@@ -458,6 +458,9 @@ struct DrawCallTransforms {
   Matrix4 worldToView = Matrix4();
   Matrix4 viewToProjection = Matrix4();
   Matrix4 textureTransform = Matrix4();
+  // The fixed-function world matrix, stored even when vertex shaders are active.
+  // Used by replacement meshes with applyOriginalVertexShader to get the game's intended world transform.
+  Matrix4 fixedFunctionWorldMatrix = Matrix4();
   bool enableClipPlane = false;
   Vector4 clipPlane{ 0.f };
   TexGenMode texgenMode = TexGenMode::None;

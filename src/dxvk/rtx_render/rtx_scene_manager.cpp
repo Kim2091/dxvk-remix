@@ -729,8 +729,15 @@ namespace dxvk {
       } else if (replacement.type == AssetReplacement::eMesh) {
         DrawCallTransforms transforms = input->getTransformData();
         
-        transforms.objectToWorld = transforms.objectToWorld * replacement.replacementToObject;
-        transforms.objectToView = transforms.objectToView * replacement.replacementToObject;
+        // When applyOriginalVertexShader is enabled, use the fixed-function world matrix
+        // even if the original draw call used a vertex shader. This allows replacement meshes
+        // to receive the game's intended world transform for proper positioning.
+        const Matrix4& baseObjectToWorld = replacement.applyOriginalVertexShader && input->usesVertexShader
+          ? transforms.fixedFunctionWorldMatrix
+          : transforms.objectToWorld;
+        
+        transforms.objectToWorld = baseObjectToWorld * replacement.replacementToObject;
+        transforms.objectToView = transforms.worldToView * transforms.objectToWorld;
 
         if (!replacement.instancesToObject.empty()) {
           transforms.instancesToObject = &replacement.instancesToObject;

@@ -120,6 +120,7 @@ private:
   void processReplacementRecursive(Args& args, const pxr::UsdPrim& prim, bool isRoot = false);
 
   Categorizer processCategoryFlags(const pxr::UsdPrim& prim);
+  bool processApplyOriginalVertexShader(const pxr::UsdPrim& prim);
 
   // Returns next hash value compatible with geometry and drawcall hashing
   XXH64_hash_t getNextGeomHash() {
@@ -434,6 +435,7 @@ void UsdMod::Impl::processPrim(Args& args, const pxr::UsdPrim& prim) {
   }
 
   Categorizer categoryFlags = processCategoryFlags(prim);
+  bool applyOriginalVertexShader = processApplyOriginalVertexShader(prim);
 
   std::optional<RtxParticleSystemDesc> particleSystem = processParticleSystem(args, prim);
 
@@ -442,6 +444,7 @@ void UsdMod::Impl::processPrim(Args& args, const pxr::UsdPrim& prim) {
     if (m_owner.m_replacements->getObject(usdOriginHash, pGeometryData)) {
       AssetReplacement newReplacementMesh(prim.GetPrimPath().GetString(), pGeometryData, materialData, categoryFlags, replacementToObject);
       newReplacementMesh.particleSystem = particleSystem;
+      newReplacementMesh.applyOriginalVertexShader = applyOriginalVertexShader;
       args.meshes.push_back(newReplacementMesh);
     }
   } else {
@@ -455,6 +458,7 @@ void UsdMod::Impl::processPrim(Args& args, const pxr::UsdPrim& prim) {
           newReplacementMesh.materialData = mat;
         }
         newReplacementMesh.particleSystem = particleSystem;
+        newReplacementMesh.applyOriginalVertexShader = applyOriginalVertexShader;
         args.meshes.push_back(newReplacementMesh);
       }
     }
@@ -1274,6 +1278,16 @@ Categorizer UsdMod::Impl::processCategoryFlags(const pxr::UsdPrim& prim) {
   }
 
   return categoryFlags;
+}
+
+bool UsdMod::Impl::processApplyOriginalVertexShader(const pxr::UsdPrim& prim) {
+  static const pxr::TfToken kApplyOriginalVertexShaderToken("applyOriginalVertexShader");
+  if (prim.HasAttribute(kApplyOriginalVertexShaderToken)) {
+    bool applyVS = false;
+    prim.GetAttribute(kApplyOriginalVertexShaderToken).Get(&applyVS);
+    return applyVS;
+  }
+  return false;
 }
 
 void UsdMod::Impl::addReplacementsSync(dxvk::Rc<dxvk::DxvkCommandList> cmdList, XXH64_hash_t hash, std::vector<AssetReplacement>& replacementVec) {

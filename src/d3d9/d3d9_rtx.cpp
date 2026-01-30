@@ -307,6 +307,10 @@ namespace dxvk {
     const bool useObjectToWorldTransform = !m_parent->UseProgrammableVS() || (m_parent->UseProgrammableVS() && useVertexCapture() && useWorldMatricesForShaders());
     transformData.objectToWorld = useObjectToWorldTransform ? d3d9State().transforms[GetTransformIndex(D3DTS_WORLD)] : Matrix4();
 
+    // Always store the fixed-function world matrix, even when vertex shaders are active.
+    // This allows replacement meshes with applyOriginalVertexShader to use the game's intended world transform.
+    transformData.fixedFunctionWorldMatrix = d3d9State().transforms[GetTransformIndex(D3DTS_WORLD)];
+
     transformData.worldToView = d3d9State().transforms[GetTransformIndex(D3DTS_VIEW)];
     transformData.viewToProjection = d3d9State().transforms[GetTransformIndex(D3DTS_PROJECTION)];
     transformData.objectToView = transformData.worldToView * transformData.objectToWorld;

@@ -78,6 +78,9 @@ namespace dxvk {
     uint32_t pointInstanceIndex = kInvalidPointInstanceIndex; 
     Type type;
     bool includeOriginal = false;
+    // When true, the replacement mesh will be transformed by the original draw call's vertex shader.
+    // This is useful for games where vertex shaders apply important transformations (e.g., light placement).
+    bool applyOriginalVertexShader = false;
 
     std::string primPath;
     XXH64_hash_t usdPathHash = kEmptyHash;
