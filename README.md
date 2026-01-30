@@ -12,7 +12,7 @@ dxvk-remix also contains a subproject in the `bridge` folder, which enables 32 b
 
 ## Build instructions
 
-### Requirements:
+### Requirements: 
 1. Windows 10 or 11
 2. [Git](https://git-scm.com/download/win)
 3. [Visual Studio ](https://visualstudio.microsoft.com/vs/older-downloads/)
