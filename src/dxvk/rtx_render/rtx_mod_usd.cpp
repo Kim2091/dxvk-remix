@@ -120,7 +120,7 @@ private:
   void processReplacementRecursive(Args& args, const pxr::UsdPrim& prim, bool isRoot = false);
 
   Categorizer processCategoryFlags(const pxr::UsdPrim& prim);
-  bool processApplyOriginalVertexShader(const pxr::UsdPrim& prim);
+  bool processApplyOriginalVertexShader(const pxr::UsdPrim& prim, const pxr::UsdPrim& rootPrim);
 
   // Returns next hash value compatible with geometry and drawcall hashing
   XXH64_hash_t getNextGeomHash() {
@@ -435,7 +435,7 @@ void UsdMod::Impl::processPrim(Args& args, const pxr::UsdPrim& prim) {
   }
 
   Categorizer categoryFlags = processCategoryFlags(prim);
-  bool applyOriginalVertexShader = processApplyOriginalVertexShader(prim);
+  bool applyOriginalVertexShader = processApplyOriginalVertexShader(prim, args.rootPrim);
 
   std::optional<RtxParticleSystemDesc> particleSystem = processParticleSystem(args, prim);
 
@@ -1280,13 +1280,24 @@ Categorizer UsdMod::Impl::processCategoryFlags(const pxr::UsdPrim& prim) {
   return categoryFlags;
 }
 
-bool UsdMod::Impl::processApplyOriginalVertexShader(const pxr::UsdPrim& prim) {
+bool UsdMod::Impl::processApplyOriginalVertexShader(const pxr::UsdPrim& prim, const pxr::UsdPrim& rootPrim) {
   static const pxr::TfToken kApplyOriginalVertexShaderToken("applyOriginalVertexShader");
+  
+  // Check on the prim itself first
   if (prim.HasAttribute(kApplyOriginalVertexShaderToken)) {
     bool applyVS = false;
     prim.GetAttribute(kApplyOriginalVertexShaderToken).Get(&applyVS);
-    return applyVS;
+    if (applyVS) return true;
   }
+  
+  // Also check on the root prim (mesh hash prim like mesh_XXXXX)
+  // This allows users to add the attribute once at the replacement root level
+  if (rootPrim.IsValid() && rootPrim != prim && rootPrim.HasAttribute(kApplyOriginalVertexShaderToken)) {
+    bool applyVS = false;
+    rootPrim.GetAttribute(kApplyOriginalVertexShaderToken).Get(&applyVS);
+    if (applyVS) return true;
+  }
+  
   return false;
 }
 
