@@ -183,6 +183,8 @@ struct Mesh {
   uint32_t     bonesPerVertex = 0;
   pxr::VtMatrix4dArray boneXForms;
   bool         isLhs = false;
+  // When true, replacement meshes should use the fixed-function world matrix for positioning
+  bool         applyOriginalVertexShader = false;
 };
 
 struct Instance {

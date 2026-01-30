@@ -613,6 +613,13 @@ void GameExporter::exportMeshes(const Export& exportData, ExportContext& ctx) {
       attribute.Set(pxr::VtValue(pair.second));
     }
 
+    // Export applyOriginalVertexShader attribute for meshes that use vertex shaders.
+    // This allows replacement meshes to receive the game's intended world transform.
+    if (mesh.applyOriginalVertexShader) {
+      const auto applyVSAttr = meshSchema.GetPrim().CreateAttribute(pxr::TfToken("applyOriginalVertexShader"), pxr::SdfValueTypeNames->Bool, true, pxr::SdfVariabilityUniform);
+      applyVSAttr.Set(pxr::VtValue(true));
+    }
+
     // Indices
     const bool reduce = exportData.meta.bReduceMeshBuffers;
     ReducedIdxBufSet reducedIdxBufSet = reduce ? reduceIdxBufferSet(mesh.buffers.idxBufs) : ReducedIdxBufSet();

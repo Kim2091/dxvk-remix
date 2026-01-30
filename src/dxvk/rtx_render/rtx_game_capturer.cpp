@@ -565,6 +565,9 @@ namespace dxvk {
       pMesh->lssData.numBones = skinData.numBones;
       pMesh->lssData.bonesPerVertex = skinData.numBonesPerVertex;
       pMesh->lssData.isLhs = isLhs;
+      // Set applyOriginalVertexShader for draw calls that use vertex shaders.
+      // This ensures replacement meshes receive the game's intended world transform.
+      pMesh->lssData.applyOriginalVertexShader = blas.input.usesVertexShader;
       Logger::debug("[GameCapturer][" + m_pCap->idStr + "][Mesh:" + pMesh->lssData.meshName + "] New");
     }
 
