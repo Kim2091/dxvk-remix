@@ -1287,7 +1287,10 @@ bool UsdMod::Impl::processApplyOriginalVertexShader(const pxr::UsdPrim& prim, co
   if (prim.HasAttribute(kApplyOriginalVertexShaderToken)) {
     bool applyVS = false;
     prim.GetAttribute(kApplyOriginalVertexShaderToken).Get(&applyVS);
-    if (applyVS) return true;
+    if (applyVS) {
+      Logger::info(str::format("[UsdMod] Replacement prim '", prim.GetPath().GetString(), "' has applyOriginalVertexShader=true (found on prim itself)"));
+      return true;
+    }
   }
   
   // Also check on the root prim (mesh hash prim like mesh_XXXXX)
@@ -1295,7 +1298,10 @@ bool UsdMod::Impl::processApplyOriginalVertexShader(const pxr::UsdPrim& prim, co
   if (rootPrim.IsValid() && rootPrim != prim && rootPrim.HasAttribute(kApplyOriginalVertexShaderToken)) {
     bool applyVS = false;
     rootPrim.GetAttribute(kApplyOriginalVertexShaderToken).Get(&applyVS);
-    if (applyVS) return true;
+    if (applyVS) {
+      Logger::info(str::format("[UsdMod] Replacement prim '", prim.GetPath().GetString(), "' has applyOriginalVertexShader=true (found on root prim '", rootPrim.GetPath().GetString(), "')"));
+      return true;
+    }
   }
   
   return false;

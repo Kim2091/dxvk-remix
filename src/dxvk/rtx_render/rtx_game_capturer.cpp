@@ -569,6 +569,9 @@ namespace dxvk {
       // This ensures replacement meshes receive the game's intended world transform.
       pMesh->lssData.applyOriginalVertexShader = blas.input.usesVertexShader;
       Logger::debug("[GameCapturer][" + m_pCap->idStr + "][Mesh:" + pMesh->lssData.meshName + "] New");
+      if (blas.input.usesVertexShader) {
+        Logger::info("[GameCapturer][" + m_pCap->idStr + "][Mesh:" + pMesh->lssData.meshName + "] Uses vertex shader - applyOriginalVertexShader will be set");
+      }
     }
 
     if (bCapturePositions && geomData.positionBuffer.defined()) {
@@ -1054,6 +1057,8 @@ namespace dxvk {
 
   void GameCapturer::prepExportMeshes(const Capture& cap, lss::Export& exportPrep) {
     OriginCalc stageOriginCalc;
+    uint32_t vertexShaderMeshCount = 0;
+    uint32_t totalMeshCount = 0;
     for (auto& [hash, pMesh] : cap.meshes) {
       std::unique_lock lock(pMesh->meshSync.mutex);
       pMesh->meshSync.cond.wait(lock,
@@ -1069,7 +1074,12 @@ namespace dxvk {
         stageOriginCalc.compareAndSwap(pMesh->lssData.origin);
       }
       exportPrep.meshes[hash] = pMesh->lssData;
+      totalMeshCount++;
+      if (pMesh->lssData.applyOriginalVertexShader) {
+        vertexShaderMeshCount++;
+      }
     }
+    Logger::info(str::format("[GameCapturer] Capture summary: ", totalMeshCount, " total meshes, ", vertexShaderMeshCount, " meshes use vertex shaders (applyOriginalVertexShader=true)"));
     if(correctBakedTransforms()) {
       exportPrep.stageOrigin = stageOriginCalc.calc();
     }

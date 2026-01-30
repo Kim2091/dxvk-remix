@@ -732,9 +732,17 @@ namespace dxvk {
         // When applyOriginalVertexShader is enabled, use the fixed-function world matrix
         // even if the original draw call used a vertex shader. This allows replacement meshes
         // to receive the game's intended world transform for proper positioning.
-        const Matrix4& baseObjectToWorld = replacement.applyOriginalVertexShader && input->usesVertexShader
+        const bool useFixedFunctionMatrix = replacement.applyOriginalVertexShader && input->usesVertexShader;
+        const Matrix4& baseObjectToWorld = useFixedFunctionMatrix
           ? transforms.fixedFunctionWorldMatrix
           : transforms.objectToWorld;
+        
+        // Debug logging for vertex shader replacement transform selection
+        static bool loggedOnce = false;
+        if (replacement.applyOriginalVertexShader && !loggedOnce) {
+          Logger::info(str::format("[SceneManager] Replacement '", replacement.primPath, "' has applyOriginalVertexShader=true, original draw usesVertexShader=", input->usesVertexShader ? "true" : "false", ", using ", useFixedFunctionMatrix ? "fixedFunctionWorldMatrix" : "objectToWorld"));
+          loggedOnce = true;
+        }
         
         transforms.objectToWorld = baseObjectToWorld * replacement.replacementToObject;
         transforms.objectToView = transforms.worldToView * transforms.objectToWorld;
