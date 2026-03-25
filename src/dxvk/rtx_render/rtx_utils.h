@@ -62,7 +62,10 @@ void writeGPUHelperExplicit(unsigned char* data, std::size_t& offset, const T& v
   static_assert(Bytes <= sizeof(T), "Explicit size must be less than or equal to the size of the original value");
 
   // Note: Ensure the value can fit in the requested explicit size
-  assert(value < (static_cast<T>(1) << (Bytes * 8)));
+  // When Bytes == sizeof(T) all values of T fit, so no range check is needed (and the shift would be UB).
+  if constexpr (Bytes < sizeof(T)) {
+    assert(value < (static_cast<T>(1) << (Bytes * 8)));
+  }
 
   std::memcpy(data + offset, &value, Bytes);
 
@@ -120,6 +123,7 @@ class GeometryBuffer : public DxvkBufferSlice {
   uint32_t offsetFromSlice() const { return m_offsetFromSlice;}
   uint32_t stride() const { return m_stride; }
   VkFormat vertexFormat() const {return m_format.vertex;}
+  void setVertexFormat(VkFormat fmt) { m_format.vertex = fmt; }
   VkIndexType indexType() const {return m_format.index;}
 
   bool operator==(GeometryBuffer const& rhs) const {

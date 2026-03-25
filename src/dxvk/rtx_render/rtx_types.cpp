@@ -492,7 +492,13 @@ namespace dxvk {
     return false;
   }
 
-  bool shouldBakeSky(const DrawCallState& drawCallState,
+  enum class SkyDetectionSource {
+    None,
+    Explicit,   // minZ, texHash, geoHash, dcIdThreshold
+    AutoDetect  // checkSkyAutoDetect
+  };
+
+  SkyDetectionSource shouldBakeSky(const DrawCallState& drawCallState,
                      bool hasSkinning,
                      uint32_t prevFrameSeenCamerasCount,
                      std::vector<Vector3>& seenCameraPositions) {           
@@ -520,16 +526,16 @@ namespace dxvk {
 
 
     if (drawCallState.minZ >= RtxOptions::skyMinZThreshold()) {
-      return true;
+      return SkyDetectionSource::Explicit;
     }
 
     if (drawCallState.getMaterialData().usesTexture()) {
       if (lookupHash(RtxOptions::skyBoxTextures(), drawCallState.getMaterialData().getHash())) {
-        return true;
+        return SkyDetectionSource::Explicit;
       }
     } else {
       if (drawCallState.drawCallID < RtxOptions::skyDrawcallIdThreshold()) {
-        return true;
+        return SkyDetectionSource::Explicit;
       }
     }
 
@@ -540,10 +546,10 @@ namespace dxvk {
                            drawCallCameraPos,
                            prevFrameSeenCamerasCount,
                            drawCallState.isDrawingToRaytracedRenderTarget ? renderTargetCameraPositions : seenCameraPositions)) {
-      return true;
+      return SkyDetectionSource::AutoDetect;
     }
 
-    return false;
+    return SkyDetectionSource::None;
   }
 
   bool shouldBakeTerrain(const DrawCallState& drawCallState) {
@@ -555,10 +561,13 @@ namespace dxvk {
 
   void DrawCallState::setupCategoriesForHeuristics(uint32_t prevFrameSeenCamerasCount,
                                                    std::vector<Vector3>& seenCameraPositions) {
-    setCategory(InstanceCategories::Sky, shouldBakeSky(*this,
+    const SkyDetectionSource skySource = shouldBakeSky(*this,
                                                        futureSkinningData.valid(),
                                                        prevFrameSeenCamerasCount,
-                                                       seenCameraPositions));
+                                                       seenCameraPositions);
+    setCategory(InstanceCategories::Sky, skySource != SkyDetectionSource::None);
+    skyAutoDetected = (skySource == SkyDetectionSource::AutoDetect);
+
     setCategory(InstanceCategories::Terrain, shouldBakeTerrain(*this));
   }
 

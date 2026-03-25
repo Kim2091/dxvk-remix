@@ -447,6 +447,11 @@ namespace dxvk {
 
   // Creates 4x4 composite debug views enumerating all debug views listed in debugViewEntries
   void DebugView::initCompositeDebugViews() {
+    static bool s_initialized = false;
+    if (s_initialized) {
+      return;
+    }
+    s_initialized = true;
 
     // Initialize implicit commposite debug views
     {
@@ -802,11 +807,17 @@ namespace dxvk {
 
     RemixGui::Checkbox("Show Cached Image", &m_showCachedImage);
 
-    RemixGui::Checkbox("Enable Debug View", &enableDebugView);
+    bool changed = RemixGui::Checkbox("Enable Debug View", &enableDebugView);
+    if (changed) {
+      RemixGui::CheckRtxOptionPopups(&debugViewIdxObject());
+    }
 
     if (enableDebugView) {
       // Debug view is required for composite debug views, so put the enablement behind it
-      RemixGui::Checkbox("Enable Composite Debug View", &enableCompositeDebugView);
+      bool compositeChanged = RemixGui::Checkbox("Enable Composite Debug View", &enableCompositeDebugView);
+      if (compositeChanged) {
+        RemixGui::CheckRtxOptionPopups(&Composite::compositeViewIdxObject());
+      }
 
       if (!enableCompositeDebugView) {
         static char codewordBuf[32] = "";

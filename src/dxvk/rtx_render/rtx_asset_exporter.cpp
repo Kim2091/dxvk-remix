@@ -221,7 +221,10 @@ namespace dxvk {
       } else {
         // Modify the state we need for reading on the CPU
         DxvkImageCreateInfo desc = dstDesc;
-        desc.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        desc.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        desc.flags = 0;
+        desc.viewFormatCount = 0;
+        desc.viewFormats = nullptr;
         desc.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
         desc.access = VK_ACCESS_TRANSFER_WRITE_BIT;
         desc.tiling = VK_IMAGE_TILING_LINEAR;
@@ -292,11 +295,11 @@ namespace dxvk {
     ctx->signal(m_readbackSignal, syncValue);
 
     // Spawn a thread so we dont sync with the GPU here...(remember, GPU runs async with CPU!).  
-    Future<void> result = getExporterThread()->Schedule([this, device = ctx->getDevice(), pBlitDests, pReadbackBuffers, pBlitTemps, syncValue, filename, outFormat, dstDesc, swizzle, useBufferReadback, readbackRowAlignment = kReadbackRowAlignment] {
+    Future<void> result = getExporterThread()->Schedule([this, device = ctx->getDevice(), pBlitDests, pReadbackBuffers, pBlitTemps, syncValue, filename, outFormat, dstDesc, swizzle] {
       ScopedCpuProfileZoneN("Export Image Finalize");
       // Stall until the GPU has completed its copy to system memory (GPU->CPU)
       this->m_readbackSignal->wait(syncValue);
-    
+
       // Push texture header to the GLI container
       const gli::extent3d outExtent = { dstDesc.extent.width, dstDesc.extent.height, 1 };
       gli::texture2d exportTex(outFormat, outExtent, dstDesc.mipLevels, swizzle);
@@ -403,7 +406,7 @@ namespace dxvk {
       bufferCallback(cDestBuffer);
       m_numExportsInFlight--;
     });
-    
+
     if (!result.valid()) {
       Logger::err(str::format("RTX: Failed to dump buffer.  Coding error, kMaxConcurrentExports, may be too low (currently: ", kMaxConcurrentExports, ")."));
     }

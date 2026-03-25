@@ -69,6 +69,7 @@
 #include "../../d3d9/d3d9_rtx.h"
 #include "dxvk_memory_tracker.h"
 #include "rtx_render/rtx_particle_system.h"
+#include "rtx_render/rtx_point_instancer_system.h"
 #include "rtx_render/rtx_overlay_window.h"
 
 
@@ -2617,6 +2618,7 @@ namespace dxvk {
         }
 
         if (changed) {
+          RemixGui::CheckRtxOptionPopups(&RtxOptions::textureGridThumbnailScaleObject());
           RtxOptions::textureGridThumbnailScale.setDeferred(static_cast<float>(percentage) / 100.f);
         }
       }
@@ -2934,6 +2936,7 @@ namespace dxvk {
           {
             ImGui::BeginDisabled(!RtxOptions::skyReprojectToMainCameraSpace());
             RemixGui::DragFloat("Reprojected Sky Scale", &RtxOptions::skyReprojectScaleObject(), 1.0f, 0.1f, 1000.0f);
+            RemixGui::Checkbox("Force Auto-Detected Sky to Reproject", &RtxOptions::skyForceAutoDetectedToReprojectObject());
             ImGui::EndDisabled();
           }
           RemixGui::DragFloat("Sky Auto-Detect Unique Camera Search Distance", &RtxOptions::skyAutoDetectUniqueCameraDistanceObject(), 1.0f, 0.1f, 1000.0f);
@@ -2946,7 +2949,9 @@ namespace dxvk {
           static int extIdx;
           extIdx = std::clamp(bit::tzcnt(RtxOptions::skyProbeSide()), 8u, 13u) - 8;
 
-          RemixGui::Combo("Sky Probe Extent", &extIdx, exts, IM_ARRAYSIZE(exts));
+          if (RemixGui::Combo("Sky Probe Extent", &extIdx, exts, IM_ARRAYSIZE(exts))) {
+            RemixGui::CheckRtxOptionPopups(&RtxOptions::skyProbeSideObject());
+          }
           RtxOptions::skyProbeSide.setDeferred(1 << (extIdx + 8));
 
           ImGui::Unindent();
@@ -3320,6 +3325,7 @@ namespace dxvk {
     if (changed) {
       // option has been toggled manually, so we need to actually store the value in the option.
       // RtxOptions::enableVsyncState will be changed by the onChange handler at the end of the frame.
+      RemixGui::CheckRtxOptionPopups(&RtxOptions::enableVsyncObject());
       RtxOptions::enableVsync.setDeferred(vsyncEnabled ? EnableVsync::On : EnableVsync::Off);
     }
 
@@ -3844,6 +3850,8 @@ namespace dxvk {
 
     RtxParticleSystemManager::showImguiSettings();
 
+    RtxPointInstancerSystem::showImguiSettings();
+
     if (RemixGui::CollapsingHeader("RTX Volumetrics (Global)", collapsingHeaderClosedFlags)) {
       ImGui::Indent();
 
@@ -4132,11 +4140,19 @@ namespace dxvk {
           }
         }
 
-        IMGUI_ADD_TOOLTIP(
+        bool terrainModeChanged = IMGUI_ADD_TOOLTIP(
           terrainModeCombo.getKey(&mode),
           "\'Terrain Baker\': rasterize the draw calls marked as \'Terrain\' into a single mesh that would be used for ray tracing.\n"
           "\n"
           "\'Terrain-as-Decals\': draw calls marked as 'Terrain' are ray traced as decals.");
+
+        if (terrainModeChanged) {
+          if (mode == TerrainMode::TerrainBaker) {
+            RemixGui::CheckRtxOptionPopups(&TerrainBaker::enableBakingObject());
+          } else if (mode == TerrainMode::AsDecals) {
+            RemixGui::CheckRtxOptionPopups(&RtxOptions::terrainAsDecalsEnabledIfNoBakerObject());
+          }
+        }
 
         switch (mode) {
         case TerrainMode::None: {

@@ -86,7 +86,9 @@ struct NeeCacheArgs {
   float triangleExplorationProbability;
   float triangleExplorationAcceptRangeRatio;
 
-  uint3 padding;
+  uint padding;
+  uint enableReshuffleResilience;
+  uint reshuffleMaxAge;
   uint enableSpatialReuse;
 };
 

@@ -679,7 +679,9 @@ std::optional<RtxParticleSystemDesc> UsdMod::Impl::processParticleSystem(Args& a
   vec4 minSpawnColor(1.0f), maxSpawnColor(1.0f), minTargetColor(1.0f, 1.0f, 1.0f, 0.0f), maxTargetColor(1.0f, 1.0f, 1.0f, 0.0f);
   vec2 minSpawnSize(10.0f, 10.0f), maxSpawnSize(10.0f, 10.0f), minTargetSize(0.0f, 0.0f), maxTargetSize(0.0f, 0.0f);
   float minSpawnRotationSpeed = 0.0f, maxSpawnRotationSpeed = 0.0f, minTargetRotationSpeed = 0.0f, maxTargetRotationSpeed = 0.0f;
-  vec3 maxSpawnVelocity(-1.0f, -1.0f, -1.0f), maxTargetVelocity(-1.0f, -1.0f, -1.0f);
+  float maxSpeed = 0.0f;
+
+  // maxSpeed has been deprecated; apply it to both velocity limits if present. 
 
   _SafeGetParticlePrimvar(GfVec4f, id, minSpawnColor, );
   _SafeGetParticlePrimvar(GfVec4f, id, maxSpawnColor, );
@@ -693,8 +695,15 @@ std::optional<RtxParticleSystemDesc> UsdMod::Impl::processParticleSystem(Args& a
   _SafeGetParticlePrimvar(float, id, maxSpawnRotationSpeed, );
   _SafeGetParticlePrimvar(float, id, minTargetRotationSpeed, );
   _SafeGetParticlePrimvar(float, id, maxTargetRotationSpeed, );
-  _SafeGetParticlePrimvar(GfVec3f, id, maxSpawnVelocity, );
-  _SafeGetParticlePrimvar(GfVec3f, id, maxTargetVelocity, );
+
+  // maxSpeed is deprecated (removed from schema); read if present for backward compatibility (do not increment counter).
+  {
+    float temp {};
+    if (_SafeGetPrimvar(sceneDelegate, id, pxr::TfToken("particle:maxSpeed"), temp)) {
+      maxSpeed = temp;
+      anyExists = true;
+    }
+  }
 
   // Fall back to legacy spawn/target animation if new fields weren't provided
   if (!hasNewMinColor) {
@@ -716,7 +725,8 @@ std::optional<RtxParticleSystemDesc> UsdMod::Impl::processParticleSystem(Args& a
     particleInfo.maxRotationSpeed = { maxSpawnRotationSpeed, maxTargetRotationSpeed };
   }
   if (!hasNewMaxVelocity) {
-    particleInfo.maxVelocity = { maxSpawnVelocity, maxTargetVelocity };
+    // maxSpeed has been deprecated; use it if maxVelocity isn't available
+    particleInfo.maxVelocity = { {maxSpeed, maxSpeed, maxSpeed}, {maxSpeed, maxSpeed, maxSpeed} };
   }
 
   _SafeGetParticlePrimvar(GfVec3f, id, attractorPosition, particleInfo.);
@@ -983,7 +993,12 @@ bool UsdMod::Impl::processReplacement(Args& args) {
     static const pxr::TfToken kMeshToken("mesh");
     args.meshes.push_back(AssetReplacement(args.rootPrim.GetPrimPath().AppendChild(kMeshToken).GetString()));
     args.meshes[0].includeOriginal = true;
-    args.meshes[0].categories = processCategoryFlags(args.rootPrim);
+    // The ParticleSystemAPI and category flags are authored on the mesh child prim, not the root hash prim.
+    pxr::UsdPrim meshPrim = args.rootPrim.GetChild(kMeshToken);
+    const pxr::UsdPrim& componentPrim = meshPrim.IsValid() ? meshPrim : args.rootPrim;
+    args.meshes[0].categories = processCategoryFlags(componentPrim);
+    std::optional<RtxParticleSystemDesc> particleSystem = processParticleSystem(args, componentPrim);
+    args.meshes[0].particleSystem = particleSystem;
   }
   processReplacementRecursive(args, args.rootPrim, true);
 
@@ -1001,7 +1016,10 @@ bool UsdMod::Impl::processReplacement(Args& args) {
   }
 
   // Only return false if no changes were made to the draw call, including the original draw being preserved.
-  if (args.meshes.size() == 1 && args.meshes[0].includeOriginal) {
+  // A particle system or category override on the original draw still counts as a change.
+  if (args.meshes.size() == 1 && args.meshes[0].includeOriginal
+      && !args.meshes[0].particleSystem.has_value()
+      && args.meshes[0].categories.categoryExists.raw() == 0) {
     return false;
   }
   return true;
