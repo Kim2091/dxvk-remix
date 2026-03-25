@@ -122,34 +122,17 @@ namespace dxvk {
     }} },
     /* Mirror's Edge (2008)                       */
     { R"(\\MirrorsEdge\.exe$)", {{
-      // UE3 camera/transform extraction
-      { "rtx.d3d9.ue3CameraFromShaderConstants",         "True" },
-      { "rtx.d3d9.ue3ObjectToWorldFromShaderConstants",  "True" },
-      // UE3 often does not keep fixed function world matrices in sync when using shaders
-      { "rtx.useWorldMatricesForShaders",                "False" },
-      // prevent one frame main camera glitches when auxiliary cameras appear before the main scene
+      { "rtx.d3d9.ue3EngineMode",                       "True" },
       { "rtx.cameraManager.guardMainCameraFromOutliers", "True" },
-      // UE3 convention
       { "rtx.zUp",                               "True" },
       { "rtx.sceneScale",                        "1.0" },
-      // render target auto detect
       // medge renders the main scene to an offscreen RT and composites/upscales later
       { "rtx.d3d9.autoRaytracedRenderTargetFromFullscreenComposite", "True" },
       { "rtx.d3d9.rasterizeFullscreenCompositeToPrimary",           "True" },
-      // textures/UVs
-      // enable PS driven texcoord inference for better UV selection on skeletal meshes and shader driven geometry
-      { "rtx.d3d9.shaderPathTexcoordIndexFromPixelShader", "True" },
       // medge billboard materials sample dirt masks alongside ad textures
-      // give lower priority to known mask textures during albedo stage inference //todo - revisit this
       { "rtx.albedoMaskTextures", "8BC96DE2A6824697" },
-      // enable UE3 MaterialInstanceConstant (child level) material hashing/tagging
-      { "rtx.d3d9.ue3MaterialInstanceConstantHash",      "True" },
-      // UE3 bakes vertex lighting into COLOR vertex elements - tell Remix to ignore it for RT
-      { "rtx.ignoreAllVertexColorBakedLighting",         "True" },
       { "rtx.legacyMaterial.roughnessConstant",          "0.5" },
       { "rtx.legacyMaterial.metallicConstant",           "0.0" },
-      // UE3 uses vertex captured normals from the VS input, don't rely on VS output NORMAL
-      { "rtx.useVertexCapturedNormals",                  "True" },
     }} },
     /* Star Wars Battlefront (2015)               */
     { R"(\\starwarsbattlefront(trial)?\.exe$)", {{

@@ -35,26 +35,87 @@ namespace dxvk {
     constexpr uint32_t kUe3VsrViewProjMatrixRegister = 0; // c0..c3
     constexpr uint32_t kUe3VsrViewOriginRegister     = 4; // c4
 
-    // compatibility fallback for certain stretched textures - todo fix this later
-    constexpr std::array<XXH64_hash_t, 6> kVsTexcoordCaptureOutlierHashes = {
-      0x7F3396C65628A031ull,
-      0xADED98814275ACD0ull,
-      0xEE12788D359E61B6ull,
-      0x5E5236906134EEC6ull,
-      0x57F8CD8A34E02ACBull,
-      0x942CAAF9A256B683ull,
-    };
-
-    inline bool isVsTexcoordCaptureOutlierHash(const XXH64_hash_t h) {
-      for (const XXH64_hash_t outlierHash : kVsTexcoordCaptureOutlierHashes) {
-        if (h == outlierHash)
-          return true;
-      }
-      return false;
-    }
-
     fast_unordered_set s_loggedNonPrimaryRtDescHashes;
     fast_unordered_set s_loggedSampledRtDescHashes;
+
+    struct VDeclSignature {
+      bool hasPosition = false;
+      uint8_t positionType = 0;
+      bool hasTangent = false;
+      uint8_t tangentType = 0;
+      bool hasNormal = false;
+      uint8_t normalType = 0;
+      bool hasBinormal = false;
+      bool hasBlendWeight = false;
+      uint8_t blendWeightType = 0;
+      bool hasBlendIndices = false;
+      bool hasColor0 = false;
+      bool hasColor1 = false;
+      uint8_t texcoordCount = 0;
+      uint8_t maxTexcoordIndex = 0;
+      uint8_t texcoordTypes[8] = {};
+      bool hasTexcoord6 = false;
+      uint8_t texcoord6Type = 0;
+      bool hasTexcoord7 = false;
+      uint8_t texcoord7Type = 0;
+      uint8_t totalElements = 0;
+    };
+
+    static VDeclSignature buildVDeclSignature(const D3D9VertexElements& elements) {
+      VDeclSignature sig;
+      sig.totalElements = uint8_t(std::min<size_t>(elements.size(), 255u));
+      for (const auto& e : elements) {
+        switch (e.Usage) {
+        case D3DDECLUSAGE_POSITION:
+        case D3DDECLUSAGE_POSITIONT:
+          sig.hasPosition = true;
+          sig.positionType = e.Type;
+          break;
+        case D3DDECLUSAGE_TANGENT:
+          sig.hasTangent = true;
+          sig.tangentType = e.Type;
+          break;
+        case D3DDECLUSAGE_NORMAL:
+          sig.hasNormal = true;
+          sig.normalType = e.Type;
+          break;
+        case D3DDECLUSAGE_BINORMAL:
+          sig.hasBinormal = true;
+          break;
+        case D3DDECLUSAGE_BLENDWEIGHT:
+          sig.hasBlendWeight = true;
+          sig.blendWeightType = e.Type;
+          break;
+        case D3DDECLUSAGE_BLENDINDICES:
+          sig.hasBlendIndices = true;
+          break;
+        case D3DDECLUSAGE_COLOR:
+          if (e.UsageIndex == 0) sig.hasColor0 = true;
+          if (e.UsageIndex == 1) sig.hasColor1 = true;
+          break;
+        case D3DDECLUSAGE_TEXCOORD:
+          if (e.UsageIndex < 8) {
+            sig.texcoordCount++;
+            if (e.UsageIndex > sig.maxTexcoordIndex) {
+              sig.maxTexcoordIndex = e.UsageIndex;
+            }
+            sig.texcoordTypes[e.UsageIndex] = e.Type;
+          }
+          if (e.UsageIndex == 6) {
+            sig.hasTexcoord6 = true;
+            sig.texcoord6Type = e.Type;
+          }
+          if (e.UsageIndex == 7) {
+            sig.hasTexcoord7 = true;
+            sig.texcoord7Type = e.Type;
+          }
+          break;
+        default:
+          break;
+        }
+      }
+      return sig;
+    }
 
     static XXH64_hash_t hashDxsoBytecode(const std::vector<uint8_t>& bytecode) {
       if (bytecode.empty())
@@ -1742,6 +1803,72 @@ namespace dxvk {
     }
   }
 
+  D3D9Rtx::Ue3VertexFactoryType D3D9Rtx::classifyUe3VertexFactory(const D3D9VertexElements& elements) {
+    if (elements.empty()) {
+      return Ue3VertexFactoryType::Unknown;
+    }
+
+    const VDeclSignature sig = buildVDeclSignature(elements);
+
+    if (!sig.hasPosition) {
+      return Ue3VertexFactoryType::Unknown;
+    }
+
+    // terrain = POSITION(UBYTE4) + BLENDWEIGHT(FLOAT1) + TANGENT(SHORT2)
+    // packed UBYTE4 position is unique to terrain
+    if (sig.positionType == D3DDECLTYPE_UBYTE4 &&
+        sig.hasBlendWeight && sig.blendWeightType == D3DDECLTYPE_FLOAT1 &&
+        sig.hasTangent && sig.tangentType == D3DDECLTYPE_SHORT2) {
+      if (sig.hasNormal) {
+        return Ue3VertexFactoryType::TerrainMorph;
+      }
+      return Ue3VertexFactoryType::Terrain;
+    }
+
+    // particle = POSITION(FLOAT3) + NORMAL(FLOAT3) + TANGENT(FLOAT3) + TEXCOORD0(FLOAT2) + BLENDWEIGHT(FLOAT1) + TEXCOORD1(FLOAT4)
+    // NORMAL is FLOAT3 (not UBYTE4), TANGENT is FLOAT3, plus BLENDWEIGHT(FLOAT1)
+    if (sig.positionType == D3DDECLTYPE_FLOAT3 &&
+        sig.hasNormal && sig.normalType == D3DDECLTYPE_FLOAT3 &&
+        sig.hasTangent && sig.tangentType == D3DDECLTYPE_FLOAT3 &&
+        sig.hasBlendWeight && sig.blendWeightType == D3DDECLTYPE_FLOAT1 &&
+        !sig.hasBlendIndices) {
+      return Ue3VertexFactoryType::Particle;
+    }
+
+    // position only (depth prepass) = only POSITION, no tangent/normal/texcoord/color
+    if (sig.positionType == D3DDECLTYPE_FLOAT3 &&
+        !sig.hasTangent && !sig.hasNormal && sig.texcoordCount == 0 &&
+        !sig.hasColor0 && !sig.hasColor1 &&
+        !sig.hasBlendWeight && !sig.hasBlendIndices) {
+      return Ue3VertexFactoryType::PositionOnly;
+    }
+
+    // GPUSkin variants - must have BLENDINDICES + BLENDWEIGHT (bone data)
+    // normal/tangent are UBYTE4 (PackedNormal)
+    if (sig.positionType == D3DDECLTYPE_FLOAT3 &&
+        sig.hasBlendIndices &&
+        sig.hasBlendWeight &&
+        sig.hasTangent && sig.tangentType == D3DDECLTYPE_UBYTE4 &&
+        sig.hasNormal && sig.normalType == D3DDECLTYPE_UBYTE4) {
+      // morph variant adds TEXCOORD6(FLOAT3) for delta position + TEXCOORD7(UBYTE4) for delta normal
+      if (sig.hasTexcoord6 && sig.texcoord6Type == D3DDECLTYPE_FLOAT3 &&
+          sig.hasTexcoord7) {
+        return Ue3VertexFactoryType::GPUSkinMorph;
+      }
+      return Ue3VertexFactoryType::GPUSkin;
+    }
+
+    // local (static mesh) = POSITION(FLOAT3) + TANGENT(UBYTE4) + NORMAL(UBYTE4) + TEXCOORDs, no BLENDINDICES
+    if (sig.positionType == D3DDECLTYPE_FLOAT3 &&
+        sig.hasTangent && sig.tangentType == D3DDECLTYPE_UBYTE4 &&
+        sig.hasNormal && sig.normalType == D3DDECLTYPE_UBYTE4 &&
+        !sig.hasBlendIndices) {
+      return Ue3VertexFactoryType::Local;
+    }
+
+    return Ue3VertexFactoryType::Unknown;
+  }
+
   D3D9Rtx::D3D9Rtx(D3D9DeviceEx* d3d9Device, bool enableDrawCallConversion)
     : m_rtStagingData(d3d9Device->GetDXVKDevice(), "RtxStagingDataAlloc: D3D9", (VkMemoryPropertyFlagBits) (VK_MEMORY_PROPERTY_HOST_CACHED_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
     , m_parent(d3d9Device)
@@ -1960,12 +2087,28 @@ namespace dxvk {
     assert(geoData.positionBuffer.offset() % 4 == 0);
 
     uint32_t capturedTexcoordOutputRegister = FindVsTexcoordOutputRegister(vertexShader, m_texcoordIndex);
-    if (capturedTexcoordOutputRegister == std::numeric_limits<uint32_t>::max())
-      capturedTexcoordOutputRegister = FindVsTexcoordOutputRegisterByRegNumber(vertexShader, m_texcoordIndex);
+    if (capturedTexcoordOutputRegister == std::numeric_limits<uint32_t>::max()) {
+      if (!ue3EngineMode())
+        capturedTexcoordOutputRegister = FindVsTexcoordOutputRegisterByRegNumber(vertexShader, m_texcoordIndex);
+    }
     if (capturedTexcoordOutputRegister == std::numeric_limits<uint32_t>::max())
       capturedTexcoordOutputRegister = FindUniqueVsTexcoordOutputRegister(vertexShader);
     if (forceIaTexcoordForOutlier)
       capturedTexcoordOutputRegister = std::numeric_limits<uint32_t>::max();
+
+    // UE3 packs UV pairs into float4 VS outputs as .xy = even UV, .wz = odd UV
+    // the only valid component extractions are (0,1) for .xy and (3,2) for .wz
+    // when PS inference produces a non standard swizzle (e.g. .yz, .yw)
+    // it's mixing components from different UV sets which is wrong
+    // fallback to IA texcoords in that case - the IA always provides the correct 2-component UV directly
+    if (ue3EngineMode() && hasIaTexcoord &&
+        capturedTexcoordOutputRegister != std::numeric_limits<uint32_t>::max()) {
+      const bool isStandardXy = (m_texcoordCompU == 0 && m_texcoordCompV == 1);
+      const bool isStandardWz = (m_texcoordCompU == 3 && m_texcoordCompV == 2);
+      if (!isStandardXy && !isStandardWz) {
+        capturedTexcoordOutputRegister = std::numeric_limits<uint32_t>::max();
+      }
+    }
 
     // Shader path with vertex capture: prefer VS output TEXCOORD to preserve any VS-side UV math.
     if (BoundShaderHasAnyUsageIndex(vertexShader, DxsoUsage::Texcoord, false) &&
@@ -1992,7 +2135,6 @@ namespace dxvk {
     const bool vsOutputsColor0 = BoundShaderHas(vertexShader, DxsoUsage::Color, false);
     const bool hasBlendWeights = geoData.blendWeightBuffer.defined();
     const bool hasBlendIndices = geoData.blendIndicesBuffer.defined();
-    const bool hasBlendWeightsAndIndices = hasBlendWeights && hasBlendIndices;
     const bool hasAnyBlendStream = hasBlendWeights || hasBlendIndices;
     const Ue3VsShaderCtabInfo* ue3CtabInfo = m_currentUe3CtabInfo.has_value() ? &(*m_currentUe3CtabInfo) : nullptr;
     const bool hasBoneMatricesInCtab = ue3CtabInfo != nullptr &&
@@ -2007,8 +2149,7 @@ namespace dxvk {
       hasAnyBlendStream &&
       hasBoneMatricesInCtab;
 
-    // logging for shading issues, todo: remove this later
-    {
+    if (Logger::logLevel() <= LogLevel::Debug) {
       const uint32_t normalDiagKey =
         (vsOutputsNormal ? 1u : 0u) | (vsHasNormalInput ? 2u : 0u) |
         (normalFromDecl ? 4u : 0u) | (isGpuSkinned ? 8u : 0u) |
@@ -2027,7 +2168,7 @@ namespace dxvk {
         else if (isGpuSkinned && normalFromDecl) caseLabel = "Case2c-bindPoseFallback";
         else if (isGpuSkinned) caseLabel = "Case2d-noNormals";
 
-        Logger::info(str::format(
+        Logger::debug(str::format(
           "[RTX-Compatibility] Vertex capture normal [", caseLabel, "]: vsOutputsNormal=", vsOutputsNormal,
           ", vsHasNormalInput=", vsHasNormalInput,
           ", normalFromDecl=", normalFromDecl,
@@ -2043,7 +2184,7 @@ namespace dxvk {
 
     uint32_t vertexCaptureFlags = 0;
 
-    if (vsOutputsNormal && useVertexCapturedNormals()) {
+    if (vsOutputsNormal && (useVertexCapturedNormals() || ue3EngineMode())) {
       // 1: VS outputs NORMAL - use vertex-captured normals (they match the captured positions)
       const uint32_t normalOffset = offsetof(CapturedVertex, normal0);
       geoData.normalBuffer = RasterBuffer(slice, normalOffset, stride, VK_FORMAT_R32G32B32_SFLOAT);
@@ -2174,7 +2315,7 @@ namespace dxvk {
         break;
       case D3DDECLUSAGE_COLOR:
         if (element.UsageIndex == 0 &&
-            !RtxOptions::ignoreAllVertexColorBakedLighting() &&
+            !RtxOptions::ignoreAllVertexColorBakedLighting() && !ue3EngineMode() &&
             !lookupHash(RtxOptions::ignoreBakedLightingTextures(), m_activeDrawCallState.materialData.colorTextures[0].getImageHash())) {
           // only treat COLOR0 as a packed 8-bit UNORM color, UE3 can use COLOR semantics for non-color data which the rtx interleaver does not interpret as vertex color
           const VkFormat fmt = DecodeDecltype(D3DDECLTYPE(element.Type));
@@ -2273,8 +2414,13 @@ namespace dxvk {
     DrawCallTransforms& transformData = m_activeDrawCallState.transformData;
     m_forceIaTexcoordForOutlier = false;
 
+    const bool isUe3Mode = ue3EngineMode();
+    const bool effectiveUe3Camera = ue3CameraFromShaderConstants() || isUe3Mode;
+    const bool effectiveUe3ObjectToWorld = ue3ObjectToWorldFromShaderConstants() || isUe3Mode;
+    const bool effectiveUseWorldMatricesForShaders = useWorldMatricesForShaders() && !isUe3Mode;
+
     // When games use vertex shaders, the object to world transforms can be unreliable, and so we can ignore them.
-    const bool useObjectToWorldTransform = !m_parent->UseProgrammableVS() || (m_parent->UseProgrammableVS() && useVertexCapture() && useWorldMatricesForShaders());
+    const bool useObjectToWorldTransform = !m_parent->UseProgrammableVS() || (m_parent->UseProgrammableVS() && useVertexCapture() && effectiveUseWorldMatricesForShaders);
     transformData.objectToWorld = useObjectToWorldTransform ? d3d9State().transforms[GetTransformIndex(D3DTS_WORLD)] : Matrix4();
 
     transformData.worldToView = d3d9State().transforms[GetTransformIndex(D3DTS_VIEW)];
@@ -2286,14 +2432,13 @@ namespace dxvk {
         ? d3d9State().vertexShader->GetCommonShader()
         : nullptr;
 
-    // for UE3 we shouild parse shader CTAB once per unique vertex shader to locate reserved constants
-    // (camera/object transforms and optional skinning metadata)
     const Ue3VsShaderCtabInfo* ue3CtabInfoPtr = nullptr;
     m_currentUe3CtabInfo.reset();
     bool ue3CameraUsedTranspose = false;
+
     const bool needsUe3CtabInfo =
-      ue3CameraFromShaderConstants() ||
-      ue3ObjectToWorldFromShaderConstants() ||
+      effectiveUe3Camera ||
+      effectiveUe3ObjectToWorld ||
       useVertexCapture();
     if (usesProgrammableVs && vertexShaderCommon != nullptr &&
         needsUe3CtabInfo) {
@@ -2443,10 +2588,16 @@ namespace dxvk {
                 info.hasBoneMatrices = true;
                 info.boneMatricesRegisterIndex = c.registerIndex;
                 info.boneMatricesRegisterCount = c.registerCount;
-              } else if (c.registerCount >= 9u && (c.registerCount % 3u) == 0u && c.registerIndex >= 5u) {
+              } else if ((c.registerCount % 3u) == 0u) {
                 // fallback for stripped/renamed symbols, in UE3 this is typically a large contiguous
                 // c-register range (3 registers per bone) usually starting after c0..c4 camera constants
-                if (c.registerCount > inferredBoneMatricesRegisterCount) {
+                const bool isConfirmedSkinVF =
+                  m_currentUe3VertexFactory == Ue3VertexFactoryType::GPUSkin ||
+                  m_currentUe3VertexFactory == Ue3VertexFactoryType::GPUSkinMorph;
+                const uint32_t minRegCount = isConfirmedSkinVF ? 3u : 9u;
+                const uint32_t minRegIndex = isConfirmedSkinVF ? 0u : 5u;
+                if (c.registerCount >= minRegCount && c.registerIndex >= minRegIndex &&
+                    c.registerCount > inferredBoneMatricesRegisterCount) {
                   inferredBoneMatricesRegisterIndex = c.registerIndex;
                   inferredBoneMatricesRegisterCount = c.registerCount;
                 }
@@ -2500,10 +2651,15 @@ namespace dxvk {
             }
           }
 
-          if (!info.hasBoneMatrices && inferredBoneMatricesRegisterCount >= 9u) {
-            info.hasBoneMatrices = true;
-            info.boneMatricesRegisterIndex = inferredBoneMatricesRegisterIndex;
-            info.boneMatricesRegisterCount = inferredBoneMatricesRegisterCount;
+          if (!info.hasBoneMatrices && inferredBoneMatricesRegisterCount >= 3u) {
+            const bool isConfirmedSkinVF =
+              m_currentUe3VertexFactory == Ue3VertexFactoryType::GPUSkin ||
+              m_currentUe3VertexFactory == Ue3VertexFactoryType::GPUSkinMorph;
+            if (isConfirmedSkinVF || inferredBoneMatricesRegisterCount >= 9u) {
+              info.hasBoneMatrices = true;
+              info.boneMatricesRegisterIndex = inferredBoneMatricesRegisterIndex;
+              info.boneMatricesRegisterCount = inferredBoneMatricesRegisterCount;
+            }
           }
         } catch (...) {
           return info;
@@ -2531,8 +2687,7 @@ namespace dxvk {
       }
     }
 
-    // in UE3 camera matrices are often provided only via reserved shader constants (VSR_ViewProjMatrix/VSR_ViewOrigin)
-    if (usesProgrammableVs && ue3CameraFromShaderConstants()) {
+    if (usesProgrammableVs && effectiveUe3Camera) {
       uint32_t viewProjReg = kUe3VsrViewProjMatrixRegister;
       uint32_t viewOriginReg = kUe3VsrViewOriginRegister;
 
@@ -2599,15 +2754,15 @@ namespace dxvk {
         transformData.worldToView = ue3WorldToView;
         transformData.viewToProjection = ue3ViewToProjection;
       } else {
-        // debugging, todo: remove later
-        if (viewProjReg + 3 < caps::MaxFloatConstantsSoftware && viewOriginReg < caps::MaxFloatConstantsSoftware) {
+        if (Logger::logLevel() <= LogLevel::Debug &&
+            viewProjReg + 3 < caps::MaxFloatConstantsSoftware && viewOriginReg < caps::MaxFloatConstantsSoftware) {
           const Vector4 c0 = d3d9State().vsConsts.fConsts[viewProjReg + 0];
           const Vector4 c1 = d3d9State().vsConsts.fConsts[viewProjReg + 1];
           const Vector4 c2 = d3d9State().vsConsts.fConsts[viewProjReg + 2];
           const Vector4 c3 = d3d9State().vsConsts.fConsts[viewProjReg + 3];
           const Vector4 cam = d3d9State().vsConsts.fConsts[viewOriginReg];
 
-          ONCE(Logger::info(str::format(
+          ONCE(Logger::debug(str::format(
             "[RTX-Compatibility] UE3 camera extraction failed (viewProjReg=c", viewProjReg, "..c", viewProjReg + 3,
             ", viewOriginReg=c", viewOriginReg, "). "
             "c0={", c0.x, ", ", c0.y, ", ", c0.z, ", ", c0.w, "} "
@@ -2616,15 +2771,14 @@ namespace dxvk {
             "c3={", c3.x, ", ", c3.y, ", ", c3.z, ", ", c3.w, "} "
             "cam={", cam.x, ", ", cam.y, ", ", cam.z, ", ", cam.w, "}")));
         } else {
-          ONCE(Logger::info(str::format(
+          ONCE(Logger::debug(str::format(
             "[RTX-Compatibility] UE3 camera extraction failed (out of bounds registers: viewProjReg=c", viewProjReg,
             ", viewOriginReg=c", viewOriginReg, ").")));
         }
       }
     }
 
-    // in UE3 perobject LocalToWorld is typically passed as a shader constant not as a fixed-function world transform
-    if (usesProgrammableVs && ue3ObjectToWorldFromShaderConstants() && ue3CtabInfoPtr != nullptr) {
+    if (usesProgrammableVs && effectiveUe3ObjectToWorld && ue3CtabInfoPtr != nullptr) {
       const Ue3VsShaderCtabInfo& ctabInfo = *ue3CtabInfoPtr;
 
       if (ctabInfo.hasLocalToWorld) {
@@ -2775,6 +2929,48 @@ namespace dxvk {
     // Stencil state is important to Remix
     m_activeDrawCallState.stencilEnabled = d3d9State().renderStates[D3DRS_STENCILENABLE];
 
+    // translucency - UE3 draws two sided translucent meshes as backface then
+    // frontface passes with the same shader/textures but different cull modes
+    // detect and skip the second pass to avoid duplicate geometry
+    if (ue3EngineMode() && usesProgrammableVs && d3d9State().vertexShader.ptr() != nullptr &&
+        d3d9State().pixelShader.ptr() != nullptr) {
+      const auto& vsBytecode = d3d9State().vertexShader->GetCommonShader()->GetBytecode();
+      const auto& psBytecode = d3d9State().pixelShader->GetCommonShader()->GetBytecode();
+      const XXH64_hash_t vsHash = vsBytecode.empty() ? 0 : XXH3_64bits(vsBytecode.data(), vsBytecode.size());
+      const XXH64_hash_t psHash = psBytecode.empty() ? 0 : XXH3_64bits(psBytecode.data(), psBytecode.size());
+      const XXH64_hash_t vsPsHash = vsHash ^ (psHash * 0x9E3779B97F4A7C15ull);
+
+      XXH64_hash_t boundTextureHash = 0;
+      for (uint32_t s = 0; s < 4u; s++) {
+        if (d3d9State().textures[s] != nullptr) {
+          D3D9CommonTexture* tex = GetCommonTexture(d3d9State().textures[s]);
+          if (tex != nullptr && tex->GetImage() != nullptr)
+            boundTextureHash ^= tex->GetImage()->getHash();
+        }
+      }
+
+      const DWORD cullMode = d3d9State().renderStates[D3DRS_CULLMODE];
+      const bool isSecondTwoSidedPass =
+        vsPsHash != 0 &&
+        vsPsHash == m_prevDrawVsPsHash &&
+        boundTextureHash == m_prevDrawTextureHash &&
+        cullMode != m_prevDrawCullMode &&
+        d3d9State().renderStates[D3DRS_ALPHABLENDENABLE] != FALSE;
+
+      m_prevDrawVsPsHash = vsPsHash;
+      m_prevDrawTextureHash = boundTextureHash;
+      m_prevDrawCullMode = cullMode;
+
+      if (isSecondTwoSidedPass) {
+        ONCE(Logger::info("[RTX-Compatibility-Info] Skipped UE3 two-pass translucent draw (second cull-mode pass)."));
+        return false;
+      }
+    } else {
+      m_prevDrawVsPsHash = 0;
+      m_prevDrawTextureHash = 0;
+      m_prevDrawCullMode = 0;
+    }
+
     // Process textures
     if (m_parent->UseProgrammablePS()) {
       return processTextures<false>();
@@ -2835,7 +3031,20 @@ namespace dxvk {
       ONCE(Logger::info(str::format("[RTX-Compatibility-Info] Raytracing an alpha-blended draw call when alpha-blended objects disabled in RT. Ignoring.")));
       return { RtxGeometryStatus::Ignored, false };
     }
-    
+
+    // UE3 depth test disabled translucency -  NeedsDepthTestDisabled materials, fog volume composites,
+    // and fullscreen overlays use alpha blend + depth test off + depth write off
+    // exclude UI tagged draws since they also match this pattern but need rasterisation with RTX injection
+    if ((ue3SkipDepthTestDisabledTranslucency() || ue3EngineMode()) &&
+        d3d9State().renderStates[D3DRS_ALPHABLENDENABLE] &&
+        (d3d9State().renderStates[D3DRS_ZENABLE] == D3DZB_FALSE ||
+         d3d9State().renderStates[D3DRS_ZFUNC] == D3DCMP_ALWAYS) &&
+        d3d9State().renderStates[D3DRS_ZWRITEENABLE] == FALSE &&
+        !checkBoundTextureCategory(RtxOptions::uiTextures())) {
+      ONCE(Logger::info("[RTX-Compatibility-Info] Skipped UE3 depth-test-disabled translucent draw."));
+      return { RtxGeometryStatus::Rasterized, false };
+    }
+
     if (m_activeOcclusionQueries > 0) {
       ONCE(Logger::info(str::format("[RTX-Compatibility-Info] Trying to raytrace an occlusion query. Ignoring.")));
       return { RtxGeometryStatus::Rasterized, false };
@@ -2852,6 +3061,14 @@ namespace dxvk {
       return { RtxGeometryStatus::Ignored, false };
     }
 
+    // UE3 depth prepass - position only vertex declarations have no texcoords/colours
+    // the same geometry will be drawn again in the base pass with full material
+    if ((ue3SkipDepthPrepass() || ue3EngineMode()) &&
+        m_currentUe3VertexFactory == Ue3VertexFactoryType::PositionOnly) {
+      ONCE(Logger::info("[RTX-Compatibility-Info] Skipped UE3 depth prepass draw (position-only vertex declaration)."));
+      return { RtxGeometryStatus::Ignored, false };
+    }
+
     // Ensure present parameters for the swapchain have been cached
     // Note: This assumes that ResetSwapChain has been called at some point before this call, typically done after creating a swapchain.
     assert(m_activePresentParams.has_value());
@@ -2865,6 +3082,21 @@ namespace dxvk {
       if (rtExt.width == rtExt.height && rtExt.width < m_activePresentParams->BackBufferWidth / 4 &&
           Resources::getFormatCompatibilityCategory(d3d9State().renderTargets[kRenderTargetIndex]->GetImageView(false)->imageInfo().format) == RtxTextureFormatCompatibilityCategory::InvalidFormatCompatibilityCategory) {
         ONCE(Logger::info("[RTX-Compatibility-Info] Skipped shadow mask drawcall."));
+        return { RtxGeometryStatus::Ignored, false };
+      }
+    }
+
+    // UE3 shadow depth pass - draws to small square render targets that are used as shadow maps
+    if ((ue3SkipShadowDepthPasses() || ue3EngineMode()) && m_activePresentParams.has_value()) {
+      const auto& rtExt = d3d9State().renderTargets[kRenderTargetIndex]->GetSurfaceExtent();
+      const uint32_t bbW = m_activePresentParams->BackBufferWidth;
+      const bool isSmallSquare = rtExt.width == rtExt.height &&
+                                 rtExt.width <= 2048 &&
+                                 rtExt.width < bbW / 2;
+      const bool hasDepthWrite = d3d9State().renderStates[D3DRS_ZWRITEENABLE] != FALSE;
+      if (isSmallSquare && hasDepthWrite) {
+        ONCE(Logger::info(str::format("[RTX-Compatibility-Info] Skipped UE3 shadow depth pass (",
+                                       rtExt.width, "x", rtExt.height, ").")));
         return { RtxGeometryStatus::Ignored, false };
       }
     }
@@ -2894,17 +3126,19 @@ namespace dxvk {
 
       if (!isPrimary) {
         // debugging, todo remove later
-        if (D3D9CommonTexture* rtTex = d3d9State().renderTargets[kRenderTargetIndex]->GetCommonTexture()) {
-          if (rtTex->GetImage() != nullptr) {
-            const XXH64_hash_t rtDescHash = rtTex->GetImage()->getDescriptorHash();
-            if (s_loggedNonPrimaryRtDescHashes.insert(rtDescHash).second) {
-              const auto* rtDesc = rtTex->Desc();
-              Logger::info(str::format(
-                "[RTX-Compatibility] Non-primary RT0 encountered: ",
-                rtDesc->Width, "x", rtDesc->Height,
-                " (backbuffer ", m_activePresentParams->BackBufferWidth, "x", m_activePresentParams->BackBufferHeight, "), ",
-                "rtDescHash=0x", std::hex, rtDescHash, std::dec,
-                ". If this RT contains the main scene, add it to rtx.raytracedRenderTargetTextures."));
+        if (Logger::logLevel() <= LogLevel::Debug) {
+          if (D3D9CommonTexture* rtTex = d3d9State().renderTargets[kRenderTargetIndex]->GetCommonTexture()) {
+            if (rtTex->GetImage() != nullptr) {
+              const XXH64_hash_t rtDescHash = rtTex->GetImage()->getDescriptorHash();
+              if (s_loggedNonPrimaryRtDescHashes.insert(rtDescHash).second) {
+                const auto* rtDesc = rtTex->Desc();
+                Logger::debug(str::format(
+                  "[RTX-Compatibility] Non-primary RT0 encountered: ",
+                  rtDesc->Width, "x", rtDesc->Height,
+                  " (backbuffer ", m_activePresentParams->BackBufferWidth, "x", m_activePresentParams->BackBufferHeight, "), ",
+                  "rtDescHash=0x", std::hex, rtDescHash, std::dec,
+                  ". If this RT contains the main scene, add it to rtx.raytracedRenderTargetTextures."));
+              }
             }
           }
         }
@@ -2914,7 +3148,6 @@ namespace dxvk {
       }
     }
 
-    // debugging, todo remove later
     if (const uint32_t rtSamplerMask = m_parent->GetActiveRTTextures()) {
       const bool depthEnabled  = d3d9State().renderStates[D3DRS_ZENABLE] == D3DZB_TRUE;
       const bool zWriteEnabled = d3d9State().renderStates[D3DRS_ZWRITEENABLE] != FALSE;
@@ -2966,19 +3199,21 @@ namespace dxvk {
         }
       }
 
-      for (uint32_t i : bit::BitMask(rtSamplerMask)) {
-        D3D9CommonTexture* tex = GetCommonTexture(d3d9State().textures[i]);
-        if (!tex || tex->GetImage() == nullptr)
-          continue;
+      if (Logger::logLevel() <= LogLevel::Debug) {
+        for (uint32_t i : bit::BitMask(rtSamplerMask)) {
+          D3D9CommonTexture* tex = GetCommonTexture(d3d9State().textures[i]);
+          if (!tex || tex->GetImage() == nullptr)
+            continue;
 
-        const XXH64_hash_t texDescHash = tex->GetImage()->getDescriptorHash();
-        if (s_loggedSampledRtDescHashes.insert(texDescHash).second) {
-          const auto* desc = tex->Desc();
-          Logger::info(str::format(
-            "[RTX-Compatibility] Sampled render-target texture: ",
-            desc->Width, "x", desc->Height,
-            ", texDescHash=0x", std::hex, texDescHash, std::dec,
-            " (sampler ", i, ")."));
+          const XXH64_hash_t texDescHash = tex->GetImage()->getDescriptorHash();
+          if (s_loggedSampledRtDescHashes.insert(texDescHash).second) {
+            const auto* desc = tex->Desc();
+            Logger::debug(str::format(
+              "[RTX-Compatibility] Sampled render-target texture: ",
+              desc->Width, "x", desc->Height,
+              ", texDescHash=0x", std::hex, texDescHash, std::dec,
+              " (sampler ", i, ")."));
+          }
         }
       }
 
@@ -3060,6 +3295,20 @@ namespace dxvk {
       return RtxOptions::skipDrawCallsPostRTXInjection()
              ? PrepareDrawFlag::Ignore
              : PrepareDrawFlag::PreserveDrawCallAndItsState;
+    }
+
+    // classify UE3 vertex factory early so makeDrawCallType can use it for pass filtering
+    m_currentUe3VertexFactory = Ue3VertexFactoryType::Unknown;
+    if (ue3EngineMode() && d3d9State().vertexDecl != nullptr) {
+      const auto& elements = d3d9State().vertexDecl->GetElements();
+      XXH64_hash_t declKey = XXH3_64bits(elements.data(), elements.size() * sizeof(D3DVERTEXELEMENT9));
+      auto it = m_ue3VertexFactoryCache.find(declKey);
+      if (it != m_ue3VertexFactoryCache.end()) {
+        m_currentUe3VertexFactory = it->second;
+      } else {
+        m_currentUe3VertexFactory = classifyUe3VertexFactory(elements);
+        m_ue3VertexFactoryCache.emplace(declKey, m_currentUe3VertexFactory);
+      }
     }
 
     const auto [status, triggerRtxInjection] = makeDrawCallType(drawContext);
@@ -3533,7 +3782,13 @@ namespace dxvk {
     const D3D9CommonShader* inferredPs = nullptr;
     XXH64_hash_t inferredPsHash = 0;
     PsSamplerTexcoordEntry* inferredPsEntry = nullptr;
-    const bool likelyGpuSkinnedMesh = [&]() {
+    const Ue3VertexFactoryType vfType = m_currentUe3VertexFactory;
+    const bool isUe3GpuSkinVF = vfType == Ue3VertexFactoryType::GPUSkin || vfType == Ue3VertexFactoryType::GPUSkinMorph;
+    const bool isUe3TerrainVF = vfType == Ue3VertexFactoryType::Terrain || vfType == Ue3VertexFactoryType::TerrainMorph;
+    const bool isUe3ParticleVF = vfType == Ue3VertexFactoryType::Particle;
+    const bool isUe3MorphVF = vfType == Ue3VertexFactoryType::GPUSkinMorph;
+
+    const bool likelyGpuSkinnedMesh = isUe3GpuSkinVF || [&]() {
       if (d3d9State().vertexDecl.ptr() == nullptr)
         return false;
 
@@ -3551,14 +3806,15 @@ namespace dxvk {
         ? &(*m_currentUe3CtabInfo)
         : nullptr;
     const bool likelyUe3DecalUvSpace =
-      ue3VsHints != nullptr &&
-      (ue3VsHints->hasDecalTransform ||
-       ue3VsHints->hasDecalLocation ||
-       ue3VsHints->hasDecalOffset);
+      (ue3VsHints != nullptr &&
+       (ue3VsHints->hasDecalTransform ||
+        ue3VsHints->hasDecalLocation ||
+        ue3VsHints->hasDecalOffset));
     const bool likelyUe3TerrainUvSpace =
-      ue3VsHints != nullptr &&
-      (ue3VsHints->hasLightMapCoordinateScaleBias ||
-       ue3VsHints->hasShadowCoordinateScaleBias);
+      isUe3TerrainVF ||
+      (ue3VsHints != nullptr &&
+       (ue3VsHints->hasLightMapCoordinateScaleBias ||
+        ue3VsHints->hasShadowCoordinateScaleBias));
     const bool likelyUe3BillboardUvSpace =
       ue3VsHints != nullptr &&
       (ue3VsHints->hasTextureCoordinateScaleBias ||
@@ -3667,7 +3923,7 @@ namespace dxvk {
     };
 
     if constexpr (!FixedFunction) {
-      if (shaderPathTexcoordIndexFromPixelShader() && d3d9State().pixelShader.ptr() != nullptr) {
+      if ((shaderPathTexcoordIndexFromPixelShader() || ue3EngineMode()) && d3d9State().pixelShader.ptr() != nullptr) {
         inferredPs = d3d9State().pixelShader->GetCommonShader();
         inferredPsEntry = getOrInitPsSamplerTexcoordEntry(inferredPs, inferredPsHash);
       }
@@ -3790,6 +4046,10 @@ namespace dxvk {
         if (inferredPsEntry != nullptr && stage < caps::MaxTexturesPS) {
           sampleCount = inferredPsEntry->samplerSampleCount[stage];
           inferredTexcoordIdx = inferredPsEntry->samplerToTexcoord[stage];
+          // GPUSkinMorphVF - TEXCOORD6/7 are morph delta streams, treat as noninferable UV
+          if (isUe3MorphVF && inferredTexcoordIdx >= 6) {
+            inferredTexcoordIdx = -1;
+          }
           inferredSamplerSemanticFlags = inferredPsEntry->samplerSemanticFlags[stage];
           inferredSamplerExpressionFlags = inferredPsEntry->samplerExpressionFlags[stage];
           inferredSamplerLooksEngineAuxiliary = (inferredSamplerSemanticFlags & kPsSamplerSemanticEngineAuxiliary) != 0;
@@ -3899,17 +4159,19 @@ namespace dxvk {
             inferredSamplerLooksEngineAuxiliary ||
             (likelyGpuSkinnedMesh && !inferredSamplerLooksMaterialTexture);
 
+          const bool skinnedHighConfidence =
+            likelyGpuSkinnedMesh && inferredSamplerLooksMaterialTexture && sampleCount >= 3u;
           const int64_t uv0Bonus = likelyGpuSkinnedMesh ? 300'000ll : 60'000ll;
           const int64_t nonUv0Penalty = likelyGpuSkinnedMesh ? 180'000ll : 20'000ll;
           const int64_t xyBonus = likelyGpuSkinnedMesh ? 120'000ll : 35'000ll;
           const int64_t wzPenalty = likelyGpuSkinnedMesh
-            ? 320'000ll
+            ? (skinnedHighConfidence ? 160'000ll : 320'000ll)
             : (packedPairSuspicious ? 120'000ll : 8'000ll);
           const int64_t zwPenalty = likelyGpuSkinnedMesh
-            ? 250'000ll
+            ? (skinnedHighConfidence ? 125'000ll : 250'000ll)
             : (packedPairSuspicious ? 100'000ll : 8'000ll);
           const int64_t packedSecondaryPenalty = likelyGpuSkinnedMesh
-            ? 80'000ll
+            ? (skinnedHighConfidence ? 40'000ll : 80'000ll)
             : (packedPairSuspicious ? 28'000ll : 2'000ll);
           const int64_t offsetPenalty = likelyGpuSkinnedMesh
             ? 220'000ll
@@ -3946,12 +4208,12 @@ namespace dxvk {
           if (inferredSamplerLooksEngineAuxiliary)
             score -= auxiliaryPenalty;
 
-          if (!likelyGpuSkinnedMesh &&
-              likelyUe3FlexiblePackedUvPath &&
-              inferredSamplerLooksMaterialTexture &&
+          const bool highConfidenceMaterialTexture =
+            inferredSamplerLooksMaterialTexture && sampleCount >= 3u;
+          if (inferredSamplerLooksMaterialTexture &&
               inferredUsesPackedSecondary &&
-              !packedPairSuspicious) {
-            // decal/terrain/speedtree billboards commonly use packed UVs for their base colour path (although there's some eceptions in medge due to reasons..)
+              !packedPairSuspicious &&
+              (likelyUe3FlexiblePackedUvPath || (likelyGpuSkinnedMesh && highConfidenceMaterialTexture))) {
             score += 45'000ll;
           }
         }
@@ -4282,7 +4544,7 @@ namespace dxvk {
                          m_activeDrawCallState.materialData, m_activeDrawCallState.transformData);
 
     if constexpr (!FixedFunction) {
-      if (shaderPathTexcoordIndexFromPixelShader()) {
+      if (shaderPathTexcoordIndexFromPixelShader() || ue3EngineMode()) {
         // shader-path draws perform UV math in shader code
         // fixed-function texture transform/texgen state can be stale and should not be reused
         m_activeDrawCallState.transformData.textureTransform = Matrix4();
@@ -4296,7 +4558,7 @@ namespace dxvk {
       // ScalarParameterValues, or StaticSwitchParameterValues
       // must run before setupCategoriesForTexture so category lookups use the full material hash
       if constexpr (!FixedFunction) {
-        if (ue3MaterialInstanceConstantHash() && m_parent->UseProgrammablePS() && d3d9State().pixelShader.ptr() != nullptr) {
+        if ((ue3MaterialInstanceConstantHash() || ue3EngineMode()) && m_parent->UseProgrammablePS() && d3d9State().pixelShader.ptr() != nullptr) {
           const auto& bytecode = d3d9State().pixelShader->GetCommonShader()->GetBytecode();
           const XXH64_hash_t psHash = hashDxsoBytecode(bytecode);
           if (psHash != 0) {
@@ -4356,8 +4618,12 @@ namespace dxvk {
     uint32_t texcoordIdx = d3d9State().textureStages[stageStateIdx][DXVK_TSS_TEXCOORDINDEX] & 0b111;
 
     m_forceIaTexcoordForOutlier = [&]() {
+      const auto& outlierSet = vsTexcoordCaptureOutlierTextures();
+      if (outlierSet.empty()) {
+        return false;
+      }
       for (uint32_t i = 0; i < LegacyMaterialData::kMaxSupportedTextures; i++) {
-        if (isVsTexcoordCaptureOutlierHash(m_activeDrawCallState.materialData.colorTextures[i].getImageHash()))
+        if (lookupHash(outlierSet, m_activeDrawCallState.materialData.colorTextures[i].getImageHash()))
           return true;
       }
 
@@ -4369,19 +4635,19 @@ namespace dxvk {
         if (texture == nullptr || texture->GetImage() == nullptr)
           continue;
 
-        if (isVsTexcoordCaptureOutlierHash(texture->GetImage()->getHash()))
+        if (lookupHash(outlierSet, texture->GetImage()->getHash()))
           return true;
       }
 
       return false;
     }();
 
+    m_psInferredSampleCount = 0;
+
     if constexpr (!FixedFunction) {
       const bool forceIaTexcoordForOutlier = m_forceIaTexcoordForOutlier;
 
-      // fixed-function TEXCOORDINDEX is often unreliable for shader-driven games
-      // prefer inferring TEXCOORD set from pixel shader bytecode when enabled
-      if (shaderPathTexcoordIndexFromPixelShader() &&
+      if ((shaderPathTexcoordIndexFromPixelShader() || ue3EngineMode()) &&
           d3d9State().pixelShader.ptr() != nullptr) {
         const D3D9CommonShader* ps = inferredPs != nullptr
           ? inferredPs
@@ -4393,8 +4659,13 @@ namespace dxvk {
 
         if (entryPtr != nullptr && firstStage < caps::MaxTexturesPS) {
           const auto& entry = *entryPtr;
-          const int8_t inferred = entry.samplerToTexcoord[firstStage];
+          int8_t inferred = entry.samplerToTexcoord[firstStage];
+          // GPUSkinMorphVF uses TEXCOORD6/7 for morph deltas, not texture UVs
+          if (isUe3MorphVF && inferred >= 6) {
+            inferred = 0;
+          }
           if (inferred >= 0) {
+            m_psInferredSampleCount = entry.samplerSampleCount[firstStage];
             texcoordIdx = uint32_t(inferred);
             if (entry.samplerCoordCompValid[firstStage] && !forceIaTexcoordForOutlier) {
               const uint8_t inferredCompU = entry.samplerCoordCompU[firstStage] & 0x3u;
@@ -4405,8 +4676,10 @@ namespace dxvk {
 
               // compat fallback for skinned meshes
               // packed secondary UV pairs (`.wz` / `.zw`) are frequently non-diffuse channels
+              const bool trustPsSwizzle = m_psInferredSampleCount >= 4u;
               if (likelyGpuSkinnedMesh &&
-                  inferredUsesPackedSecondaryPair) {
+                  inferredUsesPackedSecondaryPair &&
+                  !trustPsSwizzle) {
                 m_texcoordCompU = 0;
                 m_texcoordCompV = 1;
               } else {
@@ -4429,14 +4702,6 @@ namespace dxvk {
                 m_texcoordCompU = 0;
                 m_texcoordCompV = 1;
               }
-            }
-
-            // debugging, todo remove later
-            const XXH64_hash_t logKey = psHash ^ (XXH64_hash_t(firstStage) * 0x9E3779B97F4A7C15ull);
-            if (m_loggedPsSamplerTexcoordInference.insert(logKey).second) {
-              Logger::info(str::format(
-                "[RTX-Compatibility] Shader-path inferred TEXCOORD", uint32_t(inferred),
-                " for sampler ", firstStage, " from pixel shader bytecode."));
             }
           }
 

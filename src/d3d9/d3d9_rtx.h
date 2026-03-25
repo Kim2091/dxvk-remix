@@ -40,10 +40,14 @@ namespace dxvk {
     RTX_OPTION("rtx", bool, useVertexCapture, true, "When enabled, injects code into the original vertex shader to capture final shaded vertex positions.  Is useful for games using simple vertex shaders, that still also set the fixed function transform matrices.");
     RTX_OPTION("rtx", bool, useVertexCapturedNormals, true, "When enabled, vertex normals are read from the input assembler and used in raytracing.  This doesn't always work as normals can be in any coordinate space, but can help sometimes.");
     RTX_OPTION("rtx", bool, useWorldMatricesForShaders, true, "When enabled, Remix will utilize the world matrices being passed from the game via D3D9 fixed function API, even when running with shaders.  Sometimes games pass these matrices and they are useful, however for some games they are very unreliable, and should be filtered out.  If you're seeing precision related issues with shader vertex capture, try disabling this setting.");
+    RTX_OPTION("rtx.d3d9", bool, ue3EngineMode, false,
+               "Master toggle for Unreal Engine 3 D3D9 compatibility.");
     RTX_OPTION("rtx.d3d9", bool, ue3CameraFromShaderConstants, false,
-               "UE3 compat: derive World/View and View/Projection matrices from UE3 reserved shader constants.");
+               "UE3 compat: derive World/View and View/Projection matrices from UE3 reserved shader constants. "
+               "Implicitly enabled by rtx.d3d9.ue3EngineMode.");
     RTX_OPTION("rtx.d3d9", bool, ue3ObjectToWorldFromShaderConstants, false,
-               "UE3 compat: extract LocalToWorld from vertex shader constants using shader CTAB and use it for object transforms.");
+               "UE3 compat: extract LocalToWorld from vertex shader constants using shader CTAB and use it for object transforms. "
+               "Implicitly enabled by rtx.d3d9.ue3EngineMode.");
     RTX_OPTION("rtx.d3d9", bool, autoRaytracedRenderTargetFromFullscreenComposite, false,
                "D3D9 compat: auto-detect an offscreen render target being used as the main scene (sampled in a fullscreen composite pass) "
                "and treat it as a raytraced render target to capture the correct geometry in games that upscale/composite to the backbuffer.");
@@ -51,10 +55,27 @@ namespace dxvk {
                "D3D9 compat: rasterise likely fullscreen composite/postprocess passes to the primary render target. Helps avoid raytracing a fullscreen quad.");
     RTX_OPTION("rtx.d3d9", bool, shaderPathTexcoordIndexFromPixelShader, false,
                "Shader-path compat: infer TEXCOORD set used by pixel shader rather than trusting D3DTSS_TEXCOORDINDEX. "
-               "Helps UE3 games where fixed-function stage state is stale or incorrect when shaders are active.");
+               "Helps UE3 games where fixed-function stage state is stale or incorrect when shaders are active. "
+               "Implicitly enabled by rtx.d3d9.ue3EngineMode.");
     RTX_OPTION("rtx.d3d9", bool, ue3MaterialInstanceConstantHash, false,
                "UE3 MaterialInstanceConstant support: include pixel shader hash in material identification to enable "
-               "tagging at the child level instead of broadly at the parent level. ");
+               "tagging at the child level instead of broadly at the parent level. "
+               "Implicitly enabled by rtx.d3d9.ue3EngineMode.");
+    RTX_OPTION("rtx.d3d9", fast_unordered_set, vsTexcoordCaptureOutlierTextures, {},
+               "Texture hashes for which VS-captured texcoords should be overridden with IA (input assembler) texcoords. "
+               "Useful as a compatibility fallback when certain textures appear stretched due to incorrect VS texcoord capture.");
+    RTX_OPTION("rtx.d3d9", bool, ue3SkipDepthPrepass, false,
+               "UE3 multi-pass compat: skip draw calls using a position-only vertex declaration (no texcoords/colors), "
+               "which are characteristic of UE3 depth prepass draws. The geometry will be captured during the base pass instead. "
+               "Implicitly enabled by rtx.d3d9.ue3EngineMode.");
+    RTX_OPTION("rtx.d3d9", bool, ue3SkipShadowDepthPasses, false,
+               "UE3 multi-pass compat: skip draw calls targeting small square render targets (typical of shadow depth maps). "
+               "Prevents shadow-pass geometry from being incorrectly captured as scene geometry. "
+               "Implicitly enabled by rtx.d3d9.ue3EngineMode.");
+    RTX_OPTION("rtx.d3d9", bool, ue3SkipDepthTestDisabledTranslucency, false,
+               "UE3 translucency compat: skip alpha-blended draw calls that have depth test and depth write both disabled. "
+               "These are typically UE3 NeedsDepthTestDisabled materials (e.g. fullscreen overlays, fog volume composites) "
+               "that should not create RT geometry. Implicitly enabled by rtx.d3d9.ue3EngineMode.");
     RTX_OPTION("rtx", bool, enableIndexBufferMemoization, true, "CPU performance optimization, should generally be enabled.  Will reduce main thread time by caching processIndexBuffer operations and reusing when possible, this will come at the expense of some CPU RAM.");
     RTX_OPTION("rtx", uint32_t, numGeometryProcessingThreads, 2, "The desired number of CPU threads to dedicate to geometry processing  Will be limited by the number of CPU cores.  There may be some advantage to lowering this number in games which are fairly simple and use a low number of draw calls per frame.  The default was determined by looking at a game with around 2000 draw calls per frame, and with a reasonably high average triangle count per draw.");
 
@@ -218,12 +239,34 @@ namespace dxvk {
     DWORD m_texcoordIndex = 0;
     uint8_t m_texcoordCompU = 0;
     uint8_t m_texcoordCompV = 1;
+    uint16_t m_psInferredSampleCount = 0;
+
+    // two pass translucency dedup - track previous draw's shader/texture state
+    // to detect UE3 back+front face translucency passes on the same mesh
+    XXH64_hash_t m_prevDrawVsPsHash = 0;
+    XXH64_hash_t m_prevDrawTextureHash = 0;
+    DWORD m_prevDrawCullMode = 0;
 
     int m_activeOcclusionQueries = 0;
 
     Rc<DxvkBuffer> m_vsVertexCaptureData;
 
     fast_unordered_cache<Rc<DxvkSampler>> m_samplerCache;
+
+    enum class Ue3VertexFactoryType : uint8_t {
+      Unknown = 0,
+      Local,
+      GPUSkin,
+      GPUSkinMorph,
+      Terrain,
+      TerrainMorph,
+      Particle,
+      PositionOnly,
+    };
+    Ue3VertexFactoryType m_currentUe3VertexFactory = Ue3VertexFactoryType::Unknown;
+    fast_unordered_cache<Ue3VertexFactoryType> m_ue3VertexFactoryCache;
+
+    static Ue3VertexFactoryType classifyUe3VertexFactory(const D3D9VertexElements& elements);
 
     struct Ue3VsShaderCtabInfo {
       bool initialized = false;
