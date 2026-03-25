@@ -295,7 +295,7 @@ namespace dxvk {
     ctx->signal(m_readbackSignal, syncValue);
 
     // Spawn a thread so we dont sync with the GPU here...(remember, GPU runs async with CPU!).  
-    Future<void> result = getExporterThread()->Schedule([this, device = ctx->getDevice(), pBlitDests, pReadbackBuffers, pBlitTemps, syncValue, filename, outFormat, dstDesc, swizzle] {
+    Future<void> result = getExporterThread()->Schedule([this, pBlitDests, pReadbackBuffers, pBlitTemps, syncValue, filename, outFormat, dstDesc, swizzle, useBufferReadback, readbackRowAlignment = kReadbackRowAlignment] {
       ScopedCpuProfileZoneN("Export Image Finalize");
       // Stall until the GPU has completed its copy to system memory (GPU->CPU)
       this->m_readbackSignal->wait(syncValue);
