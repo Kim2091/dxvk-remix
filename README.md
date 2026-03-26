@@ -41,19 +41,19 @@ dxvk-remix also contains a subproject in the `bridge` folder, which enables 32 b
 		scale set TdMotionBlur false
 		toggleocclusion
 		viewmode unlit
-		set SceneCaptureComponent FrameRate 0
+		show scenecapture
 		```
 		2. Place the text file in `<path-to-game>\Binaries`
-	 	3. Type "exec=remix" into the CmdLineArg patcher in Mirror's Edge Tweaks
-		4. Launch the game via the args shortcut in Mirror's Edge Tweaks, or add "-CmdLineArgs" as a launch argument to the Steam client/other shortcuts.
-	- UE3 employs frustum culling in native land. This requires patching the executable to treat primitives as always visible (a dedicated patch script will come later). Note this has been tested only with the GOG version so far.
+  		3. By default `MirrorsEdge.exe` whitelists only a select few launch arguments. This can be fully unlocked with [Mirror's Edge Tweaks](https://github.com/softsoundd/MirrorsEdgeTweaks) via the launch argument patcher.
+	 	4. Add "-exec=remix" (without double quotes) into your game libray's launch arguments/other shortcuts, or within the launch argument field in [Mirror's Edge Tweaks](https://github.com/softsoundd/MirrorsEdgeTweaks) followed by launching via the 'Launch Game w/ Args' button.
+	- Note: UE3 employs frustum culling in native C++ land. This requires patching the executable to treat primitives as always visible (a dedicated patch script will come later). Note this has been tested only with the GOG version so far.
  		- Use a hex editor to locate offset 008E3C6C and patch `0F 84 EE 06 00 00` to `90 90 90 90 90 90`.
 
 ### 3) Shadow enhancements
 
 Refined shadow visibility behavior. Includes better handling at grazing light angles
 
-Also includes smooth shadow shading for normals. This is targeted at the shadow level and is not a change to the renderer's mesh shading mode.
+Also includes smooth shadow shading for normals. This is targeted at the shadow level and, unlike the smooth shading categorisation, it is not a change to the renderer's mesh shading mode.
 
 ### 4) Acknowledgements
 - sambow23 for their physically based sky implementation.
