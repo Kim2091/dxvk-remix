@@ -275,4 +275,9 @@ struct ParticleSystemConstants {
   float minParticleSize;
   float sceneScale;
   uint pad1;
+
+  vec3 volumeAabbMin;
+  float volumeFluidCouplingStrength;
+  vec3 volumeAabbMax;
+  uint hasVolumeVelocity; // 0 = no volume, 1 = volume available
 };

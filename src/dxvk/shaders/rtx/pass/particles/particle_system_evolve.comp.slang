@@ -36,6 +36,9 @@ Texture2D<float4> PreviousWorldPosition_WorldTriangleNormal;
 layout(binding = PARTICLE_SYSTEM_BINDING_PREV_PRIMARY_SCREEN_SPACE_MOTION_INPUT)
 Texture2D<float2> PreviousPrimaryScreenSpaceMotionVector;
 
+Texture3D<vec4> PrevVolumeVelocity : register(t0, space2);
+SamplerState VolumeLinearSampler : register(s0, space2);
+
 // Outputs
 
 layout(binding = PARTICLE_SYSTEM_BINDING_PARTICLES_BUFFER_INPUT_OUTPUT)
@@ -159,7 +162,21 @@ void evolve(inout GpuParticle particle, const GpuParticleSystem particleSystem)
   {
     collideParticleWithScene(particle);
   }
-  
+
+  // Two-way fluid coupling: blend particle velocity with volume velocity field
+  if (particleCb.hasVolumeVelocity != 0u && particleCb.volumeFluidCouplingStrength > 0.0f)
+  {
+    vec3 uvw = (particle.position - particleCb.volumeAabbMin) /
+               (particleCb.volumeAabbMax - particleCb.volumeAabbMin);
+
+    if (all(greaterThanEqual(uvw, vec3(0.0f))) && all(lessThanEqual(uvw, vec3(1.0f))))
+    {
+      vec3 fluidVelocity = PrevVolumeVelocity.SampleLevel(VolumeLinearSampler, uvw, 0).xyz;
+      float coupling = min(particleCb.volumeFluidCouplingStrength * particleCb.deltaTimeSecs, 1.0f);
+      particle.velocity = mix(particle.velocity, fluidVelocity, coupling);
+    }
+  }
+
   // Per axis motion restriction
   particle.velocity = select(bool3(particleSystem.desc.restrictVelocityX, particleSystem.desc.restrictVelocityY, particleSystem.desc.restrictVelocityZ), 0..xxx,  particle.velocity);
   
