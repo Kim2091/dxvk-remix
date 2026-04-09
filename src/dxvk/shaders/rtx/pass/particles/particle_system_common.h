@@ -106,6 +106,25 @@ struct GpuParticleSystemDesc {
   uint8_t restrictVelocityY : 1;
   uint8_t restrictVelocityZ : 1;
 
+  // Volume/fluid simulation parameters
+  float smokeDensity;
+  float smokeAbsorptionCrossSection;
+  float smokeDissipationRate;
+  float fuelAmount;
+  float burnTemperature;
+  float coolingRate;
+  float buoyancyCoefficient;
+  vec3 windDirection;
+  float vorticityConfinement;
+  float fluidCouplingStrength;
+  float emissionIntensityScale;
+  float volumePadding;
+  float volumeDecayTime;
+  uint16_t pressureIterations;
+  uint16_t lightClusterCount;
+  uint8_t volumeType; // ParticleVolumeType
+  uint8_t pad2;
+
 // Note: Spatial fields (collisionThickness, attractorRadius, gravityForce,
   // initialVelocityFromNormal, attractorForce, turbulenceForce, turbulenceFrequency)
   // are authored in centimeters and scaled by ParticleSystemConstants::sceneScale

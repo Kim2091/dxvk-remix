@@ -46,3 +46,10 @@ enum ParticleRandomFlipAxis : uint8_t {
   Vertical,
   Both
 };
+
+enum ParticleVolumeType : uint8_t
+{
+  Billboard = 0,
+  Volumetric,
+  Hybrid,
+};
