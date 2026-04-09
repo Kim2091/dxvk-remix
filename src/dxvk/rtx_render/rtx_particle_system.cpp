@@ -709,6 +709,56 @@ namespace dxvk {
       }
     }
 
+    // Volume lifecycle management for volumetric systems
+    {
+      // Extract camera world position from the view-to-world matrix (column 3 = translation).
+      const Matrix4d& viewToWorld = ctx->getSceneManager().getCamera().getViewToWorld();
+      const Vector3 cameraPosition(
+        static_cast<float>(viewToWorld.data[3].x),
+        static_cast<float>(viewToWorld.data[3].y),
+        static_cast<float>(viewToWorld.data[3].z));
+
+      // No per-system AABB is tracked yet; use a zero-sized box at the origin.
+      // The volumePadding parameter will expand it to a usable extent.
+      const Vector3 boundsMin(0.f, 0.f, 0.f);
+      const Vector3 boundsMax(0.f, 0.f, 0.f);
+
+      Rc<DxvkContext> dxvkCtx(ctx);
+
+      for (auto& [materialHash, pParticleSystem] : m_particleSystems) {
+        const bool wantsVolume = pParticleSystem->context.desc.volumeType != Billboard &&
+                                 ParticleVolume::enable();
+        const bool hasVolume = pParticleSystem->pVolume != nullptr &&
+                               pParticleSystem->pVolume->isAllocated();
+
+        if (wantsVolume && !hasVolume) {
+          if (!pParticleSystem->pVolume) {
+            pParticleSystem->pVolume = std::make_unique<ParticleVolume>();
+          }
+
+          auto targetRes = pParticleSystem->pVolume->updateAABB(
+            cameraPosition, boundsMin, boundsMax,
+            pParticleSystem->context.desc.volumePadding);
+
+          const uint64_t budgetBytes =
+            static_cast<uint64_t>(ParticleVolume::memoryBudgetMB()) * 1024ull * 1024ull;
+
+          if (m_totalVolumeMemoryBytes < budgetBytes) {
+            pParticleSystem->pVolume->allocate(dxvkCtx, targetRes);
+            m_totalVolumeMemoryBytes += pParticleSystem->pVolume->memoryUsageBytes();
+          }
+        } else if (!wantsVolume && hasVolume) {
+          m_totalVolumeMemoryBytes -= pParticleSystem->pVolume->memoryUsageBytes();
+          pParticleSystem->pVolume->release();
+        } else if (wantsVolume && hasVolume) {
+          // Update AABB; resolution transitions will be handled in a later task.
+          pParticleSystem->pVolume->updateAABB(
+            cameraPosition, boundsMin, boundsMax,
+            pParticleSystem->context.desc.volumePadding);
+        }
+      }
+    }
+
     prepareForNextFrame();
   }
 

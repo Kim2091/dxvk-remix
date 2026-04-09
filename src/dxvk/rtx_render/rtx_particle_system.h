@@ -27,6 +27,7 @@
 
 #include "rtx_resources.h"
 #include "rtx/pass/particles/particle_system_binding_indices.h"
+#include "rtx_particle_volume.h"
 #include <random>
 
 namespace dxvk {
@@ -110,6 +111,9 @@ namespace dxvk {
 
       uint32_t generationIdx = 0;
 
+      // Volumetric simulation state
+      std::unique_ptr<ParticleVolume> pVolume;
+
       ParticleSystem() = delete;
       ParticleSystem(const RtxParticleSystemDesc& desc, const MaterialData& matData, const LegacyMaterialData& legacyMatData, const CategoryFlags& cats, const uint32_t seed);
 
@@ -171,6 +175,8 @@ namespace dxvk {
 
     // Monotonically increases as new particle systems are created.  Never decrements.
     uint32_t m_particleSystemCounter = 0;
+
+    uint64_t m_totalVolumeMemoryBytes = 0;
 
     std::vector<SpawnContext> m_spawnContexts;
     bool m_initialized = false;
@@ -291,5 +297,7 @@ namespace dxvk {
       * \param ctx           The RtxContext for issuing GPU commands.
       */
     void simulate(RtxContext* ctx);
+
+    uint64_t totalVolumeMemoryBytes() const { return m_totalVolumeMemoryBytes; }
   };
 }
