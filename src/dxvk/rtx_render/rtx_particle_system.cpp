@@ -581,6 +581,7 @@ namespace dxvk {
   void RtxParticleSystemManager::simulate(RtxContext* ctx) {
     if (!enable() || !m_initialized) {
       m_spawnContexts.clear();
+      m_totalVolumeMemoryBytes = 0;
       m_particleSystems.clear();
       m_spawnContextsBuffer = nullptr;
       return;
@@ -711,12 +712,7 @@ namespace dxvk {
 
     // Volume lifecycle management for volumetric systems
     {
-      // Extract camera world position from the view-to-world matrix (column 3 = translation).
-      const Matrix4d& viewToWorld = ctx->getSceneManager().getCamera().getViewToWorld();
-      const Vector3 cameraPosition(
-        static_cast<float>(viewToWorld.data[3].x),
-        static_cast<float>(viewToWorld.data[3].y),
-        static_cast<float>(viewToWorld.data[3].z));
+      const Vector3 cameraPosition = ctx->getSceneManager().getCamera().getPosition();
 
       // No per-system AABB is tracked yet; use a zero-sized box at the origin.
       // The volumePadding parameter will expand it to a usable extent.
@@ -724,10 +720,11 @@ namespace dxvk {
       const Vector3 boundsMax(0.f, 0.f, 0.f);
 
       Rc<DxvkContext> dxvkCtx(ctx);
+      const bool volumeEnabled = ParticleVolume::enable();
 
       for (auto& [materialHash, pParticleSystem] : m_particleSystems) {
         const bool wantsVolume = pParticleSystem->context.desc.volumeType != Billboard &&
-                                 ParticleVolume::enable();
+                                 volumeEnabled;
         const bool hasVolume = pParticleSystem->pVolume != nullptr &&
                                pParticleSystem->pVolume->isAllocated();
 
@@ -1131,6 +1128,9 @@ namespace dxvk {
       auto now = GlobalTime::get().absoluteTimeMs();
       const uint64_t maxTimeBetweenSpawnEventsMs = (uint64_t)((particleSystem.context.desc.spawnBurstDuration + particleSystem.context.desc.maxTimeToLive) * 1000);
       if ((particleSystem.lastSpawnTimeMs + maxTimeBetweenSpawnEventsMs) < now) {
+        if (keyPairIt->second->pVolume && keyPairIt->second->pVolume->isAllocated()) {
+          m_totalVolumeMemoryBytes -= keyPairIt->second->pVolume->memoryUsageBytes();
+        }
         keyPairIt = m_particleSystems.erase(keyPairIt);
         continue;
       }
