@@ -23,9 +23,11 @@
 
 #include "../dxvk_format.h"
 #include "../dxvk_include.h"
+#include "../dxvk_buffer.h"
 
 #include "rtx_resources.h"
 #include "rtx_option.h"
+#include "rtx/pass/particles/particle_volume_common.h"
 
 namespace dxvk {
 
@@ -90,6 +92,20 @@ namespace dxvk {
     // Returns the approximate GPU memory used by this volume in bytes.
     size_t memoryUsageBytes() const;
 
+    // AABB accessors (world-space, includes padding applied by updateAABB).
+    const Vector3& aabbMin() const { return m_aabbMin; }
+    const Vector3& aabbMax() const { return m_aabbMax; }
+
+    // Dispatch the 6-pass fluid simulation pipeline for this volume.
+    // prevWorldPosView is the GBuffer previous-frame world position texture used
+    // by the obstacle pass; may be nullptr to skip obstacle rasterization.
+    void simulateFluid(
+      Rc<DxvkContext>& ctx,
+      const ParticleVolumeConstants& constants,
+      Rc<DxvkBuffer> pParticleBuffer,
+      uint32_t particleCount,
+      Rc<DxvkImageView> prevWorldPosView = nullptr);
+
     // Accessor: current resolution.
     Resolution currentResolution() const { return m_resolution; }
 
@@ -118,6 +134,7 @@ namespace dxvk {
     Resources::Resource m_prevVelocity;   // R16G16B16A16_SFLOAT 3D — previous frame velocity (two-way coupling)
     Resources::Resource m_obstacle;       // R8_UNORM 3D — obstacle mask
     Resources::Resource m_pressure[2];    // R16_SFLOAT 3D x2 — ping-pong pressure solve
+    Rc<DxvkBuffer>      m_cb;             // Per-frame simulation constants
 
     // --- Current state ---
     Resolution m_resolution = Resolution::Res32;

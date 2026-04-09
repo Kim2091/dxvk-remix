@@ -57,3 +57,6 @@
 // Froxel grid output
 #define PARTICLE_VOLUME_BINDING_FROXEL_DENSITY_OUTPUT      25
 #define PARTICLE_VOLUME_BINDING_FROXEL_EMISSION_OUTPUT     26
+
+// Linear sampler for advection trilinear sampling
+#define PARTICLE_VOLUME_BINDING_LINEAR_SAMPLER             30

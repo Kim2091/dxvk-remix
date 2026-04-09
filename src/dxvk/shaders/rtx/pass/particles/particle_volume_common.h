@@ -22,6 +22,9 @@
 #pragma once
 
 #include "rtx/pass/particles/particle_volume_binding_indices.h"
+#ifdef __cplusplus
+#include "rtx/utility/shader_types.h"
+#endif
 
 // Per-system per-frame constants uploaded to the GPU for all volume passes
 struct ParticleVolumeConstants

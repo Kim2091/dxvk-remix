@@ -754,6 +754,60 @@ namespace dxvk {
             pParticleSystem->context.desc.volumePadding);
         }
       }
+
+      // Fluid simulation for volumetric particle systems.
+      for (auto& [materialHash, pParticleSystem] : m_particleSystems) {
+        if (!pParticleSystem->pVolume || !pParticleSystem->pVolume->isAllocated()) {
+          continue;
+        }
+
+        ScopedGpuProfileZone(ctx, "ParticleVolume_SimulateFluid");
+
+        const RtxParticleSystemDesc& desc = pParticleSystem->context.desc;
+        const ParticleVolume& vol = *pParticleSystem->pVolume;
+
+        ParticleVolumeConstants volumeConstants {};
+        volumeConstants.gridDimension        = { vol.gridDimension(), vol.gridDimension(), vol.gridDimension() };
+        volumeConstants.aabbMin              = vol.aabbMin();
+        volumeConstants.aabbMax              = vol.aabbMax();
+        volumeConstants.deltaTimeSecs        = std::min(kMinimumParticleLife, GlobalTime::get().deltaTime()) * timeScale();
+        volumeConstants.absoluteTimeSecs     = GlobalTime::get().absoluteTimeMs() * 0.001f * timeScale();
+        volumeConstants.frameIdx             = ctx->getDevice()->getCurrentFrameId();
+        volumeConstants.smokeDensity         = desc.smokeDensity;
+        volumeConstants.smokeAbsorptionCrossSection = desc.smokeAbsorptionCrossSection;
+        volumeConstants.smokeDissipationRate = desc.smokeDissipationRate;
+        volumeConstants.fuelAmount           = desc.fuelAmount;
+        volumeConstants.burnTemperature      = desc.burnTemperature;
+        volumeConstants.coolingRate          = desc.coolingRate;
+        volumeConstants.buoyancyCoefficient  = desc.buoyancyCoefficient;
+        volumeConstants.vorticityConfinement = desc.vorticityConfinement;
+        volumeConstants.windDirection        = desc.windDirection;
+        volumeConstants.emissionIntensityScale = desc.emissionIntensityScale;
+        volumeConstants.sceneScale           = RtxOptions::sceneScale();
+        volumeConstants.pressureIterations   = desc.pressureIterations;
+        volumeConstants.fluidCouplingStrength = desc.fluidCouplingStrength;
+        volumeConstants.upDirection          = ctx->getSceneManager().getSceneUp();
+        volumeConstants.particleCount        = pParticleSystem->context.particleCount;
+        volumeConstants.renderingWidth       = ctx->getSceneManager().getCamera().m_renderResolution[0];
+        volumeConstants.renderingHeight      = ctx->getSceneManager().getCamera().m_renderResolution[1];
+        volumeConstants.prevWorldToProjection =
+          ctx->getSceneManager().getCamera().getPreviousViewToProjection() *
+          ctx->getSceneManager().getCamera().getPreviousWorldToView();
+
+        // Obtain the previous-frame world position view for obstacle rasterization.
+        const auto& rtOutput = ctx->getResourceManager().getRaytracingOutput();
+        const auto& prevWorldPos = rtOutput.getPreviousPrimaryWorldPositionWorldTriangleNormal();
+        Rc<DxvkImageView> prevWorldPosView = prevWorldPos.view(
+          Resources::AccessType::Read,
+          prevWorldPos.matchesWriteFrameIdx(volumeConstants.frameIdx - 1));
+
+        pParticleSystem->pVolume->simulateFluid(
+          dxvkCtx,
+          volumeConstants,
+          pParticleSystem->getParticlesBuffer(),
+          pParticleSystem->context.particleCount,
+          prevWorldPosView);
+      }
     }
 
     prepareForNextFrame();
