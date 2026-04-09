@@ -43,7 +43,7 @@ namespace dxvk {
   }
 
   // ---------------------------------------------------------------------------
-  void ParticleVolume::allocate(Rc<DxvkContext> ctx, Resolution resolution) {
+  void ParticleVolume::allocate(Rc<DxvkContext>& ctx, Resolution resolution) {
     ScopedCpuProfileZone();
 
     // Release any existing resources before reallocating.
@@ -82,6 +82,7 @@ namespace dxvk {
 
   // ---------------------------------------------------------------------------
   void ParticleVolume::release() {
+    if (!isAllocated()) return;
     ScopedCpuProfileZone();
 
     m_density.reset();
@@ -135,7 +136,7 @@ namespace dxvk {
   }
 
   // ---------------------------------------------------------------------------
-  void ParticleVolume::transitionResolution(Rc<DxvkContext> ctx, Resolution newResolution) {
+  void ParticleVolume::transitionResolution(Rc<DxvkContext>& ctx, Resolution newResolution) {
     ScopedCpuProfileZone();
 
     // Stub: reallocate at the new resolution without resampling existing data.

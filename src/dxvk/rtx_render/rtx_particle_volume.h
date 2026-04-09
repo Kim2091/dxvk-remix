@@ -65,7 +65,7 @@ namespace dxvk {
     ~ParticleVolume();
 
     // Allocate (or reallocate) all GPU 3D textures at the requested resolution.
-    void allocate(Rc<DxvkContext> ctx, Resolution resolution);
+    void allocate(Rc<DxvkContext>& ctx, Resolution resolution);
 
     // Release all GPU 3D texture resources.
     void release();
@@ -82,7 +82,7 @@ namespace dxvk {
                           float padding);
 
     // Resample volume data into a new grid size (stub — no-op for now).
-    void transitionResolution(Rc<DxvkContext> ctx, Resolution newResolution);
+    void transitionResolution(Rc<DxvkContext>& ctx, Resolution newResolution);
 
     // Returns the linear grid dimension (equal for all three axes).
     uint32_t gridDimension() const;
