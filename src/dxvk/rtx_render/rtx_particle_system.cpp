@@ -582,8 +582,15 @@ namespace dxvk {
     particleSystem->spawnContextParticleMap.insert(particleSystem->spawnContextParticleMap.end(), spawnCtx.numberOfParticles, m_spawnContexts.size());
     assert(particleSystem->spawnContextParticleMap.size() <= particleSystem->context.desc.maxNumParticles);
 
-    // Mark the time 
+    // Mark the time
     particleSystem->lastSpawnTimeMs = GlobalTime::get().absoluteTimeMs();
+
+    // Capture the emitter's world-space position from the draw call transform.
+    // This is used to derive the volume AABB center for volumetric systems.
+    {
+      const Matrix4& objectToWorld = drawCallState.getTransformData().objectToWorld;
+      particleSystem->lastEmitterPosition = objectToWorld[3].xyz();
+    }
 
     // Track this spawn context by copying off
     m_spawnContexts.emplace_back(std::move(spawnCtx));
@@ -729,11 +736,6 @@ namespace dxvk {
     {
       const Vector3 cameraPosition = ctx->getSceneManager().getCamera().getPosition();
 
-      // No per-system AABB is tracked yet; use a zero-sized box at the origin.
-      // The volumePadding parameter will expand it to a usable extent.
-      const Vector3 boundsMin(0.f, 0.f, 0.f);
-      const Vector3 boundsMax(0.f, 0.f, 0.f);
-
       Rc<DxvkContext> dxvkCtx(ctx);
       const bool volumeEnabled = ParticleVolume::enable();
 
@@ -742,6 +744,16 @@ namespace dxvk {
                                  volumeEnabled;
         const bool hasVolume = pParticleSystem->pVolume != nullptr &&
                                pParticleSystem->pVolume->isAllocated();
+
+        // Derive volume AABB from the emitter's world-space position.
+        // The default half-extent provides a volume that encompasses the area
+        // where particles are expected to exist around the emitter.
+        // The vertical extent is asymmetric (larger above) because fire/smoke rises.
+        const Vector3& emitterPos = pParticleSystem->lastEmitterPosition;
+        const float halfExtent = ParticleSystem::kDefaultVolumeHalfExtent;
+        const float verticalUp = halfExtent * ParticleSystem::kDefaultVolumeVerticalMultiplier;
+        const Vector3 boundsMin(emitterPos.x - halfExtent, emitterPos.y - halfExtent, emitterPos.z - halfExtent);
+        const Vector3 boundsMax(emitterPos.x + halfExtent, emitterPos.y + verticalUp, emitterPos.z + halfExtent);
 
         if (wantsVolume && !hasVolume) {
           if (!pParticleSystem->pVolume) {
@@ -758,6 +770,12 @@ namespace dxvk {
           if (m_totalVolumeMemoryBytes < budgetBytes) {
             pParticleSystem->pVolume->allocate(dxvkCtx, targetRes);
             m_totalVolumeMemoryBytes += pParticleSystem->pVolume->memoryUsageBytes();
+
+            Logger::info(str::format("[ParticleVolume] Allocated volume: emitter=(", emitterPos.x, ", ", emitterPos.y, ", ", emitterPos.z,
+              ") AABB=(", pParticleSystem->pVolume->aabbMin().x, ", ", pParticleSystem->pVolume->aabbMin().y, ", ", pParticleSystem->pVolume->aabbMin().z,
+              ")-(", pParticleSystem->pVolume->aabbMax().x, ", ", pParticleSystem->pVolume->aabbMax().y, ", ", pParticleSystem->pVolume->aabbMax().z,
+              ") res=", pParticleSystem->pVolume->gridDimension(),
+              " mem=", pParticleSystem->pVolume->memoryUsageBytes() / 1024, "KB"));
           }
         } else if (!wantsVolume && hasVolume) {
           m_totalVolumeMemoryBytes -= pParticleSystem->pVolume->memoryUsageBytes();
@@ -1234,16 +1252,17 @@ namespace dxvk {
     }
 
     // Check if any particle system has an active volume — early out if none.
-    bool hasActiveVolume = false;
+    uint32_t activeVolumeCount = 0;
     for (const auto& [materialHash, pParticleSystem] : m_particleSystems) {
       if (pParticleSystem->pVolume && pParticleSystem->pVolume->isAllocated()) {
-        hasActiveVolume = true;
-        break;
+        activeVolumeCount++;
       }
     }
-    if (!hasActiveVolume) {
+    if (activeVolumeCount == 0) {
       return;
     }
+
+    ONCE(Logger::info(str::format("[ParticleVolume] compositeVolumes: ", activeVolumeCount, " active volume(s)")));
 
     ScopedGpuProfileZone(ctx, "ParticleVolume_CompositeAll");
 
@@ -1299,6 +1318,12 @@ namespace dxvk {
       volumeConstants.renderingWidth       = rtOutput.m_compositeOutputExtent.width;
       volumeConstants.renderingHeight      = rtOutput.m_compositeOutputExtent.height;
       volumeConstants.cameraPosition       = cameraPosition;
+
+      ONCE(Logger::info(str::format("[ParticleVolume] Dispatching composite: AABB=(",
+        volumeConstants.aabbMin.x, ", ", volumeConstants.aabbMin.y, ", ", volumeConstants.aabbMin.z,
+        ")-(", volumeConstants.aabbMax.x, ", ", volumeConstants.aabbMax.y, ", ", volumeConstants.aabbMax.z,
+        ") cam=(", cameraPosition.x, ", ", cameraPosition.y, ", ", cameraPosition.z,
+        ") res=", volumeConstants.renderingWidth, "x", volumeConstants.renderingHeight)));
 
       pParticleSystem->pVolume->compositeVolume(
         dxvkCtx,

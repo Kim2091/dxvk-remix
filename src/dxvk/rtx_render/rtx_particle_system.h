@@ -111,6 +111,18 @@ namespace dxvk {
 
       uint32_t generationIdx = 0;
 
+      // Last-known emitter world-space position (translation column of the
+      // emitter mesh's object-to-world transform). Updated each frame that
+      // spawnParticles() is called. Used to derive the volume AABB center.
+      Vector3 lastEmitterPosition = Vector3(0.f, 0.f, 0.f);
+
+      // Half-extent used for the volume AABB around the emitter position.
+      // This provides a reasonable default that encompasses the area where
+      // particles are expected to exist. The vertical multiplier accounts
+      // for the fact that fire/smoke typically rises above the emitter.
+      static constexpr float kDefaultVolumeHalfExtent = 8.0f;
+      static constexpr float kDefaultVolumeVerticalMultiplier = 3.0f;
+
       // Volumetric simulation state
       std::unique_ptr<ParticleVolume> pVolume;
 
