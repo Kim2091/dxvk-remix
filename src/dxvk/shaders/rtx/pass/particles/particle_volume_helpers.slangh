@@ -1,0 +1,95 @@
+/*
+* Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+#pragma once
+
+#include "rtx/pass/particles/particle_volume_common.h"
+
+// Sample density at a world-space position via trilinear interpolation
+float particleVolumeSampleDensity(
+  Texture3D<float> densityTexture, SamplerState linearSampler,
+  vec3 worldPos, ParticleVolumeConstants cb)
+{
+  const vec3 uvw = (worldPos - cb.aabbMin) / (cb.aabbMax - cb.aabbMin);
+  return densityTexture.SampleLevel(linearSampler, uvw, 0).r;
+}
+
+// Sample temperature at a world-space position via trilinear interpolation
+float particleVolumeSampleTemperature(
+  Texture3D<float> temperatureTexture, SamplerState linearSampler,
+  vec3 worldPos, ParticleVolumeConstants cb)
+{
+  const vec3 uvw = (worldPos - cb.aabbMin) / (cb.aabbMax - cb.aabbMin);
+  return temperatureTexture.SampleLevel(linearSampler, uvw, 0).r;
+}
+
+// Sample velocity at a world-space position via trilinear interpolation
+vec3 particleVolumeSampleVelocity(
+  Texture3D<vec4> velocityTexture, SamplerState linearSampler,
+  vec3 worldPos, ParticleVolumeConstants cb)
+{
+  const vec3 uvw = (worldPos - cb.aabbMin) / (cb.aabbMax - cb.aabbMin);
+  return velocityTexture.SampleLevel(linearSampler, uvw, 0).xyz;
+}
+
+// Look up blackbody emission color from the precomputed LUT.
+// temperature is in Kelvin; returns linear RGB scaled by relative intensity.
+vec3 particleVolumeBlackbodyColor(
+  Texture2D<vec4> blackbodyLUT, SamplerState linearSampler,
+  float temperature)
+{
+  static const float kMinTemp = 500.0f;
+  static const float kMaxTemp = 6500.0f;
+  const float u = saturate((temperature - kMinTemp) / (kMaxTemp - kMinTemp));
+  const vec4 entry = blackbodyLUT.SampleLevel(linearSampler, vec2(u, 0.5f), 0);
+  return entry.rgb * entry.a;
+}
+
+// Compute the base grid cell and fractional offset for trilinear splatting
+// of a world-space position into the volume grid.
+void particleVolumeCalcSplatWeights(
+  vec3 worldPos, ParticleVolumeConstants cb,
+  inout ivec3 baseCell, inout vec3 frac)
+{
+  const vec3 gridPos = particleVolumeWorldToGrid(worldPos, cb);
+  baseCell = ivec3(floor(gridPos));
+  frac = gridPos - vec3(baseCell);
+}
+
+// Compute the curl of the velocity field at a grid cell via central differences.
+// Used for vorticity confinement.
+vec3 particleVolumeCalcCurl(
+  Texture3D<vec4> velocityTexture,
+  ivec3 cell, ParticleVolumeConstants cb)
+{
+  const vec3 vxp = texelFetch(velocityTexture, cell + ivec3(1, 0, 0), 0).xyz;
+  const vec3 vxn = texelFetch(velocityTexture, cell - ivec3(1, 0, 0), 0).xyz;
+  const vec3 vyp = texelFetch(velocityTexture, cell + ivec3(0, 1, 0), 0).xyz;
+  const vec3 vyn = texelFetch(velocityTexture, cell - ivec3(0, 1, 0), 0).xyz;
+  const vec3 vzp = texelFetch(velocityTexture, cell + ivec3(0, 0, 1), 0).xyz;
+  const vec3 vzn = texelFetch(velocityTexture, cell - ivec3(0, 0, 1), 0).xyz;
+
+  return vec3(
+    (vyp.z - vyn.z) - (vzp.y - vzn.y),
+    (vzp.x - vzn.x) - (vxp.z - vxn.z),
+    (vxp.y - vxn.y) - (vyp.x - vyn.x)
+  ) * 0.5f;
+}
