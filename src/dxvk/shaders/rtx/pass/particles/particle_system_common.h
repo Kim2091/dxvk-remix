@@ -122,8 +122,8 @@ struct GpuParticleSystemDesc {
   float volumeDecayTime;
   uint16_t pressureIterations;
   uint16_t lightClusterCount;
-  uint8_t volumeType; // ParticleVolumeType
-  uint8_t pad2;
+  ParticleVolumeType volumeType;
+  uint8_t pad2[15];
 
 // Note: Spatial fields (collisionThickness, attractorRadius, gravityForce,
   // initialVelocityFromNormal, attractorForce, turbulenceForce, turbulenceFrequency)
@@ -183,6 +183,22 @@ struct RtxParticleSystemDesc : GpuParticleSystemDesc {
     restrictVelocityX = 0;
     restrictVelocityY = 0;
     restrictVelocityZ = 0;
+    smokeDensity = 1.0f;
+    smokeAbsorptionCrossSection = 0.5f;
+    smokeDissipationRate = 0.1f;
+    fuelAmount = 0.0f;
+    burnTemperature = 1500.0f;
+    coolingRate = 0.3f;
+    buoyancyCoefficient = 1.0f;
+    windDirection = {0.0f, 0.0f, 0.0f};
+    vorticityConfinement = 0.5f;
+    fluidCouplingStrength = 0.8f;
+    emissionIntensityScale = 1.0f;
+    volumePadding = 0.2f;
+    volumeDecayTime = 3.0f;
+    pressureIterations = 30;
+    lightClusterCount = 2;
+    volumeType = Billboard;
   }
 
   XXH64_hash_t calcHash() const {
