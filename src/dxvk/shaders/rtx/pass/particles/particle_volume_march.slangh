@@ -1,0 +1,100 @@
+/*
+* Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+#pragma once
+
+#include "rtx/pass/particles/particle_volume_common.h"
+
+// Accumulated result of a single ray-march through a particle volume.
+struct ParticleVolumeMarchResult
+{
+  vec3  radiance;       // Accumulated emission from fire
+  float transmittance;  // Remaining light transmission (1.0 = fully transparent, 0.0 = fully opaque)
+};
+
+// Ray-march through a single particle volume along the segment [tMin, tMax].
+// Accumulates fire emission via blackbody LUT lookup and attenuates by Beer-Lambert law.
+ParticleVolumeMarchResult particleVolumeMarch(
+  const vec3                rayOrigin,
+  const vec3                rayDirection,
+  const float               tMin,
+  const float               tMax,
+  Texture3D<float>          densityTexture,
+  Texture3D<float>          temperatureTexture,
+  Texture2D<vec4>           blackbodyLUT,
+  SamplerState              linearSampler,
+  const ParticleVolumeConstants volumeCb)
+{
+  static const float kTransmittanceThreshold = 0.01f;
+  static const uint  kMaxSteps               = 256u;
+  static const float kFireTemperatureMin     = 500.0f;
+  static const float kBlackbodyTempMin       = 500.0f;
+  static const float kBlackbodyTempMax       = 6500.0f;
+
+  // Derive the world-space cell size from the AABB and grid dimension.
+  const vec3  cellSize  = (volumeCb.aabbMax - volumeCb.aabbMin) / vec3(volumeCb.gridDimension);
+  const float stepSize  = min(cellSize.x, min(cellSize.y, cellSize.z));
+
+  ParticleVolumeMarchResult result;
+  result.radiance      = vec3(0.0f, 0.0f, 0.0f);
+  result.transmittance = 1.0f;
+
+  // Half-step offset at the start reduces banding artifacts.
+  float t        = tMin + stepSize * 0.5f;
+  uint  stepCount = 0u;
+
+  while (t < tMax && result.transmittance > kTransmittanceThreshold && stepCount < kMaxSteps)
+  {
+    const vec3 samplePos = rayOrigin + rayDirection * t;
+
+    // Map world position to normalized [0, 1] UVW coordinates.
+    const vec3 uvw = (samplePos - volumeCb.aabbMin) / (volumeCb.aabbMax - volumeCb.aabbMin);
+
+    const float density     = densityTexture.SampleLevel(linearSampler, uvw, 0).r;
+    const float temperature = temperatureTexture.SampleLevel(linearSampler, uvw, 0).r;
+
+    if (density > 0.0f)
+    {
+      // Beer-Lambert extinction over one step.
+      const float sigma_t          = density * volumeCb.smokeAbsorptionCrossSection;
+      const float stepTransmittance = exp(-sigma_t * stepSize);
+
+      // Accumulate fire emission only where the temperature exceeds the visible threshold.
+      vec3 emission = vec3(0.0f, 0.0f, 0.0f);
+      if (temperature > kFireTemperatureMin)
+      {
+        // Sample precomputed blackbody LUT; alpha encodes relative intensity.
+        const float u       = saturate((temperature - kBlackbodyTempMin) / (kBlackbodyTempMax - kBlackbodyTempMin));
+        const vec4  lutSample = blackbodyLUT.SampleLevel(linearSampler, vec2(u, 0.5f), 0);
+        emission = lutSample.rgb * lutSample.a * volumeCb.emissionIntensityScale;
+      }
+
+      // Front-to-back compositing: weight by current transmittance and in-scattered fraction.
+      result.radiance      += result.transmittance * (1.0f - stepTransmittance) * emission;
+      result.transmittance *= stepTransmittance;
+    }
+
+    t += stepSize;
+    stepCount++;
+  }
+
+  return result;
+}
