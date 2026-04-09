@@ -496,6 +496,23 @@ extern "C" {
     uint8_t             spriteSheetMode;
     uint8_t             collisionMode;
     uint8_t             randomFlipAxis;
+    // Volumetric smoke/fire parameters
+    float               smokeDensity;
+    float               smokeAbsorptionCrossSection;
+    float               smokeDissipationRate;
+    float               fuelAmount;
+    float               burnTemperature;
+    float               coolingRate;
+    float               buoyancyCoefficient;
+    remixapi_Float3D    windDirection;
+    float               vorticityConfinement;
+    float               fluidCouplingStrength;
+    float               emissionIntensityScale;
+    float               volumePadding;
+    float               volumeDecayTime;
+    uint32_t            pressureIterations;
+    uint32_t            lightClusterCount;
+    uint32_t            volumeType; // 0=Billboard, 1=Volumetric, 2=Hybrid
   } remixapi_InstanceInfoParticleSystemEXT;
 
   typedef struct remixapi_InstanceInfoGpuInstancingEXT {

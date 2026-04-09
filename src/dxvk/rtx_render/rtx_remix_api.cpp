@@ -775,6 +775,22 @@ namespace {
       desc.restrictVelocityX = static_cast<uint8_t>(info.restrictVelocityX);
       desc.restrictVelocityY = static_cast<uint8_t>(info.restrictVelocityY);
       desc.restrictVelocityZ = static_cast<uint8_t>(info.restrictVelocityZ);
+      desc.smokeDensity = info.smokeDensity;
+      desc.smokeAbsorptionCrossSection = info.smokeAbsorptionCrossSection;
+      desc.smokeDissipationRate = info.smokeDissipationRate;
+      desc.fuelAmount = info.fuelAmount;
+      desc.burnTemperature = info.burnTemperature;
+      desc.coolingRate = info.coolingRate;
+      desc.buoyancyCoefficient = info.buoyancyCoefficient;
+      desc.windDirection = tovec3(info.windDirection);
+      desc.vorticityConfinement = info.vorticityConfinement;
+      desc.fluidCouplingStrength = info.fluidCouplingStrength;
+      desc.emissionIntensityScale = info.emissionIntensityScale;
+      desc.volumePadding = info.volumePadding;
+      desc.volumeDecayTime = info.volumeDecayTime;
+      desc.pressureIterations = static_cast<uint16_t>(info.pressureIterations);
+      desc.lightClusterCount = static_cast<uint16_t>(info.lightClusterCount);
+      desc.volumeType = static_cast<ParticleVolumeType>(info.volumeType);
 
       // If this assert fails a new particle system parameter added, please update here.
       assert(pxr::RemixParticleSystemAPI::GetSchemaAttributeNames(false).size() == 46);
