@@ -1291,4 +1291,79 @@ class "ParticleSystemAPI" (
             displayName = "Collision Mode"
             allowedTokens = ["Bounce", "Stop", "Kill"]
         )
+
+    # ========== Volumetric Simulation Properties ==========
+
+    float primvars:particle:smokeDensity = 1.0 (
+        doc = "Density contribution per particle splatted into volume."
+        displayGroup = "Volume"
+        displayName = "Smoke Density"
+    )
+    float primvars:particle:smokeAbsorptionCrossSection = 0.5 (
+        doc = "How strongly smoke attenuates light per unit density."
+        displayGroup = "Volume"
+        displayName = "Smoke Absorption Cross Section"
+    )
+    float primvars:particle:smokeDissipationRate = 0.1 (
+        doc = "How fast smoke density fades per second."
+        displayGroup = "Volume"
+        displayName = "Smoke Dissipation Rate"
+    )
+    float primvars:particle:fuelAmount = 0.0 (
+        doc = "Temperature contribution per particle. 0 = pure smoke, no fire."
+        displayGroup = "Volume"
+        displayName = "Fuel Amount"
+    )
+    float primvars:particle:burnTemperature = 1500.0 (
+        doc = "Peak fire temperature in Kelvin."
+        displayGroup = "Volume"
+        displayName = "Burn Temperature"
+    )
+    float primvars:particle:coolingRate = 0.3 (
+        doc = "Temperature decay rate per second."
+        displayGroup = "Volume"
+        displayName = "Cooling Rate"
+    )
+    float primvars:particle:buoyancyCoefficient = 1.0 (
+        doc = "Upward force multiplier from temperature."
+        displayGroup = "Volume"
+        displayName = "Buoyancy Coefficient"
+    )
+    float3 primvars:particle:windDirection = (0.0, 0.0, 0.0) (
+        doc = "External wind force direction and magnitude."
+        displayGroup = "Volume"
+        displayName = "Wind Direction"
+    )
+    float primvars:particle:vorticityConfinement = 0.5 (
+        doc = "Vorticity preservation strength."
+        displayGroup = "Volume"
+        displayName = "Vorticity Confinement"
+    )
+    float primvars:particle:fluidCouplingStrength = 0.8 (
+        doc = "How strongly fluid velocity overrides particle velocity."
+        displayGroup = "Volume"
+        displayName = "Fluid Coupling Strength"
+    )
+    float primvars:particle:emissionIntensityScale = 1.0 (
+        doc = "Artistic multiplier on blackbody emission."
+        displayGroup = "Volume"
+        displayName = "Emission Intensity Scale"
+    )
+    int primvars:particle:pressureIterations = 30 (
+        doc = "Jacobi solver iterations for pressure projection."
+        displayGroup = "Volume"
+        displayName = "Pressure Iterations"
+    )
+    token primvars:particle:volumeType = "billboard" (
+        doc = "Volume rendering mode. billboard: standard billboard particles, volumetric: full volumetric simulation, hybrid: both billboard and volumetric."
+        displayGroup = "Volume"
+        displayName = "Volume Type"
+        allowedTokens = ["billboard", "volumetric", "hybrid"]
+    )
+    token primvars:particle:preset = "" (
+        doc = "Built-in preset name. When set, overrides default parameters with preset values."
+        displayGroup = "Volume"
+        displayName = "Preset"
+        allowedTokens = ["", "campfire", "explosion", "chimneySmoke", "steamVent", "burningObject", "smoldering", "muzzleBurst"]
+    )
 }

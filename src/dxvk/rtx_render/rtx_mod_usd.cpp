@@ -63,6 +63,7 @@
 #include "../util/util_watchdog.h"
 
 #include "../../lssusd/particle_system_helpers_vec.h"
+#include "rtx_particle_presets.h"
 #include "../../lssusd/game_exporter_common.h"
 #include "../../lssusd/game_exporter_paths.h"
 #include "../../lssusd/usd_mesh_importer.h"
@@ -761,6 +762,49 @@ std::optional<RtxParticleSystemDesc> UsdMod::Impl::processParticleSystem(Args& a
   _SafeGetParticlePrimvar(bool, id, restrictVelocityX, particleInfo.);
   _SafeGetParticlePrimvar(bool, id, restrictVelocityY, particleInfo.);
   _SafeGetParticlePrimvar(bool, id, restrictVelocityZ, particleInfo.);
+
+  // Volumetric simulation parameters.
+  // Read preset first so individual overrides below can supersede it.
+  {
+    TfToken presetToken;
+    if (_SafeGetPrimvar(sceneDelegate, id, pxr::TfToken("particle:preset"), presetToken) && !presetToken.IsEmpty()) {
+      const auto* pPreset = particlePresets::getPresetByName(presetToken.GetString());
+      if (pPreset) {
+        // Preserve the CPU-side animation curves that are not in GpuParticleSystemDesc.
+        const auto savedMinColor        = particleInfo.minColor;
+        const auto savedMaxColor        = particleInfo.maxColor;
+        const auto savedMinSize         = particleInfo.minSize;
+        const auto savedMaxSize         = particleInfo.maxSize;
+        const auto savedMaxVelocity     = particleInfo.maxVelocity;
+        const auto savedMinRotSpeed     = particleInfo.minRotationSpeed;
+        const auto savedMaxRotSpeed     = particleInfo.maxRotationSpeed;
+        particleInfo = *pPreset;
+        particleInfo.minColor           = savedMinColor;
+        particleInfo.maxColor           = savedMaxColor;
+        particleInfo.minSize            = savedMinSize;
+        particleInfo.maxSize            = savedMaxSize;
+        particleInfo.maxVelocity        = savedMaxVelocity;
+        particleInfo.minRotationSpeed   = savedMinRotSpeed;
+        particleInfo.maxRotationSpeed   = savedMaxRotSpeed;
+      }
+      anyExists = true;
+    }
+    counter++; // particle:preset
+  }
+
+  _SafeGetParticlePrimvar(float,   id, smokeDensity,              particleInfo.);
+  _SafeGetParticlePrimvar(float,   id, smokeAbsorptionCrossSection, particleInfo.);
+  _SafeGetParticlePrimvar(float,   id, smokeDissipationRate,       particleInfo.);
+  _SafeGetParticlePrimvar(float,   id, fuelAmount,                 particleInfo.);
+  _SafeGetParticlePrimvar(float,   id, burnTemperature,            particleInfo.);
+  _SafeGetParticlePrimvar(float,   id, coolingRate,                particleInfo.);
+  _SafeGetParticlePrimvar(float,   id, buoyancyCoefficient,        particleInfo.);
+  _SafeGetParticlePrimvar(GfVec3f, id, windDirection,              particleInfo.);
+  _SafeGetParticlePrimvar(float,   id, vorticityConfinement,       particleInfo.);
+  _SafeGetParticlePrimvar(float,   id, fluidCouplingStrength,      particleInfo.);
+  _SafeGetParticlePrimvar(float,   id, emissionIntensityScale,     particleInfo.);
+  _SafeGetParticlePrimvar(int,     id, pressureIterations,         particleInfo.);
+  _SafeGetParticlePrimvar(TfToken, id, volumeType,                 particleInfo.);
 
   assert(RemixParticleSystemAPI::GetSchemaAttributeNames(false).size() == counter);
 

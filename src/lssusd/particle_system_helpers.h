@@ -120,6 +120,18 @@ namespace lss {
     return ParticleRandomFlipAxis::None;
   }
 
+  template<>
+  inline ParticleVolumeType AssignFromPrimvar<ParticleVolumeType, pxr::TfToken>(const pxr::TfToken& token) {
+    const std::string& s = token.GetString();
+    if (s == "volumetric") {
+      return ParticleVolumeType::Volumetric;
+    }
+    if (s == "hybrid") {
+      return ParticleVolumeType::Hybrid;
+    }
+    return ParticleVolumeType::Billboard;
+  }
+
   template<typename T>
   static bool ConvertPrimvarValue(const pxr::VtValue& v, T& out) {
     using namespace pxr;
