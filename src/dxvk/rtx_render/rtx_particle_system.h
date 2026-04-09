@@ -178,6 +178,10 @@ namespace dxvk {
 
     uint64_t m_totalVolumeMemoryBytes = 0;
 
+    // Blackbody LUT: 256x1 RGBA16F texture generated once for fire emission coloring.
+    Resources::Resource m_blackbodyLUT;
+    bool m_blackbodyLUTGenerated = false;
+
     std::vector<SpawnContext> m_spawnContexts;
     bool m_initialized = false;
 
@@ -297,6 +301,16 @@ namespace dxvk {
       * \param ctx           The RtxContext for issuing GPU commands.
       */
     void simulate(RtxContext* ctx);
+
+    /**
+      * Composites all active volumetric particle systems into the composited
+      * color buffer via screen-space ray-marching.  Should be called after the
+      * main composite pass.
+      *
+      * \param ctx       The RtxContext for issuing GPU commands.
+      * \param rtOutput  The raytracing output containing GBuffer and color buffer.
+      */
+    void compositeVolumes(RtxContext* ctx, const Resources::RaytracingOutput& rtOutput);
 
     uint64_t totalVolumeMemoryBytes() const { return m_totalVolumeMemoryBytes; }
   };

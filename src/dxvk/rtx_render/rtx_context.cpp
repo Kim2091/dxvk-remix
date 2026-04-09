@@ -636,6 +636,9 @@ namespace dxvk {
         // Composition
         dispatchComposite(rtOutput);
 
+        // Composite volumetric particle systems (screen-space ray-march into composite output)
+        m_device->getCommon()->metaParticleSystem().compositeVolumes(this, rtOutput);
+
         // Post composite Debug View that may overwrite Composite output
         dispatchReplaceCompositeWithDebugView(rtOutput);
         

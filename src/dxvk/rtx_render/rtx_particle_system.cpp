@@ -34,6 +34,8 @@
 #include <rtx_shaders/particle_system_spawn.h>
 #include <rtx_shaders/particle_system_evolve.h>
 #include <rtx_shaders/particle_system_generate_geometry.h>
+#include <rtx_shaders/blackbody_lut.h>
+#include "rtx/pass/particles/particle_volume_binding_indices.h"
 #include "math.h"
 
 namespace dxvk {
@@ -93,6 +95,15 @@ namespace dxvk {
 
         RW_STRUCTURED_BUFFER(PARTICLE_SYSTEM_BINDING_VERTEX_BUFFER_OUTPUT)
         END_PARAMETER()
+    };
+
+    // Blackbody LUT generation shader (256x1 texture).
+    class BlackbodyLutShader : public ManagedShader {
+      SHADER_SOURCE(BlackbodyLutShader, VK_SHADER_STAGE_COMPUTE_BIT, blackbody_lut)
+
+      BEGIN_PARAMETER()
+        RW_TEXTURE2D(0)
+      END_PARAMETER()
     };
   }
 
@@ -691,15 +702,19 @@ namespace dxvk {
         }
 
         // Handle geometry creation - note, should move this into own loop (barrier latency)
+        // Skip geometry generation for volumetric-only systems (they render via ray-march, not billboards)
         {
-          const VkExtent3D workgroups = util::computeBlockCount(VkExtent3D { particleSystem.particleCount, 1, 1 }, VkExtent3D { 128, 1, 1 });
+          const bool generateBillboards = system.second->context.desc.volumeType != Volumetric;
+          if (generateBillboards) {
+            const VkExtent3D workgroups = util::computeBlockCount(VkExtent3D { particleSystem.particleCount, 1, 1 }, VkExtent3D { 128, 1, 1 });
 
-          ctx->bindResourceBuffer(PARTICLE_SYSTEM_BINDING_PARTICLES_BUFFER_INPUT, DxvkBufferSlice(system.second->getParticlesBuffer()));
-          ctx->bindResourceBuffer(PARTICLE_SYSTEM_BINDING_VERTEX_BUFFER_OUTPUT, DxvkBufferSlice(system.second->getVertexBuffer()));
+            ctx->bindResourceBuffer(PARTICLE_SYSTEM_BINDING_PARTICLES_BUFFER_INPUT, DxvkBufferSlice(system.second->getParticlesBuffer()));
+            ctx->bindResourceBuffer(PARTICLE_SYSTEM_BINDING_VERTEX_BUFFER_OUTPUT, DxvkBufferSlice(system.second->getVertexBuffer()));
 
-          ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, ParticleSystemGenerateGeometry::getShader());
+            ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, ParticleSystemGenerateGeometry::getShader());
 
-          ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
+            ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
+          }
         }
 
         ctx->setBarrierControl(DxvkBarrierControlFlags());
@@ -763,7 +778,7 @@ namespace dxvk {
 
         ScopedGpuProfileZone(ctx, "ParticleVolume_SimulateFluid");
 
-        const RtxParticleSystemDesc& desc = pParticleSystem->context.desc;
+        const GpuParticleSystemDesc& desc = pParticleSystem->context.desc;
         const ParticleVolume& vol = *pParticleSystem->pVolume;
 
         ParticleVolumeConstants volumeConstants {};
@@ -790,6 +805,7 @@ namespace dxvk {
         volumeConstants.particleCount        = pParticleSystem->context.particleCount;
         volumeConstants.renderingWidth       = ctx->getSceneManager().getCamera().m_renderResolution[0];
         volumeConstants.renderingHeight      = ctx->getSceneManager().getCamera().m_renderResolution[1];
+        volumeConstants.cameraPosition       = cameraPosition;
         volumeConstants.prevWorldToProjection =
           ctx->getSceneManager().getCamera().getPreviousViewToProjection() *
           ctx->getSceneManager().getCamera().getPreviousWorldToView();
@@ -884,6 +900,11 @@ namespace dxvk {
 
     for (const auto& keyPair : m_particleSystems) {
       const ParticleSystem& particleSystem = *(keyPair.second.get());
+
+      // Skip volumetric-only systems — they have no billboard geometry and render via ray-march
+      if (particleSystem.context.desc.volumeType == Volumetric) {
+        continue;
+      }
 
       // Here we create a fake draw call, and send it through the regular scene manager pipeline
       //   which has the advantage of supporting replacement materials.
@@ -1202,6 +1223,96 @@ namespace dxvk {
       particleSystem.spawnContextParticleMap.clear();
 
       ++keyPairIt;
+    }
+  }
+
+  void RtxParticleSystemManager::compositeVolumes(RtxContext* ctx, const Resources::RaytracingOutput& rtOutput) {
+    ScopedCpuProfileZone();
+
+    if (!enable() || !m_initialized || !ParticleVolume::enable()) {
+      return;
+    }
+
+    // Check if any particle system has an active volume — early out if none.
+    bool hasActiveVolume = false;
+    for (const auto& [materialHash, pParticleSystem] : m_particleSystems) {
+      if (pParticleSystem->pVolume && pParticleSystem->pVolume->isAllocated()) {
+        hasActiveVolume = true;
+        break;
+      }
+    }
+    if (!hasActiveVolume) {
+      return;
+    }
+
+    ScopedGpuProfileZone(ctx, "ParticleVolume_CompositeAll");
+
+    Rc<DxvkContext> dxvkCtx(ctx);
+
+    // Generate the blackbody LUT if not yet done.
+    if (!m_blackbodyLUTGenerated) {
+      m_blackbodyLUT = Resources::createImageResource(dxvkCtx, "particle volume blackbody LUT",
+        { 256u, 1u, 1u }, VK_FORMAT_R16G16B16A16_SFLOAT);
+
+      ctx->bindResourceView(0, m_blackbodyLUT.view, nullptr);
+      ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, BlackbodyLutShader::getShader());
+      ctx->dispatch(1, 1, 1);
+
+      // Barrier: ensure LUT write completes before any reads.
+      ctx->emitMemoryBarrier(0,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_ACCESS_SHADER_WRITE_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_ACCESS_SHADER_READ_BIT);
+
+      m_blackbodyLUTGenerated = true;
+    }
+
+    const Vector3 cameraPosition = ctx->getSceneManager().getCamera().getPosition();
+    const uint32_t frameIdx = ctx->getDevice()->getCurrentFrameId();
+
+    // Access the current-frame world position texture and the composite output.
+    Rc<DxvkImageView> worldPosView = rtOutput.getCurrentPrimaryWorldPositionWorldTriangleNormal().view(
+      Resources::AccessType::Read);
+    Rc<DxvkImageView> colorView = rtOutput.m_compositeOutput.view(
+      Resources::AccessType::ReadWrite);
+
+    for (auto& [materialHash, pParticleSystem] : m_particleSystems) {
+      if (!pParticleSystem->pVolume || !pParticleSystem->pVolume->isAllocated()) {
+        continue;
+      }
+
+      const GpuParticleSystemDesc& desc = pParticleSystem->context.desc;
+      const ParticleVolume& vol = *pParticleSystem->pVolume;
+
+      ParticleVolumeConstants volumeConstants {};
+      volumeConstants.gridDimension        = { vol.gridDimension(), vol.gridDimension(), vol.gridDimension() };
+      volumeConstants.aabbMin              = vol.aabbMin();
+      volumeConstants.aabbMax              = vol.aabbMax();
+      volumeConstants.deltaTimeSecs        = 0.f; // Not needed for composite
+      volumeConstants.absoluteTimeSecs     = 0.f;
+      volumeConstants.frameIdx             = frameIdx;
+      volumeConstants.smokeDensity         = desc.smokeDensity;
+      volumeConstants.smokeAbsorptionCrossSection = desc.smokeAbsorptionCrossSection;
+      volumeConstants.emissionIntensityScale = desc.emissionIntensityScale;
+      volumeConstants.sceneScale           = RtxOptions::sceneScale();
+      volumeConstants.renderingWidth       = rtOutput.m_compositeOutputExtent.width;
+      volumeConstants.renderingHeight      = rtOutput.m_compositeOutputExtent.height;
+      volumeConstants.cameraPosition       = cameraPosition;
+
+      pParticleSystem->pVolume->compositeVolume(
+        dxvkCtx,
+        volumeConstants,
+        worldPosView,
+        colorView,
+        m_blackbodyLUT.view);
+
+      // Barrier between volumes so reads of the color buffer are consistent.
+      ctx->emitMemoryBarrier(0,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_ACCESS_SHADER_WRITE_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_ACCESS_SHADER_READ_BIT);
     }
   }
 

@@ -33,6 +33,7 @@
 #include <rtx_shaders/particle_volume_pressure.h>
 #include <rtx_shaders/particle_volume_project.h>
 #include <rtx_shaders/particle_volume_advect.h>
+#include <rtx_shaders/particle_volume_composite.h>
 
 namespace dxvk {
 
@@ -148,6 +149,25 @@ namespace dxvk {
     };
 
     PREWARM_SHADER_PIPELINE(ParticleVolumeAdvect);
+
+    // ---------------------------------------------------------------------------
+    // Composite pass: screen-space ray-march that blends volume fire/smoke into
+    // the composited color buffer.
+    class ParticleVolumeComposite : public ManagedShader {
+      SHADER_SOURCE(ParticleVolumeComposite, VK_SHADER_STAGE_COMPUTE_BIT, particle_volume_composite)
+
+      BEGIN_PARAMETER()
+        CONSTANT_BUFFER(PARTICLE_VOLUME_BINDING_CONSTANTS)
+        TEXTURE3D(PARTICLE_VOLUME_BINDING_DENSITY_INPUT)
+        TEXTURE3D(PARTICLE_VOLUME_BINDING_TEMPERATURE_INPUT)
+        SAMPLER2D(PARTICLE_VOLUME_BINDING_BLACKBODY_LUT_INPUT)
+        SAMPLER(PARTICLE_VOLUME_BINDING_LINEAR_SAMPLER)
+        TEXTURE2D(PARTICLE_VOLUME_BINDING_COMPOSITE_WORLD_POS_INPUT)
+        RW_TEXTURE2D(PARTICLE_VOLUME_BINDING_COMPOSITE_COLOR_INOUT)
+      END_PARAMETER()
+    };
+
+    PREWARM_SHADER_PIPELINE(ParticleVolumeComposite);
 
   } // anonymous namespace
 
@@ -556,6 +576,78 @@ namespace dxvk {
 
       ctx->dispatch(groups3D, groups3D, groups3D);
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  void ParticleVolume::compositeVolume(
+      Rc<DxvkContext>& ctx,
+      const ParticleVolumeConstants& constants,
+      Rc<DxvkImageView> worldPosView,
+      Rc<DxvkImageView> colorView,
+      Rc<DxvkImageView> blackbodyLUTView) {
+    ScopedCpuProfileZone();
+
+    if (!isAllocated()) {
+      return;
+    }
+
+    ScopedGpuProfileZone(ctx, "ParticleVolume_Composite");
+
+    // Upload the per-frame constants.
+    ctx->writeToBuffer(m_cb, 0, sizeof(ParticleVolumeConstants), &constants);
+    ctx->bindResourceBuffer(PARTICLE_VOLUME_BINDING_CONSTANTS, DxvkBufferSlice(m_cb));
+
+    // Create a linear-clamp sampler for volume sampling and blackbody LUT.
+    Rc<DxvkSampler> linearSampler;
+    {
+      DxvkSamplerCreateInfo samplerInfo {};
+      samplerInfo.magFilter      = VK_FILTER_LINEAR;
+      samplerInfo.minFilter      = VK_FILTER_LINEAR;
+      samplerInfo.mipmapMode     = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+      samplerInfo.mipmapLodBias  = 0.f;
+      samplerInfo.mipmapLodMin   = 0.f;
+      samplerInfo.mipmapLodMax   = 0.f;
+      samplerInfo.useAnisotropy  = VK_FALSE;
+      samplerInfo.maxAnisotropy  = 1.f;
+      samplerInfo.addressModeU   = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+      samplerInfo.addressModeV   = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+      samplerInfo.addressModeW   = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+      samplerInfo.compareToDepth = VK_FALSE;
+      samplerInfo.compareOp      = VK_COMPARE_OP_ALWAYS;
+      samplerInfo.borderColor    = {};
+      samplerInfo.usePixelCoord  = VK_FALSE;
+      linearSampler = ctx->getDevice()->createSampler(samplerInfo);
+    }
+
+    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, ParticleVolumeComposite::getShader());
+
+    // Bind volume textures (read-only for composite).
+    ctx->bindResourceView(PARTICLE_VOLUME_BINDING_DENSITY_INPUT,
+      m_density.view, nullptr);
+    ctx->bindResourceView(PARTICLE_VOLUME_BINDING_TEMPERATURE_INPUT,
+      m_temperature.view, nullptr);
+
+    // Bind blackbody LUT.
+    ctx->bindResourceView(PARTICLE_VOLUME_BINDING_BLACKBODY_LUT_INPUT,
+      blackbodyLUTView, nullptr);
+    ctx->bindResourceSampler(PARTICLE_VOLUME_BINDING_BLACKBODY_LUT_INPUT,
+      linearSampler);
+
+    // Bind the linear sampler for volume trilinear sampling.
+    ctx->bindResourceSampler(PARTICLE_VOLUME_BINDING_LINEAR_SAMPLER, linearSampler);
+
+    // Bind GBuffer world position (current frame).
+    ctx->bindResourceView(PARTICLE_VOLUME_BINDING_COMPOSITE_WORLD_POS_INPUT,
+      worldPosView, nullptr);
+
+    // Bind the composited color buffer (read-write).
+    ctx->bindResourceView(PARTICLE_VOLUME_BINDING_COMPOSITE_COLOR_INOUT,
+      colorView, nullptr);
+
+    // Dispatch: one thread per pixel at composite resolution.
+    const uint32_t groupsX = (constants.renderingWidth  + 15u) / 16u;
+    const uint32_t groupsY = (constants.renderingHeight +  7u) /  8u;
+    ctx->dispatch(groupsX, groupsY, 1);
   }
 
 } // namespace dxvk

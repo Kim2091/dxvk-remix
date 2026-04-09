@@ -106,6 +106,17 @@ namespace dxvk {
       uint32_t particleCount,
       Rc<DxvkImageView> prevWorldPosView = nullptr);
 
+    // Composite this volume into the color buffer via screen-space ray-march.
+    // worldPosView: current-frame primary world position GBuffer texture.
+    // colorView:    the composited color output (read-write).
+    // blackbodyLUT: precomputed blackbody color lookup table.
+    void compositeVolume(
+      Rc<DxvkContext>& ctx,
+      const ParticleVolumeConstants& constants,
+      Rc<DxvkImageView> worldPosView,
+      Rc<DxvkImageView> colorView,
+      Rc<DxvkImageView> blackbodyLUTView);
+
     // Accessor: current resolution.
     Resolution currentResolution() const { return m_resolution; }
 

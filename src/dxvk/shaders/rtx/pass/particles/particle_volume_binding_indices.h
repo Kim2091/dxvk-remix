@@ -60,3 +60,7 @@
 
 // Linear sampler for advection trilinear sampling
 #define PARTICLE_VOLUME_BINDING_LINEAR_SAMPLER             30
+
+// Volume composite pass bindings
+#define PARTICLE_VOLUME_BINDING_COMPOSITE_WORLD_POS_INPUT  31
+#define PARTICLE_VOLUME_BINDING_COMPOSITE_COLOR_INOUT      32

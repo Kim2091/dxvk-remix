@@ -22,9 +22,7 @@
 #pragma once
 
 #include "rtx/pass/particles/particle_volume_binding_indices.h"
-#ifdef __cplusplus
 #include "rtx/utility/shader_types.h"
-#endif
 
 // Per-system per-frame constants uploaded to the GPU for all volume passes
 struct ParticleVolumeConstants
@@ -55,6 +53,8 @@ struct ParticleVolumeConstants
   float fluidCouplingStrength;
   vec3 upDirection;
   uint particleCount;
+  vec3 cameraPosition;
+  float _pad0;
 };
 
 #ifndef __cplusplus
