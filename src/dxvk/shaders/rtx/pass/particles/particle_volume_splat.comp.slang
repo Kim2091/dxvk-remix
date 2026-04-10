@@ -23,6 +23,7 @@
 #include "rtx/pass/particles/particle_volume_common.h"
 #include "rtx/pass/particles/particle_volume_bindings.slangh"
 #include "rtx/pass/particles/particle_volume_helpers.slangh"
+#include "rtx/utility/packing.slangh"
 #include "rtx/pass/particles/particle_system_binding_indices.h"
 
 // Particle buffer input (one entry per particle)
@@ -35,6 +36,9 @@ RWTexture3D<float> DensityOutput;
 
 [[vk::binding(PARTICLE_VOLUME_BINDING_TEMPERATURE_OUTPUT)]]
 RWTexture3D<float> TemperatureOutput;
+
+[[vk::binding(PARTICLE_VOLUME_BINDING_VELOCITY_OUTPUT)]]
+RWTexture3D<vec4> VelocityOutput;
 
 [shader("compute")]
 [numthreads(128, 1, 1)]
@@ -73,9 +77,30 @@ void main(uint threadID : SV_DispatchThreadID)
   const float wz0 = 1.0f - frac.z;
   const float wz1 = frac.z;
 
-  // Values to splat
-  const float densityContrib     = cb.smokeDensity;
-  const float temperatureContrib = cb.fuelAmount * cb.burnTemperature;
+  // Particle life fraction: 1.0 when freshly spawned, 0.0 at end of life.
+  const float lifeFraction = (cb.maxTimeToLive > 0.0f)
+    ? saturate(float(particle.timeToLive) / cb.maxTimeToLive)
+    : 1.0f;
+
+  // Only young particles (first 30% of life) emit into the grid. This creates
+  // a concentrated source zone near the emitter; the fluid simulation carries
+  // density and heat upward from there. Without this cutoff, each particle
+  // paints density along its entire ballistic trajectory (fountain shape).
+  if (lifeFraction < 0.7f)
+  {
+    return;
+  }
+
+  // Density: additive source scaled by deltaTime.
+  const float densityContrib = cb.smokeDensity * cb.deltaTimeSecs;
+
+  // Temperature: target burn temperature at particle location.
+  const float temperatureTarget = cb.fuelAmount * cb.burnTemperature;
+
+  // Velocity: inject particle velocity into the grid to seed the flow field.
+  // Without this, the fluid must build velocity purely from buoyancy (slow).
+  // fluidCouplingStrength controls how strongly particles drive the fluid.
+  const vec3 velocityContrib = particle.velocity * cb.fluidCouplingStrength;
 
   // Iterate over all 8 neighboring cells in the trilinear kernel
   for (uint iz = 0u; iz < 2u; iz++)
@@ -101,13 +126,19 @@ void main(uint threadID : SV_DispatchThreadID)
         const float weight = wx * wy * wz;
         const uint3 coord  = uint3(cell);
 
-        // Note: may need atomic implementation for correctness under concurrent
-        // writes from multiple threads splatting into the same cell.
-        // InterlockedAdd on a uint reinterpretation of the float texel is the
-        // portable Vulkan/Slang approach; direct += is used here for simplicity
-        // and will be refined during integration testing.
-        DensityOutput[coord]     += densityContrib     * weight;
-        TemperatureOutput[coord] += temperatureContrib * weight;
+        // Density: additive with trilinear weighting (extensive property).
+        DensityOutput[coord] += densityContrib * weight;
+
+        // Temperature: drive toward burn temperature (intensive property).
+        // No trilinear weighting — all cells near a burning particle reach
+        // the target temperature.  max() prevents accumulation beyond the target.
+        TemperatureOutput[coord] = max(TemperatureOutput[coord], temperatureTarget);
+
+        // Velocity: blend particle velocity into the grid with trilinear weighting.
+        // This seeds the flow field from particle motion (Fedkiw et al. 2001).
+        vec4 existingVel = VelocityOutput[coord];
+        existingVel.xyz += velocityContrib * weight;
+        VelocityOutput[coord] = existingVel;
       }
     }
   }

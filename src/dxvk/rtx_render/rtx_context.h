@@ -260,6 +260,9 @@ namespace dxvk {
 
     DxvkRaytracingInstanceState m_rtState;
 
+    // Dummy 1x1x1 3D texture bound to unused particle volume slots.
+    Resources::Resource m_dummyVolume3D;
+
     struct {
       std::atomic<uint64_t>           signalValue = 1;
       Rc<sync::Fence>                 signal = new sync::Fence{};

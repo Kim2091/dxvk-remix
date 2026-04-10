@@ -28,9 +28,14 @@
 #include "rtx/pass/particles/particle_volume_common.h"
 #include "rtx/pass/particles/particle_volume_bindings.slangh"
 
-Texture3D<float>  PressureInput   : register(t0, space1);
-Texture3D<float>  ObstacleInput   : register(t1, space1);
-RWTexture3D<vec4> VelocityOutput  : register(u0, space2);
+[[vk::binding(PARTICLE_VOLUME_BINDING_PRESSURE_INPUT)]]
+Texture3D<float>  PressureInput;
+
+[[vk::binding(PARTICLE_VOLUME_BINDING_OBSTACLE_INPUT)]]
+Texture3D<float>  ObstacleInput;
+
+[[vk::binding(PARTICLE_VOLUME_BINDING_VELOCITY_OUTPUT)]]
+RWTexture3D<vec4> VelocityOutput;
 
 [shader("compute")]
 [numthreads(8, 8, 8)]

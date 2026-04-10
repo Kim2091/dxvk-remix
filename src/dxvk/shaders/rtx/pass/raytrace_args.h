@@ -91,6 +91,35 @@ struct NeeCacheArgs {
   uint enableSpatialReuse;
 };
 
+// Maximum number of particle volumes that can be rendered inline during resolve.
+#define MAX_PARTICLE_VOLUMES 4
+
+// Aggregate particle volume rendering state.
+// Uses individual vec4 members instead of arrays to work around Slang codegen
+// issues with fixed-size arrays in constant buffer structs.
+struct ParticleVolumeResolveArgs {
+  // Per-volume: .xyz = aabbMin, .w = unused
+  vec4 aabbMinAndDensity0;
+  vec4 aabbMinAndDensity1;
+  vec4 aabbMinAndDensity2;
+  vec4 aabbMinAndDensity3;
+  // Per-volume: .xyz = aabbMax, .w = smokeAbsorptionCrossSection
+  vec4 aabbMaxAndAbsorption0;
+  vec4 aabbMaxAndAbsorption1;
+  vec4 aabbMaxAndAbsorption2;
+  vec4 aabbMaxAndAbsorption3;
+  // Per-volume: .xyz = gridDimension (as float), .w = emissionIntensityScale
+  vec4 gridDimAndEmission0;
+  vec4 gridDimAndEmission1;
+  vec4 gridDimAndEmission2;
+  vec4 gridDimAndEmission3;
+
+  uint activeVolumeCount;
+  uint _pad0;
+  uint _pad1;
+  uint _pad2;
+};
+
 struct DomeLightArgs {
   mat4 worldToLightTransform;
 
@@ -153,6 +182,8 @@ struct RaytraceArgs {
   NrcArgs nrcArgs;
   SssArgs sssArgs;
   EyeArgs eyeArgs;
+
+  ParticleVolumeResolveArgs particleVolumeArgs;
 
   Camera renderTargetCamera;
 

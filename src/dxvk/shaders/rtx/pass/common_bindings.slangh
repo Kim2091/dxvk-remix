@@ -34,6 +34,7 @@
 #include "rtx/concept/volume_material/volume_material.h"
 #include "rtx/concept/light/light.h"
 #include "rtx/concept/billboard.h"
+#include "rtx/concept/particle_volume_proxy.h"
 #include "rtx/utility/gpu_printing.h"
 
 // Note: Texture array may only be up to a size of 2^16
@@ -116,5 +117,35 @@ RWStructuredBuffer<GpuPrintBufferElement> GpuPrintBuffer;
 layout(binding = BINDING_VALUE_NOISE_SAMPLER)
 Sampler3D<float4> ValueNoiseSampler;
 
-layout(binding = BINDING_SAMPLER_READBACK_BUFFER) 
+layout(binding = BINDING_SAMPLER_READBACK_BUFFER)
 RWStructuredBuffer<uint32_t> SamplerFeedbackBuffer;
+
+// Particle volume textures for inline resolve ray-march.
+// Up to MAX_PARTICLE_VOLUMES density/temperature 3D textures are bound here.
+// Inactive slots are bound to a dummy 1x1x1 texture.
+layout(binding = BINDING_PARTICLE_VOLUME_DENSITY_0)
+Texture3D<float> particleVolumeDensity0;
+layout(binding = BINDING_PARTICLE_VOLUME_DENSITY_1)
+Texture3D<float> particleVolumeDensity1;
+layout(binding = BINDING_PARTICLE_VOLUME_DENSITY_2)
+Texture3D<float> particleVolumeDensity2;
+layout(binding = BINDING_PARTICLE_VOLUME_DENSITY_3)
+Texture3D<float> particleVolumeDensity3;
+
+layout(binding = BINDING_PARTICLE_VOLUME_TEMPERATURE_0)
+Texture3D<float> particleVolumeTemperature0;
+layout(binding = BINDING_PARTICLE_VOLUME_TEMPERATURE_1)
+Texture3D<float> particleVolumeTemperature1;
+layout(binding = BINDING_PARTICLE_VOLUME_TEMPERATURE_2)
+Texture3D<float> particleVolumeTemperature2;
+layout(binding = BINDING_PARTICLE_VOLUME_TEMPERATURE_3)
+Texture3D<float> particleVolumeTemperature3;
+
+layout(binding = BINDING_PARTICLE_VOLUME_BLACKBODY_LUT)
+Texture2D<float4> particleVolumeBlackbodyLUT;
+
+layout(binding = BINDING_PARTICLE_VOLUME_LINEAR_SAMPLER)
+SamplerState particleVolumeLinearSampler;
+
+layout(binding = BINDING_PARTICLE_VOLUME_PROXY_BUFFER)
+StructuredBuffer<MemoryParticleVolume> particleVolumeProxies;

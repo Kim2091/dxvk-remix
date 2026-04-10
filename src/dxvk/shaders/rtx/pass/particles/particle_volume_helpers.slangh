@@ -93,3 +93,22 @@ vec3 particleVolumeCalcCurl(
     (vxp.y - vxn.y) - (vyp.x - vyn.x)
   ) * 0.5f;
 }
+
+// Overload for RWTexture3D (used by force application pass)
+vec3 particleVolumeCalcCurl(
+  RWTexture3D<vec4> velocityTexture,
+  ivec3 cell, ParticleVolumeConstants cb)
+{
+  const vec3 vxp = velocityTexture[cell + ivec3(1, 0, 0)].xyz;
+  const vec3 vxn = velocityTexture[cell - ivec3(1, 0, 0)].xyz;
+  const vec3 vyp = velocityTexture[cell + ivec3(0, 1, 0)].xyz;
+  const vec3 vyn = velocityTexture[cell - ivec3(0, 1, 0)].xyz;
+  const vec3 vzp = velocityTexture[cell + ivec3(0, 0, 1)].xyz;
+  const vec3 vzn = velocityTexture[cell - ivec3(0, 0, 1)].xyz;
+
+  return vec3(
+    (vyp.z - vyn.z) - (vzp.y - vzn.y),
+    (vzp.x - vzn.x) - (vxp.z - vxn.z),
+    (vxp.y - vxn.y) - (vyp.x - vyn.x)
+  ) * 0.5f;
+}

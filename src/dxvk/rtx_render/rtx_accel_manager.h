@@ -40,6 +40,7 @@ class DxvkDevice;
 class ResourceCache;
 class CameraManager;
 class OpacityMicromapManager;
+class RtxParticleSystemManager;
 
 // AccelManager is responsible for maintaining the acceleration structures (BLAS and TLAS)
 class AccelManager : public CommonDeviceObject {
@@ -86,6 +87,8 @@ public:
   }
 
   const Rc<DxvkBuffer> getBillboardsBuffer() const { return m_billboardsBuffer; }
+  const Rc<DxvkBuffer> getVolumeProxyBuffer() const { return m_volumeProxyBuffer; }
+  uint32_t getActiveVolumeProxyCount() const { return m_activeVolumeProxyCount; }
 
   // Clear all instances currently tracked by manager
   void clear();
@@ -94,7 +97,7 @@ public:
   void garbageCollection();
 
   // Prepares instance buffers for rendering by the GPU
-  void prepareSceneData(Rc<DxvkContext> ctx, class DxvkBarrierSet& execBarriers, InstanceManager& instanceManager);
+  void prepareSceneData(Rc<DxvkContext> ctx, class DxvkBarrierSet& execBarriers, InstanceManager& instanceManager, RtxParticleSystemManager* particleSystemMgr = nullptr);
 
   // Uploads instances' surface data to the GPU
   void uploadSurfaceData(Rc<DxvkContext> ctx);
@@ -189,6 +192,8 @@ private:
   Rc<PooledBlas> m_intersectionBlas;
   Rc<DxvkBuffer> m_aabbBuffer;
   Rc<DxvkBuffer> m_billboardsBuffer;
+  Rc<DxvkBuffer> m_volumeProxyBuffer;
+  uint32_t m_activeVolumeProxyCount = 0;
   void createAndBuildIntersectionBlas(Rc<DxvkContext> ctx, class DxvkBarrierSet& execBarriers);
   
   Rc<DxvkBuffer> getScratchMemory(const size_t requiredScratchAllocSize);

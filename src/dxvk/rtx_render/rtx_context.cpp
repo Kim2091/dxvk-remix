@@ -636,8 +636,10 @@ namespace dxvk {
         // Composition
         dispatchComposite(rtOutput);
 
-        // Composite volumetric particle systems (screen-space ray-march into composite output)
-        m_device->getCommon()->metaParticleSystem().compositeVolumes(this, rtOutput);
+        // Note: Volumetric particle systems are now rendered inline during the unordered
+        // resolve pass (resolve.slangh), so their contribution goes through denoising and
+        // proper depth-sorting with other transparent objects. The old screen-space
+        // compositeVolumes() call has been removed.
 
         // Post composite Debug View that may overwrite Composite output
         dispatchReplaceCompositeWithDebugView(rtOutput);
@@ -1314,6 +1316,39 @@ namespace dxvk {
     constants.eyeArgs.irisRadius = RtxOptions::Eye::irisRadius();
     constants.eyeArgs.irisDepth = RtxOptions::Eye::irisDepth();
 
+    // Populate particle volume resolve args from active volumes.
+    {
+      auto& particleSystem = m_device->getCommon()->metaParticleSystem();
+      auto activeVolumes = particleSystem.getActiveVolumeDescriptors();
+      constants.particleVolumeArgs.activeVolumeCount = static_cast<uint32_t>(activeVolumes.size());
+
+      // Helper: write volume data into the individual members.
+      // Uses vec4 pointers since the struct uses shader_types vec4, not dxvk::Vector4.
+      vec4* aabbMinPtrs[MAX_PARTICLE_VOLUMES] = {
+        &constants.particleVolumeArgs.aabbMinAndDensity0, &constants.particleVolumeArgs.aabbMinAndDensity1,
+        &constants.particleVolumeArgs.aabbMinAndDensity2, &constants.particleVolumeArgs.aabbMinAndDensity3
+      };
+      vec4* aabbMaxPtrs[MAX_PARTICLE_VOLUMES] = {
+        &constants.particleVolumeArgs.aabbMaxAndAbsorption0, &constants.particleVolumeArgs.aabbMaxAndAbsorption1,
+        &constants.particleVolumeArgs.aabbMaxAndAbsorption2, &constants.particleVolumeArgs.aabbMaxAndAbsorption3
+      };
+      vec4* gridDimPtrs[MAX_PARTICLE_VOLUMES] = {
+        &constants.particleVolumeArgs.gridDimAndEmission0, &constants.particleVolumeArgs.gridDimAndEmission1,
+        &constants.particleVolumeArgs.gridDimAndEmission2, &constants.particleVolumeArgs.gridDimAndEmission3
+      };
+
+      for (uint32_t i = 0; i < activeVolumes.size() && i < MAX_PARTICLE_VOLUMES; ++i) {
+        auto& src = activeVolumes[i];
+        *aabbMinPtrs[i] = vec4(src.aabbMin.x, src.aabbMin.y, src.aabbMin.z, src.smokeDensity);
+        *aabbMaxPtrs[i] = vec4(src.aabbMax.x, src.aabbMax.y, src.aabbMax.z, src.smokeAbsorptionCrossSection);
+        *gridDimPtrs[i] = vec4(
+          static_cast<float>(src.gridDimension),
+          static_cast<float>(src.gridDimension),
+          static_cast<float>(src.gridDimension),
+          src.emissionIntensityScale);
+      }
+    }
+
     // Upload the constants to the GPU
     {
       Rc<DxvkBuffer> cb = getResourceManager().getConstantsBuffer();
@@ -1357,6 +1392,8 @@ namespace dxvk {
     bindResourceBuffer(BINDING_PREVIOUS_LIGHT_DATA_BUFFER, DxvkBufferSlice(previousLightBuffer, 0, previousLightBuffer.ptr() ? previousLightBuffer->info().size : 0));
     bindResourceBuffer(BINDING_LIGHT_MAPPING, DxvkBufferSlice(lightMappingBuffer, 0, lightMappingBuffer.ptr() ? lightMappingBuffer->info().size : 0));
     bindResourceBuffer(BINDING_BILLBOARDS_BUFFER, DxvkBufferSlice(billboardsBuffer, 0, billboardsBuffer.ptr() ? billboardsBuffer->info().size : 0));
+    Rc<DxvkBuffer> volumeProxyBuffer = getSceneManager().getVolumeProxyBuffer();
+    bindResourceBuffer(BINDING_PARTICLE_VOLUME_PROXY_BUFFER, DxvkBufferSlice(volumeProxyBuffer, 0, volumeProxyBuffer.ptr() ? volumeProxyBuffer->info().size : 0));
     bindResourceView(BINDING_BLUE_NOISE_TEXTURE, getResourceManager().getBlueNoiseTexture(this), nullptr);
     bindResourceBuffer(BINDING_CONSTANTS, DxvkBufferSlice(constantsBuffer, 0, constantsBuffer->info().size));
     bindResourceView(BINDING_DEBUG_VIEW_TEXTURE, debugView.getDebugOutput(), nullptr);
@@ -1364,6 +1401,60 @@ namespace dxvk {
     bindResourceView(BINDING_VALUE_NOISE_SAMPLER, valueNoiseLut, nullptr);
     bindResourceSampler(BINDING_VALUE_NOISE_SAMPLER, linearSampler);
     bindResourceBuffer(BINDING_SAMPLER_READBACK_BUFFER, DxvkBufferSlice(samplerFeedbackBuffer, 0, samplerFeedbackBuffer.ptr() ? samplerFeedbackBuffer->info().size : 0));
+
+    // Bind particle volume textures for inline resolve ray-march.
+    {
+      auto& particleSystem = m_device->getCommon()->metaParticleSystem();
+      auto activeVolumes = particleSystem.getActiveVolumeDescriptors();
+
+      // Ensure the blackbody LUT is generated if we have active volumes.
+      if (!activeVolumes.empty()) {
+        particleSystem.ensureBlackbodyLUT(this);
+      }
+
+      // Create a dummy 1x1x1 3D texture for unused volume slots (cached as member).
+      if (!m_dummyVolume3D.view.ptr()) {
+        Rc<DxvkContext> dxvkCtx(this);
+        m_dummyVolume3D = Resources::createImageResource(dxvkCtx, "dummy volume 3D",
+          { 1u, 1u, 1u }, VK_FORMAT_R16_SFLOAT, 1,
+          VK_IMAGE_TYPE_3D, VK_IMAGE_VIEW_TYPE_3D);
+      }
+
+      // Bind density textures (slots 0..3)
+      const uint32_t densityBindings[MAX_PARTICLE_VOLUMES] = {
+        BINDING_PARTICLE_VOLUME_DENSITY_0, BINDING_PARTICLE_VOLUME_DENSITY_1,
+        BINDING_PARTICLE_VOLUME_DENSITY_2, BINDING_PARTICLE_VOLUME_DENSITY_3
+      };
+      const uint32_t temperatureBindings[MAX_PARTICLE_VOLUMES] = {
+        BINDING_PARTICLE_VOLUME_TEMPERATURE_0, BINDING_PARTICLE_VOLUME_TEMPERATURE_1,
+        BINDING_PARTICLE_VOLUME_TEMPERATURE_2, BINDING_PARTICLE_VOLUME_TEMPERATURE_3
+      };
+
+      for (uint32_t i = 0; i < MAX_PARTICLE_VOLUMES; ++i) {
+        if (i < activeVolumes.size() && activeVolumes[i].densityView.ptr()) {
+          bindResourceView(densityBindings[i], activeVolumes[i].densityView, nullptr);
+        } else {
+          bindResourceView(densityBindings[i], m_dummyVolume3D.view, nullptr);
+        }
+        if (i < activeVolumes.size() && activeVolumes[i].temperatureView.ptr()) {
+          bindResourceView(temperatureBindings[i], activeVolumes[i].temperatureView, nullptr);
+        } else {
+          bindResourceView(temperatureBindings[i], m_dummyVolume3D.view, nullptr);
+        }
+      }
+
+      // Bind blackbody LUT (or a fallback if not generated).
+      Rc<DxvkImageView> blackbodyView = particleSystem.getBlackbodyLUTView();
+      if (blackbodyView.ptr()) {
+        bindResourceView(BINDING_PARTICLE_VOLUME_BLACKBODY_LUT, blackbodyView, nullptr);
+      }
+
+      // Bind the linear-clamp sampler for volume sampling.
+      Rc<DxvkSampler> volumeLinearSampler = getResourceManager().getSampler(
+        VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
+      bindResourceSampler(BINDING_PARTICLE_VOLUME_LINEAR_SAMPLER, volumeLinearSampler);
+      bindResourceSampler(BINDING_PARTICLE_VOLUME_BLACKBODY_LUT, volumeLinearSampler);
+    }
   }
 
   void RtxContext::bindResourceView(const uint32_t slot, const Rc<DxvkImageView>& imageView, const Rc<DxvkBufferView>& bufferView)

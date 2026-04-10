@@ -54,7 +54,7 @@ struct ParticleVolumeConstants
   vec3 upDirection;
   uint particleCount;
   vec3 cameraPosition;
-  float _pad0;
+  float maxTimeToLive;
 };
 
 #ifndef __cplusplus

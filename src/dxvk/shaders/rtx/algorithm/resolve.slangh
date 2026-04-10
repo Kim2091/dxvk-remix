@@ -817,9 +817,9 @@ void resolveVertexUnordered<let RAY_FLAGS : uint8_t>(
   uint rayFlags = RAY_FLAG_CULL_OPAQUE;
 
   if (useIntersectionBillboards)
-    rayMask &= OBJECT_MASK_UNORDERED_ALL_INTERSECTION_PRIMITIVE | OBJECT_MASK_ALL_DYNAMIC;
+    rayMask &= OBJECT_MASK_UNORDERED_ALL_INTERSECTION_PRIMITIVE | OBJECT_MASK_UNORDERED_VOLUME_PROXY | OBJECT_MASK_ALL_DYNAMIC;
   else
-    rayMask &= OBJECT_MASK_UNORDERED_ALL_GEOMETRY | OBJECT_MASK_ALL_DYNAMIC;
+    rayMask &= OBJECT_MASK_UNORDERED_ALL_GEOMETRY | OBJECT_MASK_UNORDERED_VOLUME_PROXY | OBJECT_MASK_ALL_DYNAMIC;
 
   // Loop over each non-opaque object in the ray's path
 
@@ -886,6 +886,89 @@ void resolveVertexUnordered<let RAY_FLAGS : uint8_t>(
     }
     else
     {
+      // Check if this intersection primitive is a particle volume proxy.
+      const uint candidateCustomIndex = rayQuery.CandidateInstanceID();
+      if (candidateCustomIndex & PARTICLE_VOLUME_PROXY_CUSTOM_INDEX_FLAG)
+      {
+        // This is a volume proxy hit. Perform an inline ray-march through the volume
+        // and accumulate its contribution, then skip normal billboard/material evaluation.
+        const uint volIdx = candidateCustomIndex & PARTICLE_VOLUME_PROXY_INDEX_MASK;
+        MemoryParticleVolume vol = particleVolumeProxies[volIdx];
+
+        // Ray-AABB intersection (slab test) against the actual volume bounds.
+        float3 invDir = 1.0f / ray.direction;
+        float3 t0 = (vol.aabbMin - ray.origin) * invDir;
+        float3 t1 = (vol.aabbMax - ray.origin) * invDir;
+        float3 tNear = min(t0, t1);
+        float3 tFar  = max(t0, t1);
+        float volTMin = max(max(tNear.x, tNear.y), tNear.z);
+        float volTMax = min(min(tFar.x, tFar.y), tFar.z);
+        volTMin = max(volTMin, 0.0f);
+
+        if (volTMax > volTMin)
+        {
+          volTMax = min(volTMax, ray.tMax);
+          if (volTMax > volTMin)
+          {
+            vec3  aabbSize = vol.aabbMax - vol.aabbMin;
+            vec3  cellSize = aabbSize / vec3(vol.gridDimension);
+            float stepSize = min(cellSize.x, min(cellSize.y, cellSize.z));
+
+            if (stepSize > 0.0f)
+            {
+              vec3  volRadiance = vec3(0.0f, 0.0f, 0.0f);
+              float volTransmittance = 1.0f;
+              float t = volTMin + stepSize * 0.5f;
+              uint  stepCount = 0u;
+
+              while (t < volTMax && volTransmittance > 0.01f && stepCount < 128u)
+              {
+                vec3 samplePos = ray.origin + ray.direction * t;
+                vec3 uvw = (samplePos - vol.aabbMin) / aabbSize;
+
+                float density = 0.0f;
+                float temperature = 0.0f;
+                switch (vol.volumeIndex) {
+                  case 0: density = particleVolumeDensity0.SampleLevel(particleVolumeLinearSampler, uvw, 0).r; temperature = particleVolumeTemperature0.SampleLevel(particleVolumeLinearSampler, uvw, 0).r; break;
+                  case 1: density = particleVolumeDensity1.SampleLevel(particleVolumeLinearSampler, uvw, 0).r; temperature = particleVolumeTemperature1.SampleLevel(particleVolumeLinearSampler, uvw, 0).r; break;
+                  case 2: density = particleVolumeDensity2.SampleLevel(particleVolumeLinearSampler, uvw, 0).r; temperature = particleVolumeTemperature2.SampleLevel(particleVolumeLinearSampler, uvw, 0).r; break;
+                  default: density = particleVolumeDensity3.SampleLevel(particleVolumeLinearSampler, uvw, 0).r; temperature = particleVolumeTemperature3.SampleLevel(particleVolumeLinearSampler, uvw, 0).r; break;
+                }
+
+                if (density > 0.0f)
+                {
+                  float sigma_t = density * vol.smokeAbsorptionCrossSection;
+                  float stepTransmittance = exp(-sigma_t * stepSize);
+
+                  vec3 emission = vec3(0.0f, 0.0f, 0.0f);
+                  if (temperature > 500.0f)
+                  {
+                    float u = saturate((temperature - 500.0f) / (6500.0f - 500.0f));
+                    vec4  lutSample = particleVolumeBlackbodyLUT.SampleLevel(particleVolumeLinearSampler, vec2(u, 0.5f), 0);
+                    emission = lutSample.rgb * lutSample.a * vol.emissionIntensityScale;
+                  }
+
+                  volRadiance += volTransmittance * (1.0f - stepTransmittance) * emission;
+                  volTransmittance *= stepTransmittance;
+                }
+
+                t += stepSize;
+                stepCount++;
+              }
+
+              if (volTransmittance < 0.999f)
+              {
+                emissiveRadiance += vec3(radianceAttenuation) * volRadiance;
+                radianceAttenuation *= f16vec3(volTransmittance);
+                numInteractions += 1;
+              }
+            }
+          }
+        }
+
+        continue; // Skip billboard/material evaluation for volume proxy hits
+      }
+
       MemoryBillboard billboard = billboards[rayQuery.CandidateInstanceID()];
       
       float3 normal;
@@ -1191,14 +1274,19 @@ void resolveVertexUnordered<let RAY_FLAGS : uint8_t>(
     numInteractions += 1;
   }
 
-  // Early out in the special case of nothing being hit
+  // Early out in the special case of nothing being hit.
   // Note: This is a fairly common case since often rays travel unobstructed by particles or other intermediate objects, so having
   // a path to skip the somewhat costly bin flushing logic below results in a small performance improvement.
+  // Particle volumes are now discovered via TLAS intersection (volume proxy AABBs), so their
+  // contributions are included in numInteractions.
 
   if (numInteractions == 0)
   {
     return;
   }
+
+  {
+  // Begin bin-flushing block
 
 #ifdef UNORDERED_RESOLVE_WBOIT
   if (alphaWeightSum > 0.f) 
@@ -1290,6 +1378,8 @@ void resolveVertexUnordered<let RAY_FLAGS : uint8_t>(
     decalEmissiveRadiance = memory.emissiveRadiance;
   }
 #endif
+
+  } // end bin-flushing block
 
   emissiveRadiance *= 1.h/pathSelectionProbability;
   decalEmissiveRadiance *= 1.h/pathSelectionProbability;

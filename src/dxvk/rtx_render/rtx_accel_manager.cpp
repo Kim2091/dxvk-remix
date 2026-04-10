@@ -28,6 +28,8 @@
 #include "rtx_opacity_micromap_manager.h"
 #include "rtx_scene_manager.h"
 #include "rtx_accel_manager.h"
+#include "rtx_particle_system.h"
+#include "rtx/concept/particle_volume_proxy.h"
 #include "rtx_point_instancer_system.h"
 
 #include "../d3d9/d3d9_state.h"
@@ -888,7 +890,7 @@ namespace dxvk {
     }
   }
 
-  void AccelManager::prepareSceneData(Rc<DxvkContext> ctx, DxvkBarrierSet& execBarriers, InstanceManager& instanceManager) {
+  void AccelManager::prepareSceneData(Rc<DxvkContext> ctx, DxvkBarrierSet& execBarriers, InstanceManager& instanceManager, RtxParticleSystemManager* particleSystemMgr) {
     ScopedCpuProfileZone();
     bool haveInstances = false;
     for (const auto& instances : m_mergedInstances) {
@@ -898,7 +900,13 @@ namespace dxvk {
       }
     }
 
-    if (!haveInstances && instanceManager.getBillboards().empty()) {
+    // Gather active particle volume descriptors for TLAS registration.
+    std::vector<RtxParticleSystemManager::ActiveVolumeDescriptor> activeVolumes;
+    if (particleSystemMgr) {
+      activeVolumes = particleSystemMgr->getActiveVolumeDescriptors();
+    }
+
+    if (!haveInstances && instanceManager.getBillboards().empty() && activeVolumes.empty()) {
       return;
     }
 
@@ -977,6 +985,59 @@ namespace dxvk {
       numActiveBillboards = index;
     }
 
+    // Register particle volume proxies as intersection primitives in the unordered TLAS.
+    // Each active volume gets a VkAccelerationStructureInstanceKHR referencing the shared
+    // intersection BLAS, with OBJECT_MASK_UNORDERED_VOLUME_PROXY and a custom index
+    // pointing into the MemoryParticleVolume structured buffer.
+    std::vector<MemoryParticleVolume> memoryVolumes;
+    m_activeVolumeProxyCount = 0;
+
+    if (!activeVolumes.empty() && m_intersectionBlas != nullptr) {
+      memoryVolumes.resize(activeVolumes.size());
+
+      for (uint32_t vi = 0; vi < activeVolumes.size() && vi < MAX_PARTICLE_VOLUMES; ++vi) {
+        const auto& vol = activeVolumes[vi];
+
+        // Fill the GPU-side volume descriptor.
+        MemoryParticleVolume& mem = memoryVolumes[vi];
+        mem.aabbMin.x = vol.aabbMin.x;
+        mem.aabbMin.y = vol.aabbMin.y;
+        mem.aabbMin.z = vol.aabbMin.z;
+        mem.smokeAbsorptionCrossSection = vol.smokeAbsorptionCrossSection;
+        mem.aabbMax.x = vol.aabbMax.x;
+        mem.aabbMax.y = vol.aabbMax.y;
+        mem.aabbMax.z = vol.aabbMax.z;
+        mem.emissionIntensityScale = vol.emissionIntensityScale;
+        mem.gridDimension.x = vol.gridDimension;
+        mem.gridDimension.y = vol.gridDimension;
+        mem.gridDimension.z = vol.gridDimension;
+        mem.volumeIndex = vi;
+
+        // Build the TLAS instance that wraps the shared intersection BLAS.
+        VkAccelerationStructureInstanceKHR asInstance {};
+        asInstance.accelerationStructureReference = m_intersectionBlas->accelerationStructureReference;
+        asInstance.flags = 0;
+        asInstance.instanceShaderBindingTableRecordOffset = 0;
+        asInstance.mask = OBJECT_MASK_UNORDERED_VOLUME_PROXY;
+        asInstance.instanceCustomIndex = PARTICLE_VOLUME_PROXY_CUSTOM_INDEX_FLAG | vi; // flagged index into particleVolumeProxies buffer
+
+        // Transform the unit AABB [-1,1]^3 to the world-space volume bounds.
+        const Vector3 center = (vol.aabbMin + vol.aabbMax) * 0.5f;
+        const Vector3 halfExtent = (vol.aabbMax - vol.aabbMin) * 0.5f;
+        Matrix4 transform;
+        transform[0][0] = halfExtent.x;  transform[0][1] = 0.f;            transform[0][2] = 0.f;
+        transform[1][0] = 0.f;           transform[1][1] = halfExtent.y;   transform[1][2] = 0.f;
+        transform[2][0] = 0.f;           transform[2][1] = 0.f;            transform[2][2] = halfExtent.z;
+        transform[3] = Vector4(center, 1.f);
+        transform = transpose(transform);
+        memcpy(asInstance.transform.matrix, &transform, sizeof(VkTransformMatrixKHR));
+
+        m_mergedInstances[Tlas::Unordered].push_back(asInstance);
+      }
+
+      m_activeVolumeProxyCount = static_cast<uint32_t>(std::min(activeVolumes.size(), size_t(MAX_PARTICLE_VOLUMES)));
+    }
+
     // Allocate the instance buffer and copy its contents from host to device memory
     // STORAGE_BUFFER_BIT is required for the PointInstancer GPU culling compute shader
     // which writes VkAccelerationStructureInstanceKHR entries directly into this buffer.
@@ -1020,6 +1081,15 @@ namespace dxvk {
 
       // Write billboard data
       ctx->writeToBuffer(m_billboardsBuffer, 0, numActiveBillboards * sizeof(MemoryBillboard), memoryBillboards.data());
+    }
+
+    // Vk volume proxy buffer
+    if (m_activeVolumeProxyCount > 0) {
+      info.size = align(m_activeVolumeProxyCount * sizeof(MemoryParticleVolume), kBufferAlignment);
+      if (info.size > 0 && (m_volumeProxyBuffer == nullptr || info.size > m_volumeProxyBuffer->info().size)) {
+        m_volumeProxyBuffer = m_device->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXAccelerationStructure, "Volume Proxy Buffer");
+      }
+      ctx->writeToBuffer(m_volumeProxyBuffer, 0, m_activeVolumeProxyCount * sizeof(MemoryParticleVolume), memoryVolumes.data());
     }
   }
 

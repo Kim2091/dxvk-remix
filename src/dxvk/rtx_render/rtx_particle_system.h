@@ -314,15 +314,41 @@ namespace dxvk {
       */
     void simulate(RtxContext* ctx);
 
+    // Descriptor for a single active volume, used for resolve-phase binding.
+    struct ActiveVolumeDescriptor {
+      Vector3 aabbMin;
+      Vector3 aabbMax;
+      uint32_t gridDimension;
+      float smokeDensity;
+      float smokeAbsorptionCrossSection;
+      float emissionIntensityScale;
+      Rc<DxvkImageView> densityView;
+      Rc<DxvkImageView> temperatureView;
+    };
+
     /**
-      * Composites all active volumetric particle systems into the composited
-      * color buffer via screen-space ray-marching.  Should be called after the
-      * main composite pass.
-      *
-      * \param ctx       The RtxContext for issuing GPU commands.
-      * \param rtOutput  The raytracing output containing GBuffer and color buffer.
+      * Returns descriptors for all active particle volumes (up to MAX_PARTICLE_VOLUMES).
+      * Used by the raytracing binding system to bind volume textures and fill
+      * the ParticleVolumeResolveArgs in the constant buffer.
       */
-    void compositeVolumes(RtxContext* ctx, const Resources::RaytracingOutput& rtOutput);
+    std::vector<ActiveVolumeDescriptor> getActiveVolumeDescriptors() const;
+
+    /**
+      * Returns the blackbody LUT image view. The LUT is generated lazily on first
+      * call; subsequent calls return the cached texture.
+      */
+    Rc<DxvkImageView> getBlackbodyLUTView() const { return m_blackbodyLUT.view; }
+
+    /**
+      * Returns true if the blackbody LUT has been generated.
+      */
+    bool isBlackbodyLUTGenerated() const { return m_blackbodyLUTGenerated; }
+
+    /**
+      * Ensures the blackbody LUT has been generated. Call once per frame before
+      * binding volume textures.
+      */
+    void ensureBlackbodyLUT(RtxContext* ctx);
 
     uint64_t totalVolumeMemoryBytes() const { return m_totalVolumeMemoryBytes; }
   };

@@ -30,15 +30,29 @@
 #include "rtx/pass/particles/particle_volume_bindings.slangh"
 #include "rtx/pass/particles/particle_volume_helpers.slangh"
 
-Texture3D<vec4>  VelocityInput    : register(t0, space1);
-Texture3D<float> DensityInput     : register(t1, space1);
-Texture3D<float> TemperatureInput : register(t2, space1);
-Texture3D<float> ObstacleInput    : register(t3, space1);
-SamplerState     LinearSampler    : register(s0, space1);
+[[vk::binding(PARTICLE_VOLUME_BINDING_VELOCITY_INPUT)]]
+Texture3D<vec4>  VelocityInput;
 
-RWTexture3D<float> DensityOutput     : register(u0, space2);
-RWTexture3D<float> TemperatureOutput : register(u1, space2);
-RWTexture3D<vec4>  VelocityOutput    : register(u2, space2);
+[[vk::binding(PARTICLE_VOLUME_BINDING_DENSITY_INPUT)]]
+Texture3D<float> DensityInput;
+
+[[vk::binding(PARTICLE_VOLUME_BINDING_TEMPERATURE_INPUT)]]
+Texture3D<float> TemperatureInput;
+
+[[vk::binding(PARTICLE_VOLUME_BINDING_OBSTACLE_INPUT)]]
+Texture3D<float> ObstacleInput;
+
+[[vk::binding(PARTICLE_VOLUME_BINDING_LINEAR_SAMPLER)]]
+SamplerState     LinearSampler;
+
+[[vk::binding(PARTICLE_VOLUME_BINDING_DENSITY_OUTPUT)]]
+RWTexture3D<float> DensityOutput;
+
+[[vk::binding(PARTICLE_VOLUME_BINDING_TEMPERATURE_OUTPUT)]]
+RWTexture3D<float> TemperatureOutput;
+
+[[vk::binding(PARTICLE_VOLUME_BINDING_VELOCITY_OUTPUT)]]
+RWTexture3D<vec4>  VelocityOutput;
 
 struct AdvectPushConstants
 {
@@ -77,8 +91,11 @@ void main(uvec3 threadID : SV_DispatchThreadID)
   // World-space position of this cell's center
   const vec3 cellWorldPos = particleVolumeGridToWorld(threadID, cb);
 
-  // Sample velocity at this cell and backtrace
-  const vec3 velocity  = particleVolumeSampleVelocity(VelocityInput, LinearSampler, cellWorldPos, cb);
+  // Sample velocity at this cell and backtrace.
+  // Semi-Lagrangian advection is unconditionally stable — no CFL clamp needed.
+  // The backtrace position is clamped to the AABB below, so overshooting just
+  // samples from the boundary (zero density/velocity).
+  const vec3 velocity = particleVolumeSampleVelocity(VelocityInput, LinearSampler, cellWorldPos, cb);
   vec3       sourcePos = cellWorldPos - velocity * dt;
 
   // Clamp source position to the volume AABB

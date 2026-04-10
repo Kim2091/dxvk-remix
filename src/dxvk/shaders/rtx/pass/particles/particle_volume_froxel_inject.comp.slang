@@ -64,7 +64,7 @@ vec3 froxelToWorldPosition(uvec3 froxelCoord, FroxelInjectConstants froxelCb)
   // Apply depth exponent for non-linear (logarithmic-style) depth distribution
   uvw.z = pow(uvw.z, froxelCb.froxelDepthExponent);
 
-  const vec4 worldPos = froxelCb.froxelToWorld * vec4(uvw * 2.0f - 1.0f, 1.0f);
+  const vec4 worldPos = mul(froxelCb.froxelToWorld, vec4(uvw * 2.0f - 1.0f, 1.0f));
   return worldPos.xyz / worldPos.w;
 }
 

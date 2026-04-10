@@ -1598,7 +1598,7 @@ namespace dxvk {
     m_accelManager.mergeInstancesIntoBlas(ctx, execBarriers, textureManager.getTextureTable(), m_cameraManager, m_instanceManager, m_opacityMicromapManager.get());
 
     // Call on the other managers to prepare their GPU data for the current scene
-    m_accelManager.prepareSceneData(ctx, execBarriers, m_instanceManager);
+    m_accelManager.prepareSceneData(ctx, execBarriers, m_instanceManager, &m_device->getCommon()->metaParticleSystem());
     m_lightManager.prepareSceneData(ctx, m_cameraManager);
 
     // Upload surface material buffer BEFORE the GPU culling dispatch so the

@@ -106,17 +106,6 @@ namespace dxvk {
       uint32_t particleCount,
       Rc<DxvkImageView> prevWorldPosView = nullptr);
 
-    // Composite this volume into the color buffer via screen-space ray-march.
-    // worldPosView: current-frame primary world position GBuffer texture.
-    // colorView:    the composited color output (read-write).
-    // blackbodyLUT: precomputed blackbody color lookup table.
-    void compositeVolume(
-      Rc<DxvkContext>& ctx,
-      const ParticleVolumeConstants& constants,
-      Rc<DxvkImageView> worldPosView,
-      Rc<DxvkImageView> colorView,
-      Rc<DxvkImageView> blackbodyLUTView);
-
     // Accessor: current resolution.
     Resolution currentResolution() const { return m_resolution; }
 
@@ -139,8 +128,10 @@ namespace dxvk {
     Resolution resolutionFromDistance(float distanceMeters) const;
 
     // --- GPU resources ---
-    Resources::Resource m_density;        // R16_SFLOAT 3D — smoke/fire density
-    Resources::Resource m_temperature;    // R16_SFLOAT 3D — temperature
+    Resources::Resource m_density;        // R16_SFLOAT 3D — smoke/fire density (current frame)
+    Resources::Resource m_prevDensity;    // R16_SFLOAT 3D — density (previous frame, for advection read)
+    Resources::Resource m_temperature;    // R16_SFLOAT 3D — temperature (current frame)
+    Resources::Resource m_prevTemperature;// R16_SFLOAT 3D — temperature (previous frame, for advection read)
     Resources::Resource m_velocity;       // R16G16B16A16_SFLOAT 3D — current frame velocity
     Resources::Resource m_prevVelocity;   // R16G16B16A16_SFLOAT 3D — previous frame velocity (two-way coupling)
     Resources::Resource m_obstacle;       // R8_UNORM 3D — obstacle mask

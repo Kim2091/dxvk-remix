@@ -23,7 +23,8 @@
 #include "dxvk_device.h"
 #include "rtx_render/rtx_shader_manager.h"
 
-#include "rtx/pass/common_binding_indices.h" 
+#include "rtx/pass/common_binding_indices.h"
+#include "rtx/pass/raytrace_args.h"
 #include "dxvk_scoped_annotation.h"
 #include "dxvk_context.h"
 #include "rtx_context.h"
@@ -781,10 +782,10 @@ namespace dxvk {
           m_totalVolumeMemoryBytes -= pParticleSystem->pVolume->memoryUsageBytes();
           pParticleSystem->pVolume->release();
         } else if (wantsVolume && hasVolume) {
-          // Update AABB; resolution transitions will be handled in a later task.
-          pParticleSystem->pVolume->updateAABB(
-            cameraPosition, boundsMin, boundsMax,
-            pParticleSystem->context.desc.volumePadding);
+          // AABB is locked after allocation. Updating it every frame shifts the
+          // UVW coordinate system, warping the density/velocity fields and
+          // destroying the fluid simulation. The AABB only changes if the volume
+          // is reallocated (resolution transition).
         }
       }
 
@@ -824,6 +825,7 @@ namespace dxvk {
         volumeConstants.renderingWidth       = ctx->getSceneManager().getCamera().m_renderResolution[0];
         volumeConstants.renderingHeight      = ctx->getSceneManager().getCamera().m_renderResolution[1];
         volumeConstants.cameraPosition       = cameraPosition;
+        volumeConstants.maxTimeToLive        = desc.maxTimeToLive;
         volumeConstants.prevWorldToProjection =
           ctx->getSceneManager().getCamera().getPreviousViewToProjection() *
           ctx->getSceneManager().getCamera().getPreviousWorldToView();
@@ -1244,59 +1246,14 @@ namespace dxvk {
     }
   }
 
-  void RtxParticleSystemManager::compositeVolumes(RtxContext* ctx, const Resources::RaytracingOutput& rtOutput) {
-    ScopedCpuProfileZone();
+  std::vector<RtxParticleSystemManager::ActiveVolumeDescriptor> RtxParticleSystemManager::getActiveVolumeDescriptors() const {
+    std::vector<ActiveVolumeDescriptor> result;
 
     if (!enable() || !m_initialized || !ParticleVolume::enable()) {
-      return;
+      return result;
     }
 
-    // Check if any particle system has an active volume — early out if none.
-    uint32_t activeVolumeCount = 0;
     for (const auto& [materialHash, pParticleSystem] : m_particleSystems) {
-      if (pParticleSystem->pVolume && pParticleSystem->pVolume->isAllocated()) {
-        activeVolumeCount++;
-      }
-    }
-    if (activeVolumeCount == 0) {
-      return;
-    }
-
-    ONCE(Logger::info(str::format("[ParticleVolume] compositeVolumes: ", activeVolumeCount, " active volume(s)")));
-
-    ScopedGpuProfileZone(ctx, "ParticleVolume_CompositeAll");
-
-    Rc<DxvkContext> dxvkCtx(ctx);
-
-    // Generate the blackbody LUT if not yet done.
-    if (!m_blackbodyLUTGenerated) {
-      m_blackbodyLUT = Resources::createImageResource(dxvkCtx, "particle volume blackbody LUT",
-        { 256u, 1u, 1u }, VK_FORMAT_R16G16B16A16_SFLOAT);
-
-      ctx->bindResourceView(0, m_blackbodyLUT.view, nullptr);
-      ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, BlackbodyLutShader::getShader());
-      ctx->dispatch(1, 1, 1);
-
-      // Barrier: ensure LUT write completes before any reads.
-      ctx->emitMemoryBarrier(0,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_ACCESS_SHADER_WRITE_BIT,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_ACCESS_SHADER_READ_BIT);
-
-      m_blackbodyLUTGenerated = true;
-    }
-
-    const Vector3 cameraPosition = ctx->getSceneManager().getCamera().getPosition();
-    const uint32_t frameIdx = ctx->getDevice()->getCurrentFrameId();
-
-    // Access the current-frame world position texture and the composite output.
-    Rc<DxvkImageView> worldPosView = rtOutput.getCurrentPrimaryWorldPositionWorldTriangleNormal().view(
-      Resources::AccessType::Read);
-    Rc<DxvkImageView> colorView = rtOutput.m_compositeOutput.view(
-      Resources::AccessType::ReadWrite);
-
-    for (auto& [materialHash, pParticleSystem] : m_particleSystems) {
       if (!pParticleSystem->pVolume || !pParticleSystem->pVolume->isAllocated()) {
         continue;
       }
@@ -1304,41 +1261,47 @@ namespace dxvk {
       const GpuParticleSystemDesc& desc = pParticleSystem->context.desc;
       const ParticleVolume& vol = *pParticleSystem->pVolume;
 
-      ParticleVolumeConstants volumeConstants {};
-      volumeConstants.gridDimension        = { vol.gridDimension(), vol.gridDimension(), vol.gridDimension() };
-      volumeConstants.aabbMin              = vol.aabbMin();
-      volumeConstants.aabbMax              = vol.aabbMax();
-      volumeConstants.deltaTimeSecs        = 0.f; // Not needed for composite
-      volumeConstants.absoluteTimeSecs     = 0.f;
-      volumeConstants.frameIdx             = frameIdx;
-      volumeConstants.smokeDensity         = desc.smokeDensity;
-      volumeConstants.smokeAbsorptionCrossSection = desc.smokeAbsorptionCrossSection;
-      volumeConstants.emissionIntensityScale = desc.emissionIntensityScale;
-      volumeConstants.sceneScale           = RtxOptions::sceneScale();
-      volumeConstants.renderingWidth       = rtOutput.m_compositeOutputExtent.width;
-      volumeConstants.renderingHeight      = rtOutput.m_compositeOutputExtent.height;
-      volumeConstants.cameraPosition       = cameraPosition;
+      ActiveVolumeDescriptor avd {};
+      avd.aabbMin = vol.aabbMin();
+      avd.aabbMax = vol.aabbMax();
+      avd.gridDimension = vol.gridDimension();
+      avd.smokeDensity = desc.smokeDensity;
+      avd.smokeAbsorptionCrossSection = desc.smokeAbsorptionCrossSection;
+      avd.emissionIntensityScale = desc.emissionIntensityScale;
+      avd.densityView = vol.densityTexture().view;
+      avd.temperatureView = vol.temperatureTexture().view;
 
-      ONCE(Logger::info(str::format("[ParticleVolume] Dispatching composite: AABB=(",
-        volumeConstants.aabbMin.x, ", ", volumeConstants.aabbMin.y, ", ", volumeConstants.aabbMin.z,
-        ")-(", volumeConstants.aabbMax.x, ", ", volumeConstants.aabbMax.y, ", ", volumeConstants.aabbMax.z,
-        ") cam=(", cameraPosition.x, ", ", cameraPosition.y, ", ", cameraPosition.z,
-        ") res=", volumeConstants.renderingWidth, "x", volumeConstants.renderingHeight)));
+      result.push_back(std::move(avd));
 
-      pParticleSystem->pVolume->compositeVolume(
-        dxvkCtx,
-        volumeConstants,
-        worldPosView,
-        colorView,
-        m_blackbodyLUT.view);
-
-      // Barrier between volumes so reads of the color buffer are consistent.
-      ctx->emitMemoryBarrier(0,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_ACCESS_SHADER_WRITE_BIT,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_ACCESS_SHADER_READ_BIT);
+      if (result.size() >= MAX_PARTICLE_VOLUMES) {
+        break;
+      }
     }
+
+    return result;
+  }
+
+  void RtxParticleSystemManager::ensureBlackbodyLUT(RtxContext* ctx) {
+    if (m_blackbodyLUTGenerated) {
+      return;
+    }
+
+    Rc<DxvkContext> dxvkCtx(ctx);
+    m_blackbodyLUT = Resources::createImageResource(dxvkCtx, "particle volume blackbody LUT",
+      { 256u, 1u, 1u }, VK_FORMAT_R16G16B16A16_SFLOAT);
+
+    ctx->bindResourceView(0, m_blackbodyLUT.view, nullptr);
+    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, BlackbodyLutShader::getShader());
+    ctx->dispatch(1, 1, 1);
+
+    // Barrier: ensure LUT write completes before any reads.
+    ctx->emitMemoryBarrier(0,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      VK_ACCESS_SHADER_WRITE_BIT,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      VK_ACCESS_SHADER_READ_BIT);
+
+    m_blackbodyLUTGenerated = true;
   }
 
 }

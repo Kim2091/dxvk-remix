@@ -175,7 +175,7 @@ remixapi_ErrorCode init(HWND hwnd) {
       .sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO,
       .pNext = &sphereLight,
       .hash = 0x3,
-      .radiance = { 15, 15, 20 },
+      .radiance = { 60, 60, 80 },
     };
 
     remixapi_ErrorCode r = g_remix.CreateLight(&lightInfo, &g_scene_light);
@@ -351,10 +351,10 @@ void render(uint32_t windowWidth, uint32_t windowHeight) {
       .maxVelocity = { particleMaxVelocity, 1 },
       .minTimeToLive = 2.f,
       .maxTimeToLive = 4.f,
-      .initialVelocityFromNormal = 20.f,
+      .initialVelocityFromNormal = 50.f,
       .initialVelocityConeAngleDegrees = 30.f,
-      .dragCoefficient = 0.1f,
-      .gravityForce = -5.f,
+      .dragCoefficient = 0.15f,
+      .gravityForce = -2.f,
       .spawnRatePerSecond = 200.f,
       // Volumetric smoke/fire parameters (campfire preset)
       .smokeDensity = 1.5f,
@@ -367,7 +367,7 @@ void render(uint32_t windowWidth, uint32_t windowHeight) {
       .windDirection = {0.f, 0.f, 0.f},
       .vorticityConfinement = 0.3f,
       .fluidCouplingStrength = 0.9f,
-      .emissionIntensityScale = 1.f,
+      .emissionIntensityScale = 0.5f,
       .volumePadding = 0.2f,
       .volumeDecayTime = 3.f,
       .pressureIterations = 30,
@@ -378,7 +378,7 @@ void render(uint32_t windowWidth, uint32_t windowHeight) {
     remixapi_InstanceInfo emitterInst = {
       .sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO,
       .pNext = &particleInfo,
-      .categoryFlags = 0,
+      .categoryFlags = REMIXAPI_INSTANCE_CATEGORY_BIT_PARTICLE_EMITTER,
       .mesh = g_emitter_mesh,
       .transform = { {
         {1,0,0,0},

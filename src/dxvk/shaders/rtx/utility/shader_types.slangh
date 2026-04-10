@@ -96,6 +96,11 @@ T texelFetch<T : ITexelElement>(Texture2DArray<T> tex, int3 loc, int mip)
   return tex.Load(int4(loc, mip));
 }
 
+T texelFetch<T : ITexelElement>(Texture3D<T> tex, int3 loc, int mip)
+{
+  return tex.Load(int4(loc, mip));
+}
+
 T textureGrad<T : ITexelElement>(Sampler2D<T> tex, float2 loc, float2 du, float2 dv)
 {
   return tex.SampleGrad(loc, du, dv);

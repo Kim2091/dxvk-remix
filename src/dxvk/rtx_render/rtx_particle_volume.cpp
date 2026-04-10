@@ -33,8 +33,6 @@
 #include <rtx_shaders/particle_volume_pressure.h>
 #include <rtx_shaders/particle_volume_project.h>
 #include <rtx_shaders/particle_volume_advect.h>
-#include <rtx_shaders/particle_volume_composite.h>
-
 namespace dxvk {
 
   // Defined within an unnamed namespace to ensure unique definition across binary
@@ -80,6 +78,7 @@ namespace dxvk {
 
       BEGIN_PARAMETER()
         CONSTANT_BUFFER(PARTICLE_VOLUME_BINDING_CONSTANTS)
+        TEXTURE3D(PARTICLE_VOLUME_BINDING_DENSITY_INPUT)
         TEXTURE3D(PARTICLE_VOLUME_BINDING_TEMPERATURE_INPUT)
         TEXTURE3D(PARTICLE_VOLUME_BINDING_OBSTACLE_INPUT)
         RW_TEXTURE3D(PARTICLE_VOLUME_BINDING_VELOCITY_OUTPUT)
@@ -150,38 +149,21 @@ namespace dxvk {
 
     PREWARM_SHADER_PIPELINE(ParticleVolumeAdvect);
 
-    // ---------------------------------------------------------------------------
-    // Composite pass: screen-space ray-march that blends volume fire/smoke into
-    // the composited color buffer.
-    class ParticleVolumeComposite : public ManagedShader {
-      SHADER_SOURCE(ParticleVolumeComposite, VK_SHADER_STAGE_COMPUTE_BIT, particle_volume_composite)
-
-      BEGIN_PARAMETER()
-        CONSTANT_BUFFER(PARTICLE_VOLUME_BINDING_CONSTANTS)
-        TEXTURE3D(PARTICLE_VOLUME_BINDING_DENSITY_INPUT)
-        TEXTURE3D(PARTICLE_VOLUME_BINDING_TEMPERATURE_INPUT)
-        SAMPLER2D(PARTICLE_VOLUME_BINDING_BLACKBODY_LUT_INPUT)
-        SAMPLER(PARTICLE_VOLUME_BINDING_LINEAR_SAMPLER)
-        TEXTURE2D(PARTICLE_VOLUME_BINDING_COMPOSITE_WORLD_POS_INPUT)
-        RW_TEXTURE2D(PARTICLE_VOLUME_BINDING_COMPOSITE_COLOR_INOUT)
-      END_PARAMETER()
-    };
-
-    PREWARM_SHADER_PIPELINE(ParticleVolumeComposite);
-
   } // anonymous namespace
 
 
   // Bytes per grid cell across all textures:
-  //   density     : R16_SFLOAT          = 2 bytes
-  //   temperature : R16_SFLOAT          = 2 bytes
-  //   velocity    : R16G16B16A16_SFLOAT = 8 bytes
-  //   prevVelocity: R16G16B16A16_SFLOAT = 8 bytes
-  //   obstacle    : R8_UNORM            = 1 byte
-  //   pressure[0] : R16_SFLOAT          = 2 bytes
-  //   pressure[1] : R16_SFLOAT          = 2 bytes
-  //   total                             = 25 bytes
-  static constexpr size_t kBytesPerCell = 25u;
+  //   density       : R16_SFLOAT          = 2 bytes
+  //   prevDensity   : R16_SFLOAT          = 2 bytes
+  //   temperature   : R16_SFLOAT          = 2 bytes
+  //   prevTemperature: R16_SFLOAT         = 2 bytes
+  //   velocity      : R16G16B16A16_SFLOAT = 8 bytes
+  //   prevVelocity  : R16G16B16A16_SFLOAT = 8 bytes
+  //   obstacle      : R8_UNORM            = 1 byte
+  //   pressure[0]   : R16_SFLOAT          = 2 bytes
+  //   pressure[1]   : R16_SFLOAT          = 2 bytes
+  //   total                               = 29 bytes
+  static constexpr size_t kBytesPerCell = 29u;
 
   // ---------------------------------------------------------------------------
   ParticleVolume::~ParticleVolume() {
@@ -203,7 +185,13 @@ namespace dxvk {
     m_density = Resources::createImageResource(ctx, "particle volume density",
       extent, VK_FORMAT_R16_SFLOAT, 1, VK_IMAGE_TYPE_3D, VK_IMAGE_VIEW_TYPE_3D);
 
+    m_prevDensity = Resources::createImageResource(ctx, "particle volume prev density",
+      extent, VK_FORMAT_R16_SFLOAT, 1, VK_IMAGE_TYPE_3D, VK_IMAGE_VIEW_TYPE_3D);
+
     m_temperature = Resources::createImageResource(ctx, "particle volume temperature",
+      extent, VK_FORMAT_R16_SFLOAT, 1, VK_IMAGE_TYPE_3D, VK_IMAGE_VIEW_TYPE_3D);
+
+    m_prevTemperature = Resources::createImageResource(ctx, "particle volume prev temperature",
       extent, VK_FORMAT_R16_SFLOAT, 1, VK_IMAGE_TYPE_3D, VK_IMAGE_VIEW_TYPE_3D);
 
     m_velocity = Resources::createImageResource(ctx, "particle volume velocity",
@@ -245,7 +233,9 @@ namespace dxvk {
     ScopedCpuProfileZone();
 
     m_density.reset();
+    m_prevDensity.reset();
     m_temperature.reset();
+    m_prevTemperature.reset();
     m_velocity.reset();
     m_prevVelocity.reset();
     m_obstacle.reset();
@@ -369,7 +359,129 @@ namespace dxvk {
     }
 
     // -------------------------------------------------------------------------
-    // Pass 2 — Splat (one thread per particle)
+    // Snapshot current fields into prev buffers for advection.
+    // Advection reads from prev (clean snapshot) and writes to current.
+    // -------------------------------------------------------------------------
+    {
+      VkImageSubresourceLayers subresource;
+      subresource.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+      subresource.mipLevel       = 0;
+      subresource.baseArrayLayer = 0;
+      subresource.layerCount     = 1;
+
+      ctx->copyImage(
+        m_prevVelocity.image, subresource, VkOffset3D { 0, 0, 0 },
+        m_velocity.image,     subresource, VkOffset3D { 0, 0, 0 },
+        VkExtent3D { dim, dim, dim });
+
+      ctx->copyImage(
+        m_prevDensity.image, subresource, VkOffset3D { 0, 0, 0 },
+        m_density.image,     subresource, VkOffset3D { 0, 0, 0 },
+        VkExtent3D { dim, dim, dim });
+
+      ctx->copyImage(
+        m_prevTemperature.image, subresource, VkOffset3D { 0, 0, 0 },
+        m_temperature.image,     subresource, VkOffset3D { 0, 0, 0 },
+        VkExtent3D { dim, dim, dim });
+    }
+
+    emitComputeBarrier();
+
+    // Create a linear-clamp sampler for the advection trilinear sampling.
+    Rc<DxvkSampler> linearSampler;
+    {
+      DxvkSamplerCreateInfo samplerInfo {};
+      samplerInfo.magFilter      = VK_FILTER_LINEAR;
+      samplerInfo.minFilter      = VK_FILTER_LINEAR;
+      samplerInfo.mipmapMode     = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+      samplerInfo.mipmapLodBias  = 0.f;
+      samplerInfo.mipmapLodMin   = 0.f;
+      samplerInfo.mipmapLodMax   = 0.f;
+      samplerInfo.useAnisotropy  = VK_FALSE;
+      samplerInfo.maxAnisotropy  = 1.f;
+      samplerInfo.addressModeU   = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+      samplerInfo.addressModeV   = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+      samplerInfo.addressModeW   = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+      samplerInfo.compareToDepth = VK_FALSE;
+      samplerInfo.compareOp      = VK_COMPARE_OP_ALWAYS;
+      samplerInfo.borderColor    = {};
+      samplerInfo.usePixelCoord  = VK_FALSE;
+      linearSampler = ctx->getDevice()->createSampler(samplerInfo);
+    }
+
+    // -------------------------------------------------------------------------
+    // Pass 2 — Advect density and temperature (advectVelocity = 0)
+    // Reads from prev buffers (clean snapshot), writes to current buffers.
+    // Uses the previous frame's divergence-free velocity for backtrace.
+    // -------------------------------------------------------------------------
+    {
+      ScopedGpuProfileZone(ctx, "ParticleVolume_AdvectDensityTemp");
+
+      ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, ParticleVolumeAdvect::getShader());
+
+      ctx->bindResourceView(PARTICLE_VOLUME_BINDING_VELOCITY_INPUT,
+        m_prevVelocity.view, nullptr);
+      ctx->bindResourceView(PARTICLE_VOLUME_BINDING_DENSITY_INPUT,
+        m_prevDensity.view, nullptr);
+      ctx->bindResourceView(PARTICLE_VOLUME_BINDING_TEMPERATURE_INPUT,
+        m_prevTemperature.view, nullptr);
+      ctx->bindResourceView(PARTICLE_VOLUME_BINDING_OBSTACLE_INPUT,
+        m_obstacle.view, nullptr);
+      ctx->bindResourceSampler(PARTICLE_VOLUME_BINDING_LINEAR_SAMPLER, linearSampler);
+      ctx->bindResourceView(PARTICLE_VOLUME_BINDING_DENSITY_OUTPUT,
+        m_density.view, nullptr);
+      ctx->bindResourceView(PARTICLE_VOLUME_BINDING_TEMPERATURE_OUTPUT,
+        m_temperature.view, nullptr);
+      ctx->bindResourceView(PARTICLE_VOLUME_BINDING_VELOCITY_OUTPUT,
+        m_velocity.view, nullptr);
+
+      ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
+      const AdvectPushConstants pushConst { 0u, 0u };
+      ctx->pushConstants(0, sizeof(pushConst), &pushConst);
+
+      ctx->dispatch(groups3D, groups3D, groups3D);
+    }
+
+    emitComputeBarrier();
+
+    // -------------------------------------------------------------------------
+    // Pass 3 — Advect velocity (advectVelocity = 1)
+    // Reads from prevVelocity, writes to velocity.
+    // -------------------------------------------------------------------------
+    {
+      ScopedGpuProfileZone(ctx, "ParticleVolume_AdvectVelocity");
+
+      ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, ParticleVolumeAdvect::getShader());
+
+      ctx->bindResourceView(PARTICLE_VOLUME_BINDING_VELOCITY_INPUT,
+        m_prevVelocity.view, nullptr);
+      ctx->bindResourceView(PARTICLE_VOLUME_BINDING_DENSITY_INPUT,
+        m_prevDensity.view, nullptr);
+      ctx->bindResourceView(PARTICLE_VOLUME_BINDING_TEMPERATURE_INPUT,
+        m_prevTemperature.view, nullptr);
+      ctx->bindResourceView(PARTICLE_VOLUME_BINDING_OBSTACLE_INPUT,
+        m_obstacle.view, nullptr);
+      ctx->bindResourceSampler(PARTICLE_VOLUME_BINDING_LINEAR_SAMPLER, linearSampler);
+      ctx->bindResourceView(PARTICLE_VOLUME_BINDING_DENSITY_OUTPUT,
+        m_density.view, nullptr);
+      ctx->bindResourceView(PARTICLE_VOLUME_BINDING_TEMPERATURE_OUTPUT,
+        m_temperature.view, nullptr);
+      ctx->bindResourceView(PARTICLE_VOLUME_BINDING_VELOCITY_OUTPUT,
+        m_velocity.view, nullptr);
+
+      ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
+      const AdvectPushConstants pushConst { 1u, 0u };
+      ctx->pushConstants(0, sizeof(pushConst), &pushConst);
+
+      ctx->dispatch(groups3D, groups3D, groups3D);
+    }
+
+    emitComputeBarrier();
+
+    // -------------------------------------------------------------------------
+    // Pass 4 — Splat (one thread per particle)
+    // Adds sources on top of the advected field. This runs AFTER advection so
+    // that splatted density/temperature survive to the render pass.
     // -------------------------------------------------------------------------
     {
       ScopedGpuProfileZone(ctx, "ParticleVolume_Splat");
@@ -394,13 +506,16 @@ namespace dxvk {
     emitComputeBarrier();
 
     // -------------------------------------------------------------------------
-    // Pass 3 — Forces (buoyancy, wind, vorticity)
+    // Pass 5 — Forces (buoyancy, wind, vorticity)
+    // Uses post-splat temperature for buoyancy calculation.
     // -------------------------------------------------------------------------
     {
       ScopedGpuProfileZone(ctx, "ParticleVolume_Forces");
 
       ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, ParticleVolumeForces::getShader());
 
+      ctx->bindResourceView(PARTICLE_VOLUME_BINDING_DENSITY_INPUT,
+        m_density.view, nullptr);
       ctx->bindResourceView(PARTICLE_VOLUME_BINDING_TEMPERATURE_INPUT,
         m_temperature.view, nullptr);
       ctx->bindResourceView(PARTICLE_VOLUME_BINDING_OBSTACLE_INPUT,
@@ -414,7 +529,7 @@ namespace dxvk {
     emitComputeBarrier();
 
     // -------------------------------------------------------------------------
-    // Pass 4 — Pressure Jacobi iterations (ping-pong)
+    // Pass 6 — Pressure Jacobi iterations (ping-pong)
     // -------------------------------------------------------------------------
     {
       ScopedGpuProfileZone(ctx, "ParticleVolume_Pressure");
@@ -445,13 +560,11 @@ namespace dxvk {
     }
 
     // -------------------------------------------------------------------------
-    // Pass 4b — Project (subtract pressure gradient, enforce incompressibility)
+    // Pass 6b — Project (subtract pressure gradient, enforce incompressibility)
     // -------------------------------------------------------------------------
     {
       ScopedGpuProfileZone(ctx, "ParticleVolume_Project");
 
-      // After N iterations the latest pressure result is in pressure[(N-1)&1 ^ 1]
-      // = pressure[iterations & 1].  Use that as the final pressure input.
       const uint32_t iterations = constants.pressureIterations > 0
         ? constants.pressureIterations
         : 20u;
@@ -468,186 +581,6 @@ namespace dxvk {
 
       ctx->dispatch(groups3D, groups3D, groups3D);
     }
-
-    emitComputeBarrier();
-
-    // Copy projected velocity -> prevVelocity for two-way coupling next frame.
-    {
-      VkImageSubresourceLayers subresource;
-      subresource.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
-      subresource.mipLevel       = 0;
-      subresource.baseArrayLayer = 0;
-      subresource.layerCount     = 1;
-
-      ctx->copyImage(
-        m_prevVelocity.image,
-        subresource,
-        VkOffset3D { 0, 0, 0 },
-        m_velocity.image,
-        subresource,
-        VkOffset3D { 0, 0, 0 },
-        VkExtent3D { dim, dim, dim });
-    }
-
-    emitComputeBarrier();
-
-    // Create a linear-clamp sampler for the advection trilinear sampling.
-    Rc<DxvkSampler> linearSampler;
-    {
-      DxvkSamplerCreateInfo samplerInfo {};
-      samplerInfo.magFilter      = VK_FILTER_LINEAR;
-      samplerInfo.minFilter      = VK_FILTER_LINEAR;
-      samplerInfo.mipmapMode     = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-      samplerInfo.mipmapLodBias  = 0.f;
-      samplerInfo.mipmapLodMin   = 0.f;
-      samplerInfo.mipmapLodMax   = 0.f;
-      samplerInfo.useAnisotropy  = VK_FALSE;
-      samplerInfo.maxAnisotropy  = 1.f;
-      samplerInfo.addressModeU   = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-      samplerInfo.addressModeV   = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-      samplerInfo.addressModeW   = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-      samplerInfo.compareToDepth = VK_FALSE;
-      samplerInfo.compareOp      = VK_COMPARE_OP_ALWAYS;
-      samplerInfo.borderColor    = {};
-      samplerInfo.usePixelCoord  = VK_FALSE;
-      linearSampler = ctx->getDevice()->createSampler(samplerInfo);
-    }
-
-    // -------------------------------------------------------------------------
-    // Pass 5 — Advect density and temperature (advectVelocity = 0)
-    // -------------------------------------------------------------------------
-    {
-      ScopedGpuProfileZone(ctx, "ParticleVolume_AdvectDensityTemp");
-
-      ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, ParticleVolumeAdvect::getShader());
-
-      ctx->bindResourceView(PARTICLE_VOLUME_BINDING_VELOCITY_INPUT,
-        m_velocity.view, nullptr);
-      ctx->bindResourceView(PARTICLE_VOLUME_BINDING_DENSITY_INPUT,
-        m_density.view, nullptr);
-      ctx->bindResourceView(PARTICLE_VOLUME_BINDING_TEMPERATURE_INPUT,
-        m_temperature.view, nullptr);
-      ctx->bindResourceView(PARTICLE_VOLUME_BINDING_OBSTACLE_INPUT,
-        m_obstacle.view, nullptr);
-      ctx->bindResourceSampler(PARTICLE_VOLUME_BINDING_LINEAR_SAMPLER, linearSampler);
-      ctx->bindResourceView(PARTICLE_VOLUME_BINDING_DENSITY_OUTPUT,
-        m_density.view, nullptr);
-      ctx->bindResourceView(PARTICLE_VOLUME_BINDING_TEMPERATURE_OUTPUT,
-        m_temperature.view, nullptr);
-      ctx->bindResourceView(PARTICLE_VOLUME_BINDING_VELOCITY_OUTPUT,
-        m_velocity.view, nullptr);
-
-      ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
-      const AdvectPushConstants pushConst { 0u, 0u };
-      ctx->pushConstants(0, sizeof(pushConst), &pushConst);
-
-      ctx->dispatch(groups3D, groups3D, groups3D);
-    }
-
-    emitComputeBarrier();
-
-    // -------------------------------------------------------------------------
-    // Pass 6 — Advect velocity (advectVelocity = 1)
-    // -------------------------------------------------------------------------
-    {
-      ScopedGpuProfileZone(ctx, "ParticleVolume_AdvectVelocity");
-
-      ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, ParticleVolumeAdvect::getShader());
-
-      ctx->bindResourceView(PARTICLE_VOLUME_BINDING_VELOCITY_INPUT,
-        m_velocity.view, nullptr);
-      ctx->bindResourceView(PARTICLE_VOLUME_BINDING_DENSITY_INPUT,
-        m_density.view, nullptr);
-      ctx->bindResourceView(PARTICLE_VOLUME_BINDING_TEMPERATURE_INPUT,
-        m_temperature.view, nullptr);
-      ctx->bindResourceView(PARTICLE_VOLUME_BINDING_OBSTACLE_INPUT,
-        m_obstacle.view, nullptr);
-      ctx->bindResourceSampler(PARTICLE_VOLUME_BINDING_LINEAR_SAMPLER, linearSampler);
-      ctx->bindResourceView(PARTICLE_VOLUME_BINDING_DENSITY_OUTPUT,
-        m_density.view, nullptr);
-      ctx->bindResourceView(PARTICLE_VOLUME_BINDING_TEMPERATURE_OUTPUT,
-        m_temperature.view, nullptr);
-      ctx->bindResourceView(PARTICLE_VOLUME_BINDING_VELOCITY_OUTPUT,
-        m_velocity.view, nullptr);
-
-      ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
-      const AdvectPushConstants pushConst { 1u, 0u };
-      ctx->pushConstants(0, sizeof(pushConst), &pushConst);
-
-      ctx->dispatch(groups3D, groups3D, groups3D);
-    }
-  }
-
-  // ---------------------------------------------------------------------------
-  void ParticleVolume::compositeVolume(
-      Rc<DxvkContext>& ctx,
-      const ParticleVolumeConstants& constants,
-      Rc<DxvkImageView> worldPosView,
-      Rc<DxvkImageView> colorView,
-      Rc<DxvkImageView> blackbodyLUTView) {
-    ScopedCpuProfileZone();
-
-    if (!isAllocated()) {
-      return;
-    }
-
-    ScopedGpuProfileZone(ctx, "ParticleVolume_Composite");
-
-    // Upload the per-frame constants.
-    ctx->writeToBuffer(m_cb, 0, sizeof(ParticleVolumeConstants), &constants);
-    ctx->bindResourceBuffer(PARTICLE_VOLUME_BINDING_CONSTANTS, DxvkBufferSlice(m_cb));
-
-    // Create a linear-clamp sampler for volume sampling and blackbody LUT.
-    Rc<DxvkSampler> linearSampler;
-    {
-      DxvkSamplerCreateInfo samplerInfo {};
-      samplerInfo.magFilter      = VK_FILTER_LINEAR;
-      samplerInfo.minFilter      = VK_FILTER_LINEAR;
-      samplerInfo.mipmapMode     = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-      samplerInfo.mipmapLodBias  = 0.f;
-      samplerInfo.mipmapLodMin   = 0.f;
-      samplerInfo.mipmapLodMax   = 0.f;
-      samplerInfo.useAnisotropy  = VK_FALSE;
-      samplerInfo.maxAnisotropy  = 1.f;
-      samplerInfo.addressModeU   = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-      samplerInfo.addressModeV   = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-      samplerInfo.addressModeW   = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-      samplerInfo.compareToDepth = VK_FALSE;
-      samplerInfo.compareOp      = VK_COMPARE_OP_ALWAYS;
-      samplerInfo.borderColor    = {};
-      samplerInfo.usePixelCoord  = VK_FALSE;
-      linearSampler = ctx->getDevice()->createSampler(samplerInfo);
-    }
-
-    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, ParticleVolumeComposite::getShader());
-
-    // Bind volume textures (read-only for composite).
-    ctx->bindResourceView(PARTICLE_VOLUME_BINDING_DENSITY_INPUT,
-      m_density.view, nullptr);
-    ctx->bindResourceView(PARTICLE_VOLUME_BINDING_TEMPERATURE_INPUT,
-      m_temperature.view, nullptr);
-
-    // Bind blackbody LUT.
-    ctx->bindResourceView(PARTICLE_VOLUME_BINDING_BLACKBODY_LUT_INPUT,
-      blackbodyLUTView, nullptr);
-    ctx->bindResourceSampler(PARTICLE_VOLUME_BINDING_BLACKBODY_LUT_INPUT,
-      linearSampler);
-
-    // Bind the linear sampler for volume trilinear sampling.
-    ctx->bindResourceSampler(PARTICLE_VOLUME_BINDING_LINEAR_SAMPLER, linearSampler);
-
-    // Bind GBuffer world position (current frame).
-    ctx->bindResourceView(PARTICLE_VOLUME_BINDING_COMPOSITE_WORLD_POS_INPUT,
-      worldPosView, nullptr);
-
-    // Bind the composited color buffer (read-write).
-    ctx->bindResourceView(PARTICLE_VOLUME_BINDING_COMPOSITE_COLOR_INOUT,
-      colorView, nullptr);
-
-    // Dispatch: one thread per pixel at composite resolution.
-    const uint32_t groupsX = (constants.renderingWidth  + 15u) / 16u;
-    const uint32_t groupsY = (constants.renderingHeight +  7u) /  8u;
-    ctx->dispatch(groupsX, groupsY, 1);
   }
 
 } // namespace dxvk

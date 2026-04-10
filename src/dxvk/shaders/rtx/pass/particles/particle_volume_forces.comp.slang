@@ -28,9 +28,17 @@
 #include "rtx/pass/particles/particle_volume_bindings.slangh"
 #include "rtx/pass/particles/particle_volume_helpers.slangh"
 
-Texture3D<float> TemperatureInput : register(t0, space1);
-Texture3D<float> ObstacleInput    : register(t1, space1);
-RWTexture3D<vec4> VelocityOutput  : register(u0, space2);
+[[vk::binding(PARTICLE_VOLUME_BINDING_DENSITY_INPUT)]]
+Texture3D<float> DensityInput;
+
+[[vk::binding(PARTICLE_VOLUME_BINDING_TEMPERATURE_INPUT)]]
+Texture3D<float> TemperatureInput;
+
+[[vk::binding(PARTICLE_VOLUME_BINDING_OBSTACLE_INPUT)]]
+Texture3D<float> ObstacleInput;
+
+[[vk::binding(PARTICLE_VOLUME_BINDING_VELOCITY_OUTPUT)]]
+RWTexture3D<vec4> VelocityOutput;
 
 [shader("compute")]
 [numthreads(8, 8, 8)]
@@ -54,9 +62,26 @@ void main(uvec3 threadID : SV_DispatchThreadID)
   vec4 velSample = VelocityOutput[threadID];
   vec3 vel       = velSample.xyz;
 
-  // Buoyancy: hot fluid rises along the scene up direction
+  // Buoyancy: Nguyen, Fedkiw & Jensen 2002 "Physically Based Modeling of Fire"
+  //   f_buoy = (-alpha * density + beta * (T - T_ambient)) * up
+  // The density term makes heavy smoke resist rising (or sink).
+  // The temperature term makes hot gas rise — only the excess above ambient matters.
+  static const float kAmbientTemperature = 300.0f; // ~27°C room temperature
+  const float density     = DensityInput[threadID];
   const float temperature = TemperatureInput[threadID];
-  vel += cb.upDirection * (temperature * cb.buoyancyCoefficient * cb.sceneScale * dt);
+
+  // alpha: smoke weight. Dense smoke resists rising.
+  const float smokeWeight = density * 0.05f;
+
+  // beta: thermal buoyancy. Normalize excess temperature by burnTemperature
+  // so buoyancyCoefficient is resolution-independent. The 10x multiplier
+  // ensures the default coefficient (0.6) produces visible rise velocity
+  // (~3 world-units/s² at full burn temperature).
+  const float refTemp     = max(cb.burnTemperature, 1.0f);
+  const float thermalLift = saturate((temperature - kAmbientTemperature) / refTemp);
+
+  const float buoyancy = -smokeWeight + thermalLift * cb.buoyancyCoefficient * 10.0f;
+  vel += cb.upDirection * (buoyancy * cb.sceneScale * dt);
 
   // Wind: uniform directional force
   vel.xyz += cb.windDirection * dt;
