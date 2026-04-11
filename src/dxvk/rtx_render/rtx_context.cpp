@@ -1339,13 +1339,13 @@ namespace dxvk {
 
       for (uint32_t i = 0; i < activeVolumes.size() && i < MAX_PARTICLE_VOLUMES; ++i) {
         auto& src = activeVolumes[i];
-        *aabbMinPtrs[i] = vec4(src.aabbMin.x, src.aabbMin.y, src.aabbMin.z, src.smokeDensity);
-        *aabbMaxPtrs[i] = vec4(src.aabbMax.x, src.aabbMax.y, src.aabbMax.z, src.smokeAbsorptionCrossSection);
+        *aabbMinPtrs[i] = vec4(src.aabbMin.x, src.aabbMin.y, src.aabbMin.z, src.absorptionCrossSection);
+        *aabbMaxPtrs[i] = vec4(src.aabbMax.x, src.aabbMax.y, src.aabbMax.z, src.colorScale);
         *gridDimPtrs[i] = vec4(
           static_cast<float>(src.gridDimension),
           static_cast<float>(src.gridDimension),
           static_cast<float>(src.gridDimension),
-          src.emissionIntensityScale);
+          src.alphaScale);
       }
     }
 
@@ -1407,53 +1407,45 @@ namespace dxvk {
       auto& particleSystem = m_device->getCommon()->metaParticleSystem();
       auto activeVolumes = particleSystem.getActiveVolumeDescriptors();
 
-      // Ensure the blackbody LUT is generated if we have active volumes.
+      // Ensure the fire colormap is generated if we have active volumes.
       if (!activeVolumes.empty()) {
-        particleSystem.ensureBlackbodyLUT(this);
+        particleSystem.ensureColormap(this);
       }
 
       // Create a dummy 1x1x1 3D texture for unused volume slots (cached as member).
+      // Uses R16G16B16A16_SFLOAT to match the density4 format.
       if (!m_dummyVolume3D.view.ptr()) {
         Rc<DxvkContext> dxvkCtx(this);
         m_dummyVolume3D = Resources::createImageResource(dxvkCtx, "dummy volume 3D",
-          { 1u, 1u, 1u }, VK_FORMAT_R16_SFLOAT, 1,
+          { 1u, 1u, 1u }, VK_FORMAT_R16G16B16A16_SFLOAT, 1,
           VK_IMAGE_TYPE_3D, VK_IMAGE_VIEW_TYPE_3D);
       }
 
-      // Bind density textures (slots 0..3)
-      const uint32_t densityBindings[MAX_PARTICLE_VOLUMES] = {
-        BINDING_PARTICLE_VOLUME_DENSITY_0, BINDING_PARTICLE_VOLUME_DENSITY_1,
-        BINDING_PARTICLE_VOLUME_DENSITY_2, BINDING_PARTICLE_VOLUME_DENSITY_3
-      };
-      const uint32_t temperatureBindings[MAX_PARTICLE_VOLUMES] = {
-        BINDING_PARTICLE_VOLUME_TEMPERATURE_0, BINDING_PARTICLE_VOLUME_TEMPERATURE_1,
-        BINDING_PARTICLE_VOLUME_TEMPERATURE_2, BINDING_PARTICLE_VOLUME_TEMPERATURE_3
+      // Bind density4 textures (slots 0..3)
+      const uint32_t density4Bindings[MAX_PARTICLE_VOLUMES] = {
+        BINDING_PARTICLE_VOLUME_DENSITY4_0, BINDING_PARTICLE_VOLUME_DENSITY4_1,
+        BINDING_PARTICLE_VOLUME_DENSITY4_2, BINDING_PARTICLE_VOLUME_DENSITY4_3
       };
 
       for (uint32_t i = 0; i < MAX_PARTICLE_VOLUMES; ++i) {
-        if (i < activeVolumes.size() && activeVolumes[i].densityView.ptr()) {
-          bindResourceView(densityBindings[i], activeVolumes[i].densityView, nullptr);
+        if (i < activeVolumes.size() && activeVolumes[i].density4View.ptr()) {
+          bindResourceView(density4Bindings[i], activeVolumes[i].density4View, nullptr);
         } else {
-          bindResourceView(densityBindings[i], m_dummyVolume3D.view, nullptr);
-        }
-        if (i < activeVolumes.size() && activeVolumes[i].temperatureView.ptr()) {
-          bindResourceView(temperatureBindings[i], activeVolumes[i].temperatureView, nullptr);
-        } else {
-          bindResourceView(temperatureBindings[i], m_dummyVolume3D.view, nullptr);
+          bindResourceView(density4Bindings[i], m_dummyVolume3D.view, nullptr);
         }
       }
 
-      // Bind blackbody LUT (or a fallback if not generated).
-      Rc<DxvkImageView> blackbodyView = particleSystem.getBlackbodyLUTView();
-      if (blackbodyView.ptr()) {
-        bindResourceView(BINDING_PARTICLE_VOLUME_BLACKBODY_LUT, blackbodyView, nullptr);
+      // Bind fire colormap (or a fallback if not generated).
+      Rc<DxvkImageView> colormapView = particleSystem.getColormapView();
+      if (colormapView.ptr()) {
+        bindResourceView(BINDING_PARTICLE_VOLUME_COLORMAP, colormapView, nullptr);
       }
 
       // Bind the linear-clamp sampler for volume sampling.
       Rc<DxvkSampler> volumeLinearSampler = getResourceManager().getSampler(
         VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
       bindResourceSampler(BINDING_PARTICLE_VOLUME_LINEAR_SAMPLER, volumeLinearSampler);
-      bindResourceSampler(BINDING_PARTICLE_VOLUME_BLACKBODY_LUT, volumeLinearSampler);
+      bindResourceSampler(BINDING_PARTICLE_VOLUME_COLORMAP, volumeLinearSampler);
     }
   }
 

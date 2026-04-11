@@ -190,9 +190,9 @@ namespace dxvk {
 
     uint64_t m_totalVolumeMemoryBytes = 0;
 
-    // Blackbody LUT: 256x1 RGBA16F texture generated once for fire emission coloring.
-    Resources::Resource m_blackbodyLUT;
-    bool m_blackbodyLUTGenerated = false;
+    // Fire colormap: 256x1 RGBA16F texture generated once for fire emission coloring.
+    Resources::Resource m_colormap;
+    bool m_colormapGenerated = false;
 
     std::vector<SpawnContext> m_spawnContexts;
     bool m_initialized = false;
@@ -254,6 +254,46 @@ namespace dxvk {
     RTX_OPTION("rtx.particles.globalPreset", ParticleRandomFlipAxis, randomFlipAxis, ParticleRandomFlipAxis::None, "Allows the particle to be flipped randomly on spawn based on the selection here.  Controlled per axis (or both).  This feature helps hide repetition when reusing a single particle texture multiple times.");
     RTX_OPTION("rtx.particles.globalPreset", float, initialRotationDeviationDegrees, 0.f, "Range of degrees to rotate each particle by on spawn.");
 
+    // Volume fluid simulation parameters — NvFlow-style combustion/damping/rendering.
+    // These are global controls applied to ALL active volumes, tunable via ImGui.
+
+    // Combustion
+    RTX_OPTION("rtx.particles.volume", float, volIgnitionTemp, 0.05f, "Normalized temperature threshold [0,1] for combustion to begin.");
+    RTX_OPTION("rtx.particles.volume", float, volBurnPerTemp, 4.0f, "Burn rate multiplier per unit excess temperature above ignition.");
+    RTX_OPTION("rtx.particles.volume", float, volFuelPerBurn, 0.25f, "Fuel consumed per unit of burn rate.");
+    RTX_OPTION("rtx.particles.volume", float, volTempPerBurn, 5.0f, "Temperature generated per unit of burn rate.");
+    RTX_OPTION("rtx.particles.volume", float, volSmokePerBurn, 3.0f, "Smoke density generated per unit of burn rate.");
+    RTX_OPTION("rtx.particles.volume", float, volCoolingRate, 1.5f, "Exponential cooling rate for temperature decay.");
+    RTX_OPTION("rtx.particles.volume", float, volDivergencePerBurn, 0.0f, "Pressure expansion per unit of burn (for explosive effects).");
+    RTX_OPTION("rtx.particles.volume", float, volEmitterCoupleRate, 3.0f, "Rate at which emitter values blend into the fluid field per second.");
+    RTX_OPTION("rtx.particles.volume", float, volFuelAmount, 0.8f, "Normalized fuel injection target [0,1] at particle locations.");
+
+    // Damping (per-second values, converted to per-frame on CPU via NvFlow formula)
+    RTX_OPTION("rtx.particles.volume", float, volVelocityDamping, 0.01f, "Per-second velocity damping fraction [0,1].");
+    RTX_OPTION("rtx.particles.volume", float, volVelocityFade, 1.0f, "Absolute velocity fade per second.");
+    RTX_OPTION("rtx.particles.volume", float, volSmokeDamping, 0.30f, "Per-second smoke channel damping fraction [0,1].");
+    RTX_OPTION("rtx.particles.volume", float, volSmokeFade, 0.65f, "Absolute smoke fade per second.");
+
+    // Forces
+    RTX_OPTION("rtx.particles.volume", float, volBuoyancyPerTemp, 2.0f, "Buoyancy strength per unit temperature.");
+    RTX_OPTION("rtx.particles.volume", float, volBuoyancyPerSmoke, 0.0f, "Buoyancy (downward weight) per unit smoke.");
+    RTX_OPTION("rtx.particles.volume", float, volBuoyancyMaxSmoke, 1.0f, "Maximum smoke value contributing to buoyancy.");
+    RTX_OPTION("rtx.particles.volume", float, volGravityMagnitude, 100.0f, "Gravity magnitude for buoyancy calculation.");
+    RTX_OPTION("rtx.particles.volume", float, volVorticityConfinement, 0.6f, "Vorticity confinement strength for turbulent detail.");
+    RTX_OPTION("rtx.particles.volume", float, volFluidCouplingStrength, 0.9f, "How strongly particle velocity seeds the fluid velocity field.");
+    RTX_OPTION("rtx.particles.volume", Vector3, volWindDirection, Vector3(0.f), "Uniform wind force direction applied to the velocity field.");
+
+    // Rendering
+    RTX_OPTION("rtx.particles.volume", float, volAbsorptionCrossSection, 1.0f, "Smoke extinction coefficient for Beer-Lambert absorption.");
+    RTX_OPTION("rtx.particles.volume", float, volColorScale, 1.0f, "Emission brightness multiplier in the ray-march.");
+    RTX_OPTION("rtx.particles.volume", float, volAlphaScale, 1.0f, "Smoke opacity multiplier in the ray-march.");
+    RTX_OPTION("rtx.particles.volume", float, volShadowFactor, 0.5f, "Burn brightness modulation for self-shadowing.");
+
+    // Solver
+    RTX_OPTION("rtx.particles.volume", uint32_t, volPressureIterations, 30, "Number of Jacobi pressure solve iterations per frame.");
+
+    // Debug
+    RTX_OPTION("rtx.particles.volume", uint32_t, volDebugMode, 0, "Debug visualization: 0=off, 1=temperature, 2=fuel, 3=burn, 4=smoke, 5=any channel, 6=RGB composite.");
 
     void setupConstants(RtxContext* ctx, ParticleSystemConstants& constants);
 
@@ -319,11 +359,11 @@ namespace dxvk {
       Vector3 aabbMin;
       Vector3 aabbMax;
       uint32_t gridDimension;
-      float smokeDensity;
-      float smokeAbsorptionCrossSection;
-      float emissionIntensityScale;
-      Rc<DxvkImageView> densityView;
-      Rc<DxvkImageView> temperatureView;
+      float absorptionCrossSection;
+      float colorScale;
+      float alphaScale;
+      float shadowFactor;
+      Rc<DxvkImageView> density4View;
     };
 
     /**
@@ -334,21 +374,21 @@ namespace dxvk {
     std::vector<ActiveVolumeDescriptor> getActiveVolumeDescriptors() const;
 
     /**
-      * Returns the blackbody LUT image view. The LUT is generated lazily on first
-      * call; subsequent calls return the cached texture.
+      * Returns the fire colormap image view. The colormap is generated lazily on
+      * first call; subsequent calls return the cached texture.
       */
-    Rc<DxvkImageView> getBlackbodyLUTView() const { return m_blackbodyLUT.view; }
+    Rc<DxvkImageView> getColormapView() const { return m_colormap.view; }
 
     /**
-      * Returns true if the blackbody LUT has been generated.
+      * Returns true if the fire colormap has been generated.
       */
-    bool isBlackbodyLUTGenerated() const { return m_blackbodyLUTGenerated; }
+    bool isColormapGenerated() const { return m_colormapGenerated; }
 
     /**
-      * Ensures the blackbody LUT has been generated. Call once per frame before
+      * Ensures the fire colormap has been generated. Call once per frame before
       * binding volume textures.
       */
-    void ensureBlackbodyLUT(RtxContext* ctx);
+    void ensureColormap(RtxContext* ctx);
 
     uint64_t totalVolumeMemoryBytes() const { return m_totalVolumeMemoryBytes; }
   };

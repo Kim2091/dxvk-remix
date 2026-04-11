@@ -23,44 +23,18 @@
 
 #include "rtx/pass/particles/particle_volume_common.h"
 
-// Sample density at a world-space position via trilinear interpolation
-float particleVolumeSampleDensity(
-  Texture3D<float> densityTexture, SamplerState linearSampler,
-  vec3 worldPos, ParticleVolumeConstants cb)
+// Sample packed density4 at world position
+vec4 particleVolumeSampleDensity4(Texture3D<vec4> tex, SamplerState s, vec3 worldPos, ParticleVolumeConstants cb)
 {
-  const vec3 uvw = (worldPos - cb.aabbMin) / (cb.aabbMax - cb.aabbMin);
-  return densityTexture.SampleLevel(linearSampler, uvw, 0).r;
+  vec3 uvw = (worldPos - cb.aabbMin) / (cb.aabbMax - cb.aabbMin);
+  return tex.SampleLevel(s, uvw, 0);
 }
 
-// Sample temperature at a world-space position via trilinear interpolation
-float particleVolumeSampleTemperature(
-  Texture3D<float> temperatureTexture, SamplerState linearSampler,
-  vec3 worldPos, ParticleVolumeConstants cb)
+// Sample velocity at world position
+vec3 particleVolumeSampleVelocity(Texture3D<vec4> tex, SamplerState s, vec3 worldPos, ParticleVolumeConstants cb)
 {
-  const vec3 uvw = (worldPos - cb.aabbMin) / (cb.aabbMax - cb.aabbMin);
-  return temperatureTexture.SampleLevel(linearSampler, uvw, 0).r;
-}
-
-// Sample velocity at a world-space position via trilinear interpolation
-vec3 particleVolumeSampleVelocity(
-  Texture3D<vec4> velocityTexture, SamplerState linearSampler,
-  vec3 worldPos, ParticleVolumeConstants cb)
-{
-  const vec3 uvw = (worldPos - cb.aabbMin) / (cb.aabbMax - cb.aabbMin);
-  return velocityTexture.SampleLevel(linearSampler, uvw, 0).xyz;
-}
-
-// Look up blackbody emission color from the precomputed LUT.
-// temperature is in Kelvin; returns linear RGB scaled by relative intensity.
-vec3 particleVolumeBlackbodyColor(
-  Texture2D<vec4> blackbodyLUT, SamplerState linearSampler,
-  float temperature)
-{
-  static const float kMinTemp = 500.0f;
-  static const float kMaxTemp = 6500.0f;
-  const float u = saturate((temperature - kMinTemp) / (kMaxTemp - kMinTemp));
-  const vec4 entry = blackbodyLUT.SampleLevel(linearSampler, vec2(u, 0.5f), 0);
-  return entry.rgb * entry.a;
+  vec3 uvw = (worldPos - cb.aabbMin) / (cb.aabbMax - cb.aabbMin);
+  return tex.SampleLevel(s, uvw, 0).xyz;
 }
 
 // Compute the base grid cell and fractional offset for trilinear splatting

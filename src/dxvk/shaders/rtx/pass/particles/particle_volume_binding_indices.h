@@ -27,40 +27,37 @@
 #define PARTICLE_VOLUME_BINDING_CONSTANTS                  0
 
 // 3D volume textures (read-only inputs)
-#define PARTICLE_VOLUME_BINDING_DENSITY_INPUT              1
-#define PARTICLE_VOLUME_BINDING_TEMPERATURE_INPUT          2
+#define PARTICLE_VOLUME_BINDING_DENSITY4_INPUT             1   // float4: temp/fuel/burn/smoke
 #define PARTICLE_VOLUME_BINDING_VELOCITY_INPUT             3
 #define PARTICLE_VOLUME_BINDING_OBSTACLE_INPUT             4
 #define PARTICLE_VOLUME_BINDING_PRESSURE_INPUT             5
-#define PARTICLE_VOLUME_BINDING_PREV_VELOCITY_INPUT        6
 
 // 3D volume textures (read-write outputs)
-#define PARTICLE_VOLUME_BINDING_DENSITY_OUTPUT             10
-#define PARTICLE_VOLUME_BINDING_TEMPERATURE_OUTPUT         11
+#define PARTICLE_VOLUME_BINDING_DENSITY4_OUTPUT            10  // float4: temp/fuel/burn/smoke
 #define PARTICLE_VOLUME_BINDING_VELOCITY_OUTPUT            12
 #define PARTICLE_VOLUME_BINDING_OBSTACLE_OUTPUT            13
 #define PARTICLE_VOLUME_BINDING_PRESSURE_OUTPUT            14
 
 // Particle buffer (for splatting pass)
 #define PARTICLE_VOLUME_BINDING_PARTICLES_INPUT            20
-
-// Depth buffer / world position (for obstacle rasterization)
 #define PARTICLE_VOLUME_BINDING_PREV_WORLD_POSITION_INPUT  21
-#define PARTICLE_VOLUME_BINDING_DEPTH_INPUT                22
 
-// Blackbody LUT
-#define PARTICLE_VOLUME_BINDING_BLACKBODY_LUT_INPUT        23
-
-// ReSTIR light output
+// Colormap + sampler
+#define PARTICLE_VOLUME_BINDING_COLORMAP_INPUT             23
 #define PARTICLE_VOLUME_BINDING_LIGHT_OUTPUT               24
-
-// Froxel grid output
 #define PARTICLE_VOLUME_BINDING_FROXEL_DENSITY_OUTPUT      25
 #define PARTICLE_VOLUME_BINDING_FROXEL_EMISSION_OUTPUT     26
-
-// Linear sampler for advection trilinear sampling
 #define PARTICLE_VOLUME_BINDING_LINEAR_SAMPLER             30
 
-// Volume composite pass bindings
-#define PARTICLE_VOLUME_BINDING_COMPOSITE_WORLD_POS_INPUT  31
-#define PARTICLE_VOLUME_BINDING_COMPOSITE_COLOR_INOUT      32
+// REMOVED (no longer used):
+// PARTICLE_VOLUME_BINDING_DENSITY_INPUT (1) — replaced by DENSITY4_INPUT
+// PARTICLE_VOLUME_BINDING_TEMPERATURE_INPUT (2) — packed into density4
+// PARTICLE_VOLUME_BINDING_PREV_VELOCITY_INPUT (6) — velocity pass uses VELOCITY_INPUT
+// PARTICLE_VOLUME_BINDING_FUEL_INPUT (7) — packed into density4
+// PARTICLE_VOLUME_BINDING_DENSITY_OUTPUT (10) — replaced by DENSITY4_OUTPUT
+// PARTICLE_VOLUME_BINDING_TEMPERATURE_OUTPUT (11) — packed into density4
+// PARTICLE_VOLUME_BINDING_FUEL_OUTPUT (15) — packed into density4
+// PARTICLE_VOLUME_BINDING_DEPTH_INPUT (22) — unused
+// PARTICLE_VOLUME_BINDING_BLACKBODY_LUT_INPUT (23) — replaced by COLORMAP_INPUT
+// PARTICLE_VOLUME_BINDING_COMPOSITE_WORLD_POS_INPUT (31) — composite pass removed
+// PARTICLE_VOLUME_BINDING_COMPOSITE_COLOR_INOUT (32) — composite pass removed

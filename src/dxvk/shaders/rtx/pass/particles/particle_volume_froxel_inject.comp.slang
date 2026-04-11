@@ -21,20 +21,26 @@
 */
 
 // Froxel grid injection compute shader for particle volumes.
-// Downsamples particle volume density and emission into the global froxel grid
-// so the rest of the volumetric pipeline (god rays, dust lighting, atmospheric
-// scattering) accounts for smoke and fire. One thread per froxel cell.
+// Downsamples packed density4 (smoke/temperature) and colormap emission into
+// the global froxel grid so the rest of the volumetric pipeline (god rays,
+// dust lighting, atmospheric scattering) accounts for smoke and fire.
+// One thread per froxel cell.
 
 #include "rtx/pass/particles/particle_volume_common.h"
 #include "rtx/pass/particles/particle_volume_bindings.slangh"
 #include "rtx/pass/particles/particle_volume_helpers.slangh"
 
-Texture3D<float>  DensityInput     : register(t0, space1);
-Texture3D<float>  TemperatureInput : register(t1, space1);
-Texture2D<vec4>   BlackbodyLUT     : register(t2, space1);
-SamplerState      LinearSampler    : register(s0, space1);
+[[vk::binding(PARTICLE_VOLUME_BINDING_DENSITY4_INPUT)]]
+Texture3D<vec4>   Density4Input;
 
-RWTexture3D<vec4> FroxelOutput     : register(u0, space2);
+[[vk::binding(PARTICLE_VOLUME_BINDING_COLORMAP_INPUT)]]
+Texture2D<vec4>   ColormapInput;
+
+[[vk::binding(PARTICLE_VOLUME_BINDING_LINEAR_SAMPLER)]]
+SamplerState      LinearSampler;
+
+[[vk::binding(PARTICLE_VOLUME_BINDING_FROXEL_DENSITY_OUTPUT)]]
+RWTexture3D<vec4> FroxelOutput;
 
 // Per-dispatch froxel grid parameters
 struct FroxelInjectConstants
@@ -52,8 +58,8 @@ layout(binding = 1)
 ConstantBuffer<FroxelInjectConstants> fc;
 
 // Negligibility thresholds: froxels below both values are skipped early
-static const float kDensityThreshold     = 1e-5f;
-static const float kTemperatureThreshold = 1.0f; // Kelvin
+static const float kSmokeThreshold       = 1e-5f;
+static const float kTemperatureThreshold = 0.01f; // normalized [0,1]
 
 // Convert a froxel integer coordinate to a world-space position.
 // Z uses a power-law distribution so near slabs are thinner than far slabs.
@@ -94,22 +100,23 @@ void main(uvec3 threadID : SV_DispatchThreadID)
     return;
   }
 
-  // Sample density and temperature from the particle volume via trilinear interpolation
-  const float density     = particleVolumeSampleDensity(DensityInput, LinearSampler, worldPos, cb);
-  const float temperature = particleVolumeSampleTemperature(TemperatureInput, LinearSampler, worldPos, cb);
+  // Sample packed density4 from the particle volume via trilinear interpolation
+  const vec4 d = particleVolumeSampleDensity4(Density4Input, LinearSampler, worldPos, cb);
+  const float smoke = d.w;
+  const float temp  = d.x;
 
   // Skip froxels with negligible contribution to avoid polluting the froxel grid
-  if (density < kDensityThreshold && temperature < kTemperatureThreshold)
+  if (smoke < kSmokeThreshold && temp < kTemperatureThreshold)
   {
     return;
   }
 
-  // Convert density to extinction coefficient
-  const float extinction = density * cb.smokeAbsorptionCrossSection;
+  // Convert smoke to extinction coefficient
+  const float extinction = smoke * cb.absorptionCrossSection;
 
-  // Convert temperature to emission colour via the precomputed blackbody LUT
-  const vec3 emission = particleVolumeBlackbodyColor(BlackbodyLUT, LinearSampler, temperature)
-                        * cb.emissionIntensityScale;
+  // Convert temperature to emission colour via the precomputed colormap
+  const vec4 colormapColor = ColormapInput.SampleLevel(LinearSampler, vec2(temp, 0.5f), 0);
+  const vec3 emission = colormapColor.rgb * colormapColor.a * cb.colorScale;
 
   // Additive contribution: existing froxel radiance is preserved; particle
   // emission and extinction are blended on top.

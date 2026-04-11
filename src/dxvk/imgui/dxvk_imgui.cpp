@@ -3705,27 +3705,9 @@ namespace dxvk {
 
     RtxParticleSystemManager::showImguiSettings();
 
-    if (RemixGui::CollapsingHeader("Particle Volume System", collapsingHeaderClosedFlags)) {
-      ImGui::Indent();
-
-      RemixGui::Checkbox("Enable Volume Simulation", &ParticleVolume::enableObject());
-
-      RemixGui::DragInt("Memory Budget (MB)", (int*)&ParticleVolume::memoryBudgetMBObject(), 1, 16, 512);
-
-      RemixGui::Checkbox("Accurate Obstacles", &ParticleVolume::accurateObstaclesObject());
-
-      RemixGui::DragFloat("Near Distance (m)", &ParticleVolume::nearDistanceThresholdObject(), 0.5f, 1.0f, 50.0f, "%.1f");
-      RemixGui::DragFloat("Mid Distance (m)", &ParticleVolume::midDistanceThresholdObject(), 0.5f, 5.0f, 100.0f, "%.1f");
-      RemixGui::DragFloat("Far Distance (m)", &ParticleVolume::farDistanceThresholdObject(), 1.0f, 10.0f, 200.0f, "%.1f");
-
-      RemixGui::DragFloat("Hysteresis Time (s)", &ParticleVolume::hysteresisTimeObject(), 0.05f, 0.0f, 5.0f, "%.2f");
-
-      ImGui::Separator();
-      ImGui::Text("Active Volume Memory: %.1f MB",
-        static_cast<float>(common->metaParticleSystem().totalVolumeMemoryBytes()) / (1024.0f * 1024.0f));
-
-      ImGui::Unindent();
-    }
+    // NOTE: "Particle Volume System" controls have been moved into the
+    // "Volume Fluid Simulation" section under Particle System > ImGui.
+    // See rtx_particle_system.cpp for all volume controls.
 
     RtxPointInstancerSystem::showImguiSettings();
 

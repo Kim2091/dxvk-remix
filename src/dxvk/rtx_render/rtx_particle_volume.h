@@ -34,7 +34,7 @@ namespace dxvk {
   class DxvkContext;
 
   // ParticleVolume manages a set of GPU 3D textures representing a volumetric
-  // simulation cell (density, temperature, velocity, obstacles, pressure).
+  // simulation cell (density4, velocity, obstacles, pressure).
   // Resolution is chosen based on camera distance and may transition over time
   // with hysteresis to avoid thrashing.
   class ParticleVolume {
@@ -110,8 +110,7 @@ namespace dxvk {
     Resolution currentResolution() const { return m_resolution; }
 
     // GPU resource accessors — callers bind these as shader inputs/outputs.
-    const Resources::Resource& densityTexture() const { return m_density; }
-    const Resources::Resource& temperatureTexture() const { return m_temperature; }
+    const Resources::Resource& density4Texture() const { return m_density4; }
     const Resources::Resource& velocityTexture() const { return m_velocity; }
     const Resources::Resource& prevVelocityTexture() const { return m_prevVelocity; }
     const Resources::Resource& obstacleTexture() const { return m_obstacle; }
@@ -128,10 +127,8 @@ namespace dxvk {
     Resolution resolutionFromDistance(float distanceMeters) const;
 
     // --- GPU resources ---
-    Resources::Resource m_density;        // R16_SFLOAT 3D — smoke/fire density (current frame)
-    Resources::Resource m_prevDensity;    // R16_SFLOAT 3D — density (previous frame, for advection read)
-    Resources::Resource m_temperature;    // R16_SFLOAT 3D — temperature (current frame)
-    Resources::Resource m_prevTemperature;// R16_SFLOAT 3D — temperature (previous frame, for advection read)
+    Resources::Resource m_density4;       // R16G16B16A16_SFLOAT 3D — packed temp/fuel/burn/smoke (current frame)
+    Resources::Resource m_prevDensity4;   // R16G16B16A16_SFLOAT 3D — packed (previous frame, for advection read)
     Resources::Resource m_velocity;       // R16G16B16A16_SFLOAT 3D — current frame velocity
     Resources::Resource m_prevVelocity;   // R16G16B16A16_SFLOAT 3D — previous frame velocity (two-way coupling)
     Resources::Resource m_obstacle;       // R8_UNORM 3D — obstacle mask

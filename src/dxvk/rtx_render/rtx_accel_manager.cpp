@@ -1003,15 +1003,24 @@ namespace dxvk {
         mem.aabbMin.x = vol.aabbMin.x;
         mem.aabbMin.y = vol.aabbMin.y;
         mem.aabbMin.z = vol.aabbMin.z;
-        mem.smokeAbsorptionCrossSection = vol.smokeAbsorptionCrossSection;
+        mem.absorptionCrossSection = vol.absorptionCrossSection;
         mem.aabbMax.x = vol.aabbMax.x;
         mem.aabbMax.y = vol.aabbMax.y;
         mem.aabbMax.z = vol.aabbMax.z;
-        mem.emissionIntensityScale = vol.emissionIntensityScale;
+        mem.colorScale = vol.colorScale;
         mem.gridDimension.x = vol.gridDimension;
         mem.gridDimension.y = vol.gridDimension;
         mem.gridDimension.z = vol.gridDimension;
         mem.volumeIndex = vi;
+        const Vector3 sceneUp = SceneManager::getSceneUp();
+        mem.upDirection.x = sceneUp.x;
+        mem.upDirection.y = sceneUp.y;
+        mem.upDirection.z = sceneUp.z;
+        mem.alphaScale = vol.alphaScale;
+        mem.shadowFactor = vol.shadowFactor;
+        mem.debugMode = RtxParticleSystemManager::volDebugMode();
+        mem.pad1 = 0;
+        mem.pad2 = 0;
 
         // Build the TLAS instance that wraps the shared intersection BLAS.
         VkAccelerationStructureInstanceKHR asInstance {};

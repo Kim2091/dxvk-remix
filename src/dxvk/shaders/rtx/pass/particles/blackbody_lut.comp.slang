@@ -20,75 +20,49 @@
 * DEALINGS IN THE SOFTWARE.
 */
 
-// Blackbody LUT generation compute shader.
-// Maps temperature (500K - 6500K) to RGB emission color using the Tanner Helland
-// analytical approximation (temperature → linear sRGB).
-// Output: 256x1 RWTexture2D<float4> where RGB = normalized color, A = relative intensity.
+// Fire colormap generation compute shader.
+// Generates a 256x1 RGBA texture mapping normalized temperature [0,1] to a
+// fire gradient (black -> dark red -> orange -> yellow -> white) with an
+// alpha ramp that rises from 0 to 1 over the low end of the range.
+// This replaces the old blackbody LUT with an artist-friendly fire palette
+// matching NvFlow's colormap approach.
+
+#include "rtx/utility/shader_types.h"
 
 layout(binding = 0)
-RWTexture2D<float4> BlackbodyLUT;
-
-// Direct temperature (Kelvin) to linear sRGB.
-// Tanner Helland approximation, valid 1000K-40000K.  Values below 1000K are
-// clamped — they produce deep red, which is correct for barely-glowing embers.
-float3 blackbodyColor(float tempK)
-{
-  float t = max(tempK, 1000.0f) / 100.0f;
-  float3 rgb;
-
-  // Red
-  if (t <= 66.0f)
-    rgb.x = 1.0f;
-  else
-    rgb.x = saturate(1.292936f * pow(t - 60.0f, -0.1332047f));
-
-  // Green
-  if (t <= 66.0f)
-    rgb.y = saturate(0.3900816f * log(t) - 0.6318414f);
-  else
-    rgb.y = saturate(1.129891f * pow(t - 60.0f, -0.0755148f));
-
-  // Blue
-  if (t >= 66.0f)
-    rgb.z = 1.0f;
-  else if (t <= 19.0f)
-    rgb.z = 0.0f;
-  else
-    rgb.z = saturate(0.5432068f * log(t - 10.0f) - 1.1962540f);
-
-  return rgb;
-}
+RWTexture2D<float4> ColormapOutput;
 
 [shader("compute")]
 [numthreads(256, 1, 1)]
-void main(uint3 threadID : SV_DispatchThreadID)
+void main(uint threadID : SV_DispatchThreadID)
 {
-  if (threadID.x >= 256u)
+  float u = float(threadID) / 255.0;
+
+  // Fire gradient: black -> dark red -> orange -> yellow -> white
+  float3 color;
+  if (u < 0.1)
   {
-    return;
+    color = lerp(float3(0.0, 0.0, 0.0), float3(0.3, 0.0, 0.0), u / 0.1);
+  }
+  else if (u < 0.3)
+  {
+    color = lerp(float3(0.3, 0.0, 0.0), float3(1.0, 0.3, 0.0), (u - 0.1) / 0.2);
+  }
+  else if (u < 0.5)
+  {
+    color = lerp(float3(1.0, 0.3, 0.0), float3(1.0, 0.7, 0.1), (u - 0.3) / 0.2);
+  }
+  else if (u < 0.8)
+  {
+    color = lerp(float3(1.0, 0.7, 0.1), float3(1.0, 0.95, 0.7), (u - 0.5) / 0.3);
+  }
+  else
+  {
+    color = lerp(float3(1.0, 0.95, 0.7), float3(1.0, 1.0, 1.0), (u - 0.8) / 0.2);
   }
 
-  // Map texel index [0, 255] to temperature range [500K, 6500K].
-  static const float kMinTemp = 500.0f;
-  static const float kMaxTemp = 6500.0f;
-  float temperature = kMinTemp + (float(threadID.x) / 255.0f) * (kMaxTemp - kMinTemp);
+  // Alpha: ramp from 0 to 1 over [0, 0.15], then 1.0
+  float alpha = saturate(u / 0.15);
 
-  float3 rgb = blackbodyColor(temperature);
-
-  // Normalize intensity relative to a reference temperature (6500K).
-  // Physical blackbody follows T^4 (Stefan-Boltzmann), but that makes low
-  // temperatures (campfire ~1000K) produce <0.1% of peak intensity — invisible
-  // in practice.  A linear curve lets emissionIntensityScale control brightness
-  // artistically while keeping the full temperature range usable.
-  float relativeIntensity = temperature / kMaxTemp;
-
-  // Normalize color so the brightest channel equals 1.
-  float maxComp = max(rgb.x, max(rgb.y, rgb.z));
-  if (maxComp > 0.0f)
-  {
-    rgb /= maxComp;
-  }
-
-  // Write result: normalized RGB color + perceptual relative intensity (alpha).
-  BlackbodyLUT[uint2(threadID.x, 0u)] = float4(rgb, relativeIntensity);
+  ColormapOutput[uint2(threadID, 0)] = float4(color, alpha);
 }

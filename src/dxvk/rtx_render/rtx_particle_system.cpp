@@ -38,6 +38,7 @@
 #include <rtx_shaders/blackbody_lut.h>
 #include "rtx/pass/particles/particle_volume_binding_indices.h"
 #include "math.h"
+#include <cmath>
 
 namespace dxvk {
 
@@ -98,9 +99,9 @@ namespace dxvk {
         END_PARAMETER()
     };
 
-    // Blackbody LUT generation shader (256x1 texture).
-    class BlackbodyLutShader : public ManagedShader {
-      SHADER_SOURCE(BlackbodyLutShader, VK_SHADER_STAGE_COMPUTE_BIT, blackbody_lut)
+    // Fire colormap generation shader (256x1 texture).
+    class ColormapShader : public ManagedShader {
+      SHADER_SOURCE(ColormapShader, VK_SHADER_STAGE_COMPUTE_BIT, blackbody_lut)
 
       BEGIN_PARAMETER()
         RW_TEXTURE2D(0)
@@ -341,6 +342,77 @@ namespace dxvk {
         }
         ImGui::Unindent();
       }
+
+      if (RemixGui::CollapsingHeader("Volume Fluid Simulation", ImGuiTreeNodeFlags_CollapsingHeader)) {
+        ImGui::Indent();
+        RemixGui::Checkbox("Enable Volume System", &ParticleVolume::enableObject());
+        RemixGui::DragInt("Memory Budget (MB)", &ParticleVolume::memoryBudgetMBObject(), 1.0f, 1, 1024);
+        RemixGui::Checkbox("Accurate Obstacles", &ParticleVolume::accurateObstaclesObject());
+        RemixGui::DragFloat("Near Distance (m)", &ParticleVolume::nearDistanceThresholdObject(), 0.5f, 1.0f, 50.0f, "%.1f");
+        RemixGui::DragFloat("Mid Distance (m)", &ParticleVolume::midDistanceThresholdObject(), 0.5f, 5.0f, 100.0f, "%.1f");
+        RemixGui::DragFloat("Far Distance (m)", &ParticleVolume::farDistanceThresholdObject(), 1.0f, 10.0f, 200.0f, "%.1f");
+        RemixGui::Separator();
+
+        if (RemixGui::CollapsingHeader("Combustion", ImGuiTreeNodeFlags_CollapsingHeader | ImGuiTreeNodeFlags_DefaultOpen)) {
+          ImGui::Indent();
+          RemixGui::DragFloat("Ignition Temp", &volIgnitionTempObject(), 0.01f, 0.0f, 1.0f, "%.3f");
+          RemixGui::DragFloat("Burn Rate / Temp", &volBurnPerTempObject(), 0.1f, 0.0f, 20.0f, "%.2f");
+          RemixGui::DragFloat("Fuel / Burn", &volFuelPerBurnObject(), 0.01f, 0.0f, 2.0f, "%.3f");
+          RemixGui::DragFloat("Temp / Burn", &volTempPerBurnObject(), 0.1f, 0.0f, 20.0f, "%.2f");
+          RemixGui::DragFloat("Smoke / Burn", &volSmokePerBurnObject(), 0.1f, 0.0f, 20.0f, "%.2f");
+          RemixGui::DragFloat("Cooling Rate", &volCoolingRateObject(), 0.01f, 0.0f, 10.0f, "%.3f");
+          RemixGui::DragFloat("Divergence / Burn", &volDivergencePerBurnObject(), 0.01f, 0.0f, 5.0f, "%.3f");
+          RemixGui::DragFloat("Emitter Couple Rate", &volEmitterCoupleRateObject(), 0.1f, 0.0f, 20.0f, "%.2f");
+          RemixGui::DragFloat("Fuel Amount", &volFuelAmountObject(), 0.01f, 0.0f, 1.0f, "%.3f");
+          ImGui::Unindent();
+        }
+
+        if (RemixGui::CollapsingHeader("Damping", ImGuiTreeNodeFlags_CollapsingHeader | ImGuiTreeNodeFlags_DefaultOpen)) {
+          ImGui::Indent();
+          RemixGui::DragFloat("Velocity Damping", &volVelocityDampingObject(), 0.001f, 0.0f, 1.0f, "%.4f");
+          RemixGui::DragFloat("Velocity Fade", &volVelocityFadeObject(), 0.01f, 0.0f, 10.0f, "%.3f");
+          RemixGui::DragFloat("Smoke Damping", &volSmokeDampingObject(), 0.001f, 0.0f, 1.0f, "%.4f");
+          RemixGui::DragFloat("Smoke Fade", &volSmokeFadeObject(), 0.01f, 0.0f, 10.0f, "%.3f");
+          ImGui::Unindent();
+        }
+
+        if (RemixGui::CollapsingHeader("Forces", ImGuiTreeNodeFlags_CollapsingHeader | ImGuiTreeNodeFlags_DefaultOpen)) {
+          ImGui::Indent();
+          RemixGui::DragFloat("Buoyancy / Temp", &volBuoyancyPerTempObject(), 0.01f, 0.0f, 20.0f, "%.3f");
+          RemixGui::DragFloat("Buoyancy / Smoke", &volBuoyancyPerSmokeObject(), 0.01f, 0.0f, 20.0f, "%.3f");
+          RemixGui::DragFloat("Buoyancy Max Smoke", &volBuoyancyMaxSmokeObject(), 0.01f, 0.0f, 10.0f, "%.3f");
+          RemixGui::DragFloat("Gravity Magnitude", &volGravityMagnitudeObject(), 1.0f, 0.0f, 1000.0f, "%.1f");
+          RemixGui::DragFloat("Vorticity Confinement", &volVorticityConfinementObject(), 0.01f, 0.0f, 10.0f, "%.3f");
+          RemixGui::DragFloat("Fluid Coupling Strength", &volFluidCouplingStrengthObject(), 0.01f, 0.0f, 5.0f, "%.3f");
+          RemixGui::InputFloat3("Wind Direction", &volWindDirectionObject());
+          ImGui::Unindent();
+        }
+
+        if (RemixGui::CollapsingHeader("Rendering", ImGuiTreeNodeFlags_CollapsingHeader | ImGuiTreeNodeFlags_DefaultOpen)) {
+          ImGui::Indent();
+          RemixGui::DragFloat("Absorption Cross Section", &volAbsorptionCrossSectionObject(), 0.01f, 0.0f, 10.0f, "%.3f");
+          RemixGui::DragFloat("Color Scale", &volColorScaleObject(), 0.01f, 0.0f, 10.0f, "%.3f");
+          RemixGui::DragFloat("Alpha Scale", &volAlphaScaleObject(), 0.01f, 0.0f, 10.0f, "%.3f");
+          RemixGui::DragFloat("Shadow Factor", &volShadowFactorObject(), 0.01f, 0.0f, 2.0f, "%.3f");
+          ImGui::Unindent();
+        }
+
+        if (RemixGui::CollapsingHeader("Solver", ImGuiTreeNodeFlags_CollapsingHeader)) {
+          ImGui::Indent();
+          RemixGui::DragInt("Pressure Iterations", &volPressureIterationsObject(), 1.0f, 1, 100);
+          ImGui::Unindent();
+        }
+
+        if (RemixGui::CollapsingHeader("Debug Visualization", ImGuiTreeNodeFlags_CollapsingHeader)) {
+          ImGui::Indent();
+          ImGui::TextDisabled("0=Off 1=Temp 2=Fuel 3=Burn 4=Smoke 5=Any 6=RGB 7=AABB");
+          RemixGui::DragInt("Debug Mode", &volDebugModeObject(), 1.0f, 0, 7);
+          ImGui::Unindent();
+        }
+
+        ImGui::Unindent();
+      }
+
       ImGui::Unindent();
       ImGui::EndDisabled();
       ImGui::PopID();
@@ -801,31 +873,65 @@ namespace dxvk {
         const ParticleVolume& vol = *pParticleSystem->pVolume;
 
         ParticleVolumeConstants volumeConstants {};
+        const float dt = std::min(kMinimumParticleLife, GlobalTime::get().deltaTime()) * timeScale();
+
         volumeConstants.gridDimension        = { vol.gridDimension(), vol.gridDimension(), vol.gridDimension() };
         volumeConstants.aabbMin              = vol.aabbMin();
         volumeConstants.aabbMax              = vol.aabbMax();
-        volumeConstants.deltaTimeSecs        = std::min(kMinimumParticleLife, GlobalTime::get().deltaTime()) * timeScale();
+        volumeConstants.deltaTimeSecs        = dt;
         volumeConstants.absoluteTimeSecs     = GlobalTime::get().absoluteTimeMs() * 0.001f * timeScale();
         volumeConstants.frameIdx             = ctx->getDevice()->getCurrentFrameId();
-        volumeConstants.smokeDensity         = desc.smokeDensity;
-        volumeConstants.smokeAbsorptionCrossSection = desc.smokeAbsorptionCrossSection;
-        volumeConstants.smokeDissipationRate = desc.smokeDissipationRate;
-        volumeConstants.fuelAmount           = desc.fuelAmount;
-        volumeConstants.burnTemperature      = desc.burnTemperature;
-        volumeConstants.coolingRate          = desc.coolingRate;
-        volumeConstants.buoyancyCoefficient  = desc.buoyancyCoefficient;
-        volumeConstants.vorticityConfinement = desc.vorticityConfinement;
-        volumeConstants.windDirection        = desc.windDirection;
-        volumeConstants.emissionIntensityScale = desc.emissionIntensityScale;
-        volumeConstants.sceneScale           = RtxOptions::sceneScale();
-        volumeConstants.pressureIterations   = desc.pressureIterations;
-        volumeConstants.fluidCouplingStrength = desc.fluidCouplingStrength;
+
+        // Combustion
+        volumeConstants.ignitionTemp         = volIgnitionTemp();
+        volumeConstants.burnPerTemp          = volBurnPerTemp();
+        volumeConstants.fuelPerBurn          = volFuelPerBurn();
+        volumeConstants.tempPerBurn          = volTempPerBurn();
+        volumeConstants.smokePerBurn         = volSmokePerBurn();
+        volumeConstants.coolingRate          = volCoolingRate();
+        volumeConstants.divergencePerBurn    = volDivergencePerBurn();
+        volumeConstants.emitterCoupleRate    = volEmitterCoupleRate();
+
+        // Damping — NvFlow formula: dampingRate = 1 - pow(1 - damping, dt)
+        auto nfDamp = [](float damping, float frameDt) -> float {
+          return 1.f - std::pow(1.f - std::min(damping, 1.f), frameDt);
+        };
+        volumeConstants.dampingRate = {
+          0.f,                                // temp: no damping (cooling handles it)
+          0.f,                                // fuel: no damping
+          nfDamp(0.01f, dt),                  // burn: light damping
+          nfDamp(volSmokeDamping(), dt)       // smoke: moderate damping
+        };
+        volumeConstants.fadeRate = { 0.f, 0.f, 1.0f, volSmokeFade() };
+        volumeConstants.velDampingRate = { nfDamp(volVelocityDamping(), dt), nfDamp(volVelocityDamping(), dt), nfDamp(volVelocityDamping(), dt), 0.f };
+        volumeConstants.velFadeRate = { volVelocityFade(), volVelocityFade(), volVelocityFade(), 0.f };
+
+        // Forces
+        volumeConstants.buoyancyPerTemp      = volBuoyancyPerTemp();
+        volumeConstants.buoyancyPerSmoke     = volBuoyancyPerSmoke();
+        volumeConstants.buoyancyMaxSmoke     = volBuoyancyMaxSmoke();
+        volumeConstants.gravityMagnitude     = volGravityMagnitude();
         volumeConstants.upDirection          = ctx->getSceneManager().getSceneUp();
+        volumeConstants.vorticityConfinement = volVorticityConfinement();
+        volumeConstants.windDirection        = volWindDirection();
+        volumeConstants.fluidCouplingStrength = volFluidCouplingStrength();
+
+        // Rendering
+        volumeConstants.absorptionCrossSection = volAbsorptionCrossSection();
+        volumeConstants.colorScale           = volColorScale();
+        volumeConstants.alphaScale           = volAlphaScale();
+        volumeConstants.shadowFactor         = volShadowFactor();
+
+        // Pipeline
+        volumeConstants.pressureIterations   = volPressureIterations();
         volumeConstants.particleCount        = pParticleSystem->context.particleCount;
         volumeConstants.renderingWidth       = ctx->getSceneManager().getCamera().m_renderResolution[0];
         volumeConstants.renderingHeight      = ctx->getSceneManager().getCamera().m_renderResolution[1];
         volumeConstants.cameraPosition       = cameraPosition;
         volumeConstants.maxTimeToLive        = desc.maxTimeToLive;
+        volumeConstants.sceneScale           = RtxOptions::sceneScale();
+        volumeConstants.fuelAmount           = volFuelAmount();
+        volumeConstants.debugMode            = volDebugMode();
         volumeConstants.prevWorldToProjection =
           ctx->getSceneManager().getCamera().getPreviousViewToProjection() *
           ctx->getSceneManager().getCamera().getPreviousWorldToView();
@@ -1258,18 +1364,17 @@ namespace dxvk {
         continue;
       }
 
-      const GpuParticleSystemDesc& desc = pParticleSystem->context.desc;
       const ParticleVolume& vol = *pParticleSystem->pVolume;
 
       ActiveVolumeDescriptor avd {};
       avd.aabbMin = vol.aabbMin();
       avd.aabbMax = vol.aabbMax();
       avd.gridDimension = vol.gridDimension();
-      avd.smokeDensity = desc.smokeDensity;
-      avd.smokeAbsorptionCrossSection = desc.smokeAbsorptionCrossSection;
-      avd.emissionIntensityScale = desc.emissionIntensityScale;
-      avd.densityView = vol.densityTexture().view;
-      avd.temperatureView = vol.temperatureTexture().view;
+      avd.absorptionCrossSection = volAbsorptionCrossSection();
+      avd.colorScale = volColorScale();
+      avd.alphaScale = volAlphaScale();
+      avd.shadowFactor = volShadowFactor();
+      avd.density4View = vol.density4Texture().view;
 
       result.push_back(std::move(avd));
 
@@ -1281,27 +1386,27 @@ namespace dxvk {
     return result;
   }
 
-  void RtxParticleSystemManager::ensureBlackbodyLUT(RtxContext* ctx) {
-    if (m_blackbodyLUTGenerated) {
+  void RtxParticleSystemManager::ensureColormap(RtxContext* ctx) {
+    if (m_colormapGenerated) {
       return;
     }
 
     Rc<DxvkContext> dxvkCtx(ctx);
-    m_blackbodyLUT = Resources::createImageResource(dxvkCtx, "particle volume blackbody LUT",
+    m_colormap = Resources::createImageResource(dxvkCtx, "particle volume colormap",
       { 256u, 1u, 1u }, VK_FORMAT_R16G16B16A16_SFLOAT);
 
-    ctx->bindResourceView(0, m_blackbodyLUT.view, nullptr);
-    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, BlackbodyLutShader::getShader());
+    ctx->bindResourceView(0, m_colormap.view, nullptr);
+    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, ColormapShader::getShader());
     ctx->dispatch(1, 1, 1);
 
-    // Barrier: ensure LUT write completes before any reads.
+    // Barrier: ensure colormap write completes before any reads.
     ctx->emitMemoryBarrier(0,
       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
       VK_ACCESS_SHADER_WRITE_BIT,
       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
       VK_ACCESS_SHADER_READ_BIT);
 
-    m_blackbodyLUTGenerated = true;
+    m_colormapGenerated = true;
   }
 
 }

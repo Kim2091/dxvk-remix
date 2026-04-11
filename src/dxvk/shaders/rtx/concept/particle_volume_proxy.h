@@ -26,17 +26,25 @@
 // The resolve shader reads this buffer when a ray hits an OBJECT_MASK_UNORDERED_VOLUME_PROXY
 // intersection primitive, then performs an inline ray-march through the volume.
 //
-// Layout: 12 floats = 48 bytes, naturally aligned for StructuredBuffer access.
+// Layout: 20 floats = 80 bytes (5 x vec4), naturally aligned for StructuredBuffer access.
 struct MemoryParticleVolume
 {
   vec3 aabbMin;
-  float smokeAbsorptionCrossSection;
+  float absorptionCrossSection;   // Smoke extinction coefficient
 
   vec3 aabbMax;
-  float emissionIntensityScale;
+  float colorScale;               // Emission brightness multiplier
 
   uvec3 gridDimension;
-  uint volumeIndex;   // Index into the per-frame volume texture arrays (0..MAX_PARTICLE_VOLUMES-1)
+  uint volumeIndex;               // Index into the per-frame volume texture arrays (0..MAX_PARTICLE_VOLUMES-1)
+
+  vec3 upDirection;               // Scene up direction used as shadow march direction for self-shadowing
+  float alphaScale;               // Smoke opacity multiplier
+
+  float shadowFactor;             // Burn brightness modulation
+  uint debugMode;                 // 0=off, 1=temp, 2=fuel, 3=burn, 4=smoke, 5=vel mag, 6=all
+  float pad1;
+  float pad2;
 };
 
 // Flag bit set in instanceCustomIndex for intersection primitives that are

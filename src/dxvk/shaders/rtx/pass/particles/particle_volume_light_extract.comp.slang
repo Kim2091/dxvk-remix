@@ -21,8 +21,9 @@
 */
 
 // Fire light extraction compute shader for ReSTIR integration.
-// Scans the temperature field of a particle volume and extracts a light cluster
-// that can be registered as a sphere light in the ReSTIR light pool.
+// Scans the packed density4 field (temperature channel) of a particle volume
+// and extracts a light cluster that can be registered as a sphere light in the
+// ReSTIR light pool.  Uses the colormap for emission color lookup.
 // One workgroup processes the entire volume via parallel reduction; the result
 // is a single VolumeLightCluster written atomically to the output buffer.
 
@@ -34,9 +35,14 @@
 // Resource bindings
 // ---------------------------------------------------------------------------
 
-Texture3D<float>    TemperatureInput  : register(t0, space1);
-Texture2D<vec4>     BlackbodyLUT      : register(t1, space1);
-SamplerState        LinearSampler     : register(s0, space1);
+[[vk::binding(PARTICLE_VOLUME_BINDING_DENSITY4_INPUT)]]
+Texture3D<vec4>     Density4Input;
+
+[[vk::binding(PARTICLE_VOLUME_BINDING_COLORMAP_INPUT)]]
+Texture2D<vec4>     ColormapInput;
+
+[[vk::binding(PARTICLE_VOLUME_BINDING_LINEAR_SAMPLER)]]
+SamplerState        LinearSampler;
 
 // Output cluster buffer (max 4 clusters)
 struct VolumeLightCluster
@@ -47,14 +53,17 @@ struct VolumeLightCluster
   float pad0;
 };
 
-RWStructuredBuffer<VolumeLightCluster> LightOutput      : register(u0, space2);
-RWStructuredBuffer<uint>               LightCountOutput : register(u1, space2);
+[[vk::binding(PARTICLE_VOLUME_BINDING_LIGHT_OUTPUT)]]
+RWStructuredBuffer<VolumeLightCluster> LightOutput;
+
+[[vk::binding(PARTICLE_VOLUME_BINDING_LIGHT_OUTPUT + 1)]]
+RWStructuredBuffer<uint>               LightCountOutput;
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-static const float kMinLightTemperature = 800.0f;
+static const float kMinLightTemperature = 0.1f; // normalized [0,1] threshold for light contribution
 static const uint  kMaxClusters         = 4u;
 static const uint  kGroupSize           = 128u;
 
@@ -97,13 +106,15 @@ void main(uint threadID : SV_GroupIndex)
     const uint z = flatIdx / (cb.gridDimension.x * cb.gridDimension.y);
     const uvec3 gridCoord = uvec3(x, y, z);
 
-    const float temperature = TemperatureInput[gridCoord];
+    const vec4 d = Density4Input[gridCoord];
+    const float temp = d.x;
 
-    if (temperature > kMinLightTemperature)
+    if (temp > kMinLightTemperature)
     {
       const vec3  worldPos = particleVolumeGridToWorld(gridCoord, cb);
-      const vec3  emission = particleVolumeBlackbodyColor(BlackbodyLUT, LinearSampler, temperature);
-      const float weight   = temperature;
+      const vec4  colormapColor = ColormapInput.SampleLevel(LinearSampler, vec2(temp, 0.5f), 0);
+      const vec3  emission = colormapColor.rgb * colormapColor.a * cb.colorScale;
+      const float weight   = temp;
 
       posSum    += worldPos * weight;
       emitSum   += emission;

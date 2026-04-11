@@ -356,18 +356,20 @@ void render(uint32_t windowWidth, uint32_t windowHeight) {
       .dragCoefficient = 0.15f,
       .gravityForce = -2.f,
       .spawnRatePerSecond = 200.f,
-      // Volumetric smoke/fire parameters (campfire preset)
-      .smokeDensity = 1.5f,
-      .smokeAbsorptionCrossSection = 0.6f,
-      .smokeDissipationRate = 0.08f,
+      // Volumetric smoke/fire parameters (campfire preset — NvFlow normalized system)
+      // Most combustion/rendering params are now global (ImGui-controlled).
+      // Per-system values below are kept for API compatibility.
+      .smokeDensity = 1.0f,
+      .smokeAbsorptionCrossSection = 1.0f,
+      .smokeDissipationRate = 0.0f,
       .fuelAmount = 0.8f,
-      .burnTemperature = 1200.f,
-      .coolingRate = 0.25f,
-      .buoyancyCoefficient = 0.6f,
+      .burnTemperature = 1.0f,
+      .coolingRate = 1.5f,
+      .buoyancyCoefficient = 2.0f,
       .windDirection = {0.f, 0.f, 0.f},
-      .vorticityConfinement = 0.3f,
+      .vorticityConfinement = 0.6f,
       .fluidCouplingStrength = 0.9f,
-      .emissionIntensityScale = 0.5f,
+      .emissionIntensityScale = 1.0f,
       .volumePadding = 0.2f,
       .volumeDecayTime = 3.f,
       .pressureIterations = 30,
@@ -490,18 +492,24 @@ int main(int argc, char* argv[]) {
 
     MSG msg = { 0 };
     while (msg.message != WM_QUIT && (numFrames == 0 || frameIdx < numFrames)) {
-      if (PeekMessage(&msg, NULL, 0U, 0U, PM_REMOVE)) {
+      // Drain ALL pending messages before rendering so Windows doesn't
+      // mark the window as "not responding" during long render frames.
+      while (PeekMessage(&msg, NULL, 0U, 0U, PM_REMOVE)) {
         TranslateMessage(&msg);
         DispatchMessage(&msg);
-      } else {
-        RECT hwndRect = { 0 };
-        GetClientRect(hwnd, &hwndRect);
-        LONG w = hwndRect.right - hwndRect.left;
-        LONG h = hwndRect.bottom - hwndRect.top;
-
-        render(w > 0 ? (uint32_t)w : 0, h > 0 ? (uint32_t)h : 0);
-        ++frameIdx;
+        if (msg.message == WM_QUIT)
+          break;
       }
+      if (msg.message == WM_QUIT)
+        break;
+
+      RECT hwndRect = { 0 };
+      GetClientRect(hwnd, &hwndRect);
+      LONG w = hwndRect.right - hwndRect.left;
+      LONG h = hwndRect.bottom - hwndRect.top;
+
+      render(w > 0 ? (uint32_t)w : 0, h > 0 ? (uint32_t)h : 0);
+      ++frameIdx;
     }
   }
 

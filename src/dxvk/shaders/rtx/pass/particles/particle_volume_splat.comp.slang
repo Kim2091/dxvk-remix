@@ -20,6 +20,17 @@
 * DEALINGS IN THE SOFTWARE.
 */
 
+// Particle-to-grid splatting shader.  For each live particle, blends emitter
+// target values into the 8 trilinear-neighbor cells using NvFlow-style
+// blend-toward-target coupling:
+//   value = mix(existing, target, rate)
+// where rate = saturate(emitterCoupleRate * deltaTimeSecs * weight).
+//
+// The blend-toward-target emitter coupling is derived from NVIDIA Flow's
+// EmitterBoxCS pattern (https://github.com/NVIDIA-Omniverse/PhysX/tree/main/flow),
+// which is licensed under BSD-3-Clause. See ThirdPartyLicenses.txt (section
+// "NVIDIA Flow") for the full license text and attribution.
+
 #include "rtx/pass/particles/particle_volume_common.h"
 #include "rtx/pass/particles/particle_volume_bindings.slangh"
 #include "rtx/pass/particles/particle_volume_helpers.slangh"
@@ -31,11 +42,8 @@
 StructuredBuffer<GpuParticle> Particles;
 
 // Volume output grids (read-write)
-[[vk::binding(PARTICLE_VOLUME_BINDING_DENSITY_OUTPUT)]]
-RWTexture3D<float> DensityOutput;
-
-[[vk::binding(PARTICLE_VOLUME_BINDING_TEMPERATURE_OUTPUT)]]
-RWTexture3D<float> TemperatureOutput;
+[[vk::binding(PARTICLE_VOLUME_BINDING_DENSITY4_OUTPUT)]]
+RWTexture3D<vec4> Density4Output;
 
 [[vk::binding(PARTICLE_VOLUME_BINDING_VELOCITY_OUTPUT)]]
 RWTexture3D<vec4> VelocityOutput;
@@ -64,6 +72,20 @@ void main(uint threadID : SV_DispatchThreadID)
     return;
   }
 
+  // Particle life fraction: 1.0 when freshly spawned, 0.0 at end of life.
+  const float lifeFraction = (cb.maxTimeToLive > 0.0f)
+    ? saturate(float(particle.timeToLive) / cb.maxTimeToLive)
+    : 1.0f;
+
+  // Only young particles (first 30% of life) emit into the grid.  This creates
+  // a concentrated source zone near the emitter; the fluid simulation carries
+  // density and heat upward from there.  Without this cutoff, each particle
+  // paints density along its entire ballistic trajectory (fountain shape).
+  if (lifeFraction < 0.7f)
+  {
+    return;
+  }
+
   // Compute the base grid cell and the trilinear fractional offsets
   ivec3 baseCell;
   vec3 frac;
@@ -77,30 +99,11 @@ void main(uint threadID : SV_DispatchThreadID)
   const float wz0 = 1.0f - frac.z;
   const float wz1 = frac.z;
 
-  // Particle life fraction: 1.0 when freshly spawned, 0.0 at end of life.
-  const float lifeFraction = (cb.maxTimeToLive > 0.0f)
-    ? saturate(float(particle.timeToLive) / cb.maxTimeToLive)
-    : 1.0f;
-
-  // Only young particles (first 30% of life) emit into the grid. This creates
-  // a concentrated source zone near the emitter; the fluid simulation carries
-  // density and heat upward from there. Without this cutoff, each particle
-  // paints density along its entire ballistic trajectory (fountain shape).
-  if (lifeFraction < 0.7f)
-  {
-    return;
-  }
-
-  // Density: additive source scaled by deltaTime.
-  const float densityContrib = cb.smokeDensity * cb.deltaTimeSecs;
-
-  // Temperature: target burn temperature at particle location.
-  const float temperatureTarget = cb.fuelAmount * cb.burnTemperature;
-
-  // Velocity: inject particle velocity into the grid to seed the flow field.
-  // Without this, the fluid must build velocity purely from buoyancy (slow).
-  // fluidCouplingStrength controls how strongly particles drive the fluid.
-  const vec3 velocityContrib = particle.velocity * cb.fluidCouplingStrength;
+  // Emitter target values (NvFlow blend-toward-target model):
+  //   density4 target: (temp=fuelAmount, fuel=fuelAmount, burn=0, smoke=0)
+  //   velocity target: particle.velocity * fluidCouplingStrength
+  const vec4 density4Target = vec4(cb.fuelAmount, cb.fuelAmount, 0.0f, 0.0f);
+  const vec3 velTarget = particle.velocity * cb.fluidCouplingStrength;
 
   // Iterate over all 8 neighboring cells in the trilinear kernel
   for (uint iz = 0u; iz < 2u; iz++)
@@ -126,18 +129,17 @@ void main(uint threadID : SV_DispatchThreadID)
         const float weight = wx * wy * wz;
         const uint3 coord  = uint3(cell);
 
-        // Density: additive with trilinear weighting (extensive property).
-        DensityOutput[coord] += densityContrib * weight;
+        // NvFlow couple rate: blend toward target proportional to weight and dt.
+        // rate = saturate(emitterCoupleRate * deltaTimeSecs * weight)
+        const float rate = saturate(cb.emitterCoupleRate * cb.deltaTimeSecs * weight);
 
-        // Temperature: drive toward burn temperature (intensive property).
-        // No trilinear weighting — all cells near a burning particle reach
-        // the target temperature.  max() prevents accumulation beyond the target.
-        TemperatureOutput[coord] = max(TemperatureOutput[coord], temperatureTarget);
+        // Density4: blend toward emitter target
+        vec4 existing = Density4Output[coord];
+        Density4Output[coord] = mix(existing, density4Target, rate);
 
-        // Velocity: blend particle velocity into the grid with trilinear weighting.
-        // This seeds the flow field from particle motion (Fedkiw et al. 2001).
+        // Velocity: blend toward particle velocity target
         vec4 existingVel = VelocityOutput[coord];
-        existingVel.xyz += velocityContrib * weight;
+        existingVel.xyz = mix(existingVel.xyz, velTarget, rate);
         VelocityOutput[coord] = existingVel;
       }
     }

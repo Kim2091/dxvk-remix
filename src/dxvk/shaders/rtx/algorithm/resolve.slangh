@@ -916,6 +916,15 @@ void resolveVertexUnordered<let RAY_FLAGS : uint8_t>(
 
             if (stepSize > 0.0f)
             {
+              // Debug mode 7: render AABB as flat magenta to verify proxy hit
+              if (vol.debugMode == 7u)
+              {
+                emissiveRadiance += vec3(radianceAttenuation) * vec3(1.0f, 0.0f, 1.0f);
+                radianceAttenuation *= f16vec3(0.5f);
+                numInteractions += 1;
+                continue;
+              }
+
               vec3  volRadiance = vec3(0.0f, 0.0f, 0.0f);
               float volTransmittance = 1.0f;
               float t = volTMin + stepSize * 0.5f;
@@ -926,31 +935,146 @@ void resolveVertexUnordered<let RAY_FLAGS : uint8_t>(
                 vec3 samplePos = ray.origin + ray.direction * t;
                 vec3 uvw = (samplePos - vol.aabbMin) / aabbSize;
 
-                float density = 0.0f;
-                float temperature = 0.0f;
-                switch (vol.volumeIndex) {
-                  case 0: density = particleVolumeDensity0.SampleLevel(particleVolumeLinearSampler, uvw, 0).r; temperature = particleVolumeTemperature0.SampleLevel(particleVolumeLinearSampler, uvw, 0).r; break;
-                  case 1: density = particleVolumeDensity1.SampleLevel(particleVolumeLinearSampler, uvw, 0).r; temperature = particleVolumeTemperature1.SampleLevel(particleVolumeLinearSampler, uvw, 0).r; break;
-                  case 2: density = particleVolumeDensity2.SampleLevel(particleVolumeLinearSampler, uvw, 0).r; temperature = particleVolumeTemperature2.SampleLevel(particleVolumeLinearSampler, uvw, 0).r; break;
-                  default: density = particleVolumeDensity3.SampleLevel(particleVolumeLinearSampler, uvw, 0).r; temperature = particleVolumeTemperature3.SampleLevel(particleVolumeLinearSampler, uvw, 0).r; break;
+                // Sample packed density4: temp/fuel/burn/smoke
+                vec4 d = vec4(0.0f, 0.0f, 0.0f, 0.0f);
+                switch (vol.volumeIndex)
+                {
+                  case 0:  d = particleVolumeDensity4_0.SampleLevel(particleVolumeLinearSampler, uvw, 0); break;
+                  case 1:  d = particleVolumeDensity4_1.SampleLevel(particleVolumeLinearSampler, uvw, 0); break;
+                  case 2:  d = particleVolumeDensity4_2.SampleLevel(particleVolumeLinearSampler, uvw, 0); break;
+                  default: d = particleVolumeDensity4_3.SampleLevel(particleVolumeLinearSampler, uvw, 0); break;
                 }
 
-                if (density > 0.0f)
+                // ============================================================
+                // DEBUG VISUALIZATION MODES
+                // When debugMode > 0, render false-color for the selected channel.
+                // This bypasses normal rendering so we can see raw grid data.
+                // ============================================================
+                if (vol.debugMode > 0u)
                 {
-                  float sigma_t = density * vol.smokeAbsorptionCrossSection;
-                  float stepTransmittance = exp(-sigma_t * stepSize);
+                  float debugVal = 0.0f;
+                  vec3 debugColor = vec3(0.0f);
 
-                  vec3 emission = vec3(0.0f, 0.0f, 0.0f);
-                  if (temperature > 500.0f)
+                  if (vol.debugMode == 1u)
                   {
-                    float u = saturate((temperature - 500.0f) / (6500.0f - 500.0f));
-                    vec4  lutSample = particleVolumeBlackbodyLUT.SampleLevel(particleVolumeLinearSampler, vec2(u, 0.5f), 0);
-                    emission = lutSample.rgb * lutSample.a * vol.emissionIntensityScale;
+                    // Temperature: red channel
+                    debugVal = d.x;
+                    debugColor = vec3(debugVal, debugVal * 0.2f, 0.0f);
+                  }
+                  else if (vol.debugMode == 2u)
+                  {
+                    // Fuel: green channel
+                    debugVal = d.y;
+                    debugColor = vec3(0.0f, debugVal, debugVal * 0.2f);
+                  }
+                  else if (vol.debugMode == 3u)
+                  {
+                    // Burn: yellow
+                    debugVal = d.z;
+                    debugColor = vec3(debugVal, debugVal * 0.8f, 0.0f);
+                  }
+                  else if (vol.debugMode == 4u)
+                  {
+                    // Smoke: white/gray
+                    debugVal = d.w;
+                    debugColor = vec3(debugVal);
+                  }
+                  else if (vol.debugMode == 5u)
+                  {
+                    // Velocity magnitude: blue-to-red heat map
+                    // Need to sample velocity too
+                    vec3 velSample = vec3(0.0f);
+                    switch (vol.volumeIndex)
+                    {
+                      case 0:  velSample = particleVolumeDensity4_0.SampleLevel(particleVolumeLinearSampler, uvw, 0).xyz; break;
+                      default: break;
+                    }
+                    // Actually velocity is in a separate texture — just use density4 channels for now.
+                    // Show max of all 4 channels as a proxy for "anything here"
+                    debugVal = max(max(d.x, d.y), max(d.z, d.w));
+                    debugColor = vec3(debugVal, debugVal * 0.5f, 1.0f - debugVal);
+                  }
+                  else if (vol.debugMode == 6u)
+                  {
+                    // All channels: R=temp, G=fuel, B=smoke, brightness=burn
+                    debugVal = max(max(d.x, d.y), max(d.z, d.w));
+                    debugColor = vec3(d.x, d.y, d.w) + vec3(d.z * 0.5f);
                   }
 
-                  volRadiance += volTransmittance * (1.0f - stepTransmittance) * emission;
-                  volTransmittance *= stepTransmittance;
+                  if (debugVal > 0.001f)
+                  {
+                    float debugAlpha = saturate(debugVal * 3.0f);
+                    float stepT = exp(-debugVal * 2.0f * stepSize);
+                    volRadiance += volTransmittance * debugAlpha * debugColor;
+                    volTransmittance *= stepT;
+                  }
                 }
+                else
+                {
+                // ============================================================
+                // NORMAL RENDERING
+                // ============================================================
+                float smoke = d.w;
+                if (smoke > 0.001f)
+                {
+                  // Extinction from smoke channel (Beer-Lambert)
+                  float sigma_t = smoke * vol.absorptionCrossSection;
+                  float stepT = exp(-sigma_t * stepSize);
+
+                  // Color from temperature via colormap lookup
+                  vec4 cmSample = particleVolumeColormap.SampleLevel(particleVolumeLinearSampler, vec2(d.x, 0.5f), 0);
+                  // Modulate emission by burn brightness
+                  cmSample.rgb *= (1.0f + vol.shadowFactor * (d.z - 1.0f));
+                  cmSample.a *= smoke;
+                  cmSample.rgb *= vol.colorScale;
+                  cmSample.a = min(cmSample.a * vol.alphaScale, 1.0f);
+
+                  // Self-shadow: short secondary march from sample point toward the up direction.
+                  if (d.x > 0.1f)
+                  {
+                    float shadowTransmittance = 1.0f;
+                    {
+                      static const uint kShadowSteps = 6u;
+                      static const float kShadowStepScale = 2.0f;
+                      float shadowStepSize = stepSize * kShadowStepScale;
+                      vec3 shadowDir = vol.upDirection;
+
+                      for (uint si = 0u; si < kShadowSteps; si++)
+                      {
+                        vec3 shadowPos = samplePos + shadowDir * (shadowStepSize * float(si + 1u));
+                        vec3 shadowUvw = (shadowPos - vol.aabbMin) / aabbSize;
+
+                        if (any(shadowUvw < vec3(0.0f)) || any(shadowUvw > vec3(1.0f)))
+                          break;
+
+                        float shadowSmoke = 0.0f;
+                        switch (vol.volumeIndex)
+                        {
+                          case 0:  shadowSmoke = particleVolumeDensity4_0.SampleLevel(particleVolumeLinearSampler, shadowUvw, 0).w; break;
+                          case 1:  shadowSmoke = particleVolumeDensity4_1.SampleLevel(particleVolumeLinearSampler, shadowUvw, 0).w; break;
+                          case 2:  shadowSmoke = particleVolumeDensity4_2.SampleLevel(particleVolumeLinearSampler, shadowUvw, 0).w; break;
+                          default: shadowSmoke = particleVolumeDensity4_3.SampleLevel(particleVolumeLinearSampler, shadowUvw, 0).w; break;
+                        }
+
+                        if (shadowSmoke > 0.0f)
+                          shadowTransmittance *= exp(-shadowSmoke * vol.absorptionCrossSection * shadowStepSize);
+
+                        if (shadowTransmittance < 0.05f)
+                          break;
+                      }
+                    }
+
+                    cmSample.rgb *= shadowTransmittance;
+                  }
+
+                  // Ambient scattering
+                  static const vec3 kAmbientColor = vec3(0.15f, 0.17f, 0.20f);
+                  vec3 ambientScatter = kAmbientColor * smoke;
+
+                  volRadiance += volTransmittance * (cmSample.a * cmSample.rgb + (1.0f - stepT) * ambientScatter);
+                  volTransmittance *= stepT;
+                }
+                } // end normal rendering
 
                 t += stepSize;
                 stepCount++;
