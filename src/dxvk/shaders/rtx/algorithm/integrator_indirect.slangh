@@ -226,7 +226,7 @@ uint2 jitterBoundaryPixels(uint2 pixelCoordinate, uint2 jitterOffset)
 bool sampleLightNeeCache(inout RAB_RandomSamplerState rtxdiRNG, inout RNG randomState, uint16_t neeCellOffset,
   SurfaceInteraction surfaceInteraction,
   OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteraction,
-  f16vec3 viewDirection,
+  vec3 viewDirection,
   out LightSample lightSample,
   out float invSelectionPdf,
   out uint16_t lightIdx)
@@ -239,7 +239,7 @@ bool sampleLightNeeCache(inout RAB_RandomSamplerState rtxdiRNG, inout RNG random
 
   // Note: We are NOT taking transmission into consideration, because calculating probability of transmission has some costs.
   //       Also, it's an approximate importance sample and does not need to be exact, so we just skip the calculation here for better performance.
-  float16_t specularRatio = calcBt709Luminance(opaqueSurfaceMaterialInteraction.baseReflectivity)
+  float specularRatio = calcBt709Luminance(opaqueSurfaceMaterialInteraction.baseReflectivity)
     / calcBt709Luminance(opaqueSurfaceMaterialInteraction.albedo + opaqueSurfaceMaterialInteraction.baseReflectivity);
   vec2 uniformRandomNumber = vec2(getNextSampleBlueNoise(randomState), getNextSampleBlueNoise(randomState));
 
@@ -273,7 +273,7 @@ NrcProgressState updateNrcOnHit(
 
 #if ENABLE_NRC
 
-  const f16vec3 prevThroughput = pathState.throughput;
+  const vec3 prevThroughput = pathState.throughput;
 
   nrcProgressState = Nrc::updateNrcOnHit(pathState.pixelCoordinate, pathState.isNrcUpdate,
     surfaceInteraction, polymorphicSurfaceMaterialInteraction, -pathState.direction,
@@ -281,7 +281,7 @@ NrcProgressState updateNrcOnHit(
     pathState.throughput, pathState.radiance, pathState.nrcPathState);
 
   // Update the total throughput when NRC resets it
-  if (pathState.isNrcUpdate && all(pathState.throughput == 1.h))
+  if (pathState.isNrcUpdate && all(pathState.throughput == 1.0f))
   {
     pathState.throughputFullPath *= prevThroughput;
   }
@@ -314,7 +314,7 @@ void integratePathVertex(
     (cb.enableTransmissionApproximationInIndirectRays ? resolveModeTranslucencyTransmissionApprox : 0) |
     resolveModeDecalMaterialBlending |
     (separateUnorderedApproximations ? resolveModeSeparateUnorderedApproximations : 0);
-  f16vec3 radianceAttenuation = f16vec3(1.0f, 1.0f, 1.0f);
+  vec3 radianceAttenuation = vec3(1.0f, 1.0f, 1.0f);
   vec3 emissiveRadiance = vec3(0);
 
   // Handle Unordered Resolving
@@ -325,7 +325,7 @@ void integratePathVertex(
   pathState.decalEncountered = false;
   
   uint4 decalMemory = 0;
-  f16vec3 decalEmissiveRadiance = f16vec3(0);
+  vec3 decalEmissiveRadiance = vec3(0.0f);
   int unorderedSurfaceIndex = -1;  
   bool isNeeEnabledOnBounce = useNeeCacheOnThisBounce(pathState.bounceIteration, pathState.enableNeeCacheAfterFirstBounce);
   if (separateUnorderedApproximations)
@@ -333,7 +333,7 @@ void integratePathVertex(
     Ray unorderedResolveRay;
     unorderedResolveRay.origin = pathState.origin;
     unorderedResolveRay.coneRadius = pathState.coneRadius;
-    unorderedResolveRay.spreadAngle = float16_t(cb.screenSpacePixelSpreadHalfAngle);
+    unorderedResolveRay.spreadAngle = cb.screenSpacePixelSpreadHalfAngle;
     unorderedResolveRay.direction = pathState.direction;
     unorderedResolveRay.tMax = rayHitInfo.hasHit ? rayHitInfo.hitDistance * kUnorderedResolveRayLengthening : floatMax;
 
@@ -342,7 +342,7 @@ void integratePathVertex(
       | (cb.enableUnorderedEmissiveParticlesInIndirectRays ? OBJECT_MASK_UNORDERED_ALL_EMISSIVE : 0);
     unorderedRayMask = convertPrimaryRayMaskToUnordered(pathState.rayMask, unorderedRayMask);
     
-    resolveVertexUnordered<RAY_FLAG_CULL_OPAQUE>(
+    resolveVertexUnordered<RAY_FLAG_CULL_OPAQUE, true, true>(
       resolveMode, unorderedResolveRay,
       unorderedRayMask, pathState.portalSpace,
       /* useIntersectionBillboards = */ cb.enableBillboardOrientationCorrection,
@@ -382,6 +382,8 @@ void integratePathVertex(
   bool pomOpaqueSurfaceEncountered = false;
   bool isStochasticAlphaBlend = false; // note: not used here
   uint8_t firstRayPortal = invalidRayPortalIndex;
+  // Indirect rays have no transparency layer; merge any ring emissive back into emissiveRadiance below.
+  vec3 transparencyLayerEmissive = vec3(0.0f);
 
   resolveVertex<PathState>(
     resolveMode,
@@ -390,11 +392,14 @@ void integratePathVertex(
     surface, surfaceInteraction,
     polymorphicSurfaceMaterialInteraction,
     radianceAttenuation, emissiveRadiance,
+    transparencyLayerEmissive,
     decalMemory, decalEmissiveRadiance, 
     pathState.coneSpreadAngle,
     isStochasticAlphaBlend, firstRayPortal,
     pomOpaqueSurfaceEncountered,
     isRaytracedRenderTarget);
+
+  emissiveRadiance += transparencyLayerEmissive;
 
   // We can encounter a POM surface during resolving (as it's a shared function).  But if POM is disabled in indirect cases
   //  we must also handle that case and ensure nothing tries to use POM elsewhere.
@@ -415,7 +420,7 @@ void integratePathVertex(
     else
     {
       vec3 hitPosition;
-      f16vec3 hitNormal = f16vec3(0,0,0);
+      vec3 hitNormal = vec3(0,0,0);
       if (rayInteractionHasHit(rayInteraction))
       {
         hitPosition = surfaceInteraction.position;
@@ -485,7 +490,7 @@ void integratePathVertex(
 
   // Note: When accumulating radiance/throughput from the resolve logic, emissive takes priority
   // over attenuation so that emissive surfaces do not attenuate themselves.
-  float16_t oldLuminance = calcBt709Luminance(pathState.radiance);
+  float oldLuminance = calcBt709Luminance(pathState.radiance);
   accumulateRadiance(pathState, emissiveRadiance);
   accumulateThroughput(pathState, radianceAttenuation);
 
@@ -497,7 +502,8 @@ void integratePathVertex(
   {  
     nrcProgressState = updateNrcOnHit(pathState, surfaceInteraction, polymorphicSurfaceMaterialInteraction);
 
-    if (nrcProgressState == NrcProgressState::TerminateImmediately)
+    // Terminate prior to resolving surface's emissive contribution if NRC indicates so and boostEmissives is not enabled.
+    if (nrcProgressState == NrcProgressState::TerminateImmediately && !cb.nrcArgs.boostEmissives)
     {
       pathState.continuePath = false;
       return;
@@ -516,7 +522,7 @@ void integratePathVertex(
 
     // Calculate the volume transmittance
 
-    f16vec3 volumeTransmittance;
+    vec3 volumeTransmittance;
 
     if (rayInteractionHasHit(rayInteraction))
     {
@@ -535,8 +541,10 @@ void integratePathVertex(
   }
 
   // If the camera index changed then this ray passed through a render target. Cast a ray from the new camera.
-  if (cb.enableRaytracedRenderTarget && isRaytracedRenderTarget && pathState.bounceIteration == 1)
-  {
+  // Note: NRC TerminateImmediately with boostEmissives must take priority as a query record has already been created
+  if (cb.enableRaytracedRenderTarget && isRaytracedRenderTarget && pathState.bounceIteration == 1
+      && !(ENABLE_NRC && nrcProgressState == NrcProgressState::TerminateImmediately))
+  { 
     Ray newRay = rayCreateRenderTarget(cb.renderTargetCamera, surfaceInteraction.textureCoordinates, ray);
     pathState.origin = newRay.origin;
     pathState.direction = newRay.direction;
@@ -614,6 +622,16 @@ void integratePathVertex(
     accumulateRadiance(pathState, emissiveLightRadiance);
   }
 
+  // When boostEmissives is enabled, defer TerminateImmediately until after emissive accumulation
+  // so that the hit surface's emissive self-emission is properly MIS-weighted.
+  // Without this, emissive lighting is lost on TerminateImmediately paths (includeDirectLighting=true)
+  // because NRC's irradiance cache poorly captures sharp emissive features.
+  if (ENABLE_NRC && nrcProgressState == NrcProgressState::TerminateImmediately && cb.nrcArgs.boostEmissives)
+  {
+    pathState.continuePath = false;
+    return;
+  }
+
 // We don't need to sample lights or surface rays in the portal closest hit shader
 #if (SURFACE_MATERIAL_RESOLVE_TYPE_ACTIVE_MASK & SURFACE_MATERIAL_RESOLVE_TYPE_RAY_PORTAL) != 0
   if (materialType == surfaceMaterialTypeOpaque || materialType == surfaceMaterialTypeTranslucent)
@@ -623,16 +641,16 @@ void integratePathVertex(
     // Construct RNG
     RNG randomState = createRNG(pathState.pixelCoordinate, cb.frameIdx, pathState.calculateRNGOffset(kRNGOffsetSampleClosestHitShader));
     
-    float16_t restirHitT = float16_t(kMissHitDistance);
+    float restirHitT = kMissHitDistance;
     updateReSTIRGIHitDistance(oldLuminance, calcBt709Luminance(pathState.radiance), restirHitT, pathState.accumulatedHitDistance);
     
     const bool oldInsideMedium = pathState.insideMedium;
-    vec3 continuationThroughput = f16vec3(1.0);
+    vec3 continuationThroughput = vec3(1.0);
     uint8_t continuationLobe = 0;
-    f16vec3 incomingDirection = pathState.direction;
+    vec3 incomingDirection = pathState.direction;
     {
       // Sample a new direction
-      float16_t sampledLobePdf, solidAnglePdf;
+      float sampledLobePdf, solidAnglePdf;
 
       // Note: If this sample is invalid the throughput and solid angle pdf will be set to 0.
       const Ray sampledRay = sampleDirection(
@@ -677,7 +695,7 @@ void integratePathVertex(
       bool isWithinGbuffer = false;
       // Only steal rtxdi sample on rough surfaces with weak specular lobe, otherwise specular highlight will get lost.
       // The value is based on experiment.
-      const float16_t baseReflectivityFactor = 3.0f;
+      const float baseReflectivityFactor = 3.0f;
       uint16_t lightIdx = kInvalidLightIdx;
       if (cb.enableRtxdi && cb.enableRtxdiSampleStealing &&
         calcBt709Luminance(opaqueSurfaceMaterialInteraction.baseReflectivity) < baseReflectivityFactor * opaqueSurfaceMaterialInteraction.isotropicRoughness) 
@@ -773,7 +791,7 @@ void integratePathVertex(
           
           // Calculate cached triangle NEE sample's MIS light contribution
           vec3 diffuseLightTriangle, specularLightTriangle;
-          f16vec3 inputDirection = normalize(lightSampleTriangle.position - surfaceInteraction.position);
+          vec3 inputDirection = normalize(lightSampleTriangle.position - surfaceInteraction.position);
           evaluateUnshadowedLight(lightSampleTriangle, opaqueSurfaceMaterialInteraction, rayInteraction, inputDirection, diffuseLightTriangle, specularLightTriangle);
           vec2 misWeight = NEECacheUtils.calculateLightSampleMISWeight(opaqueSurfaceMaterialInteraction, inputDirection, rayInteraction.viewDirection, lightSampleTriangle.solidAnglePdf);
           diffuseLightTriangle *= misWeight.x;
@@ -827,15 +845,27 @@ void integratePathVertex(
         // WAR for REMIX-3705 producing NaNs here
         if (isValidValue(neeLight))
         {
+          // Note: Skip insertion when lightTask holds kInvalidLightIdx but would be
+          // inserted as a triangle task (isLightTask == false). This happens when
+          // reshuffle resilience keeps the original lightIdx to preserve task typing
+          // but no valid analytical light was sampled, leaving lightTask == 0xFFFF.
+          // See "if (hasFreshCandidates || !reshuffleResilience)"" above for more context.
+          // Inserting 0xFFFF as a triangle prefix sum ID corrupts the NEE cache and
+          // can cause an out-of-range shared memory access in the update shader.
+          // This isn't caught by if (lastID == NEE_CACHE_INVALID_ID) because
+          // 0xFFFF != 0xFFFFFF. The binary search in convertPrefixSumIDToID treats
+          // 65535 as a real prefix sum ID, producing garbage surfaceID/primitiveID.
+          const bool isLightTask = lightIdx != kInvalidLightIdx;
           if (NEE_CACHE_ENABLE && cb.neeCacheArgs.enable && 
               any(neeLight > 0) && 
-              all((pathState.pixelCoordinate & 0x3) != 1))
+              all((pathState.pixelCoordinate & 0x3) != 1) &&
+              (isLightTask || lightTask != uint(kInvalidLightIdx)))
           {
             NEECell cell = NEECache.getCell(pathState.neeCacheCellOffset);
-            cell.insertSlotTask(lightTask, neeLight, lightIdx != kInvalidLightIdx);
+            cell.insertSlotTask(lightTask, neeLight, isLightTask);
           }
       
-          float16_t specularPortion = calcBt709Luminance(specularLight) / calcBt709Luminance(neeLight);
+          float specularPortion = calcBt709Luminance(specularLight) / calcBt709Luminance(neeLight);
       
           accumulateRadiance(pathState, neeLight);
       
@@ -998,7 +1028,7 @@ void integratePathVertex(
       }
     
       vec3 indirectLight = vec3(0);
-      if (isWithinGbuffer && opaqueSurfaceMaterialInteraction.opacity == float16_t(1))
+      if (isWithinGbuffer && opaqueSurfaceMaterialInteraction.opacity == 1.0f)
       {
         if (cb.enableReSTIRGISampleStealing == 2)
         {
@@ -1046,7 +1076,7 @@ void integratePathVertex(
     // Update RestirGI hit distance until a rough surface is hit
     if (cb.enableReSTIRGI &&
         !pathState.restirGiHasFoundRoughSurface && 
-        restirHitT > 0.h)
+        restirHitT > 0.0f)
     {
       if (opaqueSurfaceMaterialInteraction.isotropicRoughness > cb.reSTIRGIVirtualSampleRoughnessThreshold ||
           continuationLobe == opaqueLobeTypeDiffuseReflection)
@@ -1079,7 +1109,7 @@ void integratePathVertex(
 }
 
 // Update the hit distance when a significant contribution to the final result is found
-void updateReSTIRGIHitDistance(inout float16_t oldLuminance, float16_t newLuminance, inout float16_t restirHitT, float16_t newHitT)
+void updateReSTIRGIHitDistance(inout float oldLuminance, float newLuminance, inout float restirHitT, float newHitT)
 {
 #if !ENABLE_NRC 
   // If both oldLuminance and newLuminance are 0, still update hit distance
@@ -1096,21 +1126,21 @@ void updateReSTIRGIHitDistance(inout float16_t oldLuminance, float16_t newLumina
 
 vec3 calculateReSTIRGIRadianceFactor(
   GeometryFlags geometryFlags,
-  float16_t primaryPerceptualRoughness,
-  float16_t firstSampledLobePdf,
-  float16_t firstSampledSolidAnglePdf,
+  float primaryPerceptualRoughness,
+  float firstSampledLobePdf,
+  float firstSampledSolidAnglePdf,
   vec3 firstLobeThroughput)
 {
   // pathState.radiance = L * fi * cosA / (solidAnglePdf * lobePdf)
   // throughput = fi * cosA / (solidAnglePdf * lobePdf)
-  float16_t isotropicRoughness = calcRoughness(primaryPerceptualRoughness);
-  const float16_t diffuseLobeProbability = geometryFlags.firstSampledLobeIsSpecular ?
-    float16_t(1.0) - firstSampledLobePdf : firstSampledLobePdf;
+  float isotropicRoughness = calcRoughness(primaryPerceptualRoughness);
+  const float diffuseLobeProbability = geometryFlags.firstSampledLobeIsSpecular ?
+    1.0f - firstSampledLobePdf : firstSampledLobePdf;
 
   // Only skip specular lobe when diffuse probability is high enough.
-  const float16_t minDiffuseProbability = 0.05;
+  const float minDiffuseProbability = 0.05f;
 
-  if (!kRestirGIAcceptLowRoughnessInput && isotropicRoughness < float16_t(RAB_RESTIR_GI_DELTA_ROUGHNESS) && diffuseLobeProbability > minDiffuseProbability)
+  if (!kRestirGIAcceptLowRoughnessInput && isotropicRoughness < RAB_RESTIR_GI_DELTA_ROUGHNESS && diffuseLobeProbability > minDiffuseProbability)
   {
     // For low roughness surface, only diffuse samples are input to ReSTIR GI.
     // So the input to ReSTIR GI should be L / (solidAnglePdf * lobePdf)
@@ -1137,7 +1167,7 @@ vec3 calculateReSTIRGIRadianceFactor(
 // This looks kind of stupid because we just wrote this radiance factor to a texture earlier in this function,
 // but it's actually better than storing the factor in a variable. That would result in the factor being spilled and filled
 // multiple times as the integrator progresses through the scene, and with a texture store it's only spilled once.
-void storeRestirGIRadiance(PathState pathState, GeometryFlags geometryFlags, float16_t gbufferSurfaceHitDistance)
+void storeRestirGIRadiance(PathState pathState, GeometryFlags geometryFlags, float gbufferSurfaceHitDistance)
 {
 #if !ENABLE_NRC  
   if (!(cb.enableReSTIRGI && geometryFlags.primarySelectedIntegrationSurface))
@@ -1145,14 +1175,14 @@ void storeRestirGIRadiance(PathState pathState, GeometryFlags geometryFlags, flo
     return;
   }
 
-  f16vec4 restirGIRadianceFactorHitDistance = RestirGIRadiance[pathState.pixelCoordinate];
+  vec4 restirGIRadianceFactorHitDistance = RestirGIRadiance[pathState.pixelCoordinate];
   vec3 restirGIRadiance = restirGIRadianceFactorHitDistance.rgb * pathState.radiance;
   float luminance = calcBt709Luminance(restirGIRadiance);
   float luminanceFactor = min(1.0, float16Max / luminance);
   restirGIRadiance *= luminanceFactor;
 
   // Calculate indirect portion of the path length
-  float16_t restirGIHitDistance = max(restirGIRadianceFactorHitDistance.a - gbufferSurfaceHitDistance, 0.0);
+  float restirGIHitDistance = max(restirGIRadianceFactorHitDistance.a - gbufferSurfaceHitDistance, 0.0);
 
   // Sign bit for non opaque hit
   if (!pathState.restirGiHasHitOpaque)
@@ -1215,14 +1245,14 @@ void initNrc(
   u16vec2 gbufferPixelCoordinate,
   bool isNrcUpdate,
   GeometryFlags geometryFlags,
-  float16_t firstSampledSolidAnglePdf)
+  float firstSampledSolidAnglePdf)
 {
 #if ENABLE_NRC
   pathState.isNrcUpdate = isNrcUpdate;
 
   if (isNrcUpdate) 
   {
-    pathState.throughputFullPath = f16vec3(1.h);
+    pathState.throughputFullPath = vec3(1.0f);
   }
 
   // Cache the coordinate since it's calculated
@@ -1313,9 +1343,9 @@ void writeToNrcOutputsAfterIntegration(PathState pathState)
 void initReSTIRGI(
   PathState pathState,
   GeometryFlags geometryFlags,
-  float16_t firstHitPerceptualRoughness,
-  float16_t firstSampledLobePdf,
-  float16_t firstSampledSolidAnglePdf)
+  float firstHitPerceptualRoughness,
+  float firstSampledLobePdf,
+  float firstSampledSolidAnglePdf)
 {
 #if !ENABLE_NRC
   if (cb.enableReSTIRGI && geometryFlags.primarySelectedIntegrationSurface)
@@ -1340,10 +1370,10 @@ void integrateIndirectPath(
   u16vec2 gbufferPixelCoordinate,
   uint indirectSbtOffset,
   IndirectPathTextures indirectPathTextures,
-  GeometryFlags geometryFlags, uint mediumMaterialIndex, vec3 rayOrigin, f16vec3 rayDirection,
-  f16vec3 throughput, float16_t rayConeRadius, float16_t firstHitPerceptualRoughness,
-  float16_t firstSampledLobePdf, float16_t firstSampledSolidAnglePdf,
-  float16_t gbufferSurfaceHitDistance, bool isNrcUpdate)
+  GeometryFlags geometryFlags, uint mediumMaterialIndex, vec3 rayOrigin, vec3 rayDirection,
+  vec3 throughput, float rayConeRadius, float firstHitPerceptualRoughness,
+  float firstSampledLobePdf, float firstSampledSolidAnglePdf,
+  float gbufferSurfaceHitDistance, bool isNrcUpdate)
 {
   // Initialize Path State
   // Note: Not technically live state as this is only passed into the resolve call and reconstructed from its output.
@@ -1372,12 +1402,12 @@ void integrateIndirectPath(
   // Note: Initialize the continue path flag based on if an indirect ray should actually be cast, e.g. if the PDF
   // and throughput are non-zero (as these being 0 indicates often that the sampled ray direction is invalid and should
   // not be used).
-  if (firstSampledSolidAnglePdf == 0.0h)
+  if (firstSampledSolidAnglePdf == 0.0f)
   {
     pathState.continuePath = false;
   }
 
-  pathState.continuePath &= any(pathState.throughput > 0.0h);
+  pathState.continuePath &= any(pathState.throughput > 0.0f);
 
   if (pathState.continuePath)
   {
@@ -1409,17 +1439,17 @@ void integrateIndirectPath(
             
             if (opaqueSurfaceMaterial.heightTextureIndex == BINDING_INDEX_INVALID)
             {
-              storeInDebugView(getDispatchRaysIndex().xy, float3(1.f, 1.f, 0.f));
+              storeInDebugView(gbufferPixelCoordinate, float3(1.f, 1.f, 0.f));
             }
           }
           else
           {
-            storeInDebugView(getDispatchRaysIndex().xy, float3(1.f, 0.5f, 0.f));
+            storeInDebugView(gbufferPixelCoordinate, float3(1.f, 0.5f, 0.f));
           }
         }
         else
         {
-          storeInDebugView(getDispatchRaysIndex().xy, float3(1.f, 0.f, 0.f));
+          storeInDebugView(gbufferPixelCoordinate, float3(1.f, 0.f, 0.f));
         }
       }
 
@@ -1486,32 +1516,25 @@ void integrateIndirectPath(
       TRUE_OR_CHECK_WHEN_NRC_ENABLED(pathState.isNrcQuery));
   }
 
-  u16vec2 gbufferPixelCoordinate = pathState.pixelCoordinate;
-
-#if ENABLE_NRC
-  if (pathState.isNrcUpdate)
-  {
-    gbufferPixelCoordinate = Nrc::calculateTrainingPixelCoordinateInQuerySpace(gbufferPixelCoordinate, cb.nrcArgs);
-  }
-#endif
-
-  // Re-load geometry flags from the resource so that they're not carried around as live state during a ray path integration
-  geometryFlags = geometryFlagsReadFromGBuffer(gbufferPixelCoordinate, SharedFlags);
-
-  storeRestirGIRadiance(pathState, geometryFlags, gbufferSurfaceHitDistance);
-
-  vec4 indirectOutData = vec4(pathState.radiance, pathState.firstBounceHitDistance);
-
-  // Sanitize only primary indirect signal
-  // Secondary indirect signal is sanitized in demodulate pass after radiance contribution from the direct lighting is added
-  if (geometryFlags.primarySelectedIntegrationSurface)
-  {
-    indirectOutData = sanitizeRadianceHitDistance(indirectOutData.xyz, indirectOutData.w);
-  }
-
-  // Store the integrated ray path radiance and hit distance
   if (TRUE_OR_CHECK_WHEN_NRC_ENABLED(pathState.isNrcQuery))
   {
+    const u16vec2 gbufferPixelCoordinate = pathState.pixelCoordinate;
+
+    // Re-load geometry flags from the resource so that they're not carried around as live state during a ray path integration
+    geometryFlags = geometryFlagsReadFromGBuffer(gbufferPixelCoordinate, SharedFlags);
+
+    storeRestirGIRadiance(pathState, geometryFlags, gbufferSurfaceHitDistance);
+
+    vec4 indirectOutData = vec4(pathState.radiance, pathState.firstBounceHitDistance);
+
+    // Sanitize only primary indirect signal
+    // Secondary indirect signal is sanitized in demodulate pass after radiance contribution from the direct lighting is added
+    if (geometryFlags.primarySelectedIntegrationSurface)
+    {
+      indirectOutData = sanitizeRadianceHitDistance(indirectOutData.xyz, indirectOutData.w);
+    }
+
+    // Store the integrated ray path radiance and hit distance
     indirectPathTextures.IndirectRadianceHitDistance[gbufferPixelCoordinate] = indirectOutData;
   }
   

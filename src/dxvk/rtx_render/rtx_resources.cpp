@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2021-2025, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2021-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -38,7 +38,7 @@
 #include "rtx_texture_manager.h"
 #include "rtx_debug_view.h"
 #include "rtx_xess.h"
-#include "../util/util_globaltime.h"
+#include "../util/util_global_time.h"
 
 namespace dxvk {
 
@@ -450,10 +450,12 @@ namespace dxvk {
     // Only create SSS Textures when there're SSS materials in the scene
     {
       if (sceneManager.isSssMaterialExist() || sceneManager.isThinOpaqueMaterialExist()) {
-        if (!m_raytracingOutput.m_sharedSubsurfaceData.isValid()) {
+        if (!m_raytracingOutput.m_sharedSubsurfaceData.isValid() ||
+            m_raytracingOutput.m_sharedSubsurfaceData.image->info().extent != m_downscaledExtent) {
           m_raytracingOutput.m_sharedSubsurfaceData = createImageResource(ctx, "primary subsurface material buffer", m_downscaledExtent, VK_FORMAT_R16G16_UINT);
         }
-        if (!m_raytracingOutput.m_sharedSubsurfaceDiffusionProfileData.isValid()) {
+        if (!m_raytracingOutput.m_sharedSubsurfaceDiffusionProfileData.isValid() ||
+            m_raytracingOutput.m_sharedSubsurfaceDiffusionProfileData.image->info().extent != m_downscaledExtent) {
           // The single scattering is also stored in diffusion profile texture which is used in thin opaque. So we need to create this texture for thin opaque as well.
           m_raytracingOutput.m_sharedSubsurfaceDiffusionProfileData = createImageResource(ctx, "primary subsurface material diffusion profile data buffer", m_downscaledExtent, VK_FORMAT_R32G32_UINT);
         }

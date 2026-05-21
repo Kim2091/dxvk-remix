@@ -24,7 +24,11 @@
 #define REMIX_C_H_
 
 #include <stdint.h>
+
+#ifndef REMIX_WINAPI_NO_INCLUDE
 #include <windows.h>
+#endif
+
 
 #ifndef REMIX_ALLOW_X86
 #if _WIN64 != 1
@@ -54,13 +58,44 @@
 
 #define REMIXAPI_VERSION_MAJOR 0
 #define REMIXAPI_VERSION_MINOR 6
-#define REMIXAPI_VERSION_PATCH 2
+#define REMIXAPI_VERSION_PATCH 4
 
 
 // External
 typedef struct IDirect3D9Ex       IDirect3D9Ex;
 typedef struct IDirect3DDevice9Ex IDirect3DDevice9Ex;
 typedef struct IDirect3DSurface9  IDirect3DSurface9;
+
+#ifndef REMIX_WINAPI_NO_INCLUDE
+  typedef HWND remixapi_HWND;
+  typedef HMODULE remixapi_HMODULE;
+  typedef FARPROC remixapi_loader_PROC;
+  #define REMIX_WINAPI_LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR
+  #define REMIX_WINAPI_LOAD_LIBRARY_SEARCH_DEFAULT_DIRS LOAD_LIBRARY_SEARCH_DEFAULT_DIRS
+  #define REMIX_WINAPI_MAX_PATH                         MAX_PATH
+#else // if there's no 'Windows.h', then declare WINAPI types/functions manually
+  typedef struct HWND__* remixapi_HWND;
+  typedef struct HINSTANCE__* remixapi_HMODULE;
+  typedef long long(__stdcall* remixapi_loader_PROC)();
+  #define REMIX_WINAPI_LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR 0x00000100
+  #define REMIX_WINAPI_LOAD_LIBRARY_SEARCH_DEFAULT_DIRS 0x00001000
+  #define REMIX_WINAPI_MAX_PATH                         260
+  #ifndef REMIX_WINAPI_NO_LIBRARY_LOADER // if loader is needed
+  #ifdef __cplusplus
+  extern "C" {
+  #endif // __cplusplus
+    __declspec(dllimport) unsigned long        __stdcall GetDllDirectoryW(unsigned long nBufferLength, wchar_t* lpBuffer);
+    __declspec(dllimport) int                  __stdcall FreeLibrary(remixapi_HMODULE hLibModule);
+    __declspec(dllimport) remixapi_HMODULE     __stdcall LoadLibraryW(const wchar_t* lpLibFileName);
+    __declspec(dllimport) remixapi_HMODULE     __stdcall LoadLibraryExW(const wchar_t* lpLibFileName, void* hFile, unsigned long dwFlags);
+    __declspec(dllimport) remixapi_loader_PROC __stdcall GetProcAddress(remixapi_HMODULE hModule, const char* lpProcName);
+    __declspec(dllimport) int                  __stdcall SetDllDirectoryW(const wchar_t* lpPathName);
+    __declspec(dllimport) unsigned long        __stdcall GetFullPathNameW(const wchar_t* lpFileName, unsigned long nBufferLength, wchar_t* lpBuffer, wchar_t** lpFilePart);
+  #ifdef __cplusplus
+  }
+  #endif // __cplusplus
+  #endif // !REMIX_WINAPI_NO_LIBRARY_LOADER
+#endif // !REMIX_WINAPI_NO_INCLUDE
 
 
 #ifdef __cplusplus
@@ -94,7 +129,8 @@ extern "C" {
     REMIXAPI_STRUCT_TYPE_PRESENT_INFO                         = 23,
     REMIXAPI_STRUCT_TYPE_DEPRECATED_LEGACY_PARTICLE_SYSTEM    = 24,
     REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_PARTICLE_SYSTEM_EXT    = 25,
-    REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_GPU_INSTANCING_EXT    = 26,
+    REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_GPU_INSTANCING_EXT     = 26,
+    REMIXAPI_STRUCT_TYPE_CAMERA_MEDIUM_INFO                   = 27
     // NOTE: if adding a new struct, register it in 'rtx_remix_specialization.inl'
     //       and only extend this enum by appending, never adjust the order of these 
     //       as that will break backwards compatibility.
@@ -172,7 +208,7 @@ extern "C" {
   typedef struct remixapi_StartupInfo {
     remixapi_StructType sType;
     void*               pNext;
-    HWND                hwnd;
+    remixapi_HWND       hwnd;
     remixapi_Bool       disableSrgbConversionForOutput;
     // If true, 'dxvk_GetExternalSwapchain' can be used to retrieve a raw VkImage,
     // so the application can present it, for example by using OpenGL interop:
@@ -357,6 +393,15 @@ extern "C" {
 
   typedef remixapi_ErrorCode(REMIXAPI_PTR* PFN_remixapi_SetupCamera)(
     const remixapi_CameraInfo* info);
+
+  typedef struct remixapi_CameraMediumInfo {
+    remixapi_StructType     sType;
+    void*                   pNext;
+    remixapi_MaterialHandle medium;
+  } remixapi_CameraMediumInfo;
+
+  typedef remixapi_ErrorCode(REMIXAPI_PTR* PFN_remixapi_SetCameraMediumMaterial)(
+    const remixapi_CameraMediumInfo* info);
 
 
 
@@ -650,7 +695,7 @@ extern "C" {
   typedef struct remixapi_PresentInfo {
     remixapi_StructType       sType;
     void*                     pNext;
-    HWND                      hwndOverride; // Can be NULL
+    remixapi_HWND             hwndOverride; // Can be NULL
   } remixapi_PresentInfo;
 
   typedef remixapi_ErrorCode(REMIXAPI_PTR* PFN_remixapi_Present)(const remixapi_PresentInfo* info);
@@ -715,6 +760,8 @@ extern "C" {
     uint64_t            version;
   } remixapi_InitializeLibraryInfo;
 
+  // NOTE: If adding a new function, append at the end of the struct.
+  //       Reordering breaks backwards compatibility.
   typedef struct remixapi_Interface {
     PFN_remixapi_Shutdown           Shutdown;
     PFN_remixapi_CreateMaterial     CreateMaterial;
@@ -741,6 +788,8 @@ extern "C" {
 
     PFN_remixapi_Startup            Startup;
     PFN_remixapi_Present            Present;
+
+    PFN_remixapi_SetCameraMediumMaterial SetCameraMediumMaterial;
   } remixapi_Interface;
 
   REMIXAPI remixapi_ErrorCode REMIXAPI_CALL remixapi_InitializeLibrary(
@@ -751,11 +800,11 @@ extern "C" {
     const remixapi_InitializeLibraryInfo* info,
     remixapi_Interface*                   out_result);
 
-
+#ifndef REMIX_WINAPI_NO_LIBRARY_LOADER
   inline remixapi_ErrorCode REMIXAPI_CALL remixapi_lib_loadRemixDllAndInitialize(
     const wchar_t*      remixD3D9DllPath,
     remixapi_Interface* out_remixInterface,
-    HMODULE*            out_remixDll
+    remixapi_HMODULE*   out_remixDll
   ) {
     if (remixD3D9DllPath == NULL || remixD3D9DllPath[0] == '\0') {
       return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
@@ -764,15 +813,15 @@ extern "C" {
       return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
     }
 
-    HMODULE remixDll = NULL;
+    remixapi_HMODULE remixDll = NULL;
     PFN_remixapi_InitializeLibrary pfn_InitializeLibrary = NULL;
     {
       // firstly, try the default method first, e.g. DLL is already loaded, 
       // DLL-s are around .exe, or an app has called SetDllDirectory
       {
-        HMODULE dll = LoadLibraryW(remixD3D9DllPath);
+        remixapi_HMODULE dll = LoadLibraryW(remixD3D9DllPath);
         if (dll) {
-          PROC func = GetProcAddress(dll, "remixapi_InitializeLibrary");
+          remixapi_loader_PROC func = GetProcAddress(dll, "remixapi_InitializeLibrary");
           if (func) {
             remixDll = dll;
             pfn_InitializeLibrary = (PFN_remixapi_InitializeLibrary) func;
@@ -786,11 +835,11 @@ extern "C" {
       if (!pfn_InitializeLibrary) {
         // set LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR to search 
         // dependency DLL-s in the folder of 'remixD3D9DllPath'
-        HMODULE dll = LoadLibraryExW(remixD3D9DllPath, NULL,
-                                     LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
-                                     LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+        remixapi_HMODULE dll = LoadLibraryExW(remixD3D9DllPath, NULL,
+                                     REMIX_WINAPI_LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
+                                     REMIX_WINAPI_LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
         if (dll) {
-          PROC func = GetProcAddress(dll, "remixapi_InitializeLibrary");
+          remixapi_loader_PROC func = GetProcAddress(dll, "remixapi_InitializeLibrary");
           if (func) {
             remixDll = dll;
             pfn_InitializeLibrary = (PFN_remixapi_InitializeLibrary) func;
@@ -802,24 +851,24 @@ extern "C" {
 
       // at last, try to SetDllDirectory manually
       if (!pfn_InitializeLibrary) {
-        wchar_t absoluteD3D9DllPath[MAX_PATH];
+        wchar_t absoluteD3D9DllPath[REMIX_WINAPI_MAX_PATH];
         {
-          DWORD ret = GetFullPathNameW(remixD3D9DllPath, MAX_PATH, absoluteD3D9DllPath, NULL);
+          unsigned ret = (unsigned)GetFullPathNameW(remixD3D9DllPath, REMIX_WINAPI_MAX_PATH, absoluteD3D9DllPath, NULL);
           if (ret == 0) {
             return REMIXAPI_ERROR_CODE_GET_FULL_PATH_NAME_FAILURE;
           }
         }
-        wchar_t parentDir[MAX_PATH];
+        wchar_t parentDir[REMIX_WINAPI_MAX_PATH];
         {
           int len = 0;
-          for (int i = 0; i < MAX_PATH; i++) {
+          for (int i = 0; i < REMIX_WINAPI_MAX_PATH; i++) {
             if (absoluteD3D9DllPath[i] == '\0') {
               break;
             }
             parentDir[i] = absoluteD3D9DllPath[i] == '/' ? '\\' : absoluteD3D9DllPath[i];
             ++len;
           }
-          if (len <= 0 || len >= MAX_PATH) {
+          if (len <= 0 || len >= REMIX_WINAPI_MAX_PATH) {
             return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
           }
           parentDir[len] = '\0';
@@ -842,24 +891,24 @@ extern "C" {
         }
 
         // save the previous value that is in SetDllDirectory
-        wchar_t dirToRestore[MAX_PATH];
+        wchar_t dirToRestore[REMIX_WINAPI_MAX_PATH];
         {
-          DWORD len = GetDllDirectoryW(MAX_PATH, dirToRestore);
-          if (len > 0 && len < MAX_PATH - 1) {
-            dirToRestore[MAX_PATH - 1] = '\0';
+          unsigned len = (unsigned)GetDllDirectoryW(REMIX_WINAPI_MAX_PATH, dirToRestore);
+          if (len > 0 && len < REMIX_WINAPI_MAX_PATH - 1) {
+            dirToRestore[REMIX_WINAPI_MAX_PATH - 1] = '\0';
           }
         }
 
         {
-          BOOL s = SetDllDirectoryW(parentDir);
+          int s = SetDllDirectoryW(parentDir);
           if (!s) {
             return REMIXAPI_ERROR_CODE_SET_DLL_DIRECTORY_FAILURE;
           }
         }
 
-        HMODULE dll = LoadLibraryW(absoluteD3D9DllPath);
+        remixapi_HMODULE dll = LoadLibraryW(absoluteD3D9DllPath);
         if (dll) {
-          PROC func = GetProcAddress(dll, "remixapi_InitializeLibrary");
+          remixapi_loader_PROC func = GetProcAddress(dll, "remixapi_InitializeLibrary");
           if (func) {
             remixDll = dll;
             pfn_InitializeLibrary = (PFN_remixapi_InitializeLibrary) func;
@@ -882,7 +931,7 @@ extern "C" {
       return REMIXAPI_ERROR_CODE_GET_PROC_ADDRESS_FAILURE;
     }
 
-    remixapi_InitializeLibraryInfo info = { 0 };
+    remixapi_InitializeLibraryInfo info = { (remixapi_StructType)0 };
     {
       info.sType = REMIXAPI_STRUCT_TYPE_INITIALIZE_LIBRARY_INFO;
       info.version = REMIXAPI_VERSION_MAKE(REMIXAPI_VERSION_MAJOR,
@@ -904,7 +953,7 @@ extern "C" {
 
   inline remixapi_ErrorCode REMIXAPI_CALL remixapi_lib_shutdownAndUnloadRemixDll(
     remixapi_Interface* remixInterface,
-    HMODULE             remixDll
+    remixapi_HMODULE    remixDll
   ) {
     if (remixInterface == NULL || remixInterface->Shutdown == NULL) {
       if (remixDll != NULL) {
@@ -922,6 +971,7 @@ extern "C" {
     *remixInterface = nullInterface;
     return status;
   }
+#endif // !REMIX_WINAPI_NO_LIBRARY_LOADER
 
 #ifdef __cplusplus
 }

@@ -171,7 +171,7 @@ namespace remix {
   }
 
   struct Interface {
-    HMODULE            m_RemixDLL { nullptr };
+    remixapi_HMODULE   m_RemixDLL { nullptr };
     remixapi_Interface m_CInterface {};
 
     // Functions
@@ -183,6 +183,7 @@ namespace remix {
     Result< remixapi_MeshHandle >     CreateMesh(const remixapi_MeshInfo& info);
     Result< void >                    DestroyMesh(remixapi_MeshHandle handle);
     Result< void >                    SetupCamera(const remixapi_CameraInfo& info);
+    Result< void >                    SetCameraMediumMaterial(remixapi_MaterialHandle medium);
     Result< void >                    DrawInstance(const remixapi_InstanceInfo& info);
     Result< remixapi_LightHandle >    CreateLight(const remixapi_LightInfo& info);
     Result< void >                    DestroyLight(remixapi_LightHandle handle);
@@ -206,13 +207,14 @@ namespace remix {
                                                                    uint8_t colorR, uint8_t colorG, uint8_t colorB);
   };
 
+#ifndef REMIX_WINAPI_NO_LIBRARY_LOADER
   namespace lib {
     // Helper function to load a .dll of Remix, and initialize it.
     // pRemixD3D9DllPath is a path to .dll file, e.g. "C:\dxvk-remix-nv\public\bin\d3d9.dll"
     [[nodiscard]] inline Result< Interface > loadRemixDllAndInitialize(const std::filesystem::path& remixD3D9DllPath) {
 
       remixapi_Interface interfaceInC = {};
-      HMODULE remixDll = nullptr;
+      remixapi_HMODULE remixDll = nullptr;
 
       remixapi_ErrorCode status =
         remixapi_lib_loadRemixDllAndInitialize(remixD3D9DllPath.c_str(),
@@ -223,7 +225,7 @@ namespace remix {
         return status;
       }
 
-      static_assert(sizeof(remixapi_Interface) == 168,
+      static_assert(sizeof(remixapi_Interface) == 176,
                     "Change version, update C++ wrapper when adding new functions");
 
       remix::Interface interfaceInCpp = {};
@@ -242,6 +244,7 @@ namespace remix {
       return remixapi_lib_shutdownAndUnloadRemixDll(&interfaceInCpp.m_CInterface, interfaceInCpp.m_RemixDLL);
     }
   }
+#endif // !REMIX_WINAPI_NO_LIBRARY_LOADER
 
 
 
@@ -700,6 +703,18 @@ namespace remix {
 
   inline Result< void > Interface::SetupCamera(const remixapi_CameraInfo& info) {
     return m_CInterface.SetupCamera(&info);
+  }
+
+  inline Result< void > Interface::SetCameraMediumMaterial(remixapi_MaterialHandle medium) {
+    if (!m_CInterface.SetCameraMediumMaterial) {
+      return REMIXAPI_ERROR_CODE_NOT_INITIALIZED;
+    }
+
+    remixapi_CameraMediumInfo info {};
+    info.sType = REMIXAPI_STRUCT_TYPE_CAMERA_MEDIUM_INFO;
+    info.pNext = nullptr;
+    info.medium = medium;
+    return m_CInterface.SetCameraMediumMaterial(&info);
   }
 
 

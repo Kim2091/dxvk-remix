@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2021-2024, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2021-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -247,7 +247,7 @@ struct RaytraceArgs {
   uint16_t minTranslucentTransmissionLobeSamplingProbability;
   float roughnessDemodulationOffset;
   float timeSinceStartSeconds;
-  
+
   uint enableCalculateVirtualShadingNormals;
   uint enableDirectLighting;
   uint enableEmissiveBlendEmissiveOverride;
@@ -266,6 +266,8 @@ struct RaytraceArgs {
   uint enableUnorderedEmissiveParticlesInIndirectRays;
   uint enableTransmissionApproximationInIndirectRays;
   uint enableDecalMaterialBlending;
+  uint enableLegacyRectLightConeShaping;
+  uint enableRectLightConeShapingRatioScaling;
   uint enableBillboardOrientationCorrection;
   uint enablePlayerModelInPrimarySpace;
   uint enablePlayerModelPrimaryShadows;

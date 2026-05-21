@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2022-2024, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -252,6 +252,22 @@
 //!>       ATMOSPHERE_AVAILABLE
 
 
+//!variant-matrix gbuffer
+//!> common RAY_TRACING_PRIMARY_RAY
+//!> axis features - GBUFFER_FEATURE_OBJECT_PICKING=0
+//!> axis features debug GBUFFER_FEATURE_DEBUG_VIEW=1 GBUFFER_FEATURE_OBJECT_PICKING=1
+//!> axis features lean_psr GBUFFER_FEATURE_DLSSRR=0 GBUFFER_FEATURE_OBJECT_PICKING=0 GBUFFER_FEATURE_PARTICLE_LAYER=0 GBUFFER_FEATURE_RAYTRACED_RENDER_TARGET=0 GBUFFER_FEATURE_STOCHASTIC_ALPHA=0 GBUFFER_FEATURE_PSR_REPLACEMENT=1
+//!> axis features lean_no_psr GBUFFER_FEATURE_DLSSRR=0 GBUFFER_FEATURE_OBJECT_PICKING=0 GBUFFER_FEATURE_PARTICLE_LAYER=0 GBUFFER_FEATURE_RAYTRACED_RENDER_TARGET=0 GBUFFER_FEATURE_STOCHASTIC_ALPHA=0 GBUFFER_FEATURE_PSR_REPLACEMENT=0
+//!> axis psr -
+//!> axis psr psr GBUFFER_PSR
+//!> axis pipeline raygen.rgen RT_TRACE_RAY RAY_PIPELINE
+//!> axis pipeline raygen_ser.rgen RT_TRACE_RAY RAY_PIPELINE RT_SHADER_EXECUTION_REORDERING
+//!> axis pipeline rayquery_raygen.rgen RAY_PIPELINE
+//!> axis nrc -
+//!> axis nrc nrc ENABLE_NRC=1
+//!> axis wboit -
+//!> axis wboit wboit UNORDERED_RESOLVE_WBOIT
+//!> order features psr pipeline nrc wboit
 //!end-variants
 
 // Note: Opacity lighting approximation used in the GBuffer pass due to it being most visually
@@ -283,26 +299,37 @@
 [shader("raygeneration")]
 void main()
 {
+  const uint2 threadIndex = DispatchRaysIndex().xy;
+
+  if (any(threadIndex >= cb.camera.resolution))
+  {
+    return;
+  }
+
+  uvec2 pixelCoordinate = threadIndex;
+
   #ifdef GBUFFER_PSR
-  geometryPSRResolverPass(DispatchRaysIndex().xy);
+  geometryPSRResolverPass(pixelCoordinate);
   #else
-  geometryResolver(DispatchRaysIndex().xy);
+  geometryResolver(pixelCoordinate);
   #endif
 }
 #else
 [shader("compute")]
 [numthreads(16, 8, 1)]
-void main(uint2 ipos : SV_DispatchThreadID)
+void main(uint2 threadIndex : SV_DispatchThreadID)
 {
-  if (any(ipos >= cb.camera.resolution))
+  if (any(threadIndex >= cb.camera.resolution))
   {
     return;
   }
 
+  uvec2 pixelCoordinate = threadIndex;
+
   #ifdef GBUFFER_PSR
-  geometryPSRResolverPass(ipos);
+  geometryPSRResolverPass(pixelCoordinate);
   #else
-  geometryResolver(ipos);
+  geometryResolver(pixelCoordinate);
   #endif
 }
 #endif
