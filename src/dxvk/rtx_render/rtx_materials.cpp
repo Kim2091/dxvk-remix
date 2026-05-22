@@ -115,6 +115,17 @@ template<> OpaqueMaterialData LegacyMaterialData::as() const {
     opaqueMat.setEmissiveColorTexture(emissiveTexture);
     opaqueMat.setEnableEmission(true);
   }
+
+  // Fork: route the protocol-captured height slot into the opaque material's
+  // height channel for parallax-occlusion mapping. The OpaqueMaterialData
+  // defaults set displaceIn=0.05/displaceOut=0.0 (from the constants table in
+  // rtx_material_data.h), so binding a height texture is sufficient to activate
+  // Remix's POM path -- RtOpaqueSurfaceMaterial::hasValidDisplacement() gates
+  // on (displaceIn > 0 || displaceOut > 0) AND a non-null height texture index.
+  // Users can tune depth with the existing rtx.displacement.* knobs.
+  if (heightTexture.isValid() && LegacyMaterialDefaults::autoHeightMap()) {
+    opaqueMat.setHeightTexture(heightTexture);
+  }
   // Indicate that we have an exact sampler to use on this material, directly from game
   if (getSampler().ptr()) {
     opaqueMat.setSamplerOverride(getSampler());

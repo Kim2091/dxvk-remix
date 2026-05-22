@@ -534,6 +534,13 @@ struct LegacyMaterialDefaults {
              "The downstream rtx.roughnessScale / rtx.roughnessBias multipliers still apply for in-menu "
              "tuning. Set to false to leave roughness on the legacy-constant path. Replacement assets "
              "bypass this entirely.");
+  RTX_OPTION("rtx.legacyMaterial.fnv", bool, autoHeightMap, true,
+             "When the FNV PS-classifier protocol identifies a height-map sampler on the bound pixel "
+             "shader (RS 149 nibble bits 12-15), the captured height texture is routed into the opaque "
+             "material's height channel and Remix's parallax-occlusion mapping activates with the "
+             "default displaceIn/displaceOut. Tune depth with the existing rtx.displacement.* knobs in "
+             "the dev menu. Set to false to leave height textures unwired. Replacement assets bypass "
+             "this path.");
 };
 
 // Surface Materials
@@ -1874,6 +1881,12 @@ struct LegacyMaterialData {
   // to route into the opaque material's emissive-color channel and flip enableEmission
   // when rtx.legacyMaterial.fnv.autoEmissive is true. Empty -> no auto-emissive.
   TextureRef    emissiveTexture;
+  // Fork: populated by setLegacyMaterialState when the RS-149 protocol's height nibble
+  // (bits 12-15) names a slot. Consumed by LegacyMaterialData::as<OpaqueMaterialData>()
+  // to route into the opaque material's height channel, which Remix's existing
+  // parallax-occlusion path picks up via the default displaceIn/displaceOut. Gated by
+  // rtx.legacyMaterial.fnv.autoHeightMap. Empty -> no auto-height.
+  TextureRef    heightTexture;
 
   void setHashOverride(XXH64_hash_t hash) {
     m_cachedHash = hash;

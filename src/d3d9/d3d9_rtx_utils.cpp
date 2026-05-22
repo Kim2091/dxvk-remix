@@ -262,13 +262,15 @@ namespace dxvk {
       };
 
       const uint32_t packed = materialData.remixModifierFromD3D;
-      const uint32_t diffuseSlot = (packed >> 0) & kRemixSlotRoleNibbleMask;
-      const uint32_t normalSlot  = (packed >> 4) & kRemixSlotRoleNibbleMask;
-      const uint32_t glowSlot    = (packed >> 8) & kRemixSlotRoleNibbleMask;
+      const uint32_t diffuseSlot = (packed >> 0)  & kRemixSlotRoleNibbleMask;
+      const uint32_t normalSlot  = (packed >> 4)  & kRemixSlotRoleNibbleMask;
+      const uint32_t glowSlot    = (packed >> 8)  & kRemixSlotRoleNibbleMask;
+      const uint32_t heightSlot  = (packed >> 12) & kRemixSlotRoleNibbleMask;
 
       captureSlotTexture(diffuseSlot, materialData.protocolDiffuseTexture);
       captureSlotTexture(normalSlot,  materialData.normalTexture);
       captureSlotTexture(glowSlot,    materialData.emissiveTexture);
+      captureSlotTexture(heightSlot,  materialData.heightTexture);
     }
   }
 
