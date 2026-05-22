@@ -1672,6 +1672,19 @@ enum class MaterialDataType {
   Invalid
 };
 
+// Fork-side D3D9 RS-protocol payload, written by a game-side wrapper into
+// D3DRS_149 and consumed in setLegacyMaterialState (d3d9_rtx_utils.cpp).
+// V2 encoding: packed PS slot-role nibbles (per-PS sampler-name classifier
+// output from the wrapper). See remix_protocol.hpp in the wrapper repo and
+// docs/superpowers/specs/2026-05-22-fnv-ffp-protocol-design.md.
+//   bits 0-3:   diffuse slot (0..7) or 0xF if PS has no diffuse role
+//   bits 4-7:   normal slot  (0..7) or 0xF if PS has no normal role
+//   bits 8-11:  glow slot    (0..7) or 0xF if PS has no glow role (V1: unused)
+//   bits 12-15: reserved (0xF)
+//   bits 16-31: reserved (0)
+constexpr uint32_t kRemixSlotRoleNibbleMask = 0xFu;
+constexpr uint32_t kRemixSlotRoleAbsent     = 0xFu;
+
 // Note: For use with "Legacy" D3D9 material information
 struct LegacyMaterialData {
   static OpaqueMaterialData createDefault();
@@ -1777,6 +1790,26 @@ struct LegacyMaterialData {
   D3DMATERIAL9 d3dMaterial = {};
   bool isTextureFactorBlend = false;
   bool isVertexColorBakedLighting = true;
+
+  // Fork: D3D9 RS-protocol fields populated from unused D3DRS slots by
+  // setLegacyMaterialState. 0 means "wrapper did not write this slot" (sentinel
+  // 0xfefefefe was observed and the read mapped to 0). See protocol contract in
+  // docs/superpowers/specs/2026-05-22-fnv-ffp-protocol-design.md.
+  uint32_t      remixTextureCategoryFlagsFromD3D = 0u;   // RS 42
+  uint32_t      remixModifierFromD3D             = 0u;   // RS 149 (packed slot-role nibbles)
+  XXH64_hash_t  remixHashFromD3D                 = 0;    // RS 150
+  float         remixTempFloat01FromD3D          = 0.0f; // RS 169
+  float         remixTempFloat02FromD3D          = 0.0f; // RS 177
+
+  // Fork: populated by setLegacyMaterialState when the RS-149 protocol payload
+  // names a (PS slot -> role) mapping. The wrapper's PS-classifier knows which
+  // sampler stage carries the diffuse vs normal texture for the bound shader;
+  // we read d3d9State.textures[slot] straight from device state here (which
+  // bypasses the COLOROP-DISABLE binding loop in d3d9_rtx.cpp). Empty
+  // TextureRef means "no override; fall through to upstream behaviour."
+  // Consumed by LegacyMaterialData::as<OpaqueMaterialData>().
+  TextureRef    protocolDiffuseTexture;
+  TextureRef    normalTexture;
 
   void setHashOverride(XXH64_hash_t hash) {
     m_cachedHash = hash;

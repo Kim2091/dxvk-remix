@@ -162,6 +162,15 @@ check will enforce it if discipline slips.
 
 ---
 
+## src/d3d9/d3d9_rtx_utils.cpp
+
+**Category:** index-only
+
+- **Inline tweak** at the end of `setLegacyMaterialState` — ~35 LOC for the D3D9 RS-protocol capture + slot-role decode block. Adds `#include "d3d9_texture.h"`.
+  *Reads unused render-state slots 42, 149, 150, 169, 177 (sentinel `0xfefefefe` for "not written") into the new `remix*FromD3D` fields on `LegacyMaterialData`. RS 149 is then decoded as packed PS slot-role nibbles (diffuse/normal/glow) emitted by the wrapper's per-PS sampler-name classifier; for each named slot, the texture is captured straight from `d3d9State.textures[slot]` into `protocolDiffuseTexture` / `normalTexture` on the material. Reading device state directly bypasses the COLOROP-DISABLE-gated binding loop in `d3d9_rtx.cpp` that filtered out the slots the wrapper needs Remix to see. Game-side wrappers (currently `FalloutNV-Remix-Wrapper`) drive this. See `docs/superpowers/specs/2026-05-22-fnv-ffp-protocol-design.md`.*
+
+---
+
 ## src/d3d9/d3d9_swapchain.cpp
 
 **Pre-refactor fork footprint:** +14 / -4 LOC (audit 2026-04-18)
@@ -523,6 +532,27 @@ initializer list and can't be lifted into a separate TU.
 
 ---
 
+## src/dxvk/rtx_render/rtx_materials.cpp
+
+**Category:** index-only
+
+- **Inline tweak** in `template<> OpaqueMaterialData LegacyMaterialData::as() const` — ~10 LOC for two protocol-aware branches.
+  *Prefers `protocolDiffuseTexture` over `getColorTexture()` when the RS-149 protocol has identified a diffuse slot, and routes `normalTexture` into `setNormalTexture` instead of `setSecondaryTexture`. Both fields are populated up front by `setLegacyMaterialState` (in `d3d9_rtx_utils.cpp`); empty values fall through to upstream behaviour. Fixes the FNV failure mode where the per-PS sampler layout (e.g. `s0=NormalMap` for shader 0x387C3875) caused the normal map to render as the surface colour.*
+
+---
+
+## src/dxvk/rtx_render/rtx_materials.h
+
+**Category:** index-only
+
+- **Inline tweak** at file scope (just above `struct LegacyMaterialData`) — ~12 LOC.
+  *Declares the D3D9 RS-149 packed-nibble decoding constants (`kRemixSlotRoleNibbleMask`, `kRemixSlotRoleAbsent`). The wrapper encodes (diffuse slot, normal slot, glow slot) into 4-bit nibbles via its `PsShaderClassifier`; `setLegacyMaterialState` decodes them. Glow nibble is reserved for V1.*
+
+- **Inline tweak** in `LegacyMaterialData` (after `isVertexColorBakedLighting`, before `setHashOverride`) — ~13 LOC.
+  *Declares 5 RS-protocol fields (`remixTextureCategoryFlagsFromD3D`, `remixModifierFromD3D`, `remixHashFromD3D`, `remixTempFloat01FromD3D`, `remixTempFloat02FromD3D`) populated by `setLegacyMaterialState`, plus two `TextureRef` fields (`protocolDiffuseTexture`, `normalTexture`) captured directly from `d3d9State.textures[slot]` in the same function and consumed by `LegacyMaterialData::as<OpaqueMaterialData>()`.*
+
+---
+
 ## src/dxvk/rtx_render/rtx_options.h
 
 **Pre-refactor fork footprint:** +32 / -0 LOC (audit 2026-04-18)
@@ -826,6 +856,15 @@ initializer list and can't be lifted into a separate TU.
 
 - **Inline tweak** — remove `rtx.tonemap.finalizeWithACES` RtxOption (superseded by `rtx.tonemap.tonemapOperator` in `rtx_fork_tonemap.cpp`); add `#include "rtx_fork_tonemap.h"`.
   *Adopts the fork operator enum.*
+
+---
+
+## src/dxvk/rtx_render/rtx_types.h
+
+**Category:** index-only
+
+- **Inline tweak** at `DrawCallState::getCategoryFlags` (~line 666) — 1-line modification.
+  *ORs `materialData.remixTextureCategoryFlagsFromD3D` into the returned `CategoryFlags` so RS-42 protocol bits (captured by `setLegacyMaterialState`) flow through to the standard per-draw category pipeline. V1 wrappers do not write RS 42 yet; this is forward-compat for future sky/decal/water/UI tagging.*
 
 ---
 

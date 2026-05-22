@@ -68,16 +68,31 @@ template<> OpaqueMaterialData LegacyMaterialData::as() const {
   // Copy off the defaults, and make dynamic adjustments for the remaining params from this legacy material
   OpaqueMaterialData opaqueMat(defaultLegacyOpaqueMaterial);
   if (LegacyMaterialDefaults::useAlbedoTextureIfPresent()) {
-    opaqueMat.setAlbedoOpacityTexture(getColorTexture());
+    // Fork: when the wrapper-side PS classifier has tagged a sampler slot as
+    // the actual diffuse texture (via the RS-149 protocol decoded in
+    // setLegacyMaterialState), prefer it over colorTextures[0]. Slot 0 in the
+    // FFP binding may carry a non-diffuse texture (e.g. NormalMap-only PS
+    // shaders), and getColorTexture()'s binning loop can't always recover
+    // the right one. Falls back to upstream behaviour when the protocol
+    // wasn't written.
+    if (protocolDiffuseTexture.isValid()) {
+      opaqueMat.setAlbedoOpacityTexture(protocolDiffuseTexture);
+    } else {
+      opaqueMat.setAlbedoOpacityTexture(getColorTexture());
+    }
   }
-  if (getColorTexture2().isValid()) {
+  // Fork: route the protocol-captured normal-map slot into the opaque
+  // material's normal channel. Empty -> upstream secondary-texture path.
+  if (normalTexture.isValid()) {
+    opaqueMat.setNormalTexture(normalTexture);
+  } else if (getColorTexture2().isValid()) {
     opaqueMat.setSecondaryTexture(getColorTexture2());
   }
   // Indicate that we have an exact sampler to use on this material, directly from game
   if (getSampler().ptr()) {
     opaqueMat.setSamplerOverride(getSampler());
   }
-  // Ignore colormap alpha of legacy texture if tagged as 'ignoreAlphaOnTextures' 
+  // Ignore colormap alpha of legacy texture if tagged as 'ignoreAlphaOnTextures'
   bool ignoreAlphaChannel = LegacyMaterialDefaults::ignoreAlphaChannel();
   if (!ignoreAlphaChannel) {
     ignoreAlphaChannel = lookupHash(RtxOptions::ignoreAlphaOnTextures(), getHash());

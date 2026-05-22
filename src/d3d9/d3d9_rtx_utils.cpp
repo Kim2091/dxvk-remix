@@ -5,6 +5,7 @@
 
 #include "d3d9_util.h"
 #include "d3d9_buffer.h"
+#include "d3d9_texture.h"
 
 #include "d3d9_rtx_utils.h"
 #include "d3d9_device.h"
@@ -221,6 +222,53 @@ namespace dxvk {
 
     // Allow the users to configure vertex color as baked lighting for legacy draw calls.
     materialData.isVertexColorBakedLighting = RtxOptions::vertexColorIsBakedLighting();
+
+    // Fork: D3D9 RS-protocol capture. Game-side wrapper writes per-draw
+    // classification metadata into unused render-state slots; sentinel
+    // 0xfefefefe means "not written." See protocol contract in
+    // docs/superpowers/specs/2026-05-22-fnv-ffp-protocol-design.md.
+    constexpr uint32_t kRsProtocolSentinel = 0xfefefefeu;
+    materialData.remixTextureCategoryFlagsFromD3D =
+      d3d9State.renderStates[42] != kRsProtocolSentinel ? d3d9State.renderStates[42] : 0u;
+    materialData.remixModifierFromD3D =
+      d3d9State.renderStates[149] != kRsProtocolSentinel ? d3d9State.renderStates[149] : 0u;
+    materialData.remixHashFromD3D =
+      d3d9State.renderStates[150] != kRsProtocolSentinel ? d3d9State.renderStates[150] : 0;
+    materialData.remixTempFloat01FromD3D =
+      d3d9State.renderStates[169] != kRsProtocolSentinel ? bit::cast<float>(d3d9State.renderStates[169]) : 0.0f;
+    materialData.remixTempFloat02FromD3D =
+      d3d9State.renderStates[177] != kRsProtocolSentinel ? bit::cast<float>(d3d9State.renderStates[177]) : 0.0f;
+
+    // Fork: decode RS 149's packed slot-role nibbles into TextureRefs captured
+    // straight from device state. This bypasses the COLOROP-DISABLE-gated
+    // binding loop in d3d9_rtx.cpp's processRenderState path -- the wrapper
+    // sets D3DTOP_DISABLE on stage 1+ for FFP rasterisation, which causes that
+    // loop to skip normal-map slots. Reading d3d9State.textures[slot] directly
+    // sidesteps it. Empty TextureRef means "no override; upstream path runs."
+    if (materialData.remixModifierFromD3D != 0u) {
+      auto captureSlotTexture = [&](uint32_t slot, TextureRef& out) {
+        if (slot == kRemixSlotRoleAbsent || slot >= 8u) return;
+        IDirect3DBaseTexture9* baseTex = d3d9State.textures[slot];
+        if (baseTex == nullptr) return;
+        D3D9CommonTexture* texInfo = GetCommonTexture(baseTex);
+        if (texInfo == nullptr) return;
+        // Mirror the type filter from d3d9_rtx.cpp's binding loop.
+        if (texInfo->GetType() != D3DRTYPE_TEXTURE &&
+            (!D3D9Rtx::allowCubemaps() || texInfo->GetType() != D3DRTYPE_CUBETEXTURE)) {
+          return;
+        }
+        const bool srgb = d3d9State.samplerStates[slot][D3DSAMP_SRGBTEXTURE] & 0x1;
+        out = TextureRef(texInfo->GetSampleView(srgb));
+      };
+
+      const uint32_t packed = materialData.remixModifierFromD3D;
+      const uint32_t diffuseSlot = (packed >> 0) & kRemixSlotRoleNibbleMask;
+      const uint32_t normalSlot  = (packed >> 4) & kRemixSlotRoleNibbleMask;
+      // glow nibble (bits 8-11) is reserved for future use; not consumed in V1.
+
+      captureSlotTexture(diffuseSlot, materialData.protocolDiffuseTexture);
+      captureSlotTexture(normalSlot,  materialData.normalTexture);
+    }
   }
 
 

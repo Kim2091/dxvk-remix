@@ -664,7 +664,9 @@ struct DrawCallState {
   }
 
   const CategoryFlags getCategoryFlags() const {
-    return categories;
+    // Fork: merge protocol-supplied per-draw category bits from the D3D9
+    // RS-protocol channel (RS 42, captured by setLegacyMaterialState).
+    return categories | CategoryFlags(materialData.remixTextureCategoryFlagsFromD3D);
   }
 
   bool finalizePendingFutures(const RtCamera* pLastCamera);
