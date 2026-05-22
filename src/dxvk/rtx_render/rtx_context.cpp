@@ -397,6 +397,7 @@ namespace dxvk {
     }
 
     const RtCamera& mainCamera = getSceneManager().getCamera();
+    m_resetHistory = m_resetHistory || mainCamera.isViewHistoryInvalidated(m_device->getCurrentFrameId());
 
     // Call onFrameBegin callbacks for RtxPases
     // Note: this needs to be called after resetScreenResolution() call in a frame
@@ -1751,8 +1752,9 @@ namespace dxvk {
 
     DxvkTemporalAA& taa = m_common->metaTAA();
     RtCamera& mainCamera = getSceneManager().getCamera();
+    const bool isViewHistoryInvalidated = mainCamera.isViewHistoryInvalidated(m_device->getCurrentFrameId());
 
-    if (taa.isActive() && !mainCamera.isCameraCut()) {
+    if (taa.isActive() && !isViewHistoryInvalidated) {
       float jitterOffset[2];
       mainCamera.getJittering(jitterOffset);
 
@@ -1856,7 +1858,7 @@ namespace dxvk {
       mainCamera.getShaderConstants().resolution,
       RtxOptions::rngSeedWithFrameIndex() ? m_device->getCurrentFrameId() : 0,
       rtOutput,
-      mainCamera.isCameraCut());
+      mainCamera.isViewHistoryInvalidated(m_device->getCurrentFrameId()));
   }
 
   void RtxContext::dispatchDebugView(Rc<DxvkImage>& srcImage, const Resources::RaytracingOutput& rtOutput, bool captureScreenImage)  {
