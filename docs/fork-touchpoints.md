@@ -166,8 +166,8 @@ check will enforce it if discipline slips.
 
 **Category:** index-only
 
-- **Inline tweak** at the end of `setLegacyMaterialState` — ~35 LOC for the D3D9 RS-protocol capture + slot-role decode block. Adds `#include "d3d9_texture.h"`.
-  *Reads unused render-state slots 42, 149, 150, 169, 177 (sentinel `0xfefefefe` for "not written") into the new `remix*FromD3D` fields on `LegacyMaterialData`. RS 149 is then decoded as packed PS slot-role nibbles (diffuse/normal/glow) emitted by the wrapper's per-PS sampler-name classifier; for each named slot, the texture is captured straight from `d3d9State.textures[slot]` into `protocolDiffuseTexture` / `normalTexture` on the material. Reading device state directly bypasses the COLOROP-DISABLE-gated binding loop in `d3d9_rtx.cpp` that filtered out the slots the wrapper needs Remix to see. Game-side wrappers (currently `FalloutNV-Remix-Wrapper`) drive this. See `docs/superpowers/specs/2026-05-22-fnv-ffp-protocol-design.md`.*
+- **Inline tweak** at the end of `setLegacyMaterialState` — ~38 LOC for the D3D9 RS-protocol capture + slot-role decode block. Adds `#include "d3d9_texture.h"`.
+  *Reads unused render-state slots 42, 149, 150, 169, 177 (sentinel `0xfefefefe` for "not written") into the new `remix*FromD3D` fields on `LegacyMaterialData`. RS 149 is then decoded as packed PS slot-role nibbles (diffuse/normal/glow, bits 0-3 / 4-7 / 8-11) emitted by the wrapper's per-PS sampler-name classifier; for each named slot, the texture is captured straight from `d3d9State.textures[slot]` into `protocolDiffuseTexture` / `normalTexture` / `emissiveTexture` on the material. Reading device state directly bypasses the COLOROP-DISABLE-gated binding loop in `d3d9_rtx.cpp` that filtered out the slots the wrapper needs Remix to see. Game-side wrappers (currently `FalloutNV-Remix-Wrapper`) drive this. See `docs/superpowers/specs/2026-05-22-fnv-ffp-protocol-design.md`.*
 
 ---
 
@@ -532,12 +532,21 @@ initializer list and can't be lifted into a separate TU.
 
 ---
 
+## src/dxvk/rtx_render/rtx_material_data.h
+
+**Category:** index-only
+
+- **Inline tweak** in the `REMIX_MATERIAL` macro (alongside the existing `setIgnoreAlphaChannel` / `getIgnoreAlphaChannel` block + the `m_ignoreAlphaChannelOverride` member) — ~24 LOC for two per-material override pairs.
+  *Adds (1) `setIsTangentSpaceNormalOverride` / `getIsTangentSpaceNormalOverride` + `m_isTangentSpaceNormalOverride = false`, and (2) `setIsRoughnessFromNormalAlphaOverride` / `getIsRoughnessFromNormalAlphaOverride` + `m_isRoughnessFromNormalAlphaOverride = false`. Carried on all three REMIX_MATERIAL specializations (Opaque / Translucent / RayPortal) because the macro is shared, but meaningful only on opaque; `rtx_scene_manager.cpp` reads both getters only on the opaque branch and threads them into the `RtOpaqueSurfaceMaterial` ctor as `isTangentSpaceNormal` / `isRoughnessFromNormalAlpha`. Set on the FNV PS-classifier path by `LegacyMaterialData::as<OpaqueMaterialData>()` when a captured legacy normal map needs the RGB-tangent-space decode (gated by `rtx.legacyMaterial.fnv.autoNormalTangentSpace`) or the DXT5n spec-as-roughness inversion (gated by `rtx.legacyMaterial.fnv.autoRoughnessFromSpecular`). See the shader-side branches in `opaque_surface_material_interaction.slangh`.*
+
+---
+
 ## src/dxvk/rtx_render/rtx_materials.cpp
 
 **Category:** index-only
 
-- **Inline tweak** in `template<> OpaqueMaterialData LegacyMaterialData::as() const` — ~10 LOC for two protocol-aware branches.
-  *Prefers `protocolDiffuseTexture` over `getColorTexture()` when the RS-149 protocol has identified a diffuse slot, and routes `normalTexture` into `setNormalTexture` instead of `setSecondaryTexture`. Both fields are populated up front by `setLegacyMaterialState` (in `d3d9_rtx_utils.cpp`); empty values fall through to upstream behaviour. Fixes the FNV failure mode where the per-PS sampler layout (e.g. `s0=NormalMap` for shader 0x387C3875) caused the normal map to render as the surface colour.*
+- **Inline tweak** in `template<> OpaqueMaterialData LegacyMaterialData::as() const` — ~30 LOC for five protocol-aware branches.
+  *Prefers `protocolDiffuseTexture` over `getColorTexture()` when the RS-149 protocol has identified a diffuse slot, and routes `normalTexture` into `setNormalTexture` instead of `setSecondaryTexture`. When the captured normal is wired, also calls (a) `setIsTangentSpaceNormalOverride(true)` (gated by `rtx.legacyMaterial.fnv.autoNormalTangentSpace`) so the GPU surface material carries `OPAQUE_SURFACE_MATERIAL_FLAG_TANGENT_SPACE_NORMAL` and the shader decodes RGB tangent-space instead of octahedral, and (b) `setIsRoughnessFromNormalAlphaOverride(true)` (gated by `rtx.legacyMaterial.fnv.autoRoughnessFromSpecular`) so the shader derives roughness from the NormalMap's alpha channel via `roughness = 1.0 - normalSample.a` per Bethesda's DXT5n convention. When `emissiveTexture` is valid and `rtx.legacyMaterial.fnv.autoEmissive` is true, calls `setEmissiveColorTexture(emissiveTexture)` and `setEnableEmission(true)` so FNV glow maps light up via the standard Remix emissive channel; intensity follows the existing `rtx.legacyMaterial.emissiveIntensity` legacy default and the `RtxOptions::emissiveIntensity` master applied in `rtx_scene_manager.cpp`. All three texture-ref fields are populated up front by `setLegacyMaterialState` (in `d3d9_rtx_utils.cpp`); empty values fall through to upstream behaviour. Fixes the FNV failure modes where (a) `s0=NormalMap` shaders rendered the normal map as the surface colour, (b) FNV's DX-tangent-space normals were sample-decoded as octahedral and produced mangled shading, (c) glow maps captured by the protocol were ignored, and (d) all captured surfaces shipped with the legacy default roughness constant because FNV has no separate specular sampler.*
 
 ---
 
@@ -546,10 +555,16 @@ initializer list and can't be lifted into a separate TU.
 **Category:** index-only
 
 - **Inline tweak** at file scope (just above `struct LegacyMaterialData`) — ~12 LOC.
-  *Declares the D3D9 RS-149 packed-nibble decoding constants (`kRemixSlotRoleNibbleMask`, `kRemixSlotRoleAbsent`). The wrapper encodes (diffuse slot, normal slot, glow slot) into 4-bit nibbles via its `PsShaderClassifier`; `setLegacyMaterialState` decodes them. Glow nibble is reserved for V1.*
+  *Declares the D3D9 RS-149 packed-nibble decoding constants (`kRemixSlotRoleNibbleMask`, `kRemixSlotRoleAbsent`). The wrapper encodes (diffuse slot, normal slot, glow slot) into 4-bit nibbles via its `PsShaderClassifier`; `setLegacyMaterialState` decodes all three slots (glow nibble was added to the consumer in the F1/F2 follow-up).*
 
-- **Inline tweak** in `LegacyMaterialData` (after `isVertexColorBakedLighting`, before `setHashOverride`) — ~13 LOC.
-  *Declares 5 RS-protocol fields (`remixTextureCategoryFlagsFromD3D`, `remixModifierFromD3D`, `remixHashFromD3D`, `remixTempFloat01FromD3D`, `remixTempFloat02FromD3D`) populated by `setLegacyMaterialState`, plus two `TextureRef` fields (`protocolDiffuseTexture`, `normalTexture`) captured directly from `d3d9State.textures[slot]` in the same function and consumed by `LegacyMaterialData::as<OpaqueMaterialData>()`.*
+- **Inline tweak** in `LegacyMaterialData` (after `isVertexColorBakedLighting`, before `setHashOverride`) — ~18 LOC.
+  *Declares 5 RS-protocol fields (`remixTextureCategoryFlagsFromD3D`, `remixModifierFromD3D`, `remixHashFromD3D`, `remixTempFloat01FromD3D`, `remixTempFloat02FromD3D`) populated by `setLegacyMaterialState`, plus three `TextureRef` fields (`protocolDiffuseTexture`, `normalTexture`, `emissiveTexture`) captured directly from `d3d9State.textures[slot]` in the same function and consumed by `LegacyMaterialData::as<OpaqueMaterialData>()`.*
+
+- **Inline tweak** in `LegacyMaterialDefaults` (after `thinFilmThicknessConstant`) — ~22 LOC for three `RTX_OPTION` declarations under the `rtx.legacyMaterial.fnv` namespace.
+  *Adds `autoNormalTangentSpace` (default true, gates `setIsTangentSpaceNormalOverride` in `as<OpaqueMaterialData>()`), `autoEmissive` (default true, gates the `setEmissiveColorTexture` + `setEnableEmission(true)` wiring), and `autoRoughnessFromSpecular` (default true, gates `setIsRoughnessFromNormalAlphaOverride` and the shader-side spec-as-roughness inversion for Bethesda DXT5n materials). Per-feature kill switches for the FNV PS-classifier protocol path; replacement assets bypass these conversions automatically (they don't go through `as<OpaqueMaterialData>()`).*
+
+- **Inline tweak** in `RtOpaqueSurfaceMaterial` (constructor + members + writeGPUData flag bits + HashStruct + updateCachedHash list-init) — ~12 LOC across the struct, `sizeof` bumped 120 → 128.
+  *Adds `isTangentSpaceNormal` and `isRoughnessFromNormalAlpha` defaulted-false constructor params and matching `m_*` bool members. The first packs into the alignment slot next to `m_isRaytracedRenderTarget`; the second adds 8 bytes of struct size (1 byte + alignment fill), bumping the `sizeof(*this) == 128` static_assert in `updateCachedHash`. Both OR into the GPU flags word in `writeGPUData` (setting `OPAQUE_SURFACE_MATERIAL_FLAG_TANGENT_SPACE_NORMAL` and `OPAQUE_SURFACE_MATERIAL_FLAG_ROUGHNESS_FROM_NORMAL_ALPHA` respectively), and both carry matching `uint32_t` slots in the hash struct + list-init. Set on the FNV PS-classifier path via the `OpaqueMaterialData` setters → passed through in `rtx_scene_manager.cpp` → consumed by the shader-side decode and roughness-load branches in `opaque_surface_material_interaction.slangh`.*
 
 ---
 
@@ -818,6 +833,9 @@ initializer list and can't be lifted into a separate TU.
 - **Hook** at `SceneManager::submitExternalDraw` (after particle setup, before `processDrawCallState`) → `fork_hooks::externalDrawObjectPicking` in `rtx_fork_submit.cpp`
   *Stores per-draw texture hash metadata in `m_drawCallMeta` when object picking is active. Access to the private `m_drawCallMeta` member is granted via a `friend` declaration — see the `rtx_scene_manager.h` entry below.*
 
+- **Inline tweak** at the `RtOpaqueSurfaceMaterial` construction site (~line 1344) — ~8 LOC (two local-variable extractions + two extra ctor arguments).
+  *Reads `opaqueMaterialData.getIsTangentSpaceNormalOverride()` and `getIsRoughnessFromNormalAlphaOverride()` into locals and threads them as the final two ctor arguments so the per-material flags set on the FNV PS-classifier path (in `LegacyMaterialData::as<OpaqueMaterialData>()`) are encoded into the GPU surface material's flags word (`OPAQUE_SURFACE_MATERIAL_FLAG_TANGENT_SPACE_NORMAL` and `OPAQUE_SURFACE_MATERIAL_FLAG_ROUGHNESS_FROM_NORMAL_ALPHA`) and consumed by the corresponding shader-side branches in `opaque_surface_material_interaction.slangh`.*
+
 ---
 
 ## src/dxvk/rtx_render/rtx_scene_manager.h
@@ -1002,6 +1020,18 @@ initializer list and can't be lifted into a separate TU.
 
 - **Inline tweak** at `decodePolymorphicLight` (~line 60) — 1-line addition for ignoreViewModel decode.
   *Extracts bit 1 of the flags word into `decodedPolymorphicLight.ignoreViewModel` during polymorphic-light decode.*
+
+---
+
+## src/dxvk/shaders/rtx/concept/surface_material/opaque_surface_material_interaction.slangh
+
+**Category:** index-only
+
+- **Inline tweak** in the post-`isBakedTerrain` normal-decode block of `opaqueSurfaceMaterialInteractionCreate` (~line 783) — ~12 LOC for an extra `else if` branch in front of the existing octahedral decode.
+  *Decodes the normal sample as RGB tangent-space (DirectX convention, green-down) when the per-material flag `OPAQUE_SURFACE_MATERIAL_FLAG_TANGENT_SPACE_NORMAL` is set: `normalize((normalSample.rgb * 2 - 1)` with a `z = abs(z)` hemisphere clamp mirroring NVIDIA's offline `LightspeedOctahedralConverter` reference (Remix downstream assumes hemisphere-only normals). Flag is set by `LegacyMaterialData::as<OpaqueMaterialData>()` on the FNV PS-classifier protocol path (gated by `rtx.legacyMaterial.fnv.autoNormalTangentSpace`); USD/MDL replacement assets never set the flag, so toolkit-replaced normals fall through to the existing octahedral decode unchanged.*
+
+- **Inline tweak** in the "Load Roughness" block (~line 850) — ~10 LOC for an override branch after the existing `roughnessLoaded` block.
+  *Overrides perceptual roughness with `1.0 - normalSample.a` when `normalLoaded` is true AND the per-material flag `OPAQUE_SURFACE_MATERIAL_FLAG_ROUGHNESS_FROM_NORMAL_ALPHA` is set, implementing the Bethesda/Gamebryo DXT5n convention (specular intensity packed into the NormalMap's alpha channel). Overrides both the legacy roughnessConstant default and any roughness texture sample; the downstream `roughnessScale` / `roughnessBias` modifiers still apply for in-menu tuning. Flag is set by `LegacyMaterialData::as<OpaqueMaterialData>()` on the FNV PS-classifier protocol path (gated by `rtx.legacyMaterial.fnv.autoRoughnessFromSpecular`); USD/MDL replacement assets bypass entirely.*
 
 ---
 
@@ -1229,6 +1259,15 @@ initializer list and can't be lifted into a separate TU.
 
 - **Fork-owned** — new file (2026-05-XX). Shared SMPTE ST.2084 (PQ) constants + `PQDecode` / `PQEncode` (vec3, donut-attributed) + scalar `pq_eotfSt2084` / `pq_inverseEotfSt2084` (GT7-style, frame-buffer units). Extracted from `temporal_aa.comp.slang` so both the TAA pass and the GT7 tonemap operator can share the same math.
   *Fork-owned shared PQ math.*
+
+---
+
+## src/dxvk/shaders/rtx/utility/shared_constants.h
+
+**Category:** index-only
+
+- **Inline tweak** at the `OPAQUE_SURFACE_MATERIAL_FLAG_*` bit-field block (~line 47) — 2-line `#define` block for new flag bits at `COMMON_MATERIAL_FLAG_TYPE_OFFSET(5)` and `(6)`.
+  *Adds `OPAQUE_SURFACE_MATERIAL_FLAG_TANGENT_SPACE_NORMAL` (RGB tangent-space normal decode) and `OPAQUE_SURFACE_MATERIAL_FLAG_ROUGHNESS_FROM_NORMAL_ALPHA` (Bethesda DXT5n spec-in-normal-alpha → roughness inversion). Both set by `RtOpaqueSurfaceMaterial::writeGPUData` when the corresponding CPU-side bool members are true (originating from `LegacyMaterialData::as<OpaqueMaterialData>()` on the FNV PS-classifier protocol path); consumed by the normal-decode and roughness-load branches in `opaque_surface_material_interaction.slangh`.*
 
 ---
 

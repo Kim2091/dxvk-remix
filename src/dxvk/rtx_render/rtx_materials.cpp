@@ -85,8 +85,35 @@ template<> OpaqueMaterialData LegacyMaterialData::as() const {
   // material's normal channel. Empty -> upstream secondary-texture path.
   if (normalTexture.isValid()) {
     opaqueMat.setNormalTexture(normalTexture);
+    // Fork: FNV's normal maps are RGB tangent-space DXT-compressed (DirectX
+    // convention, green-down), not Remix's native octahedral encoding. The
+    // per-material flag drives a sample-time decode branch in
+    // opaque_surface_material_interaction.slangh. Toggle the RtxOption off to
+    // leave protocol-captured normals on the octahedral path (useful when the
+    // user has pre-baked octahedral assets via LightspeedOctahedralConverter).
+    if (LegacyMaterialDefaults::autoNormalTangentSpace()) {
+      opaqueMat.setIsTangentSpaceNormalOverride(true);
+    }
+    // Fork: Bethesda DXT5n convention -- the same NormalMap's alpha channel encodes
+    // specular intensity. The shader derives `roughness = 1.0 - normalSample.a`.
+    // Gated separately from the tangent-space flag so a user can keep the normal
+    // decode but disable the spec-as-roughness inversion if a USD replacement
+    // provides its own roughness map.
+    if (LegacyMaterialDefaults::autoRoughnessFromSpecular()) {
+      opaqueMat.setIsRoughnessFromNormalAlphaOverride(true);
+    }
   } else if (getColorTexture2().isValid()) {
     opaqueMat.setSecondaryTexture(getColorTexture2());
+  }
+
+  // Fork: route the protocol-captured glow slot into the opaque material's
+  // emissive-color channel and flip enableEmission. Intensity follows the
+  // existing rtx.legacyMaterial.emissiveIntensity legacy default and the
+  // RtxOptions::emissiveIntensity master multiplier applied downstream in
+  // rtx_scene_manager.cpp. Empty -> no auto-emissive (upstream behaviour).
+  if (emissiveTexture.isValid() && LegacyMaterialDefaults::autoEmissive()) {
+    opaqueMat.setEmissiveColorTexture(emissiveTexture);
+    opaqueMat.setEnableEmission(true);
   }
   // Indicate that we have an exact sampler to use on this material, directly from game
   if (getSampler().ptr()) {

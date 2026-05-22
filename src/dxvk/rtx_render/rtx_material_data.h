@@ -273,6 +273,33 @@ struct name##Data {                                                             
     return m_ignoreAlphaChannelOverride;                                                             \
   }                                                                                                  \
                                                                                                      \
+  /* Fork: per-material flag that drives the RGB-tangent-space normal decode in the     */          \
+  /* opaque-surface shader (see OPAQUE_SURFACE_MATERIAL_FLAG_TANGENT_SPACE_NORMAL). Set */          \
+  /* by LegacyMaterialData::as<OpaqueMaterialData>() when a captured legacy normal map  */          \
+  /* came through the FNV PS-classifier protocol path. Replacement assets leave it      */          \
+  /* false, so toolkit replacements bypass the conversion. Meaningful only on opaque    */          \
+  /* materials; ignored everywhere else.                                                */          \
+  void setIsTangentSpaceNormalOverride(const bool isTangentSpaceNormal) {                            \
+    m_isTangentSpaceNormalOverride = isTangentSpaceNormal;                                           \
+  }                                                                                                  \
+                                                                                                     \
+  const bool getIsTangentSpaceNormalOverride() const {                                               \
+    return m_isTangentSpaceNormalOverride;                                                           \
+  }                                                                                                  \
+                                                                                                     \
+  /* Fork: per-material flag for Bethesda DXT5n convention -- spec in NormalMap.alpha.  */          \
+  /* See OPAQUE_SURFACE_MATERIAL_FLAG_ROUGHNESS_FROM_NORMAL_ALPHA. Set by               */          \
+  /* LegacyMaterialData::as<OpaqueMaterialData>() on the FNV PS-classifier path when   */          \
+  /* the captured normal carries the spec-in-alpha convention. Replacement assets      */          \
+  /* leave it false. Meaningful only on opaque materials.                              */          \
+  void setIsRoughnessFromNormalAlphaOverride(const bool isRoughnessFromNormalAlpha) {                \
+    m_isRoughnessFromNormalAlphaOverride = isRoughnessFromNormalAlpha;                               \
+  }                                                                                                  \
+                                                                                                     \
+  const bool getIsRoughnessFromNormalAlphaOverride() const {                                         \
+    return m_isRoughnessFromNormalAlphaOverride;                                                     \
+  }                                                                                                  \
+                                                                                                     \
 private:                                                                                             \
                                                                                                      \
   struct Ranges {                                                                                    \
@@ -307,6 +334,8 @@ private:                                                                        
   XXH64_hash_t m_cachedHash { 0 };                                                                   \
   Rc<DxvkSampler> m_samplerOverride = nullptr;                                                       \
   bool m_ignoreAlphaChannelOverride = false;                                                         \
+  bool m_isTangentSpaceNormalOverride = false;                                                       \
+  bool m_isRoughnessFromNormalAlphaOverride = false;                                                 \
 };
 
 namespace dxvk {

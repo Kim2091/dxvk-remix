@@ -780,6 +780,22 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
       // REMIX-2224: Normals blended during terrain baking using programmable shaders can sometimes end up being invalid so we sanitize them at this point
       tangentNormal = sanitize(normalSample.xyz, cb.isZUp ? vec3(0.f, 0.f, 1.f) : vec3(0.f, 1.f, 0.f));
     }
+    else if (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_TANGENT_SPACE_NORMAL)
+    {
+      // Fork: legacy RGB tangent-space normal (X/Y/Z packed in .rgb as [0,1] unsigned
+      // snorm, DirectX convention -- green-down). Flag is set by
+      // LegacyMaterialData::as<OpaqueMaterialData>() when the normal came through the
+      // FNV PS-classifier protocol path. Replacement assets never set the flag, so
+      // toolkit-replaced normals fall through to the octahedral decode below.
+      //
+      // The hemisphere clamp (z = abs(z)) mirrors the offline LightspeedOctahedralConverter
+      // reference: Remix's downstream shading assumes hemisphere-only normals (z >= 0),
+      // so any captured pixel whose authored z points inward gets flipped to outward
+      // here. Skipping this step produces shading errors on any inward-pointing texel.
+      vec3 rawNormal = normalSample.xyz * 2.0f - 1.0f;
+      rawNormal.z = abs(rawNormal.z);
+      tangentNormal = normalize(rawNormal);
+    }
     else // Decode encoded normal sample
     {
       // Note: Using f16 from texture to decode from is fine as the original texture is only 8 bits of precision.
@@ -829,6 +845,18 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   if (roughnessLoaded)
   {
     roughness = roughnessSample.x;
+  }
+
+  // Fork: Bethesda/Gamebryo DXT5n convention -- the NormalMap's alpha channel encodes
+  // specular intensity (1.0 = mirror, 0.0 = matte). Convert to perceptual roughness via
+  // the standard inversion. Overrides both the roughnessConstant default and any
+  // roughness texture (FNV doesn't ship one, but a USD-replaced material would; users
+  // can disable via rtx.legacyMaterial.fnv.autoRoughnessFromSpecular if they want the
+  // replaced roughness to take effect). The downstream roughnessScale/roughnessBias
+  // multipliers still apply for in-menu tuning.
+  if (normalLoaded && (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_ROUGHNESS_FROM_NORMAL_ALPHA))
+  {
+    roughness = 1.0f - normalSample.a;
   }
 
 #if defined(RAY_TRACING_PRIMARY_RAY)

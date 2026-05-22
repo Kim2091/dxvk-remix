@@ -264,10 +264,11 @@ namespace dxvk {
       const uint32_t packed = materialData.remixModifierFromD3D;
       const uint32_t diffuseSlot = (packed >> 0) & kRemixSlotRoleNibbleMask;
       const uint32_t normalSlot  = (packed >> 4) & kRemixSlotRoleNibbleMask;
-      // glow nibble (bits 8-11) is reserved for future use; not consumed in V1.
+      const uint32_t glowSlot    = (packed >> 8) & kRemixSlotRoleNibbleMask;
 
       captureSlotTexture(diffuseSlot, materialData.protocolDiffuseTexture);
       captureSlotTexture(normalSlot,  materialData.normalTexture);
+      captureSlotTexture(glowSlot,    materialData.emissiveTexture);
     }
   }
 
