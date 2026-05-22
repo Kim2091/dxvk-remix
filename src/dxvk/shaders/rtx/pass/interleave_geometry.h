@@ -47,7 +47,6 @@ namespace interleaver {
     // Passthrough format mapping
     VK_FORMAT_B8G8R8A8_UNORM = 44,
     VK_FORMAT_R16G16_SFLOAT = 83,
-    VK_FORMAT_R16G16_SFLOAT = 83,
     VK_FORMAT_R32G32_SFLOAT = 103,
     VK_FORMAT_R32G32B32_SFLOAT = 106,
     VK_FORMAT_R32G32B32A32_SFLOAT = 109,
@@ -138,13 +137,6 @@ namespace interleaver {
       float r = f16tof32(data & 0xFFFFu);
       float g = f16tof32((data >> 16u) & 0xFFFFu);
       return float3(r, g, 0);
-    }
-    case SupportedVkFormats::VK_FORMAT_R16G16_SFLOAT:
-    {
-      uint data = asuint(input[index]);
-      float x = f16tof32(data & 0xffff);
-      float y = f16tof32(data >> 16);
-      return float3(x, y, 0);
     }
     case SupportedVkFormats::VK_FORMAT_R16G16B16A16_SFLOAT:
     {

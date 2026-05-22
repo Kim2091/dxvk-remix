@@ -296,7 +296,7 @@ namespace dxvk {
     ctx->signal(m_readbackSignal, syncValue);
 
     // Spawn a thread so we dont sync with the GPU here (GPU runs async with CPU)
-    Future<void> result = getExporterThread()->Schedule([this, device = ctx->getDevice(), pBlitDests, pBlitTemps, syncValue, filename, outFormat, dstDesc, swizzle] {
+    Future<void> result = getExporterThread()->Schedule([this, device = ctx->getDevice(), pBlitDests, pBlitTemps, pReadbackBuffers, useBufferReadback, kReadbackRowAlignment, syncValue, filename, outFormat, dstDesc, swizzle] {
       ScopedCpuProfileZoneN("Export Image Finalize");
       // Stall until the GPU has completed its copy to system memory (GPU->CPU)
       this->m_readbackSignal->wait(syncValue);
@@ -331,7 +331,7 @@ namespace dxvk {
         if (useBufferReadback) {
           const Rc<DxvkBuffer>& buffer = pReadbackBuffers[level];
           pSrc = buffer->mapPtr(0);
-          srcRowPitch = computeAlignedPitch(VkDeviceSize(elementCount.width) * formatInfo->elementSize, readbackRowAlignment);
+          srcRowPitch = computeAlignedPitch(VkDeviceSize(elementCount.width) * formatInfo->elementSize, kReadbackRowAlignment);
           srcSlicePitch = VkDeviceSize(elementCount.height) * srcRowPitch;
         } else {
           const Rc<DxvkImage>& readbackImage = pBlitDests[level];

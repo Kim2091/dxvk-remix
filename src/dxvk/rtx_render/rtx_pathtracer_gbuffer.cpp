@@ -835,7 +835,6 @@ namespace dxvk {
         ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
       }
       break;
-    }
 
       case RaytraceMode::RayQueryRayGen:
       {

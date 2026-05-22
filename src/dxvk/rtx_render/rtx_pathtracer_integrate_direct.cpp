@@ -207,7 +207,6 @@ namespace dxvk {
       ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, getComputeShader());
       ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
       break;
-    }
     case RaytraceMode::RayQueryRayGen:
       ctx->bindRaytracingPipelineShaders(getPipelineShaders(true, ommEnabled));
       ctx->traceRays(rayDims.width, rayDims.height, rayDims.depth);
