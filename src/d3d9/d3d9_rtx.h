@@ -78,6 +78,10 @@ namespace dxvk {
                "UE3 translucency compat: skip alpha-blended draw calls that have depth test and depth write both disabled. "
                "These are typically UE3 NeedsDepthTestDisabled materials (e.g. fullscreen overlays, fog volume composites) "
                "that should not create RT geometry. Implicitly enabled by rtx.d3d9.ue3EngineMode.");
+    RTX_OPTION("rtx.d3d9", bool, ue3StaticLocalMeshVertexCaptureCache, false,
+               "UE3 compat: for stable static LocalVertexFactory draws, reuse previously captured vertex shader output instead of preserving a new vertex-capture draw.");
+    RTX_OPTION("rtx.d3d9", uint32_t, ue3StaticLocalMeshVertexCaptureCacheWarmupFrames, 2,
+               "UE3 compat: number of matching captures before a static LocalVertexFactory draw can reuse cached vertex-capture output.");
     RTX_OPTION("rtx", bool, enableIndexBufferMemoization, true, "CPU performance optimization, should generally be enabled.  Will reduce main thread time by caching processIndexBuffer operations and reusing when possible, this will come at the expense of some CPU RAM.");
     RTX_OPTION("rtx", uint32_t, numGeometryProcessingThreads, 2, "The desired number of CPU threads to dedicate to geometry processing  Will be limited by the number of CPU cores.  There may be some advantage to lowering this number in games which are fairly simple and use a low number of draw calls per frame.  The default was determined by looking at a game with around 2000 draw calls per frame, and with a reasonably high average triangle count per draw.");
 
@@ -280,6 +284,7 @@ namespace dxvk {
       Particle,
       PositionOnly,
     };
+
     Ue3VertexFactoryType m_currentUe3VertexFactory = Ue3VertexFactoryType::Unknown;
     fast_unordered_cache<Ue3VertexFactoryType> m_ue3VertexFactoryCache;
 
@@ -385,6 +390,30 @@ namespace dxvk {
       D3D9CommonBuffer* pVBO = nullptr;
       bool canUseBuffer;
     };
+
+    struct Ue3VertexCaptureCacheEntry {
+      RasterBuffer positionBuffer;
+      RasterBuffer normalBuffer;
+      RasterBuffer texcoordBuffer;
+      RasterBuffer color0Buffer;
+      uint32_t vertexCount = 0;
+      uint32_t captureCount = 0;
+      uint32_t lastFrameTouched = 0;
+    };
+
+    fast_unordered_cache<Ue3VertexCaptureCacheEntry> m_ue3VertexCaptureCache;
+
+    bool canUseUe3StaticVertexCaptureCache(const IndexContext& indexContext,
+                                           const VertexContext vertexContext[caps::MaxStreams],
+                                           const RasterGeometry& geoData) const;
+    XXH64_hash_t computeUe3StableVertexShaderHash() const;
+    XXH64_hash_t computeUe3StaticVertexCaptureCacheKey(const IndexContext& indexContext,
+                                                       const VertexContext vertexContext[caps::MaxStreams],
+                                                       const DrawContext& drawContext,
+                                                       const RasterGeometry& geoData) const;
+    bool tryReuseUe3StaticVertexCapture(XXH64_hash_t cacheKey, RasterGeometry& geoData);
+    void updateUe3StaticVertexCaptureCache(XXH64_hash_t cacheKey, const RasterGeometry& geoData);
+    void pruneUe3StaticVertexCaptureCache();
 
     static bool isPrimitiveSupported(const D3DPRIMITIVETYPE PrimitiveType) {
       return (PrimitiveType == D3DPT_TRIANGLELIST || PrimitiveType == D3DPT_TRIANGLEFAN || PrimitiveType == D3DPT_TRIANGLESTRIP);

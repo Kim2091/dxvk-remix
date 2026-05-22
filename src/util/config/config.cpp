@@ -124,11 +124,14 @@ namespace dxvk {
     { R"(\\MirrorsEdge\.exe$)", {{
       { "rtx.d3d9.ue3EngineMode",                       "True" },
       { "rtx.cameraManager.guardMainCameraFromOutliers", "True" },
+      { "rtx.cameraManager.syncMainCameraFromRenderToTexture", "True" },
       { "rtx.zUp",                               "True" },
       { "rtx.sceneScale",                        "1.0" },
       // medge renders the main scene to an offscreen RT and composites/upscales later
       { "rtx.d3d9.autoRaytracedRenderTargetFromFullscreenComposite", "True" },
       { "rtx.d3d9.rasterizeFullscreenCompositeToPrimary",           "True" },
+      { "rtx.d3d9.ue3StaticLocalMeshVertexCaptureCache",             "True" },
+      { "rtx.d3d9.ue3StaticLocalMeshVertexCaptureCacheWarmupFrames", "2" },
       // medge billboard materials sample dirt masks alongside ad textures
       { "rtx.albedoMaskTextures", "8BC96DE2A6824697" },
       { "rtx.legacyMaterial.roughnessConstant",          "0.5" },

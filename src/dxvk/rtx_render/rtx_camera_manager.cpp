@@ -23,8 +23,46 @@
 
 #include "dxvk_device.h"
 
+#include <cmath>
+
 namespace {
   constexpr float kFovToleranceRadians = 0.001f;
+  constexpr float kAspectRelDiffThreshold = 0.10f;
+  constexpr float kFovDiffThreshold = 0.35f;
+  constexpr float kStrongDirDotThreshold = 0.20f;
+  constexpr float kSuspiciousRotationDirDotThreshold = 0.35f;
+  constexpr float kPersistentDirDotThreshold = 0.85f;
+  constexpr float kPersistentFovDiffThreshold = 0.10f;
+  constexpr float kPersistentAspectRelDiffThreshold = 0.05f;
+
+  struct CameraPose {
+    dxvk::Vector3 position;
+    dxvk::Vector3 direction;
+  };
+
+  CameraPose getCameraPose(const dxvk::Matrix4& worldToView, const bool isLHS) {
+    const dxvk::Matrix4 viewToWorld = dxvk::inverseAffine(worldToView);
+
+    CameraPose pose {
+      dxvk::Vector3 { viewToWorld[3].xyz() },
+      dxvk::Vector3 { viewToWorld[2].xyz() }
+    };
+
+    if (!isLHS) {
+      pose.direction = -pose.direction;
+    }
+
+    const float directionLength = dxvk::length(pose.direction);
+    if (directionLength > 0.0f) {
+      pose.direction /= directionLength;
+    }
+
+    return pose;
+  }
+
+  float aspectRelativeDifference(const float a, const float b) {
+    return b > 1e-6f ? std::abs(a - b) / b : 0.0f;
+  }
 }
 
 namespace dxvk {
@@ -39,21 +77,75 @@ namespace dxvk {
     assert(cameraType < CameraType::Enum::Count);
     const uint32_t frameId = m_device->getCurrentFrameId();
     const RtCamera& camera = accessCamera(*this, cameraType);
-    if (camera.isValid(frameId))
-      return true;
-
-    // keep main camera usable for a rejection frame so raytracing doesn't disengage
-    // while we wait for a suspicious jump candidate to prove persistence todo: fix this later
-    if (cameraType == CameraType::Main &&
-        guardMainCameraFromOutliers() &&
-        m_pendingMainJumpCandidate.valid &&
-        m_pendingMainJumpCandidate.frameId == frameId &&
-        frameId > 0 &&
-        camera.isValid(frameId - 1)) {
+    if (camera.isValid(frameId)) {
       return true;
     }
 
     return false;
+  }
+
+  void CameraManager::finalizeFrameCameras() {
+    const uint32_t frameId = m_device->getCurrentFrameId();
+    if (m_lastFinalizedFrameId == frameId) {
+      return;
+    }
+
+    m_lastFinalizedFrameId = frameId;
+
+    if (!guardMainCameraFromOutliers()) {
+      return;
+    }
+
+    RtCamera& mainCamera = getCamera(CameraType::Main);
+    if (mainCamera.isValid(frameId)) {
+      return;
+    }
+
+    if (syncMainCameraFromRenderToTexture()) {
+      const RtCamera& renderTargetCamera = getCamera(CameraType::RenderToTexture);
+      if (renderTargetCamera.isValid(frameId)) {
+        const RtCamera::RtCameraSetting& setting = renderTargetCamera.getSetting();
+        const bool isCameraCut = mainCamera.update(
+          frameId,
+          setting.worldToView,
+          setting.viewToProjection,
+          setting.fov,
+          setting.aspectRatio,
+          setting.nearPlane,
+          setting.farPlane,
+          setting.isLHS,
+          setting.flags);
+
+        if (isCameraCut) {
+          m_lastCameraCutFrameId = frameId;
+        }
+
+        m_pendingMainJumpCandidate.valid = false;
+        m_lastSetCameraType = CameraType::Main;
+
+        if (logMainCameraUpdates()) {
+          Logger::debug(str::format(
+            "[RTX-Compatibility] CameraManager: finalized Main camera from RenderToTexture on frame ", frameId,
+            "; cameraCut=", isCameraCut ? "true" : "false"));
+        }
+        return;
+      }
+    }
+
+    if (frameId > 0 &&
+        mainCamera.isValid(frameId - 1) &&
+        m_pendingMainJumpCandidate.valid &&
+        m_pendingMainJumpCandidate.frameId == frameId) {
+      mainCamera.holdFrame(frameId);
+      m_lastSetCameraType = CameraType::Main;
+
+      if (logMainCameraUpdates() && m_lastRejectedMainCameraLogFrameId != frameId) {
+        m_lastRejectedMainCameraLogFrameId = frameId;
+        Logger::debug(str::format(
+          "[RTX-Compatibility] CameraManager: held previous Main camera on frame ", frameId,
+          " after rejecting all candidates for this frame."));
+      }
+    }
   }
 
   void CameraManager::onFrameEnd() {
@@ -148,51 +240,50 @@ namespace dxvk {
     bool isCameraCut = false;
     Matrix4 worldToView = input.getTransformData().worldToView;
     Matrix4 viewToProjection = input.getTransformData().viewToProjection;
+    const bool hadPreviousMainCamera =
+      shouldUpdateMainCamera &&
+      frameId > 0 &&
+      getCamera(CameraType::Main).isValid(frameId - 1);
+    Vector3 previousMainPosition(0.0f);
+    Vector3 previousMainDirection(0.0f);
+    float previousMainFov = 0.0f;
 
-    if (guardMainCameraFromOutliers() && shouldUpdateMainCamera && frameId > 0 && getCamera(CameraType::Main).isValid(frameId - 1)) {
+    if (hadPreviousMainCamera) {
+      const RtCamera& prevMain = getCamera(CameraType::Main);
+      previousMainPosition = prevMain.getPosition(false);
+      previousMainDirection = prevMain.getDirection(false);
+      const float previousDirectionLength = length(previousMainDirection);
+      if (previousDirectionLength > 0.0f) {
+        previousMainDirection /= previousDirectionLength;
+      }
+      previousMainFov = prevMain.getFov();
+    }
+
+    if (guardMainCameraFromOutliers() && hadPreviousMainCamera) {
       const RtCamera& prevMain = getCamera(CameraType::Main);
 
       const float prevAspect = prevMain.getAspectRatio();
-      const float prevFov = prevMain.getFov();
+      const float prevFov = previousMainFov;
 
-      const float aspectRelDiff =
-        prevAspect > 1e-6f
-          ? std::abs(decomposeProjectionParams.aspectRatio - prevAspect) / prevAspect
-          : 0.0f;
+      const float aspectRelDiff = aspectRelativeDifference(decomposeProjectionParams.aspectRatio, prevAspect);
 
-      Vector3 candDir(0.0f);
-      Vector3 candPos(0.0f);
-      {
-        const Matrix4 viewToWorld = inverseAffine(worldToView);
-        candDir = Vector3 { viewToWorld[2].xyz() };
-        candPos = Vector3 { viewToWorld[3].xyz() };
-        if (!decomposeProjectionParams.isLHS)
-          candDir = -candDir;
+      const CameraPose candidatePose = getCameraPose(worldToView, decomposeProjectionParams.isLHS);
 
-        const float len = length(candDir);
-        if (len > 0.0f)
-          candDir /= len;
-      }
-
-      Vector3 prevDir = prevMain.getDirection(false);
-      const float prevLen = length(prevDir);
-      if (prevLen > 0.0f)
-        prevDir /= prevLen;
-
-      const float dirDot = dot(candDir, prevDir);
+      const float dirDot = dot(candidatePose.direction, previousMainDirection);
       const float fovDiff = std::abs(decomposeProjectionParams.fov - prevFov);
 
-      // reject if aspect ratio is way off or if both fov and direction are strong outliers
-      constexpr float kAspectRelDiffThreshold = 0.10f;
-      constexpr float kFovDiffThreshold = 0.35f;
-      constexpr float kDirDotThreshold = 0.20f;
+      // Aspect-ratio outliers are usually utility cameras, not a real player view transition.
+      const bool rejectedByAspect = aspectRelDiff > kAspectRelDiffThreshold;
 
-      const bool rejectedByAspectOrDirection =
-        aspectRelDiff > kAspectRelDiffThreshold ||
-        (fovDiff > kFovDiffThreshold && dirDot < kDirDotThreshold);
-
-      if (rejectedByAspectOrDirection) {
+      if (rejectedByAspect) {
         m_pendingMainJumpCandidate.valid = false;
+        if (logMainCameraUpdates()) {
+          Logger::debug(str::format(
+            "[RTX-Compatibility] CameraManager: rejected Main camera candidate on frame ", frameId,
+            " by aspect; aspectRelDiff=", aspectRelDiff,
+            ", fovDiff=", fovDiff,
+            ", dirDot=", dirDot));
+        }
         ONCE(Logger::warn("[RTX-Compatibility] CameraManager: rejected outlier Main camera candidate (likely shadow/utility camera)."));
         return CameraType::Unknown;
       }
@@ -200,39 +291,57 @@ namespace dxvk {
       // reject the bad camera frame spikes but accept persistent jumps
       // on the next frame so real teleports/loads still converge to the new camera
       {
-        const float posJumpDistSqr = lengthSqr(candPos - prevMain.getPosition(false));
+        const float posJumpDistSqr = lengthSqr(candidatePose.position - previousMainPosition);
         const float suspiciousJumpThresholdSqr = RtxOptions::getUniqueObjectDistanceSqr() * 4.0f;
         const bool isSuspiciousJump = posJumpDistSqr > suspiciousJumpThresholdSqr;
+        const bool isSuspiciousRotation =
+          dirDot < kSuspiciousRotationDirDotThreshold ||
+          (fovDiff > kFovDiffThreshold && dirDot < kStrongDirDotThreshold);
 
-        if (isSuspiciousJump) {
+        if (isSuspiciousJump || isSuspiciousRotation) {
           bool isPersistentJump = false;
           if (m_pendingMainJumpCandidate.valid &&
-              (m_pendingMainJumpCandidate.frameId == frameId ||
-               m_pendingMainJumpCandidate.frameId + 1 == frameId)) {
-            const float repeatPosDistSqr = lengthSqr(candPos - m_pendingMainJumpCandidate.position);
-            const float repeatDirDot = dot(candDir, m_pendingMainJumpCandidate.direction);
+              m_pendingMainJumpCandidate.frameId + 1 == frameId) {
+            const float repeatPosDistSqr = lengthSqr(candidatePose.position - m_pendingMainJumpCandidate.position);
+            const float repeatDirDot = dot(candidatePose.direction, m_pendingMainJumpCandidate.direction);
             const float repeatFovDiff = std::abs(decomposeProjectionParams.fov - m_pendingMainJumpCandidate.fov);
-            const float repeatAspectRelDiff =
-              m_pendingMainJumpCandidate.aspectRatio > 1e-6f
-                ? std::abs(decomposeProjectionParams.aspectRatio - m_pendingMainJumpCandidate.aspectRatio) / m_pendingMainJumpCandidate.aspectRatio
-                : 0.0f;
+            const float repeatAspectRelDiff = aspectRelativeDifference(decomposeProjectionParams.aspectRatio, m_pendingMainJumpCandidate.aspectRatio);
 
             isPersistentJump =
               repeatPosDistSqr <= RtxOptions::getUniqueObjectDistanceSqr() &&
-              repeatDirDot > 0.85f &&
-              repeatFovDiff < 0.10f &&
-              repeatAspectRelDiff < 0.05f;
+              repeatDirDot > kPersistentDirDotThreshold &&
+              repeatFovDiff < kPersistentFovDiffThreshold &&
+              repeatAspectRelDiff < kPersistentAspectRelDiffThreshold;
           }
 
           if (!isPersistentJump) {
             m_pendingMainJumpCandidate.valid = true;
             m_pendingMainJumpCandidate.frameId = frameId;
-            m_pendingMainJumpCandidate.position = candPos;
-            m_pendingMainJumpCandidate.direction = candDir;
+            m_pendingMainJumpCandidate.position = candidatePose.position;
+            m_pendingMainJumpCandidate.direction = candidatePose.direction;
             m_pendingMainJumpCandidate.fov = decomposeProjectionParams.fov;
             m_pendingMainJumpCandidate.aspectRatio = decomposeProjectionParams.aspectRatio;
-            ONCE(Logger::warn("[RTX-Compatibility] CameraManager: rejected provisional large-jump Main camera candidate."));
+            if (logMainCameraUpdates()) {
+              Logger::debug(str::format(
+                "[RTX-Compatibility] CameraManager: rejected provisional Main camera candidate on frame ", frameId,
+                "; posJumpDist=", std::sqrt(posJumpDistSqr),
+                ", threshold=", std::sqrt(suspiciousJumpThresholdSqr),
+                ", dirDot=", dirDot,
+                ", fovDiff=", fovDiff,
+                ", suspiciousJump=", isSuspiciousJump ? "true" : "false",
+                ", suspiciousRotation=", isSuspiciousRotation ? "true" : "false"));
+            }
+            ONCE(Logger::warn("[RTX-Compatibility] CameraManager: rejected provisional Main camera candidate."));
             return CameraType::Unknown;
+          }
+
+          if (logMainCameraUpdates()) {
+            Logger::debug(str::format(
+              "[RTX-Compatibility] CameraManager: accepted persistent Main camera candidate on frame ", frameId,
+              "; posJumpDist=", std::sqrt(posJumpDistSqr),
+              ", threshold=", std::sqrt(suspiciousJumpThresholdSqr),
+              ", dirDot=", dirDot,
+              ", fovDiff=", fovDiff));
           }
         }
 
@@ -267,6 +376,32 @@ namespace dxvk {
     if (shouldUpdateMainCamera && RtCameraSequence::mode() == RtCameraSequence::Mode::Record) {
       auto& setting = camera.getSetting();
       cameraSequence->addRecord(setting);
+    }
+
+    if (shouldUpdateMainCamera && logMainCameraUpdates() && camera.isValid(frameId)) {
+      float positionDelta = 0.0f;
+      float directionDot = 1.0f;
+      float fovDiff = 0.0f;
+      if (hadPreviousMainCamera) {
+        Vector3 currentDirection = camera.getDirection(false);
+        const float currentDirectionLength = length(currentDirection);
+        if (currentDirectionLength > 0.0f) {
+          currentDirection /= currentDirectionLength;
+        }
+
+        positionDelta = std::sqrt(lengthSqr(camera.getPosition(false) - previousMainPosition));
+        directionDot = dot(currentDirection, previousMainDirection);
+        fovDiff = std::abs(camera.getFov() - previousMainFov);
+      }
+
+      Logger::debug(str::format(
+        "[RTX-Compatibility] CameraManager: accepted Main camera on frame ", frameId,
+        "; positionDelta=", positionDelta,
+        ", directionDot=", directionDot,
+        ", fovDiff=", fovDiff,
+        ", cameraCut=", isCameraCut ? "true" : "false",
+        ", viewHistoryInvalidated=", camera.isViewHistoryInvalidated(frameId) ? "true" : "false",
+        ", guard=", guardMainCameraFromOutliers() ? "true" : "false"));
     }
 
     // Register camera cut when there are significant interruptions to the view (like changing level, or opening a menu)

@@ -1553,6 +1553,14 @@ namespace dxvk {
 
       RtCamera::showImguiSettings();
 
+      if (RemixGui::CollapsingHeader("Manager", collapsingHeaderClosedFlags)) {
+        ImGui::Indent();
+        RemixGui::Checkbox("Guard Main Camera From Outliers", &CameraManager::guardMainCameraFromOutliersObject());
+        RemixGui::Checkbox("Sync Main Camera From Render Target", &CameraManager::syncMainCameraFromRenderToTextureObject());
+        RemixGui::Checkbox("Log Main Camera Updates", &CameraManager::logMainCameraUpdatesObject());
+        ImGui::Unindent();
+      }
+
       {
         ImGui::PushID("CameraInfos");
         auto& cameraManager = ctx->getCommonObjects()->getSceneManager().getCameraManager();

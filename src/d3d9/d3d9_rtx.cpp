@@ -38,10 +38,13 @@ namespace dxvk {
     struct VDeclSignature {
       bool hasPosition = false;
       uint8_t positionType = 0;
+      uint8_t positionStream = 0xFF;
       bool hasTangent = false;
       uint8_t tangentType = 0;
+      uint8_t tangentStream = 0xFF;
       bool hasNormal = false;
       uint8_t normalType = 0;
+      uint8_t normalStream = 0xFF;
       bool hasBinormal = false;
       bool hasBlendWeight = false;
       uint8_t blendWeightType = 0;
@@ -67,14 +70,17 @@ namespace dxvk {
         case D3DDECLUSAGE_POSITIONT:
           sig.hasPosition = true;
           sig.positionType = e.Type;
+          sig.positionStream = e.Stream;
           break;
         case D3DDECLUSAGE_TANGENT:
           sig.hasTangent = true;
           sig.tangentType = e.Type;
+          sig.tangentStream = e.Stream;
           break;
         case D3DDECLUSAGE_NORMAL:
           sig.hasNormal = true;
           sig.normalType = e.Type;
+          sig.normalStream = e.Stream;
           break;
         case D3DDECLUSAGE_BINORMAL:
           sig.hasBinormal = true;
@@ -1922,6 +1928,286 @@ namespace dxvk {
     return *m_parent->GetRawState();
   }
 
+  bool D3D9Rtx::canUseUe3StaticVertexCaptureCache(const IndexContext& indexContext,
+                                                  const VertexContext vertexContext[caps::MaxStreams],
+                                                  const RasterGeometry& geoData) const {
+    if (!ue3StaticLocalMeshVertexCaptureCache()) {
+      return false;
+    }
+    if (!ue3EngineMode()) {
+      return false;
+    }
+    if (!m_parent->UseProgrammableVS()) {
+      return false;
+    }
+    if (!useVertexCapture()) {
+      return false;
+    }
+    if (m_currentUe3VertexFactory != Ue3VertexFactoryType::Local) {
+      return false;
+    }
+    if (!m_currentUe3CtabInfo.has_value()) {
+      return false;
+    }
+    if (!m_currentUe3CtabInfo->hasLocalToWorld) {
+      return false;
+    }
+    if (!geoData.positionBuffer.defined()) {
+      return false;
+    }
+    if (geoData.blendWeightBuffer.defined() || geoData.blendIndicesBuffer.defined()) {
+      return false;
+    }
+    if (m_activeDrawCallState.testCategoryFlags(InstanceCategories::WorldUI) ||
+        m_activeDrawCallState.testCategoryFlags(InstanceCategories::Terrain)) {
+      return false;
+    }
+    if (d3d9State().vertexDecl == nullptr) {
+      return false;
+    }
+
+    const auto& elements = d3d9State().vertexDecl->GetElements();
+    const VDeclSignature sig = buildVDeclSignature(elements);
+    // UE3 static meshes use FPositionVertexBuffer for POSITION and FStaticMeshVertexBuffer
+    // for tangent/normal/UV data. Ref-pose skeletal LocalVertexFactory draws use a unified
+    // stream and are not stable static-local cache candidates.
+    if (sig.positionStream == sig.tangentStream || sig.positionStream == sig.normalStream) {
+      return false;
+    }
+
+    auto isStaticBuffer = [](D3D9CommonBuffer* buffer) {
+      if (buffer == nullptr || buffer->Desc() == nullptr) {
+        return false;
+      }
+
+      if ((buffer->Desc()->Usage & D3DUSAGE_DYNAMIC) != 0 || buffer->WasWrittenByGPU()) {
+        return false;
+      }
+
+      return !buffer->NeedsUpload();
+    };
+
+    if (indexContext.indexType != VK_INDEX_TYPE_NONE_KHR && !isStaticBuffer(indexContext.ibo)) {
+      return false;
+    }
+
+    for (const auto& element : elements) {
+      if (element.Stream >= caps::MaxStreams) {
+        return false;
+      }
+
+      const VertexContext& ctx = vertexContext[element.Stream];
+      if (ctx.mappedSlice.handle == VK_NULL_HANDLE || !isStaticBuffer(ctx.pVBO)) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  XXH64_hash_t D3D9Rtx::computeUe3StableVertexShaderHash() const {
+    if (d3d9State().vertexShader.ptr() == nullptr) {
+      return kEmptyHash;
+    }
+
+    const D3D9ConstantSets& cb = m_parent->m_consts[DxsoProgramTypes::VertexShader];
+    const auto& shaderByteCode = d3d9State().vertexShader->GetCommonShader()->GetBytecode();
+    XXH64_hash_t hash = XXH3_64bits(shaderByteCode.data(), shaderByteCode.size());
+
+    const uint32_t floatConstRegCount = cb.meta.maxConstIndexF;
+    const uint8_t* const floatConstBase = reinterpret_cast<const uint8_t*>(&d3d9State().vsConsts.fConsts[0]);
+
+    auto hashFloatConstRange = [&](uint32_t beginReg, uint32_t endReg) {
+      beginReg = std::min(beginReg, floatConstRegCount);
+      endReg = std::min(endReg, floatConstRegCount);
+      if (beginReg >= endReg) {
+        return;
+      }
+
+      const size_t offsetBytes = size_t(beginReg) * sizeof(Vector4);
+      const size_t sizeBytes = size_t(endReg - beginReg) * sizeof(Vector4);
+      hash = XXH3_64bits_withSeed(floatConstBase + offsetBytes, sizeBytes, hash);
+    };
+
+    bool hashedFloatConstsWithExclusions = false;
+    if ((ue3CameraFromShaderConstants() || ue3EngineMode()) && floatConstRegCount > 0) {
+      constexpr uint32_t kFallbackViewProjReg = 0;
+      constexpr uint32_t kFallbackViewProjRegCount = 4;
+      constexpr uint32_t kFallbackViewOriginReg = 4;
+      constexpr uint32_t kFallbackViewOriginRegCount = 1;
+
+      uint32_t viewProjReg = kFallbackViewProjReg;
+      uint32_t viewProjRegCount = kFallbackViewProjRegCount;
+      uint32_t viewOriginReg = kFallbackViewOriginReg;
+      uint32_t viewOriginRegCount = kFallbackViewOriginRegCount;
+
+      if (m_currentUe3CtabInfo.has_value()) {
+        const Ue3VsShaderCtabInfo& ctabInfo = *m_currentUe3CtabInfo;
+        if (ctabInfo.hasViewProjectionMatrix && ctabInfo.viewProjectionMatrixRegisterCount > 0) {
+          viewProjReg = ctabInfo.viewProjectionMatrixRegisterIndex;
+          viewProjRegCount = ctabInfo.viewProjectionMatrixRegisterCount;
+        }
+        if (ctabInfo.hasCameraPosition && ctabInfo.cameraPositionRegisterCount > 0) {
+          viewOriginReg = ctabInfo.cameraPositionRegisterIndex;
+          viewOriginRegCount = ctabInfo.cameraPositionRegisterCount;
+        }
+      }
+
+      struct RegRange {
+        uint32_t begin = 0;
+        uint32_t end = 0;
+      };
+
+      std::array<RegRange, 2> ranges = {{
+        { viewProjReg, viewProjReg + viewProjRegCount },
+        { viewOriginReg, viewOriginReg + viewOriginRegCount },
+      }};
+      std::array<RegRange, 2> validRanges = {};
+      uint32_t validRangeCount = 0;
+      for (const RegRange& r : ranges) {
+        RegRange clamped;
+        clamped.begin = std::min(r.begin, floatConstRegCount);
+        clamped.end = std::min(r.end, floatConstRegCount);
+        if (clamped.begin < clamped.end) {
+          validRanges[validRangeCount++] = clamped;
+        }
+      }
+
+      if (validRangeCount > 0) {
+        if (validRangeCount == 2 && validRanges[1].begin < validRanges[0].begin) {
+          std::swap(validRanges[0], validRanges[1]);
+        }
+        if (validRangeCount == 2 && validRanges[1].begin <= validRanges[0].end) {
+          validRanges[0].end = std::max(validRanges[0].end, validRanges[1].end);
+          validRangeCount = 1;
+        }
+
+        uint32_t cursor = 0;
+        for (uint32_t i = 0; i < validRangeCount; i++) {
+          hashFloatConstRange(cursor, validRanges[i].begin);
+          cursor = std::max(cursor, validRanges[i].end);
+        }
+        hashFloatConstRange(cursor, floatConstRegCount);
+        hashedFloatConstsWithExclusions = true;
+      }
+    }
+
+    if (!hashedFloatConstsWithExclusions && floatConstRegCount > 0) {
+      hash = XXH3_64bits_withSeed(
+        &d3d9State().vsConsts.fConsts[0],
+        size_t(floatConstRegCount) * sizeof(Vector4),
+        hash);
+    }
+
+    if (cb.meta.maxConstIndexI > 0) {
+      hash = XXH3_64bits_withSeed(
+        &d3d9State().vsConsts.iConsts[0],
+        size_t(cb.meta.maxConstIndexI) * sizeof(int) * 4,
+        hash);
+    }
+    if (cb.meta.maxConstIndexB > 0) {
+      hash = XXH3_64bits_withSeed(
+        &d3d9State().vsConsts.bConsts[0],
+        size_t(cb.meta.maxConstIndexB) * sizeof(uint32_t) / 32,
+        hash);
+    }
+
+    return hash;
+  }
+
+  XXH64_hash_t D3D9Rtx::computeUe3StaticVertexCaptureCacheKey(const IndexContext& indexContext,
+                                                              const VertexContext vertexContext[caps::MaxStreams],
+                                                              const DrawContext& drawContext,
+                                                              const RasterGeometry& geoData) const {
+    constexpr uint64_t kSeed = 0x92F367D3E2F391A5ull;
+    XXH64_hash_t hash = kSeed;
+
+    auto mix = [&](const auto& value) {
+      hash = XXH3_64bits_withSeed(&value, sizeof(value), hash);
+    };
+
+    mix(drawContext);
+    mix(geoData.vertexCount);
+    mix(geoData.indexCount);
+    mix(geoData.topology);
+    mix(geoData.cullMode);
+    mix(geoData.frontFace);
+    mix(m_texcoordIndex);
+    mix(m_texcoordCompU);
+    mix(m_texcoordCompV);
+    mix(m_forceIaTexcoordForOutlier);
+
+    const XXH64_hash_t stableVsHash = computeUe3StableVertexShaderHash();
+    mix(stableVsHash);
+    mix(m_activeDrawCallState.transformData.objectToWorld);
+
+    const DxvkBufferSliceHandle indexSlice = indexContext.indexBuffer;
+    mix(indexContext.indexType);
+    mix(indexContext.ibo);
+    mix(indexSlice.handle);
+    mix(indexSlice.offset);
+    mix(indexSlice.length);
+
+    const auto& elements = d3d9State().vertexDecl->GetElements();
+    hash = XXH3_64bits_withSeed(elements.data(), elements.size() * sizeof(D3DVERTEXELEMENT9), hash);
+    for (const auto& element : elements) {
+      const VertexContext& ctx = vertexContext[element.Stream];
+      const DxvkBufferSliceHandle vertexSlice = ctx.mappedSlice;
+      mix(ctx.stride);
+      mix(ctx.offset);
+      mix(ctx.pVBO);
+      mix(vertexSlice.handle);
+      mix(vertexSlice.offset);
+      mix(vertexSlice.length);
+    }
+
+    return hash;
+  }
+
+  bool D3D9Rtx::tryReuseUe3StaticVertexCapture(XXH64_hash_t cacheKey, RasterGeometry& geoData) {
+    auto it = m_ue3VertexCaptureCache.find(cacheKey);
+    if (it == m_ue3VertexCaptureCache.end()) {
+      return false;
+    }
+
+    Ue3VertexCaptureCacheEntry& entry = it->second;
+    const uint32_t currentFrame = m_parent->GetDXVKDevice()->getCurrentFrameId();
+    const uint32_t warmupFrames = std::max(1u, ue3StaticLocalMeshVertexCaptureCacheWarmupFrames());
+    if (entry.vertexCount != geoData.vertexCount ||
+        !entry.positionBuffer.defined() ||
+        entry.captureCount < warmupFrames ||
+        entry.lastFrameTouched == currentFrame) {
+      return false;
+    }
+
+    geoData.positionBuffer = entry.positionBuffer;
+    geoData.normalBuffer = entry.normalBuffer;
+    geoData.texcoordBuffer = entry.texcoordBuffer;
+    geoData.color0Buffer = entry.color0Buffer;
+    entry.lastFrameTouched = currentFrame;
+
+    return true;
+  }
+
+  void D3D9Rtx::updateUe3StaticVertexCaptureCache(XXH64_hash_t cacheKey, const RasterGeometry& geoData) {
+    Ue3VertexCaptureCacheEntry& entry = m_ue3VertexCaptureCache[cacheKey];
+    entry.positionBuffer = geoData.positionBuffer;
+    entry.normalBuffer = geoData.normalBuffer;
+    entry.texcoordBuffer = geoData.texcoordBuffer;
+    entry.color0Buffer = geoData.color0Buffer;
+    entry.vertexCount = geoData.vertexCount;
+    entry.captureCount = std::min(entry.captureCount + 1, 0xFFFFu);
+    entry.lastFrameTouched = m_parent->GetDXVKDevice()->getCurrentFrameId();
+  }
+
+  void D3D9Rtx::pruneUe3StaticVertexCaptureCache() {
+    constexpr uint32_t kMaxUntouchedFrames = 600;
+    const uint32_t currentFrame = m_parent->GetDXVKDevice()->getCurrentFrameId();
+    m_ue3VertexCaptureCache.erase_if([&](auto it) {
+      return currentFrame - it->second.lastFrameTouched > kMaxUntouchedFrames;
+    });
+  }
+
   template<typename T>
   void D3D9Rtx::copyIndices(const uint32_t indexCount, T*& pIndicesDst, T* pIndices, uint32_t& minIndex, uint32_t& maxIndex) {
     ScopedCpuProfileZone();
@@ -2755,8 +3041,9 @@ namespace dxvk {
         Matrix4 ue3WorldToView;
         Matrix4 ue3ViewToProjection;
         bool usedTranspose = false;
-        if (!tryExtractUe3WorldToViewAndProjectionFromShaderConstants(d3d9State().vsConsts, viewProjReg, viewOriginReg, ue3WorldToView, ue3ViewToProjection, &usedTranspose))
+        if (!tryExtractUe3WorldToViewAndProjectionFromShaderConstants(d3d9State().vsConsts, viewProjReg, viewOriginReg, ue3WorldToView, ue3ViewToProjection, &usedTranspose)) {
           return false;
+        }
 
         m_ue3CameraConstantsCache.hash = constantsHash;
         m_ue3CameraConstantsCache.valid = true;
@@ -3315,11 +3602,15 @@ namespace dxvk {
   PrepareDrawFlags D3D9Rtx::internalPrepareDraw(const IndexContext& indexContext, const VertexContext vertexContext[caps::MaxStreams], const DrawContext& drawContext) {
     ScopedCpuProfileZone();
 
+    auto finishPrepare = [&](PrepareDrawFlags flags) {
+      return flags;
+    };
+
     // RTX was injected => treat everything else as rasterized 
     if (m_rtxInjectTriggered) {
-      return RtxOptions::skipDrawCallsPostRTXInjection()
+      return finishPrepare(RtxOptions::skipDrawCallsPostRTXInjection()
              ? PrepareDrawFlag::Ignore
-             : PrepareDrawFlag::PreserveDrawCallAndItsState;
+             : PrepareDrawFlag::PreserveDrawCallAndItsState);
     }
 
     // classify UE3 vertex factory early so makeDrawCallType can use it for pass filtering
@@ -3344,7 +3635,7 @@ namespace dxvk {
                                                          : PrepareDrawFlag::PreserveDrawCallAndItsState;
 
     if (status == RtxGeometryStatus::Ignored) {
-      return prepareFlagsForIgnoredDraws;
+      return finishPrepare(prepareFlagsForIgnoredDraws);
     }
 
     if (triggerRtxInjection) {
@@ -3354,11 +3645,11 @@ namespace dxvk {
       triggerInjectRTX();
 
       m_rtxInjectTriggered = true;
-      return PrepareDrawFlag::PreserveDrawCallAndItsState;
+      return finishPrepare(PrepareDrawFlag::PreserveDrawCallAndItsState);
     }
 
     if (status == RtxGeometryStatus::Rasterized) {
-      return PrepareDrawFlag::PreserveDrawCallAndItsState;
+      return finishPrepare(PrepareDrawFlag::PreserveDrawCallAndItsState);
     }
 
     m_forceGeometryCopy = RtxOptions::useBuffersDirectly() == false;
@@ -3387,7 +3678,7 @@ namespace dxvk {
       // Unlikely, but invalid
       if (maxIndex == minIndex) {
         ONCE(Logger::info("[RTX-Compatibility-Info] Skipped invalid drawcall, no triangles detected in index buffer."));
-        return prepareFlagsForIgnoredDraws;
+        return finishPrepare(prepareFlagsForIgnoredDraws);
       }
 
       geoData.vertexCount = maxIndex - minIndex + 1;
@@ -3398,7 +3689,7 @@ namespace dxvk {
 
     if (geoData.vertexCount == 0) {
       ONCE(Logger::info("[RTX-Compatibility-Info] Skipped invalid drawcall, no vertices detected."));
-      return prepareFlagsForIgnoredDraws;
+      return finishPrepare(prepareFlagsForIgnoredDraws);
     }
 
     if (RtxOptions::RaytracedRenderTarget::enable()) {
@@ -3429,7 +3720,7 @@ namespace dxvk {
 
     // Fetch all the render state and send it to rtx context (textures, transforms, etc.)
     if (!processRenderState()) {
-      return prepareFlagsForIgnoredDraws;
+      return finishPrepare(prepareFlagsForIgnoredDraws);
     }
 
     // Max offseted index value within a buffer slice that geoData contains
@@ -3437,6 +3728,7 @@ namespace dxvk {
 
     // Copy all the vertices into a staging buffer.  Assign fields of the geoData structure.
     processVertices(vertexContext, vertexIndexOffset, geoData);
+
     geoData.futureGeometryHashes = computeHash(geoData, maxOffsetedIndex);
     geoData.futureBoundingBox = computeAxisAlignedBoundingBox(geoData);
     
@@ -3446,12 +3738,27 @@ namespace dxvk {
     // Hash material data
     m_activeDrawCallState.materialData.updateCachedHash();
 
+    const bool canUseCachedVertexCapture =
+      canUseUe3StaticVertexCaptureCache(indexContext, vertexContext, geoData);
+    const XXH64_hash_t vertexCaptureCacheKey =
+      canUseCachedVertexCapture
+        ? computeUe3StaticVertexCaptureCacheKey(indexContext, vertexContext, drawContext, geoData)
+        : kEmptyHash;
+    const bool reusedCachedVertexCapture =
+      canUseCachedVertexCapture &&
+      tryReuseUe3StaticVertexCapture(vertexCaptureCacheKey, geoData);
+
     // For shader based drawcalls we also want to capture the vertex shader output
-    bool needVertexCapture = m_parent->UseProgrammableVS() && useVertexCapture();
+    bool needVertexCapture =
+      m_parent->UseProgrammableVS() &&
+      useVertexCapture() &&
+      !reusedCachedVertexCapture;
     if (needVertexCapture) {
       needVertexCapture = prepareVertexCapture(vertexIndexOffset);
     }
-
+    if (canUseCachedVertexCapture && !reusedCachedVertexCapture && needVertexCapture) {
+      updateUe3StaticVertexCaptureCache(vertexCaptureCacheKey, geoData);
+    }
     m_activeDrawCallState.usesVertexShader = m_parent->UseProgrammableVS();
     m_activeDrawCallState.usesPixelShader = m_parent->UseProgrammablePS();
 
@@ -3482,17 +3789,17 @@ namespace dxvk {
     // Ignore sky draw calls that are being drawn to a Raytraced Render Target
     // Raytraced Render Target scenes just use the same sky as the main scene, no need to duplicate them
     if (m_activeDrawCallState.isDrawingToRaytracedRenderTarget && m_activeDrawCallState.categories.test(InstanceCategories::Sky)) {
-      return prepareFlagsForIgnoredDraws;
+      return finishPrepare(prepareFlagsForIgnoredDraws);
     }
 
     assert(status == RtxGeometryStatus::RayTraced);
 
     const bool preserveOriginalDraw = needVertexCapture;
 
-    return
+    return finishPrepare(
       PrepareDrawFlag::CommitToRayTracing |
       (m_activeDrawCallState.testCategoryFlags(CATEGORIES_REQUIRE_DRAW_CALL_STATE) ? PrepareDrawFlag::ApplyDrawState : 0) |
-      (preserveOriginalDraw ? PrepareDrawFlag::PreserveDrawCallAndItsState : 0);
+      (preserveOriginalDraw ? PrepareDrawFlag::PreserveDrawCallAndItsState : 0));
   }
 
   void D3D9Rtx::triggerInjectRTX() {
@@ -4922,6 +5229,8 @@ namespace dxvk {
     m_parent->EmitCs([currentReflexFrameId, targetImage, callInjectRtx](DxvkContext* ctx) { 
       static_cast<RtxContext*>(ctx)->endFrame(currentReflexFrameId, targetImage, callInjectRtx); 
     });
+
+    pruneUe3StaticVertexCaptureCache();
 
     // Reset for the next frame
     m_rtxInjectTriggered = false;

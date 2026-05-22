@@ -2615,7 +2615,7 @@ namespace dxvk {
         cPrimCount = PrimitiveCount,
         cStartVertex = StartVertex,
         cInstanceCount = GetInstanceCount(),
-        cDrawCall = bool( drawPrepare & PrepareDrawFlag::OriginalDrawCall )
+        cDrawCall = bool(drawPrepare & PrepareDrawFlag::OriginalDrawCall)
       ](DxvkContext* ctx) {
         auto drawInfo = GenerateDrawInfo(cPrimType, cPrimCount, cInstanceCount);
 
@@ -2670,7 +2670,7 @@ namespace dxvk {
         cStartIndex = StartIndex,
         cBaseVertexIndex = BaseVertexIndex,
         cInstanceCount = GetInstanceCount(),
-        cDrawCall = bool( drawPrepare & PrepareDrawFlag::OriginalDrawCall )
+        cDrawCall = bool(drawPrepare & PrepareDrawFlag::OriginalDrawCall)
       ](DxvkContext* ctx) {
         auto drawInfo = GenerateDrawInfo(cPrimType, cPrimCount, cInstanceCount);
 
@@ -2732,7 +2732,7 @@ namespace dxvk {
         cPrimCount = PrimitiveCount,
         cInstanceCount = GetInstanceCount(),
         cStride = VertexStreamZeroStride,
-        cDrawCall = bool( drawPrepare & PrepareDrawFlag::OriginalDrawCall )
+        cDrawCall = bool(drawPrepare & PrepareDrawFlag::OriginalDrawCall)
       ](DxvkContext* ctx) {
         auto drawInfo = GenerateDrawInfo(cPrimType, cPrimCount, cInstanceCount);
 
@@ -2810,7 +2810,7 @@ namespace dxvk {
         cStride = VertexStreamZeroStride,
         cInstanceCount = GetInstanceCount(),
         cIndexType = DecodeIndexType(static_cast<D3D9Format>(IndexDataFormat)),
-        cDrawCall = bool( drawPrepare & PrepareDrawFlag::OriginalDrawCall )
+        cDrawCall = bool(drawPrepare & PrepareDrawFlag::OriginalDrawCall)
       ](DxvkContext* ctx) {
         auto drawInfo = GenerateDrawInfo(cPrimType, cPrimCount, cInstanceCount);
 

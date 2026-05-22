@@ -385,7 +385,7 @@ namespace dxvk
     return customTransform;
   }
 
-  const RtCamera::RtCameraSetting& RtCamera::getSetting() {
+  const RtCamera::RtCameraSetting& RtCamera::getSetting() const {
     return m_context;
   }
 
@@ -621,6 +621,19 @@ namespace dxvk
     m_context = setting;
 
     return update(frameIdx, setting.worldToView, setting.viewToProjection, setting.fov, setting.aspectRatio, setting.nearPlane, setting.farPlane, setting.isLHS, flags);
+  }
+
+  bool RtCamera::holdFrame(uint32_t frameIdx) {
+    return update(
+      frameIdx,
+      m_context.worldToView,
+      m_context.viewToProjection,
+      m_context.fov,
+      m_context.aspectRatio,
+      m_context.nearPlane,
+      m_context.farPlane,
+      m_context.isLHS,
+      m_context.flags);
   }
 
   bool RtCamera::update(

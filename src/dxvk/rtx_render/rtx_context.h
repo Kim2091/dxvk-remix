@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <chrono>
 #include <memory>
+#include <array>
 #include "rtx_options.h"
 
 struct VolumeArgs;
@@ -263,7 +264,6 @@ namespace dxvk {
     uint32_t m_terminateAppFrameNum = -1;
     uint32_t m_framesWithoutValidScene = 0;
     IntegrateIndirectMode m_prevIntegrateIndirectMode = IntegrateIndirectMode::Count;
-
     DxvkRaytracingInstanceState m_rtState;
 
     struct {

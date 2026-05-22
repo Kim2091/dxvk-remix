@@ -24,6 +24,7 @@
 #include <cassert>
 
 #include "dxvk_device.h"
+#include "dxvk_gpu_query.h"
 #include "dxvk_scoped_annotation.h"
 #include "rtx_shader_manager.h"
 #include "dxvk_adapter.h"
@@ -519,6 +520,7 @@ namespace dxvk {
       return;
     }
 
+    getSceneManager().getCameraManager().finalizeFrameCameras();
     const bool isCameraValid = getSceneManager().getCameraManager().isCameraValid(CameraType::Main);
     if (!isCameraValid) {
       ONCE(Logger::info(str::format("[RTX-Compatibility-Info] Trying to raytrace but not detecting a valid camera.")));
@@ -621,7 +623,7 @@ namespace dxvk {
 
       // Update all the GPU buffers needed to describe the scene
       getSceneManager().prepareSceneData(this, m_execBarriers);
-      
+
       // If we really don't have any RT to do, just bail early (could be UI/menus rendering)
       if (getSceneManager().getSurfaceBuffer() != nullptr) {
 
@@ -692,6 +694,7 @@ namespace dxvk {
         }
 
         getCommonObjects()->getTextureManager().copySamplerFeedbackToHost(this);
+
         dispatchObjectPicking(rtOutput, downscaledExtent, targetImage->info().extent);
 
         // Upscaling if DLSS/NIS enabled, or the Composition Pass will do upscaling
@@ -726,6 +729,7 @@ namespace dxvk {
         dust.simulateAndDraw(this, m_state, rtOutput);
 
         dispatchBloom(rtOutput);
+
         dispatchPostFx(rtOutput);
 
         // Tone mapping
