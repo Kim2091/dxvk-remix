@@ -287,19 +287,6 @@ struct name##Data {                                                             
     return m_isTangentSpaceNormalOverride;                                                           \
   }                                                                                                  \
                                                                                                      \
-  /* Fork: per-material flag for Bethesda DXT5n convention -- spec in NormalMap.alpha.  */          \
-  /* See OPAQUE_SURFACE_MATERIAL_FLAG_ROUGHNESS_FROM_NORMAL_ALPHA. Set by               */          \
-  /* LegacyMaterialData::as<OpaqueMaterialData>() on the FNV PS-classifier path when   */          \
-  /* the captured normal carries the spec-in-alpha convention. Replacement assets      */          \
-  /* leave it false. Meaningful only on opaque materials.                              */          \
-  void setIsRoughnessFromNormalAlphaOverride(const bool isRoughnessFromNormalAlpha) {                \
-    m_isRoughnessFromNormalAlphaOverride = isRoughnessFromNormalAlpha;                               \
-  }                                                                                                  \
-                                                                                                     \
-  const bool getIsRoughnessFromNormalAlphaOverride() const {                                         \
-    return m_isRoughnessFromNormalAlphaOverride;                                                     \
-  }                                                                                                  \
-                                                                                                     \
 private:                                                                                             \
                                                                                                      \
   struct Ranges {                                                                                    \
@@ -335,7 +322,6 @@ private:                                                                        
   Rc<DxvkSampler> m_samplerOverride = nullptr;                                                       \
   bool m_ignoreAlphaChannelOverride = false;                                                         \
   bool m_isTangentSpaceNormalOverride = false;                                                       \
-  bool m_isRoughnessFromNormalAlphaOverride = false;                                                 \
 };
 
 namespace dxvk {

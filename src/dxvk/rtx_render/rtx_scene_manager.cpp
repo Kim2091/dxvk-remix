@@ -1341,13 +1341,11 @@ namespace dxvk {
         subsurfaceMaterialIndex = m_surfaceMaterialExtensionCache.track(subsurfaceMaterial);
       }
 
-      // Fork: pass through the per-material RGB-tangent-space normal flag and the
-      // DXT5n spec-in-normal-alpha flag set by LegacyMaterialData::as<OpaqueMaterialData>()
-      // on the FNV PS-classifier path. Both are encoded into the GPU surface material's
-      // flags word (see writeGPUData) and consumed by the corresponding branches in
-      // opaque_surface_material_interaction.slangh.
-      const bool isTangentSpaceNormal      = opaqueMaterialData.getIsTangentSpaceNormalOverride();
-      const bool isRoughnessFromNormalAlpha = opaqueMaterialData.getIsRoughnessFromNormalAlphaOverride();
+      // Fork: pass through the per-material RGB-tangent-space normal flag set by
+      // LegacyMaterialData::as<OpaqueMaterialData>() on the FNV PS-classifier path.
+      // Encoded into the GPU surface material's flags word (see writeGPUData) and
+      // consumed by opaque_surface_material_interaction.slangh's normal-decode branch.
+      const bool isTangentSpaceNormal = opaqueMaterialData.getIsTangentSpaceNormalOverride();
 
       const RtOpaqueSurfaceMaterial opaqueSurfaceMaterial{
         albedoOpacityTextureIndex, normalTextureIndex,
@@ -1362,8 +1360,7 @@ namespace dxvk {
         subsurfaceMaterialIndex, isUsingRaytracedRenderTarget,
         samplerFeedbackStamp,
         secondaryTextureIndex,
-        isTangentSpaceNormal,
-        isRoughnessFromNormalAlpha
+        isTangentSpaceNormal
       };
 
       if (opaqueSurfaceMaterial.hasValidDisplacement()) {

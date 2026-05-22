@@ -526,14 +526,6 @@ struct LegacyMaterialDefaults {
              "material's emissive-color channel and emission is enabled. Intensity follows the "
              "existing rtx.legacyMaterial.emissiveIntensity and rtx.emissiveIntensity controls. "
              "Set to false to leave glow textures unwired. Replacement assets bypass this path.");
-  RTX_OPTION("rtx.legacyMaterial.fnv", bool, autoRoughnessFromSpecular, true,
-             "Follows the Bethesda/Gamebryo DXT5n convention: when a normal map is captured on the "
-             "FNV PS-classifier path, the shader treats the NormalMap's alpha channel as packed "
-             "specular intensity and derives perceptual roughness via `roughness = 1.0 - normalSample.a`. "
-             "Overrides the legacy roughness constant and any roughness texture on captured materials. "
-             "The downstream rtx.roughnessScale / rtx.roughnessBias multipliers still apply for in-menu "
-             "tuning. Set to false to leave roughness on the legacy-constant path. Replacement assets "
-             "bypass this entirely.");
   RTX_OPTION("rtx.legacyMaterial.fnv", bool, autoHeightMap, true,
              "When the FNV PS-classifier protocol identifies a height-map sampler on the bound pixel "
              "shader (RS 149 nibble bits 12-15), the captured height texture is routed into the opaque "
@@ -582,8 +574,7 @@ struct RtOpaqueSurfaceMaterial {
     uint32_t subsurfaceMaterialIndex, bool isRaytracedRenderTarget,
     uint16_t samplerFeedbackStamp,
     uint32_t secondaryTextureIndex = 0,
-    bool isTangentSpaceNormal = false,
-    bool isRoughnessFromNormalAlpha = false
+    bool isTangentSpaceNormal = false
   ) :
     m_albedoOpacityTextureIndex{ albedoOpacityTextureIndex }, m_secondaryTextureIndex{secondaryTextureIndex}, m_normalTextureIndex{ normalTextureIndex },
     m_tangentTextureIndex { tangentTextureIndex }, m_heightTextureIndex { heightTextureIndex }, m_roughnessTextureIndex{ roughnessTextureIndex },
@@ -596,7 +587,6 @@ struct RtOpaqueSurfaceMaterial {
     m_thinFilmThicknessConstant { thinFilmThicknessConstant }, m_samplerIndex{ samplerIndex }, m_displaceIn{ displaceIn },
     m_displaceOut{ displaceOut }, m_subsurfaceMaterialIndex(subsurfaceMaterialIndex), m_isRaytracedRenderTarget(isRaytracedRenderTarget),
     m_isTangentSpaceNormal(isTangentSpaceNormal),
-    m_isRoughnessFromNormalAlpha(isRoughnessFromNormalAlpha),
     m_samplerFeedbackStamp{ samplerFeedbackStamp }
   {
     updateCachedData();
@@ -635,14 +625,6 @@ struct RtOpaqueSurfaceMaterial {
     // shader branches on this bit to pick the decode path.
     if (m_isTangentSpaceNormal) {
       flags |= OPAQUE_SURFACE_MATERIAL_FLAG_TANGENT_SPACE_NORMAL;
-    }
-
-    // Fork: same materials follow the Bethesda DXT5n convention (specular intensity in
-    // the NormalMap's alpha channel). The shader derives perceptual roughness from
-    // `normalSample.a` when this bit is set, overriding the legacy roughness constant
-    // and any roughness texture.
-    if (m_isRoughnessFromNormalAlpha) {
-      flags |= OPAQUE_SURFACE_MATERIAL_FLAG_ROUGHNESS_FROM_NORMAL_ALPHA;
     }
 
     float displaceIn = m_displaceIn * getDisplacementInFactor();
@@ -815,7 +797,7 @@ struct RtOpaqueSurfaceMaterial {
 private:
   void updateCachedHash() {
     static_assert(
-      sizeof(*this) == 128,
+      sizeof(*this) == 120,
       "add new member for hashing if needed: add a MEMBER into the struct + add a VALUE into the list-init"
     );
     struct HashStruct {
@@ -843,7 +825,6 @@ private:
       uint32_t subsurfaceMaterialIndex;
       uint32_t isRaytracedRenderTarget;   // NOTE: uint32_t to avoid padding
       uint32_t isTangentSpaceNormal;      // NOTE: uint32_t to avoid padding (fork)
-      uint32_t isRoughnessFromNormalAlpha; // NOTE: uint32_t to avoid padding (fork)
       uint32_t samplerFeedbackStamp;      // NOTE: uint32_t to avoid padding
       uint32_t secondaryTextureIndex;
       // NOTE: There must be NO padding between members, as the struct is used for hashing
@@ -874,7 +855,6 @@ private:
       m_subsurfaceMaterialIndex,
       m_isRaytracedRenderTarget,
       m_isTangentSpaceNormal,
-      m_isRoughnessFromNormalAlpha,
       m_samplerFeedbackStamp,
       m_secondaryTextureIndex,
     };
@@ -925,15 +905,10 @@ private:
   uint32_t m_subsurfaceMaterialIndex;
 
   bool m_isRaytracedRenderTarget;
-  // Fork: see OPAQUE_SURFACE_MATERIAL_FLAG_TANGENT_SPACE_NORMAL. Slotted here so it
-  // pairs with m_isRaytracedRenderTarget inside the natural alignment slot before the
-  // uint16_t that follows.
+  // Fork: see OPAQUE_SURFACE_MATERIAL_FLAG_TANGENT_SPACE_NORMAL. Slot here keeps the
+  // struct size stable (packs into the 2 bytes before m_samplerFeedbackStamp's uint16_t
+  // alignment slot), so the sizeof static_assert in updateCachedHash still holds.
   bool m_isTangentSpaceNormal;
-  // Fork: see OPAQUE_SURFACE_MATERIAL_FLAG_ROUGHNESS_FROM_NORMAL_ALPHA. Adding this
-  // third bool here grows the struct by 8 bytes (one byte plus alignment-fill before
-  // the uint64_t cachedHash); the sizeof static_assert in updateCachedHash is bumped
-  // from 120 to 128 to match.
-  bool m_isRoughnessFromNormalAlpha;
 
   uint16_t m_samplerFeedbackStamp;
 

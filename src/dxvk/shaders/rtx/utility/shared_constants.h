@@ -49,13 +49,6 @@ static const uint8_t surfaceMaterialTypeMask = uint8_t(0x3u);
 // to read the texture as RGB tangent-space ([0,1] unsigned snorm in .rgb) instead of
 // Remix's native octahedral encoding.
 #define OPAQUE_SURFACE_MATERIAL_FLAG_TANGENT_SPACE_NORMAL (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(5))
-// Fork: set on legacy materials following the Bethesda/Gamebryo DXT5n convention --
-// specular intensity packed into the alpha channel of the NormalMap. Tells the
-// roughness load in opaque_surface_material_interaction.slangh to override the
-// roughness texture path with `roughness = 1.0 - normalSample.a`. Implies (and only
-// makes sense alongside) OPAQUE_SURFACE_MATERIAL_FLAG_TANGENT_SPACE_NORMAL since both
-// fire on the same FNV PS-classifier capture path.
-#define OPAQUE_SURFACE_MATERIAL_FLAG_ROUGHNESS_FROM_NORMAL_ALPHA (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(6))
 
 
 #define OPAQUE_SURFACE_MATERIAL_INTERACTION_FLAG_HAS_HEIGHT_TEXTURE (1 << 0)

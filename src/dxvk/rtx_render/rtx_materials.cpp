@@ -94,14 +94,6 @@ template<> OpaqueMaterialData LegacyMaterialData::as() const {
     if (LegacyMaterialDefaults::autoNormalTangentSpace()) {
       opaqueMat.setIsTangentSpaceNormalOverride(true);
     }
-    // Fork: Bethesda DXT5n convention -- the same NormalMap's alpha channel encodes
-    // specular intensity. The shader derives `roughness = 1.0 - normalSample.a`.
-    // Gated separately from the tangent-space flag so a user can keep the normal
-    // decode but disable the spec-as-roughness inversion if a USD replacement
-    // provides its own roughness map.
-    if (LegacyMaterialDefaults::autoRoughnessFromSpecular()) {
-      opaqueMat.setIsRoughnessFromNormalAlphaOverride(true);
-    }
   } else if (getColorTexture2().isValid()) {
     opaqueMat.setSecondaryTexture(getColorTexture2());
   }
