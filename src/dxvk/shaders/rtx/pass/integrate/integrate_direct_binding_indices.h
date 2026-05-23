@@ -72,7 +72,7 @@
 
 #define INTEGRATE_DIRECT_BINDING_NEE_CACHE_SAMPLE                                   72
 
-#define INTEGRATE_DIRECT_BINDING_PRIMARY_CLOUD_SHADOW_FACTOR_OUTPUT                 73
+#define INTEGRATE_DIRECT_BINDING_PRIMARY_CLOUD_SHADOW_FACTOR_OUTPUT                 74
 
 // Aliased Inputs/Outputs 
 
