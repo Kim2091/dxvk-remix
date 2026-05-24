@@ -689,13 +689,94 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
 
 #endif
 
+  // Fork: FNV multi-layer terrain blend. When OPAQUE_SURFACE_MATERIAL_FLAG_MULTI_LAYER_TERRAIN
+  // is set on the opaque material, the bound `multiLayerTerrainIndex` points at a
+  // MultiLayerTerrainMaterial entry in surfaceMaterialExtensions[] holding N (1..7)
+  // albedo + N normal texture indices for the layered terrain draw. Sample all N
+  // albedos + normals at the hit point and blend by the seven per-vertex weight
+  // channels carried on vertexColor (color0.rgb) + vertexColor1 (color1.rgba). The
+  // blended albedo replaces the standard single-texture albedo BEFORE the FFP
+  // chooseTextureArgument block; the blended tangent-space normal is captured here
+  // and applied AFTER the standard normalLoaded decode block below (so it overrides
+  // whatever single-texture normal the standard path produced).
+  //
+  // Per-layer BaseMap[i] / NormalMap[i] hashes resolve through the normal texture-
+  // cache flow on the wrapper side, so per-layer replacements compose with the
+  // blend math transparently. The wrapper is "loud-fail" -- a draw that doesn't
+  // satisfy the multi-layer protocol gets the Ignore category instead of this flag,
+  // so the shader can trust layerCount and all referenced texture indices.
+  bool useMultiLayerBlend = false;
+  vec3 multiLayerTangentNormal = vec3(0.0f, 0.0f, 1.0f);
+  if ((opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_MULTI_LAYER_TERRAIN) &&
+      opaqueSurfaceMaterial.multiLayerTerrainIndex != BINDING_INDEX_INVALID)
+  {
+    // Pack the seven per-vertex weight channels into a flat array for the loop.
+    // Weights 0..2 come from vertexColor (color0.rgb); 3..6 from vertexColor1
+    // (color1.rgba). color0.a is reserved for other uses (see Task 7).
+    float layerWeights[7] = {
+      surfaceInteraction.vertexColor.r,
+      surfaceInteraction.vertexColor.g,
+      surfaceInteraction.vertexColor.b,
+      surfaceInteraction.vertexColor1.r,
+      surfaceInteraction.vertexColor1.g,
+      surfaceInteraction.vertexColor1.b,
+      surfaceInteraction.vertexColor1.a,
+    };
+
+    const MemoryPolymorphicSurfaceMaterial memoryMultiLayerEntry =
+      surfaceMaterialExtensions[opaqueSurfaceMaterial.multiLayerTerrainIndex];
+    const MultiLayerTerrainMaterial multiLayer = reinterpret<MultiLayerTerrainMaterial>(memoryMultiLayerEntry);
+
+    const uint layerCount = uint(multiLayer.layerCount);
+
+    vec3 blendedAlbedo = vec3(0.0f);
+    vec3 blendedTangentNormal = vec3(0.0f);
+
+    for (uint i = 0u; i < layerCount; i++)
+    {
+      const uint16_t albedoTexIdx = multiLayer.albedoTextureIndices[i];
+      const uint16_t normalTexIdx = multiLayer.normalTextureIndices[i];
+
+      vec4 layerAlbedoSample = vec4(0.0f);
+      vec4 layerNormalSample = vec4(0.0f);
+      surfaceMaterialInteractionTextureReadHelper(albedoTexIdx, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, layerAlbedoSample);
+      surfaceMaterialInteractionTextureReadHelper(normalTexIdx, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, layerNormalSample);
+
+      // Tangent-space normal decode matches the FNV PS-classifier protocol path
+      // (legacy RGB tangent-space normal, X/Y/Z packed in .rgb as [0,1] unsigned
+      // snorm). The downstream hemisphere clamp + normalization happens once on
+      // the accumulated blend below.
+      const vec3 layerTangentNormal = layerNormalSample.xyz * 2.0f - 1.0f;
+
+      blendedAlbedo += layerAlbedoSample.rgb * layerWeights[i];
+      blendedTangentNormal += layerTangentNormal * layerWeights[i];
+    }
+
+    // Override the standard single-texture albedo. The FFP texture-stage block
+    // below still runs; for multi-layer terrain the wrapper is expected to set
+    // texture-stage state such that the FFP block is a no-op for this surface
+    // (vertex colors are the layer weights, NOT a per-pixel tint).
+    albedo = blendedAlbedo;
+
+    // Match the offline LightspeedOctahedralConverter hemisphere convention used
+    // by the standard TANGENT_SPACE_NORMAL decode below. Defer the world-space
+    // transform to the standard normalLoaded path so denoiser disocclusion +
+    // baked-terrain sanitization stay consistent.
+    blendedTangentNormal.z = abs(blendedTangentNormal.z);
+    const float blendedNormalLen = length(blendedTangentNormal);
+    multiLayerTangentNormal = blendedNormalLen > 1e-5f
+      ? blendedTangentNormal / blendedNormalLen
+      : vec3(0.0f, 0.0f, 1.0f);  // Geometric-normal fallback when all weights are zero (degenerate vertex coloring)
+    useMultiLayerBlend = true;
+  }
+
   vec4 tFactor = unorm4x8ToFloat4x32(surface.tFactor).bgra;
 
   // WAR for REMIX-1573: texture ops for opacity should happen during baking and be skipped here for baked terrain,
   // but right now the opacity is not 1 in the baked texture where it is expected to be and thus texture ops
-  // are required to blend the layer contributions properly 
+  // are required to blend the layer contributions properly
 #if 0
-  if (applyTextureOperations) 
+  if (applyTextureOperations)
 #endif
   {
     if (surface.isVertexColorBakedLighting) {
@@ -712,23 +793,36 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
 
     // Fixed function texture stage setting
     vec3 textureArg1 = vec3(1.0), textureArg2 = vec3(1.0);
-    chooseTextureArgument(textureArg1, surface.textureColorArg1Source, albedo, surfaceInteraction.vertexColor.rgb, tFactor.rgb, vec3(1.0));
-    chooseTextureArgument(textureArg2, surface.textureColorArg2Source, albedo, surfaceInteraction.vertexColor.rgb, tFactor.rgb, vec3(1.0));
-    chooseTextureOperationColor(albedo, surface.textureColorOperation, textureArg1, textureArg2);
-    if (surface.isTextureFactorBlend) {
-      albedo *= tFactor.rgb;
+    // Fork: For multi-layer terrain hits, the FFP color/emissive blocks below would
+    // modulate the blended albedo by vertexColor.rgb -- but vertexColor for these
+    // draws encodes the layer WEIGHTS, not a lighting tint. Multiplying again would
+    // square the first 3 weights into the result. Skip the FFP color path entirely
+    // when multi-layer is active; the blended albedo computed above is already final.
+    // The alpha block (`calcOpaqueSurfaceMaterialOpacity`) still runs because
+    // multi-layer terrain inherits the parent material's opacity rules.
+    if (!useMultiLayerBlend) {
+      chooseTextureArgument(textureArg1, surface.textureColorArg1Source, albedo, surfaceInteraction.vertexColor.rgb, tFactor.rgb, vec3(1.0));
+      chooseTextureArgument(textureArg2, surface.textureColorArg2Source, albedo, surfaceInteraction.vertexColor.rgb, tFactor.rgb, vec3(1.0));
+      chooseTextureOperationColor(albedo, surface.textureColorOperation, textureArg1, textureArg2);
+      if (surface.isTextureFactorBlend) {
+        albedo *= tFactor.rgb;
+      }
     }
 
     // Fixed function texture stage setting (emissive)
-    chooseTextureArgument(textureArg1, surface.textureColorArg1Source, emissiveColor, surfaceInteraction.vertexColor.rgb, tFactor.rgb, vec3(1.0));
-    chooseTextureArgument(textureArg2, surface.textureColorArg2Source, emissiveColor, surfaceInteraction.vertexColor.rgb, tFactor.rgb, vec3(1.0));
-    chooseTextureOperationColor(emissiveColor, surface.textureColorOperation, textureArg1, textureArg2);
-    if (surface.isTextureFactorBlend) {
-      emissiveColor *= tFactor.rgb;
+    if (!useMultiLayerBlend) {
+      chooseTextureArgument(textureArg1, surface.textureColorArg1Source, emissiveColor, surfaceInteraction.vertexColor.rgb, tFactor.rgb, vec3(1.0));
+      chooseTextureArgument(textureArg2, surface.textureColorArg2Source, emissiveColor, surfaceInteraction.vertexColor.rgb, tFactor.rgb, vec3(1.0));
+      chooseTextureOperationColor(emissiveColor, surface.textureColorOperation, textureArg1, textureArg2);
+      if (surface.isTextureFactorBlend) {
+        emissiveColor *= tFactor.rgb;
+      }
     }
-    
+
     // Adjust opacity via texture operations.
     // Fixed function texture stage state for alpha channel
+    // (Alpha block runs unconditionally -- multi-layer terrain still needs
+    // calcOpaqueSurfaceMaterialOpacity to land for the parent material's opacity rules.)
 
     float textureAlphaArg1, textureAlphaArg2;
     chooseTextureArgument(textureAlphaArg1, surface.textureAlphaArg1Source, opacity, surfaceInteraction.vertexColor.a, tFactor.a, opacity);
@@ -821,15 +915,27 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
     if (secondNormalLoaded)
     {
       vec3 tangentNormal2 = unsignedOctahedralToHemisphereDirection(vec2(secondNormalSample.xy), cb.opaqueMaterialArgs.normalIntensity);
-      
+
       tangentNormal2 = normalBlendRNM(tangentNormal2, tangentNormal);
       normal = normalize(mul(tangentToWorld, tangentNormal2));
 
     }
   }
-  
+
+  // Fork: FNV multi-layer terrain normal override. The standard single-texture
+  // normal path above has been consumed; replace the world-space `normal` and
+  // `normalDetail` with the weight-blended N-way tangent normal captured before
+  // the FFP block. Runs whether or not `normalLoaded` was true on the standard
+  // slot -- the multi-layer entry carries its own per-layer normal indices.
+  if (useMultiLayerBlend)
+  {
+    const f16mat3 tangentToWorld = transpose(worldToTangent);
+    normal = normalize(mul(tangentToWorld, multiLayerTangentNormal));
+    normalDetail = 1.0f - multiLayerTangentNormal.z;
+  }
+
 #if defined(RAY_TRACING_PRIMARY_RAY)
-  if (cb.debugView == DEBUG_VIEW_OPAQUE_NORMAL_RESOLUTION_CHECKERS) 
+  if (cb.debugView == DEBUG_VIEW_OPAQUE_NORMAL_RESOLUTION_CHECKERS)
   {
     storeColorOverlayedWithTextureResolutionCheckersInDebugView(normal, opaqueSurfaceMaterial.normalTextureIndex, surfaceInteraction);
   }

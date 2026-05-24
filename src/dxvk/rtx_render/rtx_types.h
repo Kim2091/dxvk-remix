@@ -291,6 +291,7 @@ struct RaytraceGeometry {
   RaytraceBuffer normalBuffer;
   RaytraceBuffer texcoordBuffer;
   RaytraceBuffer color0Buffer;
+  RaytraceBuffer color1Buffer;
   RaytraceBuffer indexBuffer;
 
   uint32_t positionBufferIndex = kSurfaceInvalidBufferIndex;
@@ -298,6 +299,7 @@ struct RaytraceGeometry {
   uint32_t normalBufferIndex = kSurfaceInvalidBufferIndex;
   uint32_t texcoordBufferIndex = kSurfaceInvalidBufferIndex;
   uint32_t color0BufferIndex = kSurfaceInvalidBufferIndex;
+  uint32_t color1BufferIndex = kSurfaceInvalidBufferIndex;
   uint32_t indexBufferIndex = kSurfaceInvalidBufferIndex;
 
   Rc<DxvkBuffer> historyBuffer[2] = {nullptr};
@@ -306,6 +308,12 @@ struct RaytraceGeometry {
   // Set to true after the smooth normals compute pass has been applied to this geometry.
   // Used to avoid redundant recomputation on subsequent frames for static geometry.
   bool smoothNormalsApplied = false;
+
+  // Fork: FNV multi-layer terrain emits per-vertex blend weights as FLOAT4 streams
+  // (COLOR0 for layers 0-2, synthetic COLOR1 for layers 3-6). When this flag is
+  // set the interleaver writes 4 floats per color slot and the hit-side surface
+  // decoder reads them back as raw floats instead of decoding BGRA8.
+  bool hasMultiLayerTerrainWeights = false;
 
   bool usesIndices() const { 
     return indexBuffer.defined();
@@ -343,9 +351,18 @@ struct RasterGeometry {
   RasterBuffer normalBuffer;
   RasterBuffer texcoordBuffer;
   RasterBuffer color0Buffer;
+  RasterBuffer color1Buffer;
   RasterBuffer indexBuffer;
   RasterBuffer blendWeightBuffer;
   RasterBuffer blendIndicesBuffer;
+
+  // Fork: When true, color0Buffer / color1Buffer carry FNV's multi-layer-terrain
+  // FLOAT4 blend weights (layers 0-2 in COLOR0, layers 3-6 in synthetic COLOR1
+  // from TEXCOORD1). The interleaver writes 4 floats per slot and the hit-side
+  // decoder reads them back as raw floats; otherwise the existing BGRA8 path
+  // runs unchanged. Set by d3d9_rtx.cpp when kRemixMultiLayerTerrainBit is set
+  // on materialData.remixModifierFromD3D.
+  bool hasMultiLayerTerrainWeights = false;
 
   AxisAlignedBoundingBox boundingBox;
   Future<AxisAlignedBoundingBox> futureBoundingBox;
@@ -391,6 +408,9 @@ struct RasterGeometry {
     if (color0Buffer.defined() && (!positionBuffer.matches(color0Buffer) || positionBuffer.stride() != color0Buffer.stride()))
       return false;
 
+    if (color1Buffer.defined() && (!positionBuffer.matches(color1Buffer) || positionBuffer.stride() != color1Buffer.stride()))
+      return false;
+
     return true;
   }
 
@@ -407,6 +427,9 @@ struct RasterGeometry {
       return false;
 
     if (color0Buffer.defined() && (color0Buffer.vertexFormat() != VK_FORMAT_B8G8R8A8_UNORM))
+      return false;
+
+    if (color1Buffer.defined() && (color1Buffer.vertexFormat() != VK_FORMAT_B8G8R8A8_UNORM))
       return false;
 
     return true;
@@ -472,6 +495,9 @@ struct GeometryBufferData {
   uint32_t* vertexColorData;
   size_t vertexColorStride;
 
+  uint32_t* vertexColor1Data;
+  size_t vertexColor1Stride;
+
   GeometryBufferData(const RasterGeometry& geometryData) {
     if (geometryData.indexBuffer.defined()) {
       constexpr size_t indexSize = sizeof(uint16_t);
@@ -521,6 +547,15 @@ struct GeometryBufferData {
     } else {
       vertexColorStride = 0;
       vertexColorData = nullptr;
+    }
+
+    if (geometryData.color1Buffer.defined()) {
+      constexpr size_t colorSubElementSize = sizeof(std::uint32_t);
+      vertexColor1Stride = geometryData.color1Buffer.stride() / colorSubElementSize;
+      vertexColor1Data = (uint32_t*) geometryData.color1Buffer.mapPtr((size_t) geometryData.color1Buffer.offsetFromSlice());
+    } else {
+      vertexColor1Stride = 0;
+      vertexColor1Data = nullptr;
     }
   }
 

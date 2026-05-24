@@ -118,6 +118,9 @@ struct RtSurface {
     uint16_t flags0 = 0;
     flags0 |= normalFormat == VK_FORMAT_R32_UINT ? 1 : 0;
     flags0 |= isVertexColorBakedLighting ? (1 << 1) : 0;
+    flags0 |= hasColor1 ? (1 << 2) : 0;
+    // Fork: FNV multi-layer-terrain FLOAT4-weight decode flag (Surface::hasMultiLayerWeights).
+    flags0 |= hasMultiLayerWeights ? (1 << 3) : 0;
     // NOTE: Spare flags bits here
 
     writeGPUHelper(data, offset, flags0);
@@ -334,6 +337,15 @@ struct RtSurface {
   bool isClipPlaneEnabled = false;
   bool isTextureFactorBlend = false;
   bool isVertexColorBakedLighting = true;
+  // Fork: True when the geometry's interleaved buffer carries a second vertex color
+  // channel (COLOR1) directly after color0 in the per-vertex stride. Consumed by
+  // surface_interaction.slangh to populate surfaceInteraction.vertexColor1.
+  bool hasColor1 = false;
+  // Fork: FNV multi-layer terrain stores per-vertex blend weights as raw FLOAT4
+  // streams in both color0 and color1 interleaved slots (16 bytes each instead
+  // of 4 bytes for a packed BGRA8). When set the hit-side surface decoder reads
+  // them as raw floats; otherwise the existing BGRA8 path runs unchanged.
+  bool hasMultiLayerWeights = false;
   bool isMotionBlurMaskOut = false;
   bool skipSurfaceInteractionSpritesheetAdjustment = false;
   bool ignoreTransparencyLayer = false;
@@ -554,6 +566,10 @@ enum class RtSurfaceMaterialType {
 
   // Extensions
   Subsurface,
+  // Fork: FNV multi-layer terrain side-load extension (see
+  // RtMultiLayerTerrainMaterial). Lives in m_surfaceMaterialExtensionCache
+  // alongside Subsurface entries.
+  MultiLayerTerrain,
 
   Count
 };
@@ -571,7 +587,12 @@ struct RtOpaqueSurfaceMaterial {
     const Vector3& emissiveColorConstant, bool enableEmission,
     bool ignoreAlphaChannel, bool enableThinFilm, bool alphaIsThinFilmThickness, float thinFilmThicknessConstant,
     uint32_t samplerIndex, float displaceIn, float displaceOut,
-    uint32_t subsurfaceMaterialIndex, bool isRaytracedRenderTarget,
+    uint32_t subsurfaceMaterialIndex,
+    // Fork: aux-index into the surface-material extension cache pointing at the
+    // RtMultiLayerTerrainMaterial entry that holds this material's per-layer
+    // texture indices. SURFACE_INDEX_INVALID for materials that aren't FNV
+    // multi-layer terrain. See OPAQUE_SURFACE_MATERIAL_FLAG_MULTI_LAYER_TERRAIN.
+    uint32_t multiLayerTerrainIndex, bool isRaytracedRenderTarget,
     uint16_t samplerFeedbackStamp,
     uint32_t secondaryTextureIndex = 0,
     bool isTangentSpaceNormal = false
@@ -585,7 +606,9 @@ struct RtOpaqueSurfaceMaterial {
     m_emissiveColorConstant{ emissiveColorConstant }, m_enableEmission{ enableEmission },
     m_ignoreAlphaChannel { ignoreAlphaChannel }, m_enableThinFilm { enableThinFilm }, m_alphaIsThinFilmThickness { alphaIsThinFilmThickness },
     m_thinFilmThicknessConstant { thinFilmThicknessConstant }, m_samplerIndex{ samplerIndex }, m_displaceIn{ displaceIn },
-    m_displaceOut{ displaceOut }, m_subsurfaceMaterialIndex(subsurfaceMaterialIndex), m_isRaytracedRenderTarget(isRaytracedRenderTarget),
+    m_displaceOut{ displaceOut }, m_subsurfaceMaterialIndex(subsurfaceMaterialIndex),
+    m_multiLayerTerrainIndex(multiLayerTerrainIndex),
+    m_isRaytracedRenderTarget(isRaytracedRenderTarget),
     m_isTangentSpaceNormal(isTangentSpaceNormal),
     m_samplerFeedbackStamp{ samplerFeedbackStamp }
   {
@@ -627,6 +650,15 @@ struct RtOpaqueSurfaceMaterial {
       flags |= OPAQUE_SURFACE_MATERIAL_FLAG_TANGENT_SPACE_NORMAL;
     }
 
+    // Fork: materials produced from FNV multi-layer terrain captures carry a non-
+    // sentinel aux index into the surface-material extension cache, where an
+    // RtMultiLayerTerrainMaterial entry holds the per-layer texture indices. The
+    // shader reads that entry via m_multiLayerTerrainIndex when this flag is set.
+    // No separate bool field -- infer from the index sentinel directly.
+    if (m_multiLayerTerrainIndex != SURFACE_INDEX_INVALID) {
+      flags |= OPAQUE_SURFACE_MATERIAL_FLAG_MULTI_LAYER_TERRAIN;
+    }
+
     float displaceIn = m_displaceIn * getDisplacementInFactor();
     float displaceOut = m_displaceOut * getDisplacementOutFactor();
     uint32_t heightTextureIndex = m_heightTextureIndex;
@@ -642,6 +674,7 @@ struct RtOpaqueSurfaceMaterial {
     assert(displaceOut <= FLOAT16_MAX);
 
     assert(m_subsurfaceMaterialIndex <= SURFACE_INDEX_MAX_VALUE);
+    assert(m_multiLayerTerrainIndex <= SURFACE_INDEX_MAX_VALUE);
 
     // data[0 - 3]
     writeGPUHelper(data, offset, flags);
@@ -686,7 +719,19 @@ struct RtOpaqueSurfaceMaterial {
     // data[26]
     writeGPUHelperExplicit<2>(data, offset, m_samplerFeedbackStamp);
 
-    writeGPUPadding<10>(data, offset);
+    // data[27]: Fork -- multi-layer-terrain aux index packed as uint16. The
+    // C++ side stores SURFACE_INDEX_INVALID (0x001FFFFFu) as the "no entry"
+    // sentinel; map that to 0xFFFFu on the GPU side (matches the convention
+    // used by every other uint16 texture-index slot in this struct). For valid
+    // entries the cache index fits in 16 bits for any practical FNV scene
+    // (subsurface uses the same 21-bit range but writes uint32, see data[24-25]).
+    const uint16_t multiLayerTerrainIndex16 =
+      (m_multiLayerTerrainIndex == SURFACE_INDEX_INVALID)
+        ? kSurfaceMaterialInvalidTextureIndex
+        : static_cast<uint16_t>(m_multiLayerTerrainIndex);
+    writeGPUHelperExplicit<2>(data, offset, multiLayerTerrainIndex16);
+
+    writeGPUPadding<8>(data, offset);
     assert(offset - oldOffset == kSurfaceMaterialGPUSize);
   }
 
@@ -778,6 +823,10 @@ struct RtOpaqueSurfaceMaterial {
     return m_subsurfaceMaterialIndex;
   }
 
+  uint32_t getMultiLayerTerrainIndex() const {
+    return m_multiLayerTerrainIndex;
+  }
+
   uint32_t getIsRaytracedRenderTarget() const {
     return m_isRaytracedRenderTarget;
   }
@@ -797,7 +846,7 @@ struct RtOpaqueSurfaceMaterial {
 private:
   void updateCachedHash() {
     static_assert(
-      sizeof(*this) == 120,
+      sizeof(*this) == 128,
       "add new member for hashing if needed: add a MEMBER into the struct + add a VALUE into the list-init"
     );
     struct HashStruct {
@@ -823,6 +872,7 @@ private:
       float displaceIn;
       float displaceOut;
       uint32_t subsurfaceMaterialIndex;
+      uint32_t multiLayerTerrainIndex;    // fork: FNV multi-layer terrain aux index
       uint32_t isRaytracedRenderTarget;   // NOTE: uint32_t to avoid padding
       uint32_t isTangentSpaceNormal;      // NOTE: uint32_t to avoid padding (fork)
       uint32_t samplerFeedbackStamp;      // NOTE: uint32_t to avoid padding
@@ -853,6 +903,7 @@ private:
       m_displaceIn,
       m_displaceOut,
       m_subsurfaceMaterialIndex,
+      m_multiLayerTerrainIndex,
       m_isRaytracedRenderTarget,
       m_isTangentSpaceNormal,
       m_samplerFeedbackStamp,
@@ -903,6 +954,10 @@ private:
   float m_displaceOut;
 
   uint32_t m_subsurfaceMaterialIndex;
+  // Fork: aux-index into m_surfaceMaterialExtensionCache pointing at the
+  // RtMultiLayerTerrainMaterial entry that holds this material's per-layer
+  // texture indices. SURFACE_INDEX_INVALID for non-multi-layer-terrain materials.
+  uint32_t m_multiLayerTerrainIndex;
 
   bool m_isRaytracedRenderTarget;
   // Fork: see OPAQUE_SURFACE_MATERIAL_FLAG_TANGENT_SPACE_NORMAL. Slot here keeps the
@@ -1443,6 +1498,127 @@ private:
   XXH64_hash_t m_cachedHash;
 };
 
+// Fork: Multi-Layer Terrain Material (FNV multi-pass terrain extension)
+//
+// Mirrors RtSubsurfaceMaterial's role as a side-load extension on
+// RtOpaqueSurfaceMaterial: the parent opaque material carries
+// m_multiLayerTerrainIndex pointing at an entry of this type stored in the
+// surface-material extension cache. Holds the per-layer albedo + normal texture
+// indices captured from D3D9 samplers 0..6 / 7..13 by the
+// kRemixMultiLayerTerrainBit branch in d3d9_rtx_utils.cpp.
+//
+// GPU layout fits in kSurfaceMaterialGPUSize (64 bytes), same fixed cell size
+// as every other entry in the polymorphic extension cache. See
+// MemoryPolymorphicSurfaceMaterial in surface_material.h.
+struct RtMultiLayerTerrainMaterial {
+  // Must match LegacyMaterialData::kMaxTerrainLayers (declared further down in
+  // this header, so it can't be referenced here without a forward declaration).
+  // Static-asserted equal in rtx_scene_manager.cpp where both are in scope.
+  static constexpr uint32_t kMaxLayers = 7;
+
+  RtMultiLayerTerrainMaterial(
+    uint32_t layerCount,
+    const std::array<uint32_t, kMaxLayers>& albedoTextureIndices,
+    const std::array<uint32_t, kMaxLayers>& normalTextureIndices) :
+    m_layerCount { layerCount },
+    m_albedoTextureIndices { albedoTextureIndices },
+    m_normalTextureIndices { normalTextureIndices } {
+    updateCachedHash();
+  }
+
+  void writeGPUData(unsigned char* data, std::size_t& offset) const {
+    // 14 × uint16 indices + uint16 layerCount + uint16 type tag = 32 bytes used.
+    // Padded out to kSurfaceMaterialGPUSize (64) so every cache entry occupies
+    // the same fixed stride.
+    [[maybe_unused]] const std::size_t oldOffset = offset;
+
+    // data[0]: type tag in the same flags word slot every other extension entry
+    // uses. Mirrors RtSubsurfaceMaterial::writeGPUData which writes flags = 0.
+    uint16_t flags = surfaceMaterialTypeMultiLayerTerrain;
+    writeGPUHelperExplicit<2>(data, offset, flags);
+
+    // data[1]: active layer count (1..kMaxLayers).
+    writeGPUHelperExplicit<2>(data, offset, m_layerCount);
+
+    // data[2-8]: albedo texture indices (one uint16 per layer, kMaxLayers entries).
+    for (uint32_t i = 0; i < kMaxLayers; i++) {
+      writeGPUHelperExplicit<2>(data, offset, m_albedoTextureIndices[i]);
+    }
+
+    // data[9-15]: normal texture indices (one uint16 per layer, kMaxLayers entries).
+    for (uint32_t i = 0; i < kMaxLayers; i++) {
+      writeGPUHelperExplicit<2>(data, offset, m_normalTextureIndices[i]);
+    }
+
+    // data[16-31]: 32 bytes of padding.
+    writeGPUPadding<32>(data, offset);
+
+    assert(offset - oldOffset == kSurfaceMaterialGPUSize);
+  }
+
+  bool operator==(const RtMultiLayerTerrainMaterial& r) const {
+    return m_cachedHash == r.m_cachedHash;
+  }
+
+  bool validate() const {
+    return m_layerCount >= 1 && m_layerCount <= kMaxLayers;
+  }
+
+  XXH64_hash_t getHash() const {
+    return m_cachedHash;
+  }
+
+  uint32_t getLayerCount() const {
+    return m_layerCount;
+  }
+
+  uint32_t getAlbedoTextureIndex(uint32_t layer) const {
+    assert(layer < kMaxLayers);
+    return m_albedoTextureIndices[layer];
+  }
+
+  uint32_t getNormalTextureIndex(uint32_t layer) const {
+    assert(layer < kMaxLayers);
+    return m_normalTextureIndices[layer];
+  }
+
+  template<typename Fn>
+  void forEachTextureIndex(Fn&& fn) const {
+    for (uint32_t i = 0; i < m_layerCount; i++) {
+      fn(m_albedoTextureIndices[i]);
+      fn(m_normalTextureIndices[i]);
+    }
+  }
+
+private:
+  void updateCachedHash() {
+    static_assert(
+      sizeof(*this) == 72,
+      "add new member for hashing if needed: add a MEMBER into the struct + add a VALUE into the list-init"
+    );
+    struct HashStruct {
+      uint32_t layerCount;
+      uint32_t albedoTextureIndices[kMaxLayers];
+      uint32_t normalTextureIndices[kMaxLayers];
+      // NOTE: There must be NO padding between members, as the struct is used for hashing
+    };
+    static_assert(alignof(HashStruct) == 4 && sizeof(HashStruct) % 4 == 0);
+    HashStruct hashData{};
+    hashData.layerCount = m_layerCount;
+    for (uint32_t i = 0; i < kMaxLayers; i++) {
+      hashData.albedoTextureIndices[i] = m_albedoTextureIndices[i];
+      hashData.normalTextureIndices[i] = m_normalTextureIndices[i];
+    }
+    m_cachedHash = XXH3_64bits(&hashData, sizeof(hashData));
+  }
+
+  uint32_t m_layerCount;
+  std::array<uint32_t, kMaxLayers> m_albedoTextureIndices;
+  std::array<uint32_t, kMaxLayers> m_normalTextureIndices;
+
+  XXH64_hash_t m_cachedHash;
+};
+
 struct RtSurfaceMaterial {
   RtSurfaceMaterial(const RtOpaqueSurfaceMaterial& opaqueSurfaceMaterial) :
     m_type{ RtSurfaceMaterialType::Opaque },
@@ -1459,6 +1635,11 @@ struct RtSurfaceMaterial {
   RtSurfaceMaterial(const RtSubsurfaceMaterial& subsurfaceMaterial) :
     m_type { RtSurfaceMaterialType::Subsurface },
     m_subsurfaceMaterial { subsurfaceMaterial } {}
+
+  // Fork: side-load extension entry for FNV multi-layer terrain materials.
+  RtSurfaceMaterial(const RtMultiLayerTerrainMaterial& multiLayerTerrainMaterial) :
+    m_type { RtSurfaceMaterialType::MultiLayerTerrain },
+    m_multiLayerTerrainMaterial { multiLayerTerrainMaterial } {}
 
   RtSurfaceMaterial(const RtSurfaceMaterial& surfaceMaterial) :
     m_type{ surfaceMaterial.m_type } {
@@ -1478,6 +1659,9 @@ struct RtSurfaceMaterial {
       break;
     case RtSurfaceMaterialType::Subsurface:
       new (&m_subsurfaceMaterial) RtSubsurfaceMaterial { surfaceMaterial.m_subsurfaceMaterial };
+      break;
+    case RtSurfaceMaterialType::MultiLayerTerrain:
+      new (&m_multiLayerTerrainMaterial) RtMultiLayerTerrainMaterial { surfaceMaterial.m_multiLayerTerrainMaterial };
       break;
     }
   }
@@ -1500,6 +1684,9 @@ struct RtSurfaceMaterial {
     case RtSurfaceMaterialType::Subsurface:
       m_subsurfaceMaterial.~RtSubsurfaceMaterial();
       break;
+    case RtSurfaceMaterialType::MultiLayerTerrain:
+      m_multiLayerTerrainMaterial.~RtMultiLayerTerrainMaterial();
+      break;
     }
   }
 
@@ -1521,6 +1708,9 @@ struct RtSurfaceMaterial {
     case RtSurfaceMaterialType::Subsurface:
       m_subsurfaceMaterial.writeGPUData(data, offset);
       break;
+    case RtSurfaceMaterialType::MultiLayerTerrain:
+      m_multiLayerTerrainMaterial.writeGPUData(data, offset);
+      break;
     }
   }
 
@@ -1538,6 +1728,8 @@ struct RtSurfaceMaterial {
       return m_rayPortalSurfaceMaterial.validate();
     case RtSurfaceMaterialType::Subsurface:
       return m_subsurfaceMaterial.validate();
+    case RtSurfaceMaterialType::MultiLayerTerrain:
+      return m_multiLayerTerrainMaterial.validate();
     }
 
     return false;
@@ -1564,6 +1756,9 @@ struct RtSurfaceMaterial {
       case RtSurfaceMaterialType::Subsurface:
         m_subsurfaceMaterial = rtSurfaceMaterial.m_subsurfaceMaterial;
         break;
+      case RtSurfaceMaterialType::MultiLayerTerrain:
+        m_multiLayerTerrainMaterial = rtSurfaceMaterial.m_multiLayerTerrainMaterial;
+        break;
       }
     }
 
@@ -1589,6 +1784,8 @@ struct RtSurfaceMaterial {
       return m_rayPortalSurfaceMaterial == rhs.m_rayPortalSurfaceMaterial;
     case RtSurfaceMaterialType::Subsurface:
       return m_subsurfaceMaterial == rhs.m_subsurfaceMaterial;
+    case RtSurfaceMaterialType::MultiLayerTerrain:
+      return m_multiLayerTerrainMaterial == rhs.m_multiLayerTerrainMaterial;
     }
   }
 
@@ -1606,6 +1803,8 @@ struct RtSurfaceMaterial {
       return m_rayPortalSurfaceMaterial.getHash();
     case RtSurfaceMaterialType::Subsurface:
       return m_subsurfaceMaterial.getHash();
+    case RtSurfaceMaterialType::MultiLayerTerrain:
+      return m_multiLayerTerrainMaterial.getHash();
     }
   }
 
@@ -1650,6 +1849,9 @@ struct RtSurfaceMaterial {
     case RtSurfaceMaterialType::Subsurface:
       m_subsurfaceMaterial.forEachTextureIndex(fn);
       break;
+    case RtSurfaceMaterialType::MultiLayerTerrain:
+      m_multiLayerTerrainMaterial.forEachTextureIndex(fn);
+      break;
     }
   }
 
@@ -1662,6 +1864,8 @@ private:
     RtTranslucentSurfaceMaterial m_translucentSurfaceMaterial;
     RtRayPortalSurfaceMaterial m_rayPortalSurfaceMaterial;
     RtSubsurfaceMaterial m_subsurfaceMaterial;
+    // Fork: FNV multi-layer terrain side-load extension.
+    RtMultiLayerTerrainMaterial m_multiLayerTerrainMaterial;
   };
 };
 
@@ -1725,6 +1929,19 @@ enum class MaterialDataType {
 //   bits 16-31: reserved (0)
 constexpr uint32_t kRemixSlotRoleNibbleMask = 0xFu;
 constexpr uint32_t kRemixSlotRoleAbsent     = 0xFu;
+
+// Multi-layer terrain extension to remixModifierFromD3D:
+//   bit 16        : MULTI_LAYER_TERRAIN flag (1 = this draw is FNV multi-layer terrain)
+//   bits 17-19    : layer count (1..7), only meaningful when bit 16 is set
+//   bits 20-31    : reserved (must be 0)
+//
+// Bits 0-15 (V1 slot-role nibbles) are still available, but multi-layer-terrain
+// draws typically set them to all-0xF (no V1 slot routing) -- the multi-layer
+// capture branch reads d3d9State.textures[0..6] for albedos and [7..13] for
+// normals directly, bypassing the V1 4-slot capture.
+constexpr uint32_t kRemixMultiLayerTerrainBit   = 1u << 16;
+constexpr uint32_t kRemixMultiLayerCountShift   = 17;
+constexpr uint32_t kRemixMultiLayerCountMask    = 0x7u;  // 3 bits -- encodes counts 0..7
 
 // Note: For use with "Legacy" D3D9 material information
 struct LegacyMaterialData {
@@ -1862,6 +2079,19 @@ struct LegacyMaterialData {
   // parallax-occlusion path picks up via the default displaceIn/displaceOut. Gated by
   // rtx.legacyMaterial.fnv.autoHeightMap. Empty -> no auto-height.
   TextureRef    heightTexture;
+
+  // Fork: Multi-layer terrain albedo + normal slots. Populated by setLegacyMaterialState
+  // when kRemixMultiLayerTerrainBit is set in remixModifierFromD3D, with the layer count
+  // decoded from bits 17-19. terrainLayerCount in [0, 7]; 0 means "not multi-layer"
+  // (default). Consumed by fork_hooks::applyLegacyProtocolMultiLayerTerrain (Phase 3)
+  // to populate OpaqueMaterialData's multi-layer slots. Layer i's albedo lives at
+  // terrainAlbedoTextures[i], normal at terrainNormalTextures[i]; per-vertex weights
+  // come from the interleaved COLOR0+COLOR1 channels (color0.r..b + color1.r..a -> 7
+  // weights) and the blend lands in opaque_surface_material_interaction.slangh.
+  static constexpr uint32_t kMaxTerrainLayers = 7;
+  uint32_t      terrainLayerCount = 0;
+  TextureRef    terrainAlbedoTextures[kMaxTerrainLayers];
+  TextureRef    terrainNormalTextures[kMaxTerrainLayers];
 
   void setHashOverride(XXH64_hash_t hash) {
     m_cachedHash = hash;

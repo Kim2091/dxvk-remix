@@ -304,6 +304,22 @@ struct Surface
     set { data0b.z = newValue ? packedFlagSet(data0b.z, 1 << 1) : packedFlagUnset(data0b.z, 1 << 1); }
   }
 
+  property bool hasColor1
+  {
+    get { return packedFlagGet(data0b.z, 1 << 2); }
+    set { data0b.z = newValue ? packedFlagSet(data0b.z, 1 << 2) : packedFlagUnset(data0b.z, 1 << 2); }
+  }
+
+  // Fork: FNV multi-layer terrain stores per-vertex blend weights as raw FLOAT4s
+  // in the color0 and color1 interleaved slots (4 floats each instead of 1
+  // packed BGRA8 uint). When this flag is set the surface-interaction decoder
+  // takes the raw-float branch; otherwise the existing BGRA8 path runs unchanged.
+  property bool hasMultiLayerWeights
+  {
+    get { return packedFlagGet(data0b.z, 1 << 3); }
+    set { data0b.z = newValue ? packedFlagSet(data0b.z, 1 << 3) : packedFlagUnset(data0b.z, 1 << 3); }
+  }
+
   property uint16_t hashPacked
   {
     get { return data0b.w; }
@@ -528,6 +544,7 @@ struct SurfaceInteraction : MinimalSurfaceInteraction
   vec3 rawTangent = 0.f;
   vec3 rawBitangent = 0.f;
   vec4 vertexColor = 0.0f;
+  vec4 vertexColor1 = 0.0f;
   float triangleArea = 0.f;
 };
 

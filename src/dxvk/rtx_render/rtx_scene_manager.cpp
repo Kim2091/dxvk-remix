@@ -19,6 +19,7 @@
 * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 * DEALINGS IN THE SOFTWARE.
 */
+#include <array>
 #include <mutex>
 #include <vector>
 
@@ -59,6 +60,14 @@ namespace {
 } // namespace
 
 namespace dxvk {
+
+  // Fork: keep the multi-layer-terrain layer cap in sync between
+  // LegacyMaterialData::kMaxTerrainLayers (D3D9 capture side) and
+  // RtMultiLayerTerrainMaterial::kMaxLayers (Remix surface-material extension
+  // side). Both are 7 today; bump them together if FNV ever exposes more.
+  static_assert(
+    LegacyMaterialData::kMaxTerrainLayers == RtMultiLayerTerrainMaterial::kMaxLayers,
+    "LegacyMaterialData::kMaxTerrainLayers must equal RtMultiLayerTerrainMaterial::kMaxLayers");
 
   // Compute a hash that can be used to check if an external draw is identical to the previous frame's draw.
   XXH64_hash_t ExternalDrawState::computeExternalDrawIdentityHash() const {
@@ -460,6 +469,14 @@ namespace dxvk {
       const DxvkBufferSlice slice = DxvkBufferSlice(output.historyBuffer[0]);
       const auto& colorBuffer = drawCallState.geometryData.color0Buffer;
       output.color0Buffer = RaytraceBuffer(slice, colorBuffer.offsetFromSlice(), colorBuffer.stride(), colorBuffer.vertexFormat());
+    }
+
+    if (output.color1Buffer.defined() && !drawCallState.geometryData.color1Buffer.defined()) {
+      output.color1Buffer = RaytraceBuffer();
+    } else if (!output.color1Buffer.defined() && drawCallState.geometryData.color1Buffer.defined()) {
+      const DxvkBufferSlice slice = DxvkBufferSlice(output.historyBuffer[0]);
+      const auto& colorBuffer = drawCallState.geometryData.color1Buffer;
+      output.color1Buffer = RaytraceBuffer(slice, colorBuffer.offsetFromSlice(), colorBuffer.stride(), colorBuffer.vertexFormat());
     }
 
     // Update buffers in the cache
@@ -910,6 +927,12 @@ namespace dxvk {
       newGeoData.color0BufferIndex = kSurfaceInvalidBufferIndex;
     }
 
+    if (newGeoData.color1Buffer.defined()) {
+      newGeoData.color1BufferIndex = m_bufferCache.track(newGeoData.color1Buffer);
+    } else {
+      newGeoData.color1BufferIndex = kSurfaceInvalidBufferIndex;
+    }
+
     if (newGeoData.texcoordBuffer.defined()) {
       newGeoData.texcoordBufferIndex = m_bufferCache.track(newGeoData.texcoordBuffer);
     } else {
@@ -1347,6 +1370,34 @@ namespace dxvk {
       // consumed by opaque_surface_material_interaction.slangh's normal-decode branch.
       const bool isTangentSpaceNormal = opaqueMaterialData.getIsTangentSpaceNormalOverride();
 
+      // Fork: aux-index slot for FNV multi-layer terrain. When the opaque material
+      // staging struct carries a non-zero terrainLayerCount (set by the fork hook
+      // applyLegacyProtocolMultiLayerTerrain on the FNV protocol path), resolve each
+      // per-layer TextureRef to a texture index via the same trackTexture helper the
+      // standard albedo/normal slots use, build an RtMultiLayerTerrainMaterial, and
+      // register it in m_surfaceMaterialExtensionCache. The returned cache index is
+      // stored on m_multiLayerTerrainIndex (as uint16 at data[27]) and the shader
+      // reads it via the OPAQUE_SURFACE_MATERIAL_FLAG_MULTI_LAYER_TERRAIN flag set
+      // in writeGPUData. For every other material this remains SURFACE_INDEX_INVALID
+      // and the GPU path is a no-op for the multi-layer-terrain branch.
+      uint32_t multiLayerTerrainIndex = SURFACE_INDEX_INVALID;
+      if (opaqueMaterialData.terrainLayerCount > 0) {
+        std::array<uint32_t, RtMultiLayerTerrainMaterial::kMaxLayers> terrainAlbedoIndices{};
+        std::array<uint32_t, RtMultiLayerTerrainMaterial::kMaxLayers> terrainNormalIndices{};
+        terrainAlbedoIndices.fill(kSurfaceMaterialInvalidTextureIndex);
+        terrainNormalIndices.fill(kSurfaceMaterialInvalidTextureIndex);
+        for (uint32_t i = 0; i < opaqueMaterialData.terrainLayerCount; i++) {
+          trackTexture(opaqueMaterialData.terrainAlbedoTextures[i], terrainAlbedoIndices[i], hasTexcoords, true, samplerFeedbackStamp);
+          trackTexture(opaqueMaterialData.terrainNormalTextures[i], terrainNormalIndices[i], hasTexcoords, true, samplerFeedbackStamp);
+        }
+        const auto multiLayerTerrainMaterial = RtMultiLayerTerrainMaterial{
+          opaqueMaterialData.terrainLayerCount,
+          terrainAlbedoIndices,
+          terrainNormalIndices,
+        };
+        multiLayerTerrainIndex = m_surfaceMaterialExtensionCache.track(multiLayerTerrainMaterial);
+      }
+
       const RtOpaqueSurfaceMaterial opaqueSurfaceMaterial{
         albedoOpacityTextureIndex, normalTextureIndex,
         tangentTextureIndex, heightTextureIndex, roughnessTextureIndex,
@@ -1357,7 +1408,9 @@ namespace dxvk {
         emissiveColorConstant, enableEmissive,
         ignoreAlphaChannel, thinFilmEnable, alphaIsThinFilmThickness,
         thinFilmThicknessConstant, samplerIndex, displaceIn, displaceOut,
-        subsurfaceMaterialIndex, isUsingRaytracedRenderTarget,
+        subsurfaceMaterialIndex,
+        multiLayerTerrainIndex,
+        isUsingRaytracedRenderTarget,
         samplerFeedbackStamp,
         secondaryTextureIndex,
         isTangentSpaceNormal

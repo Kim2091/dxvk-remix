@@ -287,6 +287,21 @@ struct name##Data {                                                             
     return m_isTangentSpaceNormalOverride;                                                           \
   }                                                                                                  \
                                                                                                      \
+  /* Fork: Multi-layer terrain albedo + normal slots, populated by the fork hook       */            \
+  /* applyLegacyProtocolMultiLayerTerrain from LegacyMaterialData's matching arrays.   */            \
+  /* terrainLayerCount > 0 signals multi-layer mode; the scene manager then resolves   */            \
+  /* each TextureRef to a texture index and registers an RtMultiLayerTerrainMaterial   */            \
+  /* entry in the extension cache, storing the resulting aux index on                  */            \
+  /* RtOpaqueSurfaceMaterial::m_multiLayerTerrainIndex. Defaults to 0 so non-terrain   */            \
+  /* materials and standard replacement materials are unaffected. Carried on all three */            \
+  /* REMIX_MATERIAL specializations (the macro is shared) but meaningful only on the   */            \
+  /* opaque branch; the scene manager reads these fields exclusively from the opaque   */            \
+  /* path. Phase 3 of FNV multi-layer terrain.                                         */            \
+  static constexpr uint32_t kMaxTerrainLayers = 7;                                                   \
+  uint32_t   terrainLayerCount = 0;                                                                  \
+  TextureRef terrainAlbedoTextures[kMaxTerrainLayers];                                               \
+  TextureRef terrainNormalTextures[kMaxTerrainLayers];                                               \
+                                                                                                     \
 private:                                                                                             \
                                                                                                      \
   struct Ranges {                                                                                    \

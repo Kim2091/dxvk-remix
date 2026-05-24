@@ -271,6 +271,47 @@ namespace dxvk {
       captureSlotTexture(normalSlot,  materialData.normalTexture);
       captureSlotTexture(glowSlot,    materialData.emissiveTexture);
       captureSlotTexture(heightSlot,  materialData.heightTexture);
+
+      // Fork: Multi-layer terrain capture. When kRemixMultiLayerTerrainBit is set,
+      // the wrapper has signaled an FNV multi-layer terrain draw -- capture all 14
+      // sampler slots: albedos at s0..s(N-1), normals at s7..s(7+N-1). N is decoded
+      // from bits 17-19 of remixModifierFromD3D. This bypasses the V1 4-slot capture
+      // above (which would only see s0/s1 as diffuse/normal). See
+      // docs/superpowers/plans/2026-05-22-fnv-multilayer-terrain.md.
+      if ((materialData.remixModifierFromD3D & kRemixMultiLayerTerrainBit) != 0u) {
+        const uint32_t layerCount =
+            (materialData.remixModifierFromD3D >> kRemixMultiLayerCountShift) & kRemixMultiLayerCountMask;
+        if (layerCount >= 1 && layerCount <= LegacyMaterialData::kMaxTerrainLayers) {
+          // Parameterized capture lambda (mirrors V1's captureSlotTexture but
+          // accepts any slot < 14 -- albedos s0..s6, normals s7..s13). No 0xF
+          // "absent" sentinel since multi-layer slots are sequential by index.
+          auto captureMultiLayerSlot = [&](uint32_t slot, TextureRef& out) {
+            if (slot >= 14u) return;
+            IDirect3DBaseTexture9* baseTex = d3d9State.textures[slot];
+            if (baseTex == nullptr) return;
+            D3D9CommonTexture* texInfo = GetCommonTexture(baseTex);
+            if (texInfo == nullptr) return;
+            if (texInfo->GetType() != D3DRTYPE_TEXTURE &&
+                (!D3D9Rtx::allowCubemaps() || texInfo->GetType() != D3DRTYPE_CUBETEXTURE)) {
+              return;
+            }
+            const bool srgb = d3d9State.samplerStates[slot][D3DSAMP_SRGBTEXTURE] & 0x1;
+            out = TextureRef(texInfo->GetSampleView(srgb));
+          };
+
+          materialData.terrainLayerCount = layerCount;
+          for (uint32_t i = 0; i < layerCount; i++) {
+            captureMultiLayerSlot(i,           materialData.terrainAlbedoTextures[i]);
+            captureMultiLayerSlot(7u + i,      materialData.terrainNormalTextures[i]);
+          }
+        } else {
+          ONCE(Logger::warn(str::format(
+            "[FNV-MultiLayer] Invalid layerCount=", layerCount,
+            " in RS-149 payload 0x", std::hex, materialData.remixModifierFromD3D,
+            " (bit ", std::dec, "16 set but count=", layerCount,
+            ") -- multi-layer capture skipped.")));
+        }
+      }
     }
   }
 

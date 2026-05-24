@@ -860,6 +860,11 @@ namespace dxvk {
     currentInstance.surface.color0BufferIndex = blas.modifiedGeometryData.color0BufferIndex;
     currentInstance.surface.color0Offset = blas.modifiedGeometryData.color0Buffer.offsetFromSlice();
     currentInstance.surface.color0Stride = blas.modifiedGeometryData.color0Buffer.stride();
+    currentInstance.surface.hasColor1 = blas.modifiedGeometryData.color1BufferIndex != kSurfaceInvalidBufferIndex;
+    // Fork: FNV multi-layer-terrain FLOAT4-weight decode flag. When set, the
+    // hit-side surface decoder reads 4 raw floats per color slot instead of
+    // decoding BGRA8.
+    currentInstance.surface.hasMultiLayerWeights = blas.modifiedGeometryData.hasMultiLayerTerrainWeights;
     currentInstance.surface.texcoordBufferIndex = blas.modifiedGeometryData.texcoordBufferIndex;
     currentInstance.surface.texcoordOffset = blas.modifiedGeometryData.texcoordBuffer.offsetFromSlice();
     currentInstance.surface.texcoordStride = blas.modifiedGeometryData.texcoordBuffer.stride();

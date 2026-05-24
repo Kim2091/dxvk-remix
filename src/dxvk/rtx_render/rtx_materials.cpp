@@ -22,6 +22,7 @@
 
 #include "rtx_materials.h"
 
+#include "rtx_fork_hooks.h"
 #include "rtx_options.h"
 
 namespace dxvk {
@@ -118,6 +119,14 @@ template<> OpaqueMaterialData LegacyMaterialData::as() const {
   if (heightTexture.isValid() && LegacyMaterialDefaults::autoHeightMap()) {
     opaqueMat.setHeightTexture(heightTexture);
   }
+
+  // Fork: route FNV multi-layer terrain captures (kRemixMultiLayerTerrainBit in
+  // remixModifierFromD3D) from LegacyMaterialData's terrain{Albedo,Normal}Textures
+  // arrays into OpaqueMaterialData's matching slots. No-op when the protocol bit
+  // is unset. The scene manager (rtx_scene_manager.cpp) resolves the TextureRefs
+  // to indices and registers an RtMultiLayerTerrainMaterial extension cache entry.
+  fork_hooks::applyLegacyProtocolMultiLayerTerrain(*this, opaqueMat);
+
   // Indicate that we have an exact sampler to use on this material, directly from game
   if (getSampler().ptr()) {
     opaqueMat.setSamplerOverride(getSampler());

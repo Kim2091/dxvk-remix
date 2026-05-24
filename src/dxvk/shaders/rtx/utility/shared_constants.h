@@ -27,6 +27,13 @@
 static const uint8_t surfaceMaterialTypeOpaque = uint8_t(0u);
 static const uint8_t surfaceMaterialTypeTranslucent = uint8_t(1u);
 static const uint8_t surfaceMaterialTypeRayPortal = uint8_t(2u);
+// Fork: tag for multi-layer-terrain extension entries in the surface-material
+// extension cache. Like surfaceMaterialTypeSubsurface (implicit -- subsurface
+// extension entries use flags = 0), this tag is informational rather than used
+// for polymorphic dispatch -- the shader knows an entry is multi-layer-terrain
+// because the parent opaque material's m_multiLayerTerrainIndex points at it.
+// Fits in the existing 2-bit surfaceMaterialTypeMask.
+static const uint8_t surfaceMaterialTypeMultiLayerTerrain = uint8_t(3u);
 static const uint8_t surfaceMaterialTypeMask = uint8_t(0x3u);
 
 #define COMMON_MATERIAL_FLAG_TYPE_MASK surfaceMaterialTypeMask
@@ -49,6 +56,12 @@ static const uint8_t surfaceMaterialTypeMask = uint8_t(0x3u);
 // to read the texture as RGB tangent-space ([0,1] unsigned snorm in .rgb) instead of
 // Remix's native octahedral encoding.
 #define OPAQUE_SURFACE_MATERIAL_FLAG_TANGENT_SPACE_NORMAL (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(5))
+// Fork: set on opaque materials produced from FNV multi-layer terrain draws (see
+// LegacyMaterialData::terrainAlbedoTextures[] / terrainNormalTextures[] and
+// kRemixMultiLayerTerrainBit). Tells the shader to read the per-layer texture
+// indices via the m_multiLayerTerrainIndex aux slot pointing into the surface-
+// material extension cache (RtMultiLayerTerrainMaterial entries).
+#define OPAQUE_SURFACE_MATERIAL_FLAG_MULTI_LAYER_TERRAIN (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(6))
 
 
 #define OPAQUE_SURFACE_MATERIAL_INTERACTION_FLAG_HAS_HEIGHT_TEXTURE (1 << 0)

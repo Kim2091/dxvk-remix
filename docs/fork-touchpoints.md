@@ -160,6 +160,12 @@ check will enforce it if discipline slips.
 - **Inline tweak** at `D3D9Rtx::EndFrame` (~line 1216) — 5-line addition for [RTX-Diag] entry log on EndFrame.
   *Logs targetImage pointer and callInjectRtx flag at the top of EndFrame, plus a second log after the CS lambda is emitted, to trace the frame-end dispatch chain.*
 
+- **Inline tweak** at the `D3DDECLUSAGE_COLOR` branch in the vertex-element decode loop — ~7 LOC for a `UsageIndex == 1` capture sibling to the existing COLOR0 path.
+  *Routes the COLOR1 vertex stream into `RasterGeometry.color1Buffer` for multi-layer terrain blending. Phase 1 of FNV multi-layer terrain (see `docs/superpowers/plans/2026-05-22-fnv-multilayer-terrain.md`). FNV emits per-layer blend weights on the second color stream; this is the front-door capture that feeds the interleave / surface / shader plumbing downstream.*
+
+- **Inline tweak** at the top of `processVertices` + the `D3DDECLUSAGE_TEXCOORD` branch — ~15 LOC for the FNV multi-layer-terrain FLOAT4 capture path.
+  *FNV's multi-layer terrain vertex decl has COLOR0 as FLOAT4 (not BGRA8) and stores the weights for layers 3-6 on TEXCOORD1 (no D3DDECLUSAGE_COLOR with UsageIndex==1 exists). When the RS-149 protocol bit `kRemixMultiLayerTerrainBit` is set on `materialData.remixModifierFromD3D`, sets `geoData.hasMultiLayerTerrainWeights = true` and adds a TEXCOORD1 capture path that routes the stream into `geoData.color1Buffer` as a synthetic COLOR1. Non-FNV games (BGRA8 COLOR0 + optional native COLOR1) take the existing path unchanged. Fix for the previously-broken FLOAT4 weight delivery (see `docs/superpowers/plans/2026-05-22-fnv-multilayer-terrain.md`).*
+
 ---
 
 ## src/d3d9/d3d9_rtx_utils.cpp
@@ -420,6 +426,42 @@ initializer list and can't be lifted into a separate TU.
 
 ---
 
+## src/dxvk/rtx_render/rtx_geometry_utils.cpp
+
+**Category:** index-only
+
+- **Inline tweak** across the STRUCTURED_BUFFER table, `bindResourceBuffer`, both overloads of `processGeometryBuffers`, `computeOptimalVertexStride`, and the `interleaveGeometry` args setup + dispatch + output-offset accumulation — ~50 LOC mirroring the color0 plumbing throughout.
+  *Plumbs the COLOR1 stream through the interleave compute pass: declares the new structured-buffer slot, binds the color1 SRV when present, walks color1 in both per-vertex and per-buffer processGeometryBuffers paths, factors color1 into the optimal vertex stride, and threads `srcColor1` + `hasColor1` + color1 offset/stride into the dispatch args / output offset accumulator. Also bumps `kMaxInterleavedComponents` from `3 + 3 + 2 + 1` to `3 + 3 + 2 + 1 + 1` to reserve the extra float slot for color1. Phase 1 of FNV multi-layer terrain (see `docs/superpowers/plans/2026-05-22-fnv-multilayer-terrain.md`).*
+
+- **Inline tweak** across `kMaxInterleavedComponents`, both `processGeometryBuffers` overloads, `computeOptimalVertexStride`, and the `interleaveGeometry` args setup + output-offset accumulation — ~25 LOC for the FNV multi-layer-terrain FLOAT4 path.
+  *Threads `hasMultiLayerTerrainWeights` end-to-end: bumps `kMaxInterleavedComponents` to `3 + 3 + 2 + 4 + 4` (worst-case 4 floats per color slot), forces `color{0,1}Format` to `VK_FORMAT_R32G32B32A32_SFLOAT` and sets `args.isMultiLayerTerrain = 1` when the flag is set, widens the per-color-slot stride/output-offset accumulation from `sizeof(uint32_t)` to `4 * sizeof(uint32_t)` on the multi-layer path, tags `desc.hasMultiLayerTerrainWeights` on the InterleavedGeometryDescriptor and propagates it onto the `RaytraceGeometry` output (`output.color{0,1}Buffer.vertexFormat()` becomes FLOAT4 so the hit-side decoder picks the raw-float branch). Non-multi-layer draws take the existing BGRA8 path unchanged. Fix for the previously-broken FLOAT4 weight delivery.*
+
+---
+
+## src/dxvk/rtx_render/rtx_geometry_utils.h
+
+**Category:** index-only
+
+- **Inline tweak** at `InterleavedGeometryDescriptor` (struct) — ~2 LOC.
+  *Adds `hasColor1` bool + `color1Offset` uint32 fields so callers can describe the interleaved layout's color1 slot to the compute pass. Phase 1 of FNV multi-layer terrain (see `docs/superpowers/plans/2026-05-22-fnv-multilayer-terrain.md`).*
+
+- **Inline tweak** at `InterleavedGeometryDescriptor` (struct) — 1 LOC.
+  *Adds `hasMultiLayerTerrainWeights` bool so `processGeometryBuffers` can pick the FLOAT4 color format on the raytrace-side buffers and propagate the flag onto `RaytraceGeometry::hasMultiLayerTerrainWeights`. Fix for the previously-broken FLOAT4 weight delivery.*
+
+---
+
+## src/dxvk/rtx_render/rtx_instance_manager.cpp
+
+**Category:** index-only
+
+- **Inline tweak** in `InstanceManager::processInstanceBuffers` — 1 LOC.
+  *Sets `currentInstance.surface.hasColor1` from `blas.modifiedGeometryData.color1BufferIndex != kSurfaceInvalidBufferIndex` so the per-instance Surface upload carries the color1-presence flag through to the shader-side `Surface.hasColor1` property. Phase 1 of FNV multi-layer terrain (see `docs/superpowers/plans/2026-05-22-fnv-multilayer-terrain.md`).*
+
+- **Inline tweak** in `InstanceManager::processInstanceBuffers` — 1 LOC.
+  *Sets `currentInstance.surface.hasMultiLayerWeights` from `blas.modifiedGeometryData.hasMultiLayerTerrainWeights` so the per-instance Surface upload carries the FLOAT4-weight decode flag through to the shader-side `Surface.hasMultiLayerWeights` property (packed in flags0 bit 3). Fix for the previously-broken FLOAT4 weight delivery.*
+
+---
+
 ## src/dxvk/rtx_render/rtx_light_manager.cpp
 
 **Pre-refactor fork footprint:** +126 / -12 LOC (audit 2026-04-18)
@@ -539,11 +581,17 @@ initializer list and can't be lifted into a separate TU.
 - **Inline tweak** in the `REMIX_MATERIAL` macro (alongside the existing `setIgnoreAlphaChannel` / `getIgnoreAlphaChannel` block + the `m_ignoreAlphaChannelOverride` member) — ~12 LOC for a per-material override pair.
   *Adds `setIsTangentSpaceNormalOverride` / `getIsTangentSpaceNormalOverride` setter+getter and an `m_isTangentSpaceNormalOverride = false` member. Carried on all three REMIX_MATERIAL specializations (Opaque / Translucent / RayPortal) because the macro is shared, but meaningful only on opaque; `rtx_scene_manager.cpp` reads `getIsTangentSpaceNormalOverride()` only on the opaque branch and threads it into the `RtOpaqueSurfaceMaterial` ctor as `isTangentSpaceNormal`. Set on the FNV PS-classifier path by `LegacyMaterialData::as<OpaqueMaterialData>()` when a captured legacy normal map needs the RGB-tangent-space decode (see the shader-side branch in `opaque_surface_material_interaction.slangh`).*
 
+- **Inline tweak** in the `REMIX_MATERIAL` macro (just before the trailing `private:` block) — ~16 LOC for a public field bundle.
+  *Adds a `static constexpr uint32_t kMaxTerrainLayers = 7;` plus public `terrainLayerCount` (default 0) and `terrainAlbedoTextures[kMaxTerrainLayers]` / `terrainNormalTextures[kMaxTerrainLayers]` `TextureRef` arrays. Populated post-construction by `fork_hooks::applyLegacyProtocolMultiLayerTerrain` on the FNV protocol path; `rtx_scene_manager.cpp` resolves each `TextureRef` to a texture index, registers an `RtMultiLayerTerrainMaterial` in `m_surfaceMaterialExtensionCache`, and stores the resulting aux index on `RtOpaqueSurfaceMaterial::m_multiLayerTerrainIndex`. Carried on all three REMIX_MATERIAL specializations (the macro is shared) but meaningful only on opaque. Phase 3 of FNV multi-layer terrain (see `docs/superpowers/plans/2026-05-22-fnv-multilayer-terrain.md`).*
+
 ---
 
 ## src/dxvk/rtx_render/rtx_materials.cpp
 
 **Category:** index-only
+
+- **Inline tweak** in `template<> OpaqueMaterialData LegacyMaterialData::as() const` (after the height-routing branch, before the sampler-override branch) — ~2 LOC for a one-line fork hook call + `#include "rtx_fork_hooks.h"` (first-time include in this TU).
+  *Calls `fork_hooks::applyLegacyProtocolMultiLayerTerrain(*this, opaqueMat)` after the existing protocol-aware branches. The hook (implemented in `rtx_fork_multilayer_terrain.cpp`) no-ops unless `kRemixMultiLayerTerrainBit` is set in `remixModifierFromD3D` and `terrainLayerCount > 0`; in that case it copies LegacyMaterialData's `terrainAlbedoTextures[]` / `terrainNormalTextures[]` into OpaqueMaterialData's matching public slots. The scene manager later resolves each `TextureRef` to a texture index and registers an `RtMultiLayerTerrainMaterial` extension cache entry. Phase 3 of FNV multi-layer terrain (see `docs/superpowers/plans/2026-05-22-fnv-multilayer-terrain.md`).*
 
 - **Inline tweak** in `template<> OpaqueMaterialData LegacyMaterialData::as() const` — ~28 LOC for five protocol-aware branches (diffuse override, normal routing, tangent-space flag, emissive routing, height routing).
   *Prefers `protocolDiffuseTexture` over `getColorTexture()` when the RS-149 protocol has identified a diffuse slot, and routes `normalTexture` into `setNormalTexture` instead of `setSecondaryTexture`. When the captured normal is wired, also calls (a) `setIsTangentSpaceNormalOverride(true)` (gated by `rtx.legacyMaterial.fnv.autoNormalTangentSpace`) so the GPU surface material carries `OPAQUE_SURFACE_MATERIAL_FLAG_TANGENT_SPACE_NORMAL` and the shader decodes RGB tangent-space instead of octahedral, and (b) `setIsRoughnessFromNormalAlphaOverride(true)` (gated by `rtx.legacyMaterial.fnv.autoRoughnessFromSpecular`) so the shader derives roughness from the NormalMap's alpha channel via `roughness = 1.0 - normalSample.a` per Bethesda's DXT5n convention. When `emissiveTexture` is valid and `rtx.legacyMaterial.fnv.autoEmissive` is true, calls `setEmissiveColorTexture(emissiveTexture)` and `setEnableEmission(true)` so FNV glow maps light up via the standard Remix emissive channel; intensity follows the existing `rtx.legacyMaterial.emissiveIntensity` legacy default and the `RtxOptions::emissiveIntensity` master applied in `rtx_scene_manager.cpp`. All three texture-ref fields are populated up front by `setLegacyMaterialState` (in `d3d9_rtx_utils.cpp`); empty values fall through to upstream behaviour. Fixes the FNV failure modes where (a) `s0=NormalMap` shaders rendered the normal map as the surface colour, (b) FNV's DX-tangent-space normals were sample-decoded as octahedral and produced mangled shading, (c) glow maps captured by the protocol were ignored, and (d) all captured surfaces shipped with the legacy default roughness constant because FNV has no separate specular sampler.*
@@ -565,6 +613,21 @@ initializer list and can't be lifted into a separate TU.
 
 - **Inline tweak** in `RtOpaqueSurfaceMaterial` (constructor + member + writeGPUData flag bit + HashStruct + updateCachedHash list-init) — ~6 LOC across the struct.
   *Adds an `isTangentSpaceNormal` defaulted-false constructor param, an `m_isTangentSpaceNormal` bool member (slotted next to `m_isRaytracedRenderTarget` so it packs into the same 2-byte alignment slot before `m_samplerFeedbackStamp` — the `sizeof(*this) == 120` static_assert in `updateCachedHash` still holds), an OR into the GPU flags word in `writeGPUData` (sets `OPAQUE_SURFACE_MATERIAL_FLAG_TANGENT_SPACE_NORMAL` when true), and a matching `uint32_t isTangentSpaceNormal` slot in the hash struct + list-init. Set on the FNV PS-classifier path via `OpaqueMaterialData::setIsTangentSpaceNormalOverride` → passed through in `rtx_scene_manager.cpp` → consumed by the shader-side decode branch in `opaque_surface_material_interaction.slangh`.*
+
+- **Inline tweak** in `RtSurface` (struct field + `flags0` packing) — ~2 LOC.
+  *Adds a `hasColor1` bool member and packs it into bit 2 of `flags0` (`flags0 |= hasColor1 ? (1 << 2) : 0;`). Surface-side flag for multi-layer terrain blending; consumed shader-side via the `hasColor1` Surface property in `surface.h`. Phase 1 of FNV multi-layer terrain (see `docs/superpowers/plans/2026-05-22-fnv-multilayer-terrain.md`).*
+
+- **Inline tweak** in `RtSurface` (struct field + `flags0` packing) — ~2 LOC.
+  *Adds a `hasMultiLayerWeights` bool member and packs it into bit 3 of `flags0`. Surface-side flag for the FNV multi-layer-terrain FLOAT4 weight decode path; consumed shader-side via the `hasMultiLayerWeights` Surface property in `surface.h`. Fix for the previously-broken FLOAT4 weight delivery.*
+
+- **Inline tweak** as a new struct `RtMultiLayerTerrainMaterial` (adjacent to `RtSubsurfaceMaterial`) plus a new `MultiLayerTerrain` arm of `enum class RtSurfaceMaterialType` and the matching cases in the `RtSurfaceMaterial` tagged-union switches (ctor / dtor / copy ctor / assignment / equality / `getHash` / `writeGPUData` / `forEachTextureIndex`) + union storage — ~140 LOC.
+  *Side-load extension type mirroring `RtSubsurfaceMaterial`. Holds the per-layer (`kMaxLayers = 7`, kept in sync with `LegacyMaterialData::kMaxTerrainLayers` via a `static_assert` in `rtx_scene_manager.cpp`) albedo + normal texture indices captured by the FNV multi-layer terrain D3D9 path. Stored alongside subsurface entries in the existing `m_surfaceMaterialExtensionCache` (no separate cache or GPU binding); GPU layout fits in the same fixed `kSurfaceMaterialGPUSize = 64` cell as every other entry, tagged via the new `surfaceMaterialTypeMultiLayerTerrain` constant in the flags slot. Hash uses an internal `HashStruct` matching the upstream pattern, with `sizeof(*this) == 72` static-asserted. Phase 3 of FNV multi-layer terrain (see `docs/superpowers/plans/2026-05-22-fnv-multilayer-terrain.md`).*
+
+- **Inline tweak** in `RtOpaqueSurfaceMaterial` (constructor + member + writeGPUData index slot + HashStruct + updateCachedHash list-init + getter) — ~8 LOC across the struct (plus a parallel +1 to the existing `sizeof(*this)` static_assert: 120 → 124).
+  *Adds a `multiLayerTerrainIndex` non-default constructor param (positioned immediately after `subsurfaceMaterialIndex` to mirror the subsurface aux-index pattern), a `uint32_t m_multiLayerTerrainIndex` member (placed next to `m_subsurfaceMaterialIndex`), a `uint16` write in `writeGPUData` at `data[27]` that steals 2 bytes from the previous `writeGPUPadding<10>` (now `<9>`), a matching `uint32_t multiLayerTerrainIndex` slot in the hash struct + list-init, and a `getMultiLayerTerrainIndex()` getter. `SURFACE_INDEX_INVALID` is mapped to `kSurfaceMaterialInvalidTextureIndex` (`0xFFFFu`) at GPU write time since the slot is a uint16; in-range cache indices fit in 16 bits for any practical FNV scene. Defaults to `SURFACE_INDEX_INVALID` at the existing `rtx_scene_manager.cpp` call site; will be populated by the FNV multi-layer terrain fork hook (Task 13). Phase 3 of FNV multi-layer terrain (see `docs/superpowers/plans/2026-05-22-fnv-multilayer-terrain.md`).*
+
+- **Inline tweak** in `RtOpaqueSurfaceMaterial::writeGPUData` (alongside the existing `m_isTangentSpaceNormal` flag set) — ~3 LOC.
+  *ORs `OPAQUE_SURFACE_MATERIAL_FLAG_MULTI_LAYER_TERRAIN` into the GPU flags word when `m_multiLayerTerrainIndex != SURFACE_INDEX_INVALID`. Flag is consumed by the shader-side multi-layer blend branch in `opaque_surface_material_interaction.slangh` (Task 14). No new bool member -- the index sentinel is the source of truth. Phase 3 of FNV multi-layer terrain (see `docs/superpowers/plans/2026-05-22-fnv-multilayer-terrain.md`).*
 
 ---
 
@@ -836,6 +899,18 @@ initializer list and can't be lifted into a separate TU.
 - **Inline tweak** at the `RtOpaqueSurfaceMaterial` construction site (~line 1344) — ~5 LOC (one local-variable extraction + one extra ctor argument).
   *Reads `opaqueMaterialData.getIsTangentSpaceNormalOverride()` into a local `isTangentSpaceNormal` and threads it as the final ctor argument so the per-material flag set on the FNV PS-classifier path (in `LegacyMaterialData::as<OpaqueMaterialData>()`) is encoded into the GPU surface material's flags word (`OPAQUE_SURFACE_MATERIAL_FLAG_TANGENT_SPACE_NORMAL`) and consumed by the shader-side decode branch in `opaque_surface_material_interaction.slangh`.*
 
+- **Inline tweak** in `SceneManager::updateBufferCache` + BVH-sync block — ~14 LOC mirroring the existing color0 lifecycle.
+  *Tracks `newGeoData.color1Buffer` into the buffer cache, populates `newGeoData.color1BufferIndex` (or sets it to `kSurfaceInvalidBufferIndex` when absent), and propagates the color1 buffer/index through the BVH sync path so RaytraceGeometry sees the interleaved color1 stream. Phase 1 of FNV multi-layer terrain (see `docs/superpowers/plans/2026-05-22-fnv-multilayer-terrain.md`).*
+
+- **Inline tweak** at the top of `namespace dxvk` (`static_assert`) — 4 LOC.
+  *Pins `LegacyMaterialData::kMaxTerrainLayers == RtMultiLayerTerrainMaterial::kMaxLayers` so the two layer caps -- D3D9 capture side (`rtx_materials.h` `LegacyMaterialData`) and Remix surface-material extension side (`rtx_materials.h` `RtMultiLayerTerrainMaterial`) -- stay in lockstep. Phase 3 of FNV multi-layer terrain (see `docs/superpowers/plans/2026-05-22-fnv-multilayer-terrain.md`).*
+
+- **Inline tweak** at the `RtOpaqueSurfaceMaterial` construction site (~line 1344) — ~6 LOC (one local-variable extraction `multiLayerTerrainIndex = SURFACE_INDEX_INVALID` + one extra ctor argument inserted between `subsurfaceMaterialIndex` and `isUsingRaytracedRenderTarget`).
+  *Threads a `SURFACE_INDEX_INVALID` default for the new `m_multiLayerTerrainIndex` aux slot. The actual population (tracking an `RtMultiLayerTerrainMaterial` in `m_surfaceMaterialExtensionCache` and feeding back the returned index) is deferred to the FNV multi-layer terrain fork hook (Task 13). Phase 3 of FNV multi-layer terrain (see `docs/superpowers/plans/2026-05-22-fnv-multilayer-terrain.md`).*
+
+- **Inline tweak** at the `RtOpaqueSurfaceMaterial` construction site (replacing the Task 12 stub) — ~18 LOC + `#include <array>`.
+  *Populates `multiLayerTerrainIndex` from the new `OpaqueMaterialData` multi-layer fields. When `opaqueMaterialData.terrainLayerCount > 0`, allocates two `std::array<uint32_t, RtMultiLayerTerrainMaterial::kMaxLayers>` filled with `kSurfaceMaterialInvalidTextureIndex`, resolves each `terrainAlbedoTextures[i]` / `terrainNormalTextures[i]` `TextureRef` to a texture index via the same `trackTexture(...)` helper the standard albedo / normal slots use (sharing `hasTexcoords` and `samplerFeedbackStamp` with the surrounding draw-call context), constructs an `RtMultiLayerTerrainMaterial`, and registers it in `m_surfaceMaterialExtensionCache` via `track(...)`. The returned cache index is stored on `RtOpaqueSurfaceMaterial::m_multiLayerTerrainIndex` and later GPU-written as uint16 at `data[27]`; the shader reads the entry via the `OPAQUE_SURFACE_MATERIAL_FLAG_MULTI_LAYER_TERRAIN` flag bit. Phase 3 of FNV multi-layer terrain (see `docs/superpowers/plans/2026-05-22-fnv-multilayer-terrain.md`).*
+
 ---
 
 ## src/dxvk/rtx_render/rtx_scene_manager.h
@@ -883,6 +958,12 @@ initializer list and can't be lifted into a separate TU.
 
 - **Inline tweak** at `DrawCallState::getCategoryFlags` (~line 666) — 1-line modification.
   *ORs `materialData.remixTextureCategoryFlagsFromD3D` into the returned `CategoryFlags` so RS-42 protocol bits (captured by `setLegacyMaterialState`) flow through to the standard per-draw category pipeline. V1 wrappers do not write RS 42 yet; this is forward-compat for future sky/decal/water/UI tagging.*
+
+- **Inline tweak** across `RasterGeometry` / `RaytraceGeometry` / `GeometryBufferData` / `isVertexDataInterleaved` / `areFormatsGpuFriendly` — ~21 LOC mirroring color0.
+  *Adds `color1Buffer` / `color1BufferIndex` slots to `RasterGeometry` and `RaytraceGeometry`, adds a per-vertex color1 field to `GeometryBufferData`, and extends the `isVertexDataInterleaved` / `areFormatsGpuFriendly` predicates to factor color1 the same way they factor color0. Phase 1 of FNV multi-layer terrain (see `docs/superpowers/plans/2026-05-22-fnv-multilayer-terrain.md`).*
+
+- **Inline tweak** in `RasterGeometry` and `RaytraceGeometry` — 2 LOC.
+  *Adds `hasMultiLayerTerrainWeights` bool to both structs so FNV's multi-layer-terrain FLOAT4 weight path can be tagged on the input RasterGeometry (set by `d3d9_rtx.cpp` when `kRemixMultiLayerTerrainBit` is set) and propagated through to the modifiedGeometryData RaytraceGeometry (consumed by `rtx_instance_manager.cpp` to populate `Surface.hasMultiLayerWeights`). Fix for the previously-broken FLOAT4 weight delivery.*
 
 ---
 
@@ -1023,12 +1104,51 @@ initializer list and can't be lifted into a separate TU.
 
 ---
 
+## src/dxvk/shaders/rtx/concept/surface/surface.h
+
+**Category:** index-only
+
+- **Inline tweak** at the `Surface` flags-property block + `SurfaceInteraction` struct — ~6 LOC total.
+  *Adds a `hasColor1` slang property to `Surface` (decoded from bit 2 of `flags0` packed in `rtx_materials.h`) so shader code can branch on color1 presence, and adds a `vertexColor1` field to `SurfaceInteraction` so the interpolated per-vertex color1 value is available downstream. Phase 1 of FNV multi-layer terrain (see `docs/superpowers/plans/2026-05-22-fnv-multilayer-terrain.md`).*
+
+- **Inline tweak** at the `Surface` flags-property block — ~5 LOC.
+  *Adds a `hasMultiLayerWeights` slang property to `Surface` (decoded from bit 3 of `flags0` packed in `rtx_materials.h`) so the surface-interaction color0/color1 decoders can pick the FNV multi-layer-terrain FLOAT4 path instead of the BGRA8 path. Fix for the previously-broken FLOAT4 weight delivery.*
+
+---
+
+## src/dxvk/shaders/rtx/concept/surface/surface_interaction.slangh
+
+**Category:** index-only
+
+- **Inline tweak** in the barycentric-interpolation block of surface-interaction construction — ~26 LOC mirroring the color0 path with a +1 float-slot offset.
+  *Mirrors the color0 barycentric interpolation block: fetches the three triangle-vertex color1 values out of the interleaved buffer (using the color1 offset/stride from the BLAS surface fields, which sit one float slot past color0) and lerps them by barycentrics into `surfaceInteraction.vertexColor1`. Gated on `surface.hasColor1`. Phase 1 of FNV multi-layer terrain (see `docs/superpowers/plans/2026-05-22-fnv-multilayer-terrain.md`).*
+
+- **Inline tweak** in the color0 and color1 barycentric-interpolation blocks — ~30 LOC adding a multi-layer-terrain FLOAT4 branch in front of each existing BGRA8 branch.
+  *FNV's multi-layer-terrain path writes 4 raw floats per color slot into the interleaved buffer (16 bytes each, vs 4 bytes for the packed BGRA8 path). When `surface.hasMultiLayerWeights` is set the new branches read those 4 floats sequentially out of the interleaved buffer (color0 at `baseElementIndex + 0..3`, color1 at `+4..+7` since color1 is 4 float-slots past color0 in the multi-layer stride). Non-multi-layer surfaces fall through to the existing BGRA8 decode unchanged. Fix for the previously-broken FLOAT4 weight delivery.*
+
+---
+
 ## src/dxvk/shaders/rtx/concept/surface_material/opaque_surface_material_interaction.slangh
 
 **Category:** index-only
 
 - **Inline tweak** in the post-`isBakedTerrain` normal-decode block of `opaqueSurfaceMaterialInteractionCreate` (~line 783) — ~12 LOC for an extra `else if` branch in front of the existing octahedral decode.
   *Decodes the normal sample as RGB tangent-space (DirectX convention, green-down) when the per-material flag `OPAQUE_SURFACE_MATERIAL_FLAG_TANGENT_SPACE_NORMAL` is set: `normalize((normalSample.rgb * 2 - 1)` with a `z = abs(z)` hemisphere clamp mirroring NVIDIA's offline `LightspeedOctahedralConverter` reference (Remix downstream assumes hemisphere-only normals). Flag is set by `LegacyMaterialData::as<OpaqueMaterialData>()` on the FNV PS-classifier protocol path (gated by `rtx.legacyMaterial.fnv.autoNormalTangentSpace`); USD/MDL replacement assets never set the flag, so toolkit-replaced normals fall through to the existing octahedral decode unchanged.*
+
+- **Inline tweak** in `opaqueSurfaceMaterialInteractionCreate` (multi-layer blend block following the standard albedo and normal sample loads) — ~103 LOC across the main blend block + a NaN guard + FFP gates from the fix commit. Larger than the 20-LOC inline cap, but **structurally can't be a hook** — the block extends the upstream's inline standard-albedo / standard-normal-load flow with N-layer override paths that share function-local state (`tangentNormal`, `worldToTangent`, the albedo accumulator, the surface-interaction view). Extracting into a hook would require restructuring the upstream function signature and threading that local state in/out.
+  *Gated on `OPAQUE_SURFACE_MATERIAL_FLAG_MULTI_LAYER_TERRAIN`. When set, fetches the `MultiLayerTerrainMaterial` cache entry by `opaqueSurfaceMaterial.multiLayerTerrainIndex` (the slot-27 surfacing added below in `surface_material.h`), reads the per-vertex blend weights from `surfaceInteraction.vertexColor1` (the COLOR1 stream captured in Phase 1 and threaded through interleave / surface-interaction load), normalizes the N-layer weights (with a NaN guard for zero-weight pixels falling back to layer 0), then samples albedo and tangent-space normal per layer and blends both by the normalized weights. The blended results replace the standard albedo and tangent-space normal before they feed the existing `worldToTangent` rotate and downstream BRDF assembly. Phase 4 of FNV multi-layer terrain (see `docs/superpowers/plans/2026-05-22-fnv-multilayer-terrain.md`); consumes the vertex color from Phase 1 (`d3d9_rtx.cpp` / `rtx_geometry_utils.cpp` / `surface_interaction.slangh`) and the extension-cache entry from Phase 3 (Tasks 12–13: `rtx_materials.h`, `rtx_materials.cpp`, `rtx_scene_manager.cpp`).*
+
+---
+
+## src/dxvk/shaders/rtx/concept/surface_material/surface_material.h
+
+**Category:** index-only
+
+- **Inline tweak** at the `OpaqueSurfaceMaterial` slang struct (data array layout) — ~3 LOC splitting the trailing `uint16_t data[5]` padding into `uint16_t multiLayerTerrainIndex` + `uint16_t data[4]` so the shader can read the slot-27 multi-layer-terrain extension-cache index that `RtOpaqueSurfaceMaterial::writeGPUData` writes (Phase 3, Task 12). Under the 20-LOC inline cap.
+  *Surfaces the multi-layer-terrain extension-cache slot to shader code. The slot was already being written GPU-side by the C++ `writeGPUData` path; this entry just relabels the slot for the shader so `opaque_surface_material_interaction.slangh` can dereference it on the multi-layer blend branch (entry above). Phase 4 of FNV multi-layer terrain (see `docs/superpowers/plans/2026-05-22-fnv-multilayer-terrain.md`).*
+
+- **Inline tweak** at file scope (new `MultiLayerTerrainMaterial` slang struct) — ~24 LOC for the struct definition mirroring `RtMultiLayerTerrainMaterial`'s 64-byte GPU layout: `uint16_t typeTag`, `uint16_t layerCount`, `uint16_t albedoTextureIndices[7]`, `uint16_t normalTextureIndices[7]`, `uint16_t data[16]` padding. Total = 64 bytes, matches `kSurfaceMaterialGPUSize`.
+  *Shader-side mirror of the C++ extension-material struct (`rtx_materials.h:1522-1550` — `RtMultiLayerTerrainMaterial::writeGPUData`). The multi-layer blend block in `opaque_surface_material_interaction.slangh` loads one of these out of the extension-material cache buffer at the index surfaced by the `OpaqueSurfaceMaterial.multiLayerTerrainIndex` field above, then reads `layerCount` plus the per-layer albedo / normal texture indices to drive the N-layer sample-and-blend loop. Phase 4 of FNV multi-layer terrain (see `docs/superpowers/plans/2026-05-22-fnv-multilayer-terrain.md`).*
 
 ---
 
@@ -1149,6 +1269,39 @@ initializer list and can't be lifted into a separate TU.
 
 ---
 
+## src/dxvk/shaders/rtx/pass/interleave_geometry.comp.slang
+
+**Category:** index-only
+
+- **Inline tweak** at the binding declarations + dispatch arg load — ~2 LOC.
+  *Adds the `srcColor1` structured-buffer binding (matches the new `INTERLEAVE_GEOMETRY_BINDING_COLOR1_INPUT` slot) and reads the color1 dispatch arg out of the `InterleaveGeometryArgs` cbuffer so the kernel writes color1 into the interleaved output buffer next to color0. Phase 1 of FNV multi-layer terrain (see `docs/superpowers/plans/2026-05-22-fnv-multilayer-terrain.md`).*
+
+---
+
+## src/dxvk/shaders/rtx/pass/interleave_geometry.h
+
+**Category:** index-only
+
+- **Inline tweak** at the `interleave()` helper — ~5 LOC.
+  *Adds a `srcColor1` parameter and a conditional write block that emits the color1 float into the interleaved output one slot after color0, gated on `hasColor1`. Phase 1 of FNV multi-layer terrain (see `docs/superpowers/plans/2026-05-22-fnv-multilayer-terrain.md`).*
+
+- **Inline tweak** at `formatConversionUintSupported` + the color0/color1 write blocks in `interleave()` — ~25 LOC.
+  *Recognizes `VK_FORMAT_R32G32B32A32_SFLOAT` so FNV's FLOAT4 color streams stop hitting the "unsupported format" warning + denormal-corrupted path. Adds a FLOAT4 multi-layer-terrain branch in both the color0 and color1 write blocks: when `cb.isMultiLayerTerrain` is set, reads 4 raw uint32 cells from `srcColor{0,1}[baseIdx + 0..3]` and `asfloat()`-bitcasts each into the interleaved output (4 floats per slot). Non-multi-layer draws take the existing 1-uint-per-color path unchanged. Fix for the previously-broken FLOAT4 weight delivery.*
+
+---
+
+## src/dxvk/shaders/rtx/pass/interleave_geometry_indices.h
+
+**Category:** index-only
+
+- **Inline tweak** at `InterleaveGeometryArgs` (struct) + binding-define block — ~5 LOC total.
+  *Adds four color1 fields to `InterleaveGeometryArgs` (`hasColor1`, `color1Offset`, `color1Stride`, `color1DataIndex` — mirroring the color0 quartet) and defines `INTERLEAVE_GEOMETRY_BINDING_COLOR1_INPUT = 5` for the new structured-buffer binding slot consumed by `interleave_geometry.comp.slang`. Phase 1 of FNV multi-layer terrain (see `docs/superpowers/plans/2026-05-22-fnv-multilayer-terrain.md`).*
+
+- **Inline tweak** at `InterleaveGeometryArgs` (struct) — 1 LOC.
+  *Adds `isMultiLayerTerrain` uint32_t flag so the CPU-side `interleaveGeometry` can signal the interleaver shader to take the FLOAT4 path for color0/color1 (4 floats per slot instead of 1 packed uint). Fix for the previously-broken FLOAT4 weight delivery.*
+
+---
+
 ## src/dxvk/shaders/rtx/pass/raytrace_args.h
 
 **Pre-refactor fork footprint:** +3 / -0 LOC (audit 2026-04-18)
@@ -1265,6 +1418,12 @@ initializer list and can't be lifted into a separate TU.
 
 - **Inline tweak** at the `OPAQUE_SURFACE_MATERIAL_FLAG_*` bit-field block (~line 47) — 1-line `#define` for a new flag bit at `COMMON_MATERIAL_FLAG_TYPE_OFFSET(5)`.
   *Adds `OPAQUE_SURFACE_MATERIAL_FLAG_TANGENT_SPACE_NORMAL`. Set by `RtOpaqueSurfaceMaterial::writeGPUData` when the CPU-side `m_isTangentSpaceNormal` is true (originating from `LegacyMaterialData::as<OpaqueMaterialData>()` on the FNV PS-classifier protocol path); consumed by the normal-decode branch in `opaque_surface_material_interaction.slangh` to switch from octahedral decode to direct RGB-tangent-space decode.*
+
+- **Inline tweak** at the surface-material-type constant block (~line 27-30) — 1-line `static const uint8_t surfaceMaterialTypeMultiLayerTerrain = uint8_t(3u);` plus comment.
+  *Tags multi-layer-terrain extension entries in the surface-material extension cache. Value 3 fits in the existing `surfaceMaterialTypeMask = 0x3u`. Informational only -- like the implicit subsurface tag, the shader knows an extension entry is multi-layer-terrain because the parent opaque material's `m_multiLayerTerrainIndex` points at it; the polymorphic dispatch path is not used for extension cache entries. Phase 3 of FNV multi-layer terrain (see `docs/superpowers/plans/2026-05-22-fnv-multilayer-terrain.md`).*
+
+- **Inline tweak** at the `OPAQUE_SURFACE_MATERIAL_FLAG_*` bit-field block (~line 52) — 1-line `#define` for a new flag bit at `COMMON_MATERIAL_FLAG_TYPE_OFFSET(6)`.
+  *Adds `OPAQUE_SURFACE_MATERIAL_FLAG_MULTI_LAYER_TERRAIN`. Set by the FNV multi-layer terrain capture path; tells the shader to consult the parent opaque material's `m_multiLayerTerrainIndex` aux slot and read the per-layer texture indices from the corresponding `RtMultiLayerTerrainMaterial` entry in the surface-material extension cache. Phase 3 of FNV multi-layer terrain (see `docs/superpowers/plans/2026-05-22-fnv-multilayer-terrain.md`).*
 
 ---
 

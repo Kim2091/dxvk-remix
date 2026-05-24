@@ -48,7 +48,10 @@
 #include "rtx/pass/interleave_geometry.h"
 
 namespace dxvk {
-  static constexpr uint32_t kMaxInterleavedComponents = 3 + 3 + 2 + 1;
+  // Position(3) + Normal(3) + Texcoord(2) + Color0(1 or 4) + Color1(1 or 4).
+  // Multi-layer terrain (FNV) uses the 4-float-per-color path; non-terrain
+  // draws use the 1-uint-per-color packed path. Sized for the worst case.
+  static constexpr uint32_t kMaxInterleavedComponents = 3 + 3 + 2 + 4 + 4;
 
   // Defined within an unnamed namespace to ensure unique definition across binary
   namespace {
@@ -136,6 +139,7 @@ namespace dxvk {
       STRUCTURED_BUFFER(INTERLEAVE_GEOMETRY_BINDING_NORMAL_INPUT)
       STRUCTURED_BUFFER(INTERLEAVE_GEOMETRY_BINDING_TEXCOORD_INPUT)
       STRUCTURED_BUFFER(INTERLEAVE_GEOMETRY_BINDING_COLOR0_INPUT)
+      STRUCTURED_BUFFER(INTERLEAVE_GEOMETRY_BINDING_COLOR1_INPUT)
       END_PARAMETER()
     };
 
@@ -785,8 +789,19 @@ namespace dxvk {
     if (desc.hasTexcoord)
       output.texcoordBuffer = RaytraceBuffer(targetSlice, desc.texcoordOffset, desc.stride, VK_FORMAT_R32G32_SFLOAT);
 
-    if (desc.hasColor0) 
-      output.color0Buffer = RaytraceBuffer(targetSlice, desc.color0Offset, desc.stride, VK_FORMAT_B8G8R8A8_UNORM);
+    // Fork: multi-layer terrain tags the output color buffers as FLOAT4 instead of
+    // BGRA8 so the hit-side decoder picks the raw-float branch.
+    const VkFormat colorFormat = desc.hasMultiLayerTerrainWeights ? VK_FORMAT_R32G32B32A32_SFLOAT : VK_FORMAT_B8G8R8A8_UNORM;
+
+    if (desc.hasColor0)
+      output.color0Buffer = RaytraceBuffer(targetSlice, desc.color0Offset, desc.stride, colorFormat);
+
+    if (desc.hasColor1)
+      output.color1Buffer = RaytraceBuffer(targetSlice, desc.color1Offset, desc.stride, colorFormat);
+
+    // Fork: propagate the multi-layer-terrain tag so the surface uploader can
+    // surface it through to the shader.
+    output.hasMultiLayerTerrainWeights = desc.hasMultiLayerTerrainWeights;
   }
 
   void RtxGeometryUtils::processGeometryBuffers(const RasterGeometry& input, RaytraceGeometry& output) {
@@ -802,6 +817,12 @@ namespace dxvk {
 
     if (input.color0Buffer.defined())
       output.color0Buffer = RaytraceBuffer(slice, input.color0Buffer.offsetFromSlice(), input.color0Buffer.stride(), input.color0Buffer.vertexFormat());
+
+    if (input.color1Buffer.defined())
+      output.color1Buffer = RaytraceBuffer(slice, input.color1Buffer.offsetFromSlice(), input.color1Buffer.stride(), input.color1Buffer.vertexFormat());
+
+    // Fork: propagate the multi-layer-terrain tag.
+    output.hasMultiLayerTerrainWeights = input.hasMultiLayerTerrainWeights;
   }
 
   size_t RtxGeometryUtils::computeOptimalVertexStride(const RasterGeometry& input, bool forceNormals) {
@@ -816,8 +837,18 @@ namespace dxvk {
       stride += sizeof(float) * 2;
     }
 
+    // Fork: multi-layer terrain stores per-color slot as 4 floats (FLOAT4 raw
+    // weights) instead of 1 packed BGRA8 uint.
+    const size_t colorSlotBytes = input.hasMultiLayerTerrainWeights
+      ? 4 * sizeof(uint32_t)
+      : sizeof(uint32_t);
+
     if (input.color0Buffer.defined()) {
-      stride += sizeof(uint32_t);
+      stride += colorSlotBytes;
+    }
+
+    if (input.color1Buffer.defined()) {
+      stride += colorSlotBytes;
     }
 
     assert(stride <= kMaxInterleavedComponents * sizeof(float) && "Maximum number of interleaved components needs update.");
@@ -892,15 +923,36 @@ namespace dxvk {
         ONCE(Logger::warn(str::format("[rtx-interleaver] Unsupported texcoord buffer format (", args.texcoordFormat, "), skipping texcoord")));
       }
     }
+    // Fork: FNV multi-layer terrain selects a FLOAT4 path for both color slots.
+    args.isMultiLayerTerrain = input.hasMultiLayerTerrainWeights ? 1u : 0u;
+
     args.hasColor0 = input.color0Buffer.defined();
     if (args.hasColor0) {
       mustUseGPU |= input.color0Buffer.isPendingGpuWrite() || input.color0Buffer.mapPtr() == nullptr;
       assert(input.color0Buffer.offsetFromSlice() % 4 == 0);
       args.color0Offset = input.color0Buffer.offsetFromSlice() / 4;
       args.color0Stride = input.color0Buffer.stride() / 4;
-      args.color0Format = input.color0Buffer.vertexFormat();
+      // Multi-layer terrain forces the source format to FLOAT4 -- the actual
+      // source bytes are 4 raw floats per vertex (FNV's blend weights), and
+      // the FLOAT4 path in the interleaver reads them directly.
+      args.color0Format = args.isMultiLayerTerrain
+        ? uint32_t(VK_FORMAT_R32G32B32A32_SFLOAT)
+        : input.color0Buffer.vertexFormat();
       if (!interleaver::formatConversionUintSupported(args.color0Format)) {
         ONCE(Logger::warn(str::format("[rtx-interleaver] Unsupported color0 buffer format (", args.color0Format, "), skipping color0")));
+      }
+    }
+    args.hasColor1 = input.color1Buffer.defined();
+    if (args.hasColor1) {
+      mustUseGPU |= input.color1Buffer.isPendingGpuWrite() || input.color1Buffer.mapPtr() == nullptr;
+      assert(input.color1Buffer.offsetFromSlice() % 4 == 0);
+      args.color1Offset = input.color1Buffer.offsetFromSlice() / 4;
+      args.color1Stride = input.color1Buffer.stride() / 4;
+      args.color1Format = args.isMultiLayerTerrain
+        ? uint32_t(VK_FORMAT_R32G32B32A32_SFLOAT)
+        : input.color1Buffer.vertexFormat();
+      if (!interleaver::formatConversionUintSupported(args.color1Format)) {
+        ONCE(Logger::warn(str::format("[rtx-interleaver] Unsupported color1 buffer format (", args.color1Format, "), skipping color1")));
       }
     }
 
@@ -923,6 +975,8 @@ namespace dxvk {
         ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_TEXCOORD_INPUT, input.texcoordBuffer);
       if (args.hasColor0)
         ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_COLOR0_INPUT, input.color0Buffer);
+      if (args.hasColor1)
+        ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_COLOR1_INPUT, input.color1Buffer);
 
       ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
 
@@ -942,9 +996,10 @@ namespace dxvk {
       args.normalOffset = 0;
       args.texcoordOffset = 0;
       args.color0Offset = 0;
+      args.color1Offset = 0;
 
       for (uint32_t i = 0; i < input.vertexCount; i++) {
-        interleaver::interleave(i, dst, inputData.positionData, inputData.normalData, inputData.texcoordData, inputData.vertexColorData, args);
+        interleaver::interleave(i, dst, inputData.positionData, inputData.normalData, inputData.texcoordData, inputData.vertexColorData, inputData.vertexColor1Data, args);
       }
 
       ctx->writeToBuffer(output.buffer, 0, input.vertexCount * output.stride, dst);
@@ -967,11 +1022,28 @@ namespace dxvk {
       offset += sizeof(float) * 2;
     }
 
+    // Fork: multi-layer terrain writes 4 floats per color slot (16 bytes); the
+    // BGRA8 path writes 1 packed uint (4 bytes).
+    const uint32_t colorSlotBytes = input.hasMultiLayerTerrainWeights
+      ? uint32_t(4 * sizeof(uint32_t))
+      : uint32_t(sizeof(uint32_t));
+
     if (input.color0Buffer.defined()) {
       output.hasColor0 = true;
       output.color0Offset = offset;
-      offset += sizeof(uint32_t);
+      offset += colorSlotBytes;
     }
+
+    if (input.color1Buffer.defined()) {
+      output.hasColor1 = true;
+      output.color1Offset = offset;
+      offset += colorSlotBytes;
+    }
+
+    // Fork: tag the descriptor so processGeometryBuffers can set the correct
+    // VkFormat on the raytrace-side color buffers and propagate the flag onto
+    // the RaytraceGeometry.
+    output.hasMultiLayerTerrainWeights = input.hasMultiLayerTerrainWeights;
   }
 
   float RtxGeometryUtils::computeMaxUVTileSize(const RasterGeometry& input, const Matrix4& objectToWorld) {

@@ -69,6 +69,12 @@ namespace interleaver {
   bool formatConversionUintSupported(uint32_t format) {
     switch (format) {
     case SupportedVkFormats::VK_FORMAT_B8G8R8A8_UNORM:
+    // Fork: FNV multi-layer terrain ships per-vertex blend weights as a FLOAT4
+    // (COLOR0 layers 0-2 + TEXCOORD1 layers 3-6 captured as a synthetic COLOR1).
+    // The interleaver takes a separate FLOAT4 path for these slots (4 floats per
+    // vertex, no packed-uint conversion); the format is accepted here so the
+    // surrounding "unsupported format" warning is suppressed.
+    case SupportedVkFormats::VK_FORMAT_R32G32B32A32_SFLOAT:
       return true;
     default:
       return false;
@@ -119,7 +125,7 @@ namespace interleaver {
     return uint3(1,1,1);
   }
 
-  void interleave(const uint32_t idx, WriteBuffer(float) dst, ReadBuffer(float) srcPosition, ReadBuffer(float) srcNormal, ReadBuffer(float) srcTexcoord, ReadBuffer(uint32_t) srcColor0, const InterleaveGeometryArgs cb) {
+  void interleave(const uint32_t idx, WriteBuffer(float) dst, ReadBuffer(float) srcPosition, ReadBuffer(float) srcNormal, ReadBuffer(float) srcTexcoord, ReadBuffer(uint32_t) srcColor0, ReadBuffer(uint32_t) srcColor1, const InterleaveGeometryArgs cb) {
     const uint32_t srcVertexIndex = idx + cb.minVertexIndex;
 
     uint32_t writeOffset = 0;
@@ -148,8 +154,35 @@ namespace interleaver {
     }
 
     if (cb.hasColor0) {
-      uint3 color0 = convert(cb.color0Format, srcColor0, srcVertexIndex * cb.color0Stride + cb.color0Offset);
-      dst[idx * cb.outputStride + writeOffset++] = asfloat(color0.x);
+      if (cb.isMultiLayerTerrain) {
+        // Fork: FLOAT4 multi-layer-terrain path. Read 4 raw floats out of the
+        // source COLOR0 stream (FNV's per-vertex blend weights for layers 0-2 +
+        // unused .w) and emit them sequentially. Decoded back as 4 floats by
+        // the multi-layer branch in surface_interaction.slangh.
+        const uint baseIdx = srcVertexIndex * cb.color0Stride + cb.color0Offset;
+        dst[idx * cb.outputStride + writeOffset++] = asfloat(srcColor0[baseIdx + 0]);
+        dst[idx * cb.outputStride + writeOffset++] = asfloat(srcColor0[baseIdx + 1]);
+        dst[idx * cb.outputStride + writeOffset++] = asfloat(srcColor0[baseIdx + 2]);
+        dst[idx * cb.outputStride + writeOffset++] = asfloat(srcColor0[baseIdx + 3]);
+      } else {
+        uint3 color0 = convert(cb.color0Format, srcColor0, srcVertexIndex * cb.color0Stride + cb.color0Offset);
+        dst[idx * cb.outputStride + writeOffset++] = asfloat(color0.x);
+      }
+    }
+
+    if (cb.hasColor1) {
+      if (cb.isMultiLayerTerrain) {
+        // Fork: FLOAT4 multi-layer-terrain path. Source is the synthetic COLOR1
+        // (FNV's TEXCOORD1) carrying blend weights for layers 3-6. See above.
+        const uint baseIdx = srcVertexIndex * cb.color1Stride + cb.color1Offset;
+        dst[idx * cb.outputStride + writeOffset++] = asfloat(srcColor1[baseIdx + 0]);
+        dst[idx * cb.outputStride + writeOffset++] = asfloat(srcColor1[baseIdx + 1]);
+        dst[idx * cb.outputStride + writeOffset++] = asfloat(srcColor1[baseIdx + 2]);
+        dst[idx * cb.outputStride + writeOffset++] = asfloat(srcColor1[baseIdx + 3]);
+      } else {
+        uint3 color1 = convert(cb.color1Format, srcColor1, srcVertexIndex * cb.color1Stride + cb.color1Offset);
+        dst[idx * cb.outputStride + writeOffset++] = asfloat(color1.x);
+      }
     }
   }
 }
