@@ -953,6 +953,18 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
     roughness = roughnessSample.x;
   }
 
+  // Fork: Bethesda/Gamebryo DXT5n convention -- the NormalMap's alpha channel encodes
+  // specular intensity (1.0 = mirror, 0.0 = matte). Convert to perceptual roughness via
+  // the standard inversion. Overrides both the roughnessConstant default and any
+  // roughness texture (FNV doesn't ship one, but a USD-replaced material would; users
+  // can disable via rtx.legacyMaterial.fnv.autoRoughnessFromSpecular if they want the
+  // replaced roughness to take effect). The downstream roughnessScale/roughnessBias
+  // multipliers still apply for in-menu tuning.
+  if (normalLoaded && (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_ROUGHNESS_FROM_NORMAL_ALPHA))
+  {
+    roughness = 1.0f - normalSample.a;
+  }
+
 #if defined(RAY_TRACING_PRIMARY_RAY)
   if (cb.debugView == DEBUG_VIEW_OPAQUE_ROUGHNESS_RESOLUTION_CHECKERS) 
   {

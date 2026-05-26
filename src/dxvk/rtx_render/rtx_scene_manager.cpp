@@ -1369,6 +1369,7 @@ namespace dxvk {
       // Encoded into the GPU surface material's flags word (see writeGPUData) and
       // consumed by opaque_surface_material_interaction.slangh's normal-decode branch.
       const bool isTangentSpaceNormal = opaqueMaterialData.getIsTangentSpaceNormalOverride();
+      const bool isRoughnessFromNormalAlpha = opaqueMaterialData.getIsRoughnessFromNormalAlphaOverride();
 
       // Fork: aux-index slot for FNV multi-layer terrain. When the opaque material
       // staging struct carries a non-zero terrainLayerCount (set by the fork hook
@@ -1413,7 +1414,8 @@ namespace dxvk {
         isUsingRaytracedRenderTarget,
         samplerFeedbackStamp,
         secondaryTextureIndex,
-        isTangentSpaceNormal
+        isTangentSpaceNormal,
+        isRoughnessFromNormalAlpha
       };
 
       if (opaqueSurfaceMaterial.hasValidDisplacement()) {
