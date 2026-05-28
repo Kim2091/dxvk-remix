@@ -3608,9 +3608,17 @@ namespace dxvk {
 
     // RTX was injected => treat everything else as rasterized 
     if (m_rtxInjectTriggered) {
-      return finishPrepare(RtxOptions::skipDrawCallsPostRTXInjection()
-             ? PrepareDrawFlag::Ignore
-             : PrepareDrawFlag::PreserveDrawCallAndItsState);
+      bool isRaytracedRenderTarget = false;
+      if (RtxOptions::RaytracedRenderTarget::enable()) {
+        D3D9CommonTexture* texture = GetCommonTexture(d3d9State().renderTargets[kRenderTargetIndex]->GetBaseTexture());
+        if (texture && lookupHash(RtxOptions::raytracedRenderTargetTextures(), texture->GetImage()->getDescriptorHash())) {
+          isRaytracedRenderTarget = true;
+        }
+      }
+      if (!isRaytracedRenderTarget) {
+        return finishPrepare(RtxOptions::skipDrawCallsPostRTXInjection()
+               ? PrepareDrawFlag::Ignore
+               : PrepareDrawFlag::PreserveDrawCallAndItsState);
     }
 
     // classify UE3 vertex factory early so makeDrawCallType can use it for pass filtering
@@ -3624,6 +3632,7 @@ namespace dxvk {
       } else {
         m_currentUe3VertexFactory = classifyUe3VertexFactory(elements);
         m_ue3VertexFactoryCache.emplace(declKey, m_currentUe3VertexFactory);
+      }
       }
     }
 
