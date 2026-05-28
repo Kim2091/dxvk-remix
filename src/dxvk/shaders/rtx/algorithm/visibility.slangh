@@ -510,7 +510,7 @@ VisibilityResult traceVisibilityRay<let VisibilityMode : uint>(
   // shadow terminator mitigation for smooth shading on coarse geometry
   // in grazing/mismatch regions allow a small number of retries if the first hit is extremely close
   // to the ray origin (likely self intersection on the source surface)
-  const float16_t geomNoLForBypass = max(float16_t(0.0), dot(minimalSurfaceInteraction.triangleNormal, visibilityRay.direction));
+  const float16_t geomNoLForBypass = max(float16_t(0.0), dot(minimalSurfaceInteraction.geometryNormal, visibilityRay.direction));
   const float16_t shadeNoLForBypass = hasShadingNormal
     ? max(float16_t(0.0), dot(shadingNormal, visibilityRay.direction))
     : geomNoLForBypass;
@@ -521,7 +521,7 @@ VisibilityResult traceVisibilityRay<let VisibilityMode : uint>(
     ? saturate((float16_t(0.45) - geomNoLForBypass) / float16_t(0.45))
     : float16_t(0.0);
   const float16_t selfHitBypassWeight = max(mismatchWeightForBypass, grazingWeightForBypass);
-  const float baseRayOffsetLength = length(calculateRayOffset(minimalSurfaceInteraction.positionError, minimalSurfaceInteraction.triangleNormal));
+  const float baseRayOffsetLength = length(calculateRayOffset(minimalSurfaceInteraction.positionError, minimalSurfaceInteraction.geometryNormal));
   const float thresholdFromOffset = baseRayOffsetLength * (12.0f + 96.0f * float(selfHitBypassWeight));
   const float thresholdFromError = minimalSurfaceInteraction.positionError * (6.0f + 48.0f * float(selfHitBypassWeight));
   const float unclampedBypassThreshold = max(max(thresholdFromOffset, thresholdFromError), 0.003f);
@@ -529,7 +529,7 @@ VisibilityResult traceVisibilityRay<let VisibilityMode : uint>(
   const float tMaxRelativeBypassCap = max(0.002f, visibilityRay.tMax * (0.005f + 0.02f * float(selfHitBypassWeight)));
   const float selfHitBypassThreshold = min(0.35f, min(unclampedBypassThreshold, tMaxRelativeBypassCap));
 
-  f16vec3 selfHitBypassPushDirection = minimalSurfaceInteraction.triangleNormal;
+  f16vec3 selfHitBypassPushDirection = minimalSurfaceInteraction.geometryNormal;
   if (dot(selfHitBypassPushDirection, visibilityRay.direction) < float16_t(0.0))
   {
     selfHitBypassPushDirection = -selfHitBypassPushDirection;

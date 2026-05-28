@@ -3606,19 +3606,29 @@ namespace dxvk {
       return flags;
     };
 
-    // RTX was injected => treat everything else as rasterized 
+    // RTX was injected => treat everything else as rasterized,
+    // unless this draw targets a raytraced render target (e.g. render-to-texture
+    // in games that draw UI before 3D content).
     if (m_rtxInjectTriggered) {
       bool isRaytracedRenderTarget = false;
-      if (RtxOptions::RaytracedRenderTarget::enable()) {
+      if (RtxOptions::RaytracedRenderTarget::enable() &&
+          d3d9State().renderTargets[kRenderTargetIndex] != nullptr) {
         D3D9CommonTexture* texture = GetCommonTexture(d3d9State().renderTargets[kRenderTargetIndex]->GetBaseTexture());
-        if (texture && lookupHash(RtxOptions::raytracedRenderTargetTextures(), texture->GetImage()->getDescriptorHash())) {
-          isRaytracedRenderTarget = true;
+        if (texture) {
+          const Rc<DxvkImage> image = texture->GetImage();
+          if (image != nullptr) {
+            const XXH64_hash_t descHash = image->getDescriptorHash();
+            isRaytracedRenderTarget =
+              lookupHash(RtxOptions::raytracedRenderTargetTextures(), descHash) ||
+              lookupHash(m_autoRaytracedRenderTargetDescHashes, descHash);
+          }
         }
       }
       if (!isRaytracedRenderTarget) {
         return finishPrepare(RtxOptions::skipDrawCallsPostRTXInjection()
                ? PrepareDrawFlag::Ignore
                : PrepareDrawFlag::PreserveDrawCallAndItsState);
+      }
     }
 
     // classify UE3 vertex factory early so makeDrawCallType can use it for pass filtering
@@ -3632,7 +3642,6 @@ namespace dxvk {
       } else {
         m_currentUe3VertexFactory = classifyUe3VertexFactory(elements);
         m_ue3VertexFactoryCache.emplace(declKey, m_currentUe3VertexFactory);
-      }
       }
     }
 
