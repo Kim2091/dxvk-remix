@@ -120,6 +120,18 @@ namespace dxvk {
       return sig;
     }
 
+    static std::string toLowerAscii(const std::string& s) {
+      std::string out;
+      out.reserve(s.size());
+      for (const char c : s)
+        out.push_back(char(std::tolower(static_cast<unsigned char>(c))));
+      return out;
+    }
+
+    static bool containsToken(const std::string& s, const char* token) {
+      return s.find(token) != std::string::npos;
+    }
+
     static XXH64_hash_t hashDxsoBytecode(const std::vector<uint8_t>& bytecode) {
       if (bytecode.empty())
         return 0;
@@ -237,6 +249,8 @@ namespace dxvk {
     constexpr uint8_t kPsSamplerSemanticLightmap        = 1u << 1;
     constexpr uint8_t kPsSamplerSemanticMaterialTexture = 1u << 2;
     constexpr uint8_t kPsSamplerSemanticNonDiffuse      = 1u << 3;
+    constexpr uint8_t kPsSamplerSemanticVideo           = 1u << 4;
+    constexpr uint8_t kPsSamplerSemanticMovieTexture    = 1u << 5;
 
     // expression-level hints inferred from shader opcode/dataflow around a sampler's UV path
     constexpr uint8_t kPsSamplerExprUvTransform = 1u << 0;
@@ -259,8 +273,13 @@ namespace dxvk {
       };
 
       uint8_t flags = 0;
+      const bool isBinkPlaneName =
+        contains("ycrcb") || contains("yuv") || contains("bink");
+      const bool isMovieTextureName =
+        contains("texturesampleparametermovie") || contains("movie");
 
-      if (contains("texture2d_") || contains("texturecube_") || contains("texture3d_") ||
+      if (!isBinkPlaneName &&
+          (contains("texture2d_") || contains("texturecube_") || contains("texture3d_") ||
           contains("materialtexture") || contains("materialsampler") ||
           contains("textureparameter") || contains("texturesample") ||
           contains("texturesampleparameter2d") || contains("texturesampleparametercube") ||
@@ -270,7 +289,7 @@ namespace dxvk {
           contains("base_color") || contains("billboard") || contains("advert") ||
           contains("poster") || contains("decal") || contains("fontsample") ||
           contains("subuv") || contains("flipbook") || contains("particlesubuv") ||
-          contains("meshsubuv") || contains("cubemap")) {
+          contains("meshsubuv") || contains("cubemap"))) {
         flags |= kPsSamplerSemanticMaterialTexture;
       }
 
@@ -287,7 +306,10 @@ namespace dxvk {
           contains("scenecolorscratchtexture") || contains("ldrtranslucencytexture") ||
           contains("accumulateddistortiontexture") || contains("accumulatedfrontfaceslineintegraltexture") ||
           contains("accumulatedbackfaceslineintegraltexture") || contains("scenecoloruitexture") ||
+          contains("uibuffer") || contains("uitexture") ||
           contains("blurreduitexture") || contains("sceneblurtexture") ||
+          contains("colorcurves") || contains("exposure") ||
+          contains("ycrcb") || contains("yuv") || contains("bink") ||
           contains("destdepth") || contains("destcolor") ||
           contains("pixeldepth") || contains("scenetexture") ||
           contains("depthbias") || contains("depthbiased") ||
@@ -300,6 +322,15 @@ namespace dxvk {
       if (contains("lightmap")) {
         flags |= kPsSamplerSemanticLightmap;
         flags |= kPsSamplerSemanticEngineAuxiliary;
+      }
+
+      if (isBinkPlaneName) {
+        flags |= kPsSamplerSemanticVideo;
+        flags |= kPsSamplerSemanticEngineAuxiliary;
+        flags |= kPsSamplerSemanticNonDiffuse;
+      }
+      if (!isBinkPlaneName && isMovieTextureName) {
+        flags |= kPsSamplerSemanticMovieTexture;
       }
 
       if (contains("normal") || contains("specular") || contains("roughness") ||
@@ -1580,7 +1611,8 @@ namespace dxvk {
       const uint32_t viewOriginRegister,
       Matrix4& outWorldToView,
       Matrix4& outViewToProjection,
-      bool* outUsedTranspose = nullptr) {
+      bool* outUsedTranspose = nullptr,
+      float* outReconstructionError = nullptr) {
 
       // UE3 uploads ViewProjectionMatrix via SetVertexShaderConstantF as 4 consecutive float4 registers
       // These values are the raw shader constants and in UE3/HLSL this matrix is typically treated as column-major
@@ -1802,6 +1834,8 @@ namespace dxvk {
       outViewToProjection = best->viewToProjection;
       if (outUsedTranspose != nullptr)
         *outUsedTranspose = (best == &transposed);
+      if (outReconstructionError != nullptr)
+        *outReconstructionError = best->error;
       return true;
     }
   }
@@ -1830,12 +1864,41 @@ namespace dxvk {
 
     // particle = POSITION(FLOAT3) + NORMAL(FLOAT3) + TANGENT(FLOAT3) + TEXCOORD0(FLOAT2) + BLENDWEIGHT(FLOAT1) + TEXCOORD1(FLOAT4)
     // NORMAL is FLOAT3 (not UBYTE4), TANGENT is FLOAT3, plus BLENDWEIGHT(FLOAT1)
+    if ((sig.positionType == D3DDECLTYPE_FLOAT3 || sig.positionType == D3DDECLTYPE_FLOAT4) &&
+        !sig.hasNormal &&
+        sig.hasTangent && sig.tangentType == D3DDECLTYPE_FLOAT4 &&
+        sig.hasBlendWeight && sig.blendWeightType == D3DDECLTYPE_FLOAT1 &&
+        sig.texcoordCount >= 4 &&
+        !sig.hasBlendIndices) {
+      return Ue3VertexFactoryType::LensFlare;
+    }
+
+    if ((sig.positionType == D3DDECLTYPE_FLOAT3 || sig.positionType == D3DDECLTYPE_FLOAT4) &&
+        sig.hasNormal && sig.normalType == D3DDECLTYPE_FLOAT4 &&
+        sig.hasTangent && sig.tangentType == D3DDECLTYPE_FLOAT3 &&
+        sig.hasBlendWeight && sig.blendWeightType == D3DDECLTYPE_FLOAT1 &&
+        sig.texcoordCount >= 2 &&
+        !sig.hasBlendIndices) {
+      return Ue3VertexFactoryType::ParticleBeamTrail;
+    }
+
     if (sig.positionType == D3DDECLTYPE_FLOAT3 &&
         sig.hasNormal && sig.normalType == D3DDECLTYPE_FLOAT3 &&
         sig.hasTangent && sig.tangentType == D3DDECLTYPE_FLOAT3 &&
         sig.hasBlendWeight && sig.blendWeightType == D3DDECLTYPE_FLOAT1 &&
         !sig.hasBlendIndices) {
       return Ue3VertexFactoryType::Particle;
+    }
+
+    // SpeedTree variants carry an explicit binormal and wind info through BLENDINDICES,
+    // but they do not have skinning blend weights.
+    if (sig.positionType == D3DDECLTYPE_FLOAT3 &&
+        sig.hasBinormal &&
+        sig.hasBlendIndices &&
+        !sig.hasBlendWeight &&
+        sig.hasTangent &&
+        sig.hasNormal) {
+      return Ue3VertexFactoryType::SpeedTree;
     }
 
     // position only (depth prepass) = only POSITION, no tangent/normal/texcoord/color
@@ -1862,6 +1925,19 @@ namespace dxvk {
     }
 
     // local (static mesh) = POSITION(FLOAT3) + TANGENT(UBYTE4) + NORMAL(UBYTE4) + TEXCOORDs, no BLENDINDICES
+    // foliage extends the local layout with instancing axes in TEXCOORD1..4.
+    if (sig.positionType == D3DDECLTYPE_FLOAT3 &&
+        sig.hasTangent &&
+        sig.hasNormal &&
+        !sig.hasBlendIndices &&
+        sig.texcoordCount >= 5 &&
+        sig.texcoordTypes[1] == D3DDECLTYPE_FLOAT3 &&
+        sig.texcoordTypes[2] == D3DDECLTYPE_FLOAT3 &&
+        sig.texcoordTypes[3] == D3DDECLTYPE_FLOAT3 &&
+        sig.texcoordTypes[4] == D3DDECLTYPE_FLOAT3) {
+      return Ue3VertexFactoryType::Foliage;
+    }
+
     if (sig.positionType == D3DDECLTYPE_FLOAT3 &&
         sig.hasTangent && sig.tangentType == D3DDECLTYPE_UBYTE4 &&
         sig.hasNormal && sig.normalType == D3DDECLTYPE_UBYTE4 &&
@@ -1870,6 +1946,354 @@ namespace dxvk {
     }
 
     return Ue3VertexFactoryType::Unknown;
+  }
+
+  D3D9Rtx::Ue3ShaderFeatureInfo D3D9Rtx::getUe3ShaderFeatureInfo(const D3D9CommonShader* shader) {
+    Ue3ShaderFeatureInfo empty;
+    empty.initialized = true;
+
+    if (shader == nullptr)
+      return empty;
+
+    const auto& bytecode = shader->GetBytecode();
+    const XXH64_hash_t shaderHash = hashDxsoBytecode(bytecode);
+    if (shaderHash == 0)
+      return empty;
+
+    auto it = m_ue3ShaderFeatureCache.find(shaderHash);
+    if (it != m_ue3ShaderFeatureCache.end())
+      return it->second;
+
+    Ue3ShaderFeatureInfo info;
+    info.initialized = true;
+
+    try {
+      if (bytecode.size() < sizeof(uint32_t) || (bytecode.size() % sizeof(uint32_t)) != 0) {
+        m_ue3ShaderFeatureCache.emplace(shaderHash, info);
+        return info;
+      }
+
+      const uint32_t* tokens = reinterpret_cast<const uint32_t*>(bytecode.data());
+      DxsoDecodeContext decoder(shader->GetInfo());
+      DxsoCodeIter iter(tokens + 1);
+      while (decoder.decodeInstruction(iter)) {
+        if (decoder.getCtabInfo().m_size != 0)
+          break;
+      }
+
+      const DxsoCtab& ctab = decoder.getCtabInfo();
+      if (ctab.m_size == 0 || ctab.m_constantData.empty()) {
+        m_ue3ShaderFeatureCache.emplace(shaderHash, info);
+        return info;
+      }
+
+      auto markName = [&](const std::string& lowerName, const bool isSampler) {
+        if (isSampler) {
+          const uint8_t semanticFlags = classifyPixelSamplerSemanticFlags(lowerName);
+          info.hasMaterialSampler |= (semanticFlags & kPsSamplerSemanticMaterialTexture) != 0;
+          info.hasEngineAuxSampler |= (semanticFlags & kPsSamplerSemanticEngineAuxiliary) != 0;
+          info.hasVideoSampler |= (semanticFlags & kPsSamplerSemanticVideo) != 0;
+
+          info.hasSceneColorSampler |= containsToken(lowerName, "scenecolor");
+          info.hasSceneDepthSampler |= containsToken(lowerName, "scenedepth") ||
+                                       containsToken(lowerName, "destdepth") ||
+                                       containsToken(lowerName, "pixeldepth");
+          info.hasLightAttenuationSampler |= containsToken(lowerName, "lightattenuation");
+          info.hasShadowSampler |= containsToken(lowerName, "shadowdepth") ||
+                                   containsToken(lowerName, "shadowtexture") ||
+                                   containsToken(lowerName, "shadowvariance");
+          info.hasVelocitySampler |= containsToken(lowerName, "velocitybuffer") ||
+                                     containsToken(lowerName, "velocitytexture");
+          info.hasExposureOrToneSampler |= containsToken(lowerName, "exposure") ||
+                                           containsToken(lowerName, "colorcurves") ||
+                                           containsToken(lowerName, "saturationmask") ||
+                                           containsToken(lowerName, "blurredimage") ||
+                                           containsToken(lowerName, "filtertexture");
+          info.hasUiSampler |= containsToken(lowerName, "scenecoloruitexture") ||
+                               containsToken(lowerName, "blurredui") ||
+                               containsToken(lowerName, "uitexture") ||
+                               containsToken(lowerName, "uibuffer");
+          info.hasDistortionSampler |= containsToken(lowerName, "distortion") ||
+                                       containsToken(lowerName, "lineintegral");
+        }
+
+        info.hasBinkConstants |= containsToken(lowerName, "ycrcb") ||
+                                 containsToken(lowerName, "yuv") ||
+                                 containsToken(lowerName, "bink") ||
+                                 lowerName == "tor" ||
+                                 lowerName == "tog" ||
+                                 lowerName == "tob";
+        info.hasPrevViewProjection |= containsToken(lowerName, "prevviewprojectionmatrix") ||
+                                      containsToken(lowerName, "previousviewprojectionmatrix") ||
+                                      containsToken(lowerName, "prev_view_projection_matrix");
+        info.hasVelocityConstants |= containsToken(lowerName, "velocityscaleoffset") ||
+                                     containsToken(lowerName, "individualvelocityscale") ||
+                                     containsToken(lowerName, "stretchtimescale");
+        info.hasMotionBlurConstants |= containsToken(lowerName, "motionpacked") ||
+                                       containsToken(lowerName, "staticvelocityparameters") ||
+                                       containsToken(lowerName, "motionblur");
+        info.hasDynamicLightingConstants |= lowerName == "lightcolor" ||
+                                            containsToken(lowerName, "lightcolorandfalloffexponent") ||
+                                            containsToken(lowerName, "lightpositionandinvradius") ||
+                                            containsToken(lowerName, "lightdirection") ||
+                                            containsToken(lowerName, "spotdirection") ||
+                                            containsToken(lowerName, "tangentlightvector") ||
+                                            containsToken(lowerName, "worldlightvector");
+        info.hasLightFunctionConstants |= containsToken(lowerName, "screentolight") ||
+                                          containsToken(lowerName, "screen_to_light");
+        info.hasSphericalHarmonicLightingConstants |= containsToken(lowerName, "worldincidentlighting") ||
+                                                     containsToken(lowerName, "shbasiscubetextures") ||
+                                                     containsToken(lowerName, "shbasis");
+        info.hasScreenToShadowMatrix |= containsToken(lowerName, "screentoshadowmatrix") ||
+                                        containsToken(lowerName, "screen_to_shadow");
+        info.hasShadowModulateConstants |= containsToken(lowerName, "shadowmodulatecolor") ||
+                                           containsToken(lowerName, "shadowattenuation") ||
+                                           containsToken(lowerName, "invmaxsubjectdepth");
+        info.hasToneMapConstants |= containsToken(lowerName, "sceneshadowsanddesaturation") ||
+                                    containsToken(lowerName, "sceneinversehighlights") ||
+                                    containsToken(lowerName, "scenemidtones") ||
+                                    containsToken(lowerName, "scenescaledluminanceweights") ||
+                                    containsToken(lowerName, "exposuresettings");
+        info.hasGammaConstants |= containsToken(lowerName, "gammacolorscaleandinverse") ||
+                                  containsToken(lowerName, "gammaoverlaycolor") ||
+                                  containsToken(lowerName, "inversegamma") ||
+                                  containsToken(lowerName, "colorscale");
+        info.hasFogConstants |= containsToken(lowerName, "fog") ||
+                                containsToken(lowerName, "heightfog") ||
+                                containsToken(lowerName, "lineintegral");
+        info.hasHazeConstants |= containsToken(lowerName, "haze") ||
+                                 containsToken(lowerName, "sunvector");
+        info.hasUiCompositeConstants |= lowerName == "fade" ||
+                                        containsToken(lowerName, "scenecolorui") ||
+                                        containsToken(lowerName, "bluramount");
+      };
+
+      for (const DxsoCtab::Constant& c : ctab.m_constantData) {
+        const bool isSampler = c.registerSet == kD3dxRegisterSetSampler;
+        markName(toLowerAscii(c.name), isSampler);
+      }
+    } catch (...) {
+    }
+
+    m_ue3ShaderFeatureCache.emplace(shaderHash, info);
+    return info;
+  }
+
+  D3D9Rtx::Ue3PassType D3D9Rtx::classifyUe3Pass(const DrawContext& drawContext) {
+    if (!ue3EngineMode())
+      return Ue3PassType::Unknown;
+
+    const bool depthEnabled = d3d9State().renderStates[D3DRS_ZENABLE] == D3DZB_TRUE;
+    const bool zWriteEnabled = d3d9State().renderStates[D3DRS_ZWRITEENABLE] != FALSE;
+    const bool samplesRenderTarget = m_parent->GetActiveRTTextures() != 0;
+    const bool likelyFullscreen = !depthEnabled && !zWriteEnabled && drawContext.PrimitiveCount <= 4;
+
+    const D3D9CommonShader* vertexShaderCommon =
+      m_parent->UseProgrammableVS() && d3d9State().vertexShader.ptr() != nullptr
+        ? d3d9State().vertexShader->GetCommonShader()
+        : nullptr;
+    const D3D9CommonShader* pixelShaderCommon =
+      m_parent->UseProgrammablePS() && d3d9State().pixelShader.ptr() != nullptr
+        ? d3d9State().pixelShader->GetCommonShader()
+        : nullptr;
+
+    const Ue3ShaderFeatureInfo vsInfo = getUe3ShaderFeatureInfo(vertexShaderCommon);
+    const Ue3ShaderFeatureInfo psInfo = getUe3ShaderFeatureInfo(pixelShaderCommon);
+    const bool isWorldGeometry =
+      m_currentUe3VertexFactory == Ue3VertexFactoryType::Local ||
+      m_currentUe3VertexFactory == Ue3VertexFactoryType::LocalDecal ||
+      m_currentUe3VertexFactory == Ue3VertexFactoryType::GPUSkin ||
+      m_currentUe3VertexFactory == Ue3VertexFactoryType::GPUSkinMorph ||
+      m_currentUe3VertexFactory == Ue3VertexFactoryType::Terrain ||
+      m_currentUe3VertexFactory == Ue3VertexFactoryType::TerrainMorph ||
+      m_currentUe3VertexFactory == Ue3VertexFactoryType::SpeedTree ||
+      m_currentUe3VertexFactory == Ue3VertexFactoryType::Foliage ||
+      m_currentUe3VertexFactory == Ue3VertexFactoryType::Particle ||
+      m_currentUe3VertexFactory == Ue3VertexFactoryType::ParticleBeamTrail ||
+      m_currentUe3VertexFactory == Ue3VertexFactoryType::LensFlare;
+
+    if (m_currentUe3VertexFactory == Ue3VertexFactoryType::PositionOnly)
+      return Ue3PassType::DepthPrepass;
+
+    if (m_activePresentParams.has_value() &&
+        d3d9State().renderTargets[kRenderTargetIndex] != nullptr) {
+      const auto& rtExt = d3d9State().renderTargets[kRenderTargetIndex]->GetSurfaceExtent();
+      const uint32_t bbW = m_activePresentParams->BackBufferWidth;
+      if (rtExt.width == rtExt.height &&
+          rtExt.width <= 2048 &&
+          rtExt.width < bbW / 2 &&
+          zWriteEnabled) {
+        return Ue3PassType::ShadowDepth;
+      }
+    }
+
+    if (psInfo.hasBinkConstants) {
+      if (likelyFullscreen && !isWorldGeometry) {
+        return Ue3PassType::VideoCinematic;
+      }
+      return Ue3PassType::VideoSurface;
+    }
+
+    if (psInfo.hasUiSampler || psInfo.hasUiCompositeConstants)
+      return Ue3PassType::UiComposite;
+
+    if (psInfo.hasScreenToShadowMatrix ||
+        psInfo.hasShadowModulateConstants ||
+        (psInfo.hasShadowSampler && psInfo.hasSceneDepthSampler)) {
+      return Ue3PassType::ModulatedShadowProjection;
+    }
+
+    if ((vsInfo.hasPrevViewProjection || psInfo.hasVelocityConstants) &&
+        !samplesRenderTarget) {
+      return Ue3PassType::Velocity;
+    }
+
+    const bool hasDynamicLightPassSignals =
+      (psInfo.hasDynamicLightingConstants || vsInfo.hasDynamicLightingConstants) &&
+      (psInfo.hasLightAttenuationSampler ||
+       psInfo.hasShadowSampler ||
+       vsInfo.hasDynamicLightingConstants);
+    if (hasDynamicLightPassSignals ||
+        psInfo.hasLightFunctionConstants ||
+        psInfo.hasSphericalHarmonicLightingConstants ||
+        (psInfo.hasLightAttenuationSampler && psInfo.hasShadowSampler)) {
+      return Ue3PassType::Lighting;
+    }
+
+    if ((psInfo.hasVelocitySampler || psInfo.hasMotionBlurConstants) &&
+        (samplesRenderTarget || likelyFullscreen)) {
+      return Ue3PassType::FullscreenPostProcess;
+    }
+
+    if ((likelyFullscreen || samplesRenderTarget || !zWriteEnabled) &&
+        (psInfo.hasFogConstants || psInfo.hasHazeConstants || psInfo.hasDistortionSampler)) {
+      return Ue3PassType::FogOrDistortion;
+    }
+
+    if (!zWriteEnabled &&
+        (likelyFullscreen || samplesRenderTarget) &&
+        (psInfo.hasSceneColorSampler ||
+         psInfo.hasSceneDepthSampler ||
+         psInfo.hasLightAttenuationSampler ||
+         psInfo.hasExposureOrToneSampler ||
+         psInfo.hasToneMapConstants ||
+         psInfo.hasGammaConstants ||
+         psInfo.hasEngineAuxSampler)) {
+      return Ue3PassType::FullscreenPostProcess;
+    }
+
+    if (psInfo.hasMaterialSampler ||
+        m_currentUe3VertexFactory == Ue3VertexFactoryType::Local ||
+        m_currentUe3VertexFactory == Ue3VertexFactoryType::LocalDecal ||
+        m_currentUe3VertexFactory == Ue3VertexFactoryType::GPUSkin ||
+        m_currentUe3VertexFactory == Ue3VertexFactoryType::GPUSkinMorph ||
+        m_currentUe3VertexFactory == Ue3VertexFactoryType::Terrain ||
+        m_currentUe3VertexFactory == Ue3VertexFactoryType::TerrainMorph ||
+        m_currentUe3VertexFactory == Ue3VertexFactoryType::SpeedTree ||
+        m_currentUe3VertexFactory == Ue3VertexFactoryType::Foliage) {
+      return Ue3PassType::Material;
+    }
+
+    return Ue3PassType::Unknown;
+  }
+
+  const char* D3D9Rtx::describeUe3VertexFactory(const Ue3VertexFactoryType type) {
+    switch (type) {
+    case Ue3VertexFactoryType::Unknown: return "Unknown";
+    case Ue3VertexFactoryType::Local: return "Local";
+    case Ue3VertexFactoryType::GPUSkin: return "GPUSkin";
+    case Ue3VertexFactoryType::GPUSkinMorph: return "GPUSkinMorph";
+    case Ue3VertexFactoryType::Terrain: return "Terrain";
+    case Ue3VertexFactoryType::TerrainMorph: return "TerrainMorph";
+    case Ue3VertexFactoryType::Particle: return "Particle";
+    case Ue3VertexFactoryType::ParticleBeamTrail: return "ParticleBeamTrail";
+    case Ue3VertexFactoryType::SpeedTree: return "SpeedTree";
+    case Ue3VertexFactoryType::Foliage: return "Foliage";
+    case Ue3VertexFactoryType::LocalDecal: return "LocalDecal";
+    case Ue3VertexFactoryType::LensFlare: return "LensFlare";
+    case Ue3VertexFactoryType::PositionOnly: return "PositionOnly";
+    }
+    return "Unknown";
+  }
+
+  const char* D3D9Rtx::describeUe3PassType(const Ue3PassType type) {
+    switch (type) {
+    case Ue3PassType::Unknown: return "Unknown";
+    case Ue3PassType::Material: return "Material";
+    case Ue3PassType::DepthPrepass: return "DepthPrepass";
+    case Ue3PassType::ShadowDepth: return "ShadowDepth";
+    case Ue3PassType::Velocity: return "Velocity";
+    case Ue3PassType::Lighting: return "Lighting";
+    case Ue3PassType::ModulatedShadowProjection: return "ModulatedShadowProjection";
+    case Ue3PassType::FullscreenPostProcess: return "FullscreenPostProcess";
+    case Ue3PassType::UiComposite: return "UiComposite";
+    case Ue3PassType::FogOrDistortion: return "FogOrDistortion";
+    case Ue3PassType::VideoCinematic: return "VideoCinematic";
+    case Ue3PassType::VideoSurface: return "VideoSurface";
+    }
+    return "Unknown";
+  }
+
+  const char* D3D9Rtx::describeGeometryStatus(const RtxGeometryStatus status) {
+    switch (status) {
+    case RtxGeometryStatus::Ignored: return "Ignored";
+    case RtxGeometryStatus::Rasterized: return "Rasterized";
+    case RtxGeometryStatus::RayTraced: return "RayTraced";
+    }
+    return "Unknown";
+  }
+
+  void D3D9Rtx::logUe3Classification(const DrawContext& drawContext,
+                                     const Ue3PassType passType,
+                                     const RtxGeometryStatus status,
+                                     const char* reason) {
+    if (!ue3LogClassification() && Logger::logLevel() > LogLevel::Debug)
+      return;
+
+    Logger::debug(str::format(
+      "[RTX-Compatibility][UE3] draw=", m_activeDrawCallState.drawCallID,
+      " vf=", describeUe3VertexFactory(m_currentUe3VertexFactory),
+      " pass=", describeUe3PassType(passType),
+      " status=", describeGeometryStatus(status),
+      " prims=", drawContext.PrimitiveCount,
+      " reason=", reason));
+  }
+
+  bool D3D9Rtx::trackUe3MovieTextureRenderTarget(const char* reason) {
+    if (d3d9State().renderTargets[kRenderTargetIndex] == nullptr ||
+        !m_activePresentParams.has_value()) {
+      return false;
+    }
+
+    D3D9CommonTexture* rtTexture = GetCommonTexture(d3d9State().renderTargets[kRenderTargetIndex]->GetBaseTexture());
+    if (rtTexture == nullptr || rtTexture->GetImage() == nullptr || rtTexture->Desc() == nullptr) {
+      return false;
+    }
+
+    if (isRenderTargetPrimary(*m_activePresentParams, rtTexture->Desc())) {
+      return false;
+    }
+
+    const XXH64_hash_t descHash = rtTexture->GetImage()->getDescriptorHash();
+    if (descHash == kEmptyHash) {
+      return false;
+    }
+
+    const bool inserted = m_ue3MovieTextureDescHashes.insert(descHash).second;
+    if (inserted && Logger::logLevel() <= LogLevel::Debug) {
+      const auto* desc = rtTexture->Desc();
+      Logger::debug(str::format(
+        "[RTX-Compatibility][UE3] Tracked movie texture render target: ",
+        desc->Width, "x", desc->Height,
+        ", descHash=0x", std::hex, descHash, std::dec,
+        ", reason=", reason));
+    }
+    return true;
+  }
+
+  bool D3D9Rtx::isUe3MovieTextureDescHash(const XXH64_hash_t descHash) const {
+    return descHash != kEmptyHash &&
+           m_ue3MovieTextureDescHashes.find(descHash) != m_ue3MovieTextureDescHashes.end();
   }
 
   D3D9Rtx::D3D9Rtx(D3D9DeviceEx* d3d9Device, bool enableDrawCallConversion)
@@ -1928,6 +2352,58 @@ namespace dxvk {
     return *m_parent->GetRawState();
   }
 
+  bool D3D9Rtx::shouldUseUe3CameraHashCell() const {
+    return (ue3CameraFromShaderConstants() || ue3EngineMode()) &&
+           ue3VertexCaptureCameraCellSize() > 0.0f;
+  }
+
+  bool D3D9Rtx::computeUe3CameraHashCell(Ue3CameraHashCell& outCell) const {
+    if (!shouldUseUe3CameraHashCell()) {
+      return false;
+    }
+
+    const float cellSize = ue3VertexCaptureCameraCellSize();
+    if (!std::isfinite(cellSize) || cellSize <= 0.0f) {
+      return false;
+    }
+
+    const Matrix4 cameraViewToWorld = inverseAffine(m_activeDrawCallState.transformData.worldToView);
+    const Vector3 cameraPos = cameraViewToWorld[3].xyz();
+    if (!std::isfinite(cameraPos.x) || !std::isfinite(cameraPos.y) || !std::isfinite(cameraPos.z)) {
+      return false;
+    }
+
+    outCell = {
+      int32_t(std::floor(cameraPos.x / cellSize)),
+      int32_t(std::floor(cameraPos.y / cellSize)),
+      int32_t(std::floor(cameraPos.z / cellSize)),
+    };
+    return true;
+  }
+
+  bool D3D9Rtx::areUe3CameraHashCellsEqual(const Ue3CameraHashCell& a, const Ue3CameraHashCell& b) {
+    return a.x == b.x && a.y == b.y && a.z == b.z;
+  }
+
+  void D3D9Rtx::logUe3CameraHashCellIfChanged(const Ue3CameraHashCell& cell, const char* reason) {
+    if (!ue3LogCapturePrecision() && Logger::logLevel() > LogLevel::Debug) {
+      return;
+    }
+
+    if (m_hasLoggedUe3CameraHashCell &&
+        areUe3CameraHashCellsEqual(m_lastLoggedUe3CameraHashCell, cell)) {
+      return;
+    }
+
+    m_hasLoggedUe3CameraHashCell = true;
+    m_lastLoggedUe3CameraHashCell = cell;
+    Logger::debug(str::format(
+      "[RTX-Compatibility][UE3-Capture] cameraCell=(",
+      cell.x, ",", cell.y, ",", cell.z,
+      "), cellSize=", ue3VertexCaptureCameraCellSize(),
+      ", reason=", reason));
+  }
+
   bool D3D9Rtx::canUseUe3StaticVertexCaptureCache(const IndexContext& indexContext,
                                                   const VertexContext vertexContext[caps::MaxStreams],
                                                   const RasterGeometry& geoData) const {
@@ -1984,6 +2460,77 @@ namespace dxvk {
         return false;
       }
 
+      return !buffer->NeedsUpload();
+    };
+
+    if (indexContext.indexType != VK_INDEX_TYPE_NONE_KHR && !isStaticBuffer(indexContext.ibo)) {
+      return false;
+    }
+
+    for (const auto& element : elements) {
+      if (element.Stream >= caps::MaxStreams) {
+        return false;
+      }
+
+      const VertexContext& ctx = vertexContext[element.Stream];
+      if (ctx.mappedSlice.handle == VK_NULL_HANDLE || !isStaticBuffer(ctx.pVBO)) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  bool D3D9Rtx::canUseUe3NativeLocalVertexCapture(const IndexContext& indexContext,
+                                                  const VertexContext vertexContext[caps::MaxStreams],
+                                                  const RasterGeometry& geoData) const {
+    if (!ue3NativeLocalMeshVertexCapture() || !ue3EngineMode()) {
+      return false;
+    }
+    if (!m_parent->UseProgrammableVS() || !useVertexCapture()) {
+      return false;
+    }
+    if (m_currentUe3VertexFactory != Ue3VertexFactoryType::Local) {
+      return false;
+    }
+    if (!m_currentUe3CtabInfo.has_value() || !m_currentUe3CtabInfo->hasLocalToWorld) {
+      return false;
+    }
+    const Ue3VsShaderCtabInfo& ctabInfo = *m_currentUe3CtabInfo;
+    if (ctabInfo.hasDecalTransform ||
+        ctabInfo.hasDecalLocation ||
+        ctabInfo.hasDecalOffset ||
+        ctabInfo.hasTextureCoordinateScaleBias ||
+        ctabInfo.hasViewToLocal ||
+        ctabInfo.hasWindMatrices) {
+      return false;
+    }
+    if (!geoData.positionBuffer.defined() ||
+        geoData.blendWeightBuffer.defined() ||
+        geoData.blendIndicesBuffer.defined()) {
+      return false;
+    }
+    if (m_activeDrawCallState.testCategoryFlags(InstanceCategories::WorldUI) ||
+        m_activeDrawCallState.testCategoryFlags(InstanceCategories::Terrain)) {
+      return false;
+    }
+    if (d3d9State().vertexDecl == nullptr) {
+      return false;
+    }
+
+    const auto& elements = d3d9State().vertexDecl->GetElements();
+    const VDeclSignature sig = buildVDeclSignature(elements);
+    if (sig.positionStream == sig.tangentStream || sig.positionStream == sig.normalStream) {
+      return false;
+    }
+
+    auto isStaticBuffer = [](D3D9CommonBuffer* buffer) {
+      if (buffer == nullptr || buffer->Desc() == nullptr) {
+        return false;
+      }
+      if ((buffer->Desc()->Usage & D3DUSAGE_DYNAMIC) != 0 || buffer->WasWrittenByGPU()) {
+        return false;
+      }
       return !buffer->NeedsUpload();
     };
 
@@ -2136,10 +2683,15 @@ namespace dxvk {
     mix(m_texcoordCompU);
     mix(m_texcoordCompV);
     mix(m_forceIaTexcoordForOutlier);
+    mix(ue3NativeLocalMeshVertexCapture());
 
     const XXH64_hash_t stableVsHash = computeUe3StableVertexShaderHash();
     mix(stableVsHash);
     mix(m_activeDrawCallState.transformData.objectToWorld);
+    Ue3CameraHashCell cameraCell;
+    if (computeUe3CameraHashCell(cameraCell)) {
+      mix(cameraCell);
+    }
 
     const DxvkBufferSliceHandle indexSlice = indexContext.indexBuffer;
     mix(indexContext.indexType);
@@ -2284,7 +2836,7 @@ namespace dxvk {
     return DxvkBufferSlice(pDevice->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::AppBuffer, "Vertex Capture Buffer"));
   }
 
-  bool D3D9Rtx::prepareVertexCapture(const int vertexIndexOffset) {
+  bool D3D9Rtx::prepareVertexCapture(const int vertexIndexOffset, const bool capturePositionFromInput) {
     ScopedCpuProfileZone();
 
     static_assert(sizeof CapturedVertex == 48, "The injected shader code is expecting this exact structure size to work correctly, see emitVertexCaptureWrite in dxso_compiler.cpp");
@@ -2494,6 +3046,9 @@ namespace dxvk {
     }
 
     uint32_t vertexCaptureFlags = 0;
+    if (capturePositionFromInput) {
+      vertexCaptureFlags |= kVertexCaptureFlag_PositionFromInput;
+    }
 
     if (vsOutputsNormal && (useVertexCapturedNormals() || ue3EngineMode())) {
       // 1: VS outputs NORMAL - use vertex-captured normals (they match the captured positions)
@@ -2994,6 +3549,13 @@ namespace dxvk {
         if (it != m_ue3VsShaderCtabCache.end()) {
           ue3CtabInfoPtr = &it->second;
           m_currentUe3CtabInfo = *ue3CtabInfoPtr;
+          if (isUe3Mode &&
+              m_currentUe3VertexFactory == Ue3VertexFactoryType::Local &&
+              (ue3CtabInfoPtr->hasDecalTransform ||
+               ue3CtabInfoPtr->hasDecalLocation ||
+               ue3CtabInfoPtr->hasDecalOffset)) {
+            m_currentUe3VertexFactory = Ue3VertexFactoryType::LocalDecal;
+          }
         }
       }
     }
@@ -3016,7 +3578,7 @@ namespace dxvk {
         Vector4 regs[5];
       };
 
-      auto tryApplyFromConstants = [&](Matrix4& outWorldToView, Matrix4& outViewToProjection, bool& outUsedTranspose) -> bool {
+      auto tryApplyFromConstants = [&](Matrix4& outWorldToView, Matrix4& outViewToProjection, bool& outUsedTranspose, float& outReconstructionError) -> bool {
         if (viewProjReg + 3 >= caps::MaxFloatConstantsSoftware || viewOriginReg >= caps::MaxFloatConstantsSoftware)
           return false;
 
@@ -3035,13 +3597,15 @@ namespace dxvk {
           outWorldToView = m_ue3CameraConstantsCache.worldToView;
           outViewToProjection = m_ue3CameraConstantsCache.viewToProjection;
           outUsedTranspose = m_ue3CameraConstantsCache.usedTranspose;
+          outReconstructionError = m_ue3CameraConstantsCache.reconstructionError;
           return true;
         }
 
         Matrix4 ue3WorldToView;
         Matrix4 ue3ViewToProjection;
         bool usedTranspose = false;
-        if (!tryExtractUe3WorldToViewAndProjectionFromShaderConstants(d3d9State().vsConsts, viewProjReg, viewOriginReg, ue3WorldToView, ue3ViewToProjection, &usedTranspose)) {
+        float reconstructionError = 0.0f;
+        if (!tryExtractUe3WorldToViewAndProjectionFromShaderConstants(d3d9State().vsConsts, viewProjReg, viewOriginReg, ue3WorldToView, ue3ViewToProjection, &usedTranspose, &reconstructionError)) {
           return false;
         }
 
@@ -3050,19 +3614,27 @@ namespace dxvk {
         m_ue3CameraConstantsCache.usedTranspose = usedTranspose;
         m_ue3CameraConstantsCache.worldToView = ue3WorldToView;
         m_ue3CameraConstantsCache.viewToProjection = ue3ViewToProjection;
+        m_ue3CameraConstantsCache.reconstructionError = reconstructionError;
 
         outWorldToView = ue3WorldToView;
         outViewToProjection = ue3ViewToProjection;
         outUsedTranspose = usedTranspose;
+        outReconstructionError = reconstructionError;
         return true;
       };
 
       Matrix4 ue3WorldToView;
       Matrix4 ue3ViewToProjection;
+      float ue3CameraReconstructionError = 0.0f;
 
-      if (tryApplyFromConstants(ue3WorldToView, ue3ViewToProjection, ue3CameraUsedTranspose)) {
+      if (tryApplyFromConstants(ue3WorldToView, ue3ViewToProjection, ue3CameraUsedTranspose, ue3CameraReconstructionError)) {
         ONCE(Logger::info(str::format("[RTX-Compatibility] UE3 camera matrices extracted from shader constants (viewProjReg=c",
                                       viewProjReg, "..c", viewProjReg + 3, ", viewOriginReg=c", viewOriginReg, ").")));
+        if (ue3LogCapturePrecision() && Logger::logLevel() <= LogLevel::Debug) {
+          ONCE(Logger::debug(str::format(
+            "[RTX-Compatibility][UE3-Capture] camera matrix reconstruction error=",
+            ue3CameraReconstructionError, ", usedTranspose=", ue3CameraUsedTranspose)));
+        }
         transformData.worldToView = ue3WorldToView;
         transformData.viewToProjection = ue3ViewToProjection;
       } else {
@@ -3353,8 +3925,8 @@ namespace dxvk {
          d3d9State().renderStates[D3DRS_ZFUNC] == D3DCMP_ALWAYS) &&
         d3d9State().renderStates[D3DRS_ZWRITEENABLE] == FALSE &&
         !checkBoundTextureCategory(RtxOptions::uiTextures())) {
-      ONCE(Logger::info("[RTX-Compatibility-Info] Skipped UE3 depth-test-disabled translucent draw."));
-      return { RtxGeometryStatus::Rasterized, false };
+      ONCE(Logger::info("[RTX-Compatibility-Info] Ignored UE3 depth-test-disabled translucent draw."));
+      return { RtxGeometryStatus::Ignored, false };
     }
 
     if (m_activeOcclusionQueries > 0) {
@@ -3384,6 +3956,38 @@ namespace dxvk {
     // Ensure present parameters for the swapchain have been cached
     // Note: This assumes that ResetSwapChain has been called at some point before this call, typically done after creating a swapchain.
     assert(m_activePresentParams.has_value());
+
+    m_currentUe3PassType = classifyUe3Pass(drawContext);
+    switch (m_currentUe3PassType) {
+    case Ue3PassType::DepthPrepass:
+      logUe3Classification(drawContext, m_currentUe3PassType, RtxGeometryStatus::Ignored, "position-only depth prepass");
+      return { RtxGeometryStatus::Ignored, false };
+    case Ue3PassType::ShadowDepth:
+      logUe3Classification(drawContext, m_currentUe3PassType, RtxGeometryStatus::Ignored, "shadow depth render target");
+      return { RtxGeometryStatus::Ignored, false };
+    case Ue3PassType::Velocity:
+      logUe3Classification(drawContext, m_currentUe3PassType, RtxGeometryStatus::Ignored, "native velocity helper pass");
+      return { RtxGeometryStatus::Ignored, false };
+    case Ue3PassType::Lighting:
+      logUe3Classification(drawContext, m_currentUe3PassType, RtxGeometryStatus::Ignored, "native UE3 lighting pass");
+      return { RtxGeometryStatus::Ignored, false };
+    case Ue3PassType::ModulatedShadowProjection:
+      logUe3Classification(drawContext, m_currentUe3PassType, RtxGeometryStatus::Ignored, "native modulated shadow projection");
+      return { RtxGeometryStatus::Ignored, false };
+    case Ue3PassType::UiComposite:
+      logUe3Classification(drawContext, m_currentUe3PassType, RtxGeometryStatus::Rasterized, "UI composite");
+      return { RtxGeometryStatus::Rasterized, true };
+    case Ue3PassType::VideoCinematic:
+      trackUe3MovieTextureRenderTarget("video cinematic/decode");
+      logUe3Classification(drawContext, m_currentUe3PassType, RtxGeometryStatus::Rasterized, "video/cinematic pass");
+      return { RtxGeometryStatus::Rasterized, false };
+    case Ue3PassType::VideoSurface:
+      trackUe3MovieTextureRenderTarget("video surface/decode");
+      logUe3Classification(drawContext, m_currentUe3PassType, RtxGeometryStatus::Rasterized, "video texture surface/decode pass");
+      return { RtxGeometryStatus::Rasterized, false };
+    default:
+      break;
+    }
 
     // Attempt to detect shadow mask draws and ignore them
     // Conditions: non-textured flood-fill draws into a small quad render target
@@ -3531,9 +4135,16 @@ namespace dxvk {
 
       // Optional: do not raytrace likely fullscreen composite passes to primary.
       if (rasterizeFullscreenCompositeToPrimary() && likelyFullscreenComposite) {
+        logUe3Classification(drawContext, m_currentUe3PassType, RtxGeometryStatus::Rasterized, "fullscreen RT composite");
         ONCE(Logger::info("[RTX-Compatibility] Rasterizing likely fullscreen composite pass to primary RT (post-process)."));
         return { RtxGeometryStatus::Rasterized, false };
       }
+    }
+
+    if (m_currentUe3PassType == Ue3PassType::FullscreenPostProcess ||
+        m_currentUe3PassType == Ue3PassType::FogOrDistortion) {
+      logUe3Classification(drawContext, m_currentUe3PassType, RtxGeometryStatus::Ignored, "native UE3 screen-space contribution pass");
+      return { RtxGeometryStatus::Ignored, false };
     }
 
     // Detect stencil shadow draws and ignore them
@@ -3563,6 +4174,7 @@ namespace dxvk {
       }
     }
 
+    logUe3Classification(drawContext, m_currentUe3PassType, RtxGeometryStatus::RayTraced, "default raytraced geometry");
     return { RtxGeometryStatus::RayTraced, false };
   }
 
@@ -3633,6 +4245,7 @@ namespace dxvk {
 
     // classify UE3 vertex factory early so makeDrawCallType can use it for pass filtering
     m_currentUe3VertexFactory = Ue3VertexFactoryType::Unknown;
+    m_currentUe3PassType = Ue3PassType::Unknown;
     if (ue3EngineMode() && d3d9State().vertexDecl != nullptr) {
       const auto& elements = d3d9State().vertexDecl->GetElements();
       XXH64_hash_t declKey = XXH3_64bits(elements.data(), elements.size() * sizeof(D3DVERTEXELEMENT9));
@@ -3756,6 +4369,21 @@ namespace dxvk {
     // Hash material data
     m_activeDrawCallState.materialData.updateCachedHash();
 
+    const bool useUe3NativeLocalCapture =
+      canUseUe3NativeLocalVertexCapture(indexContext, vertexContext, geoData);
+    if (useUe3NativeLocalCapture) {
+      ONCE(Logger::info("[RTX-Compatibility] UE3 native LocalVertexFactory capture: using IA object-space positions for conservative static local meshes."));
+      if (ue3LogCapturePrecision() && Logger::logLevel() <= LogLevel::Debug) {
+        static fast_unordered_set s_loggedNativeLocalDraws;
+        const XXH64_hash_t nativeKey = XXH3_64bits(&m_activeDrawCallState.transformData.objectToWorld, sizeof(Matrix4));
+        if (s_loggedNativeLocalDraws.insert(nativeKey).second) {
+          Logger::debug(str::format(
+            "[RTX-Compatibility][UE3-Capture] native local mesh capture active, vertices=",
+            geoData.vertexCount, ", indices=", geoData.indexCount));
+        }
+      }
+    }
+
     const bool canUseCachedVertexCapture =
       canUseUe3StaticVertexCaptureCache(indexContext, vertexContext, geoData);
     const XXH64_hash_t vertexCaptureCacheKey =
@@ -3765,6 +4393,19 @@ namespace dxvk {
     const bool reusedCachedVertexCapture =
       canUseCachedVertexCapture &&
       tryReuseUe3StaticVertexCapture(vertexCaptureCacheKey, geoData);
+    if (ue3LogCapturePrecision() &&
+        Logger::logLevel() <= LogLevel::Debug &&
+        canUseCachedVertexCapture) {
+      static fast_unordered_set s_loggedCacheReuse;
+      const XXH64_hash_t logKey = vertexCaptureCacheKey ^ (reusedCachedVertexCapture ? 0x9E3779B97F4A7C15ull : 0xD1B54A32D192ED03ull);
+      if (s_loggedCacheReuse.insert(logKey).second) {
+        Logger::debug(str::format(
+          "[RTX-Compatibility][UE3-Capture] static local vertex capture cache ",
+          reusedCachedVertexCapture ? "reused" : "recapturing",
+          ", key=0x", std::hex, vertexCaptureCacheKey, std::dec,
+          ", vertices=", geoData.vertexCount));
+      }
+    }
 
     // For shader based drawcalls we also want to capture the vertex shader output
     bool needVertexCapture =
@@ -3772,7 +4413,7 @@ namespace dxvk {
       useVertexCapture() &&
       !reusedCachedVertexCapture;
     if (needVertexCapture) {
-      needVertexCapture = prepareVertexCapture(vertexIndexOffset);
+      needVertexCapture = prepareVertexCapture(vertexIndexOffset, useUe3NativeLocalCapture);
     }
     if (canUseCachedVertexCapture && !reusedCachedVertexCapture && needVertexCapture) {
       updateUe3StaticVertexCaptureCache(vertexCaptureCacheKey, geoData);
@@ -4131,7 +4772,13 @@ namespace dxvk {
     const Ue3VertexFactoryType vfType = m_currentUe3VertexFactory;
     const bool isUe3GpuSkinVF = vfType == Ue3VertexFactoryType::GPUSkin || vfType == Ue3VertexFactoryType::GPUSkinMorph;
     const bool isUe3TerrainVF = vfType == Ue3VertexFactoryType::Terrain || vfType == Ue3VertexFactoryType::TerrainMorph;
-    const bool isUe3ParticleVF = vfType == Ue3VertexFactoryType::Particle;
+    const bool isUe3ParticleVF =
+      vfType == Ue3VertexFactoryType::Particle ||
+      vfType == Ue3VertexFactoryType::ParticleBeamTrail ||
+      vfType == Ue3VertexFactoryType::LensFlare;
+    const bool isUe3FoliageVF = vfType == Ue3VertexFactoryType::Foliage;
+    const bool isUe3SpeedTreeVF = vfType == Ue3VertexFactoryType::SpeedTree;
+    const bool isUe3LocalDecalVF = vfType == Ue3VertexFactoryType::LocalDecal;
     const bool isUe3MorphVF = vfType == Ue3VertexFactoryType::GPUSkinMorph;
 
     const bool likelyGpuSkinnedMesh = isUe3GpuSkinVF || [&]() {
@@ -4152,6 +4799,7 @@ namespace dxvk {
         ? &(*m_currentUe3CtabInfo)
         : nullptr;
     const bool likelyUe3DecalUvSpace =
+      isUe3LocalDecalVF ||
       (ue3VsHints != nullptr &&
        (ue3VsHints->hasDecalTransform ||
         ue3VsHints->hasDecalLocation ||
@@ -4162,13 +4810,15 @@ namespace dxvk {
        (ue3VsHints->hasLightMapCoordinateScaleBias ||
         ue3VsHints->hasShadowCoordinateScaleBias));
     const bool likelyUe3BillboardUvSpace =
-      ue3VsHints != nullptr &&
-      (ue3VsHints->hasTextureCoordinateScaleBias ||
-       ue3VsHints->hasViewToLocal ||
-       ue3VsHints->hasWindMatrices);
+      isUe3ParticleVF ||
+      isUe3SpeedTreeVF ||
+      (ue3VsHints != nullptr &&
+       (ue3VsHints->hasTextureCoordinateScaleBias ||
+        ue3VsHints->hasViewToLocal ||
+        ue3VsHints->hasWindMatrices));
     const bool likelyUe3FlexiblePackedUvPath =
       !likelyGpuSkinnedMesh &&
-      (likelyUe3DecalUvSpace || likelyUe3TerrainUvSpace || likelyUe3BillboardUvSpace);
+      (likelyUe3DecalUvSpace || likelyUe3TerrainUvSpace || likelyUe3BillboardUvSpace || isUe3FoliageVF);
     const bool likelyPackedUvConventions = likelyGpuSkinnedMesh || likelyUe3FlexiblePackedUvPath;
     auto resolveInferredSamplerOffset = [&](const PsSamplerTexcoordEntry* entry, const uint32_t stage, float& outU, float& outV) -> bool {
       outU = 0.0f;
@@ -4285,6 +4935,7 @@ namespace dxvk {
       }
       return texture->GetSampleView(srgb);
     };
+    bool selectedUe3MovieTexture = false;
 
     if constexpr (FixedFunction) {
       uint32_t textureID = 0;
@@ -4296,6 +4947,10 @@ namespace dxvk {
         D3D9CommonTexture* pTexInfo = GetCommonTexture(d3d9State().textures[stage]);
         assert(pTexInfo != nullptr);
         const XXH64_hash_t texHash = pTexInfo->GetImage()->getHash();
+        const XXH64_hash_t texDescHash =
+          pTexInfo->GetImage() != nullptr
+            ? pTexInfo->GetImage()->getDescriptorHash()
+            : kEmptyHash;
 
         if (texHash == kEmptyHash)
           continue;
@@ -4323,6 +4978,7 @@ namespace dxvk {
           continue;
         m_activeDrawCallState.materialData.colorTextures[textureID] = TextureRef(sampleView);
         m_activeDrawCallState.materialData.samplers[textureID] = sampler;
+        selectedUe3MovieTexture |= isUe3MovieTextureDescHash(texDescHash);
         if (textureID == 0)
           m_activeDrawCallState.materialData.colorTextureIsSrgb = srgb;
 
@@ -4363,7 +5019,10 @@ namespace dxvk {
 
         const bool srgb = (d3d9State().samplerStates[stage][D3DSAMP_SRGBTEXTURE] & 0x1) != 0;
         const bool isRenderTarget = texture->IsRenderTarget();
-
+        const XXH64_hash_t texDescHash =
+          (texture->GetImage() != nullptr)
+            ? texture->GetImage()->getDescriptorHash()
+            : kEmptyHash;
         const auto* desc = texture->Desc();
         const uint64_t area = desc ? uint64_t(desc->Width) * uint64_t(desc->Height) : 0;
         uint16_t sampleCount = 0;
@@ -4376,6 +5035,8 @@ namespace dxvk {
         bool inferredSamplerLooksMaterialTexture = false;
         bool inferredSamplerLooksLightmap = false;
         bool inferredSamplerLooksNonDiffuse = false;
+        bool inferredSamplerLooksVideo = false;
+        bool inferredSamplerLooksMovieTexture = false;
         bool inferredSamplerExprUvTransform = false;
         bool inferredSamplerExprUvOffset = false;
         bool inferredSamplerExprUvAnimated = false;
@@ -4402,6 +5063,8 @@ namespace dxvk {
           inferredSamplerLooksMaterialTexture = (inferredSamplerSemanticFlags & kPsSamplerSemanticMaterialTexture) != 0;
           inferredSamplerLooksLightmap = (inferredSamplerSemanticFlags & kPsSamplerSemanticLightmap) != 0;
           inferredSamplerLooksNonDiffuse = (inferredSamplerSemanticFlags & kPsSamplerSemanticNonDiffuse) != 0;
+          inferredSamplerLooksVideo = (inferredSamplerSemanticFlags & kPsSamplerSemanticVideo) != 0;
+          inferredSamplerLooksMovieTexture = (inferredSamplerSemanticFlags & kPsSamplerSemanticMovieTexture) != 0;
           inferredSamplerExprUvTransform = (inferredSamplerExpressionFlags & kPsSamplerExprUvTransform) != 0;
           inferredSamplerExprUvOffset = (inferredSamplerExpressionFlags & kPsSamplerExprUvOffset) != 0;
           inferredSamplerExprUvAnimated = (inferredSamplerExpressionFlags & kPsSamplerExprUvAnimated) != 0;
@@ -4432,11 +5095,14 @@ namespace dxvk {
           inferredUsesPackedSecondary = inferredUsesWz || inferredUsesZw;
           hasNonZeroInferredOffset = hasNonZeroInferredSamplerOffset(inferredPsEntry, stage);
         }
+        const bool isMovieTexture =
+          isUe3MovieTextureDescHash(texDescHash) ||
+          (isRenderTarget && inferredSamplerLooksMovieTexture);
 
         if (isCubeTexture && !allowCubemaps()) {
           const bool looksMaterialCubemap =
             sampleCount > 0 &&
-            !isRenderTarget &&
+            (!isRenderTarget || isMovieTexture) &&
             !inferredSamplerLooksEngineAuxiliary &&
             !inferredSamplerLooksLightmap &&
             !inferredSamplerLooksNonDiffuse &&
@@ -4473,14 +5139,24 @@ namespace dxvk {
         score += int64_t(std::min<uint16_t>(sampleCount, 16u)) * 120'000ll;
         score += hasInferredTexcoord ? 250'000 : -150'000;
         score += hasInferredUvHint ? 80'000 : 0;
-        score -= isRenderTarget ? 500'000 : 0;
+        score -= (isRenderTarget && !isMovieTexture) ? 500'000 : 0;
+        score += isMovieTexture ? 4'000'000 : 0;
         score += inferredSamplerLooksMaterialTexture ? 230'000 : 0;
         score -= inferredSamplerLooksEngineAuxiliary ? 420'000 : 0;
         score -= inferredSamplerLooksLightmap ? 280'000 : 0;
         score -= inferredSamplerLooksNonDiffuse ? 220'000 : 0;
         score -= inferredSamplerExprViewDependent ? 260'000 : 0;
         score -= inferredSamplerExprMaskControl ? 320'000 : 0;
+        score -= inferredSamplerLooksVideo ? 8'000'000 : 0;
         score -= isKnownAlbedoMask ? 6'000'000 : 0;
+        if (ue3EngineMode()) {
+          // UE3 binds many scene buffers, shadow maps, exposure/color curves, and UI/video
+          // surfaces alongside material samplers. Keep these out of legacy albedo slots.
+          score -= ((isRenderTarget && !isMovieTexture) || inferredSamplerLooksEngineAuxiliary) ? 450'000 : 0;
+          score -= (inferredSamplerLooksEngineAuxiliary && !inferredSamplerLooksMaterialTexture) ? 350'000 : 0;
+          score -= (isRenderTarget && !srgb && !isMovieTexture) ? 250'000 : 0;
+          score -= (!hasInferredTexcoord && inferredSamplerLooksEngineAuxiliary) ? 220'000 : 0;
+        }
         const bool looksExpressionDrivenMaterial =
           !inferredSamplerLooksEngineAuxiliary &&
           !inferredSamplerLooksLightmap &&
@@ -4661,6 +5337,7 @@ namespace dxvk {
             const bool looksMaterialTexture = (semanticFlags & kPsSamplerSemanticMaterialTexture) != 0;
             const bool looksEngineAuxiliary = (semanticFlags & kPsSamplerSemanticEngineAuxiliary) != 0;
             const bool looksNonDiffuse = (semanticFlags & kPsSamplerSemanticNonDiffuse) != 0;
+            const bool looksVideo = (semanticFlags & kPsSamplerSemanticVideo) != 0;
             const bool looksExprUvTransform = (expressionFlags & kPsSamplerExprUvTransform) != 0;
             const bool looksExprUvOffset = (expressionFlags & kPsSamplerExprUvOffset) != 0;
             const bool looksExprUvAnimated = (expressionFlags & kPsSamplerExprUvAnimated) != 0;
@@ -4675,12 +5352,16 @@ namespace dxvk {
               score -= 360;
             if ((semanticFlags & kPsSamplerSemanticLightmap) != 0)
               score -= 260;
+            if (ue3EngineMode() && looksEngineAuxiliary)
+              score -= looksMaterialTexture ? 160 : 320;
             if (looksNonDiffuse)
               score -= 220;
             if (looksExprViewDependent)
               score -= 240;
             if (looksExprMaskControl)
               score -= 280;
+            if (looksVideo)
+              score -= 8000;
             const bool looksExpressionDrivenMaterial =
               !looksEngineAuxiliary &&
               !looksNonDiffuse &&
@@ -4803,6 +5484,10 @@ namespace dxvk {
         D3D9CommonTexture* pTexInfo = GetCommonTexture(d3d9State().textures[stage]);
         assert(pTexInfo != nullptr);
         const XXH64_hash_t texHash = pTexInfo->GetImage()->getHash();
+        const XXH64_hash_t texDescHash =
+          pTexInfo->GetImage() != nullptr
+            ? pTexInfo->GetImage()->getDescriptorHash()
+            : kEmptyHash;
         const bool allowHashlessCubemap =
           pTexInfo->GetType() == D3DRTYPE_CUBETEXTURE && stage == strictCubemapFallbackStage;
 
@@ -4831,6 +5516,12 @@ namespace dxvk {
           continue;
         m_activeDrawCallState.materialData.colorTextures[textureID] = TextureRef(sampleView);
         m_activeDrawCallState.materialData.samplers[textureID] = sampler;
+        selectedUe3MovieTexture |=
+          isUe3MovieTextureDescHash(texDescHash) ||
+          (stage < caps::MaxTexturesPS &&
+           inferredPsEntry != nullptr &&
+           (inferredPsEntry->samplerSemanticFlags[stage] & kPsSamplerSemanticMovieTexture) != 0 &&
+           pTexInfo->IsRenderTarget());
         if (textureID == 0)
           m_activeDrawCallState.materialData.colorTextureIsSrgb = srgb;
 
@@ -4865,6 +5556,7 @@ namespace dxvk {
           if (sampleView != nullptr) {
             m_activeDrawCallState.materialData.colorTextures[0] = TextureRef(sampleView);
             m_activeDrawCallState.materialData.samplers[0] = sampler;
+            selectedUe3MovieTexture |= isUe3MovieTextureDescHash(pTexInfo->GetImage()->getDescriptorHash());
             m_activeDrawCallState.materialData.colorTextureIsSrgb = srgb;
 
             auto shaderSampler = RemapStateSamplerShader(firstStage);
@@ -4923,6 +5615,31 @@ namespace dxvk {
       // This ensures we track all materials sent by the game, not just the ones that are actually rendered.
       const XXH64_hash_t textureHash = m_activeDrawCallState.materialData.getColorTexture().getImageHash();
       const XXH64_hash_t materialHash = m_activeDrawCallState.materialData.getHash();
+      bool usesMovieTexture = selectedUe3MovieTexture;
+      for (uint32_t i = 0; i < LegacyMaterialData::kMaxSupportedTextures; i++) {
+        if (m_activeDrawCallState.materialData.colorTextures[i].isValid()) {
+          const DxvkImageView* imageView = m_activeDrawCallState.materialData.colorTextures[i].getImageView();
+          const XXH64_hash_t descHash =
+            imageView != nullptr
+              ? imageView->image()->getDescriptorHash()
+              : kEmptyHash;
+          if (isUe3MovieTextureDescHash(descHash)) {
+            usesMovieTexture = true;
+            break;
+          }
+        }
+      }
+      if (usesMovieTexture) {
+        m_activeDrawCallState.setCategory(InstanceCategories::WorldUI, true);
+        if (Logger::logLevel() <= LogLevel::Debug) {
+          static fast_unordered_set s_loggedMovieSurfaceMaterials;
+          if (s_loggedMovieSurfaceMaterials.insert(materialHash).second) {
+            Logger::debug(str::format(
+              "[RTX-Compatibility][UE3] Marked movie texture material as WorldUI: materialHash=0x",
+              std::hex, materialHash, ", textureHash=0x", textureHash, std::dec));
+          }
+        }
+      }
 
       // Flag smooth normals category at the d3d9 layer
       m_activeDrawCallState.setCategory(InstanceCategories::SmoothNormals, lookupHash(RtxOptions::smoothNormalsTextures(), textureHash) || lookupHash(RtxOptions::smoothNormalsTextures(), materialHash));

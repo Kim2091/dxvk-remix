@@ -61,6 +61,7 @@ namespace dxvk {
     m_vs.oPos        = DxsoRegisterPointer{ };
     m_fog            = DxsoRegisterPointer{ };
     m_vs.oPSize      = DxsoRegisterPointer{ };
+    m_vs.iPosition0  = DxsoRegisterPointer{ };
     m_vs.oTex0       = DxsoRegisterPointer{ };
     m_vs.oNormal0    = DxsoRegisterPointer{ };
     m_vs.oColor0     = DxsoRegisterPointer{ };
@@ -3716,6 +3717,9 @@ void DxsoCompiler::emitControlFlowGenericLoop(
       m_module.opStore(indexPtr.id, workingReg.id);
 
       // NV-DXVK start: vertex shader data capture implementation
+      if (m_programInfo.type() == DxsoProgramType::VertexShader && elem.semantic.usage == DxsoUsage::Position && elem.semantic.usageIndex == 0) {
+        m_vs.iPosition0 = indexPtr;
+      }
       if (m_programInfo.type() == DxsoProgramType::VertexShader && elem.semantic.usage == DxsoUsage::Normal && elem.semantic.usageIndex == 0) {
         m_vs.oNormal0 = indexPtr;
       }
@@ -3789,6 +3793,13 @@ void DxsoCompiler::emitControlFlowGenericLoop(
     // Compute vertex index in the CapturedVertex array
     const uint32_t vertexIndex = m_module.opISub(uintType, uVertexId, baseVertex);
 
+    const uint32_t flagsId = LoadConstant(uintType, (uint32_t)(D3D9RtxVertexCaptureMembers::Flags));
+    const uint32_t positionFromInputBit = m_module.constu32(kVertexCaptureFlag_PositionFromInput);
+    const uint32_t hasPositionFromInputFlagId = m_module.opINotEqual(
+      m_module.defBoolType(),
+      m_module.opBitwiseAnd(uintType, flagsId, positionFromInputBit),
+      m_module.constu32(0));
+
     // Load matrices we actually use for capture
     const uint32_t invProj = LoadConstant(mat4TypeId, (uint32_t) D3D9RtxVertexCaptureMembers::InvProj);
     const uint32_t viewToWorld = LoadConstant(mat4TypeId, (uint32_t) D3D9RtxVertexCaptureMembers::ViewToWorld);
@@ -3825,13 +3836,20 @@ void DxsoCompiler::emitControlFlowGenericLoop(
     // world -> object (affine)
     const uint32_t objH = m_module.opVectorTimesMatrix(vec4TypeId, world4, worldToObject);
     const uint32_t obj3 = m_module.opVectorShuffle(vec3TypeId, objH, objH, 3, lit012);
-    const uint32_t ox = m_module.opCompositeExtract(floatType, obj3, 1, &lit0);       
-    const uint32_t oy = m_module.opCompositeExtract(floatType, obj3, 1, &lit1);       
-    const uint32_t oz = m_module.opCompositeExtract(floatType, obj3, 1, &lit2);       
+
+    uint32_t capturedPosition = obj3;
+    if (m_vs.iPosition0.id > 0) {
+      const uint32_t inputPosition4 = m_module.opLoad(vec4TypeId, m_vs.iPosition0.id);
+      const uint32_t inputPosition3 = m_module.opVectorShuffle(vec3TypeId, inputPosition4, inputPosition4, 3, lit012);
+      capturedPosition = m_module.opSelect(vec3TypeId, hasPositionFromInputFlagId, inputPosition3, capturedPosition);
+    }
+    const uint32_t ox = m_module.opCompositeExtract(floatType, capturedPosition, 1, &lit0);
+    const uint32_t oy = m_module.opCompositeExtract(floatType, capturedPosition, 1, &lit1);
+    const uint32_t oz = m_module.opCompositeExtract(floatType, capturedPosition, 1, &lit2);
     uint32_t outComps[4] = { ox, oy, oz, oneF };
     const uint32_t worldPosId = m_module.opCompositeConstruct(vec4TypeId, 4, outComps);
 
-    emitVertexCaptureWrite(vertexIndex, CapturedVertexMembers::Position, obj3, vec3TypeId);
+    emitVertexCaptureWrite(vertexIndex, CapturedVertexMembers::Position, capturedPosition, vec3TypeId);
     
     // Write texcoord
     {
@@ -3911,7 +3929,6 @@ void DxsoCompiler::emitControlFlowGenericLoop(
         return value;
       };
 
-      const uint32_t flagsId = LoadConstant(uintType, (uint32_t)(D3D9RtxVertexCaptureMembers::Flags));
       const uint32_t normalFromColor0Bit = m_module.constu32(kVertexCaptureFlag_NormalFromColor0);
       const uint32_t normalBoneSkinningBit = m_module.constu32(kVertexCaptureFlag_NormalBoneSkinning);
       const uint32_t normalInputEncodedUByte4Bit = m_module.constu32(kVertexCaptureFlag_NormalInputEncodedUByte4);

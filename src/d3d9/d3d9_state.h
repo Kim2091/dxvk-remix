@@ -57,6 +57,7 @@ namespace dxvk {
   static constexpr uint32_t kVertexCaptureFlag_NormalInputEncodedUByte4 = 1u << 2;
   static constexpr uint32_t kVertexCaptureFlag_BlendIndicesInputNormalized = 1u << 3;
   static constexpr uint32_t kVertexCaptureFlag_BlendWeightsInputUnnormalized = 1u << 4;
+  static constexpr uint32_t kVertexCaptureFlag_PositionFromInput = 1u << 5;
 
   struct D3D9RtxVertexCaptureData {
     Matrix4 normalTransform;

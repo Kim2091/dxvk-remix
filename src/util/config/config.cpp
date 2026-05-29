@@ -132,6 +132,7 @@ namespace dxvk {
       { "rtx.d3d9.rasterizeFullscreenCompositeToPrimary",           "True" },
       { "rtx.d3d9.ue3StaticLocalMeshVertexCaptureCache",             "True" },
       { "rtx.d3d9.ue3StaticLocalMeshVertexCaptureCacheWarmupFrames", "2" },
+      { "rtx.d3d9.ue3NativeLocalMeshVertexCapture",                  "True" },
       // medge billboard materials sample dirt masks alongside ad textures
       { "rtx.albedoMaskTextures", "8BC96DE2A6824697" },
       { "rtx.legacyMaterial.roughnessConstant",          "0.5" },

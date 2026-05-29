@@ -82,6 +82,14 @@ namespace dxvk {
                "UE3 compat: for stable static LocalVertexFactory draws, reuse previously captured vertex shader output instead of preserving a new vertex-capture draw.");
     RTX_OPTION("rtx.d3d9", uint32_t, ue3StaticLocalMeshVertexCaptureCacheWarmupFrames, 2,
                "UE3 compat: number of matching captures before a static LocalVertexFactory draw can reuse cached vertex-capture output.");
+    RTX_OPTION("rtx.d3d9", float, ue3VertexCaptureCameraCellSize, 2000.0f,
+               "UE3 compat: world-space camera cell size used to refresh camera-sensitive vertex captures. Smaller values recapture more often; 0 disables camera-cell hashing.");
+    RTX_OPTION("rtx.d3d9", bool, ue3NativeLocalMeshVertexCapture, false,
+               "UE3 compat experimental: use input-assembler object-space positions directly for conservative static LocalVertexFactory draws instead of reconstructing positions from clip space.");
+    RTX_OPTION("rtx.d3d9", bool, ue3LogClassification, false,
+               "UE3 compat: log explicit pass and vertex factory classification decisions for draw-call routing diagnostics.");
+    RTX_OPTION("rtx.d3d9", bool, ue3LogCapturePrecision, false,
+               "UE3 compat: log camera-cell, hash, cache, and matrix diagnostics for vertex capture precision issues.");
     RTX_OPTION("rtx", bool, enableIndexBufferMemoization, true, "CPU performance optimization, should generally be enabled.  Will reduce main thread time by caching processIndexBuffer operations and reusing when possible, this will come at the expense of some CPU RAM.");
     RTX_OPTION("rtx", uint32_t, numGeometryProcessingThreads, 2, "The desired number of CPU threads to dedicate to geometry processing  Will be limited by the number of CPU cores.  There may be some advantage to lowering this number in games which are fairly simple and use a low number of draw calls per frame.  The default was determined by looking at a game with around 2000 draw calls per frame, and with a reasonably high average triangle count per draw.");
 
@@ -282,13 +290,76 @@ namespace dxvk {
       Terrain,
       TerrainMorph,
       Particle,
+      ParticleBeamTrail,
+      SpeedTree,
+      Foliage,
+      LocalDecal,
+      LensFlare,
       PositionOnly,
     };
 
     Ue3VertexFactoryType m_currentUe3VertexFactory = Ue3VertexFactoryType::Unknown;
+    enum class Ue3PassType : uint8_t {
+      Unknown = 0,
+      Material,
+      DepthPrepass,
+      ShadowDepth,
+      Velocity,
+      Lighting,
+      ModulatedShadowProjection,
+      FullscreenPostProcess,
+      UiComposite,
+      FogOrDistortion,
+      VideoCinematic,
+      VideoSurface,
+    };
+
+    Ue3PassType m_currentUe3PassType = Ue3PassType::Unknown;
     fast_unordered_cache<Ue3VertexFactoryType> m_ue3VertexFactoryCache;
 
     static Ue3VertexFactoryType classifyUe3VertexFactory(const D3D9VertexElements& elements);
+
+    struct Ue3ShaderFeatureInfo {
+      bool initialized = false;
+      bool hasMaterialSampler = false;
+      bool hasEngineAuxSampler = false;
+      bool hasSceneColorSampler = false;
+      bool hasSceneDepthSampler = false;
+      bool hasLightAttenuationSampler = false;
+      bool hasShadowSampler = false;
+      bool hasVelocitySampler = false;
+      bool hasExposureOrToneSampler = false;
+      bool hasUiSampler = false;
+      bool hasDistortionSampler = false;
+      bool hasVideoSampler = false;
+      bool hasBinkConstants = false;
+      bool hasPrevViewProjection = false;
+      bool hasVelocityConstants = false;
+      bool hasMotionBlurConstants = false;
+      bool hasDynamicLightingConstants = false;
+      bool hasLightFunctionConstants = false;
+      bool hasSphericalHarmonicLightingConstants = false;
+      bool hasScreenToShadowMatrix = false;
+      bool hasShadowModulateConstants = false;
+      bool hasToneMapConstants = false;
+      bool hasGammaConstants = false;
+      bool hasFogConstants = false;
+      bool hasHazeConstants = false;
+      bool hasUiCompositeConstants = false;
+    };
+
+    fast_unordered_cache<Ue3ShaderFeatureInfo> m_ue3ShaderFeatureCache;
+    Ue3ShaderFeatureInfo getUe3ShaderFeatureInfo(const D3D9CommonShader* shader);
+    Ue3PassType classifyUe3Pass(const DrawContext& drawContext);
+    static const char* describeUe3VertexFactory(Ue3VertexFactoryType type);
+    static const char* describeUe3PassType(Ue3PassType type);
+    static const char* describeGeometryStatus(RtxGeometryStatus status);
+    void logUe3Classification(const DrawContext& drawContext,
+                              Ue3PassType passType,
+                              RtxGeometryStatus status,
+                              const char* reason);
+    bool trackUe3MovieTextureRenderTarget(const char* reason);
+    bool isUe3MovieTextureDescHash(XXH64_hash_t descHash) const;
 
     struct Ue3VsShaderCtabInfo {
       bool initialized = false;
@@ -335,6 +406,7 @@ namespace dxvk {
       bool usedTranspose = false;
       Matrix4 worldToView;
       Matrix4 viewToProjection;
+      float reconstructionError = 0.0f;
     };
 
     Ue3CameraConstantsCache m_ue3CameraConstantsCache;
@@ -369,6 +441,7 @@ namespace dxvk {
     fast_unordered_cache<PsSamplerTexcoordEntry> m_psSamplerTexcoordCache;
     fast_unordered_set m_loggedPsSamplerTexcoordInference;
     fast_unordered_set m_autoRaytracedRenderTargetDescHashes;
+    fast_unordered_set m_ue3MovieTextureDescHashes;
 
     // NOTE: to avoid calculating matrix inverse,
     //       m_seenCameraPositions doesn't contain the actual positions,
@@ -403,7 +476,23 @@ namespace dxvk {
 
     fast_unordered_cache<Ue3VertexCaptureCacheEntry> m_ue3VertexCaptureCache;
 
+    struct Ue3CameraHashCell {
+      int32_t x = 0;
+      int32_t y = 0;
+      int32_t z = 0;
+    };
+    bool m_hasLoggedUe3CameraHashCell = false;
+    Ue3CameraHashCell m_lastLoggedUe3CameraHashCell = {};
+
+    bool shouldUseUe3CameraHashCell() const;
+    bool computeUe3CameraHashCell(Ue3CameraHashCell& outCell) const;
+    static bool areUe3CameraHashCellsEqual(const Ue3CameraHashCell& a, const Ue3CameraHashCell& b);
+    void logUe3CameraHashCellIfChanged(const Ue3CameraHashCell& cell, const char* reason);
+
     bool canUseUe3StaticVertexCaptureCache(const IndexContext& indexContext,
+                                           const VertexContext vertexContext[caps::MaxStreams],
+                                           const RasterGeometry& geoData) const;
+    bool canUseUe3NativeLocalVertexCapture(const IndexContext& indexContext,
                                            const VertexContext vertexContext[caps::MaxStreams],
                                            const RasterGeometry& geoData) const;
     XXH64_hash_t computeUe3StableVertexShaderHash() const;
@@ -427,7 +516,7 @@ namespace dxvk {
     template<typename T>
     DxvkBufferSlice processIndexBuffer(const uint32_t indexCount, const uint32_t startIndex, const IndexContext& indexCtx, uint32_t& minIndex, uint32_t& maxIndex);
 
-    bool prepareVertexCapture(const int vertexIndexOffset);
+    bool prepareVertexCapture(const int vertexIndexOffset, bool capturePositionFromInput = false);
 
     void processVertices(const VertexContext vertexContext[caps::MaxStreams], int vertexIndexOffset, RasterGeometry& geoData);
 

@@ -181,7 +181,7 @@ namespace dxvk {
         };
 
         bool hashedFloatConstsWithExclusions = false;
-        if (ue3CameraFromShaderConstants() && floatConstRegCount > 0) {
+        if ((ue3CameraFromShaderConstants() || ue3EngineMode()) && floatConstRegCount > 0) {
           // UE3 compat/perf to avoid camera-motion-only hash churn by excluding known
           // camera constants (ViewProjection + CameraPosition) from the VS constant hash
           constexpr uint32_t kFallbackViewProjReg = 0;
@@ -269,22 +269,19 @@ namespace dxvk {
           // refresh geometry as the camera travels by folding a coarse camera anchor into the hash
           // doing this to avoid the distortion that grows with distance from the location where RT was enabled
           // todo: revisit this, it still doesn't solve scene capture distortion
-          constexpr float kCameraHashCellSize = 2000.0f;
-          const Matrix4 cameraViewToWorld = inverseAffine(m_activeDrawCallState.transformData.worldToView);
-          const Vector3 cameraPos = cameraViewToWorld[3].xyz();
-          struct CameraHashCell {
-            int32_t x;
-            int32_t y;
-            int32_t z;
-          } cameraCell = {
-            int32_t(std::floor(cameraPos.x / kCameraHashCellSize)),
-            int32_t(std::floor(cameraPos.y / kCameraHashCellSize)),
-            int32_t(std::floor(cameraPos.z / kCameraHashCellSize)),
-          };
-          vertexShaderHash = XXH3_64bits_withSeed(
-            &cameraCell,
-            sizeof(cameraCell),
-            vertexShaderHash);
+          Ue3CameraHashCell cameraCell;
+          if (computeUe3CameraHashCell(cameraCell)) {
+            logUe3CameraHashCellIfChanged(cameraCell, "geometry hash");
+            vertexShaderHash = XXH3_64bits_withSeed(
+              &cameraCell,
+              sizeof(cameraCell),
+              vertexShaderHash);
+          }
+          if (ue3LogCapturePrecision() && Logger::logLevel() <= LogLevel::Debug) {
+            ONCE(Logger::debug(str::format(
+              "[RTX-Compatibility][UE3-Capture] VS camera constants excluded from geometry hash, cameraCellEnabled=",
+              shouldUseUe3CameraHashCell(), ", floatConstRegCount=", floatConstRegCount)));
+          }
         }
 
         if (m_forceIaTexcoordForOutlier) {

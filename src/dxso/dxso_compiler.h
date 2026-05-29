@@ -179,6 +179,7 @@ namespace dxvk {
     DxsoRegisterPointer oPSize;
 
     // NV-DXVK start: vertex shader data capture implementation
+    DxsoRegisterPointer iPosition0;
     DxsoRegisterPointer oTex0;
     DxsoRegisterPointer oNormal0;
     DxsoRegisterPointer oColor0;
