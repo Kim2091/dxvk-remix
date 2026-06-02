@@ -20,20 +20,18 @@
   DEALINGS IN THE SOFTWARE.
 #>
 
-function SetupVS {
-	param(
-		[Parameter(Mandatory)]
-		[string]$Platform
-	)
-	If ($vsWhere = Get-Command "vswhere.exe" -ErrorAction SilentlyContinue) {
-	  $vsWhere = $vsWhere.Path
-	} ElseIf (Test-Path "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe") {
-	  $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-	}
-	 Else {
-	  Write-Error "vswhere not found. Aborting." -ErrorAction Stop
-	}
-	Write-Host "vswhere found at: $vsWhere" -ForegroundColor Yellow
+#
+# Find vswhere (installed with recent Visual Studio versions).
+#
+If ($vsWhere = Get-Command "vswhere.exe" -ErrorAction SilentlyContinue) {
+  $vsWhere = $vsWhere.Path
+} ElseIf (Test-Path "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe") {
+  $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+}
+ Else {
+  Write-Error "vswhere not found. Aborting." -ErrorAction Stop
+}
+Write-Host "vswhere found at: $vsWhere" -ForegroundColor Yellow
 
 
 #
@@ -74,8 +72,6 @@ function PerformBuild {
 		[Parameter(Mandatory)]
 		[string]$Backend,
 
-		[string]$Platform = "x64",
-
 		[Parameter(Mandatory)]
 		[string]$BuildFlavour,
 		
@@ -94,23 +90,16 @@ function PerformBuild {
 		[bool]$ShadersOnly = $false
 	)
 
-	SetupVS -Platform $Platform
-
 	$CurrentDir = Get-Location
+	$OutputDir = [IO.Path]::Combine($CurrentDir, "_output")
 	$BuildDir = [IO.Path]::Combine($CurrentDir, $BuildSubDir)
 
 	Push-Location $CurrentDir
-		$setupArgs = @(
-			"setup",
-			"--buildtype", $BuildFlavour,
-			"--backend", $Backend,
-			("-Denable_tracy=$EnableTracy"),
-			$BuildSubDir
-		)
+		$mesonArgs = "setup --buildtype `"$BuildFlavour`" --backend `"$Backend`" -Denable_tracy=`"$EnableTracy`" `"$BuildSubDir`""
 		if ( $ShadersOnly ) {
-			$setupArgs += "-Ddownload_apics=False"
+			$mesonArgs = "$mesonArgs -Ddownload_apics=False"
 		}
-		Invoke-Meson -MesonArgs $setupArgs
+		Start-Process "meson" -NoNewWindow -ArgumentList $mesonArgs -wait
 	Pop-Location
 
 	if ( $LASTEXITCODE -ne 0 ) {
@@ -120,22 +109,23 @@ function PerformBuild {
 
 	if ($ShadersOnly) {
 		Push-Location $BuildDir
-		Invoke-Meson -MesonArgs @("compile", "rtx_shaders")
+		$mesonArgs = "compile rtx_shaders"
+		Start-Process "meson" -NoNewWindow -ArgumentList $mesonArgs -wait
 		Pop-Location
 		exit $LASTEXITCODE
 	}
 
 	if (!$ConfigureOnly) {
 		Push-Location $BuildDir
-			Invoke-Meson -MesonArgs @("compile", "-v")
+			& meson compile -v 
 
 			if ($InstallTags -and $InstallTags.Count -gt 0) {
 				# join array into comma-separated list
 				$tagList = $InstallTags -join ','
-				Invoke-Meson -MesonArgs @("install", "--tags", $tagList)
+				& meson install --tags $tagList
 			}
 			else {
-				Invoke-Meson -MesonArgs @("install")
+				& meson install
 			}
 		Pop-Location
 
