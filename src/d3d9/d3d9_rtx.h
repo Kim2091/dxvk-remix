@@ -266,6 +266,7 @@ namespace dxvk {
     bool m_forceGeometryCopy = false;
     bool m_forceIaTexcoordForOutlier = false;
     DWORD m_texcoordIndex = 0;
+    DWORD m_iaTexcoordIndex = 0;
     uint8_t m_texcoordCompU = 0;
     uint8_t m_texcoordCompV = 1;
     uint16_t m_psInferredSampleCount = 0;
@@ -415,6 +416,7 @@ namespace dxvk {
     struct PsSamplerTexcoordEntry {
       bool initialized = false;
       std::array<int8_t, caps::MaxTexturesPS> samplerToTexcoord;
+      std::array<int8_t, caps::MaxTexturesPS> samplerToTexcoordReg;
       std::array<uint8_t, caps::MaxTexturesPS> samplerCoordCompValid;
       std::array<uint8_t, caps::MaxTexturesPS> samplerCoordCompU;
       std::array<uint8_t, caps::MaxTexturesPS> samplerCoordCompV;
@@ -440,6 +442,16 @@ namespace dxvk {
     };
     fast_unordered_cache<PsSamplerTexcoordEntry> m_psSamplerTexcoordCache;
     fast_unordered_set m_loggedPsSamplerTexcoordInference;
+
+    struct Ue3VsTexcoordTraceEntry {
+      bool initialized = false;
+      bool valid = false;
+      uint8_t iaTexcoordIndex = 0;
+      uint8_t inputReg = 0;
+      uint8_t sourceCompU = 0;
+      uint8_t sourceCompV = 1;
+    };
+    fast_unordered_cache<Ue3VsTexcoordTraceEntry> m_ue3VsTexcoordTraceCache;
     fast_unordered_set m_autoRaytracedRenderTargetDescHashes;
     fast_unordered_set m_ue3MovieTextureDescHashes;
 

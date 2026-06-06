@@ -138,6 +138,194 @@ namespace dxvk {
       return XXH3_64bits(bytecode.data(), bytecode.size());
     }
 
+    static uint32_t findVsTexcoordOutputRegister(const D3D9CommonShader* shader, uint32_t usageIndex) {
+      if (shader == nullptr)
+        return std::numeric_limits<uint32_t>::max();
+
+      const auto& osgn = shader->GetOsgn();
+      for (uint32_t i = 0; i < osgn.elemCount; i++) {
+        const auto& decl = osgn.elems[i];
+        if (decl.semantic.usage == DxsoUsage::Texcoord && decl.semantic.usageIndex == usageIndex)
+          return decl.regNumber;
+      }
+
+      return std::numeric_limits<uint32_t>::max();
+    }
+
+    struct Ue3VsTexcoordTraceResult {
+      bool valid = false;
+      uint8_t iaTexcoordIndex = 0;
+      uint8_t inputReg = 0;
+      uint8_t sourceCompU = 0;
+      uint8_t sourceCompV = 1;
+    };
+
+    struct Ue3VsComponentOrigin {
+      bool valid = false;
+      uint8_t inputReg = 0;
+      uint8_t component = 0;
+    };
+
+    static bool sameUe3VsComponentOrigin(const Ue3VsComponentOrigin& a, const Ue3VsComponentOrigin& b) {
+      return a.valid == b.valid &&
+             a.inputReg == b.inputReg &&
+             a.component == b.component;
+    }
+
+    static Ue3VsTexcoordTraceResult traceVsOutputTexcoordToInputUsageIndex(
+      const D3D9CommonShader* vertexShader,
+      const uint32_t outputRegNumber,
+      const uint8_t compU,
+      const uint8_t compV) {
+      Ue3VsTexcoordTraceResult result;
+
+      if (vertexShader == nullptr ||
+          outputRegNumber >= DxsoMaxInterfaceRegs ||
+          compU >= 4u ||
+          compV >= 4u) {
+        return result;
+      }
+
+      const auto& info = vertexShader->GetInfo();
+      if (info.type() != DxsoProgramTypes::VertexShader)
+        return result;
+
+      const auto& bytecode = vertexShader->GetBytecode();
+      if (bytecode.size() < sizeof(uint32_t) || (bytecode.size() % sizeof(uint32_t)) != 0)
+        return result;
+
+      std::array<int8_t, 2 * DxsoMaxInterfaceRegs> inputRegToTexcoord = {};
+      inputRegToTexcoord.fill(-1);
+      {
+        const auto& isgn = vertexShader->GetIsgn();
+        for (uint32_t i = 0; i < isgn.elemCount; i++) {
+          const auto& e = isgn.elems[i];
+          if (e.semantic.usage == DxsoUsage::Texcoord && e.regNumber < inputRegToTexcoord.size())
+            inputRegToTexcoord[e.regNumber] = int8_t(e.semantic.usageIndex & 0b111);
+        }
+      }
+
+      std::array<std::array<Ue3VsComponentOrigin, 4>, 64> tempOrigins = {};
+      std::array<Ue3VsComponentOrigin, 4> outputOrigins = {};
+
+      auto readOriginFromSource = [&](const DxsoRegister& src, const uint32_t dstComponent) -> Ue3VsComponentOrigin {
+        const uint8_t srcComponent = uint8_t(src.swizzle[dstComponent & 0x3u] & 0x3u);
+        switch (src.id.type) {
+        case DxsoRegisterType::Input:
+          if (src.id.num < inputRegToTexcoord.size() && inputRegToTexcoord[src.id.num] >= 0) {
+            Ue3VsComponentOrigin origin;
+            origin.valid = true;
+            origin.inputReg = uint8_t(src.id.num);
+            origin.component = srcComponent;
+            return origin;
+          }
+          break;
+        case DxsoRegisterType::Temp:
+        case DxsoRegisterType::TempFloat16:
+          if (src.id.num < tempOrigins.size())
+            return tempOrigins[src.id.num][srcComponent];
+          break;
+        default:
+          break;
+        }
+
+        return Ue3VsComponentOrigin{};
+      };
+
+      auto mergeOrigins = [&](std::initializer_list<Ue3VsComponentOrigin> origins) {
+        Ue3VsComponentOrigin merged;
+        for (const Ue3VsComponentOrigin& origin : origins) {
+          if (!origin.valid)
+            continue;
+
+          if (!merged.valid) {
+            merged = origin;
+          } else if (!sameUe3VsComponentOrigin(merged, origin)) {
+            return Ue3VsComponentOrigin{};
+          }
+        }
+
+        return merged;
+      };
+
+      auto traceInstructionComponent = [&](const DxsoInstructionContext& ctx, const uint32_t dstComponent) {
+        switch (ctx.instruction.opcode) {
+        case DxsoOpcode::Mov:
+        case DxsoOpcode::Abs:
+        case DxsoOpcode::Frc:
+          return readOriginFromSource(ctx.src[0], dstComponent);
+        case DxsoOpcode::Add:
+        case DxsoOpcode::Sub:
+        case DxsoOpcode::Mul:
+        case DxsoOpcode::Min:
+        case DxsoOpcode::Max:
+          return mergeOrigins({
+            readOriginFromSource(ctx.src[0], dstComponent),
+            readOriginFromSource(ctx.src[1], dstComponent) });
+        case DxsoOpcode::Mad:
+        case DxsoOpcode::Lrp:
+        case DxsoOpcode::Cmp:
+        case DxsoOpcode::Dp2Add:
+          return mergeOrigins({
+            readOriginFromSource(ctx.src[0], dstComponent),
+            readOriginFromSource(ctx.src[1], dstComponent),
+            readOriginFromSource(ctx.src[2], dstComponent) });
+        default:
+          break;
+        }
+
+        return Ue3VsComponentOrigin{};
+      };
+
+      auto isTraceableDestination = [](const DxsoRegister& dst) {
+        return dst.id.type == DxsoRegisterType::Temp ||
+               dst.id.type == DxsoRegisterType::TempFloat16 ||
+               dst.id.type == DxsoRegisterType::Output;
+      };
+
+      const uint32_t* tokens = reinterpret_cast<const uint32_t*>(bytecode.data());
+      DxsoDecodeContext decoder(info);
+      DxsoCodeIter iter(tokens + 1);
+
+      while (decoder.decodeInstruction(iter)) {
+        const DxsoInstructionContext& ctx = decoder.getInstructionContext();
+        if (!isTraceableDestination(ctx.dst))
+          continue;
+
+        for (uint32_t c = 0; c < 4u; c++) {
+          if (!ctx.dst.mask[c])
+            continue;
+
+          const Ue3VsComponentOrigin origin = traceInstructionComponent(ctx, c);
+          if (ctx.dst.id.type == DxsoRegisterType::Temp ||
+              ctx.dst.id.type == DxsoRegisterType::TempFloat16) {
+            if (ctx.dst.id.num < tempOrigins.size())
+              tempOrigins[ctx.dst.id.num][c] = origin;
+          } else if (ctx.dst.id.num == outputRegNumber) {
+            outputOrigins[c] = origin;
+          }
+        }
+      }
+
+      const Ue3VsComponentOrigin uOrigin = outputOrigins[compU & 0x3u];
+      const Ue3VsComponentOrigin vOrigin = outputOrigins[compV & 0x3u];
+      if (!uOrigin.valid || !vOrigin.valid || uOrigin.inputReg != vOrigin.inputReg)
+        return result;
+
+      if (uOrigin.component != 0u || vOrigin.component != 1u)
+        return result;
+
+      if (uOrigin.inputReg >= inputRegToTexcoord.size() || inputRegToTexcoord[uOrigin.inputReg] < 0)
+        return result;
+
+      result.valid = true;
+      result.iaTexcoordIndex = uint8_t(inputRegToTexcoord[uOrigin.inputReg]);
+      result.inputReg = uOrigin.inputReg;
+      result.sourceCompU = uOrigin.component;
+      result.sourceCompV = vOrigin.component;
+      return result;
+    }
+
     // UE3 reserves PS constants c0, c1, c2 (PSR_ColorBiasFactor, PSR_ScreenPositionScaleBias, PSR_MinZ_MaxZ_Ratio)
     // material params (VectorParameterValues e.g. DiffuseColor, ScalarParameterValues) live in UniformVector_* and UniformScalar_*
     // we parse the shader CTAB to find their register indices, fallback to fixed range if CTAB is empty/stripped
@@ -400,6 +588,7 @@ namespace dxvk {
 
     struct PsSamplerTexcoordInference {
       int32_t texcoord = -1;
+      int32_t texcoordReg = -1;
       bool coordCompValid = false;
       uint8_t coordCompU = 0;
       uint8_t coordCompV = 1;
@@ -512,6 +701,8 @@ namespace dxvk {
 
       std::array<int8_t, 64> tempToTexcoord = {};
       tempToTexcoord.fill(-1);
+      std::array<int8_t, 64> tempToTexcoordReg = {};
+      tempToTexcoordReg.fill(-1);
 
       std::array<PsTexcoordScaleHint, 64> tempToScaleHint = {};
       std::array<uint8_t, 64> tempCoordProvenance = {};
@@ -549,6 +740,23 @@ namespace dxvk {
         case DxsoRegisterType::Temp:
         case DxsoRegisterType::TempFloat16:
           return (r.id.num < tempToTexcoord.size()) ? tempToTexcoord[r.id.num] : -1;
+        default:
+          return -1;
+        }
+      };
+
+      auto getTexcoordRegFromRegister = [&](const DxsoRegister& r) -> int32_t {
+        switch (r.id.type) {
+        case DxsoRegisterType::Texture:
+        case DxsoRegisterType::PixelTexcoord:
+          return int32_t(r.id.num);
+        case DxsoRegisterType::Input:
+          return (r.id.num < inputRegToTexcoord.size() && inputRegToTexcoord[r.id.num] >= 0)
+            ? int32_t(r.id.num)
+            : -1;
+        case DxsoRegisterType::Temp:
+        case DxsoRegisterType::TempFloat16:
+          return (r.id.num < tempToTexcoordReg.size()) ? tempToTexcoordReg[r.id.num] : -1;
         default:
           return -1;
         }
@@ -765,6 +973,9 @@ namespace dxvk {
 
       std::array<uint32_t, 8> texcoordUseCount = {};
       texcoordUseCount.fill(0);
+      std::array<std::array<uint16_t, 2 * DxsoMaxInterfaceRegs>, 8> texcoordRegUseCount = {};
+      for (auto& regUseCount : texcoordRegUseCount)
+        regUseCount.fill(0);
       std::array<std::array<uint16_t, 16>, 8> texcoordCoordPairUseCount = {};
       for (auto& coordPairUseCount : texcoordCoordPairUseCount)
         coordPairUseCount.fill(0);
@@ -797,6 +1008,7 @@ namespace dxvk {
         if ((ctx.dst.id.type == DxsoRegisterType::Temp || ctx.dst.id.type == DxsoRegisterType::TempFloat16) &&
             ctx.dst.id.num < tempToTexcoord.size()) {
           int32_t derived = -1;
+          int32_t derivedReg = -1;
           bool writesTrackedTemp = false;
           PsTexcoordScaleHint derivedScaleHint;
           uint8_t derivedExpressionFlags =
@@ -809,6 +1021,7 @@ namespace dxvk {
 
           auto assignFromSource = [&](const DxsoRegister& srcReg) {
             derived = getTexcoordFromRegister(srcReg);
+            derivedReg = getTexcoordRegFromRegister(srcReg);
             derivedExpressionFlags |= getCoordExpressionFlagsFromRegister(srcReg);
             derivedSamplerValueRole |= classifySamplerValueRoleWithSwizzle(srcReg);
             if (derived < 0)
@@ -974,6 +1187,9 @@ namespace dxvk {
               }
             } else {
               derived = mergeSingle({ tc0, tc1 });
+              derivedReg = mergeSingle({
+                getTexcoordRegFromRegister(ctx.src[0]),
+                getTexcoordRegFromRegister(ctx.src[1]) });
             }
             break;
           }
@@ -1000,6 +1216,9 @@ namespace dxvk {
               assignFromSource(ctx.src[1]);
             } else {
               derived = mergeSingle({ tc0, tc1 });
+              derivedReg = mergeSingle({
+                getTexcoordRegFromRegister(ctx.src[0]),
+                getTexcoordRegFromRegister(ctx.src[1]) });
             }
             if (derived >= 0 &&
                 (op == DxsoOpcode::Dp3 || op == DxsoOpcode::Dp4 ||
@@ -1043,6 +1262,9 @@ namespace dxvk {
               }
             } else {
               derived = mergeSingle({ tc0, tc1 });
+              derivedReg = mergeSingle({
+                getTexcoordRegFromRegister(ctx.src[0]),
+                getTexcoordRegFromRegister(ctx.src[1]) });
               if (derived < 0) {
                 PsTexcoordScaleHint h0, h1;
                 if (tryLoadConstantLikeHint(ctx.src[0], h0) &&
@@ -1111,6 +1333,10 @@ namespace dxvk {
               }
             } else {
               derived = mergeSingle({ tc0, tc1, tc2 });
+              derivedReg = mergeSingle({
+                getTexcoordRegFromRegister(ctx.src[0]),
+                getTexcoordRegFromRegister(ctx.src[1]),
+                getTexcoordRegFromRegister(ctx.src[2]) });
             }
             if (derived >= 0)
               derivedExpressionFlags |= kPsSamplerExprUvTransform;
@@ -1124,6 +1350,10 @@ namespace dxvk {
               getTexcoordFromRegister(ctx.src[0]),
               getTexcoordFromRegister(ctx.src[1]),
               getTexcoordFromRegister(ctx.src[2]) });
+            derivedReg = mergeSingle({
+              getTexcoordRegFromRegister(ctx.src[0]),
+              getTexcoordRegFromRegister(ctx.src[1]),
+              getTexcoordRegFromRegister(ctx.src[2]) });
             if (derived >= 0)
               derivedExpressionFlags |= kPsSamplerExprBlendMath;
             break;
@@ -1205,6 +1435,7 @@ namespace dxvk {
 
           if (derived >= 0) {
             tempToTexcoord[ctx.dst.id.num] = int8_t(derived);
+            tempToTexcoordReg[ctx.dst.id.num] = int8_t(derivedReg);
             tempCoordExpressionFlags[ctx.dst.id.num] = derivedExpressionFlags;
             tempSamplerValueRole[ctx.dst.id.num] = derivedSamplerValueRole;
             tempCoordProvenance[ctx.dst.id.num] =
@@ -1219,6 +1450,7 @@ namespace dxvk {
               tempToScaleHint[ctx.dst.id.num] = PsTexcoordScaleHint{};
           } else if (writesTrackedTemp) {
             tempToTexcoord[ctx.dst.id.num] = -1;
+            tempToTexcoordReg[ctx.dst.id.num] = -1;
             tempCoordExpressionFlags[ctx.dst.id.num] = derivedExpressionFlags;
             tempSamplerValueRole[ctx.dst.id.num] = derivedSamplerValueRole;
             tempCoordProvenance[ctx.dst.id.num] =
@@ -1374,6 +1606,13 @@ namespace dxvk {
               uint16_t& pairCount = texcoordCoordPairUseCount[tcIdx][pairIdx];
               if (pairCount < std::numeric_limits<uint16_t>::max())
                 pairCount = uint16_t(pairCount + 1u);
+
+              const int32_t tcReg = getTexcoordRegFromRegister(*swizzleReg);
+              if (tcReg >= 0 && uint32_t(tcReg) < texcoordRegUseCount[tcIdx].size()) {
+                uint16_t& regCount = texcoordRegUseCount[tcIdx][uint32_t(tcReg)];
+                if (regCount < std::numeric_limits<uint16_t>::max())
+                  regCount = uint16_t(regCount + 1u);
+              }
             }
           }
 
@@ -1440,6 +1679,18 @@ namespace dxvk {
       if (foundTexcoord >= 0 && uint32_t(foundTexcoord) < perTexcoordScaleHints.size()) {
         const auto& agg = perTexcoordScaleHints[uint32_t(foundTexcoord)];
         const uint32_t tcIdx = uint32_t(foundTexcoord);
+        {
+          uint32_t bestRegCount = 0;
+          int32_t bestReg = -1;
+          for (uint32_t reg = 0; reg < texcoordRegUseCount[tcIdx].size(); reg++) {
+            const uint32_t regCount = texcoordRegUseCount[tcIdx][reg];
+            if (regCount > bestRegCount) {
+              bestRegCount = regCount;
+              bestReg = int32_t(reg);
+            }
+          }
+          result.texcoordReg = bestReg;
+        }
         {
           uint32_t totalPairCount = 0;
           uint32_t bestPairCount = 0;
@@ -2680,6 +2931,7 @@ namespace dxvk {
     mix(geoData.cullMode);
     mix(geoData.frontFace);
     mix(m_texcoordIndex);
+    mix(m_iaTexcoordIndex);
     mix(m_texcoordCompU);
     mix(m_texcoordCompV);
     mix(m_forceIaTexcoordForOutlier);
@@ -2958,6 +3210,12 @@ namespace dxvk {
       capturedTexcoordOutputRegister = FindUniqueVsTexcoordOutputRegister(vertexShader);
     if (forceIaTexcoordForOutlier)
       capturedTexcoordOutputRegister = std::numeric_limits<uint32_t>::max();
+    if (ue3EngineMode() && capturePositionFromInput && hasIaTexcoord) {
+      // UE3 LocalVertexFactory capture deliberately keeps object space IA
+      // positions - keep IA UVs too so the deterministic interpolant->IA trace
+      // can correct packed material UV channels
+      capturedTexcoordOutputRegister = std::numeric_limits<uint32_t>::max();
+    }
 
     // UE3 packs UV pairs into float4 VS outputs as .xy = even UV, .wz = odd UV
     // the only valid component extractions are (0,1) for .xy and (3,2) for .wz
@@ -3176,7 +3434,7 @@ namespace dxvk {
           targetBuffer = &geoData.normalBuffer;
         break;
       case D3DDECLUSAGE_TEXCOORD:
-        if (m_texcoordIndex <= MAXD3DDECLUSAGEINDEX && element.UsageIndex == m_texcoordIndex)
+        if (m_iaTexcoordIndex <= MAXD3DDECLUSAGEINDEX && element.UsageIndex == m_iaTexcoordIndex)
           targetBuffer = &geoData.texcoordBuffer;
         break;
       case D3DDECLUSAGE_COLOR:
@@ -3228,7 +3486,8 @@ namespace dxvk {
         VkFormat fmt = DecodeDecltype(D3DDECLTYPE(element.Type));
         uint32_t elementOffset = element.Offset;
 
-        if (element.Usage == D3DDECLUSAGE_TEXCOORD &&
+        if (!ue3EngineMode() &&
+            element.Usage == D3DDECLUSAGE_TEXCOORD &&
             m_texcoordCompV == uint8_t(m_texcoordCompU + 1) &&
             (m_texcoordCompU != 0 || m_texcoordCompV != 1)) {
           auto describeTexcoordFormat = [](VkFormat format, uint32_t& outCompCount, uint32_t& outCompSize) {
@@ -4801,6 +5060,7 @@ namespace dxvk {
     m_activeDrawCallState.materialData.colorTextureIsSrgb = false;
     m_texcoordCompU = 0;
     m_texcoordCompV = 1;
+    m_iaTexcoordIndex = 0;
     const D3D9CommonShader* inferredPs = nullptr;
     XXH64_hash_t inferredPsHash = 0;
     PsSamplerTexcoordEntry* inferredPsEntry = nullptr;
@@ -4891,6 +5151,82 @@ namespace dxvk {
       return std::abs(uOffset) > kOffsetEps || std::abs(vOffset) > kOffsetEps;
     };
 
+    auto resolveInferredSamplerScale = [&](const PsSamplerTexcoordEntry* entry, const uint32_t stage, float& outU, float& outV) -> bool {
+      outU = 1.0f;
+      outV = 1.0f;
+
+      if (entry == nullptr || stage >= caps::MaxTexturesPS)
+        return false;
+
+      if (entry->samplerScaleImmediateValid[stage]) {
+        outU = entry->samplerScaleImmediateU[stage];
+        outV = entry->samplerScaleImmediateV[stage];
+        return std::isfinite(outU) && std::isfinite(outV);
+      }
+
+      const int16_t scaleConstReg = entry->samplerScaleConstReg[stage];
+      if (scaleConstReg >= 0 && uint32_t(scaleConstReg) < caps::MaxFloatConstantsPS) {
+        const Vector4& scaleConst = d3d9State().psConsts.fConsts[uint32_t(scaleConstReg)];
+        const uint32_t compU = entry->samplerScaleConstCompU[stage] & 0x3;
+        const uint32_t compV = entry->samplerScaleConstCompV[stage] & 0x3;
+        outU = scaleConst[compU] * entry->samplerScaleFactorU[stage];
+        outV = scaleConst[compV] * entry->samplerScaleFactorV[stage];
+        return std::isfinite(outU) && std::isfinite(outV);
+      }
+
+      return false;
+    };
+
+    auto vertexDeclHasFloat2Texcoord = [&](const uint32_t usageIndex) -> bool {
+      if (d3d9State().vertexDecl.ptr() == nullptr)
+        return false;
+
+      for (const auto& element : d3d9State().vertexDecl->GetElements()) {
+        if (element.Usage == D3DDECLUSAGE_TEXCOORD &&
+            element.UsageIndex == usageIndex &&
+            element.Type == D3DDECLTYPE_FLOAT2) {
+          return true;
+        }
+      }
+
+      return false;
+    };
+
+    auto vertexDeclHasFloat16x2Texcoord = [&](const uint32_t usageIndex) -> bool {
+      if (d3d9State().vertexDecl.ptr() == nullptr)
+        return false;
+
+      for (const auto& element : d3d9State().vertexDecl->GetElements()) {
+        if (element.Usage == D3DDECLUSAGE_TEXCOORD &&
+            element.UsageIndex == usageIndex &&
+            element.Type == D3DDECLTYPE_FLOAT16_2) {
+          return true;
+        }
+      }
+
+      return false;
+    };
+
+    auto vertexDeclTexcoordAppearsBefore = [&](const uint32_t firstUsageIndex, const uint32_t secondUsageIndex) -> bool {
+      if (d3d9State().vertexDecl.ptr() == nullptr)
+        return false;
+
+      int32_t firstPosition = -1;
+      int32_t secondPosition = -1;
+      int32_t position = 0;
+      for (const auto& element : d3d9State().vertexDecl->GetElements()) {
+        if (element.Usage == D3DDECLUSAGE_TEXCOORD) {
+          if (element.UsageIndex == firstUsageIndex)
+            firstPosition = position;
+          if (element.UsageIndex == secondUsageIndex)
+            secondPosition = position;
+          position++;
+        }
+      }
+
+      return firstPosition >= 0 && secondPosition >= 0 && firstPosition < secondPosition;
+    };
+
     auto getOrInitPsSamplerTexcoordEntry = [&](const D3D9CommonShader* ps, XXH64_hash_t& outHash) -> PsSamplerTexcoordEntry* {
       if (ps == nullptr)
         return nullptr;
@@ -4900,6 +5236,7 @@ namespace dxvk {
       if (!entry.initialized) {
         entry.initialized = true;
         entry.samplerToTexcoord.fill(-1);
+        entry.samplerToTexcoordReg.fill(-1);
         entry.samplerCoordCompValid.fill(0);
         entry.samplerCoordCompU.fill(0);
         entry.samplerCoordCompV.fill(1);
@@ -4925,6 +5262,7 @@ namespace dxvk {
         for (uint32_t s = 0; s < caps::MaxTexturesPS; s++) {
           const PsSamplerTexcoordInference inferred = inferPixelShaderTexcoordForSampler(ps, s);
           entry.samplerToTexcoord[s] = int8_t(inferred.texcoord);
+          entry.samplerToTexcoordReg[s] = int8_t(inferred.texcoordReg);
           entry.samplerCoordCompValid[s] = inferred.coordCompValid ? 1u : 0u;
           entry.samplerCoordCompU[s] = inferred.coordCompU;
           entry.samplerCoordCompV[s] = inferred.coordCompV;
@@ -5714,6 +6052,8 @@ namespace dxvk {
     // only keep the passthrough texcoord index for selecting the vertex declaration element
     // upper bits are D3DTSS_TCI_* flags used for fixed-function texgen
     uint32_t texcoordIdx = d3d9State().textureStages[stageStateIdx][DXVK_TSS_TEXCOORDINDEX] & 0b111;
+    uint32_t iaTexcoordIdx = texcoordIdx;
+    bool ue3VsTexcoordTraceValid = false;
 
     m_forceIaTexcoordForOutlier = [&]() {
       const auto& outlierSet = vsTexcoordCaptureOutlierTextures();
@@ -5745,6 +6085,40 @@ namespace dxvk {
     if constexpr (!FixedFunction) {
       const bool forceIaTexcoordForOutlier = m_forceIaTexcoordForOutlier;
 
+      auto getOrInitVsTexcoordTraceEntry = [&](const D3D9CommonShader* vs,
+                                               const uint32_t outputReg,
+                                               const uint8_t compU,
+                                               const uint8_t compV) -> Ue3VsTexcoordTraceEntry* {
+        if (vs == nullptr || outputReg == std::numeric_limits<uint32_t>::max())
+          return nullptr;
+
+        const XXH64_hash_t vsHash = hashDxsoBytecode(vs->GetBytecode());
+        if (vsHash == 0)
+          return nullptr;
+
+        XXH64_hash_t traceKey = vsHash;
+        auto mix = [&](const uint64_t v) {
+          traceKey ^= v + 0x9E3779B97F4A7C15ull + (traceKey << 6) + (traceKey >> 2);
+        };
+        mix(outputReg);
+        mix(compU);
+        mix(uint64_t(compV) << 8);
+
+        auto& entry = m_ue3VsTexcoordTraceCache[traceKey];
+        if (!entry.initialized) {
+          entry.initialized = true;
+          const Ue3VsTexcoordTraceResult trace =
+            traceVsOutputTexcoordToInputUsageIndex(vs, outputReg, compU, compV);
+          entry.valid = trace.valid;
+          entry.iaTexcoordIndex = trace.iaTexcoordIndex;
+          entry.inputReg = trace.inputReg;
+          entry.sourceCompU = trace.sourceCompU;
+          entry.sourceCompV = trace.sourceCompV;
+        }
+
+        return &entry;
+      };
+
       if ((shaderPathTexcoordIndexFromPixelShader() || ue3EngineMode()) &&
           d3d9State().pixelShader.ptr() != nullptr) {
         const D3D9CommonShader* ps = inferredPs != nullptr
@@ -5758,37 +6132,132 @@ namespace dxvk {
         if (entryPtr != nullptr && firstStage < caps::MaxTexturesPS) {
           const auto& entry = *entryPtr;
           int8_t inferred = entry.samplerToTexcoord[firstStage];
+          int8_t inferredReg = entry.samplerToTexcoordReg[firstStage];
           // GPUSkinMorphVF uses TEXCOORD6/7 for morph deltas, not texture UVs
           if (isUe3MorphVF && inferred >= 6) {
             inferred = 0;
+            inferredReg = 0;
           }
           if (inferred >= 0) {
             m_psInferredSampleCount = entry.samplerSampleCount[firstStage];
             texcoordIdx = uint32_t(inferred);
+            iaTexcoordIdx = texcoordIdx;
             if (entry.samplerCoordCompValid[firstStage] && !forceIaTexcoordForOutlier) {
+              const uint8_t inferredCompU = entry.samplerCoordCompU[firstStage] & 0x3u;
+              const uint8_t inferredCompV = entry.samplerCoordCompV[firstStage] & 0x3u;
+              m_texcoordCompU = inferredCompU;
+              m_texcoordCompV = inferredCompV;
+            }
+
+            if (ue3EngineMode() &&
+                d3d9State().vertexShader.ptr() != nullptr &&
+                !forceIaTexcoordForOutlier) {
+              const D3D9CommonShader* vs = d3d9State().vertexShader->GetCommonShader();
+              const uint32_t ue3VsTexcoordOutputReg = findVsTexcoordOutputRegister(vs, texcoordIdx);
+
+              if (ue3VsTexcoordOutputReg != std::numeric_limits<uint32_t>::max()) {
+                Ue3VsTexcoordTraceEntry* traceEntry =
+                  getOrInitVsTexcoordTraceEntry(vs, ue3VsTexcoordOutputReg, m_texcoordCompU, m_texcoordCompV);
+                if (traceEntry != nullptr && traceEntry->valid) {
+                  ue3VsTexcoordTraceValid = true;
+                  iaTexcoordIdx = traceEntry->iaTexcoordIndex;
+                }
+              }
+
+              bool psRegTraceAttempted = false;
+              bool psRegTraceValid = false;
+              if (inferredReg >= 0) {
+                psRegTraceAttempted = true;
+                Ue3VsTexcoordTraceEntry* psRegTraceEntry =
+                  getOrInitVsTexcoordTraceEntry(vs, uint32_t(inferredReg), m_texcoordCompU, m_texcoordCompV);
+                psRegTraceValid = psRegTraceEntry != nullptr && psRegTraceEntry->valid;
+              }
+
+              float explicitScaleU = 1.0f;
+              float explicitScaleV = 1.0f;
+              const bool hasExplicitScale =
+                resolveInferredSamplerScale(&entry, firstStage, explicitScaleU, explicitScaleV);
+              constexpr float kSecondaryUvScaleEps = 1e-5f;
+              const bool hasNonIdentityExplicitScale =
+                hasExplicitScale &&
+                (std::abs(explicitScaleU - 1.0f) > kSecondaryUvScaleEps ||
+                 std::abs(explicitScaleV - 1.0f) > kSecondaryUvScaleEps);
+              const bool hasTwoAxisNonUniformExplicitScale =
+                hasExplicitScale &&
+                std::abs(explicitScaleU - 1.0f) > kSecondaryUvScaleEps &&
+                std::abs(explicitScaleV - 1.0f) > kSecondaryUvScaleEps &&
+                std::abs(explicitScaleU - explicitScaleV) > kSecondaryUvScaleEps;
+              const bool hasFloat2ExplicitTexcoord =
+                inferred >= 0 && vertexDeclHasFloat2Texcoord(uint32_t(inferred));
+              const bool hasFloat16x2ExplicitTexcoord =
+                inferred >= 0 && vertexDeclHasFloat16x2Texcoord(uint32_t(inferred));
+              const bool hasVOnlyDoubleScale =
+                hasExplicitScale &&
+                std::abs(explicitScaleU - 1.0f) <= kSecondaryUvScaleEps &&
+                std::abs(explicitScaleV - 2.0f) <= kSecondaryUvScaleEps;
+              const bool hasAlternateHalfUvDeclarationOrder =
+                hasFloat16x2ExplicitTexcoord &&
+                vertexDeclTexcoordAppearsBefore(3u, 2u);
+              const bool hasAnimatedMultiSampleSecondaryUv =
+                hasAlternateHalfUvDeclarationOrder &&
+                entry.samplerSampleCount[firstStage] > 1u;
+
+              // UE3 Local-style vertex factories can expose material UVs through a shifted
+              // packed interpolant while the IA still stores each material UV set separately.
+              // Keep the explicit secondary material UV when the normal semantic trace maps
+              // back to UV0 but the PS register path cannot be traced through the VS
+              const bool secondaryMaterialTexcoordBase =
+                ue3VsTexcoordTraceValid &&
+                (vfType == Ue3VertexFactoryType::Local ||
+                 vfType == Ue3VertexFactoryType::LocalDecal ||
+                 vfType == Ue3VertexFactoryType::SpeedTree) &&
+                (entry.samplerSemanticFlags[firstStage] & kPsSamplerSemanticMaterialTexture) != 0 &&
+                inferred > 0 &&
+                m_texcoordCompU == 0u &&
+                m_texcoordCompV == 1u &&
+                psRegTraceAttempted &&
+                !psRegTraceValid &&
+                iaTexcoordIdx != uint32_t(inferred);
+              const bool secondaryTransformedSingleSampleTexcoord =
+                secondaryMaterialTexcoordBase &&
+                entry.samplerSampleCount[firstStage] == 1u &&
+                hasNonIdentityExplicitScale;
+              const bool explicitTransformedSecondaryMaterialTexcoord =
+                (secondaryTransformedSingleSampleTexcoord &&
+                 ((hasTwoAxisNonUniformExplicitScale && hasFloat2ExplicitTexcoord) ||
+                  (hasVOnlyDoubleScale && hasAlternateHalfUvDeclarationOrder))) ||
+                (secondaryMaterialTexcoordBase && hasAnimatedMultiSampleSecondaryUv);
+              if (explicitTransformedSecondaryMaterialTexcoord) {
+                iaTexcoordIdx = uint32_t(inferred);
+              }
+            }
+
+            if (!ue3VsTexcoordTraceValid &&
+                entry.samplerCoordCompValid[firstStage] &&
+                !forceIaTexcoordForOutlier) {
               const uint8_t inferredCompU = entry.samplerCoordCompU[firstStage] & 0x3u;
               const uint8_t inferredCompV = entry.samplerCoordCompV[firstStage] & 0x3u;
               const bool inferredUsesPackedSecondaryPair =
                 (inferredCompU == 2u && inferredCompV == 3u) ||
                 (inferredCompU == 3u && inferredCompV == 2u);
 
-              // compat fallback for skinned meshes
-              // packed secondary UV pairs (`.wz` / `.zw`) are frequently non-diffuse channels
+              // Fallback only: when the VS trace cannot prove the IA UV channel, keep the
+              // older skinned-mesh guard against likely non-diffuse packed UV pairs.
               const bool trustPsSwizzle = m_psInferredSampleCount >= 4u;
               if (likelyGpuSkinnedMesh &&
                   inferredUsesPackedSecondaryPair &&
                   !trustPsSwizzle) {
                 m_texcoordCompU = 0;
                 m_texcoordCompV = 1;
-              } else {
-                m_texcoordCompU = inferredCompU;
-                m_texcoordCompV = inferredCompV;
               }
             }
 
             // additional guard for skinned meshes using packed atlas UVs
             // if inference points at a non-UV0 set with a large offset, clamp to UV0 `.xy`
-            if (likelyGpuSkinnedMesh && texcoordIdx > 0 && !forceIaTexcoordForOutlier) {
+            if (!ue3VsTexcoordTraceValid &&
+                likelyGpuSkinnedMesh &&
+                texcoordIdx > 0 &&
+                !forceIaTexcoordForOutlier) {
               float inferredOffsetU = 0.0f;
               float inferredOffsetV = 0.0f;
               const bool hasResolvedOffset = resolveInferredSamplerOffset(&entry, firstStage, inferredOffsetU, inferredOffsetV);
@@ -5797,9 +6266,32 @@ namespace dxvk {
                 (std::abs(inferredOffsetU) >= kLargeAtlasOffset || std::abs(inferredOffsetV) >= kLargeAtlasOffset);
               if (hasLargeOffset) {
                 texcoordIdx = 0;
+                iaTexcoordIdx = 0;
                 m_texcoordCompU = 0;
                 m_texcoordCompV = 1;
               }
+            }
+          } else {
+            const uint8_t semanticFlags = entry.samplerSemanticFlags[firstStage];
+            const uint8_t expressionFlags = entry.samplerExpressionFlags[firstStage];
+            const bool missingTexcoordMaterialSampler =
+              ue3EngineMode() &&
+              (vfType == Ue3VertexFactoryType::Local ||
+               vfType == Ue3VertexFactoryType::LocalDecal ||
+               vfType == Ue3VertexFactoryType::SpeedTree) &&
+              d3d9State().vertexShader.ptr() != nullptr &&
+              !forceIaTexcoordForOutlier &&
+              entry.samplerSampleCount[firstStage] > 0u &&
+              (semanticFlags & kPsSamplerSemanticMaterialTexture) != 0 &&
+              (expressionFlags & kPsSamplerExprUvOffset) != 0 &&
+              (expressionFlags & kPsSamplerExprBlendMath) != 0 &&
+              vertexDeclHasFloat16x2Texcoord(1u) &&
+              vertexDeclTexcoordAppearsBefore(3u, 2u);
+            if (missingTexcoordMaterialSampler) {
+              texcoordIdx = 1u;
+              iaTexcoordIdx = 1u;
+              m_texcoordCompU = 0u;
+              m_texcoordCompV = 1u;
             }
           }
 
@@ -5877,6 +6369,7 @@ namespace dxvk {
     }
 
     m_texcoordIndex = texcoordIdx;
+    m_iaTexcoordIndex = iaTexcoordIdx;
 
     return true;
   }
