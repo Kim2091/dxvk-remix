@@ -85,7 +85,14 @@ DrawCallCache::CacheState DrawCallCache::get(const DrawCallState& drawCall, Blas
 
   float bestScore = std::numeric_limits<float>::min();
   Matrix4 newTransform = drawCall.getTransformData().objectToWorld;
-  const Vector3 newWorldPosition = drawCall.getGeometryData().boundingBox.getTransformedCentroid(newTransform);
+  // for UE3 vertex shader skinned draws, objectToWorld is identity and the bounding box is
+  // bindpose, so the transformed centroid is identical for every instance of a shared skeletal
+  // mesh and cannot separate them - so we should use the bone derived world anchor instead and fall back to the
+  // transformed centroid for everything else
+  const bool useSkinnedAnchor = drawCall.hasSkinnedWorldAnchor();
+  const Vector3 newWorldPosition = useSkinnedAnchor
+    ? drawCall.getSkinnedWorldAnchor()
+    : drawCall.getGeometryData().boundingBox.getTransformedCentroid(newTransform);
 
   for (auto bucketIter = range.first; bucketIter != range.second; bucketIter++) {
     BlasEntry& blas  = bucketIter->second;
@@ -110,9 +117,19 @@ DrawCallCache::CacheState DrawCallCache::get(const DrawCallState& drawCall, Blas
     }
     // TODO this is only checking the distance to the first instance that created the BlasEntry, not to
     // each instance.  It also doesn't include the portal logic from InstanceManager.
-    Matrix4 oldTransform = blas.input.getTransformData().objectToWorld;
-    const Vector3 worldPosition = blas.input.getGeometryData().boundingBox.getTransformedCentroid(oldTransform);
-    score -= lengthSqr(newWorldPosition - worldPosition);
+    // only compare positions when both sides live in the same space, bone-derived world anchors
+    // for skinned draws or transformed bindpose centroids otherwise. Mixing the two would be
+    // meaningless so in that case the spatial term is left at zero and matching relies on the
+    // hash scores above
+    if (useSkinnedAnchor) {
+      if (blas.input.hasSkinnedWorldAnchor()) {
+        score -= lengthSqr(newWorldPosition - blas.input.getSkinnedWorldAnchor());
+      }
+    } else {
+      Matrix4 oldTransform = blas.input.getTransformData().objectToWorld;
+      const Vector3 worldPosition = blas.input.getGeometryData().boundingBox.getTransformedCentroid(oldTransform);
+      score -= lengthSqr(newWorldPosition - worldPosition);
+    }
     if (score > bestScore) {
       bestScore = score;
       *out = &blas;

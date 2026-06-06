@@ -657,6 +657,14 @@ struct DrawCallState {
     return skinningData;
   }
 
+  bool hasSkinnedWorldAnchor() const {
+    return m_hasSkinnedWorldAnchor;
+  }
+
+  const Vector3& getSkinnedWorldAnchor() const {
+    return m_skinnedWorldAnchor;
+  }
+
   const FogState& getFogState() const {
     return fogState;
   }
@@ -797,6 +805,15 @@ private:
   // Note: Set these pointers to nullptr when not used
   SkinningData skinningData;
   Future<SkinningData> futureSkinningData;
+
+  // for UE3 vertex shader skinned (GPUSkin) draws, objectToWorld is identity and both the
+  // geometry position hash and the bounding box are derived from the static bindpose source
+  // buffer - that makes every instance of a shared skeletal mesh look identical to the BLAS
+  // cache, which then cross assigns BlasEntries between unrelated instances. This is a worldspace anchor
+  // derived from the bone matrices in the VS constants so it gives the cache a per-instance + frame-stable position so it can tell
+  // simultaneous skinned instances apart and rematch them across frames
+  Vector3 m_skinnedWorldAnchor = Vector3(0.0f, 0.0f, 0.0f);
+  bool m_hasSkinnedWorldAnchor = false;
 
   FogState fogState;
 

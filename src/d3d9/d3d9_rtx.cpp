@@ -4360,6 +4360,41 @@ namespace dxvk {
     // Copy all the vertices into a staging buffer.  Assign fields of the geoData structure.
     processVertices(vertexContext, vertexIndexOffset, geoData);
 
+    // for UE3 vertex shader skinned (GPUSkin) draws the LocalToWorld placement is baked into the
+    // bone matrices where objectToWorld stays identity and the captured vertices are already in world
+    // space. We should derive a per-instance worldspace anchor from the first bone's translation so the
+    // BLAS cache can spatially determine simultaneous instances of a shared skeletal mesh and
+    // give skinningData a real bone hash so the geometry refit decision tracks the animated pose
+    m_activeDrawCallState.m_hasSkinnedWorldAnchor = false;
+    const bool usesVertexShaderSkinning =
+      ue3EngineMode() &&
+      m_parent->UseProgrammableVS() &&
+      m_currentUe3CtabInfo.has_value() &&
+      m_currentUe3CtabInfo->hasBoneMatrices;
+    if (usesVertexShaderSkinning &&
+        m_currentUe3CtabInfo->boneMatricesRegisterCount >= 3) {
+      const D3D9ConstantSets& cb = m_parent->m_consts[DxsoProgramTypes::VertexShader];
+      const uint32_t floatConstRegCount = cb.meta.maxConstIndexF;
+      const uint32_t boneReg = m_currentUe3CtabInfo->boneMatricesRegisterIndex;
+      const uint32_t boneRegCount =
+        std::min(m_currentUe3CtabInfo->boneMatricesRegisterCount, floatConstRegCount > boneReg ? floatConstRegCount - boneReg : 0u);
+      if (boneRegCount >= 3) {
+        const auto& fConsts = d3d9State().vsConsts.fConsts;
+        // UE3 bone matrices are float4x3 (3 float4 rows per bone) and the world translation lives in
+        // the .w of the first three rows of the first bone
+        m_activeDrawCallState.m_skinnedWorldAnchor = Vector3(
+          fConsts[boneReg + 0].w,
+          fConsts[boneReg + 1].w,
+          fConsts[boneReg + 2].w);
+        m_activeDrawCallState.m_hasSkinnedWorldAnchor = true;
+
+        // processSkinning() returns no SkinningData for programmable-VS draws, so skinningData
+        // stays default (numBones == 0) and this bone hash will not be overwritten by finalise
+        m_activeDrawCallState.skinningData.boneHash =
+          XXH3_64bits(&fConsts[boneReg], size_t(boneRegCount) * sizeof(Vector4));
+      }
+    }
+
     geoData.futureGeometryHashes = computeHash(geoData, maxOffsetedIndex);
     geoData.futureBoundingBox = computeAxisAlignedBoundingBox(geoData);
     
