@@ -629,8 +629,9 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
   // Bake frequency scale (fork — 2026-06-11, stage B). Lives in the former
   // padCloudLook1 slot so the CB layout is unchanged.
   args.cloudNoiseBaseFreqScale         = RtxOptions::cloudNoiseBaseFreqScale();
-  // padCloudLook2 (formerly cloudColumnShapingEnable) left unset — the column
-  // model is now unconditional; see atmosphere_args.h.
+  // Sky <- clouds bleed (fork — 2026-06-19). Reuses the former
+  // cloudColumnShapingEnable (padCloudLook2) slot; see atmosphere_args.h.
+  args.cloudSkyBleedStrength           = RtxOptions::cloudSkyBleedStrength();
 
   // Cloud parameters
   {
@@ -703,8 +704,7 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
     // Bottom darkening + additive edge detail (fork — 2026-06-10). Live in the
     // former pad_cloudVoxel0..2 slots so the CB layout is unchanged.
     args.cloudBottomDarkening       = RtxOptions::cloudBottomDarkening();
-    // pad_cloudVoxel1 (formerly cloudBottomDarkeningHeight) left unset — the
-    // constant-gradient reach is gone; see atmosphere_args.h.
+    args.cloudSkyAmbientFill        = RtxOptions::cloudSkyAmbientFill();
     args.cloudDetailStrength        = RtxOptions::cloudDetailStrength();
   }
 

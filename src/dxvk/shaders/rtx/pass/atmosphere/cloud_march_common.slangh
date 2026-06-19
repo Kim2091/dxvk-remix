@@ -94,6 +94,9 @@ struct CloudShadeContext {
   vec3  skyRadianceWarm;     // Sun-direction sky LUT sample (warm at sunset).
   vec3  skyRadianceCool;     // Anti-sun-horizon sky LUT sample (cool at sunset).
                              // Per-sample blend happens in evalNubisCubedSample.
+  vec3  skyRadianceZenith;   // Overhead sky LUT sample — the sky-dome underside
+                             // fill (bright daytime, dim at sunset). Used by
+                             // evalNubisCubedSample's dome-fill term.
   vec3  combinedMoonDir;
   vec3  combinedMoonDiffuseCoeff;
   vec3  combinedMoonPhaseAmt;
@@ -161,6 +164,16 @@ CloudShadeContext buildCloudShadeContext(AtmosphereArgs args) {
   // Same dayFactor gate as the warm sample (issue #33): fades the daytime
   // sky-ambient out at night so it can't keep tinting clouds below the horizon.
   vec3 skyRadianceCool = sampleSkyAmbientForVolume(antiSunDir, args,
+                                                    AtmosphereSkyViewLut,
+                                                    AtmosphereCloudSkyTransmittanceLut,
+                                                    AtmosphereSkyViewSampler) * dayFactor;
+
+  // Overhead (zenith) sky sample for the sky-dome underside fill (fork —
+  // 2026-06-19, clouds-reflect-sky). This is the bright daytime sky that lights
+  // cloud bottoms from below/around — the term the warm/cool sun-direction
+  // samples above deliberately omit. Dim at sunset, so it self-fades and lets
+  // the warm samples carry the look. Same dayFactor gate as the others.
+  vec3 skyRadianceZenith = sampleSkyAmbientForVolume(vec3(0.0f, 1.0f, 0.0f), args,
                                                     AtmosphereSkyViewLut,
                                                     AtmosphereCloudSkyTransmittanceLut,
                                                     AtmosphereSkyViewSampler) * dayFactor;
@@ -305,6 +318,7 @@ CloudShadeContext buildCloudShadeContext(AtmosphereArgs args) {
   ctx.sunRadiance              = sunRadiance;
   ctx.skyRadianceWarm          = skyRadianceWarm;
   ctx.skyRadianceCool          = skyRadianceCool;
+  ctx.skyRadianceZenith        = skyRadianceZenith;
   ctx.combinedMoonDir          = combinedMoonDir;
   ctx.combinedMoonDiffuseCoeff = combinedMoonDiffuseCoeff;
   ctx.combinedMoonPhaseAmt     = combinedMoonPhaseAmt;
@@ -481,7 +495,7 @@ void marchCloudSlab(vec3   viewDirYUp,
     NubisCubedLighting lighting = evalNubisCubedSample(
         samplePos, shapeHf, density, columnSpan,
         viewDirYUp, ctx.sunDirYUp, ctx.sunRadiance,
-        ctx.skyRadianceWarm, ctx.skyRadianceCool,
+        ctx.skyRadianceWarm, ctx.skyRadianceCool, ctx.skyRadianceZenith,
         args, /*isZUp=*/false);
 
     // ===== Per-sample moon direct light =====
