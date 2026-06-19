@@ -296,6 +296,10 @@ namespace fork_hooks {
       samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
       samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
       samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+      // Allow explicit-LOD sampling of mips: the secondary cloud LUT (shared via
+      // this sampler) is mipmapped and the sky<-clouds bleed samples a coarse
+      // mip. Harmless for the mip-less sky-view LUT / cloud RT (only mip 0 used).
+      samplerInfo.mipmapLodMax = VK_LOD_CLAMP_NONE;
       Rc<DxvkSampler> skyViewSampler = ctx.m_device->createSampler(samplerInfo);
       ctx.bindResourceSampler(BINDING_ATMOSPHERE_SKY_VIEW_SAMPLER, skyViewSampler);
     }

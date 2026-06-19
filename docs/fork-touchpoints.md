@@ -2139,3 +2139,23 @@ The clear sky read wrong vs reality at all times of day: over-saturated/wrong bl
   *`computeGroundReflectionAnalytical` / `computeAirMultiscatteringAnalytical` no longer bake in `sunIlluminance` (the caller applies it once, matching the physical LUT twins and `contribLut`); fixes the `sunIlluminance²` double-count on the analytical A/B path. Call-site comment added so it isn't re-introduced.*
 
 ---
+
+## Workstream — Sky-reflects-clouds bleed: mip-blur fix (fork — 2026-06-19)
+
+The first cut of the sky<-clouds bleed sampled the 256x128 secondary cloud dome LUT at mip 0 and added it to the sky. Result: cloud EDGES read pixelated/faceted (a single bilinear tap of a near-binary low-res signal steps across the LUT's coarse texels at silhouettes, and the coarse dome silhouette is misaligned with the sharp screen-space cloud RT), and the sky "barely changed color" (a true gap samples ~0 cloud in its exact direction — no neighborhood spread). An Opus debug pass identified both and prescribed a pre-blurred coarse-mip source. Fix: give the secondary LUT a mip chain, regenerate it (Gaussian) each frame after the bake, and sample a coarse mip (mip 4 = 16x8) for the bleed — one tap = a wide neighborhood blur, which removes the facets AND spreads cloud color smoothly into the gaps next to clouds. Re-enabled by default (`cloudSkyBleedStrength` 0 -> 0.15).
+
+- **`src/dxvk/rtx_render/rtx_atmosphere.h` / `rtx_atmosphere.cpp`** — fork-owned changes.
+  *`m_cloudSecondaryLut` becomes an `RtxMipmap::Resource` (6 mips, 256x128 -> 8x4) via `RtxMipmap::createResource`; the bake binds `.views[0]` (mip 0) for the storage write; after the dispatch a write->read barrier + `RtxMipmap::updateMipmap(..., Gaussian)` fills mips 1..5 (ctx is the RtxContext, cast from the DxvkContext param). Added `#include "rtx_mipmap.h"`.*
+
+- **`src/dxvk/rtx_render/rtx_fork_atmosphere.cpp`** — fork-owned change.
+  *The shared sky-view sampler gains `mipmapLodMax = VK_LOD_CLAMP_NONE` so explicit-LOD mip sampling works (harmless for the mip-less sky-view LUT / cloud RT).*
+
+- **`src/dxvk/shaders/rtx/pass/atmosphere/atmosphere_sky.slangh`** — fork-owned change.
+  *The bleed samples `AtmosphereCloudSecondaryLut` at `kBleedMip = 4.0` instead of 0.*
+
+- **`src/dxvk/shaders/rtx/pass/atmosphere/atmosphere_common.slangh`** — fork-owned change.
+  *`cloudDomeDirToUv` wraps u with `frac()` so dome sampling no longer depends on sampler address mode (the mip-gen uses a CLAMP sampler).*
+
+- **`src/dxvk/rtx_render/rtx_options.h`** — `cloudSkyBleedStrength` default 0.0 -> 0.15 (re-enabled).
+
+---

@@ -959,8 +959,17 @@ vec3 evalSkyRadiance(
   // baked (it is, by default); 0 strength = no coupling (legacy).
   if (args.cloudSkyBleedStrength > 0.0f && args.cloudSecondaryLutEnable != 0u) {
     vec2 bleedUv = cloudDomeDirToUv(viewDirYUp);
-    vec4 bleedCloud = AtmosphereCloudSecondaryLut.SampleLevel(AtmosphereSkyViewSampler, bleedUv, 0.0f);
-    // bleedCloud.rgb is premultiplied (smooth) cloud radiance in this direction.
+    // Sample a COARSE mip of the secondary cloud dome LUT (fork — 2026-06-19):
+    // a wide neighborhood blur in one tap. Sampling mip 0 here showed the LUT's
+    // coarse 256x128 texels as faceted cloud edges, and gave ~0 in true gaps
+    // (no spread). The blurred mip both removes the facets and spreads cloud
+    // color smoothly into the open sky next to clouds. Mip 4 = 16x8 (~16x blur).
+    // Requires the LUT's mip chain (RtxAtmosphere::dispatchCloudSecondaryLut)
+    // and a sampler with mipmapLodMax > 0 (the shared sky-view sampler sets it).
+    const float kBleedMip = 4.0f;
+    vec4 bleedCloud = AtmosphereCloudSecondaryLut.SampleLevel(AtmosphereSkyViewSampler, bleedUv, kBleedMip);
+    // bleedCloud.rgb is premultiplied (now wide-blurred) cloud radiance; the blur
+    // makes it non-zero in gaps near clouds, so the sky picks up their color.
     radiance += args.cloudSkyBleedStrength * bleedCloud.rgb;
   }
 

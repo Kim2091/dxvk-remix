@@ -555,9 +555,11 @@ vec2 cloudDomeDirToUv(vec3 dirYUp) {
   float elevation = asin(clamp(dirYUp.y, 0.0f, 1.0f));
   float v = sqrt(elevation / (0.5f * kPi));
   // Same azimuth convention as cloudDomeUvToDir: az 0 = +Z, increasing
-  // toward +X. u may land in [-0.5, 0.5); the sky-view sampler's REPEAT-U
-  // address mode wraps it across the azimuth seam.
-  float u = atan2(dirYUp.x, dirYUp.z) / (2.0f * kPi);
+  // toward +X. atan2 gives u in [-0.5, 0.5); wrap to [0, 1) here with frac so
+  // sampling correctness no longer depends on the sampler's address mode
+  // (robustness — fork 2026-06-19; the shared sky-view sampler is REPEAT-U, but
+  // the mip-gen for the bleed uses a CLAMP sampler, so don't rely on wrap).
+  float u = frac(atan2(dirYUp.x, dirYUp.z) / (2.0f * kPi));
   return vec2(u, v);
 }
 

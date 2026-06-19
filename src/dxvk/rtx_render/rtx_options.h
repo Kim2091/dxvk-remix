@@ -1722,7 +1722,7 @@ namespace dxvk {
                "the actual sky color; naturally fades at sunset (the overhead "
                "sky is dim then). Higher = brighter, more sky-colored bases; "
                "0 = off (legacy, undersides ignore the open sky). Applies live.");
-    RTX_OPTION("rtx.atmosphere", float, cloudSkyBleedStrength, 0.0f,
+    RTX_OPTION("rtx.atmosphere", float, cloudSkyBleedStrength, 0.15f,
                "How strongly the clouds tint the surrounding sky [0..1+]. The "
                "sky picks up cloud-colored inscatter sampled from the (smooth) "
                "cloud field, so an orange sunset deck warms the blue gaps "
