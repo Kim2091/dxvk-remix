@@ -2183,3 +2183,19 @@ Two physically-motivated lighting corrections, both addressing "lit things out-b
 - **`RtxOptions.md`** — PENDING: `cloudEnergyConserve` / `cloudMsLobeWeight` not yet added; regenerate in-app for canonical form.
 
 ---
+
+## Workstream — Sunset "neon cloud" fixes: cloud sun-transmittance Mie + dayFactor rolloff (fork — 2026-06-20)
+
+Final two corrections that fixed the right-before-sunset "neon orange clouds" (flat, too bright, too saturated; worst at sun elevation below sun.y ~0.2, recovering once the sun is well below the horizon). Both validated in-game.
+
+(1) **Mie/aerosol extinction added to the cloud + moon sun-direction transmittance.** `getAtmosphericTransmittanceForDir` (the analytical Kasten-Young model that lights clouds + moons; the sky body uses the transmittance LUT) was composing extinction as Rayleigh + ozone only — the Mie term was MISSING, while the LUT (transmittance_lut.comp.slang) correctly includes Rayleigh + Mie + ozone. At a low sun the omitted grey aerosol extinction left the cloud beam under-extinguished, so cloud direct light stayed a bright, fully-saturated red while the LUT-lit sky looked correct. Added the Mie slant optical depth (`mieScaleHeight * airMass`), mirroring the LUT's extinction composition — physically the aerosol extinction that dims a hazy setting sun, and it realigns the cloud/moon sun color with the sky.
+
+(2) **Cloud daytime-lighting rolloff widened through the sunset approach.** `buildCloudShadeContext`'s `dayFactor = smoothstep(-0.05, 0.02, sun.y)` held the cloud's sun + sky-ambient lighting at FULL brightness until the geometric horizon, then crashed to night — so through the whole low-sun band (where airTrans + the sky-view LUT are most saturated) the clouds were lit at full strength = full-bright, full-saturated, flat orange. Widened the upper bound to 0.20 (~11.5°) so the daytime cloud lighting dims PROGRESSIVELY as the sun descends (physically: the scene darkens through sunset); the reddest light is no longer the brightest. Above 0.20 daytime is unchanged (golden hour untouched); horizon dayFactor ~0.2, reaching 0 at -0.05 where the moon/night terms take over.
+
+- **`src/dxvk/shaders/rtx/pass/atmosphere/atmosphere_common.slangh`** — fork-owned change.
+  *`getAtmosphericTransmittanceForDir`: add `- args.mieScattering * (args.mieScaleHeight * airMass)` to the transmittance exponent (Rayleigh + Mie + ozone, matching the LUT bake). Stale "mirrors lines 308-328" comment corrected.*
+
+- **`src/dxvk/shaders/rtx/pass/atmosphere/cloud_march_common.slangh`** — fork-owned change.
+  *`buildCloudShadeContext`: `dayFactor` smoothstep upper bound 0.02 → 0.20 for a progressive sunset-approach dim of all sun-derived cloud lighting.*
+
+---

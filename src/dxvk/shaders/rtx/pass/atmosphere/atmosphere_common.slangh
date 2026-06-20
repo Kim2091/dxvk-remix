@@ -760,8 +760,10 @@ vec3 getAtmosphericTransmittanceForDir(vec3 dirYUp, AtmosphereArgs args) {
   float zenithCosAngle = dirYUp.y;
 
   // Kasten-Young air mass above horizon, exponential continuation below.
-  // Mirrors lines 308-328 of evalAtmosphereRadiance verbatim — single
-  // source of truth for sun-direction transmittance physics.
+  // This analytical Kasten-Young model is the sun-direction transmittance used
+  // by the CLOUD + MOON paths; the sky body uses the per-sample transmittance
+  // LUT (its old inline analytical twin was removed when the sky moved to the
+  // LUT in 3e37062b, so this is now the sole copy).
   float airMass;
   if (zenithCosAngle > 0.01f) {
     float zenithRad = acos(clamp(zenithCosAngle, -1.0f, 1.0f));
@@ -774,10 +776,22 @@ vec3 getAtmosphericTransmittanceForDir(vec3 dirYUp, AtmosphereArgs args) {
   }
   airMass = min(airMass, 200.0f);
 
-  // Optical depth for ground-level samples: H * density(0) * airMass = H * airMass.
-  float opticalDepthToSun = H * airMass;
+  // Slant optical depth per species = scaleHeight * density(0) * airMass
+  // (density(0) = 1 at ground), composing extinction as Rayleigh + Mie + ozone —
+  // identical to the per-sample transmittance LUT bake (transmittance_lut.comp.slang).
+  // The Mie/aerosol term was MISSING here (fork — 2026-06-20 fix): this analytical
+  // path had only Rayleigh + ozone while the LUT (sky) includes Mie, so at a low
+  // sun the omitted grey aerosol extinction left the beam under-extinguished and
+  // cloud direct light stayed a bright, fully-saturated red right before sunset
+  // (the "neon orange clouds" window) even though the LUT-lit sky looked correct.
+  // Mie extinction is grey and grows with air mass — it dims the horizon beam
+  // (physically: aerosol is why you can look at a hazy setting sun) and realigns
+  // the cloud/moon sun color with the LUT-lit sky.
+  float rayleighOpticalDepthToSun = H * airMass;
+  float mieOpticalDepthToSun      = args.mieScaleHeight * airMass;
   float ozonePathLength = ozoneDensity(args.ozoneLayerAltitude, args) * airMass;
-  vec3 transmittance = exp(-args.rayleighScattering * opticalDepthToSun
+  vec3 transmittance = exp(-args.rayleighScattering * rayleighOpticalDepthToSun
+                            - args.mieScattering * mieOpticalDepthToSun
                             - args.ozoneAbsorption * ozonePathLength * 0.15f);
 
   // Twilight fade — sky/light should be effectively black by ~-15° below
