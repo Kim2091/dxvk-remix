@@ -2159,3 +2159,27 @@ The first cut of the sky<-clouds bleed sampled the 256x128 secondary cloud dome 
 - **`src/dxvk/rtx_render/rtx_options.h`** — `cloudSkyBleedStrength` default 0.0 -> 0.15 (re-enabled).
 
 ---
+
+## Workstream — Cloud direct energy conservation + multiscatter sunset gather fix (fork — 2026-06-19)
+
+Two physically-motivated lighting corrections, both addressing "lit things out-bright/mis-color the sky they composite against." WIP: shipped + deployed for in-game look validation, NOT yet eyeballed — values/approach may change after the look-check.
+
+(1) **Cloud direct dual-lobe energy conservation.** The Nubis direct term summed two full-amplitude phase lobes (`L_direct = T_primary*HG1 + M*HG2`); HG1 and HG2 each integrate to 1 over the sphere, so the in-scatter phase integrated to up to (1+M) ≈ 2 — the cloud scattered up to ~2× the energy one scattering event can redistribute, worst at the sunlit edge where both lobes fire at once, so lit clouds out-brightened the physical sky LUT. Reformulated as an energy-conserving convex blend (phase integral 1), lerped from the legacy additive sum by a strength knob for in-game A/B. Brings the sun path onto the bounded-energy footing the moon path already had.
+
+(2) **Multiscatter sunset gather fix.** The MS LUT gather in `computeMultiscattering` swept zenith 0..π at a SINGLE azimuth (`rayDir = vec3(sinZenith, cosZenith, 0)`, x-y plane), but the sun lies in the y-z plane (x=0), so every gather ray sat 90° from the sun and the integral never sampled the sun-ward sky. At sunset it gathered only the blue sky orthogonal to the sun and missed the warm reddened horizon → pale-blue MS fill (sky too blue, warm band couldn't climb, clouds inherited the cold ambient via the sky-view LUT). Fixed to a proper 2D sphere quadrature (8 zenith × 8 azimuth, same 64 samples); the sinZenith Jacobian + 2π/N normalization are kept so a uniform integrand changes <1% — corrects the integral's direction/color without shifting the tuned brightness. Knob-free. (A first attempt — a `multiScatterReddening` tint knob — was reverted as a hack once the gather bug was found.)
+
+- **`src/dxvk/shaders/rtx/pass/atmosphere/atmosphere_common.slangh`** — fork-owned change.
+  *In `evalNubisCubedSample`, the direct term `T_primary*HG1 + M*HG2` becomes `A*(1 - s*w) + B*(1 - s*(1-w))` with `A = T_primary*HG1`, `B = M*HG2`, `s = cloudEnergyConserve`, `w = cloudMsLobeWeight`. s=0 reproduces the legacy additive sum byte-for-byte.*
+
+- **`src/dxvk/shaders/rtx/pass/atmosphere/multiscattering_lut.comp.slang`** — fork-owned change.
+  *`computeMultiscattering` gather loop: single-azimuth 64× zenith sweep → nested 8 zenith × 8 azimuth full-sphere quadrature; `rayDir` gains an azimuth term. Jacobian + 2π/N normalization unchanged (uniform-integrand magnitude preserved to <1%).*
+
+- **`src/dxvk/shaders/rtx/pass/atmosphere/atmosphere_args.h`** — fork-owned change.
+  *`pad_artistic1` / `pad_artistic2` (trailing slots of the `cloudShadowFactorStrength` 16-byte row) → `cloudEnergyConserve` / `cloudMsLobeWeight`. No CB layout change.*
+
+- **`src/dxvk/rtx_render/rtx_options.h` / `rtx_atmosphere.cpp`** — fork-owned changes.
+  *New `RTX_OPTION(float, cloudEnergyConserve, 1.0f, …)` and `RTX_OPTION(float, cloudMsLobeWeight, 0.5f, …)` after `cloudPhaseG2`; `getAtmosphereArgs` fills both `args.*`.*
+
+- **`RtxOptions.md`** — PENDING: `cloudEnergyConserve` / `cloudMsLobeWeight` not yet added; regenerate in-app for canonical form.
+
+---

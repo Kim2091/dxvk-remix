@@ -714,6 +714,8 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
   {
     args.cloudPhaseG1         = RtxOptions::cloudPhaseG1();
     args.cloudPhaseG2         = RtxOptions::cloudPhaseG2();
+    args.cloudEnergyConserve  = RtxOptions::cloudEnergyConserve();
+    args.cloudMsLobeWeight    = RtxOptions::cloudMsLobeWeight();
     args.cloudMsSunDotMax     = RtxOptions::cloudMsSunDotMax();
     args.cloudMsSigmaShallow  = RtxOptions::cloudMsSigmaShallow();
     args.cloudMsSigmaDeep     = RtxOptions::cloudMsSigmaDeep();

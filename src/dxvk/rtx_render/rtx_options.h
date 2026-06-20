@@ -1781,6 +1781,22 @@ namespace dxvk {
                "Primary HG asymmetry; strong forward-scatter, drives silver lining at backlit edges.");
     RTX_OPTION("rtx.atmosphere", float, cloudPhaseG2, 0.3f,
                "Secondary HG asymmetry; mild forward-scatter, drives broader in-scatter envelope.");
+    // Energy conservation of the direct dual-lobe (fork — 2026-06-19). The legacy
+    // direct term summed two full-amplitude phase lobes (T_primary*HG1 + M*HG2),
+    // whose combined phase integrated to up to ~2 over the sphere — the cloud
+    // scattered up to ~2x the energy a single event can redistribute, brightest
+    // exactly at the sunlit edge, which is why lit clouds out-brightened the
+    // physical sky LUT regardless of the ambient sliders. cloudEnergyConserve
+    // lerps that additive sum toward a convex (1-w)*HG1 + w*HG2 blend whose phase
+    // integrates to exactly 1; cloudMsLobeWeight is w.
+    RTX_OPTION("rtx.atmosphere", float, cloudEnergyConserve, 1.0f,
+               "[0,1] Energy conservation of the cloud direct lighting. 0 = legacy additive "
+               "dual-lobe (phase integral up to 2, brighter-than-sky look). 1 = convex blend "
+               "(phase integral 1, energy-conserving). Set 0 to A/B against the old look.");
+    RTX_OPTION("rtx.atmosphere", float, cloudMsLobeWeight, 0.5f,
+               "[0,1] Convex weight between the forward single-scatter lobe (silver lining, "
+               "weight 1-w) and the broader multi-scatter body fill (weight w) when "
+               "cloudEnergyConserve > 0. Higher = flatter/softer body, dimmer silver lining.");
     RTX_OPTION("rtx.atmosphere", float, cloudMsSunDotMax, 0.9f,
                "Nubis Cubed sigma_ms remap upper bound on sun_dot. Lower = wider 'shallow extinction' zone.");
     RTX_OPTION("rtx.atmosphere", float, cloudMsSigmaShallow, 0.25f,

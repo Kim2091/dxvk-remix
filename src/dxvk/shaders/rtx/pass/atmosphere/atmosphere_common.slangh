@@ -2881,7 +2881,34 @@ NubisCubedLighting evalNubisCubedSample(
   float M = dim_profile * exp(-sigma_ms * D_sun) * verticalLight;
   float HG1 = hgPhaseNubis(cosTheta, args.cloudPhaseG1);
   float HG2 = hgPhaseNubis(cosTheta, args.cloudPhaseG2);
-  float L_direct = T_primary * HG1 + M * HG2;
+
+  // Energy-conserving dual-lobe blend (fork — 2026-06-19, cloud energy
+  // conservation). The legacy direct term was the raw sum
+  //   L = T_primary*HG1 + M*HG2
+  // and HG1, HG2 each integrate to 1 over the sphere, so the in-scatter source
+  // integrated a phase of up to (1 + M) ~ 2 — the cloud scattered up to ~2x the
+  // energy one scattering event can redistribute. Worst exactly at the sunlit
+  // edge, where T_primary -> 1 AND M is nonzero, so the silver lining fired both
+  // lobes at full amplitude and out-brightened the physical sky LUT it
+  // composites against. That is the long-standing "clouds brighter than the sky
+  // / not energy conserving" read — and the reason the ambient sliders (which
+  // touch only the SEPARATE ambient term) never moved it.
+  //
+  // Reformulate as a CONVEX blend of the single-scatter forward lobe A (silver
+  // lining) and the multi-scatter body fill B: (1-w)*A + w*B has a phase that
+  // integrates to exactly 1. T_primary and M stay <= 1, so they only ever
+  // REMOVE energy from a now-bounded budget. cloudMsLobeWeight = w sets the
+  // forward/body balance; cloudEnergyConserve = s lerps from the legacy additive
+  // sum (s=0, byte-identical old look for an in-game A/B) to the conserving
+  // blend (s=1). The moon path already sums its octaves with bounded geometric
+  // energy decay (cloud_march_common.slangh) — this brings the sun path onto the
+  // same footing.
+  float A = T_primary * HG1;
+  float B = M * HG2;
+  float msLobeS = saturate(args.cloudEnergyConserve);
+  float msLobeW = saturate(args.cloudMsLobeWeight);
+  float L_direct = A * (1.0f - msLobeS * msLobeW)
+                 + B * (1.0f - msLobeS * (1.0f - msLobeW));
 
   // === Ambient scattering (paper p. 142) ===
   // Per-sample warm/cool ambient blend (fork — 2026-05-21). Warm color is

@@ -488,6 +488,12 @@ struct AtmosphereArgs {
   // Mirrors RtxOptions::cloudShadowFactorStrength(). Reuses the former
   // pad_artistic0 slot; CB layout unchanged.
   float cloudShadowFactorStrength;
-  float pad_artistic1;
-  float pad_artistic2;
+  // ----- Cloud direct-lighting energy conservation (fork — 2026-06-19) -----
+  // Reformulates the direct dual-lobe from the legacy additive sum
+  // (T_primary*HG1 + M*HG2, phase integral up to ~2) into an energy-conserving
+  // convex blend (phase integral 1) — the fix for lit clouds out-brightening
+  // the physical sky LUT. Consumed by evalNubisCubedSample. Both reuse the
+  // former pad_artistic1/2 slots; CB layout unchanged.
+  float cloudEnergyConserve;  // [0,1] 0 = legacy additive look (A/B), 1 = energy-conserving convex blend
+  float cloudMsLobeWeight;    // [0,1] convex weight: forward single-scatter lobe (1-w) vs multi-scatter body fill (w)
 };
