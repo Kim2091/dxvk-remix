@@ -240,6 +240,18 @@ namespace dxvk {
   void D3D9Rtx::processVertices(const VertexContext vertexContext[caps::MaxStreams], int vertexIndexOffset, RasterGeometry& geoData) {
     DxvkBufferSlice streamCopies[caps::MaxStreams] {};
 
+    // Fork: FNV multi-layer-terrain protocol bit. When set on the active draw's
+    // RS-149 modifier payload, the vertex layout carries blend weights as FLOAT4
+    // streams: layers 0-2 in COLOR0 (already a FLOAT4 here, not BGRA8) and
+    // layers 3-6 in TEXCOORD1, which we capture as a synthetic COLOR1. The
+    // hasMultiLayerTerrainWeights tag flows through the interleaver / surface
+    // upload / hit shader to select the FLOAT4 decode branch.
+    const bool isMultiLayerTerrain =
+      (m_activeDrawCallState.materialData.remixModifierFromD3D & kRemixMultiLayerTerrainBit) != 0u;
+    if (isMultiLayerTerrain) {
+      geoData.hasMultiLayerTerrainWeights = true;
+    }
+
     // Process vertex buffers from CPU
     for (const auto& element : d3d9State().vertexDecl->GetElements()) {
       // Get vertex context
@@ -282,12 +294,28 @@ namespace dxvk {
       case D3DDECLUSAGE_TEXCOORD:
         if (m_texcoordIndex <= MAXD3DDECLUSAGEINDEX && element.UsageIndex == m_texcoordIndex)
           targetBuffer = &geoData.texcoordBuffer;
+        // Fork: FNV multi-layer-terrain captures TEXCOORD1 as a synthetic COLOR1.
+        // The vertex decl has no D3DDECLUSAGE_COLOR with UsageIndex==1; instead
+        // the per-vertex blend weights for layers 3-6 are emitted on TEXCOORD1
+        // (FLOAT4). Only claim the slot when the multi-layer-terrain protocol
+        // bit is set so non-FNV games that legitimately use TEXCOORD1 as a
+        // second UV set are unaffected.
+        else if (isMultiLayerTerrain && element.UsageIndex == 1) {
+          targetBuffer = &geoData.color1Buffer;
+        }
         break;
       case D3DDECLUSAGE_COLOR:
         if (element.UsageIndex == 0 &&
             !RtxOptions::ignoreAllVertexColorBakedLighting() &&
             !lookupHash(RtxOptions::ignoreBakedLightingTextures(), m_activeDrawCallState.materialData.colorTextures[0].getImageHash())) {
           targetBuffer = &geoData.color0Buffer;
+        } else if (element.UsageIndex == 1) {
+          // Fork: Capture COLOR1 stream into geoData.color1Buffer. Unlike color0 which
+          // is gated by vertex-color-baked-lighting toggles (since many games store
+          // baked lighting in COLOR0), color1 carries non-lighting per-vertex data --
+          // notably FNV's multi-layer terrain blend weights. Capture unconditionally
+          // and let the consumer decide what to do with it.
+          targetBuffer = &geoData.color1Buffer;
         }
         break;
       }

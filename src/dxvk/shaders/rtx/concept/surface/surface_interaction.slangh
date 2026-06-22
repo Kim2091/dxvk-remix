@@ -706,7 +706,31 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
 
   // Compute vertex colors
 
-  if (surface.color0BufferIndex != BINDING_INDEX_INVALID &&
+  if (surface.hasMultiLayerWeights && surface.color0BufferIndex != BINDING_INDEX_INVALID && !isBakedTerrain)
+  {
+    // Fork: FNV multi-layer terrain stores per-vertex blend weights as raw
+    // FLOAT4s in the color0 interleaved slot (4 floats per vertex, not 1
+    // packed BGRA8 uint). Read them as raw floats; layers 0-2 land in xyz, .w
+    // is unused (FNV only carries 3 layers in COLOR0; the remaining 4 layer
+    // weights sit in vertexColor1, populated below from the synthetic COLOR1).
+    vec4 color[3];
+
+    for (uint i = 0; i < 3; i++)
+    {
+      const uint currentIndex = idx[i];
+
+      const uint color0BufferIndex = surface.color0BufferIndex;
+      const uint baseElementIndex = (currentIndex * uint(surface.color0Stride) + surface.color0Offset) / 4;
+
+      color[i].x = BUFFER_ARRAY(geometries, color0BufferIndex, baseElementIndex + 0);
+      color[i].y = BUFFER_ARRAY(geometries, color0BufferIndex, baseElementIndex + 1);
+      color[i].z = BUFFER_ARRAY(geometries, color0BufferIndex, baseElementIndex + 2);
+      color[i].w = BUFFER_ARRAY(geometries, color0BufferIndex, baseElementIndex + 3);
+    }
+
+    surfaceInteraction.vertexColor = interpolateHitAttribute(color, bary);
+  }
+  else if (surface.color0BufferIndex != BINDING_INDEX_INVALID &&
      // Baked terrain has vertex colors already baked in, so default to neutral vertex color of 1.
      // They won't get reapplied later anyway
      !isBakedTerrain)
@@ -734,6 +758,54 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
   else
   {
     surfaceInteraction.vertexColor = vec4(1.0, 1.0, 1.0, 1.0);
+  }
+
+  // Fork: COLOR1 is interleaved directly after COLOR0 in the per-vertex output
+  // stride. Two encoding paths share the same buffer:
+  //  * BGRA8 path (default): color0 + color1 each occupy 1 float (4 bytes).
+  //    color1 sits at color0Offset + 4 bytes (+1 float slot).
+  //  * FLOAT4 multi-layer-terrain path (FNV): color0 + color1 each occupy 4
+  //    floats (16 bytes). color1 sits at color0Offset + 16 bytes (+4 float
+  //    slots), and carries blend weights for layers 3-6 as raw floats.
+  if (surface.hasColor1 && surface.color0BufferIndex != BINDING_INDEX_INVALID && !isBakedTerrain)
+  {
+    vec4 color1[3];
+
+    if (surface.hasMultiLayerWeights)
+    {
+      for (uint i = 0; i < 3; i++)
+      {
+        const uint currentIndex = idx[i];
+
+        const uint color1BufferIndex = surface.color0BufferIndex;
+        // Multi-layer slot: 4 floats per color, so color1 starts 4 slots past color0.
+        const uint baseElementIndex = (currentIndex * uint(surface.color0Stride) + surface.color0Offset) / 4 + 4;
+
+        color1[i].x = BUFFER_ARRAY(geometries, color1BufferIndex, baseElementIndex + 0);
+        color1[i].y = BUFFER_ARRAY(geometries, color1BufferIndex, baseElementIndex + 1);
+        color1[i].z = BUFFER_ARRAY(geometries, color1BufferIndex, baseElementIndex + 2);
+        color1[i].w = BUFFER_ARRAY(geometries, color1BufferIndex, baseElementIndex + 3);
+      }
+    }
+    else
+    {
+      for (uint i = 0; i < 3; i++)
+      {
+        const uint currentIndex = idx[i];
+
+        const uint color1BufferIndex = surface.color0BufferIndex;
+        const uint color1ElementIndex = (currentIndex * uint(surface.color0Stride) + surface.color0Offset) / 4 + 1;
+
+        const uint colorBits = floatBitsToUint(BUFFER_ARRAY(geometries, color1BufferIndex, color1ElementIndex));
+
+        color1[i].x = unorm8ToF32(uint8_t(colorBits >> 16));
+        color1[i].y = unorm8ToF32(uint8_t(colorBits >> 8));
+        color1[i].z = unorm8ToF32(uint8_t(colorBits));
+        color1[i].w = unorm8ToF32(uint8_t(colorBits >> 24));
+      }
+    }
+
+    surfaceInteraction.vertexColor1 = interpolateHitAttribute(color1, bary);
   }
 
   return surfaceInteraction;

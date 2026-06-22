@@ -41,6 +41,17 @@ struct InterleaveGeometryArgs {
   uint32_t color0Stride;
   uint32_t color0Format;
 
+  uint32_t hasColor1;
+  uint32_t color1Offset;
+  uint32_t color1Stride;
+  uint32_t color1Format;
+
+  // Fork: FNV multi-layer terrain selects a FLOAT4 source path for color0/color1.
+  // When set, the interleaver writes 4 floats per color slot (instead of one
+  // packed uint), and `color{0,1}Format` are forced to VK_FORMAT_R32G32B32A32_SFLOAT
+  // on the CPU side. See docs/superpowers/plans/2026-05-22-fnv-multilayer-terrain.md.
+  uint32_t isMultiLayerTerrain;
+
   uint32_t minVertexIndex;
   uint32_t outputStride;
   uint32_t vertexCount;
@@ -52,3 +63,4 @@ struct InterleaveGeometryArgs {
 #define INTERLEAVE_GEOMETRY_BINDING_NORMAL_INPUT     2
 #define INTERLEAVE_GEOMETRY_BINDING_TEXCOORD_INPUT   3
 #define INTERLEAVE_GEOMETRY_BINDING_COLOR0_INPUT     4
+#define INTERLEAVE_GEOMETRY_BINDING_COLOR1_INPUT     5

@@ -81,6 +81,10 @@
 
 #define INTEGRATE_DIRECT_BINDING_NEE_CACHE_SAMPLE                                   100
 
+// Slot 74 was INTEGRATE_DIRECT_BINDING_PRIMARY_CLOUD_SHADOW_FACTOR_OUTPUT (fork
+// screen-space cloud shadows). Retired 2026-06-19 with the rest of that path --
+// see composite_binding_indices.h slot 19 and debug_view_binding_indices.h slot 38.
+
 // Aliased Inputs/Outputs
 
 #define INTEGRATE_DIRECT_BINDING_ALIASED_DATA_0   150

@@ -99,10 +99,17 @@ struct OpaqueSurfaceMaterial
   // 26
   uint16_t samplerFeedbackStamp;
 
+  // 27: Fork -- FNV multi-layer terrain aux index. When
+  // OPAQUE_SURFACE_MATERIAL_FLAG_MULTI_LAYER_TERRAIN is set in `flags`, this
+  // points at a MultiLayerTerrainMaterial entry in surfaceMaterialExtensions[].
+  // BINDING_INDEX_INVALID (0xFFFF) when unused. See rtx_materials.h
+  // RtOpaqueSurfaceMaterial::writeGPUData (data[27]).
+  uint16_t multiLayerTerrainIndex;
+
   // Todo: Fixed function blend state info here in the future (Actually this should go on a Legacy Material, or some sort of non-PBR Legacy Surface)
 
   // padding (to keep size matching with MemoryPolymorphicSurfaceMaterial)
-  uint16_t data[5];
+  uint16_t data[4];
 
   bool hasValidDisplacement() {
     return flags & OPAQUE_SURFACE_MATERIAL_FLAG_HAS_DISPLACEMENT;
@@ -170,9 +177,32 @@ struct SubsurfaceMaterial
   f16vec3 singleScatteringAlbedo;
 
   float16_t maxSampleRadius;
-  
+
   // padding (to keep size matching with MemoryPolymorphicSurfaceMaterial)
   uint16_t data[19];
+};
+
+// Fork: FNV multi-layer terrain extension. Mirrors RtMultiLayerTerrainMaterial
+// in rtx_materials.h. Stored as an entry in surfaceMaterialExtensions[] (the
+// 64-byte polymorphic extension cache), referenced by
+// OpaqueSurfaceMaterial::multiLayerTerrainIndex when the
+// OPAQUE_SURFACE_MATERIAL_FLAG_MULTI_LAYER_TERRAIN flag is set.
+//
+// GPU layout (16-bit slots):
+//   data[0]      typeTag (== surfaceMaterialTypeMultiLayerTerrain)
+//   data[1]      layerCount (1..7)
+//   data[2..8]   albedo texture indices (kMaxLayers entries)
+//   data[9..15]  normal texture indices (kMaxLayers entries)
+//   data[16..31] padding (32 bytes, to keep size matching with
+//                MemoryPolymorphicSurfaceMaterial)
+struct MultiLayerTerrainMaterial
+{
+  uint16_t typeTag;
+  uint16_t layerCount;
+  uint16_t albedoTextureIndices[7];
+  uint16_t normalTextureIndices[7];
+
+  uint16_t data[16];
 };
 
 struct SubsurfaceMaterialInteraction

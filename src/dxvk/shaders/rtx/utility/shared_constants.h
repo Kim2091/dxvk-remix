@@ -27,6 +27,13 @@
 static const uint8_t surfaceMaterialTypeOpaque = uint8_t(0u);
 static const uint8_t surfaceMaterialTypeTranslucent = uint8_t(1u);
 static const uint8_t surfaceMaterialTypeRayPortal = uint8_t(2u);
+// Fork: tag for multi-layer-terrain extension entries in the surface-material
+// extension cache. Like surfaceMaterialTypeSubsurface (implicit -- subsurface
+// extension entries use flags = 0), this tag is informational rather than used
+// for polymorphic dispatch -- the shader knows an entry is multi-layer-terrain
+// because the parent opaque material's m_multiLayerTerrainIndex points at it.
+// Fits in the existing 2-bit surfaceMaterialTypeMask.
+static const uint8_t surfaceMaterialTypeMultiLayerTerrain = uint8_t(3u);
 static const uint8_t surfaceMaterialTypeMask = uint8_t(0x3u);
 
 #define COMMON_MATERIAL_FLAG_TYPE_MASK surfaceMaterialTypeMask
@@ -54,6 +61,26 @@ static const uint8_t surfaceMaterialTypeMask = uint8_t(0x3u);
 // approximation adds a sky-ambient term for such particles on top of the froxel radiance sample,
 // supplying the skylight that the froxel grid does not contain (its integrator has no sky term).
 #define OPAQUE_SURFACE_MATERIAL_FLAG_SKY_LIT_PARTICLE (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(7))
+// Fork: set on legacy materials whose normal texture came through the FNV PS-classifier
+// protocol path; tells the sample-time decode in opaque_surface_material_interaction.slangh
+// to read the texture as RGB tangent-space ([0,1] unsigned snorm in .rgb) instead of
+// Remix's native octahedral encoding.
+#define OPAQUE_SURFACE_MATERIAL_FLAG_TANGENT_SPACE_NORMAL (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(8))
+// Fork: set on opaque materials produced from FNV multi-layer terrain draws (see
+// LegacyMaterialData::terrainAlbedoTextures[] / terrainNormalTextures[] and
+// kRemixMultiLayerTerrainBit). Tells the shader to read the per-layer texture
+// indices via the m_multiLayerTerrainIndex aux slot pointing into the surface-
+// material extension cache (RtMultiLayerTerrainMaterial entries).
+#define OPAQUE_SURFACE_MATERIAL_FLAG_MULTI_LAYER_TERRAIN (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(9))
+// Fork: set on legacy materials following the Bethesda/Gamebryo DXT5n convention --
+// specular intensity packed into the alpha channel of the NormalMap. Tells the
+// roughness load in opaque_surface_material_interaction.slangh to override the
+// roughness texture path with `roughness = 1.0 - normalSample.a`. Implies (and only
+// makes sense alongside) OPAQUE_SURFACE_MATERIAL_FLAG_TANGENT_SPACE_NORMAL since both
+// fire on the same FNV PS-classifier capture path.
+#define OPAQUE_SURFACE_MATERIAL_FLAG_ROUGHNESS_FROM_NORMAL_ALPHA (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(10))
+// Offsets 8-10 (bits 10-12 of the uint16_t flags field) were moved off 5-7 when this
+// commit was brought onto numos3 -- 5-7 are the sRGB-linearize and sky-lit-particle bits.
 
 
 #define OPAQUE_SURFACE_MATERIAL_INTERACTION_FLAG_HAS_HEIGHT_TEXTURE (1 << 0)

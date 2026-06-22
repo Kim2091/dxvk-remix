@@ -22,6 +22,7 @@
 
 #include "rtx_materials.h"
 
+#include "rtx_fork_hooks.h"
 #include "rtx_options.h"
 
 namespace dxvk {
@@ -68,16 +69,77 @@ template<> OpaqueMaterialData LegacyMaterialData::as() const {
   // Copy off the defaults, and make dynamic adjustments for the remaining params from this legacy material
   OpaqueMaterialData opaqueMat(defaultLegacyOpaqueMaterial);
   if (LegacyMaterialDefaults::useAlbedoTextureIfPresent()) {
-    opaqueMat.setAlbedoOpacityTexture(getColorTexture());
+    // Fork: when the wrapper-side PS classifier has tagged a sampler slot as
+    // the actual diffuse texture (via the RS-149 protocol decoded in
+    // setLegacyMaterialState), prefer it over colorTextures[0]. Slot 0 in the
+    // FFP binding may carry a non-diffuse texture (e.g. NormalMap-only PS
+    // shaders), and getColorTexture()'s binning loop can't always recover
+    // the right one. Falls back to upstream behaviour when the protocol
+    // wasn't written.
+    if (protocolDiffuseTexture.isValid()) {
+      opaqueMat.setAlbedoOpacityTexture(protocolDiffuseTexture);
+    } else {
+      opaqueMat.setAlbedoOpacityTexture(getColorTexture());
+    }
   }
-  if (getColorTexture2().isValid()) {
+  // Fork: route the protocol-captured normal-map slot into the opaque
+  // material's normal channel. Empty -> upstream secondary-texture path.
+  if (normalTexture.isValid()) {
+    opaqueMat.setNormalTexture(normalTexture);
+    // Fork: FNV's normal maps are RGB tangent-space DXT-compressed (DirectX
+    // convention, green-down), not Remix's native octahedral encoding. The
+    // per-material flag drives a sample-time decode branch in
+    // opaque_surface_material_interaction.slangh. Toggle the RtxOption off to
+    // leave protocol-captured normals on the octahedral path (useful when the
+    // user has pre-baked octahedral assets via LightspeedOctahedralConverter).
+    if (LegacyMaterialDefaults::autoNormalTangentSpace()) {
+      opaqueMat.setIsTangentSpaceNormalOverride(true);
+    }
+    // Fork: Bethesda DXT5n convention -- the same NormalMap's alpha channel encodes
+    // specular intensity. The shader derives `roughness = 1.0 - normalSample.a`.
+    // Gated separately from the tangent-space flag so a user can keep the normal
+    // decode but disable the spec-as-roughness inversion if a USD replacement
+    // provides its own roughness map.
+    if (LegacyMaterialDefaults::autoRoughnessFromSpecular()) {
+      opaqueMat.setIsRoughnessFromNormalAlphaOverride(true);
+    }
+  } else if (getColorTexture2().isValid()) {
     opaqueMat.setSecondaryTexture(getColorTexture2());
   }
+
+  // Fork: route the protocol-captured glow slot into the opaque material's
+  // emissive-color channel and flip enableEmission. Intensity follows the
+  // existing rtx.legacyMaterial.emissiveIntensity legacy default and the
+  // RtxOptions::emissiveIntensity master multiplier applied downstream in
+  // rtx_scene_manager.cpp. Empty -> no auto-emissive (upstream behaviour).
+  if (emissiveTexture.isValid() && LegacyMaterialDefaults::autoEmissive()) {
+    opaqueMat.setEmissiveColorTexture(emissiveTexture);
+    opaqueMat.setEnableEmission(true);
+  }
+
+  // Fork: route the protocol-captured height slot into the opaque material's
+  // height channel for parallax-occlusion mapping. The OpaqueMaterialData
+  // defaults set displaceIn=0.05/displaceOut=0.0 (from the constants table in
+  // rtx_material_data.h), so binding a height texture is sufficient to activate
+  // Remix's POM path -- RtOpaqueSurfaceMaterial::hasValidDisplacement() gates
+  // on (displaceIn > 0 || displaceOut > 0) AND a non-null height texture index.
+  // Users can tune depth with the existing rtx.displacement.* knobs.
+  if (heightTexture.isValid() && LegacyMaterialDefaults::autoHeightMap()) {
+    opaqueMat.setHeightTexture(heightTexture);
+  }
+
+  // Fork: route FNV multi-layer terrain captures (kRemixMultiLayerTerrainBit in
+  // remixModifierFromD3D) from LegacyMaterialData's terrain{Albedo,Normal}Textures
+  // arrays into OpaqueMaterialData's matching slots. No-op when the protocol bit
+  // is unset. The scene manager (rtx_scene_manager.cpp) resolves the TextureRefs
+  // to indices and registers an RtMultiLayerTerrainMaterial extension cache entry.
+  fork_hooks::applyLegacyProtocolMultiLayerTerrain(*this, opaqueMat);
+
   // Indicate that we have an exact sampler to use on this material, directly from game
   if (getSampler().ptr()) {
     opaqueMat.setSamplerOverride(getSampler());
   }
-  // Ignore colormap alpha of legacy texture if tagged as 'ignoreAlphaOnTextures' 
+  // Ignore colormap alpha of legacy texture if tagged as 'ignoreAlphaOnTextures'
   bool ignoreAlphaChannel = LegacyMaterialDefaults::ignoreAlphaChannel();
   if (!ignoreAlphaChannel) {
     ignoreAlphaChannel = lookupHash(RtxOptions::ignoreAlphaOnTextures(), getHash());

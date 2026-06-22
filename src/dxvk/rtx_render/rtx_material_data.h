@@ -274,6 +274,48 @@ struct name##Data {                                                             
     return m_ignoreAlphaChannelOverride;                                                             \
   }                                                                                                  \
                                                                                                      \
+  /* Fork: per-material flag that drives the RGB-tangent-space normal decode in the     */          \
+  /* opaque-surface shader (see OPAQUE_SURFACE_MATERIAL_FLAG_TANGENT_SPACE_NORMAL). Set */          \
+  /* by LegacyMaterialData::as<OpaqueMaterialData>() when a captured legacy normal map  */          \
+  /* came through the FNV PS-classifier protocol path. Replacement assets leave it      */          \
+  /* false, so toolkit replacements bypass the conversion. Meaningful only on opaque    */          \
+  /* materials; ignored everywhere else.                                                */          \
+  void setIsTangentSpaceNormalOverride(const bool isTangentSpaceNormal) {                            \
+    m_isTangentSpaceNormalOverride = isTangentSpaceNormal;                                           \
+  }                                                                                                  \
+                                                                                                     \
+  const bool getIsTangentSpaceNormalOverride() const {                                               \
+    return m_isTangentSpaceNormalOverride;                                                           \
+  }                                                                                                  \
+                                                                                                     \
+  /* Fork: per-material flag for Bethesda DXT5n convention -- spec in NormalMap.alpha.  */          \
+  /* See OPAQUE_SURFACE_MATERIAL_FLAG_ROUGHNESS_FROM_NORMAL_ALPHA. Set by               */          \
+  /* LegacyMaterialData::as<OpaqueMaterialData>() on the FNV PS-classifier path when   */          \
+  /* the captured normal carries the spec-in-alpha convention. Replacement assets      */          \
+  /* leave it false. Meaningful only on opaque materials.                              */          \
+  void setIsRoughnessFromNormalAlphaOverride(const bool isRoughnessFromNormalAlpha) {                \
+    m_isRoughnessFromNormalAlphaOverride = isRoughnessFromNormalAlpha;                               \
+  }                                                                                                  \
+                                                                                                     \
+  const bool getIsRoughnessFromNormalAlphaOverride() const {                                         \
+    return m_isRoughnessFromNormalAlphaOverride;                                                     \
+  }                                                                                                  \
+                                                                                                     \
+  /* Fork: Multi-layer terrain albedo + normal slots, populated by the fork hook       */            \
+  /* applyLegacyProtocolMultiLayerTerrain from LegacyMaterialData's matching arrays.   */            \
+  /* terrainLayerCount > 0 signals multi-layer mode; the scene manager then resolves   */            \
+  /* each TextureRef to a texture index and registers an RtMultiLayerTerrainMaterial   */            \
+  /* entry in the extension cache, storing the resulting aux index on                  */            \
+  /* RtOpaqueSurfaceMaterial::m_multiLayerTerrainIndex. Defaults to 0 so non-terrain   */            \
+  /* materials and standard replacement materials are unaffected. Carried on all three */            \
+  /* REMIX_MATERIAL specializations (the macro is shared) but meaningful only on the   */            \
+  /* opaque branch; the scene manager reads these fields exclusively from the opaque   */            \
+  /* path. Phase 3 of FNV multi-layer terrain.                                         */            \
+  static constexpr uint32_t kMaxTerrainLayers = 7;                                                   \
+  uint32_t   terrainLayerCount = 0;                                                                  \
+  TextureRef terrainAlbedoTextures[kMaxTerrainLayers];                                               \
+  TextureRef terrainNormalTextures[kMaxTerrainLayers];                                               \
+                                                                                                     \
 private:                                                                                             \
                                                                                                      \
   struct Ranges {                                                                                    \
@@ -308,6 +350,8 @@ private:                                                                        
   XXH64_hash_t m_cachedHash { 0 };                                                                   \
   Rc<DxvkSampler> m_samplerOverride = nullptr;                                                       \
   bool m_ignoreAlphaChannelOverride = false;                                                         \
+  bool m_isTangentSpaceNormalOverride = false;                                                       \
+  bool m_isRoughnessFromNormalAlphaOverride = false;                                                 \
 };
 
 namespace dxvk {

@@ -69,6 +69,7 @@ namespace dxvk {
   class RtxContext;
   class SceneManager;
   struct LegacyMaterialData;
+  struct OpaqueMaterialData;
   struct RtLight;
   struct TextureRef;
 
@@ -139,6 +140,16 @@ namespace dxvk {
       DrawCallState& drawCall,
       XXH64_hash_t textureHash,
       SceneManager& scene);
+
+    // Consumes LegacyMaterialData's multi-layer terrain fields (populated by
+    // setLegacyMaterialState when kRemixMultiLayerTerrainBit is set in
+    // remixModifierFromD3D) and copies them into OpaqueMaterialData's matching
+    // multi-layer slots. The scene manager later resolves the TextureRefs to
+    // indices and registers an RtMultiLayerTerrainMaterial extension cache entry.
+    // Called from LegacyMaterialData::as<OpaqueMaterialData>() at the tail of the
+    // FNV protocol-driven conversion block. Implementation in
+    // rtx_fork_multilayer_terrain.cpp.
+    void applyLegacyProtocolMultiLayerTerrain(const LegacyMaterialData& materialData, OpaqueMaterialData& opaqueOut);
 
     // Forwards keyboard (WM_KEY*, WM_CHAR, WM_SYSCHAR) AND mouse
     // (WM_MOUSEMOVE, WM_{L,R,M,X}BUTTON*, WM_MOUSE{,H}WHEEL) messages to

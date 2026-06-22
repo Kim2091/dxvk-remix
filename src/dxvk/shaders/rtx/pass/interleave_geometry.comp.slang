@@ -31,8 +31,10 @@ layout(binding = INTERLEAVE_GEOMETRY_BINDING_NORMAL_INPUT)
 StructuredBuffer<float> srcNormal;
 layout(binding = INTERLEAVE_GEOMETRY_BINDING_TEXCOORD_INPUT) 
 StructuredBuffer<float> srcTexcoord;
-layout(binding = INTERLEAVE_GEOMETRY_BINDING_COLOR0_INPUT) 
+layout(binding = INTERLEAVE_GEOMETRY_BINDING_COLOR0_INPUT)
 StructuredBuffer<uint32_t> srcColor0;
+layout(binding = INTERLEAVE_GEOMETRY_BINDING_COLOR1_INPUT)
+StructuredBuffer<uint32_t> srcColor1;
 
 layout(push_constant)
 ConstantBuffer<InterleaveGeometryArgs> cb;
@@ -45,6 +47,6 @@ void main(uint idx : SV_DispatchThreadID)
   {
     return;
   }
-  
-  interleaver::interleave(idx, dst, srcPosition, srcNormal, srcTexcoord, srcColor0, cb);
+
+  interleaver::interleave(idx, dst, srcPosition, srcNormal, srcTexcoord, srcColor0, srcColor1, cb);
 }

@@ -152,6 +152,13 @@ namespace dxvk {
       uint32_t texcoordOffset = 0;
       bool hasColor0 = false;
       uint32_t color0Offset = 0;
+      bool hasColor1 = false;
+      uint32_t color1Offset = 0;
+      // Fork: FNV multi-layer terrain stores per-vertex blend weights as FLOAT4
+      // streams (COLOR0 + synthetic COLOR1 from TEXCOORD1). When set, color slots
+      // carry 4 floats each instead of 1 packed BGRA8 uint; the hit-side surface
+      // decoder reads them as raw floats.
+      bool hasMultiLayerTerrainWeights = false;
     };
 
     // Helpers for promoting Geometry Snapshots from raster pipeline to Geometry Data for RT pipeline
