@@ -36,6 +36,10 @@
 
 #include "rtx/pass/atmosphere/atmosphere_common.slangh"
 
+#ifdef ATMOSPHERE_AVAILABLE
+#include "rtx/pass/atmosphere/cloud_march_common.slangh"
+#endif
+
 // ============================================================================
 // Night sky — stars, galactic band, shooting stars, airglow
 // ============================================================================
@@ -675,6 +679,42 @@ vec3 evalMoonDisk(vec3 viewDir, uint moonIdx, AtmosphereArgs args, out float dis
   return max(moonRadiance, vec3(0.0f));
 }
 
+#ifdef ATMOSPHERE_AVAILABLE
+// Near-field cloud in-scatter along a view ray truncated at tMaxKm (km).
+// Used by primary geometry hits so terrain inside/near the volume receives
+// cloud fog in front of the surface, not only sky-miss pixels.
+void compositeNearFieldCloudOverRadiance(
+  inout vec3 radiance,
+  inout vec3 attenuation,
+  vec3 viewDirYUp,
+  vec3 originYUpKm,
+  float tMaxKm,
+  uint2 pixelCoord,
+  uint frameIdx,
+  AtmosphereArgs args)
+{
+  if (!shouldUseNearFieldCloudMarch(originYUpKm, args)) {
+    return;
+  }
+  // tMaxKm > 0 truncates at geometry hit distance; tMaxKm == 0 marches the full slab.
+
+  CloudShadeContext ctx = buildCloudShadeContext(args);
+  float jitter = fastJitter(pixelCoord, frameIdx).x;
+  vec3 accumColor = vec3(0.0f);
+  float viewTransmittance = 1.0f;
+  const float tMaxClamp = (tMaxKm > 0.0f) ? tMaxKm : 0.0f;
+  marchCloudLayers(viewDirYUp, originYUpKm, jitter,
+                   /*tMinClamp=*/0.0f,
+                   /*tMaxClamp=*/tMaxClamp,
+                   args.cloudViewSamples,
+                   /*useFullExtinction=*/true,
+                   ctx, args,
+                   accumColor, viewTransmittance);
+  radiance = accumColor + viewTransmittance * radiance;
+  attenuation *= viewTransmittance;
+}
+#endif
+
 // ============================================================================
 // Sky entry point
 // ============================================================================
@@ -727,7 +767,8 @@ vec3 evalSkyRadiance(
   // indirect sky-gather call sites pass true (see integrator_indirect). Primary,
   // PSR, and specular/refraction/cutout misses leave it false so the sky they
   // show stays at physical brightness and matches the visible sky.
-  bool applySkyIndirectRadianceScale = false
+  bool applySkyIndirectRadianceScale = false,
+  vec3 originYUpKm = vec3(0.0f, 0.0f, 0.0f)
 ) {
   // Perf bisect (fork — 2026-06-11, diagnostic): flat sky miss. Returns a
   // constant mid-grey immediately so a live session can read the full
@@ -742,6 +783,10 @@ vec3 evalSkyRadiance(
   // Transform view direction to Y-up space if needed
   vec3 viewDirYUp = isZUp ? vec3(viewDir.x, viewDir.z, viewDir.y) : viewDir;
   viewDirYUp = normalize(viewDirYUp);
+
+  if (length(originYUpKm) < 1e-6f) {
+    originYUpKm = args.cameraWorldPosYUpKm;
+  }
 
   // Sample the pre-baked sky-view LUT instead of marching the atmosphere live.
   // sky_view_lut.comp.slang bakes evalAtmosphereRadiance from cameraPos =
@@ -852,7 +897,23 @@ vec3 evalSkyRadiance(
   // source: both paths are accumulated as `radiance += stepRadiance * T_so_far`,
   // so the rgb-channel semantics match once the alpha convention is reconciled.
   vec4 cloudLayer;
-  if (args.cloudRenderRTEnable != 0u && isPrimaryRay) {
+  bool useNearFieldCloudMarch = false;
+  const bool nearFieldMarch = shouldUseNearFieldCloudMarch(originYUpKm, args);
+  if (nearFieldMarch && args.cloudEnabled > 0.5f && args.cloudViewSamples > 0u) {
+    useNearFieldCloudMarch = true;
+    CloudShadeContext ctx = buildCloudShadeContext(args);
+    float jitter = fastJitter(pixelCoord, frameIdx).x;
+    vec3 accumColor = vec3(0.0f);
+    float viewTransmittance = 1.0f;
+    marchCloudLayers(viewDirYUp, originYUpKm, jitter,
+                     /*tMinClamp=*/0.0f,
+                     /*tMaxClamp=*/0.0f,
+                     args.cloudViewSamples,
+                     /*useFullExtinction=*/true,
+                     ctx, args,
+                     accumColor, viewTransmittance);
+    cloudLayer = vec4(accumColor, 1.0f - viewTransmittance);
+  } else if (args.cloudRenderRTEnable != 0u && isPrimaryRay) {
     // Half-res cloud RT upsample (fork — 2026-06-11, perf). The cloud RT may
     // be allocated at a fraction of the downscale extent
     // (cloudRenderResolutionScale); pixelCoord is in DOWNSCALE coordinates,
@@ -983,7 +1044,8 @@ vec3 evalSkyRadiance(
   // 65536 frames and frame-0 startup both collide harmlessly with the
   // sentinel for a single one-frame rejection (~18 min cadence at 60fps).
   vec4 smoothedCloud = cloudLayer;  // default: no smoothing
-  if (enableCloudTemporalSmoothing && all(historyResolution > uint2(0u, 0u))) {
+  if (enableCloudTemporalSmoothing && !useNearFieldCloudMarch
+      && all(historyResolution > uint2(0u, 0u))) {
     vec4 currentPremul = vec4(cloudLayer.rgb * cloudLayer.a, cloudLayer.a);
 
     // Reproject: previous-frame pixel = current pixel + motion-vector (in pixels).
@@ -1021,8 +1083,26 @@ vec3 evalSkyRadiance(
         // less smoothing benefit. 0.92 was picked to settle to within 1% of
         // a stable signal in ~30 frames at 60Hz (~0.5s) while still strongly
         // suppressing the per-frame jitter variance DLSS sees.
+        //
+        // Attenuate history during camera motion (fork — 2026-06-29). Sky-miss
+        // motion vectors are rotation-only (infinite distance), but clouds are
+        // world-anchored at finite altitude — temporal reprojection misaligns
+        // during translation/dolly pans and reads as wobble. Scale history
+        // weight down by screen-space motion magnitude and per-frame camera
+        // translation so animated cameras prefer the live march.
         const float kHistoryWeight = 0.92f;
-        vec4 blended = lerp(currentPremul, history, kHistoryWeight);
+        const float kMotionRejectStartPx = 1.5f;
+        const float kMotionRejectFullPx  = 10.0f;
+        const float kTransRejectStartKm  = 0.001f;  // 1 m
+        const float kTransRejectFullKm   = 0.05f;   // 50 m
+        float motionReject = smoothstep(kMotionRejectStartPx, kMotionRejectFullPx,
+                                        length(motionVectorPixels));
+        float transReject  = smoothstep(kTransRejectStartKm, kTransRejectFullKm,
+                                        args.cameraTranslationKm);
+        float rotationReject = smoothstep(0.0003f, 0.01f, args.cameraAngularDeltaRad);
+        float historyWeight = kHistoryWeight
+                            * (1.0f - max(max(motionReject, transReject), rotationReject));
+        vec4 blended = lerp(currentPremul, history, historyWeight);
         smoothedCloud = vec4(blended.rgb, blended.a);
       } else {
         smoothedCloud = currentPremul;
@@ -1043,7 +1123,7 @@ vec3 evalSkyRadiance(
     radiance = radiance * (1.0f - smoothedCloud.a) + smoothedCloud.rgb;
   } else {
     // No temporal smoothing — original composite path.
-    radiance = mix(radiance, cloudLayer.rgb, cloudLayer.a);
+    radiance = radiance * (1.0f - cloudLayer.a) + cloudLayer.rgb;
   }
 
   // Star composite (fork). Stars were held out of `radiance` above so they

@@ -138,10 +138,12 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
 
   vec3 accumColor = vec3(0.0f);
   float viewTransmittance = 1.0f;
-  marchCloudLayers(viewDirYUp, jitter,
+  marchCloudLayers(viewDirYUp, args.cameraWorldPosYUpKm, jitter,
                    /*tMinClamp=*/0.0f,
                    /*tMaxClamp=*/0.0f,
-                   args.cloudViewSamples, ctx, args,
+                   args.cloudViewSamples,
+                   /*useFullExtinction=*/false,
+                   ctx, args,
                    accumColor, viewTransmittance);
 
   cloudSecondaryLutOutput[pixelCoord] = vec4(accumColor, viewTransmittance);

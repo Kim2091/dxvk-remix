@@ -405,6 +405,9 @@ private:
   // flips cloudVoxelShadowsEnable, by which point the setter will have run
   // at least one frame.
   Vector3  m_cameraWorldPosYUpKm   { 0.0f, 0.0f, 0.0f };
+  float    m_cameraTranslationKm   { 0.0f };
+  float    m_cameraAngularDeltaRad   { 0.0f };
+  bool     m_cloudBasisInitialized   { false };
 
   // Unified cloud-motion accumulators (fork — 2026-06-21). Integrated once per
   // frame by advanceCloudMotion() (offset += velocity * dt) and read by the const

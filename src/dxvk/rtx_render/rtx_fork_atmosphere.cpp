@@ -24,6 +24,8 @@
 #include "rtx/pass/common_binding_indices.h"
 #include "rtx/pass/atmosphere/atmosphere_args.h" // MAX_MOONS (showAtmosphereUI moon loop)
 #include "../util/util_global_time.h" // GlobalTime::get().deltaTime (cloud-motion integrator)
+#include "../../util/log/log.h"       // TEMP DIAG: Logger::info (cloud camera tracking probe)
+#include "../../util/util_string.h"   // TEMP DIAG: str::format
 #include "imgui/imgui.h"              // ImGui::Button, ImGui::Text, etc. (showAtmosphereUI)
 #include "rtx_imgui.h"                // RemixGui::DragFloat, ComboWithKey (showAtmosphereUI)
 #include <cstdio>                     // std::snprintf (renderMoonUI label)
@@ -293,9 +295,9 @@ namespace fork_hooks {
       // a weighted sum to reconstruct viewDir per pixel.
       {
         const RtCamera& camera = ctx.getSceneManager().getCamera();
-        const Vector3 forward = camera.getDirection(/*freecam=*/true);
-        const Vector3 right   = camera.getRight(/*freecam=*/true);
-        const Vector3 up      = camera.getUp(/*freecam=*/true);
+        const Vector3 forward = camera.getDirection(/*freecam=*/false);
+        const Vector3 right   = camera.getRight(/*freecam=*/false);
+        const Vector3 up      = camera.getUp(/*freecam=*/false);
 
         const bool isZUp = RtxOptions::zUp();
         // Swap (x, y, z) -> (x, z, y) when the game is Z-up. Mirrors the
@@ -334,13 +336,38 @@ namespace fork_hooks {
         // mirrors the basis-vector swap above so the helper's camera-relative
         // subtraction lands in the right frame.
         {
-          const Vector3 cameraPosWorldUnits = camera.getPosition(/*freecam=*/false);
+          // Camera world position in game units. Normally the Remix camera, but
+          // camera-relative engines (e.g. FalloutNV) zero it out, which welds the
+          // cloud volume to the view; those integrations push the real position
+          // into cameraWorldOverride. See useCameraWorldOverride in rtx_options.h.
+          const Vector3 cameraPosWorldUnits = RtxOptions::useCameraWorldOverride()
+            ? RtxOptions::cameraWorldOverride()
+            : camera.getPosition(/*freecam=*/false);
           const Vector3 cameraPosWorldUnitsYUp = toYUp(cameraPosWorldUnits);
           const float sceneScaleSafe = std::max(RtxOptions::sceneScale(), 1e-5f);
           const float worldUnitsPerKm = 100000.0f * sceneScaleSafe;
           const float kmPerWorldUnit = 1.0f / worldUnitsPerKm;
-          const Vector3 cameraPosYUpKm = cameraPosWorldUnitsYUp * kmPerWorldUnit;
+          const float altitudeOffsetKm = RtxOptions::altitude() * 0.001f;
+          const Vector3 cameraPosYUpKm(
+            cameraPosWorldUnitsYUp.x * kmPerWorldUnit,
+            cameraPosWorldUnitsYUp.y * kmPerWorldUnit + altitudeOffsetKm,
+            cameraPosWorldUnitsYUp.z * kmPerWorldUnit);
           ctx.m_atmosphere->setCloudShadowCameraPosition(cameraPosYUpKm);
+
+          // Cloud world-anchor camera probe (fork — 2026-06-29). Logs the chosen
+          // anchor source vs the resulting cloud origin ~twice/sec, for diagnosing
+          // camera-relative anchoring regressions (see useCameraWorldOverride).
+          // Off by default; enable rtx.atmosphere.cloudCameraDebugProbe.
+          if (RtxOptions::cloudCameraDebugProbe() && (frameIdx % 30u) == 0u) {
+            Logger::info(str::format(
+              "[CLOUDCAM] src=(", cameraPosWorldUnits.x, ", ",
+              cameraPosWorldUnits.y, ", ", cameraPosWorldUnits.z,
+              ")  cloudOriginYUpKm=(", cameraPosYUpKm.x, ", ",
+              cameraPosYUpKm.y, ", ", cameraPosYUpKm.z,
+              ")  override=", (RtxOptions::useCameraWorldOverride() ? 1 : 0),
+              " sceneScale=", RtxOptions::sceneScale(),
+              " zUp=", (RtxOptions::zUp() ? 1 : 0)));
+          }
         }
 
         // Allocate the cloud render RT at the downscale extent (the resolution
@@ -1107,7 +1134,7 @@ namespace fork_hooks {
         RemixGui::SetTooltipToLastWidgetOnHover("Density of ozone layer");
 
         if (ImGui::TreeNode("Advanced")) {
-          RemixGui::DragFloat("Planet Radius", &RtxOptions::planetRadiusObject(), 10.0f, 1000.0f, 10000.0f, "%.0f km", sliderFlags);
+          RemixGui::DragFloat("Planet Radius", &RtxOptions::planetRadiusObject(), 1.0f, 100.0f, 10000.0f, "%.0f km", sliderFlags);
           RemixGui::DragFloat("Atmosphere Thickness", &RtxOptions::atmosphereThicknessObject(), 1.0f, 10.0f, 500.0f, "%.0f km", sliderFlags);
           RemixGui::DragFloat("Mie Anisotropy", &RtxOptions::mieAnisotropyObject(), 0.01f, -1.0f, 1.0f, "%.2f", sliderFlags);
 
@@ -1249,6 +1276,18 @@ namespace fork_hooks {
                               0.05f, 0.0f, 4.0f, "%.2f", sliderFlags);
           RemixGui::SetTooltipToLastWidgetOnHover(
               "Cloud opacity. Higher = thicker / darker clouds.");
+          RemixGui::DragFloat("Proximity Density Boost", &RtxOptions::cloudProximityDensityBoostObject(),
+                              0.1f, 1.0f, 8.0f, "%.1f", sliderFlags);
+          RemixGui::SetTooltipToLastWidgetOnHover(
+              "Thickens clouds when the camera is near or inside the slab. "
+              "1.0 = off; higher = denser near-field fog (including on geometry).");
+          RemixGui::DragFloat("Near Field Margin", &RtxOptions::cloudNearFieldMarginKmObject(),
+                              0.1f, 0.0f, 10.0f, "%.1f km", sliderFlags);
+          RemixGui::SetTooltipToLastWidgetOnHover(
+              "Distance from the cloud slab at which primary sky-miss switches "
+              "from the screen-space cloud RT to a live per-ray volumetric march. "
+              "0 = only when inside the slab; higher = volumetric march kicks in "
+              "from farther away as you approach the deck.");
           RemixGui::DragFloat("Altitude", &RtxOptions::cloudAltitudeObject(),
                               0.1f, 0.5f, 12.0f, "%.1f km", sliderFlags);
           RemixGui::SetTooltipToLastWidgetOnHover(

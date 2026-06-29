@@ -194,39 +194,24 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
                               + ndc.x * args.cloudRenderRightYUp
                               + ndc.y * args.cloudRenderUpYUp);
 
-  // Below-horizon view direction: no clouds above this pixel.
-  if (viewDirYUp.y <= 0.001f) {
-    cloudRenderOutput[pixelCoord] = vec4(0.0f, 0.0f, 0.0f, 1.0f);
-    return;
-  }
-
   // ===== Per-pixel FAST-noise jitter on the fractional step offset =====
   // Channel x is the view-march; we don't take more than one tap so channel
   // y is unused.
-  // Slab intersection + stepLen now live inside marchCloudSlab so both layer
-  // marches can reuse them with their own slab params.
   float jitter = fastJitter(pixelCoord, args.cloudRenderFrameIdx).x;
 
   // ===== Static-per-frame shading context (cloud_march_common.slangh) =====
-  // Sun/sky radiances, the full per-moon precompute, combined-moon shadow
-  // direction, and the Wrenninge octave count — all pixel-independent, all
-  // extracted verbatim into buildCloudShadeContext.
   CloudShadeContext ctx = buildCloudShadeContext(args);
 
   // ===== View-ray raymarch, both layers (cloud_march_common.slangh) =====
-  // evalNubisCubedSample inside marchCloudSlab uses sigma = args.cloudDensity
-  // (no doubling — Nubis Cubed equations take raw cloudDensity as extinction).
-  // marchCloudLayers sequences layer 1 (cumulus) then the optional layer-2
-  // cirrus deck front-to-back, zeroing the moon coefficients for layer 2.
-  // The 0/0 distance clamps mean "march the full slab" — bit-identical to
-  // the pre-extraction inline march.
   vec3 accumColor = vec3(0.0f);
   float viewTransmittance = 1.0f;
 
-  marchCloudLayers(viewDirYUp, jitter,
+  marchCloudLayers(viewDirYUp, args.cameraWorldPosYUpKm, jitter,
                    /*tMinClamp=*/0.0f,
                    /*tMaxClamp=*/0.0f,
-                   args.cloudViewSamples, ctx, args,
+                   args.cloudViewSamples,
+                   /*useFullExtinction=*/true,
+                   ctx, args,
                    accumColor, viewTransmittance);
 
   // Output is premultiplied: rgb = accumulated cloud radiance,

@@ -869,6 +869,9 @@ initializer list and can't be lifted into a separate TU.
 - **Block** at `(file scope)` (atmosphere include) — ~4 LOC, planned target `fork_hooks::atmosphereInclude` in `rtx_fork_atmosphere.slangh`.
   *Adds `#include "rtx/pass/atmosphere/atmosphere_common.slangh"` at the top of the file, plus `#include "rtx/pass/atmosphere/atmosphere_sky.slangh"` gated by `#ifdef ATMOSPHERE_AVAILABLE` for the sky-radiance evaluation paths.*
 
+- **Block** at `geometryResolverVertex` (hit path — near-field cloud composite) — ~18 LOC (fork — 2026-06-29).
+  *Before writing `SharedRadiance`, when `skyMode == 1` and clouds are enabled, calls `compositeNearFieldCloudOverRadiance` with the unjittered primary view direction and hit distance (km) so geometry inside/near the cloud slab receives in-scatter fog in front of the surface — not only sky-miss pixels.*
+
 ---
 
 ## src/dxvk/shaders/rtx/algorithm/integrator_direct.slangh
@@ -2348,5 +2351,130 @@ Adds the `rtx.atmosphere.skyIndirectRadianceScale` knob (default **1.0** = physi
 - **`src/dxvk/rtx_render/rtx_fork_atmosphere.cpp`** — fork-owned change.
   *Adds the "Sky Indirect Scale" ImGui slider (0–20) + tooltip in the atmosphere UI.*
 - **`RtxOptions.md`** — REGEN PENDING (adds `rtx.atmosphere.skyIndirectRadianceScale`).
+
+---
+
+## Workstream — Cloud lag fix + hybrid near-field volumetric (fork — 2026-06-29)
+
+Animated roll/pitch cloud lag was traced to temporal cloud smoothing: per-pixel sky-miss motion vectors stay near zero at the screen center during slow rotation, so the 0.92 history weight persisted while the cloud RT updated every frame. Fix: track per-frame global camera forward angular delta on the CPU (`cameraAngularDeltaRad`) and scale history weight down via `rotationReject` in `evalSkyRadiance`. Align cloud-render basis vectors to the game camera (`freecam=false`) so rotation matches position. Hybrid near-field path: when the camera is inside or within `cloudNearFieldMarginKm` of either cloud slab, primary sky-miss runs `marchCloudLayers` per ray instead of sampling the screen-space cloud RT; temporal smoothing is skipped on that path.
+
+- **`src/dxvk/rtx_render/rtx_options.h`** — fork-owned change.
+  *Adds `RTX_OPTION("rtx.atmosphere", float, cloudNearFieldMarginKm, 0.5f, …)`.*
+- **`src/dxvk/shaders/rtx/pass/atmosphere/atmosphere_args.h`** — fork-owned change.
+  *Repurposes `pad_cloudMultiScatterStrength` → `cameraAngularDeltaRad` and `pad_cloudLayer2Color0` → `cloudNearFieldMarginKm`; CB layout unchanged.*
+- **`src/dxvk/rtx_render/rtx_atmosphere.h/.cpp`** — fork-owned change.
+  *Tracks `m_cameraAngularDeltaRad` in `setCloudRenderCameraBasis()`; publishes both new args fields in `getAtmosphereArgs()`; zeroes `cameraAngularDeltaRad` in `normalizeForSkyLutCache()`.*
+- **`src/dxvk/rtx_render/rtx_fork_atmosphere.cpp`** — fork-owned change.
+  *Cloud basis push uses `getDirection/getRight/getUp(/*freecam=*/false)` so rotation matches game-camera position.*
+- **`src/dxvk/shaders/rtx/pass/atmosphere/atmosphere_common.slangh`** — fork-owned change.
+  *Adds `distToCloudSlabShellKm()` + `shouldUseNearFieldCloudMarch()`.*
+- **`src/dxvk/shaders/rtx/pass/atmosphere/atmosphere_sky.slangh`** — fork-owned change.
+  *Includes `cloud_march_common.slangh` when `ATMOSPHERE_AVAILABLE`; primary-ray near-field branch live-marches; `rotationReject` in temporal smoothing; skips temporal smoothing when near-field march is active.*
+- **`RtxOptions.md`** — regenerated; adds `rtx.atmosphere.cloudNearFieldMarginKm`.
+
+---
+
+## Workstream — Cloud fly-through, horizon seam, planet radius UI (fork — 2026-06-29)
+
+Follow-up to hybrid near-field volumetric: geometry hits inside the cloud volume still occluded clouds (near-field march ran only on sky miss); high-altitude observers saw an empty horizon band in the cloud RT because the below-horizon gate only bypassed for cameras inside the slab, not above it; Planet Radius ImGui min lowered for small-planet debugging.
+
+- **`src/dxvk/shaders/rtx/pass/atmosphere/atmosphere_common.slangh`** — fork-owned change.
+  *Adds `isCameraAboveCloudSlabArgs()` and `allowsBelowHorizonCloudMarch()` (inside / near-field / above-deck bypass for below-horizon cloud marches). Grazing above-deck intersection fallback in `intersectCloudSlabMarchRange` when `tExit <= tEntry`.*
+- **`src/dxvk/shaders/rtx/pass/atmosphere/cloud_render.comp.slang`** — fork-owned change.
+  *Replaces inside-slab-only below-horizon gate with `allowsBelowHorizonCloudMarch()` so high-altitude horizon and downward rays populate the cloud RT.*
+- **`src/dxvk/shaders/rtx/pass/atmosphere/atmosphere_sky.slangh`** — fork-owned change.
+  *Adds `compositeNearFieldCloudOverRadiance()` — truncated `marchCloudLayers` composite for primary geometry hits (no temporal smoothing).*
+- **`src/dxvk/shaders/rtx/algorithm/geometry_resolver.slangh`** — upstream touchpoint (see block entry above).
+  *Hit-path hook calling `compositeNearFieldCloudOverRadiance` before `SharedRadiance` output.*
+- **`src/dxvk/rtx_render/rtx_fork_atmosphere.cpp`** — fork-owned change.
+  *Planet Radius ImGui slider min 1000 → 100 km; drag step 1.0 km for finer control at small radii.*
+
+---
+
+## Workstream — Graduated horizon gate + proximity density boost (fork — 2026-06-29)
+
+Follow-up: binary below-horizon cloud gate left a visible horizon band when approaching the deck (outside the 0.5 km near-field margin); near-field geometry-hit fog looked thin at max Density because truncated marches integrate fewer steps.
+
+- **`src/dxvk/shaders/rtx/pass/atmosphere/atmosphere_common.slangh`** — fork-owned change.
+  *Adds `minDistToAnyCloudSlabShellKm`, `cloudProximityRelaxFactor`, `cloudBelowHorizonElevationMin`, `cloudProximityDensityScale`. Below-deck grazing intersection fallback in `intersectCloudSlabMarchRange`.*
+- **`src/dxvk/shaders/rtx/pass/atmosphere/cloud_render.comp.slang`** — fork-owned change.
+  *Replaces binary horizon gate with `cloudBelowHorizonElevationMin()` (distance-aware fade toward horizontal rays).*
+- **`src/dxvk/shaders/rtx/pass/atmosphere/cloud_march_common.slangh`** — fork-owned change.
+  *Applies `cloudProximityDensityScale` to Beer-Lambert extinction in `marchCloudSlab` and `marchEchoDeck`.*
+- **`src/dxvk/shaders/rtx/pass/atmosphere/atmosphere_args.h`** — fork-owned change.
+  *Repurposes `pad_cloudShadowTintStrength` → `cloudProximityDensityBoost`; CB layout unchanged.*
+- **`src/dxvk/rtx_render/rtx_options.h`** — fork-owned change.
+  *Adds `cloudProximityDensityBoost` RTX_OPTION (default 3.0, 1 = off).*
+- **`src/dxvk/rtx_render/rtx_atmosphere.cpp`** — fork-owned change.
+  *Publishes `cloudProximityDensityBoost` in `getAtmosphereArgs()`.*
+- **`src/dxvk/rtx_render/rtx_fork_atmosphere.cpp`** — fork-owned change.
+  *Adds "Proximity Density Boost" ImGui slider in the Clouds block.*
+- **`RtxOptions.md`** — regenerated; adds `rtx.atmosphere.cloudProximityDensityBoost`.
+
+---
+
+## Workstream — Horizon gap + geometry occlusion fix (fork — 2026-06-29)
+
+Follow-up: persistent horizon band at curvature=0 (hard elevation gate + spherical shell tangent misses); geometry hits still showed through clouds despite proximity boost (wrong mix composite + aerial fade softening extinction on truncated marches).
+
+- **`src/dxvk/shaders/rtx/pass/atmosphere/atmosphere_common.slangh`** — fork-owned change.
+  *Adds `cloudEffectiveRadiusForViewRay`, `cloudSlabRadiiForViewRay`, `intersectCloudSlabFlatFallback`, `intersectCloudSlabMarchRangeForLayer` (horizon flatness blend + flat-slab fallback).*
+- **`src/dxvk/shaders/rtx/pass/atmosphere/cloud_march_common.slangh`** — fork-owned change.
+  *Uses layer intersection helper; `useFullExtinction` param with proximity-scaled aerial fade mix on truncated/near-field paths.*
+- **`src/dxvk/shaders/rtx/pass/atmosphere/cloud_render.comp.slang`** — fork-owned change.
+  *Soft horizon feather replaces hard early-out.*
+- **`src/dxvk/shaders/rtx/pass/atmosphere/atmosphere_sky.slangh`** — fork-owned change.
+  *`compositeNearFieldCloudOverRadiance` uses `accumColor + T * radiance`; near-field sky march passes `useFullExtinction=true`.*
+- **`src/dxvk/shaders/rtx/pass/atmosphere/cloud_secondary_lut.comp.slang`** — fork-owned change.
+  *Updated `marchCloudLayers` call signature (`useFullExtinction=false`).*
+
+---
+
+## Workstream — Horizon sliver + geometry attenuation occlusion (fork — 2026-06-29)
+
+Follow-up: soft horizon feather zeroed clouds at y≈0 (remaining sliver); cloud fog only modified SharedRadiance while path-traced direct/specular used unmodified PrimaryAttenuation (water stayed bright, geometry never fully occluded).
+
+- **`src/dxvk/shaders/rtx/pass/atmosphere/cloud_render.comp.slang`** — fork-owned change.
+  *One-sided horizonWeight: full weight for y >= horizonMinY; fade only below horizon.*
+- **`src/dxvk/shaders/rtx/pass/atmosphere/atmosphere_common.slangh`** — fork-owned change.
+  *Horizon flatBlend range 0.12 → 0.08 km elevation.*
+- **`src/dxvk/shaders/rtx/pass/atmosphere/atmosphere_sky.slangh`** — fork-owned change.
+  *`compositeNearFieldCloudOverRadiance` also scales `attenuation` by view transmittance.*
+- **`src/dxvk/shaders/rtx/algorithm/geometry_resolver.slangh`** — upstream touchpoint.
+  *Passes attenuation into cloud composite; rewrites PrimaryAttenuation after cloud march.*
+
+---
+
+## Workstream — Water occlusion + stable horizon (fork — 2026-06-29)
+
+Follow-up: opaque geometry occlusion worked but water/mirrors stayed bright (PSR attenuation overwritten pre-cloud; SharedRadiance sky used direction-only LUT; wrong premultiplied cloud composite on non-temporal path). Horizon fixes caused flicker/noise (per-pixel radius blend, dual intersection handoff, degenerate epsilon marches, horizonWeight feather).
+
+- **`src/dxvk/shaders/rtx/pass/atmosphere/atmosphere_common.slangh`** — fork-owned change.
+  *Reverts radius blend / fallback / grazing epsilon / elevation-min feather helpers. Flat horizontal slab at `|y| < 0.12`, spherical otherwise, with minimum march-span reject. Adds `worldPosToOriginYUpKm()`.*
+- **`src/dxvk/shaders/rtx/pass/atmosphere/cloud_march_common.slangh`** — fork-owned change.
+  *Threads `originYUpKm` through `marchCloudSlab` / `marchCloudLayers` / `marchEchoDeck`.*
+- **`src/dxvk/shaders/rtx/pass/atmosphere/cloud_render.comp.slang`** — fork-owned change.
+  *Removes `horizonWeight` feather; `useFullExtinction=true`.*
+- **`src/dxvk/shaders/rtx/pass/atmosphere/atmosphere_sky.slangh`** — fork-owned change.
+  *Premultiplied cloud-over-atmosphere composite; origin-aware near-field march for all ray types; `compositeNearFieldCloudOverRadiance` accepts ray origin + `tMaxKm=0` full march.*
+- **`src/dxvk/shaders/rtx/algorithm/geometry_resolver.slangh`** — upstream touchpoint.
+  *Patches PSR packed attenuation after camera-path cloud composite; PSR sky-miss passes surface origin to `evalSkyRadiance`.*
+- **`src/dxvk/shaders/rtx/algorithm/integrator_indirect.slangh`** — upstream touchpoint.
+  *Indirect sky gather passes bounce origin to `evalSkyRadiance` for near-field cloud march.*
+- **`src/dxvk/rtx_render/rtx_options.h`** — fork-owned change.
+  *Default `cloudProximityDensityBoost` 3.0 → 1.0 (off).*
+
+---
+
+## Workstream — World-anchored clouds for camera-relative engines (fork — 2026-06-29)
+
+Camera-relative engines (e.g. FalloutNV via its Remix wrapper) subtract the camera position out of all geometry, so `RtCamera::getPosition()` reads `(0,0,0)`. The procedural cloud march anchors its sample positions to that camera position, so a zero anchor welds the whole cloud volume to the view — the deck "follows" the player in every axis and fly-through is impossible. Confirmed in-game by a probe (`getPos=(0,0,0)` no matter how the player flew). Fix: let the game integration push the real camera world position into a new RtxOption that the cloud camera-basis push uses as the anchor. Games that already hand Remix an absolute camera (e.g. GTA 4) are unaffected — the override defaults off.
+
+- **`src/dxvk/rtx_render/rtx_options.h`** — fork-owned additions.
+  *Adds `useCameraWorldOverride` (bool, default false), `cameraWorldOverride` (Vector3, default 0), and `cloudCameraDebugProbe` (bool, default false) under `rtx.atmosphere`. With the override on, clouds anchor to the pushed position (raw game units) instead of `getPosition()`. The probe logs the anchor source vs the resulting cloud origin to the runtime log (off by default).*
+- **`src/dxvk/rtx_render/rtx_fork_atmosphere.cpp`** — fork-owned change.
+  *In the cloud camera-basis push (`updateAtmosphereConstants`), selects `cameraWorldOverride` over `camera.getPosition(false)` when `useCameraWorldOverride` is set; the same Z-up swap + km scaling applies. Adds the gated `[CLOUDCAM]` diagnostic log.*
+
+Companion game-side push lives in the FalloutNV Remix wrapper (`src/comp/comp.cpp`, `camera_push` namespace): it feeds the engine `camera_position_ptr` to `rtx.atmosphere.cameraWorldOverride` each frame and enables the override once after warmup.
 
 ---

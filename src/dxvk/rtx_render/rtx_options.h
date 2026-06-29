@@ -1240,6 +1240,28 @@ namespace dxvk {
     RTX_OPTION("rtx.atmosphere", float, sunRotation, 0.0f,
                "Sun rotation in degrees. Game-drivable per-frame; persists when saved unless overridden by a runtime push.");
     RTX_OPTION("rtx.atmosphere", float, altitude, 100.0f, "Height from sea level in meters.");
+    // Cloud world-anchor override (fork — 2026-06-29). Some engines render
+    // camera-relative (they subtract the camera position out of all geometry, so
+    // the camera reads as the origin and RtCamera::getPosition() returns ~0). The
+    // procedural cloud march anchors its sample positions to the camera world
+    // position; with a zero anchor the whole cloud volume welds to the view and
+    // "follows" the player in every axis. When useCameraWorldOverride is true the
+    // cloud camera-basis push uses cameraWorldOverride (raw game units, same
+    // convention getPosition would return) as the anchor instead. The game
+    // integration (e.g. the FalloutNV Remix wrapper, which already reads the engine
+    // camera NiPoint3) is expected to push the real camera position each frame.
+    RTX_OPTION("rtx.atmosphere", bool, useCameraWorldOverride, false,
+        "Anchor the procedural cloud volume to rtx.atmosphere.cameraWorldOverride instead of the "
+        "Remix camera position. Required for camera-relative engines where getPosition() reads as "
+        "(0,0,0); without it the cloud deck follows the camera. The game integration pushes the "
+        "real camera world position each frame.");
+    RTX_OPTION("rtx.atmosphere", Vector3, cameraWorldOverride, Vector3(0.f, 0.f, 0.f),
+        "Camera world position in game units, used as the cloud-volume world anchor when "
+        "useCameraWorldOverride is true. Pushed per-frame by the game integration.");
+    RTX_OPTION("rtx.atmosphere", bool, cloudCameraDebugProbe, false,
+        "Debug: log the cloud world-anchor source position and resulting cloud origin ~twice/sec "
+        "to the runtime log. For diagnosing camera-relative anchoring (see useCameraWorldOverride). "
+        "Off by default.");
     RTX_OPTION("rtx.atmosphere", float, airDensity, 1.0f, "Density of air molecules multiplier (1.0 = clear sky).");
     RTX_OPTION("rtx.atmosphere", float, aerosolDensity, 1.1f, "Density of aerosols/dust multiplier (1.0 = typical).");
     RTX_OPTION("rtx.atmosphere", float, ozoneDensity, 1.0f, "Density of ozone layer multiplier (1.0 = typical).");
@@ -1879,6 +1901,16 @@ namespace dxvk {
                "internal (DLSS-input) resolution [0.25..1]. 0.5 = quarter the "
                "pixels (~4x cheaper cloud march); 1.0 = native (legacy, "
                "bit-exact). Applies on the next frame; live-tunable.");
+
+    RTX_OPTION("rtx.atmosphere", float, cloudNearFieldMarginKm, 0.5f,
+               "Distance (km) from the cloud slab at which primary sky-miss "
+               "switches from the screen-space cloud RT to a live per-ray "
+               "volumetric march. 0 = only when inside the slab. Applies live.");
+
+    RTX_OPTION("rtx.atmosphere", float, cloudProximityDensityBoost, 1.0f,
+               "Max extinction multiplier when the camera is at the cloud shell "
+               "(1 = disabled). Fades to 1.0 with distance from the slab. "
+               "Thickens near-field fog on geometry hits. Applies live.");
 
     // Secondary-ray cloud LUT (fork — 2026-06-10, perf). Every indirect /
     // PSR / reflection ray that reaches sky-miss would otherwise run a full

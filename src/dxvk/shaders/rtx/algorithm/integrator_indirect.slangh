@@ -391,7 +391,9 @@ void integratePathVertex(
                                      vec2(0.0f, 0.0f),
                                      uint2(0u, 0u),
                                      /*isPrimaryRay=*/ false,
-                                     /*applySkyIndirectRadianceScale=*/ pathState.skyGatherEligible);
+                                     /*applySkyIndirectRadianceScale=*/ pathState.skyGatherEligible,
+                                     worldPosToOriginYUpKm(pathState.origin, cb.atmosphereArgs,
+                                                           cb.isZUp != 0));
     }
 #endif
     else

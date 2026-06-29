@@ -642,6 +642,246 @@ float cloudHeightProfile(float hf, float type, AtmosphereArgs args) {
   return cloudHeightProfileFull(hf, type, args).r;
 }
 
+// True when the camera world position sits inside the spherical shell between
+// baseRadius and topRadius (fly-through / penetration case).
+bool isCameraInsideCloudSlab(vec3 originYUpKm,
+                              vec3 planetCenter,
+                              float baseRadius,
+                              float topRadius) {
+  const float shellMargin = 0.001f;  // km
+  float camDist = length(originYUpKm - planetCenter);
+  return camDist >= (baseRadius - shellMargin) && camDist <= (topRadius + shellMargin);
+}
+
+// Convenience wrapper using slab altitude/thickness from AtmosphereArgs.
+bool isCameraInsideCloudSlabArgs(vec3 originYUpKm,
+                                  AtmosphereArgs args,
+                                  float slabAltitudeKm,
+                                  float slabThicknessKm) {
+  float cloudR = cloudPlanetRadius(args);
+  vec3 planetCenter = vec3(0.0f, -cloudR, 0.0f);
+  float baseRadius = cloudR + slabAltitudeKm;
+  float topRadius  = cloudR + slabAltitudeKm + slabThicknessKm;
+  return isCameraInsideCloudSlab(originYUpKm, planetCenter, baseRadius, topRadius);
+}
+
+// True when the camera sits above the top of the spherical cloud shell.
+bool isCameraAboveCloudSlabArgs(vec3 originYUpKm,
+                                 AtmosphereArgs args,
+                                 float slabAltitudeKm,
+                                 float slabThicknessKm) {
+  float cloudR = cloudPlanetRadius(args);
+  vec3 planetCenter = vec3(0.0f, -cloudR, 0.0f);
+  float topRadius  = cloudR + slabAltitudeKm + slabThicknessKm;
+  const float shellMargin = 0.001f;  // km
+  float camDist = length(originYUpKm - planetCenter);
+  return camDist > topRadius + shellMargin;
+}
+
+// Radial distance (km) from originYUpKm to the nearest spherical shell surface
+// of the cloud slab (0 when inside the shell).
+float distToCloudSlabShellKm(vec3 originYUpKm,
+                              AtmosphereArgs args,
+                              float slabAltitudeKm,
+                              float slabThicknessKm) {
+  float cloudR = cloudPlanetRadius(args);
+  vec3 planetCenter = vec3(0.0f, -cloudR, 0.0f);
+  float baseRadius = cloudR + slabAltitudeKm;
+  float topRadius  = cloudR + slabAltitudeKm + slabThicknessKm;
+  float camDist = length(originYUpKm - planetCenter);
+  if (camDist < baseRadius) {
+    return baseRadius - camDist;
+  }
+  if (camDist > topRadius) {
+    return camDist - topRadius;
+  }
+  return 0.0f;
+}
+
+// Primary sky-miss gate: live per-ray volumetric march when the camera is inside
+// or within cloudNearFieldMarginKm of either cloud slab.
+bool shouldUseNearFieldCloudMarch(vec3 originYUpKm, AtmosphereArgs args) {
+  if (args.cloudEnabled < 0.5f) {
+    return false;
+  }
+  float effectiveCoverageMean = args.cloudCoverageMean;
+  if (args.cloudLayer2Enable != 0u) {
+    effectiveCoverageMean = max(effectiveCoverageMean, args.cloudLayer2CoverageMean);
+  }
+  if (effectiveCoverageMean < 0.01f || args.cloudViewSamples == 0u) {
+    return false;
+  }
+  const float margin = max(args.cloudNearFieldMarginKm, 0.0f);
+  if (distToCloudSlabShellKm(originYUpKm, args, args.cloudAltitude, args.cloudThickness) <= margin) {
+    return true;
+  }
+  if (args.cloudLayer2Enable != 0u) {
+    if (distToCloudSlabShellKm(originYUpKm, args, args.cloudLayer2Altitude, args.cloudLayer2Thickness) <= margin) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Min distance (km) to either enabled cloud slab shell (0 when inside).
+float minDistToAnyCloudSlabShellKm(vec3 originYUpKm, AtmosphereArgs args) {
+  float d = distToCloudSlabShellKm(originYUpKm, args, args.cloudAltitude, args.cloudThickness);
+  if (args.cloudLayer2Enable != 0u) {
+    d = min(d, distToCloudSlabShellKm(originYUpKm, args,
+                                      args.cloudLayer2Altitude, args.cloudLayer2Thickness));
+  }
+  return d;
+}
+
+// Fade band (km) for proximity-based horizon gate and density boost.
+float cloudProximityRelaxRangeKm(AtmosphereArgs args) {
+  float relaxRangeKm = max(args.cloudThickness + max(args.cloudNearFieldMarginKm, 0.0f), 1.0f);
+  if (args.cloudLayer2Enable != 0u) {
+    relaxRangeKm = max(relaxRangeKm,
+                       args.cloudLayer2Thickness + max(args.cloudNearFieldMarginKm, 0.0f));
+  }
+  return max(relaxRangeKm, 3.0f);
+}
+
+// Shared 0..1 fade: 0 when far from any slab, 1 at/inside the shell.
+float cloudProximityRelaxFactor(vec3 originYUpKm, AtmosphereArgs args) {
+  float distKm = minDistToAnyCloudSlabShellKm(originYUpKm, args);
+  return 1.0f - smoothstep(0.0f, cloudProximityRelaxRangeKm(args), distKm);
+}
+
+// Extinction multiplier for view marches: 1.0 far away, up to boost at shell.
+float cloudProximityDensityScale(vec3 originYUpKm, AtmosphereArgs args) {
+  if (args.cloudProximityDensityBoost <= 1.0f) {
+    return 1.0f;
+  }
+  float relax = cloudProximityRelaxFactor(originYUpKm, args);
+  return lerp(1.0f, args.cloudProximityDensityBoost, relax);
+}
+
+// Flat horizontal-slab intersection for low-elevation view rays.
+bool intersectCloudSlabFlat(vec3 originYUpKm,
+                             vec3 viewDirYUp,
+                             float slabAltitudeKm,
+                             float slabThicknessKm,
+                             out float tEntry,
+                             out float tExit) {
+  const float kEps = 1e-4f;
+  tEntry = -1.0f;
+  tExit  = -1.0f;
+
+  if (abs(viewDirYUp.y) < kEps) {
+    return false;
+  }
+
+  float tBase = (slabAltitudeKm - originYUpKm.y) / viewDirYUp.y;
+  float tTop  = (slabAltitudeKm + slabThicknessKm - originYUpKm.y) / viewDirYUp.y;
+  if (tBase > tTop) {
+    float temp = tBase;
+    tBase = tTop;
+    tTop = temp;
+  }
+
+  tEntry = (tBase > kEps) ? tBase : ((tTop > kEps) ? kEps : -1.0f);
+  tExit  = (tTop > kEps) ? tTop : -1.0f;
+
+  if (tEntry < 0.0f || tExit <= tEntry || tExit <= kEps) {
+    return false;
+  }
+  return true;
+}
+
+// Convert engine world position to Y-up km for cloud ray origins.
+vec3 worldPosToOriginYUpKm(vec3 worldPos, AtmosphereArgs args, bool isZUp) {
+  const vec3 worldPosYUp = isZUp ? vec3(worldPos.x, worldPos.z, worldPos.y) : worldPos;
+  const float kmPerWorldUnit = 1.0f / max(args.worldUnitsPerKm, 1e-6f);
+  return worldPosYUp * kmPerWorldUnit;
+}
+
+// Compute the [tEntry, tExit] segment along viewDirYUp (km) for marching through
+// the spherical cloud slab. originYUpKm is the camera world position in Y-up km
+// (args.cameraWorldPosYUpKm). Distances t are measured from the camera along the
+// view ray — samplePos = originYUpKm + viewDirYUp * t.
+bool intersectCloudSlabMarchRange(vec3 originYUpKm,
+                                   vec3 viewDirYUp,
+                                   vec3 planetCenter,
+                                   float baseRadius,
+                                   float topRadius,
+                                   out float tEntry,
+                                   out float tExit) {
+  const float kEps = 1e-4f;
+  tEntry = -1.0f;
+  tExit  = -1.0f;
+
+  float t0b, t1b, t0t, t1t;
+  if (!intersectSphere(originYUpKm, viewDirYUp, planetCenter, baseRadius, t0b, t1b)) {
+    return false;
+  }
+  if (!intersectSphere(originYUpKm, viewDirYUp, planetCenter, topRadius, t0t, t1t)) {
+    return false;
+  }
+
+  float camDist = length(originYUpKm - planetCenter);
+  const float shellMargin = 0.001f;  // km
+
+  if (camDist < baseRadius - shellMargin) {
+    // Below the shell — classic ground observer looking up into the deck.
+    tEntry = (t1b > kEps) ? t1b : -1.0f;
+    tExit  = (t1t > kEps) ? t1t : -1.0f;
+  } else if (camDist > topRadius + shellMargin) {
+    // Above the deck — looking down into clouds from a high-altitude camera.
+    tEntry = (t0t > kEps) ? t0t : ((t1t > kEps) ? t1t : -1.0f);
+    tExit  = (t1b > kEps) ? t1b : ((t0b > kEps) ? t0b : -1.0f);
+  } else {
+    // Inside the shell — camera can penetrate / fly through the volume.
+    tEntry = 0.0f;
+    tExit = 1e30f;
+    if (t0t > kEps) { tExit = min(tExit, t0t); }
+    if (t1t > kEps) { tExit = min(tExit, t1t); }
+    if (t0b > kEps) { tExit = min(tExit, t0b); }
+    if (t1b > kEps) { tExit = min(tExit, t1b); }
+    if (tExit >= 1e29f) {
+      return false;
+    }
+  }
+
+  if (tEntry < 0.0f || tExit <= tEntry || tExit <= kEps) {
+    return false;
+  }
+  return true;
+}
+
+// Layer intersection: flat horizontal slab at low elevation, spherical otherwise.
+bool intersectCloudSlabMarchRangeForLayer(vec3 originYUpKm,
+                                           vec3 viewDirYUp,
+                                           AtmosphereArgs args,
+                                           float slabAltitudeKm,
+                                           float slabThicknessKm,
+                                           out float tEntry,
+                                           out float tExit) {
+  const float kLowElevationThreshold = 0.12f;
+  if (abs(viewDirYUp.y) < kLowElevationThreshold) {
+    if (!intersectCloudSlabFlat(originYUpKm, viewDirYUp, slabAltitudeKm, slabThicknessKm,
+                                tEntry, tExit)) {
+      return false;
+    }
+  } else {
+    float cloudR = cloudPlanetRadius(args);
+    vec3 planetCenter = vec3(0.0f, -cloudR, 0.0f);
+    float baseRadius = cloudR + slabAltitudeKm;
+    float topRadius  = cloudR + slabAltitudeKm + slabThicknessKm;
+    if (!intersectCloudSlabMarchRange(originYUpKm, viewDirYUp, planetCenter,
+                                      baseRadius, topRadius, tEntry, tExit)) {
+      return false;
+    }
+  }
+
+  float minSpan = max(args.cloudViewStepKm, slabThicknessKm * 0.1f);
+  if ((tExit - tEntry) < minSpan) {
+    return false;
+  }
+  return true;
+}
+
 // Intersect view ray with the cloud shell. Returns true and the hit distance
 // if we hit the upward-looking cloud sphere at altitude args.cloudAltitude.
 // Ray origin is at the camera (0,0,0) in Y-up space; the cloud sphere uses

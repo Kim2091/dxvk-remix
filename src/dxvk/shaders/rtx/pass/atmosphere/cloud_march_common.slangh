@@ -387,6 +387,7 @@ CloudShadeContext buildCloudShadeContext(AtmosphereArgs args) {
 // segments partition the slab exactly, with no double-counted extinction).
 // =============================================================================
 void marchCloudSlab(vec3   viewDirYUp,
+                    vec3   originYUpKm,
                     float  pixelJitter,
                     float  slabAltitudeKm,
                     float  slabThicknessKm,
@@ -397,25 +398,17 @@ void marchCloudSlab(vec3   viewDirYUp,
                     float  tMinClamp,
                     float  tMaxClamp,
                     uint   sampleCount,
+                    bool   useFullExtinction,
                     CloudShadeContext ctx,
                     AtmosphereArgs args,
                     inout vec3  accumColor,
                     inout float viewTransmittance) {
-  // Slab intersection (mirrors the original main() body — same ray-sphere
-  // tests against the base + top shells of the curvature-adjusted cloud
-  // planet, but with slabAltitudeKm / slabThicknessKm threaded through so
-  // layer 2 hits its own altitude band).
-  float cloudR = cloudPlanetRadius(args);
-  vec3 planetCenter = vec3(0.0f, -cloudR, 0.0f);
-  float baseRadius = cloudR + slabAltitudeKm;
-  float topRadius  = cloudR + slabAltitudeKm + slabThicknessKm;
-
-  float t0base, t1base, t0top, t1top;
-  if (!intersectSphere(vec3(0.0f), viewDirYUp, planetCenter, baseRadius, t0base, t1base)) return;
-  if (!intersectSphere(vec3(0.0f), viewDirYUp, planetCenter, topRadius,  t0top,  t1top))  return;
-
-  float tEntry = t1base;
-  float tExit  = t1top;
+  float tEntry, tExit;
+  if (!intersectCloudSlabMarchRangeForLayer(originYUpKm, viewDirYUp, args,
+                                          slabAltitudeKm, slabThicknessKm,
+                                          tEntry, tExit)) {
+    return;
+  }
   tEntry = max(tEntry, tMinClamp);
   if (tMaxClamp > 0.0f) {
     tExit = min(tExit, tMaxClamp);
@@ -443,6 +436,11 @@ void marchCloudSlab(vec3   viewDirYUp,
 
   float stepLen = (tExit - tEntry) / float(effSampleCount);
 
+  const float proximityScale = cloudProximityDensityScale(originYUpKm, args);
+  const float proximityRelax = useFullExtinction
+    ? cloudProximityRelaxFactor(originYUpKm, args)
+    : 0.0f;
+
   // Wrenninge phase-octave constants (also referenced by the moon block below).
   const float kMsA = 0.5f;
   const float kMsC = 0.5f;
@@ -457,8 +455,8 @@ void marchCloudSlab(vec3   viewDirYUp,
   // smoothing of weather-region boundaries ALONG the ray, far below the
   // jitter noise floor. (The voxel-grid bake integrals already use the
   // same single-position reuse.)
-  vec3 entryPosCF = args.cameraWorldPosYUpKm + viewDirYUp * tEntry;
-  vec3 exitPosCF  = args.cameraWorldPosYUpKm + viewDirYUp * tExit;
+  vec3 entryPosCF = originYUpKm + viewDirYUp * tEntry;
+  vec3 exitPosCF  = originYUpKm + viewDirYUp * tExit;
   vec2 entryXZ = vec2(entryPosCF.x, entryPosCF.z);
   vec2 exitXZ  = vec2(exitPosCF.x,  exitPosCF.z);
   float typeNoiseEntry     = cloudControlField2D(entryXZ * args.cloudTypeNoiseScale,     200.0f + slabNoiseSeedOffset);
@@ -484,7 +482,7 @@ void marchCloudSlab(vec3   viewDirYUp,
     // length()-based altitude reading shifts negligibly. Voxel grids
     // (D_sun / D_ambient) are world-anchored on the bake side, so this also
     // brings the runtime lookup into alignment with the bake's convention.
-    vec3 samplePos = args.cameraWorldPosYUpKm + viewDirYUp * t;
+    vec3 samplePos = originYUpKm + viewDirYUp * t;
 
     // Spatial coverage / type fields: per-step lerp between the slab entry
     // and exit evaluations hoisted above the loop. Variation amplitude
@@ -577,7 +575,7 @@ void marchCloudSlab(vec3   viewDirYUp,
                      + ctx.nightLight;
 
     // Beer-Lambert step accumulation.
-    float effectiveDensity = density * args.cloudDensity;
+    float effectiveDensity = density * args.cloudDensity * proximityScale;
     float stepTransmittance = exp(-effectiveDensity * stepLen);
     vec3 stepRadiance = sampleColor * (1.0f - stepTransmittance);
 
@@ -594,8 +592,11 @@ void marchCloudSlab(vec3   viewDirYUp,
     // across passes.
     float aerialT_haze = exp(-args.cloudAerialHazePerKm * t);
     float aerialT_fade = exp(-args.cloudAerialFadePerKm * t);
+    float fadeMix = useFullExtinction
+      ? lerp(aerialT_fade, 1.0f, proximityRelax)
+      : aerialT_fade;
     accumColor += stepRadiance * viewTransmittance * aerialT_haze;
-    viewTransmittance *= mix(1.0f, stepTransmittance, aerialT_fade);
+    viewTransmittance *= mix(1.0f, stepTransmittance, fadeMix);
   }
 }
 
@@ -633,6 +634,7 @@ void marchCloudSlab(vec3   viewDirYUp,
 // dropped — the echo deck never needs the partition experiment.
 // =============================================================================
 void marchEchoDeck(vec3   viewDirYUp,
+                   vec3   originYUpKm,
                    float  pixelJitter,
                    float  slabAltitudeKm,
                    float  slabThicknessKm,
@@ -640,21 +642,17 @@ void marchEchoDeck(vec3   viewDirYUp,
                    float  slabCoverageMean,
                    float  slabDensityScale,
                    float  slabNoiseSeedOffset,
+                   bool   useFullExtinction,
                    CloudShadeContext ctx,
                    AtmosphereArgs args,
                    inout vec3  accumColor,
                    inout float viewTransmittance) {
-  float cloudR = cloudPlanetRadius(args);
-  vec3 planetCenter = vec3(0.0f, -cloudR, 0.0f);
-  float baseRadius = cloudR + slabAltitudeKm;
-  float topRadius  = cloudR + slabAltitudeKm + slabThicknessKm;
-
-  float t0base, t1base, t0top, t1top;
-  if (!intersectSphere(vec3(0.0f), viewDirYUp, planetCenter, baseRadius, t0base, t1base)) return;
-  if (!intersectSphere(vec3(0.0f), viewDirYUp, planetCenter, topRadius,  t0top,  t1top))  return;
-
-  float tEntry = max(t1base, 0.0f);
-  float tExit  = t1top;
+  float tEntry, tExit;
+  if (!intersectCloudSlabMarchRangeForLayer(originYUpKm, viewDirYUp, args,
+                                          slabAltitudeKm, slabThicknessKm,
+                                          tEntry, tExit)) {
+    return;
+  }
   if (tEntry >= tExit || tExit <= 0.0f) return;
 
   // Low step budget — the echo deck's headline perf lever, user-adjustable via
@@ -677,6 +675,11 @@ void marchEchoDeck(vec3   viewDirYUp,
   }
   float stepLen = (tExit - tEntry) / float(effSampleCount);
 
+  const float proximityScale = cloudProximityDensityScale(originYUpKm, args);
+  const float proximityRelax = useFullExtinction
+    ? cloudProximityRelaxFactor(originYUpKm, args)
+    : 0.0f;
+
   // Wrenninge phase-octave constants (used by the per-sample moon block).
   const float kMsA = 0.5f;
   const float kMsC = 0.5f;
@@ -697,8 +700,8 @@ void marchEchoDeck(vec3   viewDirYUp,
   // coverage field collapses to a uniform slabCoverageMean and the coverage taps
   // below fall out of the per-step blend — that's what removed the coverage
   // "tiling". Type still varies via the plain single-octave field.
-  vec3 entryPosCF = args.cameraWorldPosYUpKm + viewDirYUp * tEntry;
-  vec3 exitPosCF  = args.cameraWorldPosYUpKm + viewDirYUp * tExit;
+  vec3 entryPosCF = originYUpKm + viewDirYUp * tEntry;
+  vec3 exitPosCF  = originYUpKm + viewDirYUp * tExit;
   vec2 entryXZ = vec2(entryPosCF.x, entryPosCF.z);
   vec2 exitXZ  = vec2(exitPosCF.x,  exitPosCF.z);
   float typeNoiseEntry     = cloudControlField2D(entryXZ * args.cloudTypeNoiseScale,     200.0f + slabNoiseSeedOffset);
@@ -710,7 +713,7 @@ void marchEchoDeck(vec3   viewDirYUp,
     if (viewTransmittance < 0.01f) break;
 
     float t = tEntry + stepLen * (float(i) + pixelJitter);
-    vec3 samplePos = args.cameraWorldPosYUpKm + viewDirYUp * t;
+    vec3 samplePos = originYUpKm + viewDirYUp * t;
 
     float rayFrac = (float(i) + pixelJitter) / float(effSampleCount);
     float typeNoise     = mix(typeNoiseEntry,     typeNoiseExit,     rayFrac);
@@ -780,14 +783,17 @@ void marchEchoDeck(vec3   viewDirYUp,
                      * (lighting.direct + lighting.ambient * ambientThinFade + moonDirectLight)
                      + ctx.nightLight;
 
-    float effectiveDensity = density * args.cloudDensity;
+    float effectiveDensity = density * args.cloudDensity * proximityScale;
     float stepTransmittance = exp(-effectiveDensity * stepLen);
     vec3 stepRadiance = sampleColor * (1.0f - stepTransmittance);
 
     float aerialT_haze = exp(-args.cloudAerialHazePerKm * t);
     float aerialT_fade = exp(-args.cloudAerialFadePerKm * t);
+    float fadeMix = useFullExtinction
+      ? lerp(aerialT_fade, 1.0f, proximityRelax)
+      : aerialT_fade;
     accumColor += stepRadiance * viewTransmittance * aerialT_haze;
-    viewTransmittance *= mix(1.0f, stepTransmittance, aerialT_fade);
+    viewTransmittance *= mix(1.0f, stepTransmittance, fadeMix);
   }
 }
 
@@ -800,21 +806,23 @@ void marchEchoDeck(vec3   viewDirYUp,
 // deck behind it.
 // =============================================================================
 void marchCloudLayers(vec3  viewDirYUp,
+                      vec3  originYUpKm,
                       float pixelJitter,
                       float tMinClamp,
                       float tMaxClamp,
                       uint  sampleCount,
+                      bool  useFullExtinction,
                       CloudShadeContext ctx,
                       AtmosphereArgs args,
                       inout vec3  accumColor,
                       inout float viewTransmittance) {
-  marchCloudSlab(viewDirYUp, pixelJitter,
+  marchCloudSlab(viewDirYUp, originYUpKm, pixelJitter,
                  args.cloudAltitude, args.cloudThickness,
                  args.cloudTypeMean, args.cloudCoverageMean,
                  /*slabDensityScale=*/1.0f,
                  /*slabNoiseSeedOffset=*/0.0f,
                  tMinClamp, tMaxClamp,
-                 sampleCount, ctx, args,
+                 sampleCount, useFullExtinction, ctx, args,
                  accumColor, viewTransmittance);
 
   // Layer 2 echo deck — same slab model at a gapped altitude, marched cheaply.
@@ -858,11 +866,12 @@ void marchCloudLayers(vec3  viewDirYUp,
     // march composite multiplies all scatter terms by args.cloudColor). Defaults
     // to the same near-white, so this is a no-op until the user tints it.
     args2.cloudColor     = args.cloudLayer2Color;
-    marchEchoDeck(viewDirYUp, pixelJitter,
+    marchEchoDeck(viewDirYUp, originYUpKm, pixelJitter,
                   args.cloudLayer2Altitude, args.cloudLayer2Thickness,
                   args.cloudLayer2TypeMean, args.cloudLayer2CoverageMean,
                   args.cloudLayer2DensityScale,
                   args.cloudLayer2NoiseSeed,
+                  useFullExtinction,
                   ctx, args2,
                   accumColor, viewTransmittance);
   }

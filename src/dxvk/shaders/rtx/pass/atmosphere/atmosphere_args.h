@@ -237,11 +237,14 @@ struct AtmosphereArgs {
 
   // ----- Cloud volumetric / appearance enhancements (fork) -----
   vec3 pad_cloudShadowTint;        // was cloudShadowTint (removed 2026-06-21 — no shader consumer)
-  float pad_cloudShadowTintStrength; // was cloudShadowTintStrength (removed 2026-06-21). Reclaimable pads.
+  float cloudProximityDensityBoost; // Max extinction multiplier at cloud shell (1 = off).
+                                   // Reuses the former pad_cloudShadowTintStrength slot.
 
   float cloudThickness;        // Cloud-slab vertical depth, km
   float cloudLayer2TypeSpread; // [0,1] cloud-type variation for layer 2 (independent of layer 1)
-  float pad_cloudSunsetWarmth; // was cloudSunsetWarmth (removed 2026-06-21 — no shader consumer)
+  float cameraTranslationKm;   // Per-frame camera translation magnitude (Y-up km), for
+                               // attenuating cloud temporal smoothing during pans/dollies.
+                               // Reuses the former pad_cloudSunsetWarmth slot; CB layout unchanged.
   uint cloudViewSamples;       // Ray-march steps through cloud slab
 
   // ----- Spatial variation fields (Nubis-style weather) -----
@@ -255,7 +258,10 @@ struct AtmosphereArgs {
   float cloudAnvilBias;            // [0,1] cumulus top inflation strength (Nubis anvil pow trick).
   float cloudMsScale;              // Multi-scatter sigma_ms master multiplier (1.0 = paper baseline)
 
-  float pad_cloudMultiScatterStrength; // was cloudMultiScatterStrength (removed 2026-06-21 — no shader consumer; cloudMsScale is the live knob). Reclaimable pad.
+  float cameraAngularDeltaRad;     // Per-frame camera forward angular delta (rad), for
+                                   // attenuating cloud temporal smoothing during
+                                   // animated roll/pitch. Reuses the former
+                                   // pad_cloudMultiScatterStrength slot; CB layout unchanged.
   uint  cloudMultiScatterOctaves;  // Number of Wrenninge octaves to sum (clamped 1..4 in shader).
   float cloudLayer2NoiseSeed;      // Seed offset added to layer 2's 2D coverage/type smoothNoise2D
                                    // calls so layer 2 generates a fully decorrelated noise pattern
@@ -531,5 +537,8 @@ struct AtmosphereArgs {
   // vec4 row, so the CB stays 16-byte aligned (see the step block above —
   // appending a bare vec3 would straddle the row boundary and corrupt the CB).
   vec3  cloudLayer2Color;        // Deck base color; defaults to cloudColor's near-white
-  float pad_cloudLayer2Color0;   // reserve — completes the vec4 row
+  float cloudNearFieldMarginKm;    // Distance (km) from the cloud slab at which primary
+                                   // sky-miss switches to a live per-ray volumetric march.
+                                   // 0 = only when inside the slab. Reuses the former
+                                   // pad_cloudLayer2Color0 slot; CB layout unchanged.
 };

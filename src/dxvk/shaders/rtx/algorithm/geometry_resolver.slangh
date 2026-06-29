@@ -1904,13 +1904,16 @@ void geometryResolverVertex(
 #ifdef ATMOSPHERE_AVAILABLE
     else if (cb.skyMode == 1)
     {
-      // Primary view ray — enable cloud temporal smoothing. The motion vector
-      // for sky misses comes from calcMotionVectorForRayMiss (already used
-      // below to write PrimaryScreenSpaceMotionVector), and historyResolution
-      // is the downscaled render extent (where this raygen writes).
+      // Primary view ray — enable cloud temporal smoothing. Use an unjittered
+      // view direction so the sky LUT and cloud RT (built without TAA jitter)
+      // sample the same ray. The motion vector for sky misses comes from
+      // calcMotionVectorForRayMiss (already used below to write
+      // PrimaryScreenSpaceMotionVector), and historyResolution is the downscaled
+      // render extent (where this raygen writes).
+      const Ray unjitteredCameraRay = rayCreatePrimaryFromPixel(cb.camera, geometryResolverState.pixelCoordinate, false);
       const vec2 cloudMotion = calcMotionVectorForRayMiss(geometryResolverState.pixelCoordinate);
       const uint2 cloudHistoryRes = cb.camera.resolution;
-      skyRadiance = evalSkyRadiance(ray.direction, cb.atmosphereArgs,
+      skyRadiance = evalSkyRadiance(unjitteredCameraRay.direction, cb.atmosphereArgs,
                                      geometryResolverState.pixelCoordinate, cb.frameIdx,
                                      cb.isZUp != 0,
                                      /*enableCloudTemporalSmoothing=*/ true,
@@ -2258,6 +2261,54 @@ void geometryResolverVertex(
   {
     PrimaryAttenuation[geometryResolverState.pixelCoordinate] = colorToR11G11B10(geometryResolverState.attenuation);
   }
+
+#ifdef ATMOSPHERE_AVAILABLE
+  // Near-field cloud fog on primary geometry hits (fork — 2026-06-29). Sky-miss
+  // pixels already get clouds via evalSkyRadiance; hit pixels need a truncated
+  // march to the surface so world geometry inside the volume is fogged in front.
+  if (cb.skyMode == 1 && cb.atmosphereArgs.cloudEnabled > 0.5f) {
+    const Ray unjitteredCameraRay = rayCreatePrimaryFromPixel(cb.camera, geometryResolverState.pixelCoordinate, false);
+    vec3 viewDirYUp = cb.isZUp != 0
+      ? vec3(unjitteredCameraRay.direction.x, unjitteredCameraRay.direction.z, unjitteredCameraRay.direction.y)
+      : unjitteredCameraRay.direction;
+    viewDirYUp = normalize(viewDirYUp);
+    const float kmPerWorldUnit = 1.0f / max(cb.atmosphereArgs.worldUnitsPerKm, 1e-6f);
+    const float tMaxKm = geometryResolverState.accumulatedHitDistance * kmPerWorldUnit;
+    vec3 cloudRadiance = geometryResolverState.radiance;
+    vec3 preCloudAttenuation = vec3(geometryResolverState.attenuation);
+    vec3 cloudAttenuation = preCloudAttenuation;
+    compositeNearFieldCloudOverRadiance(
+      cloudRadiance,
+      cloudAttenuation,
+      viewDirYUp,
+      cb.atmosphereArgs.cameraWorldPosYUpKm,
+      tMaxKm,
+      geometryResolverState.pixelCoordinate,
+      cb.frameIdx,
+      cb.atmosphereArgs);
+    geometryResolverState.radiance = cloudRadiance;
+    geometryResolverState.attenuation = f16vec3(cloudAttenuation);
+    PrimaryAttenuation[geometryResolverState.pixelCoordinate] =
+      colorToR11G11B10(cloudAttenuation);
+
+    if (geometryResolverState.performedAnyPSR()) {
+      const vec3 cloudAttScale = cloudAttenuation / max(preCloudAttenuation, vec3(1e-6f));
+      const uint2 pc = geometryResolverState.pixelCoordinate;
+      if (geometryResolverState.performPSRR) {
+        uint attEnc = ReflectionPSRData2[pc].x;
+        vec3 psrAtt = r11g11b10ToColor(attEnc);
+        psrAtt *= cloudAttScale;
+        ReflectionPSRData2[pc].x = colorToR11G11B10(psrAtt);
+      }
+      if (geometryResolverState.performPSTR) {
+        uint attEnc = TransmissionPSRData3[pc].x;
+        vec3 psrAtt = r11g11b10ToColor(attEnc);
+        psrAtt *= cloudAttScale;
+        TransmissionPSRData3[pc].x = colorToR11G11B10(psrAtt);
+      }
+    }
+  }
+#endif
   
   // Output Emissive Radiance
   SharedRadianceRG[geometryResolverState.pixelCoordinate] = geometryResolverState.radiance.rg;
@@ -2578,7 +2629,14 @@ void geometryPSRResolverVertex(
       // Physical atmosphere mode
       vec3 skyRadiance = evalSkyRadiance(ray.direction, cb.atmosphereArgs,
                                           geometryPSRResolverState.pixelCoordinate, cb.frameIdx,
-                                          cb.isZUp != 0);
+                                          cb.isZUp != 0,
+                                          /*enableCloudTemporalSmoothing=*/ false,
+                                          vec2(0.0f, 0.0f),
+                                          uint2(0u, 0u),
+                                          /*isPrimaryRay=*/ false,
+                                          /*applySkyIndirectRadianceScale=*/ false,
+                                          worldPosToOriginYUpKm(ray.origin, cb.atmosphereArgs,
+                                                                cb.isZUp != 0));
       emissiveRadiance += skyRadiance * radianceAttenuation;
     }
 #endif

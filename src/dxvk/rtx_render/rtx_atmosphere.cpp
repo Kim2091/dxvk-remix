@@ -360,6 +360,8 @@ namespace {
     args.cloudRenderRightYUp         = vec3(0.0f, 0.0f, 0.0f);
     args.cloudRenderUpYUp            = vec3(0.0f, 0.0f, 0.0f);
     args.cameraWorldPosYUpKm         = vec3(0.0f, 0.0f, 0.0f);
+    args.cameraTranslationKm         = 0.0f;
+    args.cameraAngularDeltaRad        = 0.0f;
     // Applied post-LUT-sample per ray, never feeds a LUT bake — exclude from the key.
     args.skyIndirectRadianceScale    = 0.0f;
   }
@@ -671,6 +673,10 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
   {
     args.cloudThickness = RtxOptions::cloudThickness();
     args.cloudLayer2TypeSpread = RtxOptions::cloudLayer2TypeSpread();
+    args.cameraTranslationKm = m_cameraTranslationKm;
+    args.cameraAngularDeltaRad = m_cameraAngularDeltaRad;
+    args.cloudNearFieldMarginKm = RtxOptions::cloudNearFieldMarginKm();
+    args.cloudProximityDensityBoost = RtxOptions::cloudProximityDensityBoost();
     args.cloudViewSamples = RtxOptions::cloudViewSamples();
     args.cloudCurvature = RtxOptions::cloudCurvature();
     args.cloudTypeMean = RtxOptions::cloudTypeMean();
@@ -1605,6 +1611,25 @@ void RtxAtmosphere::setCloudRenderCameraBasis(const Vector3& forwardYUp,
                                                 const Vector3& rightYUp,
                                                 const Vector3& upYUp,
                                                 uint32_t frameIdx) {
+  auto normalize3 = [](const Vector3& v) -> Vector3 {
+    const float len = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+    if (len > 1e-8f) {
+      return Vector3(v.x / len, v.y / len, v.z / len);
+    }
+    return Vector3(0.0f, 0.0f, 1.0f);
+  };
+
+  if (m_cloudBasisInitialized) {
+    const Vector3 nPrev = normalize3(m_cloudRenderForwardYUp);
+    const Vector3 nCurr = normalize3(forwardYUp);
+    const float dotVal = std::min(std::max(
+      nPrev.x * nCurr.x + nPrev.y * nCurr.y + nPrev.z * nCurr.z, -1.0f), 1.0f);
+    m_cameraAngularDeltaRad = std::acos(dotVal);
+  } else {
+    m_cameraAngularDeltaRad = 0.0f;
+    m_cloudBasisInitialized = true;
+  }
+
   m_cloudRenderForwardYUp = forwardYUp;
   m_cloudRenderRightYUp   = rightYUp;
   m_cloudRenderUpYUp      = upYUp;
@@ -1612,6 +1637,8 @@ void RtxAtmosphere::setCloudRenderCameraBasis(const Vector3& forwardYUp,
 }
 
 void RtxAtmosphere::setCloudShadowCameraPosition(const Vector3& cameraWorldPosYUpKm) {
+  const Vector3 delta = cameraWorldPosYUpKm - m_cameraWorldPosYUpKm;
+  m_cameraTranslationKm = std::sqrt(delta.x * delta.x + delta.y * delta.y + delta.z * delta.z);
   m_cameraWorldPosYUpKm = cameraWorldPosYUpKm;
 }
 
