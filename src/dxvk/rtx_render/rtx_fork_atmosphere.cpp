@@ -606,6 +606,49 @@ namespace fork_hooks {
   }
 
   // ---------------------------------------------------------------------------
+  // cameraAtOrInsideCloudDeck
+  //
+  // True when the camera sits AT OR ABOVE a cloud slab's base — i.e. the deck is
+  // around the camera or below it, so cloud along a view ray is plausibly IN
+  // FRONT of nearby geometry. Used to gate the composite-pass alpha-blend cloud
+  // fog (fork — 2026-06-29): that fog reuses the full-slab screen-space cloud RT,
+  // which carries no per-surface depth, so applied unconditionally it also fogs
+  // alpha-blended foliage that sits in front of a cloud BEHIND it (a ground
+  // observer's tree silhouetted against the deck reads as see-through). Gating on
+  // "not below the deck" suppresses that: below the deck the cloud is a backdrop
+  // and foliage must be left alone; at/inside/above it the cloud genuinely
+  // fronts the lower geometry. Mirrors the shell math in cloudPlanetRadius /
+  // isCameraInsideCloudSlabArgs (atmosphere_common.slangh) on the CPU using the
+  // args the atmosphere already computed this frame; no private state added.
+  //
+  // ACCESS NOTE: reads m_atmosphere (private). Friend declaration required.
+  // ---------------------------------------------------------------------------
+  bool cameraAtOrInsideCloudDeck(RtxContext& ctx) {
+    if (!ctx.m_atmosphere) {
+      return false;
+    }
+    const AtmosphereArgs a = ctx.m_atmosphere->getAtmosphereArgs();
+    if (a.cloudEnabled < 0.5f) {
+      return false;
+    }
+    const float cloudR = std::max(100.0f, a.planetRadius * std::exp(-a.cloudCurvature * 5.0f));
+    // Camera distance from the cloud sphere center (0, -cloudR, 0), Y-up km.
+    const float dx = a.cameraWorldPosYUpKm.x;
+    const float dy = a.cameraWorldPosYUpKm.y + cloudR;
+    const float dz = a.cameraWorldPosYUpKm.z;
+    const float camDist = std::sqrt(dx * dx + dy * dy + dz * dz);
+    const float kShellMargin = 0.001f;  // km
+    // At or above the LOWER of the enabled slab bases (layer 1 is normally the
+    // lower deck). Being above any deck base means that deck can front geometry
+    // below the camera.
+    bool atOrAbove = camDist >= (cloudR + a.cloudAltitude) - kShellMargin;
+    if (a.cloudLayer2Enable != 0u) {
+      atOrAbove = atOrAbove || (camDist >= (cloudR + a.cloudLayer2Altitude) - kShellMargin);
+    }
+    return atOrAbove;
+  }
+
+  // ---------------------------------------------------------------------------
   // injectRtxAtmosphereSkySkip
   //
   // Returns true when the caller (RtxContext::rasterizeSky) should skip

@@ -851,6 +851,26 @@ bool intersectCloudSlabMarchRange(vec3 originYUpKm,
 }
 
 // Layer intersection: flat horizontal slab at low elevation, spherical otherwise.
+//
+// Bands fix (fork — 2026-06-29, issue #1). xoxor's design uses a FLAT slab near
+// the horizon (it avoids the spherical shell clipping the deck at the edges when
+// the camera is high in a big-coordinate world) and the SPHERICAL shell above.
+// The original HARD switch at |viewDir.y| = 0.12 made the march range jump
+// discontinuously at exactly that elevation: the flat plane's exit distance is
+// far (near-parallel ray) while the spherical exit curves down and is nearer, so
+// the marched cloud column — and thus the in-scatter — stepped abruptly right
+// there. Seen from inside / close to the deck that reads as a hard curved BAND
+// ~7deg off the horizon (the constant-elevation locus projects to an arc). It is
+// also the "horizon doesn't curve right" complaint (issue #4).
+//
+// Fix: keep BOTH of xoxor's intersections exactly as-is (the spherical one still
+// feeds the camera's full world position into the shell test, so world-anchoring
+// / fly-through is untouched), but BLEND their [tEntry,tExit] ranges across a
+// transition band instead of hard-switching. Below kFlatBandLo it is pure flat
+// (anti-clip preserved); above kFlatBandHi it is pure spherical; between, a
+// smoothstep lerp makes the handoff continuous so there is no seam. Only the
+// march RANGE is interpolated — sample positions stay world-anchored
+// (originYUpKm + viewDir*t), so this is purely a look fix.
 bool intersectCloudSlabMarchRangeForLayer(vec3 originYUpKm,
                                            vec3 viewDirYUp,
                                            AtmosphereArgs args,
@@ -858,21 +878,45 @@ bool intersectCloudSlabMarchRangeForLayer(vec3 originYUpKm,
                                            float slabThicknessKm,
                                            out float tEntry,
                                            out float tExit) {
-  const float kLowElevationThreshold = 0.12f;
-  if (abs(viewDirYUp.y) < kLowElevationThreshold) {
-    if (!intersectCloudSlabFlat(originYUpKm, viewDirYUp, slabAltitudeKm, slabThicknessKm,
-                                tEntry, tExit)) {
-      return false;
-    }
-  } else {
+  const float kFlatBandLo = 0.08f;  // |viewDir.y| at/below: pure flat slab
+  const float kFlatBandHi = 0.20f;  // |viewDir.y| at/above: pure spherical shell
+  const float ay = abs(viewDirYUp.y);
+
+  float fEntry = 0.0f, fExit = 0.0f;
+  float sEntry = 0.0f, sExit = 0.0f;
+  bool fOk = false;
+  bool sOk = false;
+
+  // Flat slab — computed in (and just past) the low band.
+  if (ay < kFlatBandHi) {
+    fOk = intersectCloudSlabFlat(originYUpKm, viewDirYUp, slabAltitudeKm, slabThicknessKm,
+                                 fEntry, fExit);
+  }
+  // Spherical shell — computed in (and just below) the high band.
+  if (ay > kFlatBandLo) {
     float cloudR = cloudPlanetRadius(args);
     vec3 planetCenter = vec3(0.0f, -cloudR, 0.0f);
     float baseRadius = cloudR + slabAltitudeKm;
     float topRadius  = cloudR + slabAltitudeKm + slabThicknessKm;
-    if (!intersectCloudSlabMarchRange(originYUpKm, viewDirYUp, planetCenter,
-                                      baseRadius, topRadius, tEntry, tExit)) {
-      return false;
-    }
+    sOk = intersectCloudSlabMarchRange(originYUpKm, viewDirYUp, planetCenter,
+                                       baseRadius, topRadius, sEntry, sExit);
+  }
+
+  if (fOk && sOk) {
+    // Both valid (transition band): smoothstep-blend the ranges. w=0 at the low
+    // edge reproduces pure flat, w=1 at the high edge reproduces pure spherical,
+    // so the result is continuous with the pure regions on either side.
+    float w = smoothstep(kFlatBandLo, kFlatBandHi, ay);
+    tEntry = lerp(fEntry, sEntry, w);
+    tExit  = lerp(fExit,  sExit,  w);
+  } else if (fOk) {
+    tEntry = fEntry;
+    tExit  = fExit;
+  } else if (sOk) {
+    tEntry = sEntry;
+    tExit  = sExit;
+  } else {
+    return false;
   }
 
   float minSpan = max(args.cloudViewStepKm, slabThicknessKm * 0.1f);

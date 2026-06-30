@@ -52,8 +52,11 @@
 #define COMPOSITE_BSDF_FACTOR2_INPUT                                18
 // Slot 19 was COMPOSITE_PRIMARY_CLOUD_SHADOW_FACTOR_INPUT (fork screen-space
 // cloud shadow). Removed 2026-06-19 when the cloud shadow moved onto the sun
-// term in the NEE; the number is left reserved (no descriptor bound) so the
-// remaining slot numbers stay stable rather than renumbering 20..26.
+// term in the NEE; the number was left reserved. Re-used 2026-06-29 for the
+// Nubis screen-space cloud render RT, so the downstream alpha-blend composite
+// can fog alpha-blended foliage behind the deck (it was punching through —
+// foliage is composited here, after the path tracer applied the cloud).
+#define COMPOSITE_ATMOSPHERE_CLOUD_RENDER_RT_INPUT                  19
 
 #define COMPOSITE_VOLUME_FILTERED_RADIANCE_AGE_INPUT                20
 #define COMPOSITE_VOLUME_FILTERED_RADIANCE_Y_INPUT                  21

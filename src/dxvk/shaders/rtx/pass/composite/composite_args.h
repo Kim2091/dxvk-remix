@@ -110,5 +110,9 @@ struct CompositeArgs {
   float alphaBlendSurfacePackMult; // for packing/unpacking hitT into Float16 in AlphaBlendSurface
   float postFilterThreshold;
   uint writeRayReconstructionHitDistance;
-  float pad1;
+  // Fog alpha-blended surfaces with the screen-space cloud RT (fork — 2026-06-29).
+  // 1 when Numos sky + clouds are on and the cloud RT is bound at slot
+  // COMPOSITE_ATMOSPHERE_CLOUD_RENDER_RT_INPUT; 0 leaves the alpha-blend composite
+  // untouched. Re-uses the former pad1 slot so the CB layout/size is unchanged.
+  uint enableCloudAlphaBlendFog;
 };

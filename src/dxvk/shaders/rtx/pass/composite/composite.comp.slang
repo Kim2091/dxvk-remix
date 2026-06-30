@@ -41,6 +41,15 @@
 #include "rtx/pass/sparse_rendering/sparse_rendering.slangh"
 #include "rtx/pass/sparse_rendering/compact_active_pixels.slangh"
 
+// Screen-space cloud render RT (Nubis Cubed 2023) — premultiplied in-scatter in
+// rgb, view-ray cloud transmittance in alpha. Declared here (not in the shared
+// composite_bindings.slangh) so only the main composite shader carries the
+// descriptor; composite_alpha_blend's set is untouched. Bound by CompositePass::
+// dispatch at slot COMPOSITE_ATMOSPHERE_CLOUD_RENDER_RT_INPUT, gated by
+// cb.enableCloudAlphaBlendFog (it is (0,0,0,1) / unread when clouds are off).
+layout(binding = COMPOSITE_ATMOSPHERE_CLOUD_RENDER_RT_INPUT)
+Texture2D<float4> AtmosphereCloudRender;
+
 float3 sampleDomeLightTexture(Sampler2D<float3> DomeLight, float3 worldDirection, float4x4 worldToDomeLightTransform)
 {
   float3 domeSampleDirection = mul(worldToDomeLightTransform, float4(worldDirection, 0.0f)).xyz;
@@ -498,6 +507,33 @@ void applyVolumetricLighting(
         totalLight.xyz = lerp(totalLight.xyz, multilayerLight.xyz, saturate(depthRange / surface.hitT / depthBandwidth));
       }
       alphaBlendOutput = totalLight.xyz;
+
+      // Near-field cloud fog on alpha-blended surfaces (fork — 2026-06-29).
+      // Alpha-blended geometry (e.g. FNV foliage billboards) is resolved into
+      // AlphaBlendGBuffer and composited HERE, downstream of the path tracer —
+      // so it never received the cloud that the opaque/sky-miss paths already
+      // applied, and it punched straight THROUGH the deck. Re-use the per-pixel
+      // screen-space cloud RT (premultiplied in-scatter rgb + view-ray
+      // transmittance a) to bury the surface behind the same cloud. This factors
+      // out exactly against the background's cloud in the final composite:
+      //   radianceOutput*bgAlpha + (cloudRT.a*foliage + cloudRT.rgb)*coverage
+      //     == cloudRT.rgb + cloudRT.a*(background*bgAlpha + foliage*coverage)
+      // i.e. the deck appears in front exactly once, no double-count (bgAlpha +
+      // coverage == 1; the *coverage scale is applied just below). cloudRT is
+      // (0,0,0,1) where there is no cloud, so this is a no-op there.
+      if (cb.enableCloudAlphaBlendFog != 0u)
+      {
+        // The cloud RT may be allocated at a fraction of the composite extent
+        // (rtx.atmosphere.cloudRenderResolutionScale), so map via normalized
+        // screen UV rather than a raw pixel index.
+        uint cloudW, cloudH;
+        AtmosphereCloudRender.GetDimensions(cloudW, cloudH);
+        const vec2 cloudUV = cameraPixelCoordinateToScreenUV(cb.camera, pixelCoordinate);
+        uint2 cloudCoord = uint2(saturate(cloudUV) * vec2(float(cloudW), float(cloudH)));
+        cloudCoord = min(cloudCoord, uint2(cloudW, cloudH) - uint2(1u, 1u));
+        const vec4 cloudSample = AtmosphereCloudRender[cloudCoord];
+        alphaBlendOutput = cloudSample.a * alphaBlendOutput + cloudSample.rgb;
+      }
 
       if (cb.volumeArgs.enable)
       {

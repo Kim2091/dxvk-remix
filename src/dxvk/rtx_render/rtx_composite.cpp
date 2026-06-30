@@ -113,6 +113,7 @@ namespace dxvk {
         CONSTANT_BUFFER(COMPOSITE_CONSTANTS_INPUT)
         TEXTURE2D(COMPOSITE_BSDF_FACTOR_INPUT)
         TEXTURE2D(COMPOSITE_BSDF_FACTOR2_INPUT)
+        TEXTURE2D(COMPOSITE_ATMOSPHERE_CLOUD_RENDER_RT_INPUT)
         TEXTURE2D(COMPOSITE_DIRECT_PIXEL_SAMPLING_RATE_INPUT)
         TEXTURE2D(COMPOSITE_INDIRECT_PIXEL_SAMPLING_RATE_INPUT)
         SAMPLER3D(COMPOSITE_VOLUME_FILTERED_RADIANCE_AGE_INPUT)
@@ -350,6 +351,24 @@ namespace dxvk {
     ctx->bindResourceView(COMPOSITE_DIRECT_PIXEL_SAMPLING_RATE_INPUT, rtOutput.m_sparseRenderingDirectPixelSamplingRate.view, nullptr);
     ctx->bindResourceView(COMPOSITE_INDIRECT_PIXEL_SAMPLING_RATE_INPUT, rtOutput.m_sparseRenderingIndirectPixelSamplingRate.view, nullptr);
     ctx->bindResourceView(COMPOSITE_ALPHA_GBUFFER_INPUT, rtOutput.m_alphaBlendGBuffer.view, nullptr);
+
+    // Screen-space cloud RT for fogging alpha-blended foliage behind the deck
+    // (fork — 2026-06-29). Only meaningful in Numos with clouds on; otherwise
+    // bind nothing and clear the gate flag so the alpha-blend composite is
+    // untouched (the codebase already binds nullptr for absent optional inputs,
+    // e.g. COMPOSITE_LAST_FINAL_OUTPUT below).
+    const bool wantCloudFoliageFog = RtxOptions::cloudRenderRTEnable()
+                                  && RtxOptions::skyMode() == SkyMode::Numos
+                                  && RtxOptions::cloudEnabled()
+                                  // Only when the deck is around/below the camera. Below the deck
+                                  // the cloud is a backdrop BEHIND foliage, and the full-slab cloud
+                                  // RT (no per-surface depth) would otherwise fog it see-through.
+                                  && fork_hooks::cameraAtOrInsideCloudDeck(*ctx);
+    Rc<DxvkImageView> cloudRenderRTView = nullptr;
+    if (wantCloudFoliageFog) {
+      cloudRenderRTView = fork_hooks::getCloudRenderRT(*ctx).view;
+    }
+    ctx->bindResourceView(COMPOSITE_ATMOSPHERE_CLOUD_RENDER_RT_INPUT, cloudRenderRTView, nullptr);
     ctx->bindResourceView(COMPOSITE_ACTIVE_PIXEL_MASK_INPUT, rtOutput.m_sparseRenderingUnionActivePixelMask.view, nullptr);
     ctx->bindResourceView(COMPOSITE_ACTIVE_LOCAL_PIXEL_COORDS_INPUT, rtOutput.m_sparseRenderingUnionActiveLocalPixelCoords.view, nullptr);
     ctx->bindResourceView(COMPOSITE_DIRECT_ACTIVE_PIXEL_MASK_INPUT, rtOutput.m_sparseRenderingDirectActivePixelMask.view, nullptr);
@@ -482,7 +501,9 @@ namespace dxvk {
     compositeArgs.stochasticAlphaBlendDiscardBlackPixel = stochasticAlphaBlendDiscardBlackPixel();
     compositeArgs.stochasticAlphaBlendRadianceVolumeMultiplier = stochasticAlphaBlendRadianceVolumeMultiplier();
     compositeArgs.alphaBlendSurfacePackMult = RtxOptions::getMeterToWorldUnitScale();
-    
+    // Gate the alpha-blend cloud fog on the cloud RT actually being bound above.
+    compositeArgs.enableCloudAlphaBlendFog = (cloudRenderRTView != nullptr) ? 1u : 0u;
+
     compositeArgs.clearColorFinalColor = sceneManager.getGlobals().clearColorFinalColor;
 
     // TODO: These are copied from raytrace_args.  Perhaps we should unify this...
