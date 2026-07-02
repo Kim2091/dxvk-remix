@@ -222,7 +222,16 @@ namespace fork_hooks {
       imageInfo.stages      = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
       imageInfo.access      = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
       imageInfo.tiling      = VK_IMAGE_TILING_OPTIMAL;
-      imageInfo.layout      = VK_IMAGE_LAYOUT_UNDEFINED;
+      // Steady-state layout the image returns to between operations. Must not
+      // be UNDEFINED: copyBufferToImage's closing barrier transitions back to
+      // info().layout (dxvk_context.cpp), and transitioning *to* UNDEFINED is
+      // invalid Vulkan -- it trips assert(dstLayout != VK_IMAGE_LAYOUT_UNDEFINED)
+      // in dxvk_barrier.cpp on the first overlay upload. SHADER_READ_ONLY_OPTIMAL
+      // matches the sampled-texture convention (see rtx_texture.cpp) and is the
+      // layout the ScreenOverlayShader dispatch samples in. The per-frame copy
+      // covers the full subresource, so dxvk discards the stale contents with an
+      // UNDEFINED->TRANSFER_DST acquire regardless of this declared layout.
+      imageInfo.layout      = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
       ctx.m_screenOverlayImage = ctx.m_device->createImage(
         imageInfo,
