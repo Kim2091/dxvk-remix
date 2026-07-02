@@ -2415,6 +2415,119 @@ namespace dxvk {
       return;
     }
 
+    // ---- Fork: preserve path for external (Remix API) draws ----
+    // Historically only submitDrawState (D3D9) consulted the preserve path;
+    // every external submit re-ran the full dynamic translation
+    // (processDrawCallState: geometry-info processing, surface-material
+    // translation, instance matching) every frame even when the identity hash
+    // matched last frame exactly. Mirror the submitDrawState gate (see
+    // usePreservePath above) for the common static case:
+    //   - single submesh: preserveReplacementInstance's pReplacements==nullptr
+    //     branch refreshes only prims[0]'s BlasEntry::input, so multi-submesh
+    //     draws stay dynamic;
+    //   - non-batched: instancesToObject forces a replicated/dynamic BLAS in
+    //     AccelManager regardless, so batched submits gain nothing here;
+    //   - no particle desc: processDrawCallState owns particle spawning;
+    //   - RI fully set up by a prior dynamic frame (fresh RIs have clear
+    //     dirtyFlags but no prims yet).
+    // Identity (computeExternalDrawIdentityHash) already folds in the mesh
+    // handle, material hash, categories, transform, and the GPU-instancing
+    // transform array, so any change routes through L2/L3 and lands dynamic.
+    // Known v1 gap: fork_hooks::externalDrawTextureCategories runs inside the
+    // dynamic loop AFTER identity hashing, so texture-hash category edits made
+    // mid-session do not re-categorize draws that keep taking the preserve
+    // path; toggle rtx.enablePreservePath off/on (or touch the draw) to force
+    // one dynamic frame if that matters.
+    const uint32_t currentFrameId = m_device->getCurrentFrameId();
+
+    // Preserve-vs-dynamic telemetry. The debug view (Preserve path, idx 278)
+    // shows WHERE preservation lands but there is no numeric signal an
+    // integrator can read from the log to confirm the gate engages at all.
+    // One line every ~900 frames (~15s at 60fps), reporting the LAST fully
+    // counted frame. Function-local statics are safe: external submits run
+    // on the device's single CS thread.
+    static uint32_t s_preserveStatFrame = 0;
+    static uint32_t s_preservedCount = 0;
+    static uint32_t s_dynamicCount = 0;
+    if (currentFrameId != s_preserveStatFrame) {
+      if (s_preserveStatFrame != 0 && (currentFrameId / 900) != (s_preserveStatFrame / 900)) {
+        Logger::info(str::format("[RTX-Preserve] external draws in frame ", s_preserveStatFrame,
+                                 ": preserved=", s_preservedCount,
+                                 " dynamic=", s_dynamicCount));
+      }
+      s_preserveStatFrame = currentFrameId;
+      s_preservedCount = 0;
+      s_dynamicCount = 0;
+    }
+
+    auto externalBlasAlreadyTouchedByOtherDraw = [replacementInstance, currentFrameId]() -> bool {
+      for (const auto& prim : replacementInstance->prims) {
+        RtInstance* inst = prim.getInstance();
+        if (inst == nullptr) {
+          continue;
+        }
+        BlasEntry* pBlas = inst->getBlas();
+        if (pBlas == nullptr) {
+          continue;
+        }
+        if (pBlas->frameLastTouched == currentFrameId) {
+          return true;
+        }
+      }
+      return false;
+    };
+
+    const bool riReadyForPreserve =
+        replacementInstance->prims.size() == 1 &&
+        replacementInstance->prims[0].getInstance() != nullptr &&
+        replacementInstance->prims[0].getInstance()->getBlas() != nullptr &&
+        replacementInstance->activeReplacements == nullptr;
+
+    const bool externalCachedTexturesValidForPreserve =
+        m_device->getCommon()->getTextureManager().getTextureCacheGeneration() ==
+        m_textureCacheGenerationValidForPreserve;
+
+    // shouldConvertToLight is configured against the effective material hash;
+    // the dynamic loop applies the external material's hash via
+    // setHashOverride, so test that hash when an external material exists.
+    const MaterialData* externalMat0 = m_pReplacer->accessExternalMaterial(submeshes[0].externalMaterial);
+    const XXH64_hash_t effectiveMatHash0 = externalMat0 != nullptr ? externalMat0->getHash() : matHash;
+
+    const bool useExternalPreservePath =
+        RtxOptions::enablePreservePath() &&
+        submeshes.size() == 1 &&
+        state.drawCall.transformData.instancesToObject == nullptr &&
+        riReadyForPreserve &&
+        replacementInstance->dirtyFlags.isClear() &&
+        replacementInstance->frameLastSeen != currentFrameId &&  // second submission this frame -> dynamic
+        !state.optionalParticleDesc.has_value() &&
+        !state.drawCall.getCategoryFlags().test(InstanceCategories::ParticleEmitter) &&
+        !RtxOptions::shouldConvertToLight(effectiveMatHash0) &&
+        !externalBlasAlreadyTouchedByOtherDraw() &&
+        !(state.drawCall.getCategoryFlags().test(InstanceCategories::Terrain) &&
+          m_terrainBaker->cascadeCompositionChangedThisFrame()) &&
+        externalCachedTexturesValidForPreserve;
+
+    if (useExternalPreservePath) {
+      // Feed this frame's submesh geometry as the preserve input:
+      // preserveReplacementInstance refreshes prims[0]'s BlasEntry::input from
+      // it and recalculates the bounding box, matching the dynamic loop's
+      // i==0 setup below.
+      state.drawCall.geometryData = submeshes[0];
+      state.drawCall.geometryData.cullMode = state.doubleSided ? VK_CULL_MODE_NONE : VK_CULL_MODE_BACK_BIT;
+
+      preserveReplacementInstance(ctx, state.drawCall, nullptr, replacementInstance);
+
+      replacementInstance->frameLastSeen = currentFrameId;
+      if (submeshes[0].boundingBox.isValid()) {
+        replacementInstance->geometryBoundingBox = submeshes[0].boundingBox;
+        replacementInstance->objectToWorld = xform;
+      }
+      ++s_preservedCount;
+      return;
+    }
+    ++s_dynamicCount;
+
     AxisAlignedBoundingBox geometryBBox;
 
     for (size_t i = 0; i < submeshes.size(); i++) {
