@@ -693,7 +693,13 @@ void compositeNearFieldCloudOverRadiance(
   uint frameIdx,
   AtmosphereArgs args)
 {
-  if (!shouldUseNearFieldCloudMarch(originYUpKm, args)) {
+  // Snap fix (fork — 2026-06-30): fade the geometry fog in over the near-field
+  // margin band instead of popping it on at the old boolean gate's boundary
+  // (dist == margin) — the same one-frame discontinuity class as the sky-source
+  // switch. w scales the fog's EFFECT (in-scatter and extinction toward
+  // identity), continuous from nothing at the margin to full at the shell.
+  const float w = nearFieldCloudMarchWeight(originYUpKm, args);
+  if (w <= 0.0f) {
     return;
   }
   // tMaxKm > 0 truncates at geometry hit distance; tMaxKm == 0 marches the full slab.
@@ -710,8 +716,9 @@ void compositeNearFieldCloudOverRadiance(
                    /*useFullExtinction=*/true,
                    ctx, args,
                    accumColor, viewTransmittance);
-  radiance = accumColor + viewTransmittance * radiance;
-  attenuation *= viewTransmittance;
+  const float effT = lerp(1.0f, viewTransmittance, w);
+  radiance = accumColor * w + effT * radiance;
+  attenuation *= effT;
 }
 #endif
 
@@ -897,23 +904,24 @@ vec3 evalSkyRadiance(
   // source: both paths are accumulated as `radiance += stepRadiance * T_so_far`,
   // so the rgb-channel semantics match once the alpha convention is reconciled.
   vec4 cloudLayer;
-  bool useNearFieldCloudMarch = false;
-  const bool nearFieldMarch = shouldUseNearFieldCloudMarch(originYUpKm, args);
-  if (nearFieldMarch && args.cloudEnabled > 0.5f && args.cloudViewSamples > 0u) {
-    useNearFieldCloudMarch = true;
-    CloudShadeContext ctx = buildCloudShadeContext(args);
-    float jitter = fastJitter(pixelCoord, frameIdx).x;
-    vec3 accumColor = vec3(0.0f);
-    float viewTransmittance = 1.0f;
-    marchCloudLayers(viewDirYUp, originYUpKm, jitter,
-                     /*tMinClamp=*/0.0f,
-                     /*tMaxClamp=*/0.0f,
-                     args.cloudViewSamples,
-                     /*useFullExtinction=*/true,
-                     ctx, args,
-                     accumColor, viewTransmittance);
-    cloudLayer = vec4(accumColor, 1.0f - viewTransmittance);
-  } else if (args.cloudRenderRTEnable != 0u && isPrimaryRay) {
+  // Near-field cross-fade (fork — 2026-06-30, fly-through snap fix). nearFieldW
+  // ramps 0 -> 1 across the cloudNearFieldMarginKm band around the deck (see
+  // nearFieldCloudMarchWeight). The far-field cloud source (RT / dome LUT) and
+  // the live per-ray march are BLENDED by it instead of hard-switched — the old
+  // boolean gate flipped every sky pixel's source in ONE frame at exactly
+  // dist == margin, and simultaneously disabled the temporal EMA below. The EMA
+  // lags the deck's true position during camera translation (sky motion vectors
+  // are rotation-only; clouds have parallax), so crossing the margin dumped that
+  // lag instantly: the whole deck visibly SNAPPED while flying through the
+  // clouds. In the fade band both sources are evaluated; the band is thin and
+  // the march was already paid there under the old binary gate, so the cost is
+  // essentially unchanged (one extra RT/LUT tap).
+  const float nearFieldW = nearFieldCloudMarchWeight(originYUpKm, args);
+
+  // Far-field cloud source — skipped only when fully near-field.
+  vec4 farFieldCloud = vec4(0.0f, 0.0f, 0.0f, 0.0f);
+  if (nearFieldW < 1.0f) {
+    if (args.cloudRenderRTEnable != 0u && isPrimaryRay) {
     // Half-res cloud RT upsample (fork — 2026-06-11, perf). The cloud RT may
     // be allocated at a fraction of the downscale extent
     // (cloudRenderResolutionScale); pixelCoord is in DOWNSCALE coordinates,
@@ -936,8 +944,8 @@ vec3 evalSkyRadiance(
     } else {
       cloudRT = AtmosphereCloudRender.Load(int3(pixelCoord, 0));
     }
-    cloudLayer = vec4(cloudRT.rgb, 1.0f - cloudRT.a);
-  } else if (args.cloudSecondaryLutEnable != 0u && !isPrimaryRay) {
+    farFieldCloud = vec4(cloudRT.rgb, 1.0f - cloudRT.a);
+    } else if (args.cloudSecondaryLutEnable != 0u && !isPrimaryRay) {
     // Secondary-ray cloud LUT (fork — 2026-06-10, perf). Indirect / PSR /
     // reflection sky-miss rays read the per-frame 256x128 dome LUT baked by
     // cloud_secondary_lut.comp.slang instead of a full per-ray cloud march —
@@ -955,15 +963,33 @@ vec3 evalSkyRadiance(
     // sampler's REPEAT-U address mode.
     vec2 domeUv = cloudDomeDirToUv(viewDirYUp);
     vec4 lut = AtmosphereCloudSecondaryLut.SampleLevel(AtmosphereSkyViewSampler, domeUv, 0.0f);
-    cloudLayer = vec4(lut.rgb, 1.0f - lut.a);
+    farFieldCloud = vec4(lut.rgb, 1.0f - lut.a);
+    }
+    // Remaining case: no far-field cloud source for this ray (cloudRenderRTEnable
+    // off for primary / cloudSecondaryLutEnable off for non-primary). The legacy
+    // analytical evalClouds view-march that used to back this was removed
+    // (2026-06-19) — farFieldCloud stays (0,0,0,0): cloudless far field.
+  }
+
+  // Live near-field march, cross-faded over the far-field source by nearFieldW.
+  // nearFieldW > 0 already implies cloudEnabled && cloudViewSamples > 0 (the
+  // weight helper's early-outs), so no extra guards here.
+  if (nearFieldW > 0.0f) {
+    CloudShadeContext ctx = buildCloudShadeContext(args);
+    float jitter = fastJitter(pixelCoord, frameIdx).x;
+    vec3 accumColor = vec3(0.0f);
+    float viewTransmittance = 1.0f;
+    marchCloudLayers(viewDirYUp, originYUpKm, jitter,
+                     /*tMinClamp=*/0.0f,
+                     /*tMaxClamp=*/0.0f,
+                     args.cloudViewSamples,
+                     /*useFullExtinction=*/true,
+                     ctx, args,
+                     accumColor, viewTransmittance);
+    const vec4 nearFieldCloud = vec4(accumColor, 1.0f - viewTransmittance);
+    cloudLayer = lerp(farFieldCloud, nearFieldCloud, nearFieldW);
   } else {
-    // No cloud source for this ray (fork — 2026-06-19). Reached only when
-    // cloudRenderRTEnable (primary) or cloudSecondaryLutEnable (non-primary)
-    // is OFF. The legacy analytical evalClouds view-march that used to back
-    // this branch was removed — clouds now come exclusively from the
-    // cloud_render compute pass (primary) and the secondary dome LUT
-    // (indirect/PSR/reflection), so with both disabled the sky is cloudless.
-    cloudLayer = vec4(0.0f, 0.0f, 0.0f, 0.0f);
+    cloudLayer = farFieldCloud;
   }
 
   // Sky <- clouds bleed (fork — 2026-06-19, sky-reflects-clouds coupling).
@@ -1044,7 +1070,13 @@ vec3 evalSkyRadiance(
   // 65536 frames and frame-0 startup both collide harmlessly with the
   // sentinel for a single one-frame rejection (~18 min cadence at 60fps).
   vec4 smoothedCloud = cloudLayer;  // default: no smoothing
-  if (enableCloudTemporalSmoothing && !useNearFieldCloudMarch
+  // Snap fix (fork — 2026-06-30): the smoothing gate was binary on the old
+  // near-field bool — the EMA turned OFF in one frame at the margin crossing,
+  // dumping its accumulated reprojection lag (the fly-through snap). Now the
+  // branch stays active through the fade band (nearFieldW < 1) and nearFieldW
+  // joins the history-rejection max below, ramping the EMA weight to zero
+  // continuously by the time the source is fully the live march.
+  if (enableCloudTemporalSmoothing && nearFieldW < 1.0f
       && all(historyResolution > uint2(0u, 0u))) {
     vec4 currentPremul = vec4(cloudLayer.rgb * cloudLayer.a, cloudLayer.a);
 
@@ -1099,9 +1131,36 @@ vec3 evalSkyRadiance(
                                         length(motionVectorPixels));
         float transReject  = smoothstep(kTransRejectStartKm, kTransRejectFullKm,
                                         args.cameraTranslationKm);
+        // Parallax-RATE rejection (fork — 2026-07-02, transition-thickness fix).
+        // The absolute-translation thresholds above are sized for teleports;
+        // they need >= 1 m PER FRAME before they even start, so a normal fly-up
+        // toward the deck (sub-meter per frame) keeps the EMA fully on. But
+        // cloud parallax scales with translation / distance: a 0.6 m/frame
+        // ascent 500 m below the deck slides the deck ~1 px/frame on screen
+        // with rotation-only sky motion vectors (no reprojection), so the
+        // 0.92-weight EMA smears it across its ~12-frame settle — a softened,
+        // thinner-looking deck. When nearFieldW then turns the EMA off across
+        // the thin handoff band, the un-smeared full-density deck pops in:
+        // "the clouds suddenly get thicker during the transition". Reject on
+        // the angular rate proxy translation/distance instead so the EMA is
+        // ALREADY off (continuously, speed- and distance-scaled) well before
+        // the handoff. Thresholds in rad/frame: 0.0002 ~ 0.3 px, 0.0013 ~ 2 px
+        // at a nominal ~1500 px/rad. Walking under a 2 km deck (~3e-5 rad)
+        // stays fully smoothed; the 50 m distance floor only matters where
+        // nearFieldW disables the EMA anyway.
+        const float kParallaxRejectStartRad = 0.0002f;
+        const float kParallaxRejectFullRad  = 0.0013f;
+        float deckDistKm = max(minDistToAnyCloudSlabShellKm(originYUpKm, args), 0.05f);
+        float parallaxReject = smoothstep(kParallaxRejectStartRad, kParallaxRejectFullRad,
+                                          args.cameraTranslationKm / deckDistKm);
+        transReject = max(transReject, parallaxReject);
         float rotationReject = smoothstep(0.0003f, 0.01f, args.cameraAngularDeltaRad);
+        // nearFieldW joins the rejection: approaching the deck ramps the EMA
+        // to raw continuously, so no lag remains to dump when the live march
+        // takes over (the fly-through snap fix).
         float historyWeight = kHistoryWeight
-                            * (1.0f - max(max(motionReject, transReject), rotationReject));
+                            * (1.0f - max(max(motionReject, transReject),
+                                          max(rotationReject, nearFieldW)));
         vec4 blended = lerp(currentPremul, history, historyWeight);
         smoothedCloud = vec4(blended.rgb, blended.a);
       } else {

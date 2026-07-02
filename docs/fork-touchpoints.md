@@ -2478,3 +2478,26 @@ Camera-relative engines (e.g. FalloutNV via its Remix wrapper) subtract the came
 Companion game-side push lives in the FalloutNV Remix wrapper (`src/comp/comp.cpp`, `camera_push` namespace): it feeds the engine `camera_position_ptr` to `rtx.atmosphere.cameraWorldOverride` each frame and enables the override once after warmup.
 
 ---
+
+## Workstream — Fly-through snap fixes: continuous near-field handoff + interval-subtraction slab intersect (fork — 2026-06-30 … 2026-07-02)
+
+Fixes the family of one-frame discontinuities seen when flying up through the cloud deck. (1) The boolean near-field gate flipped every sky pixel's cloud source (temporally-smoothed RT/LUT → raw live march) in one frame and disabled the temporal EMA at the same instant — replaced by a continuous `nearFieldCloudMarchWeight` ramp over the near-field margin band that cross-fades the source, scales the EMA to zero, and fades the near-field geometry/foliage fog. (2) The spherical slab intersect's above-deck branch marched to the base sphere's FAR crossing (through the planet, ~6,650 km), starving the deck below the camera of samples the frame the top was crossed, culled rim-grazing rays outright via an unconditional base-sphere early-return, and had ±1 m `shellMargin` dead zones that blinked the whole sky's cloud at an exact height — replaced by exact interval subtraction (slab = inside-top-sphere minus inside-base-sphere; no camera-height branches, no margins; ground-observer result unchanged). (3) The hard span-floor cull popped rays carrying up to ~15% opacity — the marches now fade density to zero over [1×, 3×] the shared `cloudMarchMinSpanKm` floor, plus a thin-span rim fade (entry-gated so mid-deck rays keep full density). (4) The EMA's absolute translation rejection (starts at 1 m/frame) never fired at fly speeds, so approach parallax smear was dumped at the handoff — added a parallax-RATE rejection (`cameraTranslationKm / distToDeck`). In-game: the vanish-at-height is confirmed fixed; a residual "clouds get slightly thicker" step at the handoff remains a known issue.
+
+- **`src/dxvk/shaders/rtx/pass/atmosphere/atmosphere_common.slangh`** — fork-owned change.
+  *Adds `nearFieldCloudMarchWeight` (0→1 smoothstep over `max(cloudNearFieldMarginKm, 0.05)` around either slab shell) and `cloudMarchMinSpanKm`. `intersectCloudSlabMarchRange` rewritten as interval subtraction; `intersectCloudSlabMarchRangeForLayer`'s span floor lowered to the shared min-span helper.*
+- **`src/dxvk/shaders/rtx/pass/atmosphere/cloud_march_common.slangh`** — fork-owned change.
+  *`marchCloudSlab` / `marchEchoDeck`: thin-span rim fade (entry-gated) × near-cull fade folded into the Beer-Lambert density so intersection-side culls always land at zero opacity.*
+- **`src/dxvk/shaders/rtx/pass/atmosphere/atmosphere_sky.slangh`** — fork-owned change.
+  *`evalSkyRadiance`: cross-fades far-field cloud (RT/dome LUT) with the live march by `nearFieldW`; `nearFieldW` joins the EMA history-rejection max; new parallax-rate history rejection. `compositeNearFieldCloudOverRadiance`: fog effect scaled by the weight instead of a boolean early-out.*
+- **`src/dxvk/rtx_render/rtx_fork_atmosphere.cpp`** — fork-owned change.
+  *`cameraAtOrInsideCloudDeck` (bool) → `cameraCloudDeckFogWeight` (0..1): smoothstep ramp over the margin band below each enabled slab base.*
+- **`src/dxvk/rtx_render/rtx_context.h`** — fork-touchpoint inline tweak (~2 LOC delta).
+  *The `fork_hooks` forward declaration + friend declaration for the renamed weight hook (was the 2026-06-29 foliage-fog bool gate, previously uninventoried — gap closed here).*
+- **`src/dxvk/rtx_render/rtx_composite.cpp`** — fork-touchpoint inline tweak.
+  *The 2026-06-29 foliage-fog block (previously uninventoried): binds the cloud RT at reserved slot `COMPOSITE_ATMOSPHERE_CLOUD_RENDER_RT_INPUT` (19) and populates the CB gate — now the 0..1 `cloudAlphaBlendFogWeight` from the hook instead of a bool.*
+- **`src/dxvk/shaders/rtx/pass/composite/composite_args.h`** — fork-touchpoint inline tweak.
+  *Former `pad1` slot: `enableCloudAlphaBlendFog` (uint) → `cloudAlphaBlendFogWeight` (float). CB layout/size unchanged.*
+- **`src/dxvk/shaders/rtx/pass/composite/composite.comp.slang`** — fork-touchpoint inline tweak.
+  *`applyVolumetricLighting`'s alpha-blend cloud fog (2026-06-29, previously uninventoried): cloud sample now lerped toward identity `(0,0,0,1)` by the weight so the fog ramps in continuously.*
+
+---

@@ -46,7 +46,7 @@
 // composite_bindings.slangh) so only the main composite shader carries the
 // descriptor; composite_alpha_blend's set is untouched. Bound by CompositePass::
 // dispatch at slot COMPOSITE_ATMOSPHERE_CLOUD_RENDER_RT_INPUT, gated by
-// cb.enableCloudAlphaBlendFog (it is (0,0,0,1) / unread when clouds are off).
+// cb.cloudAlphaBlendFogWeight (it is (0,0,0,1) / unread when clouds are off).
 layout(binding = COMPOSITE_ATMOSPHERE_CLOUD_RENDER_RT_INPUT)
 Texture2D<float4> AtmosphereCloudRender;
 
@@ -521,7 +521,7 @@ void applyVolumetricLighting(
       // i.e. the deck appears in front exactly once, no double-count (bgAlpha +
       // coverage == 1; the *coverage scale is applied just below). cloudRT is
       // (0,0,0,1) where there is no cloud, so this is a no-op there.
-      if (cb.enableCloudAlphaBlendFog != 0u)
+      if (cb.cloudAlphaBlendFogWeight > 0.0f)
       {
         // The cloud RT may be allocated at a fraction of the composite extent
         // (rtx.atmosphere.cloudRenderResolutionScale), so map via normalized
@@ -531,7 +531,11 @@ void applyVolumetricLighting(
         const vec2 cloudUV = cameraPixelCoordinateToScreenUV(cb.camera, pixelCoordinate);
         uint2 cloudCoord = uint2(saturate(cloudUV) * vec2(float(cloudW), float(cloudH)));
         cloudCoord = min(cloudCoord, uint2(cloudW, cloudH) - uint2(1u, 1u));
-        const vec4 cloudSample = AtmosphereCloudRender[cloudCoord];
+        vec4 cloudSample = AtmosphereCloudRender[cloudCoord];
+        // Weight < 1 fades the fog toward identity (no cloud: rgb 0, T 1) so the
+        // effect ramps in continuously as the camera approaches the deck base
+        // instead of popping on at the crossing (snap-fix 2026-06-30).
+        cloudSample = lerp(vec4(0.0f, 0.0f, 0.0f, 1.0f), cloudSample, cb.cloudAlphaBlendFogWeight);
         alphaBlendOutput = cloudSample.a * alphaBlendOutput + cloudSample.rgb;
       }
 

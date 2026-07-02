@@ -606,30 +606,29 @@ namespace fork_hooks {
   }
 
   // ---------------------------------------------------------------------------
-  // cameraAtOrInsideCloudDeck
+  // cameraCloudDeckFogWeight
   //
-  // True when the camera sits AT OR ABOVE a cloud slab's base — i.e. the deck is
-  // around the camera or below it, so cloud along a view ray is plausibly IN
-  // FRONT of nearby geometry. Used to gate the composite-pass alpha-blend cloud
-  // fog (fork — 2026-06-29): that fog reuses the full-slab screen-space cloud RT,
-  // which carries no per-surface depth, so applied unconditionally it also fogs
-  // alpha-blended foliage that sits in front of a cloud BEHIND it (a ground
-  // observer's tree silhouetted against the deck reads as see-through). Gating on
-  // "not below the deck" suppresses that: below the deck the cloud is a backdrop
-  // and foliage must be left alone; at/inside/above it the cloud genuinely
-  // fronts the lower geometry. Mirrors the shell math in cloudPlanetRadius /
+  // 0..1 weight for the composite-pass alpha-blend cloud fog (fork — 2026-06-29,
+  // made continuous 2026-06-30). 1 when the camera sits AT OR ABOVE a cloud
+  // slab's base — the deck is around/below the camera, so cloud along a view ray
+  // is plausibly IN FRONT of nearby geometry; 0 well below the deck, where the
+  // cloud is a backdrop BEHIND foliage and the full-slab cloud RT (no per-surface
+  // depth) would wrongly fog it see-through (the 2026-06-29 regression); a
+  // smoothstep ramp over the near-field margin band below the base in between,
+  // so the fog fades in on approach instead of popping on in one frame at the
+  // base crossing. Mirrors the shell math in cloudPlanetRadius /
   // isCameraInsideCloudSlabArgs (atmosphere_common.slangh) on the CPU using the
   // args the atmosphere already computed this frame; no private state added.
   //
   // ACCESS NOTE: reads m_atmosphere (private). Friend declaration required.
   // ---------------------------------------------------------------------------
-  bool cameraAtOrInsideCloudDeck(RtxContext& ctx) {
+  float cameraCloudDeckFogWeight(RtxContext& ctx) {
     if (!ctx.m_atmosphere) {
-      return false;
+      return 0.0f;
     }
     const AtmosphereArgs a = ctx.m_atmosphere->getAtmosphereArgs();
     if (a.cloudEnabled < 0.5f) {
-      return false;
+      return 0.0f;
     }
     const float cloudR = std::max(100.0f, a.planetRadius * std::exp(-a.cloudCurvature * 5.0f));
     // Camera distance from the cloud sphere center (0, -cloudR, 0), Y-up km.
@@ -637,15 +636,25 @@ namespace fork_hooks {
     const float dy = a.cameraWorldPosYUpKm.y + cloudR;
     const float dz = a.cameraWorldPosYUpKm.z;
     const float camDist = std::sqrt(dx * dx + dy * dy + dz * dz);
-    const float kShellMargin = 0.001f;  // km
-    // At or above the LOWER of the enabled slab bases (layer 1 is normally the
-    // lower deck). Being above any deck base means that deck can front geometry
-    // below the camera.
-    bool atOrAbove = camDist >= (cloudR + a.cloudAltitude) - kShellMargin;
+    // Snap fix (fork — 2026-06-30): the boolean at-or-above-base gate turned the
+    // foliage fog on in ONE frame at the deck-base crossing — the same one-frame
+    // discontinuity class as the sky's near-field source switch. Return a weight
+    // that ramps 0 -> 1 over the near-field margin band BELOW the base instead
+    // (same band the sky-side nearFieldCloudMarchWeight uses), so the fog fades
+    // in continuously on approach. Full weight at/above the base preserves the
+    // validated inside-deck behaviour; ground-level foliage stays at 0.
+    const float bandKm = std::max(a.cloudNearFieldMarginKm, 0.05f);
+    auto baseFade = [&](float slabAltitudeKm) -> float {
+      const float baseDist = cloudR + slabAltitudeKm;
+      float t = (camDist - (baseDist - bandKm)) / bandKm;
+      t = std::min(std::max(t, 0.0f), 1.0f);
+      return t * t * (3.0f - 2.0f * t);  // smoothstep
+    };
+    float w = baseFade(a.cloudAltitude);
     if (a.cloudLayer2Enable != 0u) {
-      atOrAbove = atOrAbove || (camDist >= (cloudR + a.cloudLayer2Altitude) - kShellMargin);
+      w = std::max(w, baseFade(a.cloudLayer2Altitude));
     }
-    return atOrAbove;
+    return w;
   }
 
   // ---------------------------------------------------------------------------

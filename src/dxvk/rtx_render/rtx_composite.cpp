@@ -357,15 +357,18 @@ namespace dxvk {
     // bind nothing and clear the gate flag so the alpha-blend composite is
     // untouched (the codebase already binds nullptr for absent optional inputs,
     // e.g. COMPOSITE_LAST_FINAL_OUTPUT below).
-    const bool wantCloudFoliageFog = RtxOptions::cloudRenderRTEnable()
-                                  && RtxOptions::skyMode() == SkyMode::Numos
-                                  && RtxOptions::cloudEnabled()
-                                  // Only when the deck is around/below the camera. Below the deck
-                                  // the cloud is a backdrop BEHIND foliage, and the full-slab cloud
-                                  // RT (no per-surface depth) would otherwise fog it see-through.
-                                  && fork_hooks::cameraAtOrInsideCloudDeck(*ctx);
+    // Weight (0..1) fades the foliage fog in over the margin band below the deck
+    // base instead of a boolean pop at the crossing (snap-fix 2026-06-30). Zero
+    // well below the deck — the cloud is a backdrop BEHIND foliage there, and
+    // the full-slab cloud RT (no per-surface depth) would fog it see-through.
+    float cloudFoliageFogWeight = 0.0f;
+    if (RtxOptions::cloudRenderRTEnable()
+        && RtxOptions::skyMode() == SkyMode::Numos
+        && RtxOptions::cloudEnabled()) {
+      cloudFoliageFogWeight = fork_hooks::cameraCloudDeckFogWeight(*ctx);
+    }
     Rc<DxvkImageView> cloudRenderRTView = nullptr;
-    if (wantCloudFoliageFog) {
+    if (cloudFoliageFogWeight > 0.0f) {
       cloudRenderRTView = fork_hooks::getCloudRenderRT(*ctx).view;
     }
     ctx->bindResourceView(COMPOSITE_ATMOSPHERE_CLOUD_RENDER_RT_INPUT, cloudRenderRTView, nullptr);
@@ -502,7 +505,8 @@ namespace dxvk {
     compositeArgs.stochasticAlphaBlendRadianceVolumeMultiplier = stochasticAlphaBlendRadianceVolumeMultiplier();
     compositeArgs.alphaBlendSurfacePackMult = RtxOptions::getMeterToWorldUnitScale();
     // Gate the alpha-blend cloud fog on the cloud RT actually being bound above.
-    compositeArgs.enableCloudAlphaBlendFog = (cloudRenderRTView != nullptr) ? 1u : 0u;
+    compositeArgs.cloudAlphaBlendFogWeight =
+        (cloudRenderRTView != nullptr) ? cloudFoliageFogWeight : 0.0f;
 
     compositeArgs.clearColorFinalColor = sceneManager.getGlobals().clearColorFinalColor;
 

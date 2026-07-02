@@ -85,11 +85,13 @@ namespace dxvk {
     // ensureCloudRenderRT has run during updateAtmosphereConstants. Used by
     // the cloud-render-RT debug view (enum 876).
     Resources::Resource getCloudRenderRT(RtxContext& ctx);
-    // True when the camera is at or above a cloud slab base (deck around/below
-    // the camera). Gates the composite-pass alpha-blend cloud fog so foliage
-    // below the deck is not fogged by a cloud that sits behind it (fork —
-    // 2026-06-29). Defined in rtx_fork_atmosphere.cpp.
-    bool cameraAtOrInsideCloudDeck(RtxContext& ctx);
+    // 0..1 weight for the composite-pass alpha-blend cloud fog: 1 when the
+    // camera is at/above a cloud slab base (deck around/below the camera), 0
+    // well below the deck (cloud is a backdrop behind foliage — must not fog),
+    // smoothstep ramp over the near-field margin band below the base so the fog
+    // fades in continuously instead of popping at the base crossing (fork —
+    // 2026-06-29, made continuous 2026-06-30). Defined in rtx_fork_atmosphere.cpp.
+    float cameraCloudDeckFogWeight(RtxContext& ctx);
   } // namespace fork_hooks
 
   /**
@@ -369,6 +371,6 @@ namespace dxvk {
     friend Resources::Resource fork_hooks::getCloudDSun(RtxContext& ctx);
     friend Resources::Resource fork_hooks::getCloudDAmbient(RtxContext& ctx);
     friend Resources::Resource fork_hooks::getCloudRenderRT(RtxContext& ctx);
-    friend bool fork_hooks::cameraAtOrInsideCloudDeck(RtxContext& ctx);
+    friend float fork_hooks::cameraCloudDeckFogWeight(RtxContext& ctx);
   };
 } // namespace dxvk

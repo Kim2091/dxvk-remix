@@ -409,6 +409,37 @@ void marchCloudSlab(vec3   viewDirYUp,
                                           tEntry, tExit)) {
     return;
   }
+  // Thin-span fade (fork — 2026-07-01, fly-through snap fix, part 2; entry-gated
+  // 2026-07-01 rev 2). A distant grazing ray that clips only a thin sliver of
+  // the deck (the far rim) should melt out smoothly rather than be culled whole
+  // by the intersection-side span floor — that one-frame cull was the residual
+  // fly-through snap. But keyed on span ALONE the fade also fired for rays
+  // STARTING inside the deck near its top (their overhead span is small too),
+  // melting the surrounding cloud away while the camera was still inside it —
+  // the "clouds temporarily vanish while crossing" regression. Gate the fade by
+  // ENTRY distance: tEntry ~ 0 (camera at/inside the local volume) keeps full
+  // density — Beer-Lambert opacity already goes to zero naturally as the local
+  // span shrinks — while far entries (a genuine rim sliver seen from outside)
+  // get the smooth melt.
+  // Both factors use the UNCLAMPED range (before the geometry/tMax clamps below).
+  const float kThinSpanFadeSpans = 0.75f;
+  const float spanFade = smoothstep(0.0f, max(slabThicknessKm * kThinSpanFadeSpans, 1e-3f),
+                                    tExit - tEntry);
+  const float entryGate = saturate(max(tEntry, 0.0f) / max(slabThicknessKm, 1e-3f));
+  // Near-cull fade (fork — 2026-07-02, rev 3). The rev-2 entry gate bet that
+  // the span floor culls "at negligible opacity" — false at real densities:
+  // at the floor (55 m at default step), a dense sample still carries ~8-15%
+  // opacity, so the cull front sweeping overhead during a deck-top crossing
+  // popped per-ray ("clouds above me vanish at a specific height"). Fade
+  // density to zero over [1x, 3x] the intersection cull span — narrow enough
+  // (~165 m of span at defaults) that only rays about to be culled are
+  // touched (mid-deck overhead spans are far larger), so the rev-2 regression
+  // (whole-deck melt while inside) cannot recur, and the cull itself lands at
+  // exactly zero opacity. Applies to ALL rays, entry-gated or not: any ray's
+  // span can shrink under the floor (overhead top crossing, rim slivers).
+  const float cullSpanKm = cloudMarchMinSpanKm(args, slabThicknessKm);
+  const float nearCullFade = smoothstep(cullSpanKm, cullSpanKm * 3.0f, tExit - tEntry);
+  const float thinSpanFade = lerp(1.0f, spanFade, entryGate) * nearCullFade;
   tEntry = max(tEntry, tMinClamp);
   if (tMaxClamp > 0.0f) {
     tExit = min(tExit, tMaxClamp);
@@ -574,8 +605,10 @@ void marchCloudSlab(vec3   viewDirYUp,
                      * (lighting.direct + lighting.ambient * ambientThinFade + moonDirectLight)
                      + ctx.nightLight;
 
-    // Beer-Lambert step accumulation.
-    float effectiveDensity = density * args.cloudDensity * proximityScale;
+    // Beer-Lambert step accumulation. thinSpanFade (<=1) melts the deck out
+    // continuously where a ray's span through the slab is thin (deck-top
+    // crossing, spherical far rim) — see its derivation above the loop.
+    float effectiveDensity = density * args.cloudDensity * proximityScale * thinSpanFade;
     float stepTransmittance = exp(-effectiveDensity * stepLen);
     vec3 stepRadiance = sampleColor * (1.0f - stepTransmittance);
 
@@ -654,6 +687,20 @@ void marchEchoDeck(vec3   viewDirYUp,
     return;
   }
   if (tEntry >= tExit || tExit <= 0.0f) return;
+
+  // Thin-span fade — same as marchCloudSlab (fly-through snap fix, part 2 +
+  // entry gate rev 2 + near-cull fade rev 3): melt DISTANT thin slivers (far
+  // rim) smoothly, and fade ALL rays to zero density just above the
+  // intersection-side span floor so the cull never steps visibly. The echo
+  // deck takes no tMin/tMax clamps, so (tExit - tEntry) is the deck span
+  // directly. See marchCloudSlab for the full derivation.
+  const float kThinSpanFadeSpans = 0.75f;
+  const float spanFade = smoothstep(0.0f, max(slabThicknessKm * kThinSpanFadeSpans, 1e-3f),
+                                    tExit - tEntry);
+  const float entryGate = saturate(max(tEntry, 0.0f) / max(slabThicknessKm, 1e-3f));
+  const float cullSpanKm = cloudMarchMinSpanKm(args, slabThicknessKm);
+  const float nearCullFade = smoothstep(cullSpanKm, cullSpanKm * 3.0f, tExit - tEntry);
+  const float thinSpanFade = lerp(1.0f, spanFade, entryGate) * nearCullFade;
 
   // Low step budget — the echo deck's headline perf lever, user-adjustable via
   // cloudLayer2StepFloor / cloudLayer2StepMax (decoupled from layer 1's
@@ -783,7 +830,7 @@ void marchEchoDeck(vec3   viewDirYUp,
                      * (lighting.direct + lighting.ambient * ambientThinFade + moonDirectLight)
                      + ctx.nightLight;
 
-    float effectiveDensity = density * args.cloudDensity * proximityScale;
+    float effectiveDensity = density * args.cloudDensity * proximityScale * thinSpanFade;
     float stepTransmittance = exp(-effectiveDensity * stepLen);
     vec3 stepRadiance = sampleColor * (1.0f - stepTransmittance);
 

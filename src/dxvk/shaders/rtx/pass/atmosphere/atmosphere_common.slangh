@@ -733,6 +733,37 @@ float minDistToAnyCloudSlabShellKm(vec3 originYUpKm, AtmosphereArgs args) {
   return d;
 }
 
+// Continuous near-field weight (fork — 2026-06-30, snap fix). The boolean gate
+// above made the sky-miss cloud SOURCE flip in a single frame at exactly
+// dist == margin: every sky pixel switched from the temporally-smoothed cloud
+// RT / dome LUT to the raw live march (and evalSkyRadiance disabled the
+// temporal EMA at the same instant). The EMA lags the deck's true position
+// during camera translation (sky motion vectors are rotation-only, clouds have
+// parallax), so crossing the margin visibly SNAPPED the whole deck to its
+// un-lagged position. This weight ramps 0 -> 1 across the margin band instead:
+// 0 at/beyond margin (pure RT/LUT + full smoothing), 1 at the shell and inside
+// (pure live march, no smoothing), smoothstep between. Consumers lerp the cloud
+// source, scale the EMA history weight by (1 - w), and scale the near-field
+// geometry fog by w — one continuous ramp, no per-frame discontinuity anywhere.
+// Same early-outs as the bool so w > 0 implies shouldUseNearFieldCloudMarch.
+float nearFieldCloudMarchWeight(vec3 originYUpKm, AtmosphereArgs args) {
+  if (args.cloudEnabled < 0.5f) {
+    return 0.0f;
+  }
+  float effectiveCoverageMean = args.cloudCoverageMean;
+  if (args.cloudLayer2Enable != 0u) {
+    effectiveCoverageMean = max(effectiveCoverageMean, args.cloudLayer2CoverageMean);
+  }
+  if (effectiveCoverageMean < 0.01f || args.cloudViewSamples == 0u) {
+    return 0.0f;
+  }
+  // Floor the band width so margin = 0 still gives a thin (50 m) fade at the
+  // shell rather than re-introducing a binary flip there.
+  const float margin = max(args.cloudNearFieldMarginKm, 0.05f);
+  const float distKm = minDistToAnyCloudSlabShellKm(originYUpKm, args);
+  return 1.0f - smoothstep(0.0f, margin, distKm);
+}
+
 // Fade band (km) for proximity-based horizon gate and density boost.
 float cloudProximityRelaxRangeKm(AtmosphereArgs args) {
   float relaxRangeKm = max(args.cloudThickness + max(args.cloudNearFieldMarginKm, 0.0f), 1.0f);
@@ -812,42 +843,66 @@ bool intersectCloudSlabMarchRange(vec3 originYUpKm,
   tEntry = -1.0f;
   tExit  = -1.0f;
 
-  float t0b, t1b, t0t, t1t;
-  if (!intersectSphere(originYUpKm, viewDirYUp, planetCenter, baseRadius, t0b, t1b)) {
-    return false;
-  }
+  // Exact interval subtraction (fork — 2026-07-02, fly-through snap fix,
+  // part 3). This replaces the old below / inside / above camDist branch
+  // heuristic, which had two frame-visible defects during a deck crossing:
+  //   * The ABOVE branch took the base sphere's FAR crossing (t1b — through
+  //     the planet, thousands of km) as the exit, so the capped adaptive step
+  //     count spread over the whole through-planet span and the 1-3 km deck
+  //     segment right below the camera got ~no samples: crossing the deck top
+  //     made every cloud below dissolve into per-frame sample noise in ONE
+  //     frame. It also culled rim-grazing rays outright via the unconditional
+  //     base-sphere early-return (a grazing ray can cross the slab between
+  //     the spheres without its line ever touching the base sphere).
+  //   * The branch selection itself had a +-1 m shellMargin dead zone at each
+  //     shell: with the camera inside that band, down-rays landed in the
+  //     INSIDE branch, took the just-crossed top surface (t0t ~ 0) as their
+  //     exit, and culled — a one-frame whole-sky cloud blink at a specific
+  //     camera height.
+  //
+  // The slab along the ray is (inside top sphere) MINUS (inside base sphere):
+  //   piece 1: [t0t, min(t0b, t1t)] — the near side (approach / descent path)
+  //   piece 2: [max(t1b, t0t), t1t] — the far side, re-entering the shell
+  //            after passing under the deck (only exists when the base sphere
+  //            is hit). Marched only when piece 1 is empty/behind: for a
+  //            ground observer this IS the visible deck overhead (the classic
+  //            below-deck case, t1b -> t1t); for true through-planet rays the
+  //            aerial haze extinguishes it, matching prior behavior.
+  // March the first piece with positive length ahead of the camera. No
+  // camDist classification, no margins — continuous through both shells.
+  float t0t, t1t;
   if (!intersectSphere(originYUpKm, viewDirYUp, planetCenter, topRadius, t0t, t1t)) {
-    return false;
+    return false;  // line never reaches the shell at all
   }
+  float t0b = 0.0f, t1b = 0.0f;
+  const bool baseHit = intersectSphere(originYUpKm, viewDirYUp, planetCenter, baseRadius, t0b, t1b);
 
-  float camDist = length(originYUpKm - planetCenter);
-  const float shellMargin = 0.001f;  // km
-
-  if (camDist < baseRadius - shellMargin) {
-    // Below the shell — classic ground observer looking up into the deck.
-    tEntry = (t1b > kEps) ? t1b : -1.0f;
-    tExit  = (t1t > kEps) ? t1t : -1.0f;
-  } else if (camDist > topRadius + shellMargin) {
-    // Above the deck — looking down into clouds from a high-altitude camera.
-    tEntry = (t0t > kEps) ? t0t : ((t1t > kEps) ? t1t : -1.0f);
-    tExit  = (t1b > kEps) ? t1b : ((t0b > kEps) ? t0b : -1.0f);
-  } else {
-    // Inside the shell — camera can penetrate / fly through the volume.
-    tEntry = 0.0f;
-    tExit = 1e30f;
-    if (t0t > kEps) { tExit = min(tExit, t0t); }
-    if (t1t > kEps) { tExit = min(tExit, t1t); }
-    if (t0b > kEps) { tExit = min(tExit, t0b); }
-    if (t1b > kEps) { tExit = min(tExit, t1b); }
-    if (tExit >= 1e29f) {
-      return false;
+  float p0Start = max(t0t, kEps);
+  float p0End   = baseHit ? min(t0b, t1t) : t1t;
+  if (p0End - p0Start > kEps) {
+    tEntry = p0Start;
+    tExit  = p0End;
+    return true;
+  }
+  if (baseHit) {
+    float p1Start = max(max(t1b, t0t), kEps);
+    float p1End   = t1t;
+    if (p1End - p1Start > kEps) {
+      tEntry = p1Start;
+      tExit  = p1End;
+      return true;
     }
   }
+  return false;
+}
 
-  if (tEntry < 0.0f || tExit <= tEntry || tExit <= kEps) {
-    return false;
-  }
-  return true;
+// Degenerate-span floor shared by the layer intersection cull and the marches'
+// near-cull density fade (fork — 2026-07-02). Spans shorter than this are
+// culled by intersectCloudSlabMarchRangeForLayer; the marches fade density to
+// zero over [1x, 3x] this span so the cull boundary itself is never a visible
+// step (see the thin-span fade in marchCloudSlab / marchEchoDeck).
+float cloudMarchMinSpanKm(AtmosphereArgs args, float slabThicknessKm) {
+  return max(args.cloudViewStepKm * 0.5f, slabThicknessKm * 0.02f);
 }
 
 // Layer intersection: flat horizontal slab at low elevation, spherical otherwise.
@@ -919,7 +974,17 @@ bool intersectCloudSlabMarchRangeForLayer(vec3 originYUpKm,
     return false;
   }
 
-  float minSpan = max(args.cloudViewStepKm, slabThicknessKm * 0.1f);
+  // Span floor: cull only truly degenerate (sub-step) spans. This was
+  // max(cloudViewStepKm, thickness*0.1) — but that culls DISCRETELY: as the
+  // camera ascends through the deck, each ray's remaining span shrinks
+  // continuously, and the frame it dropped under the floor that ray's cloud
+  // vanished whole. A band of sky crosses the threshold together at the deck-top
+  // crossing => the residual fly-through SNAP (fork — 2026-07-01). The floor now
+  // only rejects spans too short to take a single march step, AND the marches
+  // fade density to zero over [1x, 3x] this floor (the near-cull fade, fork —
+  // 2026-07-02), so a ray reaching this cull carries exactly zero opacity —
+  // the boundary can never step visibly.
+  float minSpan = cloudMarchMinSpanKm(args, slabThicknessKm);
   if ((tExit - tEntry) < minSpan) {
     return false;
   }
