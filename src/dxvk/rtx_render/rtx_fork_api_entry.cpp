@@ -82,8 +82,10 @@ extern "C" {
 #include <atomic>
 #include <cstdint>
 #include <cstring>                        // memcpy
+#include <mutex>                          // std::mutex (external-texture registry)
 #include <optional>
 #include <string>
+#include <unordered_map>                  // external-texture registry
 
 namespace dxvk {
 namespace {
@@ -128,6 +130,36 @@ namespace {
   PFN_remixapi_BridgeCallback    s_endCallback    { nullptr };
   PFN_remixapi_BridgeCallback    s_presentCallback { nullptr };
 
+  // -------------------------------------------------------------------------
+  // External-texture registry (2026-07-02)
+  //
+  // remixapi_CreateTexture registers its TextureRef ONLY in
+  // RtxTextureManager::m_textureCache -- a volatile table that
+  // SceneManager::clear() (camera cuts, replacer hot-reload,
+  // requestTextureVramFree) wipes wholesale via textureManager.clear().
+  // Legacy D3D9 draws repopulate the table every frame from their live D3D9
+  // texture objects; API-uploaded textures have NO re-registration path, so
+  // after any scene clear a later CreateMaterial naming a pre-clear texture
+  // by its "0x<hex>" pseudo-path resolved to nothing and the material was
+  // born permanently black. Observed as FO4-Remix's "objects load correctly,
+  // then come back pure black after an unload/reload cycle": the plugin's
+  // handle bookkeeping said the texture was alive, so it never re-uploaded,
+  // and every material (re)created after a camera cut lost its albedo.
+  //
+  // This map is the durable side registry: written by createTexture's EmitCs
+  // lambda, erased by destroyTexture's, consulted by textureHashPathLookup
+  // as a fallback that also re-adds the entry to the live table. The
+  // TextureRef holds the Rc<DxvkImageView>, so registry residency keeps the
+  // VkImage alive exactly as long as the API handle -- mirroring the ImGui
+  // catalog retention documented in destroyTexture.
+  //
+  // All three touch points run on the CS thread today; the mutex guards
+  // against future callers of textureHashPathLookup from asset-loading
+  // contexts (the lookup is also reachable from material JSON resolution).
+  // -------------------------------------------------------------------------
+  std::mutex s_externalTexturesMutex;
+  std::unordered_map<uint64_t, TextureRef> s_externalTextures;
+
 } // anonymous namespace
 
 namespace fork_hooks {
@@ -166,6 +198,26 @@ namespace fork_hooks {
       for (const auto& ref : textureTable) {
         if (ref.isValid() && ref.getImageHash() == hash) {
           outRef = ref;
+          return true;
+        }
+      }
+
+      // Table miss: the live table is volatile -- SceneManager::clear()
+      // (camera cuts, hot reload) empties it, and nothing re-registers
+      // API-uploaded textures. Serve the ref from the durable external
+      // registry so a CreateMaterial arriving after a scene clear still
+      // resolves its pseudo-path (previously it silently got no texture and
+      // the material was born black). Re-add the entry to the live table so
+      // same-frame lookups hit the fast path again and bindless
+      // registration/tracking sees the texture as usual.
+      {
+        std::lock_guard<std::mutex> lock(s_externalTexturesMutex);
+        auto extIt = s_externalTextures.find(hash);
+        if (extIt != s_externalTextures.end() && extIt->second.isValid()) {
+          uint32_t textureIndex;
+          ctx.getCommonObjects()->getTextureManager().addTexture(
+            extIt->second, 0, false, textureIndex);
+          outRef = extIt->second;
           return true;
         }
       }
@@ -612,6 +664,15 @@ namespace fork_hooks {
       uint32_t textureIndex;
       textureManager.addTexture(textureRef, 0, false, textureIndex);
 
+      // Mirror into the durable external registry: the table entry above
+      // does not survive SceneManager::clear() (camera cuts), and there is
+      // no other re-registration path for API-uploaded textures. See the
+      // s_externalTextures comment block for the full failure mode.
+      {
+        std::lock_guard<std::mutex> lock(s_externalTexturesMutex);
+        s_externalTextures[cHash] = textureRef;
+      }
+
       // Register with ImGui for categorization UI.
       // Flag 1 (kTextureFlagsDefault) allows assignment to texture categories.
       ctx->getCommonObjects()->getImgui().AddTexture(cHash, cImageView, 1);
@@ -659,6 +720,14 @@ namespace fork_hooks {
       // destroys again; ImGui keeps every generation alive). Match the
       // AddTexture call with its corresponding ReleaseTexture here.
       ctx->getCommonObjects()->getImgui().ReleaseTexture(cHash);
+
+      // Drop the durable external-registry entry. This is the release point
+      // that ends the API handle's lifetime; after this, a table miss in
+      // textureHashPathLookup is a genuine miss (no resurrection).
+      {
+        std::lock_guard<std::mutex> lock(s_externalTexturesMutex);
+        s_externalTextures.erase(cHash);
+      }
 
       const auto& textureTable = textureManager.getTextureTable();
       for (const auto& textureRef : textureTable) {
