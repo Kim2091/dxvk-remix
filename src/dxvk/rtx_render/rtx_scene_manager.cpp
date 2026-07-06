@@ -1113,6 +1113,28 @@ namespace dxvk {
       uint16_t leaderStamp = SAMPLER_FEEDBACK_INVALID;
       if (surfaceMat.getType() == RtSurfaceMaterialType::Opaque) {
         pOpaqueMat = &surfaceMat.getOpaqueSurfaceMaterial();
+        // FORK-DIAG (2026-07-05): a preserved instance whose surface material
+        // references an out-of-range or invalidated albedo texture slot will
+        // render black while looking perfectly healthy to the plugin. Detect
+        // it here, at the only place preserved state is touched per frame.
+        {
+          const uint32_t diagAlbedoIdx = pOpaqueMat->getAlbedoOpacityTextureIndex();
+          const auto& diagTable = textureManager.getTextureTable();
+          const bool outOfRange = (diagAlbedoIdx != 0xFFFFu) && (diagAlbedoIdx >= diagTable.size());
+          const bool invalidRef = (diagAlbedoIdx != 0xFFFFu) && !outOfRange && !diagTable[diagAlbedoIdx].isValid();
+          if (outOfRange || invalidRef) {
+            static std::atomic<int> s_diagStaleAlbedo { 0 };
+            const int sn = s_diagStaleAlbedo.fetch_add(1, std::memory_order_relaxed);
+            if (sn < 100 || (sn % 500) == 0) {
+              Logger::warn(str::format("[FORK-DIAG] preserved instance STALE albedo slot #", sn,
+                                       " albedoIdx=", diagAlbedoIdx,
+                                       " tableSize=", diagTable.size(),
+                                       outOfRange ? " (out of range)" : " (invalid ref)",
+                                       " matIdx=", surfaceMatIdx,
+                                       " frame=", m_device->getCurrentFrameId()));
+            }
+          }
+        }
         leaderStamp = pOpaqueMat->getSamplerFeedbackStamp();
         if (leaderStamp == SAMPLER_FEEDBACK_INVALID) {
           const uint32_t albedoIdx = pOpaqueMat->getAlbedoOpacityTextureIndex();
@@ -2680,6 +2702,11 @@ namespace dxvk {
     }
 
     if (freeTextures) {
+      // FORK-DIAG (2026-07-05): texture-table wipe WITHOUT a scene clear --
+      // the one path that can orphan preserve-path texture indices while
+      // instances stay alive. Previously silent.
+      Logger::info(str::format("[FORK-DIAG] textureManager.clear via requestTextureVramFree, frame ",
+                               m_device->getCurrentFrameId()));
       m_device->getCommon()->getTextureManager().clear();
 
       if (m_opacityMicromapManager) {
