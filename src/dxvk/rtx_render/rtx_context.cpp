@@ -811,6 +811,15 @@ namespace dxvk {
         if (m_framesWithoutValidScene > RtxOptions::sceneKeepAliveFrames()) {
           // Only perform Wait For Idle on the first clear to avoid expensive GPU sync on every frame
           const bool needWfi = (m_framesWithoutValidScene == RtxOptions::sceneKeepAliveFrames() + 1);
+          // FORK-DIAG (2026-07-05): this SceneManager::clear (and its texture
+          // table wipe) previously ran with ZERO log evidence -- unlike the
+          // camera-cut clear, which logs. Log the first frame of each streak.
+          if (needWfi) {
+            Logger::info(str::format("[FORK-DIAG] SceneManager::clear via invalid-scene streak, frame ",
+                                     m_device->getCurrentFrameId(),
+                                     " (rtEnabled=", isRaytracingEnabled,
+                                     " cameraValid=", isCameraValid, ")"));
+          }
           getSceneManager().clear(this, needWfi);
         }
       } else {

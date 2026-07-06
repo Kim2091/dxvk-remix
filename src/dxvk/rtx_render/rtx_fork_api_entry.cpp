@@ -218,7 +218,26 @@ namespace fork_hooks {
           ctx.getCommonObjects()->getTextureManager().addTexture(
             extIt->second, 0, false, textureIndex);
           outRef = extIt->second;
+          // FORK-DIAG (2026-07-05): the durable-registry rescue actually
+          // fired (live table missed a pre-clear texture). Capped: proves
+          // clears orphan textures in real sessions and the fallback works.
+          static std::atomic<int> s_diagRescue { 0 };
+          const int rn = s_diagRescue.fetch_add(1, std::memory_order_relaxed);
+          if (rn < 50 || (rn % 500) == 0) {
+            Logger::info(str::format("[FORK-DIAG] registry rescue #", rn,
+                                     " hash=0x", std::hex, hash));
+          }
           return true;
+        }
+        // FORK-DIAG (2026-07-05): a "0x<hex>" pseudo-path in NEITHER the live
+        // table NOR the durable registry. The material referencing it is born
+        // black. This is the primary black-object signature.
+        static std::atomic<int> s_diagMiss { 0 };
+        const int mn = s_diagMiss.fetch_add(1, std::memory_order_relaxed);
+        if (mn < 100 || (mn % 200) == 0) {
+          Logger::warn(str::format("[FORK-DIAG] hash-path lookup TOTAL MISS #", mn,
+                                   " hash=0x", std::hex, hash,
+                                   std::dec, " registrySize=", s_externalTextures.size()));
         }
       }
     } catch (...) {

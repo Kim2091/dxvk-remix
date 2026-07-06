@@ -372,6 +372,16 @@ namespace {
 
         auto assetData = AssetDataManager::get().findAsset(path.string());
         if (assetData == nullptr) {
+          // FORK-DIAG (2026-07-05): a non-empty texture path that resolves to
+          // nothing means this material slot is born permanently textureless
+          // (pure black albedo if it is the albedo slot). Capped log so the
+          // black-object investigation has runtime-side evidence.
+          static std::atomic<int> s_diagResolveFail { 0 };
+          const int n = s_diagResolveFail.fetch_add(1, std::memory_order_relaxed);
+          if (n < 100 || (n % 200) == 0) {
+            Logger::warn(str::format("[FORK-DIAG] material texture resolve FAILED #", n,
+                                     " path=", path.string()));
+          }
           return {};
         }
         auto uploadedTexture = ctx.getCommonObjects()->getTextureManager()
