@@ -152,26 +152,898 @@ namespace dxvk {
       return std::numeric_limits<uint32_t>::max();
     }
 
-    struct Ue3VsTexcoordTraceResult {
-      bool valid = false;
-      uint8_t iaTexcoordIndex = 0;
-      uint8_t inputReg = 0;
-      uint8_t sourceCompU = 0;
-      uint8_t sourceCompV = 1;
-    };
-
-    struct Ue3VsComponentOrigin {
-      bool valid = false;
-      uint8_t inputReg = 0;
-      uint8_t component = 0;
-    };
-
-    static bool sameUe3VsComponentOrigin(const Ue3VsComponentOrigin& a, const Ue3VsComponentOrigin& b) {
-      return a.valid == b.valid &&
-             a.inputReg == b.inputReg &&
-             a.component == b.component;
+    static bool isFloatConstantRegisterType(const DxsoRegisterType type) {
+      return type == DxsoRegisterType::Const
+          || type == DxsoRegisterType::Const2
+          || type == DxsoRegisterType::Const3
+          || type == DxsoRegisterType::Const4;
     }
 
+    static int32_t getFloatConstantRegisterIndex(const DxsoRegister& r) {
+      switch (r.id.type) {
+      case DxsoRegisterType::Const:
+        return int32_t(r.id.num);
+      case DxsoRegisterType::Const2:
+        return 2048 + int32_t(r.id.num);
+      case DxsoRegisterType::Const3:
+        return 4096 + int32_t(r.id.num);
+      case DxsoRegisterType::Const4:
+        return 6144 + int32_t(r.id.num);
+      default:
+        return -1;
+      }
+    }
+
+    static bool decodeConstantModifierScale(const DxsoRegModifier modifier, float& outScale) {
+      switch (modifier) {
+      case DxsoRegModifier::None:
+        outScale = 1.0f;
+        return true;
+      case DxsoRegModifier::Neg:
+        outScale = -1.0f;
+        return true;
+      default:
+        outScale = 1.0f;
+        return false;
+      }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Exact UV dataflow tracing
+    //
+    // Shared per-component dataflow machinery used by:
+    //  - the PS sampler coordinate-origin resolver (analyzePsSamplerUvOrigins)
+    //  - the VS interpolant->IA texcoord trace (traceVsOutputTexcoordToInputUsageIndex)
+    //
+    // The tracer proves, per register component, which interpolant (PS) or IA texcoord
+    // input (VS) component a value originates from, and accumulates the affine chain
+    // (scale/offset from draw-time constants or def'd immediates) applied along the way.
+    // Math outside the affine model keeps the origin but marks the affine inexact;
+    // genuinely ambiguous origins are invalidated.
+    // ---------------------------------------------------------------------------
+
+    static bool uvAffineTermPresent(const UvAffineTerm& t) {
+      return t.immValid || t.constReg >= 0;
+    }
+
+    static bool uvAffineTermsEqual(const UvAffineTerm& a, const UvAffineTerm& b) {
+      if (a.inexact != b.inexact || a.immValid != b.immValid || a.constReg != b.constReg)
+        return false;
+      if (a.immValid && a.imm != b.imm)
+        return false;
+      if (a.constReg >= 0 && (a.constComp != b.constComp || a.factor != b.factor))
+        return false;
+      return true;
+    }
+
+    static bool uvComponentAffinesEqual(const UvComponentAffine& a, const UvComponentAffine& b) {
+      return uvAffineTermsEqual(a.scale, b.scale) && uvAffineTermsEqual(a.offset, b.offset);
+    }
+
+    static bool uvComponentAffineExact(const UvComponentAffine& a) {
+      return !a.scale.inexact && !a.offset.inexact;
+    }
+
+    static bool uvComponentAffineIsIdentity(const UvComponentAffine& a) {
+      return uvComponentAffineExact(a) &&
+             (!uvAffineTermPresent(a.scale) || (a.scale.immValid && a.scale.imm == 1.0f)) &&
+             (!uvAffineTermPresent(a.offset) || (a.offset.immValid && a.offset.imm == 0.0f));
+    }
+
+    static void uvAffineMarkInexact(UvComponentAffine& a) {
+      a.scale.inexact = true;
+      a.offset.inexact = true;
+    }
+
+    // value' = value * m for a compile-time immediate m
+    static void uvAffineMulImmediate(UvComponentAffine& a, const float value) {
+      if (a.scale.constReg >= 0) {
+        a.scale.factor *= value;
+      } else if (a.scale.immValid) {
+        a.scale.imm *= value;
+      } else {
+        a.scale.immValid = true;
+        a.scale.imm = value;
+      }
+
+      if (a.offset.constReg >= 0) {
+        a.offset.factor *= value;
+      } else if (a.offset.immValid) {
+        a.offset.imm *= value;
+      }
+    }
+
+    // value' = value * consts[reg][comp] * factor
+    static void uvAffineMulConstant(UvComponentAffine& a, const int16_t reg, const uint8_t comp, const float factor) {
+      if (a.scale.constReg >= 0) {
+        // scale would become a product of two draw-time constants - not representable
+        a.scale.inexact = true;
+      } else if (a.scale.immValid) {
+        const float staticScale = a.scale.imm;
+        a.scale.immValid = false;
+        a.scale.imm = 0.0f;
+        a.scale.constReg = reg;
+        a.scale.constComp = comp;
+        a.scale.factor = staticScale * factor;
+      } else {
+        a.scale.constReg = reg;
+        a.scale.constComp = comp;
+        a.scale.factor = factor;
+      }
+
+      if (a.offset.constReg >= 0) {
+        a.offset.inexact = true;
+      } else if (a.offset.immValid) {
+        if (a.offset.imm != 0.0f) {
+          const float staticOffset = a.offset.imm;
+          a.offset.immValid = false;
+          a.offset.imm = 0.0f;
+          a.offset.constReg = reg;
+          a.offset.constComp = comp;
+          a.offset.factor = staticOffset * factor;
+        } else {
+          a.offset.immValid = false;
+        }
+      }
+    }
+
+    static void uvAffineAddImmediate(UvComponentAffine& a, const float value) {
+      if (value == 0.0f)
+        return;
+
+      if (a.offset.constReg >= 0) {
+        // constant-register offset plus an immediate is a two-term offset - not representable
+        a.offset.inexact = true;
+      } else {
+        a.offset.immValid = true;
+        a.offset.imm += value;
+      }
+    }
+
+    static void uvAffineAddConstant(UvComponentAffine& a, const int16_t reg, const uint8_t comp, const float factor) {
+      if (a.offset.immValid && a.offset.imm == 0.0f)
+        a.offset.immValid = false;
+
+      if (uvAffineTermPresent(a.offset)) {
+        a.offset.inexact = true;
+      } else {
+        a.offset.constReg = reg;
+        a.offset.constComp = comp;
+        a.offset.factor = factor;
+      }
+    }
+
+    // Applies a DXSO source modifier to the affine chain; returns false when not representable.
+    static bool uvAffineApplySourceModifier(UvComponentAffine& a, const DxsoRegModifier modifier) {
+      switch (modifier) {
+      case DxsoRegModifier::None:
+        return true;
+      case DxsoRegModifier::Neg:
+        uvAffineMulImmediate(a, -1.0f);
+        return true;
+      case DxsoRegModifier::Bias: // r - 0.5
+        uvAffineAddImmediate(a, -0.5f);
+        return true;
+      case DxsoRegModifier::BiasNeg: // -(r - 0.5)
+        uvAffineAddImmediate(a, -0.5f);
+        uvAffineMulImmediate(a, -1.0f);
+        return true;
+      case DxsoRegModifier::Sign: // r * 2 - 1
+        uvAffineMulImmediate(a, 2.0f);
+        uvAffineAddImmediate(a, -1.0f);
+        return true;
+      case DxsoRegModifier::SignNeg: // -(r * 2 - 1)
+        uvAffineMulImmediate(a, -2.0f);
+        uvAffineAddImmediate(a, 1.0f);
+        return true;
+      case DxsoRegModifier::Comp: // 1 - r
+        uvAffineMulImmediate(a, -1.0f);
+        uvAffineAddImmediate(a, 1.0f);
+        return true;
+      case DxsoRegModifier::X2:
+        uvAffineMulImmediate(a, 2.0f);
+        return true;
+      case DxsoRegModifier::X2Neg:
+        uvAffineMulImmediate(a, -2.0f);
+        return true;
+      default:
+        return false; // Dz/Dw/Abs/AbsNeg/Not: origin survives, affine does not
+      }
+    }
+
+    struct UvExactComponentOrigin {
+      bool valid = false;
+      uint8_t reg = 0;                 // PS pass: TEXCOORD usage index; VS pass: input register number
+      uint8_t component = 0;           // primary source component (meaningful when componentMask has one bit)
+      uint8_t componentMask = 0;       // all origin components contributing to this value (bit per component)
+      UvComponentAffine affine;
+    };
+
+    static bool uvIsSingleComponentMask(const uint8_t mask) {
+      return mask != 0u && (mask & (mask - 1u)) == 0u;
+    }
+
+    static bool uvOriginSameRegister(const UvExactComponentOrigin& a, const UvExactComponentOrigin& b) {
+      return a.valid && b.valid && a.reg == b.reg;
+    }
+
+    // Merges two value origins that both contribute to one result component (blend endpoints,
+    // clamps, dot products, etc.). Keeping the origin with an inexact affine when one contributor
+    // is unknown deliberately models "base UV plus per-pixel detail" patterns (bump offset,
+    // distortion). Component mixing (e.g. UV rotators) unions the component mask so the sample
+    // site can still be attributed to the packed UV half it reads from.
+    static UvExactComponentOrigin uvMergeOrigins(const UvExactComponentOrigin& a, const UvExactComponentOrigin& b) {
+      if (!a.valid && !b.valid)
+        return UvExactComponentOrigin{};
+
+      if (a.valid != b.valid) {
+        UvExactComponentOrigin merged = a.valid ? a : b;
+        uvAffineMarkInexact(merged.affine);
+        return merged;
+      }
+
+      if (a.reg != b.reg)
+        return UvExactComponentOrigin{};
+
+      UvExactComponentOrigin merged = a;
+      merged.componentMask = uint8_t(a.componentMask | b.componentMask);
+      if (!uvIsSingleComponentMask(merged.componentMask)) {
+        uvAffineMarkInexact(merged.affine);
+      } else if (!uvComponentAffinesEqual(a.affine, b.affine)) {
+        uvAffineMarkInexact(merged.affine);
+      }
+      return merged;
+    }
+
+    struct UvConstComponentRef {
+      bool valid = false;
+      bool isImmediate = false;
+      float immediate = 0.0f;
+      int16_t constReg = -1;
+      uint8_t constComp = 0;
+      float factor = 1.0f;
+    };
+
+    static void uvAffineMulConstRef(UvComponentAffine& a, const UvConstComponentRef& ref) {
+      if (ref.isImmediate)
+        uvAffineMulImmediate(a, ref.immediate);
+      else
+        uvAffineMulConstant(a, ref.constReg, ref.constComp, ref.factor);
+    }
+
+    static void uvAffineAddConstRef(UvComponentAffine& a, const UvConstComponentRef& ref, const float sign) {
+      if (ref.isImmediate)
+        uvAffineAddImmediate(a, sign * ref.immediate);
+      else
+        uvAffineAddConstant(a, ref.constReg, ref.constComp, sign * ref.factor);
+    }
+
+    class UvDataflowTracer {
+    public:
+      UvDataflowTracer(const std::array<int8_t, 2 * DxsoMaxInterfaceRegs>& inputRegToTexcoord,
+                       const bool texcoordRegsAreInterpolants,
+                       const bool originIsSemanticIndex)
+        : m_inputRegToTexcoord(inputRegToTexcoord)
+        , m_texcoordRegsAreInterpolants(texcoordRegsAreInterpolants)
+        , m_originIsSemanticIndex(originIsSemanticIndex) {
+        m_defConstValid.fill(0);
+      }
+
+      void setTrackedOutputRegister(const uint32_t reg) {
+        m_trackedOutputReg = reg;
+      }
+
+      const UvExactComponentOrigin& outputOrigin(const uint32_t component) const {
+        return m_outputOrigins[component & 0x3u];
+      }
+
+      UvConstComponentRef readConst(const DxsoRegister& r, const uint32_t dstComponent) const {
+        UvConstComponentRef ref;
+        if (!isFloatConstantRegisterType(r.id.type) || r.hasRelative)
+          return ref;
+
+        float modifierScale = 1.0f;
+        if (!decodeConstantModifierScale(r.modifier, modifierScale))
+          return ref;
+
+        const int32_t reg = getFloatConstantRegisterIndex(r);
+        if (reg < 0 || reg > int32_t(std::numeric_limits<int16_t>::max()))
+          return ref;
+
+        const uint8_t comp = uint8_t(r.swizzle[dstComponent & 0x3u] & 0x3u);
+        ref.valid = true;
+        if (reg < int32_t(m_defConstValid.size()) && m_defConstValid[reg]) {
+          ref.isImmediate = true;
+          ref.immediate = modifierScale * m_defConsts[reg][comp];
+        } else {
+          ref.constReg = int16_t(reg);
+          ref.constComp = comp;
+          ref.factor = modifierScale;
+        }
+        return ref;
+      }
+
+      UvExactComponentOrigin readOrigin(const DxsoRegister& r, const uint32_t dstComponent) const {
+        const uint8_t srcComponent = uint8_t(r.swizzle[dstComponent & 0x3u] & 0x3u);
+        UvExactComponentOrigin origin;
+
+        switch (r.id.type) {
+        case DxsoRegisterType::Texture: // == Addr in VS; only meaningful for PS
+        case DxsoRegisterType::PixelTexcoord:
+          if (m_texcoordRegsAreInterpolants) {
+            origin.valid = true;
+            origin.reg = m_originIsSemanticIndex ? mapRegToSemantic(r.id.num, true) : uint8_t(r.id.num);
+            origin.component = srcComponent;
+            origin.componentMask = uint8_t(1u << srcComponent);
+          }
+          break;
+        case DxsoRegisterType::Input:
+          if (r.id.num < m_inputRegToTexcoord.size() && m_inputRegToTexcoord[r.id.num] >= 0) {
+            origin.valid = true;
+            origin.reg = m_originIsSemanticIndex ? uint8_t(m_inputRegToTexcoord[r.id.num]) : uint8_t(r.id.num);
+            origin.component = srcComponent;
+            origin.componentMask = uint8_t(1u << srcComponent);
+          }
+          break;
+        case DxsoRegisterType::Temp:
+        case DxsoRegisterType::TempFloat16:
+          if (r.id.num < m_tempOrigins.size())
+            origin = m_tempOrigins[r.id.num][srcComponent];
+          break;
+        default:
+          break;
+        }
+
+        if (origin.valid && r.modifier != DxsoRegModifier::None) {
+          if (!uvAffineApplySourceModifier(origin.affine, r.modifier))
+            uvAffineMarkInexact(origin.affine);
+        }
+
+        return origin;
+      }
+
+      // Merges the origins of the first `componentCount` components of a source operand.
+      // Used for dot-product style consumption where several components feed one result.
+      UvExactComponentOrigin readOriginUnion(const DxsoRegister& r, const uint32_t componentCount) const {
+        UvExactComponentOrigin merged;
+        bool first = true;
+        for (uint32_t c = 0; c < componentCount && c < 4u; c++) {
+          const UvExactComponentOrigin componentOrigin = readOrigin(r, c);
+          if (first) {
+            merged = componentOrigin;
+            first = false;
+          } else {
+            merged = uvMergeOrigins(merged, componentOrigin);
+          }
+        }
+        return merged;
+      }
+
+      void processInstruction(const DxsoInstructionContext& ctx) {
+        const DxsoOpcode op = ctx.instruction.opcode;
+
+        if (op == DxsoOpcode::Def &&
+            ctx.dst.id.type == DxsoRegisterType::Const &&
+            ctx.dst.id.num < m_defConsts.size()) {
+          m_defConstValid[ctx.dst.id.num] = 1;
+          m_defConsts[ctx.dst.id.num] = Vector4(
+            ctx.def.float32[0],
+            ctx.def.float32[1],
+            ctx.def.float32[2],
+            ctx.def.float32[3]);
+          return;
+        }
+
+        // Flow control makes a linear trace unsound (conditional writes, loop-carried values):
+        // conservatively drop all derived provenance at every flow-control boundary. Values read
+        // directly from interpolants/inputs after the boundary remain provable.
+        switch (op) {
+        case DxsoOpcode::If:
+        case DxsoOpcode::Ifc:
+        case DxsoOpcode::Else:
+        case DxsoOpcode::EndIf:
+        case DxsoOpcode::Loop:
+        case DxsoOpcode::EndLoop:
+        case DxsoOpcode::Rep:
+        case DxsoOpcode::EndRep:
+        case DxsoOpcode::Break:
+        case DxsoOpcode::BreakC:
+        case DxsoOpcode::BreakP:
+        case DxsoOpcode::Call:
+        case DxsoOpcode::CallNz:
+        case DxsoOpcode::Label:
+          for (auto& tempComponents : m_tempOrigins)
+            tempComponents = {};
+          for (auto& outputComponent : m_outputOrigins)
+            outputComponent = UvExactComponentOrigin{};
+          return;
+        // note: a trailing `ret` in main must not clear already-written output origins
+        case DxsoOpcode::Ret:
+          for (auto& tempComponents : m_tempOrigins)
+            tempComponents = {};
+          return;
+        default:
+          break;
+        }
+
+        // non-arithmetic opcodes whose dst token is not a value write
+        if (op == DxsoOpcode::Dcl || op == DxsoOpcode::Def ||
+            op == DxsoOpcode::DefI || op == DxsoOpcode::DefB ||
+            op == DxsoOpcode::TexKill || op == DxsoOpcode::Comment)
+          return;
+
+        const bool dstIsTemp =
+          ctx.dst.id.type == DxsoRegisterType::Temp ||
+          ctx.dst.id.type == DxsoRegisterType::TempFloat16;
+        const bool dstIsTrackedOutput =
+          m_trackedOutputReg != std::numeric_limits<uint32_t>::max() &&
+          ctx.dst.id.type == DxsoRegisterType::Output &&
+          ctx.dst.id.num == m_trackedOutputReg;
+
+        if (!dstIsTemp && !dstIsTrackedOutput)
+          return;
+        if (dstIsTemp && ctx.dst.id.num >= m_tempOrigins.size())
+          return;
+
+        for (uint32_t c = 0; c < 4u; c++) {
+          if (!ctx.dst.mask[c])
+            continue;
+
+          UvExactComponentOrigin origin;
+          // predicated writes are conditional - the resulting value origin is unknowable
+          if (!ctx.instruction.predicated)
+            origin = traceComponent(ctx, c);
+
+          if (origin.valid) {
+            if (ctx.dst.shift != 0)
+              uvAffineMulImmediate(origin.affine, std::exp2(float(ctx.dst.shift)));
+            if (ctx.dst.saturate)
+              uvAffineMarkInexact(origin.affine);
+          }
+
+          if (dstIsTemp)
+            m_tempOrigins[ctx.dst.id.num][c] = origin;
+          else
+            m_outputOrigins[c] = origin;
+        }
+      }
+
+      uint8_t mapRegToSemantic(const uint32_t regNum, const bool allowLegacyFallback) const {
+        if (regNum < m_inputRegToTexcoord.size() && m_inputRegToTexcoord[regNum] >= 0)
+          return uint8_t(m_inputRegToTexcoord[regNum]);
+        return allowLegacyFallback ? uint8_t(regNum & 0b111) : uint8_t(regNum);
+      }
+
+    private:
+      UvExactComponentOrigin traceComponent(const DxsoInstructionContext& ctx, const uint32_t c) const {
+        switch (ctx.instruction.opcode) {
+        case DxsoOpcode::Mov:
+        case DxsoOpcode::Frc: // fract() is UV-equivalent under wrap addressing
+        case DxsoOpcode::TexCoord: // ps_1_4 texcrd: moves a texcoord register into a temp
+          return readOrigin(ctx.src[0], c);
+
+        case DxsoOpcode::Abs: {
+          UvExactComponentOrigin origin = readOrigin(ctx.src[0], c);
+          if (origin.valid)
+            uvAffineMarkInexact(origin.affine);
+          return origin;
+        }
+
+        case DxsoOpcode::Mul: {
+          const UvExactComponentOrigin o0 = readOrigin(ctx.src[0], c);
+          const UvExactComponentOrigin o1 = readOrigin(ctx.src[1], c);
+          const UvConstComponentRef k0 = readConst(ctx.src[0], c);
+          const UvConstComponentRef k1 = readConst(ctx.src[1], c);
+
+          if (o0.valid && !o1.valid && k1.valid) {
+            UvExactComponentOrigin origin = o0;
+            uvAffineMulConstRef(origin.affine, k1);
+            return origin;
+          }
+          if (o1.valid && !o0.valid && k0.valid) {
+            UvExactComponentOrigin origin = o1;
+            uvAffineMulConstRef(origin.affine, k0);
+            return origin;
+          }
+          if (o0.valid && o1.valid) {
+            UvExactComponentOrigin merged = uvMergeOrigins(o0, o1);
+            if (merged.valid)
+              uvAffineMarkInexact(merged.affine); // value * value is never affine
+            return merged;
+          }
+          if (o0.valid || o1.valid) {
+            // origin times an unknown factor: keep base provenance, scale unknown
+            UvExactComponentOrigin origin = o0.valid ? o0 : o1;
+            origin.affine.scale.inexact = true;
+            if (uvAffineTermPresent(origin.affine.offset))
+              origin.affine.offset.inexact = true;
+            return origin;
+          }
+          return UvExactComponentOrigin{};
+        }
+
+        case DxsoOpcode::Add:
+        case DxsoOpcode::Sub: {
+          const bool isSub = ctx.instruction.opcode == DxsoOpcode::Sub;
+          const UvExactComponentOrigin o0 = readOrigin(ctx.src[0], c);
+          UvExactComponentOrigin o1 = readOrigin(ctx.src[1], c);
+          if (o1.valid && isSub)
+            uvAffineMulImmediate(o1.affine, -1.0f);
+          const UvConstComponentRef k0 = readConst(ctx.src[0], c);
+          const UvConstComponentRef k1 = readConst(ctx.src[1], c);
+
+          if (o0.valid && !o1.valid && k1.valid) {
+            UvExactComponentOrigin origin = o0;
+            uvAffineAddConstRef(origin.affine, k1, isSub ? -1.0f : 1.0f);
+            return origin;
+          }
+          if (o1.valid && !o0.valid && k0.valid) {
+            UvExactComponentOrigin origin = o1; // already negated when subtracting
+            uvAffineAddConstRef(origin.affine, k0, 1.0f);
+            return origin;
+          }
+          if (o0.valid && o1.valid) {
+            // x + x with identical origin and affine is an exact doubling: fxc strength-reduces
+            // `uv * 2` (e.g. UTiling/VTiling = 2 literals) into a self-add
+            if (!isSub &&
+                uvOriginSameRegister(o0, o1) &&
+                o0.componentMask == o1.componentMask &&
+                uvIsSingleComponentMask(o0.componentMask) &&
+                uvComponentAffinesEqual(o0.affine, o1.affine)) {
+              UvExactComponentOrigin origin = o0;
+              uvAffineMulImmediate(origin.affine, 2.0f);
+              return origin;
+            }
+            UvExactComponentOrigin merged = uvMergeOrigins(o0, o1);
+            if (merged.valid)
+              uvAffineMarkInexact(merged.affine); // sum of two interpolant terms
+            return merged;
+          }
+          if (o0.valid || o1.valid) {
+            // origin plus an unknown term: base UV plus per-pixel detail, offset unknown
+            UvExactComponentOrigin origin = o0.valid ? o0 : o1;
+            origin.affine.offset.inexact = true;
+            return origin;
+          }
+          return UvExactComponentOrigin{};
+        }
+
+        case DxsoOpcode::Mad: {
+          const UvExactComponentOrigin o0 = readOrigin(ctx.src[0], c);
+          const UvExactComponentOrigin o1 = readOrigin(ctx.src[1], c);
+          const UvExactComponentOrigin o2 = readOrigin(ctx.src[2], c);
+          const UvConstComponentRef k0 = readConst(ctx.src[0], c);
+          const UvConstComponentRef k1 = readConst(ctx.src[1], c);
+          const UvConstComponentRef k2 = readConst(ctx.src[2], c);
+
+          UvExactComponentOrigin product;
+          if (o0.valid && !o1.valid && k1.valid) {
+            product = o0;
+            uvAffineMulConstRef(product.affine, k1);
+          } else if (o1.valid && !o0.valid && k0.valid) {
+            product = o1;
+            uvAffineMulConstRef(product.affine, k0);
+          } else if (o0.valid && o1.valid) {
+            product = uvMergeOrigins(o0, o1);
+            if (product.valid)
+              uvAffineMarkInexact(product.affine);
+          } else if (o0.valid || o1.valid) {
+            product = o0.valid ? o0 : o1;
+            product.affine.scale.inexact = true;
+            if (uvAffineTermPresent(product.affine.offset))
+              product.affine.offset.inexact = true;
+          }
+
+          if (product.valid) {
+            if (!o2.valid && k2.valid) {
+              uvAffineAddConstRef(product.affine, k2, 1.0f);
+              return product;
+            }
+            if (o2.valid) {
+              UvExactComponentOrigin merged = uvMergeOrigins(product, o2);
+              if (merged.valid)
+                uvAffineMarkInexact(merged.affine);
+              return merged;
+            }
+            product.affine.offset.inexact = true; // unknown additive term
+            return product;
+          }
+
+          // const * const + origin (e.g. precomputed pan offsets added to a UV)
+          if (o2.valid && !o0.valid && !o1.valid) {
+            UvExactComponentOrigin origin = o2;
+            if (k0.valid && k1.valid) {
+              if (k0.isImmediate && k1.isImmediate) {
+                uvAffineAddImmediate(origin.affine, k0.immediate * k1.immediate);
+              } else if (k0.isImmediate) {
+                uvAffineAddConstant(origin.affine, k1.constReg, k1.constComp, k1.factor * k0.immediate);
+              } else if (k1.isImmediate) {
+                uvAffineAddConstant(origin.affine, k0.constReg, k0.constComp, k0.factor * k1.immediate);
+              } else {
+                origin.affine.offset.inexact = true;
+              }
+            } else {
+              origin.affine.offset.inexact = true;
+            }
+            return origin;
+          }
+          return UvExactComponentOrigin{};
+        }
+
+        case DxsoOpcode::Min:
+        case DxsoOpcode::Max: {
+          const UvExactComponentOrigin o0 = readOrigin(ctx.src[0], c);
+          const UvExactComponentOrigin o1 = readOrigin(ctx.src[1], c);
+          if (o0.valid && o1.valid)
+            return uvMergeOrigins(o0, o1); // min(x,x) stays exact; differing affines go inexact
+          if (o0.valid || o1.valid) {
+            // clamp against a constant/unknown keeps the base origin
+            UvExactComponentOrigin origin = o0.valid ? o0 : o1;
+            uvAffineMarkInexact(origin.affine);
+            return origin;
+          }
+          return UvExactComponentOrigin{};
+        }
+
+        case DxsoOpcode::Lrp:
+          // lerp(src2, src1, src0): src0 is the blend factor, not a value contributor
+          return uvMergeOrigins(readOrigin(ctx.src[1], c), readOrigin(ctx.src[2], c));
+
+        case DxsoOpcode::Cmp:
+        case DxsoOpcode::Cnd:
+          // per-component select between src1/src2; src0 is the condition
+          return uvMergeOrigins(readOrigin(ctx.src[1], c), readOrigin(ctx.src[2], c));
+
+        // single-source value-mangling math: register provenance survives, affine does not
+        case DxsoOpcode::Rcp:
+        case DxsoOpcode::Rsq:
+        case DxsoOpcode::Exp:
+        case DxsoOpcode::Log: {
+          UvExactComponentOrigin origin = readOrigin(ctx.src[0], c);
+          if (origin.valid)
+            uvAffineMarkInexact(origin.affine);
+          return origin;
+        }
+
+        // dot products consume multiple components of their sources: union the origins so
+        // register provenance (and the packed-UV half being read) survives. This is how UV
+        // rotators / matrix transforms (dp2add pairs, m3x2) keep an attributable origin.
+        case DxsoOpcode::Dp2Add: {
+          UvExactComponentOrigin merged = uvMergeOrigins(
+            readOriginUnion(ctx.src[0], 2u),
+            readOriginUnion(ctx.src[1], 2u));
+          merged = uvMergeOrigins(merged, readOrigin(ctx.src[2], c));
+          if (merged.valid)
+            uvAffineMarkInexact(merged.affine);
+          return merged;
+        }
+
+        case DxsoOpcode::Dp3:
+        case DxsoOpcode::Dp4: {
+          const uint32_t count = ctx.instruction.opcode == DxsoOpcode::Dp3 ? 3u : 4u;
+          UvExactComponentOrigin merged = uvMergeOrigins(
+            readOriginUnion(ctx.src[0], count),
+            readOriginUnion(ctx.src[1], count));
+          if (merged.valid)
+            uvAffineMarkInexact(merged.affine);
+          return merged;
+        }
+
+        case DxsoOpcode::M3x2:
+        case DxsoOpcode::M3x3:
+        case DxsoOpcode::M3x4:
+        case DxsoOpcode::M4x3:
+        case DxsoOpcode::M4x4: {
+          const uint32_t count =
+            (ctx.instruction.opcode == DxsoOpcode::M4x3 || ctx.instruction.opcode == DxsoOpcode::M4x4) ? 4u : 3u;
+          // src1 is a matrix-row register sequence (typically constants; readOrigin yields
+          // invalid for those, so the union is driven by the vector operand)
+          UvExactComponentOrigin merged = uvMergeOrigins(
+            readOriginUnion(ctx.src[0], count),
+            readOriginUnion(ctx.src[1], count));
+          if (merged.valid)
+            uvAffineMarkInexact(merged.affine);
+          return merged;
+        }
+
+        default:
+          // anything else (transcendental math, samples, ...) destroys provenance
+          return UvExactComponentOrigin{};
+        }
+      }
+
+      std::array<int8_t, 2 * DxsoMaxInterfaceRegs> m_inputRegToTexcoord;
+      bool m_texcoordRegsAreInterpolants = false;
+      bool m_originIsSemanticIndex = false;
+      uint32_t m_trackedOutputReg = std::numeric_limits<uint32_t>::max();
+
+      std::array<std::array<UvExactComponentOrigin, 4>, 64> m_tempOrigins = {};
+      std::array<UvExactComponentOrigin, 4> m_outputOrigins = {};
+
+      std::array<uint8_t, 256> m_defConstValid = {};
+      std::array<Vector4, 256> m_defConsts = {};
+    };
+
+    // Resolves the exact coordinate origin for every sampler of a pixel shader in one pass.
+    static void analyzePsSamplerUvOrigins(const D3D9CommonShader* pixelShader,
+                                          std::array<PsSamplerUvOrigin, caps::MaxTexturesPS>& outOrigins) {
+      for (auto& origin : outOrigins)
+        origin = PsSamplerUvOrigin{};
+
+      if (pixelShader == nullptr)
+        return;
+
+      const auto& info = pixelShader->GetInfo();
+      if (info.type() != DxsoProgramTypes::PixelShader)
+        return;
+
+      const auto& bytecode = pixelShader->GetBytecode();
+      if (bytecode.size() < sizeof(uint32_t) || (bytecode.size() % sizeof(uint32_t)) != 0)
+        return;
+
+      std::array<int8_t, 2 * DxsoMaxInterfaceRegs> inputRegToTexcoord = {};
+      inputRegToTexcoord.fill(-1);
+      {
+        const auto& isgn = pixelShader->GetIsgn();
+        for (uint32_t i = 0; i < isgn.elemCount; i++) {
+          const auto& e = isgn.elems[i];
+          if (e.semantic.usage == DxsoUsage::Texcoord && e.regNumber < inputRegToTexcoord.size())
+            inputRegToTexcoord[e.regNumber] = int8_t(e.semantic.usageIndex & 0b111);
+        }
+      }
+
+      UvDataflowTracer tracer(inputRegToTexcoord, true /*texcoordRegsAreInterpolants*/, true /*originIsSemanticIndex*/);
+
+      struct SiteRecord {
+        bool valid = false;
+        uint8_t semanticIndex = 0;
+        uint8_t compU = 0;
+        uint8_t compV = 1;
+        bool affineExact = false;
+        UvComponentAffine affineU;
+        UvComponentAffine affineV;
+      };
+
+      const uint32_t* tokens = reinterpret_cast<const uint32_t*>(bytecode.data());
+      DxsoDecodeContext decoder(info);
+      DxsoCodeIter iter(tokens + 1);
+
+      while (decoder.decodeInstruction(iter)) {
+        const DxsoInstructionContext& ctx = decoder.getInstructionContext();
+        const DxsoOpcode op = ctx.instruction.opcode;
+
+        // identify sample sites before the write invalidates the destination temp
+        uint32_t sampledSampler = ~0u;
+        const DxsoRegister* coordReg = nullptr;
+        bool directTexcoordSite = false;
+        bool projected = false;
+        bool untraceableSite = false;
+
+        switch (op) {
+        case DxsoOpcode::Tex:
+          if (info.majorVersion() >= 2) {
+            sampledSampler = ctx.src[1].id.num;
+            coordReg = &ctx.src[0];
+            projected = ctx.instruction.specificData.texld == DxsoTexLdMode::Project;
+          } else if (info.majorVersion() == 1 && info.minorVersion() == 4) {
+            sampledSampler = ctx.dst.id.num;
+            coordReg = &ctx.src[0];
+          } else {
+            // ps_1_0..1_3: `tex t#` samples sampler # at texcoord # directly
+            sampledSampler = ctx.dst.id.num;
+            directTexcoordSite = true;
+          }
+          break;
+        case DxsoOpcode::TexLdd:
+        case DxsoOpcode::TexLdl:
+          sampledSampler = ctx.src[1].id.num;
+          coordReg = &ctx.src[0];
+          break;
+        case DxsoOpcode::TexBem:
+        case DxsoOpcode::TexBemL:
+        case DxsoOpcode::TexReg2Ar:
+        case DxsoOpcode::TexReg2Gb:
+        case DxsoOpcode::TexReg2Rgb:
+        case DxsoOpcode::TexM3x2Tex:
+        case DxsoOpcode::TexM3x3Tex:
+        case DxsoOpcode::TexDp3Tex:
+        case DxsoOpcode::TexM3x3Spec:
+        case DxsoOpcode::TexM3x3VSpec:
+          sampledSampler = ctx.dst.id.num;
+          untraceableSite = true;
+          break;
+        default:
+          break;
+        }
+
+        if (sampledSampler < caps::MaxTexturesPS &&
+            (coordReg != nullptr || directTexcoordSite || untraceableSite)) {
+          PsSamplerUvOrigin& agg = outOrigins[sampledSampler];
+
+          SiteRecord site;
+          if (directTexcoordSite) {
+            site.valid = true;
+            site.semanticIndex = tracer.mapRegToSemantic(ctx.dst.id.num, true);
+            site.compU = 0;
+            site.compV = 1;
+            site.affineExact = true;
+          } else if (coordReg != nullptr) {
+            const UvExactComponentOrigin uOrigin = tracer.readOrigin(*coordReg, 0);
+            const UvExactComponentOrigin vOrigin = tracer.readOrigin(*coordReg, 1);
+            if (uOrigin.valid && vOrigin.valid && uOrigin.reg == vOrigin.reg) {
+              site.valid = true;
+              site.semanticIndex = uOrigin.reg;
+              const bool cleanComponents =
+                uvIsSingleComponentMask(uOrigin.componentMask) &&
+                uvIsSingleComponentMask(vOrigin.componentMask);
+              if (cleanComponents) {
+                site.compU = uOrigin.component;
+                site.compV = vOrigin.component;
+              } else {
+                // component-mixing math (rotators, UV matrices): the register is proven but the
+                // exact pair is not - attribute the packed interpolant half being consumed
+                const uint8_t unionMask = uint8_t(uOrigin.componentMask | vOrigin.componentMask);
+                const bool onlySecondaryHalf =
+                  (unionMask & 0b0011u) == 0u && (unionMask & 0b1100u) != 0u;
+                site.compU = onlySecondaryHalf ? 3u : 0u;
+                site.compV = onlySecondaryHalf ? 2u : 1u;
+              }
+              site.affineU = uOrigin.affine;
+              site.affineV = vOrigin.affine;
+              site.affineExact =
+                cleanComponents &&
+                !projected &&
+                uvComponentAffineExact(uOrigin.affine) &&
+                uvComponentAffineExact(vOrigin.affine);
+            }
+          }
+
+          if (site.valid) {
+            if (agg.validSiteCount < std::numeric_limits<uint16_t>::max())
+              agg.validSiteCount++;
+
+            if (!agg.originValid) {
+              // first valid site is authoritative; later disagreements only clear sitesAgree
+              agg.originValid = true;
+              agg.semanticIndex = site.semanticIndex;
+              agg.compU = site.compU;
+              agg.compV = site.compV;
+              agg.affineU = site.affineU;
+              agg.affineV = site.affineV;
+              agg.affineExact = site.affineExact;
+            } else {
+              const bool matches =
+                agg.semanticIndex == site.semanticIndex &&
+                agg.compU == site.compU &&
+                agg.compV == site.compV &&
+                agg.affineExact == site.affineExact &&
+                uvComponentAffinesEqual(agg.affineU, site.affineU) &&
+                uvComponentAffinesEqual(agg.affineV, site.affineV);
+              if (!matches)
+                agg.sitesAgree = false;
+            }
+          } else {
+            if (agg.invalidSiteCount < std::numeric_limits<uint16_t>::max())
+              agg.invalidSiteCount++;
+            if (agg.originValid)
+              agg.sitesAgree = false;
+          }
+        }
+
+        tracer.processInstruction(ctx);
+      }
+    }
+
+    struct Ue3VsTexcoordTraceResult {
+      Ue3VsUvTraceKind kind = Ue3VsUvTraceKind::Invalid;
+      uint8_t iaTexcoordIndex = 0;
+      uint8_t inputReg = 0;
+      UvComponentAffine affineU;
+      UvComponentAffine affineV;
+    };
+
+    // Traces a VS output TEXCOORD interpolant (components compU/compV) back to the IA:
+    // proves which IA texcoord set feeds it and classifies the math along the way.
     static Ue3VsTexcoordTraceResult traceVsOutputTexcoordToInputUsageIndex(
       const D3D9CommonShader* vertexShader,
       const uint32_t outputRegNumber,
@@ -205,124 +1077,54 @@ namespace dxvk {
         }
       }
 
-      std::array<std::array<Ue3VsComponentOrigin, 4>, 64> tempOrigins = {};
-      std::array<Ue3VsComponentOrigin, 4> outputOrigins = {};
-
-      auto readOriginFromSource = [&](const DxsoRegister& src, const uint32_t dstComponent) -> Ue3VsComponentOrigin {
-        const uint8_t srcComponent = uint8_t(src.swizzle[dstComponent & 0x3u] & 0x3u);
-        switch (src.id.type) {
-        case DxsoRegisterType::Input:
-          if (src.id.num < inputRegToTexcoord.size() && inputRegToTexcoord[src.id.num] >= 0) {
-            Ue3VsComponentOrigin origin;
-            origin.valid = true;
-            origin.inputReg = uint8_t(src.id.num);
-            origin.component = srcComponent;
-            return origin;
-          }
-          break;
-        case DxsoRegisterType::Temp:
-        case DxsoRegisterType::TempFloat16:
-          if (src.id.num < tempOrigins.size())
-            return tempOrigins[src.id.num][srcComponent];
-          break;
-        default:
-          break;
-        }
-
-        return Ue3VsComponentOrigin{};
-      };
-
-      auto mergeOrigins = [&](std::initializer_list<Ue3VsComponentOrigin> origins) {
-        Ue3VsComponentOrigin merged;
-        for (const Ue3VsComponentOrigin& origin : origins) {
-          if (!origin.valid)
-            continue;
-
-          if (!merged.valid) {
-            merged = origin;
-          } else if (!sameUe3VsComponentOrigin(merged, origin)) {
-            return Ue3VsComponentOrigin{};
-          }
-        }
-
-        return merged;
-      };
-
-      auto traceInstructionComponent = [&](const DxsoInstructionContext& ctx, const uint32_t dstComponent) {
-        switch (ctx.instruction.opcode) {
-        case DxsoOpcode::Mov:
-        case DxsoOpcode::Abs:
-        case DxsoOpcode::Frc:
-          return readOriginFromSource(ctx.src[0], dstComponent);
-        case DxsoOpcode::Add:
-        case DxsoOpcode::Sub:
-        case DxsoOpcode::Mul:
-        case DxsoOpcode::Min:
-        case DxsoOpcode::Max:
-          return mergeOrigins({
-            readOriginFromSource(ctx.src[0], dstComponent),
-            readOriginFromSource(ctx.src[1], dstComponent) });
-        case DxsoOpcode::Mad:
-        case DxsoOpcode::Lrp:
-        case DxsoOpcode::Cmp:
-        case DxsoOpcode::Dp2Add:
-          return mergeOrigins({
-            readOriginFromSource(ctx.src[0], dstComponent),
-            readOriginFromSource(ctx.src[1], dstComponent),
-            readOriginFromSource(ctx.src[2], dstComponent) });
-        default:
-          break;
-        }
-
-        return Ue3VsComponentOrigin{};
-      };
-
-      auto isTraceableDestination = [](const DxsoRegister& dst) {
-        return dst.id.type == DxsoRegisterType::Temp ||
-               dst.id.type == DxsoRegisterType::TempFloat16 ||
-               dst.id.type == DxsoRegisterType::Output;
-      };
+      UvDataflowTracer tracer(inputRegToTexcoord, false /*texcoordRegsAreInterpolants*/, false /*originIsSemanticIndex*/);
+      tracer.setTrackedOutputRegister(outputRegNumber);
 
       const uint32_t* tokens = reinterpret_cast<const uint32_t*>(bytecode.data());
       DxsoDecodeContext decoder(info);
       DxsoCodeIter iter(tokens + 1);
 
-      while (decoder.decodeInstruction(iter)) {
-        const DxsoInstructionContext& ctx = decoder.getInstructionContext();
-        if (!isTraceableDestination(ctx.dst))
-          continue;
+      while (decoder.decodeInstruction(iter))
+        tracer.processInstruction(decoder.getInstructionContext());
 
-        for (uint32_t c = 0; c < 4u; c++) {
-          if (!ctx.dst.mask[c])
-            continue;
+      const UvExactComponentOrigin& uOrigin = tracer.outputOrigin(compU);
+      const UvExactComponentOrigin& vOrigin = tracer.outputOrigin(compV);
 
-          const Ue3VsComponentOrigin origin = traceInstructionComponent(ctx, c);
-          if (ctx.dst.id.type == DxsoRegisterType::Temp ||
-              ctx.dst.id.type == DxsoRegisterType::TempFloat16) {
-            if (ctx.dst.id.num < tempOrigins.size())
-              tempOrigins[ctx.dst.id.num][c] = origin;
-          } else if (ctx.dst.id.num == outputRegNumber) {
-            outputOrigins[c] = origin;
-          }
-        }
+      if (!uOrigin.valid || !vOrigin.valid || uOrigin.reg != vOrigin.reg)
+        return result;
+
+      if (uOrigin.reg >= inputRegToTexcoord.size() || inputRegToTexcoord[uOrigin.reg] < 0)
+        return result;
+
+      result.inputReg = uOrigin.reg;
+      result.iaTexcoordIndex = uint8_t(inputRegToTexcoord[uOrigin.reg]);
+      result.affineU = uOrigin.affine;
+      result.affineV = vOrigin.affine;
+
+      // IA texcoord sets are float2 streams: an exact IA representation requires the
+      // interpolant components to be exactly U <- .x and V <- .y of a single set
+      const bool pureComponentMapping =
+        uvIsSingleComponentMask(uOrigin.componentMask) &&
+        uvIsSingleComponentMask(vOrigin.componentMask) &&
+        uOrigin.component == 0u && vOrigin.component == 1u;
+
+      if (!pureComponentMapping) {
+        result.kind = Ue3VsUvTraceKind::OriginOnly;
+        return result;
       }
 
-      const Ue3VsComponentOrigin uOrigin = outputOrigins[compU & 0x3u];
-      const Ue3VsComponentOrigin vOrigin = outputOrigins[compV & 0x3u];
-      if (!uOrigin.valid || !vOrigin.valid || uOrigin.inputReg != vOrigin.inputReg)
+      const bool affinesExact =
+        uvComponentAffineExact(uOrigin.affine) &&
+        uvComponentAffineExact(vOrigin.affine);
+      if (!affinesExact) {
+        result.kind = Ue3VsUvTraceKind::OriginOnly;
         return result;
+      }
 
-      if (uOrigin.component != 0u || vOrigin.component != 1u)
-        return result;
-
-      if (uOrigin.inputReg >= inputRegToTexcoord.size() || inputRegToTexcoord[uOrigin.inputReg] < 0)
-        return result;
-
-      result.valid = true;
-      result.iaTexcoordIndex = uint8_t(inputRegToTexcoord[uOrigin.inputReg]);
-      result.inputReg = uOrigin.inputReg;
-      result.sourceCompU = uOrigin.component;
-      result.sourceCompV = vOrigin.component;
+      const bool affinesIdentity =
+        uvComponentAffineIsIdentity(uOrigin.affine) &&
+        uvComponentAffineIsIdentity(vOrigin.affine);
+      result.kind = affinesIdentity ? Ue3VsUvTraceKind::PureMove : Ue3VsUvTraceKind::AffineConst;
       return result;
     }
 
@@ -588,7 +1390,6 @@ namespace dxvk {
 
     struct PsSamplerTexcoordInference {
       int32_t texcoord = -1;
-      int32_t texcoordReg = -1;
       bool coordCompValid = false;
       uint8_t coordCompU = 0;
       uint8_t coordCompV = 1;
@@ -632,42 +1433,6 @@ namespace dxvk {
       float offsetImmediateV = 0.0f;
     };
 
-    static bool isFloatConstantRegisterType(const DxsoRegisterType type) {
-      return type == DxsoRegisterType::Const
-          || type == DxsoRegisterType::Const2
-          || type == DxsoRegisterType::Const3
-          || type == DxsoRegisterType::Const4;
-    }
-
-    static int32_t getFloatConstantRegisterIndex(const DxsoRegister& r) {
-      switch (r.id.type) {
-      case DxsoRegisterType::Const:
-        return int32_t(r.id.num);
-      case DxsoRegisterType::Const2:
-        return 2048 + int32_t(r.id.num);
-      case DxsoRegisterType::Const3:
-        return 4096 + int32_t(r.id.num);
-      case DxsoRegisterType::Const4:
-        return 6144 + int32_t(r.id.num);
-      default:
-        return -1;
-      }
-    }
-
-    static bool decodeConstantModifierScale(const DxsoRegModifier modifier, float& outScale) {
-      switch (modifier) {
-      case DxsoRegModifier::None:
-        outScale = 1.0f;
-        return true;
-      case DxsoRegModifier::Neg:
-        outScale = -1.0f;
-        return true;
-      default:
-        outScale = 1.0f;
-        return false;
-      }
-    }
-
     // Infer which TEXCOORD set (usageIndex) a pixel shader uses for a given sampler by analyzing shader bytecode,
     // also captures UE3-style TextureCoordinate scaling (UTiling/VTiling) when emitted as `TexCoord * cN`
     static PsSamplerTexcoordInference inferPixelShaderTexcoordForSampler(const D3D9CommonShader* pixelShader, const uint32_t samplerIdx) {
@@ -701,8 +1466,6 @@ namespace dxvk {
 
       std::array<int8_t, 64> tempToTexcoord = {};
       tempToTexcoord.fill(-1);
-      std::array<int8_t, 64> tempToTexcoordReg = {};
-      tempToTexcoordReg.fill(-1);
 
       std::array<PsTexcoordScaleHint, 64> tempToScaleHint = {};
       std::array<uint8_t, 64> tempCoordProvenance = {};
@@ -740,23 +1503,6 @@ namespace dxvk {
         case DxsoRegisterType::Temp:
         case DxsoRegisterType::TempFloat16:
           return (r.id.num < tempToTexcoord.size()) ? tempToTexcoord[r.id.num] : -1;
-        default:
-          return -1;
-        }
-      };
-
-      auto getTexcoordRegFromRegister = [&](const DxsoRegister& r) -> int32_t {
-        switch (r.id.type) {
-        case DxsoRegisterType::Texture:
-        case DxsoRegisterType::PixelTexcoord:
-          return int32_t(r.id.num);
-        case DxsoRegisterType::Input:
-          return (r.id.num < inputRegToTexcoord.size() && inputRegToTexcoord[r.id.num] >= 0)
-            ? int32_t(r.id.num)
-            : -1;
-        case DxsoRegisterType::Temp:
-        case DxsoRegisterType::TempFloat16:
-          return (r.id.num < tempToTexcoordReg.size()) ? tempToTexcoordReg[r.id.num] : -1;
         default:
           return -1;
         }
@@ -973,9 +1719,6 @@ namespace dxvk {
 
       std::array<uint32_t, 8> texcoordUseCount = {};
       texcoordUseCount.fill(0);
-      std::array<std::array<uint16_t, 2 * DxsoMaxInterfaceRegs>, 8> texcoordRegUseCount = {};
-      for (auto& regUseCount : texcoordRegUseCount)
-        regUseCount.fill(0);
       std::array<std::array<uint16_t, 16>, 8> texcoordCoordPairUseCount = {};
       for (auto& coordPairUseCount : texcoordCoordPairUseCount)
         coordPairUseCount.fill(0);
@@ -1008,7 +1751,6 @@ namespace dxvk {
         if ((ctx.dst.id.type == DxsoRegisterType::Temp || ctx.dst.id.type == DxsoRegisterType::TempFloat16) &&
             ctx.dst.id.num < tempToTexcoord.size()) {
           int32_t derived = -1;
-          int32_t derivedReg = -1;
           bool writesTrackedTemp = false;
           PsTexcoordScaleHint derivedScaleHint;
           uint8_t derivedExpressionFlags =
@@ -1021,7 +1763,6 @@ namespace dxvk {
 
           auto assignFromSource = [&](const DxsoRegister& srcReg) {
             derived = getTexcoordFromRegister(srcReg);
-            derivedReg = getTexcoordRegFromRegister(srcReg);
             derivedExpressionFlags |= getCoordExpressionFlagsFromRegister(srcReg);
             derivedSamplerValueRole |= classifySamplerValueRoleWithSwizzle(srcReg);
             if (derived < 0)
@@ -1187,9 +1928,6 @@ namespace dxvk {
               }
             } else {
               derived = mergeSingle({ tc0, tc1 });
-              derivedReg = mergeSingle({
-                getTexcoordRegFromRegister(ctx.src[0]),
-                getTexcoordRegFromRegister(ctx.src[1]) });
             }
             break;
           }
@@ -1216,9 +1954,6 @@ namespace dxvk {
               assignFromSource(ctx.src[1]);
             } else {
               derived = mergeSingle({ tc0, tc1 });
-              derivedReg = mergeSingle({
-                getTexcoordRegFromRegister(ctx.src[0]),
-                getTexcoordRegFromRegister(ctx.src[1]) });
             }
             if (derived >= 0 &&
                 (op == DxsoOpcode::Dp3 || op == DxsoOpcode::Dp4 ||
@@ -1262,9 +1997,6 @@ namespace dxvk {
               }
             } else {
               derived = mergeSingle({ tc0, tc1 });
-              derivedReg = mergeSingle({
-                getTexcoordRegFromRegister(ctx.src[0]),
-                getTexcoordRegFromRegister(ctx.src[1]) });
               if (derived < 0) {
                 PsTexcoordScaleHint h0, h1;
                 if (tryLoadConstantLikeHint(ctx.src[0], h0) &&
@@ -1333,10 +2065,6 @@ namespace dxvk {
               }
             } else {
               derived = mergeSingle({ tc0, tc1, tc2 });
-              derivedReg = mergeSingle({
-                getTexcoordRegFromRegister(ctx.src[0]),
-                getTexcoordRegFromRegister(ctx.src[1]),
-                getTexcoordRegFromRegister(ctx.src[2]) });
             }
             if (derived >= 0)
               derivedExpressionFlags |= kPsSamplerExprUvTransform;
@@ -1350,10 +2078,6 @@ namespace dxvk {
               getTexcoordFromRegister(ctx.src[0]),
               getTexcoordFromRegister(ctx.src[1]),
               getTexcoordFromRegister(ctx.src[2]) });
-            derivedReg = mergeSingle({
-              getTexcoordRegFromRegister(ctx.src[0]),
-              getTexcoordRegFromRegister(ctx.src[1]),
-              getTexcoordRegFromRegister(ctx.src[2]) });
             if (derived >= 0)
               derivedExpressionFlags |= kPsSamplerExprBlendMath;
             break;
@@ -1435,7 +2159,6 @@ namespace dxvk {
 
           if (derived >= 0) {
             tempToTexcoord[ctx.dst.id.num] = int8_t(derived);
-            tempToTexcoordReg[ctx.dst.id.num] = int8_t(derivedReg);
             tempCoordExpressionFlags[ctx.dst.id.num] = derivedExpressionFlags;
             tempSamplerValueRole[ctx.dst.id.num] = derivedSamplerValueRole;
             tempCoordProvenance[ctx.dst.id.num] =
@@ -1450,7 +2173,6 @@ namespace dxvk {
               tempToScaleHint[ctx.dst.id.num] = PsTexcoordScaleHint{};
           } else if (writesTrackedTemp) {
             tempToTexcoord[ctx.dst.id.num] = -1;
-            tempToTexcoordReg[ctx.dst.id.num] = -1;
             tempCoordExpressionFlags[ctx.dst.id.num] = derivedExpressionFlags;
             tempSamplerValueRole[ctx.dst.id.num] = derivedSamplerValueRole;
             tempCoordProvenance[ctx.dst.id.num] =
@@ -1606,13 +2328,6 @@ namespace dxvk {
               uint16_t& pairCount = texcoordCoordPairUseCount[tcIdx][pairIdx];
               if (pairCount < std::numeric_limits<uint16_t>::max())
                 pairCount = uint16_t(pairCount + 1u);
-
-              const int32_t tcReg = getTexcoordRegFromRegister(*swizzleReg);
-              if (tcReg >= 0 && uint32_t(tcReg) < texcoordRegUseCount[tcIdx].size()) {
-                uint16_t& regCount = texcoordRegUseCount[tcIdx][uint32_t(tcReg)];
-                if (regCount < std::numeric_limits<uint16_t>::max())
-                  regCount = uint16_t(regCount + 1u);
-              }
             }
           }
 
@@ -1679,18 +2394,6 @@ namespace dxvk {
       if (foundTexcoord >= 0 && uint32_t(foundTexcoord) < perTexcoordScaleHints.size()) {
         const auto& agg = perTexcoordScaleHints[uint32_t(foundTexcoord)];
         const uint32_t tcIdx = uint32_t(foundTexcoord);
-        {
-          uint32_t bestRegCount = 0;
-          int32_t bestReg = -1;
-          for (uint32_t reg = 0; reg < texcoordRegUseCount[tcIdx].size(); reg++) {
-            const uint32_t regCount = texcoordRegUseCount[tcIdx][reg];
-            if (regCount > bestRegCount) {
-              bestRegCount = regCount;
-              bestReg = int32_t(reg);
-            }
-          }
-          result.texcoordReg = bestReg;
-        }
         {
           uint32_t totalPairCount = 0;
           uint32_t bestPairCount = 0;
@@ -2934,6 +3637,7 @@ namespace dxvk {
     mix(m_iaTexcoordIndex);
     mix(m_texcoordCompU);
     mix(m_texcoordCompV);
+    mix(m_uvResolutionMode);
     mix(m_forceIaTexcoordForOutlier);
     mix(ue3NativeLocalMeshVertexCapture());
 
@@ -3201,35 +3905,38 @@ namespace dxvk {
     geoData.positionBuffer = RasterBuffer(slice, 0, stride, VK_FORMAT_R32G32B32A32_SFLOAT);
     assert(geoData.positionBuffer.offset() % 4 == 0);
 
-    uint32_t capturedTexcoordOutputRegister = FindVsTexcoordOutputRegister(vertexShader, m_texcoordIndex);
-    if (capturedTexcoordOutputRegister == std::numeric_limits<uint32_t>::max()) {
-      if (!ue3EngineMode())
-        capturedTexcoordOutputRegister = FindVsTexcoordOutputRegisterByRegNumber(vertexShader, m_texcoordIndex);
+    // Obey the deterministic UV resolution made in processTextures:
+    // - ProvenIa: the exact IA texcoord set is bound by processVertices; do not capture UVs
+    // - CaptureInterpolant: capture the proven interpolant register/components (correct by
+    //   construction for procedural or otherwise unprovable VS-side UV math)
+    // - LegacyTss: no provable resolution; keep the legacy capture cascade
+    uint32_t capturedTexcoordOutputRegister = std::numeric_limits<uint32_t>::max();
+    switch (m_uvResolutionMode) {
+    case UvResolutionMode::ProvenIa:
+      if (!hasIaTexcoord) {
+        // proven IA set is missing from this draw's declaration (degenerate);
+        // the captured interpolant is still exact
+        capturedTexcoordOutputRegister = FindVsTexcoordOutputRegister(vertexShader, m_texcoordIndex);
+      }
+      break;
+    case UvResolutionMode::CaptureInterpolant:
+      capturedTexcoordOutputRegister = FindVsTexcoordOutputRegister(vertexShader, m_texcoordIndex);
+      if (capturedTexcoordOutputRegister == std::numeric_limits<uint32_t>::max())
+        capturedTexcoordOutputRegister = FindUniqueVsTexcoordOutputRegister(vertexShader);
+      break;
+    case UvResolutionMode::LegacyTss:
+    default:
+      capturedTexcoordOutputRegister = FindVsTexcoordOutputRegister(vertexShader, m_texcoordIndex);
+      if (capturedTexcoordOutputRegister == std::numeric_limits<uint32_t>::max()) {
+        if (!ue3EngineMode())
+          capturedTexcoordOutputRegister = FindVsTexcoordOutputRegisterByRegNumber(vertexShader, m_texcoordIndex);
+      }
+      if (capturedTexcoordOutputRegister == std::numeric_limits<uint32_t>::max())
+        capturedTexcoordOutputRegister = FindUniqueVsTexcoordOutputRegister(vertexShader);
+      break;
     }
-    if (capturedTexcoordOutputRegister == std::numeric_limits<uint32_t>::max())
-      capturedTexcoordOutputRegister = FindUniqueVsTexcoordOutputRegister(vertexShader);
     if (forceIaTexcoordForOutlier)
       capturedTexcoordOutputRegister = std::numeric_limits<uint32_t>::max();
-    if (ue3EngineMode() && capturePositionFromInput && hasIaTexcoord) {
-      // UE3 LocalVertexFactory capture deliberately keeps object space IA
-      // positions - keep IA UVs too so the deterministic interpolant->IA trace
-      // can correct packed material UV channels
-      capturedTexcoordOutputRegister = std::numeric_limits<uint32_t>::max();
-    }
-
-    // UE3 packs UV pairs into float4 VS outputs as .xy = even UV, .wz = odd UV
-    // the only valid component extractions are (0,1) for .xy and (3,2) for .wz
-    // when PS inference produces a non standard swizzle (e.g. .yz, .yw)
-    // it's mixing components from different UV sets which is wrong
-    // fallback to IA texcoords in that case - the IA always provides the correct 2-component UV directly
-    if (ue3EngineMode() && hasIaTexcoord &&
-        capturedTexcoordOutputRegister != std::numeric_limits<uint32_t>::max()) {
-      const bool isStandardXy = (m_texcoordCompU == 0 && m_texcoordCompV == 1);
-      const bool isStandardWz = (m_texcoordCompU == 3 && m_texcoordCompV == 2);
-      if (!isStandardXy && !isStandardWz) {
-        capturedTexcoordOutputRegister = std::numeric_limits<uint32_t>::max();
-      }
-    }
 
     // Shader path with vertex capture: prefer VS output TEXCOORD to preserve any VS-side UV math.
     if (BoundShaderHasAnyUsageIndex(vertexShader, DxsoUsage::Texcoord, false) &&
@@ -3486,43 +4193,8 @@ namespace dxvk {
         VkFormat fmt = DecodeDecltype(D3DDECLTYPE(element.Type));
         uint32_t elementOffset = element.Offset;
 
-        if (!ue3EngineMode() &&
-            element.Usage == D3DDECLUSAGE_TEXCOORD &&
-            m_texcoordCompV == uint8_t(m_texcoordCompU + 1) &&
-            (m_texcoordCompU != 0 || m_texcoordCompV != 1)) {
-          auto describeTexcoordFormat = [](VkFormat format, uint32_t& outCompCount, uint32_t& outCompSize) {
-            outCompCount = 0;
-            outCompSize = 0;
-            switch (format) {
-            case VK_FORMAT_R16G16_SFLOAT:
-              outCompCount = 2; outCompSize = 2; return true;
-            case VK_FORMAT_R16G16B16A16_SFLOAT:
-              outCompCount = 4; outCompSize = 2; return true;
-            case VK_FORMAT_R32G32_SFLOAT:
-              outCompCount = 2; outCompSize = 4; return true;
-            case VK_FORMAT_R32G32B32_SFLOAT:
-              outCompCount = 3; outCompSize = 4; return true;
-            case VK_FORMAT_R32G32B32A32_SFLOAT:
-              outCompCount = 4; outCompSize = 4; return true;
-            default:
-              return false;
-            }
-          };
-
-          uint32_t compCount = 0;
-          uint32_t compSize = 0;
-          if (describeTexcoordFormat(fmt, compCount, compSize) &&
-              m_texcoordCompV < compCount) {
-            const uint32_t byteOffset = uint32_t(m_texcoordCompU) * compSize;
-            if ((byteOffset % 4u) == 0u) {
-              elementOffset += byteOffset;
-              if (compSize == 2)
-                fmt = VK_FORMAT_R16G16_SFLOAT;
-              else if (compSize == 4)
-                fmt = VK_FORMAT_R32G32_SFLOAT;
-            }
-          }
-        }
+        // note: m_texcoordCompU/V select VS interpolant components (capture path only);
+        // a proven IA texcoord element is always a plain (u, v) pair and is read as-is
 
         // UE3 packed normals use D3DDECLTYPE_UBYTE4 (not normalised) so for remix purposes we want a decoded
         // [-1, 1] normal and the interleaver supports VK_FORMAT_R8G8B8A8_UNORM for this
@@ -5155,82 +5827,6 @@ namespace dxvk {
       return std::abs(uOffset) > kOffsetEps || std::abs(vOffset) > kOffsetEps;
     };
 
-    auto resolveInferredSamplerScale = [&](const PsSamplerTexcoordEntry* entry, const uint32_t stage, float& outU, float& outV) -> bool {
-      outU = 1.0f;
-      outV = 1.0f;
-
-      if (entry == nullptr || stage >= caps::MaxTexturesPS)
-        return false;
-
-      if (entry->samplerScaleImmediateValid[stage]) {
-        outU = entry->samplerScaleImmediateU[stage];
-        outV = entry->samplerScaleImmediateV[stage];
-        return std::isfinite(outU) && std::isfinite(outV);
-      }
-
-      const int16_t scaleConstReg = entry->samplerScaleConstReg[stage];
-      if (scaleConstReg >= 0 && uint32_t(scaleConstReg) < caps::MaxFloatConstantsPS) {
-        const Vector4& scaleConst = d3d9State().psConsts.fConsts[uint32_t(scaleConstReg)];
-        const uint32_t compU = entry->samplerScaleConstCompU[stage] & 0x3;
-        const uint32_t compV = entry->samplerScaleConstCompV[stage] & 0x3;
-        outU = scaleConst[compU] * entry->samplerScaleFactorU[stage];
-        outV = scaleConst[compV] * entry->samplerScaleFactorV[stage];
-        return std::isfinite(outU) && std::isfinite(outV);
-      }
-
-      return false;
-    };
-
-    auto vertexDeclHasFloat2Texcoord = [&](const uint32_t usageIndex) -> bool {
-      if (d3d9State().vertexDecl.ptr() == nullptr)
-        return false;
-
-      for (const auto& element : d3d9State().vertexDecl->GetElements()) {
-        if (element.Usage == D3DDECLUSAGE_TEXCOORD &&
-            element.UsageIndex == usageIndex &&
-            element.Type == D3DDECLTYPE_FLOAT2) {
-          return true;
-        }
-      }
-
-      return false;
-    };
-
-    auto vertexDeclHasFloat16x2Texcoord = [&](const uint32_t usageIndex) -> bool {
-      if (d3d9State().vertexDecl.ptr() == nullptr)
-        return false;
-
-      for (const auto& element : d3d9State().vertexDecl->GetElements()) {
-        if (element.Usage == D3DDECLUSAGE_TEXCOORD &&
-            element.UsageIndex == usageIndex &&
-            element.Type == D3DDECLTYPE_FLOAT16_2) {
-          return true;
-        }
-      }
-
-      return false;
-    };
-
-    auto vertexDeclTexcoordAppearsBefore = [&](const uint32_t firstUsageIndex, const uint32_t secondUsageIndex) -> bool {
-      if (d3d9State().vertexDecl.ptr() == nullptr)
-        return false;
-
-      int32_t firstPosition = -1;
-      int32_t secondPosition = -1;
-      int32_t position = 0;
-      for (const auto& element : d3d9State().vertexDecl->GetElements()) {
-        if (element.Usage == D3DDECLUSAGE_TEXCOORD) {
-          if (element.UsageIndex == firstUsageIndex)
-            firstPosition = position;
-          if (element.UsageIndex == secondUsageIndex)
-            secondPosition = position;
-          position++;
-        }
-      }
-
-      return firstPosition >= 0 && secondPosition >= 0 && firstPosition < secondPosition;
-    };
-
     auto getOrInitPsSamplerTexcoordEntry = [&](const D3D9CommonShader* ps, XXH64_hash_t& outHash) -> PsSamplerTexcoordEntry* {
       if (ps == nullptr)
         return nullptr;
@@ -5239,8 +5835,8 @@ namespace dxvk {
       auto& entry = m_psSamplerTexcoordCache[outHash];
       if (!entry.initialized) {
         entry.initialized = true;
+        analyzePsSamplerUvOrigins(ps, entry.samplerUvOrigin);
         entry.samplerToTexcoord.fill(-1);
-        entry.samplerToTexcoordReg.fill(-1);
         entry.samplerCoordCompValid.fill(0);
         entry.samplerCoordCompU.fill(0);
         entry.samplerCoordCompV.fill(1);
@@ -5266,7 +5862,6 @@ namespace dxvk {
         for (uint32_t s = 0; s < caps::MaxTexturesPS; s++) {
           const PsSamplerTexcoordInference inferred = inferPixelShaderTexcoordForSampler(ps, s);
           entry.samplerToTexcoord[s] = int8_t(inferred.texcoord);
-          entry.samplerToTexcoordReg[s] = int8_t(inferred.texcoordReg);
           entry.samplerCoordCompValid[s] = inferred.coordCompValid ? 1u : 0u;
           entry.samplerCoordCompU[s] = inferred.coordCompU;
           entry.samplerCoordCompV[s] = inferred.coordCompV;
@@ -6057,7 +6652,7 @@ namespace dxvk {
     // upper bits are D3DTSS_TCI_* flags used for fixed-function texgen
     uint32_t texcoordIdx = d3d9State().textureStages[stageStateIdx][DXVK_TSS_TEXCOORDINDEX] & 0b111;
     uint32_t iaTexcoordIdx = texcoordIdx;
-    bool ue3VsTexcoordTraceValid = false;
+    m_uvResolutionMode = UvResolutionMode::LegacyTss;
 
     m_forceIaTexcoordForOutlier = [&]() {
       const auto& outlierSet = vsTexcoordCaptureOutlierTextures();
@@ -6083,8 +6678,6 @@ namespace dxvk {
 
       return false;
     }();
-
-    m_psInferredSampleCount = 0;
 
     if constexpr (!FixedFunction) {
       const bool forceIaTexcoordForOutlier = m_forceIaTexcoordForOutlier;
@@ -6113,14 +6706,43 @@ namespace dxvk {
           entry.initialized = true;
           const Ue3VsTexcoordTraceResult trace =
             traceVsOutputTexcoordToInputUsageIndex(vs, outputReg, compU, compV);
-          entry.valid = trace.valid;
+          entry.kind = trace.kind;
           entry.iaTexcoordIndex = trace.iaTexcoordIndex;
           entry.inputReg = trace.inputReg;
-          entry.sourceCompU = trace.sourceCompU;
-          entry.sourceCompV = trace.sourceCompV;
+          entry.affineU = trace.affineU;
+          entry.affineV = trace.affineV;
         }
 
         return &entry;
+      };
+
+      // resolves an affine term against live draw-time shader constants
+      auto resolvePsAffineTermValue = [&](const UvAffineTerm& term, const float identity, float& outValue) -> bool {
+        outValue = identity;
+        if (term.inexact)
+          return false;
+        if (term.constReg >= 0) {
+          if (uint32_t(term.constReg) >= caps::MaxFloatConstantsPS)
+            return false;
+          outValue = d3d9State().psConsts.fConsts[uint32_t(term.constReg)][term.constComp & 0x3u] * term.factor;
+        } else if (term.immValid) {
+          outValue = term.imm;
+        }
+        return std::isfinite(outValue);
+      };
+
+      auto resolveVsAffineTermValue = [&](const UvAffineTerm& term, const float identity, float& outValue) -> bool {
+        outValue = identity;
+        if (term.inexact)
+          return false;
+        if (term.constReg >= 0) {
+          if (uint32_t(term.constReg) >= caps::MaxFloatConstantsSoftware)
+            return false;
+          outValue = d3d9State().vsConsts.fConsts[uint32_t(term.constReg)][term.constComp & 0x3u] * term.factor;
+        } else if (term.immValid) {
+          outValue = term.imm;
+        }
+        return std::isfinite(outValue);
       };
 
       if ((shaderPathTexcoordIndexFromPixelShader() || ue3EngineMode()) &&
@@ -6135,237 +6757,187 @@ namespace dxvk {
 
         if (entryPtr != nullptr && firstStage < caps::MaxTexturesPS) {
           const auto& entry = *entryPtr;
-          int8_t inferred = entry.samplerToTexcoord[firstStage];
-          int8_t inferredReg = entry.samplerToTexcoordReg[firstStage];
-          // GPUSkinMorphVF uses TEXCOORD6/7 for morph deltas, not texture UVs
-          if (isUe3MorphVF && inferred >= 6) {
-            inferred = 0;
-            inferredReg = 0;
-          }
-          if (inferred >= 0) {
-            m_psInferredSampleCount = entry.samplerSampleCount[firstStage];
-            texcoordIdx = uint32_t(inferred);
-            iaTexcoordIdx = texcoordIdx;
-            if (entry.samplerCoordCompValid[firstStage] && !forceIaTexcoordForOutlier) {
-              const uint8_t inferredCompU = entry.samplerCoordCompU[firstStage] & 0x3u;
-              const uint8_t inferredCompV = entry.samplerCoordCompV[firstStage] & 0x3u;
-              m_texcoordCompU = inferredCompU;
-              m_texcoordCompV = inferredCompV;
+          const PsSamplerUvOrigin& uvOrigin = entry.samplerUvOrigin[firstStage];
+
+          const D3D9CommonShader* vs =
+            (m_parent->UseProgrammableVS() && d3d9State().vertexShader.ptr() != nullptr)
+              ? d3d9State().vertexShader->GetCommonShader()
+              : nullptr;
+
+          const Ue3VsTexcoordTraceEntry* traceEntry = nullptr;
+
+          if (uvOrigin.originValid) {
+            texcoordIdx = uvOrigin.semanticIndex;
+            m_texcoordCompU = uvOrigin.compU;
+            m_texcoordCompV = uvOrigin.compV;
+
+            uint32_t vsTexcoordOutputReg = std::numeric_limits<uint32_t>::max();
+            if (vs != nullptr) {
+              vsTexcoordOutputReg = findVsTexcoordOutputRegister(vs, texcoordIdx);
+              if (vsTexcoordOutputReg != std::numeric_limits<uint32_t>::max())
+                traceEntry = getOrInitVsTexcoordTraceEntry(vs, vsTexcoordOutputReg, m_texcoordCompU, m_texcoordCompV);
             }
 
-            if (ue3EngineMode() &&
-                d3d9State().vertexShader.ptr() != nullptr &&
-                !forceIaTexcoordForOutlier) {
-              const D3D9CommonShader* vs = d3d9State().vertexShader->GetCommonShader();
-              const uint32_t ue3VsTexcoordOutputReg = findVsTexcoordOutputRegister(vs, texcoordIdx);
+            // VS-side proof: interpolant == vsAffine(IA texcoord set k)
+            float vsScaleU = 1.0f;
+            float vsScaleV = 1.0f;
+            float vsOffsetU = 0.0f;
+            float vsOffsetV = 0.0f;
+            bool vsAffineFold = false;
+            int32_t provenIaIndex = -1;
+            if (traceEntry != nullptr) {
+              if (traceEntry->kind == Ue3VsUvTraceKind::PureMove) {
+                provenIaIndex = traceEntry->iaTexcoordIndex;
+              } else if (traceEntry->kind == Ue3VsUvTraceKind::AffineConst) {
+                // the IA set is only usable if the VS transform resolves against live constants
+                if (resolveVsAffineTermValue(traceEntry->affineU.scale, 1.0f, vsScaleU) &&
+                    resolveVsAffineTermValue(traceEntry->affineU.offset, 0.0f, vsOffsetU) &&
+                    resolveVsAffineTermValue(traceEntry->affineV.scale, 1.0f, vsScaleV) &&
+                    resolveVsAffineTermValue(traceEntry->affineV.offset, 0.0f, vsOffsetV)) {
+                  provenIaIndex = traceEntry->iaTexcoordIndex;
+                  vsAffineFold = true;
+                }
+              }
+            } else if (vs == nullptr && m_texcoordCompU == 0u && m_texcoordCompV == 1u) {
+              // fixed-function vertex processing: interpolant slot j is fed from the IA set
+              // selected by stage j's texcoord index state
+              const uint32_t ffStage = std::min(texcoordIdx, uint32_t(caps::TextureStageCount - 1u));
+              provenIaIndex = int32_t(d3d9State().textureStages[ffStage][DXVK_TSS_TEXCOORDINDEX] & 0b111);
+            }
 
-              if (ue3VsTexcoordOutputReg != std::numeric_limits<uint32_t>::max()) {
-                Ue3VsTexcoordTraceEntry* traceEntry =
-                  getOrInitVsTexcoordTraceEntry(vs, ue3VsTexcoordOutputReg, m_texcoordCompU, m_texcoordCompV);
-                if (traceEntry != nullptr && traceEntry->valid) {
-                  ue3VsTexcoordTraceValid = true;
-                  iaTexcoordIdx = traceEntry->iaTexcoordIndex;
+            const bool canCaptureInterpolant =
+              vs != nullptr &&
+              useVertexCapture() &&
+              vsTexcoordOutputReg != std::numeric_limits<uint32_t>::max();
+
+            if (forceIaTexcoordForOutlier) {
+              // manual override via vsTexcoordCaptureOutlierTextures
+              m_uvResolutionMode = UvResolutionMode::ProvenIa;
+              iaTexcoordIdx = provenIaIndex >= 0 ? uint32_t(provenIaIndex) : texcoordIdx;
+              m_texcoordCompU = 0;
+              m_texcoordCompV = 1;
+            } else if (provenIaIndex >= 0) {
+              m_uvResolutionMode = UvResolutionMode::ProvenIa;
+              iaTexcoordIdx = uint32_t(provenIaIndex);
+            } else if (canCaptureInterpolant) {
+              // the VS-side path is procedural or unprovable: capture the exact interpolant
+              // from the VS output instead of guessing an IA set
+              m_uvResolutionMode = UvResolutionMode::CaptureInterpolant;
+              iaTexcoordIdx = (traceEntry != nullptr && traceEntry->kind != Ue3VsUvTraceKind::Invalid)
+                ? traceEntry->iaTexcoordIndex  // known base set: best backstop if capture cannot run
+                : 0u;
+            } else {
+              m_uvResolutionMode = UvResolutionMode::LegacyTss;
+              iaTexcoordIdx = texcoordIdx;
+            }
+
+            // exact UV transform: sampledUv = psAffine(interpolant),
+            // interpolant = vsAffine(iaUv) when the IA path is used
+            float psScaleU = 1.0f;
+            float psScaleV = 1.0f;
+            float psOffsetU = 0.0f;
+            float psOffsetV = 0.0f;
+            const bool psAffineResolved =
+              uvOrigin.affineExact &&
+              resolvePsAffineTermValue(uvOrigin.affineU.scale, 1.0f, psScaleU) &&
+              resolvePsAffineTermValue(uvOrigin.affineU.offset, 0.0f, psOffsetU) &&
+              resolvePsAffineTermValue(uvOrigin.affineV.scale, 1.0f, psScaleV) &&
+              resolvePsAffineTermValue(uvOrigin.affineV.offset, 0.0f, psOffsetV);
+            if (!psAffineResolved) {
+              // non-affine or unresolvable PS math: keep the proven base UV, apply no transform
+              psScaleU = 1.0f;
+              psScaleV = 1.0f;
+              psOffsetU = 0.0f;
+              psOffsetV = 0.0f;
+            }
+
+            float finalScaleU = psScaleU;
+            float finalScaleV = psScaleV;
+            float finalOffsetU = psOffsetU;
+            float finalOffsetV = psOffsetV;
+            if (m_uvResolutionMode == UvResolutionMode::ProvenIa && vsAffineFold) {
+              // ps(vs(uv)) = (psScale * vsScale) * uv + (psScale * vsOffset + psOffset)
+              finalScaleU = psScaleU * vsScaleU;
+              finalScaleV = psScaleV * vsScaleV;
+              finalOffsetU = psScaleU * vsOffsetU + psOffsetU;
+              finalOffsetV = psScaleV * vsOffsetV + psOffsetV;
+            }
+
+            constexpr float kMinAbsScale = 1e-6f;
+            const bool transformIsIdentity =
+              finalScaleU == 1.0f && finalScaleV == 1.0f &&
+              finalOffsetU == 0.0f && finalOffsetV == 0.0f;
+            const bool transformIsUsable =
+              std::isfinite(finalScaleU) && std::isfinite(finalScaleV) &&
+              std::isfinite(finalOffsetU) && std::isfinite(finalOffsetV) &&
+              std::abs(finalScaleU) > kMinAbsScale && std::abs(finalScaleV) > kMinAbsScale;
+
+            if (!transformIsIdentity && transformIsUsable) {
+              Matrix4& texXform = m_activeDrawCallState.transformData.textureTransform;
+              texXform = Matrix4();
+              texXform[0].x = finalScaleU;
+              texXform[1].y = finalScaleV;
+              texXform[3].x = finalOffsetU;
+              texXform[3].y = finalOffsetV;
+            }
+          } else {
+            // the sampled coordinate has no provable interpolant origin (screen-space,
+            // reflection-driven, or untraceable): keep upstream-style TSS behavior
+            m_uvResolutionMode = UvResolutionMode::LegacyTss;
+          }
+
+          if (ue3LogUvResolution() || Logger::logLevel() <= LogLevel::Debug) {
+            const XXH64_hash_t colorTextureHash =
+              m_activeDrawCallState.materialData.colorTextures[0].getImageHash();
+
+            XXH64_hash_t logKey = psHash;
+            auto mixLog = [&](const uint64_t v) {
+              logKey ^= v + 0x9E3779B97F4A7C15ull + (logKey << 6) + (logKey >> 2);
+            };
+            mixLog(firstStage);
+            mixLog(uint64_t(m_uvResolutionMode));
+            mixLog(texcoordIdx);
+            mixLog(iaTexcoordIdx);
+            mixLog((uint64_t(m_texcoordCompU) << 8) | uint64_t(m_texcoordCompV));
+            mixLog(colorTextureHash);
+
+            if (m_loggedUvResolutions.insert(logKey).second) {
+              const char* modeName = "legacy-tss";
+              if (m_uvResolutionMode == UvResolutionMode::ProvenIa) {
+                modeName = "proven-ia";
+              } else if (m_uvResolutionMode == UvResolutionMode::CaptureInterpolant) {
+                modeName = "capture-interpolant";
+              }
+
+              const char* traceKindName = "none";
+              if (traceEntry != nullptr) {
+                switch (traceEntry->kind) {
+                case Ue3VsUvTraceKind::PureMove: traceKindName = "pure-move"; break;
+                case Ue3VsUvTraceKind::AffineConst: traceKindName = "affine-const"; break;
+                case Ue3VsUvTraceKind::OriginOnly: traceKindName = "origin-only"; break;
+                default: traceKindName = "invalid"; break;
                 }
               }
 
-              bool psRegTraceAttempted = false;
-              bool psRegTraceValid = false;
-              if (inferredReg >= 0) {
-                psRegTraceAttempted = true;
-                Ue3VsTexcoordTraceEntry* psRegTraceEntry =
-                  getOrInitVsTexcoordTraceEntry(vs, uint32_t(inferredReg), m_texcoordCompU, m_texcoordCompV);
-                psRegTraceValid = psRegTraceEntry != nullptr && psRegTraceEntry->valid;
+              const std::string msg = str::format(
+                "[RTX-UV] ", modeName,
+                ": ps=0x", std::hex, psHash,
+                ", tex=0x", colorTextureHash, std::dec,
+                ", stage=", firstStage,
+                ", originValid=", uvOrigin.originValid,
+                ", interpolantTexcoord=", texcoordIdx,
+                ", comps=(", uint32_t(m_texcoordCompU), ",", uint32_t(m_texcoordCompV), ")",
+                ", iaSet=", iaTexcoordIdx,
+                ", vsTrace=", traceKindName,
+                ", sites=", uvOrigin.validSiteCount, " valid/", uvOrigin.invalidSiteCount, " invalid",
+                uvOrigin.sitesAgree ? "" : " [AMBIGUOUS: sample sites disagree]",
+                uvOrigin.affineExact ? "" : " [affine-inexact]",
+                m_forceIaTexcoordForOutlier ? " [outlier-override]" : "");
+              if (ue3LogUvResolution()) {
+                Logger::info(msg);
+              } else {
+                Logger::debug(msg);
               }
-
-              float explicitScaleU = 1.0f;
-              float explicitScaleV = 1.0f;
-              const bool hasExplicitScale =
-                resolveInferredSamplerScale(&entry, firstStage, explicitScaleU, explicitScaleV);
-              constexpr float kSecondaryUvScaleEps = 1e-5f;
-              const bool hasNonIdentityExplicitScale =
-                hasExplicitScale &&
-                (std::abs(explicitScaleU - 1.0f) > kSecondaryUvScaleEps ||
-                 std::abs(explicitScaleV - 1.0f) > kSecondaryUvScaleEps);
-              const bool hasTwoAxisNonUniformExplicitScale =
-                hasExplicitScale &&
-                std::abs(explicitScaleU - 1.0f) > kSecondaryUvScaleEps &&
-                std::abs(explicitScaleV - 1.0f) > kSecondaryUvScaleEps &&
-                std::abs(explicitScaleU - explicitScaleV) > kSecondaryUvScaleEps;
-              const bool hasFloat2ExplicitTexcoord =
-                inferred >= 0 && vertexDeclHasFloat2Texcoord(uint32_t(inferred));
-              const bool hasFloat16x2ExplicitTexcoord =
-                inferred >= 0 && vertexDeclHasFloat16x2Texcoord(uint32_t(inferred));
-              const bool hasVOnlyDoubleScale =
-                hasExplicitScale &&
-                std::abs(explicitScaleU - 1.0f) <= kSecondaryUvScaleEps &&
-                std::abs(explicitScaleV - 2.0f) <= kSecondaryUvScaleEps;
-              const bool hasAlternateHalfUvDeclarationOrder =
-                hasFloat16x2ExplicitTexcoord &&
-                vertexDeclTexcoordAppearsBefore(3u, 2u);
-              const bool hasAnimatedMultiSampleSecondaryUv =
-                hasAlternateHalfUvDeclarationOrder &&
-                entry.samplerSampleCount[firstStage] > 1u;
-
-              // UE3 Local-style vertex factories can expose material UVs through a shifted
-              // packed interpolant while the IA still stores each material UV set separately.
-              // Keep the explicit secondary material UV when the normal semantic trace maps
-              // back to UV0 but the PS register path cannot be traced through the VS
-              const bool secondaryMaterialTexcoordBase =
-                ue3VsTexcoordTraceValid &&
-                (vfType == Ue3VertexFactoryType::Local ||
-                 vfType == Ue3VertexFactoryType::LocalDecal ||
-                 vfType == Ue3VertexFactoryType::SpeedTree) &&
-                (entry.samplerSemanticFlags[firstStage] & kPsSamplerSemanticMaterialTexture) != 0 &&
-                inferred > 0 &&
-                m_texcoordCompU == 0u &&
-                m_texcoordCompV == 1u &&
-                psRegTraceAttempted &&
-                !psRegTraceValid &&
-                iaTexcoordIdx != uint32_t(inferred);
-              const bool secondaryTransformedSingleSampleTexcoord =
-                secondaryMaterialTexcoordBase &&
-                entry.samplerSampleCount[firstStage] == 1u &&
-                hasNonIdentityExplicitScale;
-              const bool explicitTransformedSecondaryMaterialTexcoord =
-                (secondaryTransformedSingleSampleTexcoord &&
-                 ((hasTwoAxisNonUniformExplicitScale && hasFloat2ExplicitTexcoord) ||
-                  (hasVOnlyDoubleScale && hasAlternateHalfUvDeclarationOrder))) ||
-                (secondaryMaterialTexcoordBase && hasAnimatedMultiSampleSecondaryUv);
-              if (explicitTransformedSecondaryMaterialTexcoord) {
-                iaTexcoordIdx = uint32_t(inferred);
-              }
-            }
-
-            if (!ue3VsTexcoordTraceValid &&
-                entry.samplerCoordCompValid[firstStage] &&
-                !forceIaTexcoordForOutlier) {
-              const uint8_t inferredCompU = entry.samplerCoordCompU[firstStage] & 0x3u;
-              const uint8_t inferredCompV = entry.samplerCoordCompV[firstStage] & 0x3u;
-              const bool inferredUsesPackedSecondaryPair =
-                (inferredCompU == 2u && inferredCompV == 3u) ||
-                (inferredCompU == 3u && inferredCompV == 2u);
-
-              // Fallback only: when the VS trace cannot prove the IA UV channel, keep the
-              // older skinned-mesh guard against likely non-diffuse packed UV pairs.
-              const bool trustPsSwizzle = m_psInferredSampleCount >= 4u;
-              if (likelyGpuSkinnedMesh &&
-                  inferredUsesPackedSecondaryPair &&
-                  !trustPsSwizzle) {
-                m_texcoordCompU = 0;
-                m_texcoordCompV = 1;
-              }
-            }
-
-            // additional guard for skinned meshes using packed atlas UVs
-            // if inference points at a non-UV0 set with a large offset, clamp to UV0 `.xy`
-            if (!ue3VsTexcoordTraceValid &&
-                likelyGpuSkinnedMesh &&
-                texcoordIdx > 0 &&
-                !forceIaTexcoordForOutlier) {
-              float inferredOffsetU = 0.0f;
-              float inferredOffsetV = 0.0f;
-              const bool hasResolvedOffset = resolveInferredSamplerOffset(&entry, firstStage, inferredOffsetU, inferredOffsetV);
-              constexpr float kLargeAtlasOffset = 0.2f;
-              const bool hasLargeOffset = hasResolvedOffset &&
-                (std::abs(inferredOffsetU) >= kLargeAtlasOffset || std::abs(inferredOffsetV) >= kLargeAtlasOffset);
-              if (hasLargeOffset) {
-                texcoordIdx = 0;
-                iaTexcoordIdx = 0;
-                m_texcoordCompU = 0;
-                m_texcoordCompV = 1;
-              }
-            }
-          } else {
-            const uint8_t semanticFlags = entry.samplerSemanticFlags[firstStage];
-            const uint8_t expressionFlags = entry.samplerExpressionFlags[firstStage];
-            const bool missingTexcoordMaterialSampler =
-              ue3EngineMode() &&
-              (vfType == Ue3VertexFactoryType::Local ||
-               vfType == Ue3VertexFactoryType::LocalDecal ||
-               vfType == Ue3VertexFactoryType::SpeedTree) &&
-              d3d9State().vertexShader.ptr() != nullptr &&
-              !forceIaTexcoordForOutlier &&
-              entry.samplerSampleCount[firstStage] > 0u &&
-              (semanticFlags & kPsSamplerSemanticMaterialTexture) != 0 &&
-              (expressionFlags & kPsSamplerExprUvOffset) != 0 &&
-              (expressionFlags & kPsSamplerExprBlendMath) != 0 &&
-              vertexDeclHasFloat16x2Texcoord(1u) &&
-              vertexDeclTexcoordAppearsBefore(3u, 2u);
-            if (missingTexcoordMaterialSampler) {
-              texcoordIdx = 1u;
-              iaTexcoordIdx = 1u;
-              m_texcoordCompU = 0u;
-              m_texcoordCompV = 1u;
-            }
-          }
-
-          bool hasScale = false;
-          float uScale = 1.0f;
-          float vScale = 1.0f;
-          bool hasOffset = false;
-          float uOffset = 0.0f;
-          float vOffset = 0.0f;
-
-          if (entry.samplerScaleImmediateValid[firstStage]) {
-            hasScale = true;
-            uScale = entry.samplerScaleImmediateU[firstStage];
-            vScale = entry.samplerScaleImmediateV[firstStage];
-          } else {
-            const int16_t scaleConstReg = entry.samplerScaleConstReg[firstStage];
-            if (scaleConstReg >= 0 && uint32_t(scaleConstReg) < caps::MaxFloatConstantsPS) {
-              hasScale = true;
-              const Vector4& scaleConst = d3d9State().psConsts.fConsts[uint32_t(scaleConstReg)];
-              const uint32_t compU = entry.samplerScaleConstCompU[firstStage] & 0x3;
-              const uint32_t compV = entry.samplerScaleConstCompV[firstStage] & 0x3;
-              uScale = scaleConst[compU] * entry.samplerScaleFactorU[firstStage];
-              vScale = scaleConst[compV] * entry.samplerScaleFactorV[firstStage];
-            }
-          }
-
-          if (entry.samplerOffsetImmediateValid[firstStage]) {
-            hasOffset = true;
-            uOffset = entry.samplerOffsetImmediateU[firstStage];
-            vOffset = entry.samplerOffsetImmediateV[firstStage];
-          } else {
-            const int16_t offsetConstReg = entry.samplerOffsetConstReg[firstStage];
-            if (offsetConstReg >= 0 && uint32_t(offsetConstReg) < caps::MaxFloatConstantsPS) {
-              hasOffset = true;
-              const Vector4& offsetConst = d3d9State().psConsts.fConsts[uint32_t(offsetConstReg)];
-              const uint32_t compU = entry.samplerOffsetConstCompU[firstStage] & 0x3;
-              const uint32_t compV = entry.samplerOffsetConstCompV[firstStage] & 0x3;
-              uOffset = offsetConst[compU] * entry.samplerOffsetFactorU[firstStage];
-              vOffset = offsetConst[compV] * entry.samplerOffsetFactorV[firstStage];
-            }
-          }
-
-          constexpr float kMinAbsScale = 1e-6f;
-          bool applyScale = hasScale &&
-            std::isfinite(uScale) && std::isfinite(vScale) &&
-            std::abs(uScale) > kMinAbsScale && std::abs(vScale) > kMinAbsScale;
-          bool applyOffset = hasOffset &&
-            std::isfinite(uOffset) && std::isfinite(vOffset);
-          if (applyOffset && likelyGpuSkinnedMesh) {
-            // keep tile scale but reject large atlas-like offsets on skinned diffuse paths
-            constexpr float kLargeAtlasOffset = 0.2f;
-            if (std::abs(uOffset) >= kLargeAtlasOffset || std::abs(vOffset) >= kLargeAtlasOffset)
-              applyOffset = false;
-          }
-
-          if (applyScale || applyOffset) {
-            Matrix4& texXform = m_activeDrawCallState.transformData.textureTransform;
-
-            texXform = Matrix4();
-
-            if (applyScale) {
-              // UE3 TextureCoordinate compiles to a UV multiply by (UTiling, VTiling).
-              texXform[0].x = uScale;
-              texXform[1].y = vScale;
-            }
-
-            if (applyOffset) {
-              // Handle common UE3 UV panning/offset patterns (e.g. texcoord * scale + offset).
-              texXform[3].x = uOffset;
-              texXform[3].y = vOffset;
             }
           }
         }

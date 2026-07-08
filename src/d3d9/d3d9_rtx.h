@@ -31,6 +31,52 @@ namespace dxvk {
   }
   using PrepareDrawFlags = uint32_t;
 
+  // Exact UV dataflow analysis types (shared between the PS coordinate-origin resolver,
+  // the VS interpolant->IA trace, and the per-draw UV decision in D3D9Rtx).
+  //
+  // A UvAffineTerm models one term of `value' = value * scale + offset` where the term is
+  // either a shader `def` immediate (immValid) or a draw-time float constant register
+  // component multiplied by a static factor (constReg >= 0). When neither is set the term
+  // is absent (identity for scale, zero for offset). `inexact` marks terms that encountered
+  // math not representable in this model (the origin may still be provable).
+  struct UvAffineTerm {
+    bool immValid = false;
+    float imm = 0.0f;
+    int16_t constReg = -1;
+    uint8_t constComp = 0;
+    float factor = 1.0f;
+    bool inexact = false;
+  };
+
+  struct UvComponentAffine {
+    UvAffineTerm scale;   // absent => 1.0
+    UvAffineTerm offset;  // absent => 0.0
+  };
+
+  // Deterministic resolution of the coordinate a pixel shader feeds into a sampler:
+  // proves (or fails to prove) that both the U and V components of every sample site
+  // originate from components of a single TEXCOORD interpolant, with an affine chain.
+  struct PsSamplerUvOrigin {
+    bool originValid = false;    // U/V proven to originate from one TEXCOORD interpolant
+    bool sitesAgree = true;      // all valid sample sites agreed on origin + affine
+    bool affineExact = false;    // affine chain fully representable for both components
+    uint8_t semanticIndex = 0;   // TEXCOORD usage index of the source interpolant
+    uint8_t compU = 0;           // interpolant component feeding sample U
+    uint8_t compV = 1;           // interpolant component feeding sample V
+    UvComponentAffine affineU;
+    UvComponentAffine affineV;
+    uint16_t validSiteCount = 0;
+    uint16_t invalidSiteCount = 0;
+  };
+
+  // Classification of the VS-side path from an output TEXCOORD interpolant back to the IA.
+  enum class Ue3VsUvTraceKind : uint8_t {
+    Invalid = 0,     // origin could not be proven (procedural UVs, mixed inputs, unsupported ops)
+    PureMove,        // interpolant components == IA texcoord set `.xy` exactly
+    AffineConst,     // interpolant == IA texcoord `.xy` * scale + offset (constants/immediates)
+    OriginOnly,      // origin proven but the VS math is not representable as an affine transform
+  };
+
   //This class handles all of the RTX operations that are required from the D3D9 side.
   struct D3D9Rtx {
     friend class ImGUI; // <-- we want to modify these values directly.
@@ -89,6 +135,9 @@ namespace dxvk {
                "UE3 compat experimental: use input-assembler object-space positions directly for conservative static LocalVertexFactory draws instead of reconstructing positions from clip space.");
     RTX_OPTION("rtx.d3d9", bool, ue3LogClassification, false,
                "UE3 compat: log explicit pass and vertex factory classification decisions for draw-call routing diagnostics.");
+    RTX_OPTION("rtx.d3d9", bool, ue3LogUvResolution, false,
+               "UE3 compat: log the deterministic UV resolution decision (proven IA set / captured interpolant / legacy fallback) "
+               "once per unique pixel shader + stage combination, including ambiguity diagnostics.");
     RTX_OPTION("rtx.d3d9", bool, ue3LogCapturePrecision, false,
                "UE3 compat: log camera-cell, hash, cache, and matrix diagnostics for vertex capture precision issues.");
     RTX_OPTION("rtx", bool, enableIndexBufferMemoization, true, "CPU performance optimization, should generally be enabled.  Will reduce main thread time by caching processIndexBuffer operations and reusing when possible, this will come at the expense of some CPU RAM.");
@@ -270,7 +319,18 @@ namespace dxvk {
     DWORD m_iaTexcoordIndex = 0;
     uint8_t m_texcoordCompU = 0;
     uint8_t m_texcoordCompV = 1;
-    uint16_t m_psInferredSampleCount = 0;
+
+    // Per-draw result of the deterministic UV resolution:
+    // - LegacyTss: no provable resolution, behave like upstream (TSS index + optional capture fallbacks)
+    // - ProvenIa: PS origin + VS trace proved an exact IA texcoord set; use IA texcoords
+    // - CaptureInterpolant: PS origin proven but the VS path is procedural/unprovable;
+    //   capture the exact interpolant components from the VS output instead of guessing an IA set
+    enum class UvResolutionMode : uint8_t {
+      LegacyTss = 0,
+      ProvenIa,
+      CaptureInterpolant,
+    };
+    UvResolutionMode m_uvResolutionMode = UvResolutionMode::LegacyTss;
 
     // two pass translucency dedup - track previous draw's shader/texture state
     // to detect UE3 back+front face translucency passes on the same mesh
@@ -416,8 +476,10 @@ namespace dxvk {
     // pixel shader texcoord inference cache (for shader-path UV selection)
     struct PsSamplerTexcoordEntry {
       bool initialized = false;
+      // exact per-sampler coordinate origin resolution (authoritative for the UV decision)
+      std::array<PsSamplerUvOrigin, caps::MaxTexturesPS> samplerUvOrigin;
+      // statistical inference below is used for diffuse-sampler *scoring* only
       std::array<int8_t, caps::MaxTexturesPS> samplerToTexcoord;
-      std::array<int8_t, caps::MaxTexturesPS> samplerToTexcoordReg;
       std::array<uint8_t, caps::MaxTexturesPS> samplerCoordCompValid;
       std::array<uint8_t, caps::MaxTexturesPS> samplerCoordCompU;
       std::array<uint8_t, caps::MaxTexturesPS> samplerCoordCompV;
@@ -442,15 +504,15 @@ namespace dxvk {
       std::array<float, caps::MaxTexturesPS> samplerOffsetImmediateV;
     };
     fast_unordered_cache<PsSamplerTexcoordEntry> m_psSamplerTexcoordCache;
-    fast_unordered_set m_loggedPsSamplerTexcoordInference;
+    fast_unordered_set m_loggedUvResolutions;
 
     struct Ue3VsTexcoordTraceEntry {
       bool initialized = false;
-      bool valid = false;
+      Ue3VsUvTraceKind kind = Ue3VsUvTraceKind::Invalid;
       uint8_t iaTexcoordIndex = 0;
       uint8_t inputReg = 0;
-      uint8_t sourceCompU = 0;
-      uint8_t sourceCompV = 1;
+      UvComponentAffine affineU;
+      UvComponentAffine affineV;
     };
     fast_unordered_cache<Ue3VsTexcoordTraceEntry> m_ue3VsTexcoordTraceCache;
     fast_unordered_set m_autoRaytracedRenderTargetDescHashes;

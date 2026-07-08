@@ -1082,8 +1082,8 @@ namespace dxvk {
         currentInstance.surface.isTextureFactorBlend = drawCall.getMaterialData().isTextureFactorBlend;
         currentInstance.surface.isVertexColorBakedLighting = drawCall.getMaterialData().isVertexColorBakedLighting;
         bool colorTextureIsSrgb = drawCall.getMaterialData().colorTextureIsSrgb;
-        if (materialData.getType() == MaterialDataType::Opaque) {
-          const TextureRef& albedoTexture = materialData.getOpaqueMaterialData().getAlbedoOpacityTexture();
+        if (materialData->getType() == MaterialDataType::Opaque) {
+          const TextureRef& albedoTexture = materialData->getOpaqueMaterialData().getAlbedoOpacityTexture();
           if (albedoTexture.isValid()) {
             colorTextureIsSrgb = isTextureRefSrgb(albedoTexture);
           }
