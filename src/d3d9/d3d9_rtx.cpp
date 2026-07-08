@@ -1128,24 +1128,36 @@ namespace dxvk {
       return result;
     }
 
-    // UE3 reserves PS constants c0, c1, c2 (PSR_ColorBiasFactor, PSR_ScreenPositionScaleBias, PSR_MinZ_MaxZ_Ratio)
-    // material params (VectorParameterValues e.g. DiffuseColor, ScalarParameterValues) live in UniformVector_* and UniformScalar_*
-    // we parse the shader CTAB to find their register indices, fallback to fixed range if CTAB is empty/stripped
-    constexpr uint32_t kUe3PsMaterialConstantsStart = 3;
-    constexpr uint32_t kUe3PsMaterialConstantsCount = 77;
+    // Material texture params (TextureParameterValues) live in samplers the UE3 material
+    // translator names Texture2D_* / TextureCube_*, and material constants (VectorParameterValues
+    // e.g. DiffuseColor, ScalarParameterValues) in UniformVector_* / UniformScalar_* registers -
+    // the shader CTAB is parsed for both.
+    // Note: UE3 also writes frame-varying uniform expression values (Time, fades, sub-UV frames)
+    // into the same constant registers; the two are indistinguishable at the D3D9 level, so
+    // shaders doing that must be opted out of constants-based identity via
+    // rtx.d3d9.ue3MicConstantIdentityExcludedShaders.
+    constexpr uint16_t kD3dxRegisterSetSampler = 3u;
 
-    using Ue3PsMaterialConstRanges = std::vector<std::pair<uint32_t, uint32_t>>;
+    // merged (start, count) register ranges of UniformVector_* / UniformScalar_* constants
+    using Ue3MaterialConstRanges = std::vector<std::pair<uint32_t, uint32_t>>;
 
-    static Ue3PsMaterialConstRanges parseUe3PsMaterialConstRangesFromCtab(const std::vector<uint8_t>& bytecode) {
-      Ue3PsMaterialConstRanges ranges;
+    struct Ue3PsMaterialIdentityInfo {
+      Ue3MaterialConstRanges constRanges;
+      // bit per sampler index: CTAB sampler strictly named texture2d_* / texturecube_* / texture3d_*
+      uint32_t materialSamplerMask = 0;
+      bool hasCtab = false;
+    };
+
+    static Ue3PsMaterialIdentityInfo parseUe3PsMaterialIdentityFromCtab(const std::vector<uint8_t>& bytecode) {
+      Ue3PsMaterialIdentityInfo info;
       if (bytecode.size() < sizeof(uint32_t) || (bytecode.size() % sizeof(uint32_t)) != 0)
-        return ranges;
+        return info;
 
       const uint32_t* tokens = reinterpret_cast<const uint32_t*>(bytecode.data());
       const uint32_t headerToken = tokens[0];
       const uint32_t headerTypeMask = headerToken & 0xffff0000u;
       if (headerTypeMask != 0xffff0000u)
-        return ranges;
+        return info;
 
       const uint32_t majorVersion = (headerToken >> 8) & 0xffu;
       const uint32_t minorVersion = headerToken & 0xffu;
@@ -1160,18 +1172,31 @@ namespace dxvk {
 
       const DxsoCtab& ctab = decoder.getCtabInfo();
       if (ctab.m_size == 0 || ctab.m_constantData.empty())
-        return ranges;
+        return info;
 
-      auto lower = [](const std::string& s) {
-        std::string out;
-        out.reserve(s.size());
-        for (const char c : s)
-          out.push_back(char(std::tolower(static_cast<unsigned char>(c))));
-        return out;
+      info.hasCtab = true;
+
+      auto startsWith = [](const std::string& s, const char* prefix) {
+        return s.rfind(prefix, 0) == 0;
       };
 
       for (const DxsoCtab::Constant& c : ctab.m_constantData) {
-        const std::string name = lower(c.name);
+        const std::string name = toLowerAscii(c.name);
+
+        if (c.registerSet == kD3dxRegisterSetSampler) {
+          // strict prefix rule: only the numbered sampler names emitted by the UE3 material
+          // translator count as material texture parameters; lightmaps/scene/shadow samplers
+          // use other names and must stay out of the material identity
+          if (c.registerCount != 0 &&
+              (startsWith(name, "texture2d_") || startsWith(name, "texturecube_") || startsWith(name, "texture3d_"))) {
+            const uint32_t end = std::min<uint32_t>(c.registerIndex + c.registerCount, caps::MaxTexturesPS);
+            for (uint32_t s = c.registerIndex; s < end; s++) {
+              info.materialSamplerMask |= (1u << s);
+            }
+          }
+          continue;
+        }
+
         const bool isUniformVector = name.find("uniformvector_") != std::string::npos;
         const bool isUniformScalar = name.find("uniformscalar_") != std::string::npos;
         if (!isUniformVector && !isUniformScalar)
@@ -1180,15 +1205,15 @@ namespace dxvk {
           continue;
         if (c.registerIndex + c.registerCount > caps::MaxFloatConstantsPS)
           continue;
-        ranges.emplace_back(c.registerIndex, c.registerCount);
+        info.constRanges.emplace_back(c.registerIndex, c.registerCount);
       }
 
-      if (ranges.empty())
-        return ranges;
+      if (info.constRanges.empty())
+        return info;
 
-      std::sort(ranges.begin(), ranges.end());
-      Ue3PsMaterialConstRanges merged;
-      for (const auto& r : ranges) {
+      std::sort(info.constRanges.begin(), info.constRanges.end());
+      Ue3MaterialConstRanges merged;
+      for (const auto& r : info.constRanges) {
         if (merged.empty() || r.first > merged.back().first + merged.back().second) {
           merged.push_back(r);
         } else {
@@ -1196,44 +1221,95 @@ namespace dxvk {
           merged.back().second = end - merged.back().first;
         }
       }
-      return merged;
+      info.constRanges = std::move(merged);
+      return info;
     }
 
-    static XXH64_hash_t hashUe3PixelShaderMaterialConstantsWithRanges(
+    // Returns kEmptyHash when ranges is empty: without CTAB info, a raw register-range
+    // fallback would fold per-view/per-mesh constants into the hash.
+    static XXH64_hash_t hashUe3MaterialConstants(
         const Vector4* fConsts,
-        const Ue3PsMaterialConstRanges& ranges) {
+        const Ue3MaterialConstRanges& ranges) {
       if (ranges.empty())
-        return XXH3_64bits(&fConsts[kUe3PsMaterialConstantsStart], kUe3PsMaterialConstantsCount * sizeof(Vector4));
+        return kEmptyHash;
 
       XXH3_state_t* const state = XXH3_createState();
-      if (!state)
-        return XXH3_64bits(&fConsts[kUe3PsMaterialConstantsStart], kUe3PsMaterialConstantsCount * sizeof(Vector4));
+      if (state == nullptr)
+        return kEmptyHash;
       XXH3_64bits_reset(state);
-      for (const auto& r : ranges) {
-        const uint32_t start = r.first;
-        const uint32_t count = r.second;
-        if (start + count <= caps::MaxFloatConstantsPS)
-          XXH3_64bits_update(state, &fConsts[start], count * sizeof(Vector4));
+
+      bool anyRegisterHashed = false;
+      for (const auto& [start, count] : ranges) {
+        if (start + count > caps::MaxFloatConstantsPS)
+          continue;
+        XXH3_64bits_update(state, &fConsts[start], count * sizeof(Vector4));
+        anyRegisterHashed = true;
       }
-      const XXH64_hash_t result = XXH3_64bits_digest(state);
+
+      const XXH64_hash_t result = anyRegisterHashed ? XXH3_64bits_digest(state) : kEmptyHash;
       XXH3_freeState(state);
       return result;
     }
 
-    static fast_unordered_cache<Ue3PsMaterialConstRanges> s_ue3PsMaterialConstRangesCache;
+    static fast_unordered_cache<Ue3PsMaterialIdentityInfo> s_ue3PsMaterialIdentityCache;
 
-    static XXH64_hash_t hashUe3PixelShaderMaterialConstants(
-        const std::vector<uint8_t>& bytecode,
-        const Vector4* fConsts) {
-      const XXH64_hash_t psHash = hashDxsoBytecode(bytecode);
-      auto it = s_ue3PsMaterialConstRangesCache.find(psHash);
-      if (it == s_ue3PsMaterialConstRangesCache.end()) {
-        it = s_ue3PsMaterialConstRangesCache.emplace(psHash, parseUe3PsMaterialConstRangesFromCtab(bytecode)).first;
+    static const Ue3PsMaterialIdentityInfo& getOrParseUe3PsMaterialIdentityInfo(
+        const XXH64_hash_t psHash,
+        const std::vector<uint8_t>& bytecode) {
+      auto it = s_ue3PsMaterialIdentityCache.find(psHash);
+      if (it == s_ue3PsMaterialIdentityCache.end()) {
+        it = s_ue3PsMaterialIdentityCache.emplace(psHash, parseUe3PsMaterialIdentityFromCtab(bytecode)).first;
       }
-      return hashUe3PixelShaderMaterialConstantsWithRanges(fConsts, it->second);
+      return it->second;
     }
 
-    constexpr uint16_t kD3dxRegisterSetSampler = 3u;
+    // Churn threshold for warning about frame-varying constant registers: genuine
+    // constant-differentiated material instance siblings form small groups (measured 2-8 per
+    // shader+texture set), while frame-varying values sweep unbounded hashes within a single
+    // group. A widely reused shader legitimately produces many hashes spread across many
+    // texture sets, so the count must be per group, not per shader.
+    constexpr uint32_t kUe3MicChurnWarnThreshold = 32;
+
+    static void logUe3MaterialInstanceHashBreakdownOnce(
+        const XXH64_hash_t materialHash,
+        const XXH64_hash_t psHash,
+        const XXH64_hash_t textureSetHash,
+        const XXH64_hash_t constantsHash,
+        const Ue3PsMaterialIdentityInfo& identityInfo,
+        const bool constantsExcluded,
+        const std::string& textureList) {
+      static fast_unordered_set s_loggedMaterialInstanceHashes;
+      if (!s_loggedMaterialInstanceHashes.insert(materialHash).second)
+        return;
+
+      std::string ranges;
+      for (const auto& [start, count] : identityInfo.constRanges) {
+        ranges += str::format(ranges.empty() ? "c" : ",c", start, "+", count);
+      }
+
+      Logger::info(str::format(
+        "[RTX-Compatibility][UE3-MIC] materialHash=0x", std::hex, materialHash,
+        " ps=0x", psHash,
+        " textureSet=0x", textureSetHash,
+        " consts=0x", constantsHash, std::dec,
+        " textures=[", textureList, "]",
+        " constRanges=[", ranges, "]",
+        constantsExcluded ? " constsExcluded=1" : "",
+        " ctab=", identityInfo.hasCtab ? 1 : 0));
+
+      static fast_unordered_cache<uint32_t> s_distinctHashCountPerGroup;
+      static fast_unordered_set s_churnWarnedShaders;
+      const XXH64_hash_t groupKey = XXH3_64bits_withSeed(&textureSetHash, sizeof(textureSetHash), psHash);
+      const uint32_t distinctCount = ++s_distinctHashCountPerGroup[groupKey];
+      if (distinctCount == kUe3MicChurnWarnThreshold && s_churnWarnedShaders.insert(psHash).second) {
+        Logger::warn(str::format(
+          "[RTX-Compatibility][UE3-MIC] Pixel shader 0x", std::hex, psHash,
+          " has minted ", std::dec, distinctCount, "+ distinct material hashes for a single texture set (0x",
+          std::hex, textureSetHash, std::dec, ") - its constant registers are likely frame-varying ",
+          "(Time/panner/fade/sub-UV expressions). Add it to ",
+          "rtx.d3d9.ue3MicConstantIdentityExcludedShaders to stabilize its material identity."));
+      }
+    }
 
     constexpr uint8_t kPsSamplerSemanticEngineAuxiliary = 1u << 0;
     constexpr uint8_t kPsSamplerSemanticLightmap        = 1u << 1;
@@ -6563,19 +6639,67 @@ namespace dxvk {
     }
 
     if (d3d9State().textures[firstStage]) {
-      // UE3 MaterialInstanceConstant compat - include pixel shader hash and constants for child-level material tagging
-      // this differentiates instances that share parent but have different VectorParameterValues (e.g. DiffuseColor)
-      // ScalarParameterValues, or StaticSwitchParameterValues
+      // UE3 MaterialInstanceConstant compat - deterministic child-level material identity:
+      //   PS bytecode hash -> ordered material texture set -> material constants
+      // this differentiates instances that share a parent but override TextureParameterValues
+      // in any material sampler, VectorParameterValues/ScalarParameterValues (e.g. DiffuseColor),
+      // or StaticSwitchParameterValues (different bytecode)
       // must run before setupCategoriesForTexture so category lookups use the full material hash
       if constexpr (!FixedFunction) {
         if ((ue3MaterialInstanceConstantHash() || ue3EngineMode()) && m_parent->UseProgrammablePS() && d3d9State().pixelShader.ptr() != nullptr) {
           const auto& bytecode = d3d9State().pixelShader->GetCommonShader()->GetBytecode();
           const XXH64_hash_t psHash = hashDxsoBytecode(bytecode);
           if (psHash != 0) {
+            const Ue3PsMaterialIdentityInfo& identityInfo = getOrParseUe3PsMaterialIdentityInfo(psHash, bytecode);
+
             m_activeDrawCallState.materialData.setPixelShaderHashForMaterialInstance(psHash);
-            // include PS constants for material params (DiffuseColor, etc.) - parse CTAB for UniformVector_*/UniformScalar_* or fallback to c3..c79
-            const XXH64_hash_t psConstsHash = hashUe3PixelShaderMaterialConstants(bytecode, d3d9State().psConsts.fConsts);
+
+            // ordered (sampler index, image hash) set over every texture bound to a material
+            // sampler (CTAB names Texture2D_* / TextureCube_*) - catches TextureParameterValues
+            // overridden in any material sampler, not just the chosen primary color texture
+            const bool logMicHash = ue3LogMaterialInstanceHash();
+            std::string micTextureListLog;
+            XXH64_hash_t textureSetHash = kEmptyHash;
+            if (identityInfo.materialSamplerMask != 0) {
+              XXH3_state_t* const state = XXH3_createState();
+              if (state != nullptr) {
+                XXH3_64bits_reset(state);
+                bool anyTextureHashed = false;
+                for (uint32_t s = 0; s < caps::MaxTexturesPS; s++) {
+                  if ((identityInfo.materialSamplerMask & (1u << s)) == 0 || d3d9State().textures[s] == nullptr)
+                    continue;
+                  D3D9CommonTexture* const texture = GetCommonTexture(d3d9State().textures[s]);
+                  if (texture == nullptr || texture->GetImage() == nullptr)
+                    continue;
+                  const XXH64_hash_t imageHash = texture->GetImage()->getHash();
+                  if (imageHash == kEmptyHash)
+                    continue; // hashless (e.g. render target bound as a material texture)
+                  XXH3_64bits_update(state, &s, sizeof(s));
+                  XXH3_64bits_update(state, &imageHash, sizeof(imageHash));
+                  anyTextureHashed = true;
+                  if (logMicHash) {
+                    micTextureListLog += str::format(micTextureListLog.empty() ? "s" : ",s", s, ":0x", std::hex, imageHash, std::dec);
+                  }
+                }
+                if (anyTextureHashed)
+                  textureSetHash = XXH3_64bits_digest(state);
+                XXH3_freeState(state);
+              }
+            }
+            m_activeDrawCallState.materialData.setMaterialTextureSetHashForMaterialInstance(textureSetHash);
+
+            const bool constantsExcluded = lookupHash(ue3MicConstantIdentityExcludedShaders(), psHash);
+            const XXH64_hash_t psConstsHash = constantsExcluded
+              ? kEmptyHash
+              : hashUe3MaterialConstants(d3d9State().psConsts.fConsts, identityInfo.constRanges);
             m_activeDrawCallState.materialData.setPixelShaderConstantsHashForMaterialInstance(psConstsHash);
+
+            if (logMicHash) {
+              m_activeDrawCallState.materialData.updateCachedHash();
+              logUe3MaterialInstanceHashBreakdownOnce(
+                m_activeDrawCallState.materialData.getHash(), psHash, textureSetHash, psConstsHash,
+                identityInfo, constantsExcluded, micTextureListLog);
+            }
           }
         }
       }

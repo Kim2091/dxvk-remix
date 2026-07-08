@@ -156,8 +156,14 @@ namespace dxvk {
       assert(!gli::is_compressed(outFormat));
     }
 
-    // NOTE: Only supporting non-array Textures for now.
-    assert(dstDesc.numLayers == 1);
+    // NOTE: Only non-array textures are fully supported. For array/cube images (e.g. UE3
+    // reflection/sky cubemaps captured as a material's primary texture), export layer 0 only -
+    // every copy below already addresses baseArrayLayer 0 with a single layer.
+    if (dstDesc.numLayers != 1) {
+      Logger::warn(str::format("RTX: Exporting only layer 0 of a ", dstDesc.numLayers,
+                               "-layer image (cube/array textures are not fully supported) for \"", filename, "\""));
+      dstDesc.numLayers = 1;
+    }
 
     const uint32_t numMipLevels = dstDesc.mipLevels;
 
@@ -189,6 +195,10 @@ namespace dxvk {
       if (useBlit) {
         DxvkImageCreateInfo desc = dstDesc;
         desc.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        // Drop source-image flags (e.g. VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT, which requires 6+ layers)
+        desc.flags = 0;
+        desc.viewFormatCount = 0;
+        desc.viewFormats = nullptr;
         desc.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
         desc.access = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
         desc.tiling = VK_IMAGE_TILING_OPTIMAL;

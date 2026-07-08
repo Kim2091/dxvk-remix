@@ -1838,13 +1838,34 @@ struct LegacyMaterialData {
   }
 
   // UE3 MaterialInstanceConstant compat - when set, material hashes include shader identity
-  // in addition to the base color texture hash
+  // in addition to the material texture set
   void setPixelShaderHashForMaterialInstance(XXH64_hash_t hash) {
     m_pixelShaderHashForMaterialInstance = hash;
   }
 
+  // Hash over the ordered (sampler index, image hash) set of all textures bound to the pixel
+  // shader's material samplers (CTAB names Texture2D_* / TextureCube_*). Differentiates
+  // MaterialInstanceConstants that override TextureParameterValues in any material sampler,
+  // not just the primary color texture.
+  void setMaterialTextureSetHashForMaterialInstance(XXH64_hash_t hash) {
+    m_materialTextureSetHash = hash;
+  }
+
+  // Hash over the material constant registers (CTAB UniformVector_* / UniformScalar_*).
+  // Differentiates MaterialInstanceConstants that override VectorParameterValues/
+  // ScalarParameterValues on an identical texture set. kEmptyHash for shaders listed in
+  // rtx.d3d9.ue3MicConstantIdentityExcludedShaders (frame-varying constants) or without
+  // CTAB constant ranges.
   void setPixelShaderConstantsHashForMaterialInstance(XXH64_hash_t hash) {
     m_pixelShaderConstantsHashForMaterialInstance = hash;
+  }
+
+  // Intermediate identity tier: PS bytecode + material texture set, without constants.
+  // Shared by all MaterialInstanceConstant siblings that only differ via constants, and
+  // stable even for shaders with frame-varying constant registers. kEmptyHash unless the
+  // UE3 MaterialInstanceConstant path is active.
+  XXH64_hash_t getTextureSetAndShaderHash() const {
+    return m_textureSetShaderHash;
   }
 
 private:
@@ -1856,11 +1877,18 @@ private:
 
   void updateCachedHash() {
     // note - by default this is based on the color texture hash
-    // for UE3 MaterialInstanceConstant compat we optionally fold in shader identity and
-    // stable material constants so child instances can be tagged independently from parent materials
+    // for UE3 MaterialInstanceConstant compat the identity is a deterministic seed chain:
+    //   PS bytecode hash -> material texture set -> material constants
+    // every input is a pure function of the current draw, so the same material instance
+    // always produces the same hash
     const XXH64_hash_t textureHash = colorTextures[0].getImageHash();
     if (m_pixelShaderHashForMaterialInstance != kEmptyHash) {
-      XXH64_hash_t hash = XXH3_64bits_withSeed(&textureHash, sizeof(textureHash), m_pixelShaderHashForMaterialInstance);
+      // when the shader's CTAB exposes no material samplers, fall back to the primary
+      // color texture so the identity keeps the texture+shader structure
+      const XXH64_hash_t textureSetHash =
+        (m_materialTextureSetHash != kEmptyHash) ? m_materialTextureSetHash : textureHash;
+      XXH64_hash_t hash = XXH3_64bits_withSeed(&textureSetHash, sizeof(textureSetHash), m_pixelShaderHashForMaterialInstance);
+      m_textureSetShaderHash = hash;
       if (m_pixelShaderConstantsHashForMaterialInstance != kEmptyHash) {
         hash = XXH3_64bits_withSeed(
           &m_pixelShaderConstantsHashForMaterialInstance,
@@ -1869,6 +1897,7 @@ private:
       }
       m_cachedHash = hash;
     } else {
+      m_textureSetShaderHash = kEmptyHash;
       m_cachedHash = textureHash;
     }
   }
@@ -1881,7 +1910,10 @@ private:
 
   XXH64_hash_t m_cachedHash = kEmptyHash;
   XXH64_hash_t m_pixelShaderHashForMaterialInstance = kEmptyHash;
+  XXH64_hash_t m_materialTextureSetHash = kEmptyHash;
   XXH64_hash_t m_pixelShaderConstantsHashForMaterialInstance = kEmptyHash;
+  // Derived in updateCachedHash: PS bytecode + material texture set (no constants).
+  XXH64_hash_t m_textureSetShaderHash = kEmptyHash;
 };
 
 struct MaterialData {

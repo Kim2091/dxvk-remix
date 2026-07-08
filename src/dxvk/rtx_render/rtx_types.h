@@ -945,13 +945,24 @@ struct BlasEntry {
     }
   }
 
-  const LegacyMaterialData& getMaterialData(XXH64_hash_t matHash) const {
+  // input is overwritten by whichever draw touched the entry last and the material cache is
+  // cleared once per frame, so a linked instance that wasn't re-drawn recently can hold a
+  // hash this BlasEntry no longer knows - returns nullptr in that case.
+  const LegacyMaterialData* tryGetMaterialData(XXH64_hash_t matHash) const {
     if (input.getMaterialData().getHash() == matHash) {
-      return input.getMaterialData();
+      return &input.getMaterialData();
     }
     auto iter = m_materials.find(matHash);
     if (iter != m_materials.end()) {
-      return iter->second;
+      return &iter->second;
+    }
+    return nullptr;
+  }
+
+  const LegacyMaterialData& getMaterialData(XXH64_hash_t matHash) const {
+    const LegacyMaterialData* pMaterial = tryGetMaterialData(matHash);
+    if (pMaterial != nullptr) {
+      return *pMaterial;
     }
     assert(false); // tried to get a material that the BlasEntry doesn't know about.
     return input.getMaterialData();

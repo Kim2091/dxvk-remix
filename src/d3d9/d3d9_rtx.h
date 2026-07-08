@@ -107,9 +107,31 @@ namespace dxvk {
                "Helps UE3 games where fixed-function stage state is stale or incorrect when shaders are active. "
                "Implicitly enabled by rtx.d3d9.ue3EngineMode.");
     RTX_OPTION("rtx.d3d9", bool, ue3MaterialInstanceConstantHash, false,
-               "UE3 MaterialInstanceConstant support: include pixel shader hash in material identification to enable "
-               "tagging at the child level instead of broadly at the parent level. "
+               "UE3 MaterialInstanceConstant support: deterministic child-level material identity composed of the "
+               "pixel shader bytecode hash, the ordered set of textures bound to the shader's material samplers "
+               "(CTAB names Texture2D_*/TextureCube_*), and the shader's material constants (CTAB UniformVector_*/"
+               "UniformScalar_* registers). Distinguishes material instances by their TextureParameterValues, "
+               "StaticSwitchParameters and VectorParameterValues/ScalarParameterValues, enabling tagging at the "
+               "child level instead of broadly at the parent level. Shaders whose constant registers carry "
+               "frame-varying expression values (Time, fades, sub-UV frames) must be listed in "
+               "rtx.d3d9.ue3MicConstantIdentityExcludedShaders or their hashes churn every frame. "
                "Implicitly enabled by rtx.d3d9.ue3EngineMode.");
+    RTX_OPTION("rtx.d3d9", fast_unordered_set, ue3MicConstantIdentityExcludedShaders, {},
+               "UE3 MaterialInstanceConstant support: pixel shader bytecode hashes whose UniformVector_*/"
+               "UniformScalar_* constants are excluded from material identity hashing. UE3 evaluates material "
+               "uniform expressions on the CPU every draw, so shaders using Time/panner/fade/sub-UV expressions "
+               "receive frame-varying values in the same constant registers as stable material instance "
+               "parameters; folding those into the hash would mint a new material identity every frame. "
+               "Such shaders announce themselves as an endless stream of new materialHash lines when "
+               "rtx.d3d9.ue3LogMaterialInstanceHash is enabled (a churn warning names the shader once a "
+               "threshold is crossed) - add the reported ps hash here. Excluded shaders fall back to "
+               "pixel shader + material texture set identity.");
+    RTX_OPTION("rtx.d3d9", bool, ue3LogMaterialInstanceHash, false,
+               "UE3 MaterialInstanceConstant support: log a one-shot per-material breakdown of the material "
+               "identity hash (pixel shader hash, material texture set with per-sampler image hashes, constant "
+               "ranges and hash, and the final hash), plus a churn warning naming any shader that mints an "
+               "abnormal number of distinct hashes (a sign its constants are frame-varying and it belongs in "
+               "rtx.d3d9.ue3MicConstantIdentityExcludedShaders).");
     RTX_OPTION("rtx.d3d9", fast_unordered_set, vsTexcoordCaptureOutlierTextures, {},
                "Texture hashes for which VS-captured texcoords should be overridden with IA (input assembler) texcoords. "
                "Useful as a compatibility fallback when certain textures appear stretched due to incorrect VS texcoord capture.");

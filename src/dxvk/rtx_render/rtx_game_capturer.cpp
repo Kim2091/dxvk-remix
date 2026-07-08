@@ -465,15 +465,36 @@ namespace dxvk {
   void GameCapturer::newInstance(const Rc<DxvkContext> ctx, const RtInstance& rtInstance) {
     const BlasEntry* pBlas = rtInstance.getBlas();
     assert(pBlas != nullptr);
-    const XXH64_hash_t matHash = rtInstance.getMaterialDataHash();
     const XXH64_hash_t meshHash = pBlas->input.getHash(RtxOptions::geometryAssetHashRule());
     assert(meshHash != 0);
 
-    const LegacyMaterialData& material = pBlas->getMaterialData(matHash);
+    // Instances kept alive without being re-drawn (e.g. anti-culling) can hold a material hash
+    // their shared BlasEntry no longer knows (see BlasEntry::tryGetMaterialData). Fall back to
+    // the BlasEntry's current material, keyed by its own hash so the exported binding stays
+    // consistent.
+    XXH64_hash_t matHash = rtInstance.getMaterialDataHash();
+    const LegacyMaterialData* pMaterial = pBlas->tryGetMaterialData(matHash);
+    if (pMaterial == nullptr) {
+      pMaterial = &pBlas->input.getMaterialData();
+      Logger::warn(str::format(
+        "[GameCapturer][", m_pCap->idStr, "] Instance material 0x", std::hex, matHash,
+        " is no longer resident on its BlasEntry - capturing with the BlasEntry's current material 0x",
+        pMaterial->getHash(), std::dec, " instead."));
+      matHash = pMaterial->getHash();
+    }
+    const LegacyMaterialData& material = *pMaterial;
 
     const bool bIsNewMat = (matHash != 0x0) && (m_pCap->materials.count(matHash) == 0);
     if (bIsNewMat) {
-      captureMaterial(ctx, material, !rtInstance.surface.alphaState.isFullyOpaque);
+      // Materials without a resident color texture or sampler (e.g. render-target-only or
+      // evicted textures) can't be exported; the USD exporter tolerates unbound materials.
+      if (material.getColorTexture().getImageView() != nullptr && material.getSampler().ptr() != nullptr) {
+        captureMaterial(ctx, material, !rtInstance.surface.alphaState.isFullyOpaque);
+      } else {
+        Logger::warn(str::format(
+          "[GameCapturer][", m_pCap->idStr, "] Skipping material 0x", std::hex, matHash, std::dec,
+          " - no resident color texture/sampler to export."));
+      }
     }
 
     bool bIsNewMesh = false;
@@ -669,24 +690,54 @@ namespace dxvk {
                                         const T& inputNormalBuffer,
                                         const float currentFrameNum,
                                         std::shared_ptr<Mesh> pMesh) {
-                                          
-    AssetExporter::BufferCallback captureMeshNormalsAsync = [ctx, numVertices, inputNormalBuffer, currentFrameNum, pMesh](Rc<DxvkBuffer> norBuf) {
-      assert(inputNormalBuffer.vertexFormat() == VK_FORMAT_R32G32B32_SFLOAT);
+    // Converted raytrace geometry delivers float3 normals, but skinned meshes capture the
+    // raw IA stream, which UE3 packs as byte4 (FPackedNormal / D3DCOLOR).
+    const VkFormat normalFormat = inputNormalBuffer.vertexFormat();
+    const bool bFloatNormals = (normalFormat == VK_FORMAT_R32G32B32_SFLOAT) ||
+                               (normalFormat == VK_FORMAT_R32G32B32A32_SFLOAT);
+    const bool bByte4Normals = (normalFormat == VK_FORMAT_R8G8B8A8_UNORM) ||
+                               (normalFormat == VK_FORMAT_R8G8B8A8_USCALED) ||
+                               (normalFormat == VK_FORMAT_R8G8B8A8_SNORM) ||
+                               (normalFormat == VK_FORMAT_B8G8R8A8_UNORM);
+    if (!bFloatNormals && !bByte4Normals) {
+      Logger::warn(str::format("[GameCapturer] Skipping normals for mesh ", pMesh->lssData.meshName,
+                               " - unsupported normal buffer format ", normalFormat,
+                               ". The mesh is captured without authored normals."));
+      return;
+    }
+
+    AssetExporter::BufferCallback captureMeshNormalsAsync = [ctx, numVertices, inputNormalBuffer, currentFrameNum, pMesh,
+                                                             normalFormat, bFloatNormals](Rc<DxvkBuffer> norBuf) {
       // Prep helper vars
-      constexpr size_t normalSubElementSize = sizeof(float);
-      const size_t normalStride = inputNormalBuffer.stride() / normalSubElementSize;
+      const size_t strideBytes = inputNormalBuffer.stride();
       const DxvkBufferSlice normalBuffer(norBuf, 0, norBuf->info().size );
       // Ensure no reads are out of bounds
-      assert(((size_t) (numVertices - 1) * (size_t)inputNormalBuffer.stride() + sizeof(pxr::GfVec3f)) <=
+      const size_t elementSize = bFloatNormals ? sizeof(pxr::GfVec3f) : 4 * sizeof(uint8_t);
+      assert(((size_t) (numVertices - 1) * strideBytes + elementSize) <=
             (normalBuffer.length() - inputNormalBuffer.offsetFromSlice()));
       // Get copied-to-CPU GPU buffer
-      const float* pVkNormalBuf = (float*) normalBuffer.mapPtr((size_t)inputNormalBuffer.offsetFromSlice());
+      const uint8_t* pVkNormalBuf = (const uint8_t*) normalBuffer.mapPtr((size_t)inputNormalBuffer.offsetFromSlice());
       assert(pVkNormalBuf);
+      const bool bSwapRB = (normalFormat == VK_FORMAT_B8G8R8A8_UNORM);
+      const bool bSnorm = (normalFormat == VK_FORMAT_R8G8B8A8_SNORM);
       // Copy GPU buffer to local VtArray
       pxr::VtArray<pxr::GfVec3f> normals;
       normals.reserve(numVertices);
       for (size_t idx = 0; idx < numVertices; ++idx) {
-        normals.push_back(pxr::GfVec3f(&pVkNormalBuf[idx * normalStride]));
+        const uint8_t* pElement = pVkNormalBuf + idx * strideBytes;
+        if (bFloatNormals) {
+          normals.push_back(pxr::GfVec3f(reinterpret_cast<const float*>(pElement)));
+        } else {
+          // UE3 FPackedNormal decode: n = byte / 127.5 - 1 (SNORM variants store int8 / 127)
+          float n[3];
+          for (uint32_t c = 0; c < 3; c++) {
+            const uint32_t src = bSwapRB ? 2 - c : c;
+            n[c] = bSnorm
+              ? std::max(static_cast<int8_t>(pElement[src]) / 127.f, -1.f)
+              : pElement[src] / 127.5f - 1.f;
+          }
+          normals.push_back(pxr::GfVec3f(n[0], n[1], n[2]));
+        }
       }
       assert(normals.size() > 0);
       // Create comparison function that returns float
@@ -768,15 +819,18 @@ namespace dxvk {
                                           const float currentFrameNum,
                                           std::shared_ptr<Mesh> pMesh) {
 
+    // Only float32 texcoord formats can be safely read as float* on the CPU.
+    // Non-float32 formats (e.g. R16G16_SFLOAT) are normally converted to R32G32_SFLOAT by the
+    // GPU interleaver before reaching here, but guard defensively in case that changes.
+    // Note: must skip BEFORE numOutstandingInc, otherwise the capture waits forever on a
+    // buffer callback that never ran.
+    const VkFormat texFmt = geomData.texcoordBuffer.vertexFormat();
+    if (texFmt != VK_FORMAT_R32G32_SFLOAT && texFmt != VK_FORMAT_R32G32B32_SFLOAT && texFmt != VK_FORMAT_R32G32B32A32_SFLOAT) {
+      Logger::err(str::format("[GameCapturer] Skipping texcoord capture for unsupported format: ", texFmt));
+      return;
+    }
+
     AssetExporter::BufferCallback captureMeshTexCoordsAsync = [ctx, geomData, currentFrameNum, pMesh](Rc<DxvkBuffer> texBuf) {
-      // Only float32 texcoord formats can be safely read as float* on the CPU.
-      // Non-float32 formats (e.g. R16G16_SFLOAT) are normally converted to R32G32_SFLOAT by the
-      // GPU interleaver before reaching here, but guard defensively in case that changes.
-      const VkFormat texFmt = geomData.texcoordBuffer.vertexFormat();
-      if (texFmt != VK_FORMAT_R32G32_SFLOAT && texFmt != VK_FORMAT_R32G32B32_SFLOAT && texFmt != VK_FORMAT_R32G32B32A32_SFLOAT) {
-        Logger::err(str::format("[GameCapturer] Skipping texcoord capture for unsupported format: ", texFmt));
-        return;
-      }
       // Prep helper vars
       const size_t numVertices = geomData.vertexCount;
       constexpr size_t texcoordSubElementSize = sizeof(float);
@@ -814,8 +868,15 @@ namespace dxvk {
                                       const float currentFrameNum,
                                       std::shared_ptr<Mesh> pMesh) {
 
-    AssetExporter::BufferCallback captureMeshColorAsync = [ctx, geomData, currentFrameNum, pMesh](Rc<DxvkBuffer> colBuf) {
-      assert(geomData.color0Buffer.vertexFormat() == VK_FORMAT_B8G8R8A8_UNORM);
+    // D3DCOLOR streams arrive as B8G8R8A8; UE3 UBYTE4N color streams as R8G8B8A8.
+    const VkFormat colorFormat = geomData.color0Buffer.vertexFormat();
+    if (colorFormat != VK_FORMAT_B8G8R8A8_UNORM && colorFormat != VK_FORMAT_R8G8B8A8_UNORM) {
+      Logger::warn(str::format("[GameCapturer] Skipping vertex color capture for mesh ", pMesh->lssData.meshName,
+                               " - unsupported color buffer format ", colorFormat, "."));
+      return;
+    }
+
+    AssetExporter::BufferCallback captureMeshColorAsync = [ctx, geomData, currentFrameNum, pMesh, colorFormat](Rc<DxvkBuffer> colBuf) {
       // Prep helper vars
       const size_t numVertices = geomData.vertexCount;
       constexpr size_t colorSubElementSize = sizeof(uint8_t);
@@ -827,13 +888,15 @@ namespace dxvk {
       // Get copied-to-CPU GPU buffer
       const uint8_t* pVkColorBuf = (uint8_t*) colorBuffer.mapPtr((size_t) geomData.color0Buffer.offsetFromSlice());
       assert(pVkColorBuf);
+      const uint32_t redOffset = (colorFormat == VK_FORMAT_B8G8R8A8_UNORM) ? 2u : 0u;
+      const uint32_t blueOffset = 2u - redOffset;
       // Copy GPU buffer to local VtArray
       pxr::VtArray<pxr::GfVec4f> colors;
       colors.reserve(numVertices);
       for (size_t idx = 0; idx < numVertices; ++idx) {
-        colors.push_back(pxr::GfVec4f((float) pVkColorBuf[idx * colorStride + 2] / 255.f,
+        colors.push_back(pxr::GfVec4f((float) pVkColorBuf[idx * colorStride + redOffset] / 255.f,
                                       (float) pVkColorBuf[idx * colorStride + 1] / 255.f,
-                                      (float) pVkColorBuf[idx * colorStride + 0] / 255.f,
+                                      (float) pVkColorBuf[idx * colorStride + blueOffset] / 255.f,
                                       (float) pVkColorBuf[idx * colorStride + 3] / 255.f));
       }
       assert(colors.size() > 0);
@@ -854,38 +917,68 @@ namespace dxvk {
                                          const RasterGeometry& geomData,
                                          const float currentFrameNum,
                                          std::shared_ptr<Mesh> pMesh) {
-    AssetExporter::BufferCallback captureMeshBlendWeightsAsync = [ctx, geomData, currentFrameNum, pMesh](Rc<DxvkBuffer> inBuf) {
+    const size_t bonesPerVertex = pMesh->lssData.bonesPerVertex;
+    const VkFormat weightFormat = geomData.blendWeightBuffer.vertexFormat();
+    // Fixed-function style streams store bonesPerVertex-1 float weights (the last weight is
+    // derived); UE3 GPU-skinned meshes store all weights as normalized bytes (UBYTE4N).
+    const bool bFloatWeights = (weightFormat == VK_FORMAT_R32_SFLOAT) ||
+                               (weightFormat == VK_FORMAT_R32G32_SFLOAT) ||
+                               (weightFormat == VK_FORMAT_R32G32B32_SFLOAT);
+    const bool bByte4Weights = (weightFormat == VK_FORMAT_R8G8B8A8_UNORM) ||
+                               (weightFormat == VK_FORMAT_B8G8R8A8_UNORM);
+    if ((!bFloatWeights && !bByte4Weights) || (bByte4Weights && bonesPerVertex > 4)) {
+      Logger::warn(str::format("[GameCapturer] Skipping blend weights/indices for mesh ", pMesh->lssData.meshName,
+                               " - unsupported blend weight buffer format ", weightFormat,
+                               " (", bonesPerVertex, " bones per vertex)."));
+      return;
+    }
+
+    const VkFormat indicesFormat = geomData.blendIndicesBuffer.defined()
+      ? geomData.blendIndicesBuffer.vertexFormat()
+      : VK_FORMAT_UNDEFINED;
+    const bool bCaptureIndices = geomData.blendIndicesBuffer.defined() &&
+                                 (indicesFormat == VK_FORMAT_R8G8B8A8_USCALED ||
+                                  indicesFormat == VK_FORMAT_R8G8B8A8_UINT);
+    if (geomData.blendIndicesBuffer.defined() && !bCaptureIndices) {
+      Logger::warn(str::format("[GameCapturer] Skipping blend indices for mesh ", pMesh->lssData.meshName,
+                               " - unsupported blend indices buffer format ", indicesFormat, "."));
+    }
+
+    AssetExporter::BufferCallback captureMeshBlendWeightsAsync = [ctx, geomData, currentFrameNum, pMesh,
+                                                                  bonesPerVertex, bFloatWeights, weightFormat](Rc<DxvkBuffer> inBuf) {
       // Prep helper vars
       const size_t numVertices = geomData.vertexCount;
-      const size_t bonesPerVertex = pMesh->lssData.bonesPerVertex;
-      const size_t stride = geomData.blendWeightBuffer.stride() / sizeof(float);
+      const size_t strideBytes = geomData.blendWeightBuffer.stride();
       const DxvkBufferSlice bufferSlice(inBuf, 0, inBuf->info().size);
-      const VkFormat format = geomData.blendWeightBuffer.vertexFormat();
-      if (bonesPerVertex <= 2) {
-        assert(format == VK_FORMAT_R32_SFLOAT || format == VK_FORMAT_R32G32_SFLOAT || format == VK_FORMAT_R32G32B32_SFLOAT);
-      } else if (bonesPerVertex == 3) {
-        assert(format == VK_FORMAT_R32G32_SFLOAT || format == VK_FORMAT_R32G32B32_SFLOAT);
-      } else if (bonesPerVertex == 4) {
-        assert(format == VK_FORMAT_R32G32B32_SFLOAT);
-      }
       // Ensure no reads are out of bounds
-      assert(((size_t) (numVertices - 1) * (size_t) geomData.blendWeightBuffer.stride() + sizeof(float) * bonesPerVertex) <=
+      const size_t elementSize = bFloatWeights ? sizeof(float) * bonesPerVertex : 4 * sizeof(uint8_t);
+      assert(((size_t) (numVertices - 1) * strideBytes + elementSize) <=
              (bufferSlice.length() - geomData.blendWeightBuffer.offsetFromSlice()));
       // Get copied-to-CPU GPU buffer
-      const float* pVkBwBuf = (float*) bufferSlice.mapPtr((size_t) geomData.blendWeightBuffer.offsetFromSlice());
+      const uint8_t* pVkBwBuf = (const uint8_t*) bufferSlice.mapPtr((size_t) geomData.blendWeightBuffer.offsetFromSlice());
       assert(pVkBwBuf);
+      const bool bSwapRB = (weightFormat == VK_FORMAT_B8G8R8A8_UNORM);
       // Copy GPU buffer to local VtArray
       pxr::VtArray<float> targetBuffer;
       targetBuffer.reserve(numVertices * bonesPerVertex);
       for (size_t idx = 0; idx < numVertices; ++idx) {
-        float lastWeight = 1.0;
-        for (size_t bone_idx = 0; bone_idx < bonesPerVertex - 1; ++bone_idx) {
-          float thisWeight = pVkBwBuf[idx * stride + bone_idx];
-          lastWeight -= thisWeight;
-          targetBuffer.push_back(thisWeight);
+        const uint8_t* pElement = pVkBwBuf + idx * strideBytes;
+        if (bFloatWeights) {
+          const float* pWeights = reinterpret_cast<const float*>(pElement);
+          float lastWeight = 1.0;
+          for (size_t bone_idx = 0; bone_idx < bonesPerVertex - 1; ++bone_idx) {
+            float thisWeight = pWeights[bone_idx];
+            lastWeight -= thisWeight;
+            targetBuffer.push_back(thisWeight);
+          }
+          // D3D9 only stores bonesPerVertex - 1 weights. The last weight is 1 minus the other weights.
+          targetBuffer.push_back(lastWeight);
+        } else {
+          for (size_t bone_idx = 0; bone_idx < bonesPerVertex; ++bone_idx) {
+            const size_t src = bSwapRB && bone_idx < 3 ? 2 - bone_idx : bone_idx;
+            targetBuffer.push_back(pElement[src] / 255.f);
+          }
         }
-        // D3D9 only stores bonesPerVertex - 1 weights. The last weight is 1 minus the other weights.
-        targetBuffer.push_back(lastWeight);
       }
       assert(targetBuffer.size() > 0);
       // Create comparison function that returns float
@@ -896,11 +989,9 @@ namespace dxvk {
       // Cache buffer iff new buffer differs from previous buffer
       evalNewBufferAndCache(pMesh, pMesh->lssData.buffers.blendWeightBufs, targetBuffer, currentFrameNum, weightsDifferentEnough);
     };
-    AssetExporter::BufferCallback captureMeshBlendIndicesAsync = [ctx, geomData, currentFrameNum, pMesh](Rc<DxvkBuffer> inBuf) {
-      assert(geomData.blendIndicesBuffer.vertexFormat() == VK_FORMAT_R8G8B8A8_USCALED);
+    AssetExporter::BufferCallback captureMeshBlendIndicesAsync = [ctx, geomData, currentFrameNum, pMesh, bonesPerVertex](Rc<DxvkBuffer> inBuf) {
       // Prep helper vars
       const size_t numVertices = geomData.vertexCount;
-      const size_t bonesPerVertex = pMesh->lssData.bonesPerVertex;
       const size_t stride = geomData.blendIndicesBuffer.stride() / sizeof(uint8_t);
       const DxvkBufferSlice bufferSlice(inBuf, 0, inBuf->info().size);
       // Ensure no reads are out of bounds
@@ -927,7 +1018,7 @@ namespace dxvk {
     };
     pMesh->meshSync.numOutstandingInc();
     m_exporter.copyBufferFromGPU(ctx, geomData.blendWeightBuffer, captureMeshBlendWeightsAsync);
-    if (geomData.blendIndicesBuffer.defined()) {
+    if (bCaptureIndices) {
       pMesh->meshSync.numOutstandingInc();
       m_exporter.copyBufferFromGPU(ctx, geomData.blendIndicesBuffer, captureMeshBlendIndicesAsync);
     }

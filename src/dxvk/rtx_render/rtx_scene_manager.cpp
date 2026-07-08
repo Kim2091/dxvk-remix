@@ -788,88 +788,46 @@ namespace dxvk {
     } 
 
     // test if any direct material replacements exist
+    //
+    // UE3 MaterialInstanceConstant tiered lookup - every tier is a pure function of the
+    // current draw (no session history), so the same surface always resolves to the same
+    // replacement:
+    //   1. materialHash          - exact child identity (PS + material texture set + constants)
+    //   2. textureSetShaderHash  - all MIC siblings sharing the shader and texture set (constants
+    //                              ignored; stable even for shaders with frame-varying constants)
+    //   3. textureHash           - parent-level tag on the primary color texture
+    // For non-UE3 games the tiers collapse into the legacy single texture-hash lookup.
     const LegacyMaterialData& inputMaterial = input.getMaterialData();
     const XXH64_hash_t materialHash = inputMaterial.getHash();
     const XXH64_hash_t textureHash = inputMaterial.getColorTexture().getImageHash();
-    const XXH64_hash_t shaderHash = inputMaterial.m_pixelShaderHashForMaterialInstance;
-    const XXH64_hash_t shaderConstantsHash = inputMaterial.m_pixelShaderConstantsHashForMaterialInstance;
-    const XXH64_hash_t textureAndShaderHash =
-      (shaderHash != kEmptyHash && textureHash != kEmptyHash)
-        ? XXH3_64bits_withSeed(&textureHash, sizeof(textureHash), shaderHash)
-        : kEmptyHash;
-    const XXH64_hash_t geometryHash = input.getGeometryData().getHashForRule(RtxOptions::geometryAssetHashRule());
-    const XXH64_hash_t geometryTextureKey =
-      (textureHash != kEmptyHash)
-        ? XXH3_64bits_withSeed(&textureHash, sizeof(textureHash), geometryHash)
-        : kEmptyHash;
-    const bool isPotentiallyUnstableAnchor = input.getGeometryData().indexBuffer.defined()
-      && input.getGeometryData().vertexCount > input.getGeometryData().indexCount;
+    const XXH64_hash_t textureSetShaderHash = inputMaterial.getTextureSetAndShaderHash();
 
-    if (textureAndShaderHash != kEmptyHash && shaderConstantsHash != kEmptyHash) {
-      const auto [it, isNew] =
-        m_ue3MiFirstConstantsByTextureShaderHash.emplace(textureAndShaderHash, shaderConstantsHash);
-      if (!isNew && it->second != shaderConstantsHash) {
-        m_ue3MiUnstableTextureShaderHashes.insert(textureAndShaderHash);
-      }
-    }
-    const bool hasUnstableConstantsForTextureShader =
-      textureAndShaderHash != kEmptyHash &&
-      m_ue3MiUnstableTextureShaderHashes.find(textureAndShaderHash) != m_ue3MiUnstableTextureShaderHashes.end();
-    if (geometryTextureKey != kEmptyHash && materialHash != kEmptyHash) {
-      const auto [it, isNew] =
-        m_ue3MiFirstMaterialHashByGeometryTexture.emplace(geometryTextureKey, materialHash);
-      if (!isNew && it->second != materialHash) {
-        m_ue3MiUnstableGeometryTextureKeys.insert(geometryTextureKey);
-      }
-    }
-    const bool hasUnstableMaterialForGeometryTexture =
-      geometryTextureKey != kEmptyHash &&
-      m_ue3MiUnstableGeometryTextureKeys.find(geometryTextureKey) != m_ue3MiUnstableGeometryTextureKeys.end();
-
+    const char* matchedTier = "material";
     MaterialData* pReplacementMaterial = m_pReplacer->getReplacementMaterial(materialHash);
-    XXH64_hash_t matchedSpecificReplacementHash = kEmptyHash;
-    if (pReplacementMaterial != nullptr && materialHash != textureHash) {
-      matchedSpecificReplacementHash = materialHash;
+
+    if (pReplacementMaterial == nullptr &&
+        textureSetShaderHash != kEmptyHash && textureSetShaderHash != materialHash) {
+      pReplacementMaterial = m_pReplacer->getReplacementMaterial(textureSetShaderHash);
+      matchedTier = "textureSet+shader";
     }
 
-    // UE3 MaterialInstanceConstant fallback path
-    // first try texture+shader to preserve child vs parent separation and avoid wrong texture routing
-    if (pReplacementMaterial == nullptr && textureAndShaderHash != kEmptyHash) {
-      if (textureAndShaderHash != materialHash) {
-        pReplacementMaterial = m_pReplacer->getReplacementMaterial(textureAndShaderHash);
-        if (pReplacementMaterial != nullptr) {
-          matchedSpecificReplacementHash = textureAndShaderHash;
-        }
-      }
-    }
-
-    if (matchedSpecificReplacementHash != kEmptyHash && geometryTextureKey != kEmptyHash) {
-      m_ue3MiSpecificReplacementHashByGeometryTexture[geometryTextureKey] = matchedSpecificReplacementHash;
-    }
-
-    // prefer sticky specific replacement for this geometry+texture key if we already discovered one
-    if (pReplacementMaterial == nullptr && geometryTextureKey != kEmptyHash) {
-      auto it = m_ue3MiSpecificReplacementHashByGeometryTexture.find(geometryTextureKey);
-      if (it != m_ue3MiSpecificReplacementHashByGeometryTexture.end()) {
-        pReplacementMaterial = m_pReplacer->getReplacementMaterial(it->second);
-      }
-    }
-
-    const bool hasSpecificReplacementForGeometryTexture =
-      geometryTextureKey != kEmptyHash &&
-      m_ue3MiSpecificReplacementHashByGeometryTexture.find(geometryTextureKey) != m_ue3MiSpecificReplacementHashByGeometryTexture.end();
-
-    // allow texture only fallback only when instability is observed on the current surface family
-    // and we already know this geometry+texture has a specific replacement
-    if (pReplacementMaterial == nullptr
-        && hasSpecificReplacementForGeometryTexture
-        && (hasUnstableConstantsForTextureShader || (hasUnstableMaterialForGeometryTexture && isPotentiallyUnstableAnchor))
-        && materialHash != textureHash
-        && textureHash != kEmptyHash) {
+    if (pReplacementMaterial == nullptr &&
+        textureHash != kEmptyHash && textureHash != materialHash && textureHash != textureSetShaderHash) {
       pReplacementMaterial = m_pReplacer->getReplacementMaterial(textureHash);
+      matchedTier = "texture";
     }
 
     if (pReplacementMaterial != nullptr) {
+      if (Logger::logLevel() <= LogLevel::Debug && materialHash != textureHash) {
+        static fast_unordered_set s_loggedReplacementTierMaterials;
+        if (s_loggedReplacementTierMaterials.insert(materialHash).second) {
+          Logger::debug(str::format(
+            "[RTX-Compatibility][UE3-MIC] Replacement matched at tier '", matchedTier,
+            "' for materialHash=0x", std::hex, materialHash,
+            " (textureSetShader=0x", textureSetShaderHash, ", texture=0x", textureHash, ")", std::dec));
+        }
+      }
+
       // Make a copy - dont modify the replacement data.
       MaterialData renderMaterialData = *pReplacementMaterial;
       // merge in the input material from game

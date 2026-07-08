@@ -376,12 +376,16 @@ namespace dxvk {
   void DrawCallState::setupCategoriesForTexture() {
     // TODO (REMIX-231): It would probably be much more efficient to use a map of texture hash to category flags, rather
     //                   than doing N lookups per texture hash for each category.
-    // support both parent level and child level tagging for UE3 MaterialInstanceConstant
+    // support tagging at every UE3 MaterialInstanceConstant identity tier:
+    //   child (materialHash), shader+texture-set group (textureSetShaderHash), parent (textureHash)
     const XXH64_hash_t textureHash = materialData.getColorTexture().getImageHash();
     const XXH64_hash_t materialHash = materialData.getHash();
+    const XXH64_hash_t textureSetShaderHash = materialData.getTextureSetAndShaderHash();
 
     auto lookupMaterialOrTexture = [&](const fast_unordered_set& hashSet) {
-      return lookupHash(hashSet, materialHash) || lookupHash(hashSet, textureHash);
+      return lookupHash(hashSet, materialHash) || lookupHash(hashSet, textureHash) ||
+             (textureSetShaderHash != kEmptyHash && textureSetShaderHash != materialHash &&
+              lookupHash(hashSet, textureSetShaderHash));
     };
 
     setCategory(InstanceCategories::WorldUI, lookupMaterialOrTexture(RtxOptions::worldSpaceUiTextures()));
@@ -391,7 +395,7 @@ namespace dxvk {
     setCategory(InstanceCategories::IgnoreLights, lookupMaterialOrTexture(RtxOptions::ignoreLights()));
     setCategory(InstanceCategories::IgnoreAntiCulling, lookupMaterialOrTexture(RtxOptions::antiCullingTextures()));
     setCategory(InstanceCategories::IgnoreMotionBlur, lookupMaterialOrTexture(RtxOptions::motionBlurMaskOutTextures()));
-    setCategory(InstanceCategories::IgnoreOpacityMicromap, lookupHash(RtxOptions::opacityMicromapIgnoreTextures(), materialHash) || lookupHash(RtxOptions::opacityMicromapIgnoreTextures(), textureHash) || isUsingRaytracedRenderTarget);
+    setCategory(InstanceCategories::IgnoreOpacityMicromap, lookupMaterialOrTexture(RtxOptions::opacityMicromapIgnoreTextures()) || isUsingRaytracedRenderTarget);
     setCategory(InstanceCategories::IgnoreAlphaChannel, lookupMaterialOrTexture(RtxOptions::ignoreAlphaOnTextures()));
     setCategory(InstanceCategories::IgnoreBakedLighting, lookupMaterialOrTexture(RtxOptions::ignoreBakedLightingTextures()));
 
