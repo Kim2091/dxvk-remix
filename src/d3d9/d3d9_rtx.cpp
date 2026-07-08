@@ -806,8 +806,8 @@ namespace dxvk {
         }
 
         // dot products consume multiple components of their sources: union the origins so
-        // register provenance (and the packed-UV half being read) survives. This is how UV
-        // rotators / matrix transforms (dp2add pairs, m3x2) keep an attributable origin.
+        // register provenance (and the packed-UV half being read) survives. This is what keeps
+        // UV rotators / matrix transforms (dp2add pairs, m3x2..m4x4) attributable.
         case DxsoOpcode::Dp2Add: {
           UvExactComponentOrigin merged = uvMergeOrigins(
             readOriginUnion(ctx.src[0], 2u),

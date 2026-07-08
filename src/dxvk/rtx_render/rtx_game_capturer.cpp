@@ -434,7 +434,8 @@ namespace dxvk {
         const BlasEntry* pBlas = pRtInstance->getBlas();
         assert(pBlas != nullptr);
 
-        captureMesh(ctx, instance.meshHash, *pBlas, pRtInstance->getCategoryFlags(), false, bPointsUpdate, bNormalsUpdate, bIndexUpdate, pRtInstance->isFrontFaceFlipped);
+        captureMesh(ctx, instance.meshHash, *pBlas, pRtInstance->getCategoryFlags(), false, bPointsUpdate, bNormalsUpdate, bIndexUpdate, pRtInstance->isFrontFaceFlipped,
+                    pRtInstance->surface.textureTransform);
       }
       if (m_pCap->bCaptureInstances && (bIsNew || bXformUpdate)) {
         pxr::GfMatrix4d xform { 1.0 };
@@ -510,7 +511,8 @@ namespace dxvk {
       instanceNum = m_pCap->meshes[meshHash]->instanceCount++;
     }
     if (bIsNewMesh) {
-      captureMesh(ctx, meshHash, *pBlas, rtInstance.getCategoryFlags(), true, true, true, true, rtInstance.isFrontFaceFlipped);
+      captureMesh(ctx, meshHash, *pBlas, rtInstance.getCategoryFlags(), true, true, true, true, rtInstance.isFrontFaceFlipped,
+                  rtInstance.surface.textureTransform);
     }
 
     const XXH64_hash_t instanceId = rtInstance.getId();
@@ -558,7 +560,8 @@ namespace dxvk {
                                  const bool bCapturePositions,
                                  const bool bCaptureNormals,
                                  const bool bCaptureIndices,
-                                 const bool isLhs) {
+                                 const bool isLhs,
+                                 const Matrix4& textureTransform) {
     assert((bIsNewMesh && bCapturePositions && bCaptureNormals && bCaptureIndices) || !bIsNewMesh);
     const RaytraceGeometry& geomData = blas.modifiedGeometryData;
     const SkinningData& skinData = blas.input.getSkinningState();
@@ -625,7 +628,7 @@ namespace dxvk {
     }
 
     if (bIsNewMesh && geomData.texcoordBuffer.defined()) {
-      captureMeshTexCoords(ctx, geomData, m_pCap->currentFrameNum, pMesh);
+      captureMeshTexCoords(ctx, geomData, textureTransform, m_pCap->currentFrameNum, pMesh);
     }
 
     if (bIsNewMesh && geomData.color0Buffer.defined()) {
@@ -816,6 +819,7 @@ namespace dxvk {
 
   void GameCapturer::captureMeshTexCoords(const Rc<DxvkContext> ctx,
                                           const RaytraceGeometry& geomData,
+                                          const Matrix4& textureTransform,
                                           const float currentFrameNum,
                                           std::shared_ptr<Mesh> pMesh) {
 
@@ -830,7 +834,7 @@ namespace dxvk {
       return;
     }
 
-    AssetExporter::BufferCallback captureMeshTexCoordsAsync = [ctx, geomData, currentFrameNum, pMesh](Rc<DxvkBuffer> texBuf) {
+    AssetExporter::BufferCallback captureMeshTexCoordsAsync = [ctx, geomData, textureTransform, currentFrameNum, pMesh](Rc<DxvkBuffer> texBuf) {
       // Prep helper vars
       const size_t numVertices = geomData.vertexCount;
       constexpr size_t texcoordSubElementSize = sizeof(float);
@@ -842,12 +846,23 @@ namespace dxvk {
       // Get copied-to-CPU GPU buffer
       const float* pVkTexcoordsBuf = (float*) texcoordBuffer.mapPtr((size_t) geomData.texcoordBuffer.offsetFromSlice());
       assert(pVkTexcoordsBuf);
+      // The RT shaders apply surface.textureTransform (material tiling/panning) at hit time;
+      // captured USD has no equivalent, so bake it into the exported texcoords. Meshes shared
+      // by instances with differing transforms keep the first captured instance's transform.
+      const bool hasNonIdentityTextureTransform = textureTransform != Matrix4();
       // Copy GPU buffer to local VtArray
       pxr::VtArray<pxr::GfVec2f> texcoords;
       texcoords.reserve(numVertices);
       for (size_t idx = 0; idx < numVertices; ++idx) {
-        texcoords.push_back(pxr::GfVec2f(pVkTexcoordsBuf[idx * texcoordStride],
-                                         1.0f - pVkTexcoordsBuf[idx * texcoordStride + 1]));
+        float u = pVkTexcoordsBuf[idx * texcoordStride];
+        float v = pVkTexcoordsBuf[idx * texcoordStride + 1];
+        if (hasNonIdentityTextureTransform) {
+          // applied before the USD V-flip, matching surface_interaction.slangh
+          const Vector4 transformed = textureTransform * Vector4(u, v, 0.0f, 1.0f);
+          u = transformed.x;
+          v = transformed.y;
+        }
+        texcoords.push_back(pxr::GfVec2f(u, 1.0f - v));
       }
       assert(texcoords.size() > 0);
       // Create comparison function that returns float
