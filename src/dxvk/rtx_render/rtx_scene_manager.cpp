@@ -1436,6 +1436,11 @@ namespace dxvk {
       {
         XXH64_hash_t h;
         h = drawCallState.getMaterialData().getColorTexture().getImageHash();
+        // texture-less (constant-color) materials have no albedo texture; fall back to
+        // the material hash so clicking the surface resolves to its texture-UI entry
+        if (h == kEmptyHash) {
+          h = drawCallState.getMaterialData().getHash();
+        }
         if (h != kEmptyHash) {
           meta.legacyTextureHash = h;
         }

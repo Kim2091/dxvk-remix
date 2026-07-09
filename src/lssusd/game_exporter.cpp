@@ -329,6 +329,7 @@ namespace ShaderAttr {
 enum Enum {
   OutputsOut,
   DiffuseTex,
+  DiffuseConstant,
   ImplSrc,
   MdlSrcAsset,
   MdlSrcAssetSubId,
@@ -340,6 +341,7 @@ enum Enum {
 static std::unordered_map<Enum,std::string> attrNames {
   {OutputsOut,       "outputs:out"},
   {DiffuseTex,       "inputs:diffuse_texture"},
+  {DiffuseConstant,  "inputs:diffuse_color_constant"},
   {ImplSrc,          "info:implementationSource"},
   {MdlSrcAsset,      "info:mdl:sourceAsset"},
   {MdlSrcAssetSubId, "info:mdl:sourceAsset:subIdentifier"},
@@ -351,6 +353,7 @@ static std::unordered_map<Enum,std::string> attrNames {
 static std::unordered_map<Enum,AttrDesc> attrDescs{
   AttrDescMapEntry(OutputsOut,       Token, false, Varying),
   AttrDescMapEntry(DiffuseTex,       Asset, false, Varying),
+  AttrDescMapEntry(DiffuseConstant,  Color3f, false, Varying),
   AttrDescMapEntry(ImplSrc,          Token, false, Uniform),
   AttrDescMapEntry(MdlSrcAsset,      Asset, false, Uniform),
   AttrDescMapEntry(MdlSrcAssetSubId, Token, false, Uniform),
@@ -399,6 +402,13 @@ void GameExporter::exportMaterials(const Export& exportData, ExportContext& ctx)
 
     std::unordered_map<ShaderAttr::Enum, pxr::UsdAttribute> shaderAttrs;
     for(const auto& [attrEnum, desc] : ShaderAttr::attrDescs) {
+      // only author the diffuse inputs the material actually provides
+      if (attrEnum == ShaderAttr::DiffuseTex && matData.albedoTexPath.empty()) {
+        continue;
+      }
+      if (attrEnum == ShaderAttr::DiffuseConstant && !matData.hasAlbedoConstant) {
+        continue;
+      }
       shaderAttrs[attrEnum] =
         shaderPrim.CreateAttribute(desc.attrName, desc.typeName, desc.custom, desc.sdfVariability);
       // Cannot assert. Attr "outputs:out" asserts false, but authoring + Setting works just fine.
@@ -416,10 +426,16 @@ void GameExporter::exportMaterials(const Export& exportData, ExportContext& ctx)
     pxr::UsdModelAPI(shader).SetKind(kTokMaterial);
 
     // Create and set textures asset paths on material
-    const auto relToMaterialsTexPath =
-      std::filesystem::relative(computeLocalPath(matData.albedoTexPath), fullMaterialBasePath).string();
-    ASSERT_OR_EXECUTE(shaderAttrs[ShaderAttr::DiffuseTex].Set(pxr::SdfAssetPath(relToMaterialsTexPath)));
-    shaderAttrs[ShaderAttr::DiffuseTex].SetColorSpace(pxr::TfToken("auto"));
+    if (!matData.albedoTexPath.empty()) {
+      const auto relToMaterialsTexPath =
+        std::filesystem::relative(computeLocalPath(matData.albedoTexPath), fullMaterialBasePath).string();
+      ASSERT_OR_EXECUTE(shaderAttrs[ShaderAttr::DiffuseTex].Set(pxr::SdfAssetPath(relToMaterialsTexPath)));
+      shaderAttrs[ShaderAttr::DiffuseTex].SetColorSpace(pxr::TfToken("auto"));
+    }
+
+    if (matData.hasAlbedoConstant) {
+      ASSERT_OR_EXECUTE(shaderAttrs[ShaderAttr::DiffuseConstant].Set(matData.albedoConstant));
+    }
 
     // Create and set OmniPBR MDL boilerplate attributes on shader
     ASSERT_OR_EXECUTE(shaderAttrs[ShaderAttr::ImplSrc].Set(pxr::TfToken("sourceAsset")));

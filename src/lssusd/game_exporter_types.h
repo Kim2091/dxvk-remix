@@ -114,12 +114,15 @@ struct DistantLight {
 struct Material {
   std::string matName;
   std::string albedoTexPath;
+  // texture-less (constant-color) materials export their color instead of a texture
+  bool         hasAlbedoConstant = false;
+  pxr::GfVec3f albedoConstant{ 1.f, 1.f, 1.f };
   bool        enableOpacity = false;
   struct Sampler {
-    VkSamplerAddressMode addrModeU;
-    VkSamplerAddressMode addrModeV;
-    VkFilter             filter;
-    VkClearColorValue    borderColor;
+    VkSamplerAddressMode addrModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    VkSamplerAddressMode addrModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    VkFilter             filter = VK_FILTER_LINEAR;
+    VkClearColorValue    borderColor = {};
   } sampler;
   // TODO: std::string normalTexPath;
   // TODO: etc...

@@ -162,6 +162,22 @@ namespace dxvk {
                "(c0..c4) can otherwise be misinterpreted as a one-frame Main camera (e.g. a light-space matrix during "
                "UE3 light environment updates). Geometry from unverified draws is still rendered normally. "
                "Implicitly enabled by rtx.d3d9.ue3EngineMode.");
+    RTX_OPTION("rtx.d3d9", bool, ue3StableDiffuseSelection, false,
+               "Shader-path compat: cache the diffuse/albedo sampler selection per (pixel shader, bound texture set, "
+               "sRGB states, vertex factory) so the same material always resolves to the same albedo texture. "
+               "Without this, selection heuristics that read live shader constants (UE3 rewrites uniform expression "
+               "registers per draw for panner/time/view-driven materials) can flip the chosen sampler between frames "
+               "or with camera position, making a surface's albedo switch to an unrelated texture. "
+               "Implicitly enabled by rtx.d3d9.ue3EngineMode.");
+    RTX_OPTION("rtx.d3d9", bool, ue3MicAutoExcludeFrameVaryingConstants, true,
+               "UE3 MaterialInstanceConstant support: automatically detect pixel shaders whose UniformVector_*/"
+               "UniformScalar_* constant registers are frame-varying (Time/panner/fade/sub-UV expressions) and "
+               "exclude their constants from material identity hashing at runtime, as if they were listed in "
+               "rtx.d3d9.ue3MicConstantIdentityExcludedShaders. Without this, such shaders mint a new material hash "
+               "every frame, churning instance identity (visible as temporal instability/flicker and per-frame BLAS "
+               "rebuilds) until each shader is excluded manually. Detection triggers once a single shader + texture "
+               "set group has minted an abnormal number of distinct constant hashes. Only active when material "
+               "instance hashing is enabled (rtx.d3d9.ue3MaterialInstanceConstantHash or rtx.d3d9.ue3EngineMode).");
     RTX_OPTION("rtx.d3d9", bool, ue3LogClassification, false,
                "UE3 compat: log explicit pass and vertex factory classification decisions for draw-call routing diagnostics.");
     RTX_OPTION("rtx.d3d9", bool, ue3LogUvResolution, false,
@@ -169,6 +185,11 @@ namespace dxvk {
                "once per unique pixel shader + stage combination, including ambiguity diagnostics.");
     RTX_OPTION("rtx.d3d9", bool, ue3LogCapturePrecision, false,
                "UE3 compat: log camera-cell, hash, cache, and matrix diagnostics for vertex capture precision issues.");
+    RTX_OPTION("rtx.d3d9", bool, ue3LogDrawStatusFlaps, false,
+               "UE3 compat diagnostics: detect draws whose raytracing status (raytraced/rasterized/ignored) changes "
+               "between nearby frames and log the transition with pass classification and shader hashes. A draw whose "
+               "status flaps frame-to-frame manifests as geometry flickering in and out of the raytraced scene; this "
+               "probe identifies which submission-side decision is responsible. Logs are capped per draw identity.");
     RTX_OPTION("rtx", bool, enableIndexBufferMemoization, true, "CPU performance optimization, should generally be enabled.  Will reduce main thread time by caching processIndexBuffer operations and reusing when possible, this will come at the expense of some CPU RAM.");
     RTX_OPTION("rtx", uint32_t, numGeometryProcessingThreads, 2, "The desired number of CPU threads to dedicate to geometry processing  Will be limited by the number of CPU cores.  There may be some advantage to lowering this number in games which are fairly simple and use a low number of draw calls per frame.  The default was determined by looking at a game with around 2000 draw calls per frame, and with a reasonably high average triangle count per draw.");
 
@@ -361,10 +382,14 @@ namespace dxvk {
     };
     UvResolutionMode m_uvResolutionMode = UvResolutionMode::LegacyTss;
 
-    // two pass translucency dedup - track previous draw's shader/texture state
-    // to detect UE3 back+front face translucency passes on the same mesh
+    // two pass translucency dedup - track previous draw's shader/texture/geometry state
+    // to detect UE3 back+front face translucency passes on the same mesh. The geometry
+    // identity is required: UE3 sorts translucent prims back-to-front per camera, so
+    // consecutive draws of different meshes sharing one material are common and must
+    // never dedup against each other. Reset at frame end (EndFrame).
     XXH64_hash_t m_prevDrawVsPsHash = 0;
     XXH64_hash_t m_prevDrawTextureHash = 0;
+    XXH64_hash_t m_prevDrawGeometryHash = 0;
     DWORD m_prevDrawCullMode = 0;
 
     int m_activeOcclusionQueries = 0;
@@ -535,6 +560,41 @@ namespace dxvk {
     fast_unordered_cache<PsSamplerTexcoordEntry> m_psSamplerTexcoordCache;
     fast_unordered_set m_loggedUvResolutions;
 
+    // Deterministic diffuse selection: the winning sampler stages for a given
+    // (pixel shader, ordered bound texture set, sRGB states, vertex factory) key.
+    // Reusing the first decision keeps the albedo pick stable when scoring inputs
+    // read live shader constants that UE3 rewrites per draw.
+    struct Ue3DiffuseSelectionEntry {
+      uint8_t chosenStages[2] = { 0xFF, 0xFF };
+      uint8_t cubemapFallbackStage = 0xFF;
+    };
+    fast_unordered_cache<Ue3DiffuseSelectionEntry> m_ue3DiffuseSelectionCache;
+    // scoring reads the user-taggable lightmap/albedo-mask texture sets; drop cached
+    // decisions when those sets change so texture tagging in the UI takes effect live
+    size_t m_ue3DiffuseSelectionLightmapSetSize = 0;
+    size_t m_ue3DiffuseSelectionAlbedoMaskSetSize = 0;
+
+    // Diagnostic state for rtx.d3d9.ue3LogDrawStatusFlaps: per draw identity, the
+    // prepare-flags outcome of the previous sighting, to detect frame-to-frame flapping
+    struct Ue3DrawStatusEntry {
+      uint32_t lastFlags = 0;
+      uint32_t lastFrame = 0;
+      const char* lastDecision = "";
+      uint8_t lastPassType = 0;
+      uint8_t logCount = 0;
+    };
+    fast_unordered_cache<Ue3DrawStatusEntry> m_ue3DrawStatusCache;
+    uint32_t m_ue3FrameCounter = 0;
+    const char* m_ue3LastDrawDecision = "";
+
+    XXH64_hash_t mixUe3InstanceTransformConstants(XXH64_hash_t seed) const;
+    void trackUe3DrawStatusFlap(const DrawContext& drawContext, PrepareDrawFlags flags);
+    void logUe3UnboundAlbedoOnce(const D3D9CommonShader* pixelShader,
+                                 XXH64_hash_t psHash,
+                                 uint32_t usedSamplerMask,
+                                 uint32_t usedTextureMask,
+                                 const PsSamplerTexcoordEntry* inferredEntry);
+
     struct Ue3VsTexcoordTraceEntry {
       bool initialized = false;
       Ue3VsUvTraceKind kind = Ue3VsUvTraceKind::Invalid;
@@ -624,7 +684,7 @@ namespace dxvk {
 
     void processVertices(const VertexContext vertexContext[caps::MaxStreams], int vertexIndexOffset, RasterGeometry& geoData);
 
-    bool processRenderState();
+    bool processRenderState(const DrawContext& drawContext);
 
     template<bool FixedFunction>
     bool processTextures();

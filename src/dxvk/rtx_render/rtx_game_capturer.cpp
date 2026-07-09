@@ -52,6 +52,7 @@
 
 #include "../util/util_global_time.h"
 
+#include <algorithm>
 #include <filesystem>
 
 #define BASE_DIR (util::RtxFileSys::path(util::RtxFileSys::Captures).string())
@@ -488,8 +489,11 @@ namespace dxvk {
     const bool bIsNewMat = (matHash != 0x0) && (m_pCap->materials.count(matHash) == 0);
     if (bIsNewMat) {
       // Materials without a resident color texture or sampler (e.g. render-target-only or
-      // evicted textures) can't be exported; the USD exporter tolerates unbound materials.
-      if (material.getColorTexture().getImageView() != nullptr && material.getSampler().ptr() != nullptr) {
+      // evicted textures) can't be exported unless they carry a constant color instead;
+      // the USD exporter tolerates unbound materials.
+      const bool hasResidentColorTexture =
+        material.getColorTexture().getImageView() != nullptr && material.getSampler().ptr() != nullptr;
+      if (hasResidentColorTexture || material.hasUe3ConstantAlbedo) {
         captureMaterial(ctx, material, !rtInstance.surface.alphaState.isFullyOpaque);
       } else {
         Logger::warn(str::format(
@@ -532,20 +536,32 @@ namespace dxvk {
     const std::string matName = dxvk::hashToString(materialData.getHash());
     lssMat.matName = matName;
     // Export Textures
-    const std::string albedoTexFilename(matName + lss::ext::dds);
-    m_exporter.dumpImageToFile(ctx, BASE_DIR + lss::commonDirName::texDir,
-                               albedoTexFilename,
-                               materialData.getColorTexture().getImageView()->image());
-    const std::string albedoTexPath = str::format(BASE_DIR + lss::commonDirName::texDir, albedoTexFilename);
-    lssMat.albedoTexPath = albedoTexPath;
+    const bool hasColorTexture =
+      materialData.getColorTexture().getImageView() != nullptr && materialData.getSampler().ptr() != nullptr;
+    if (hasColorTexture) {
+      const std::string albedoTexFilename(matName + lss::ext::dds);
+      m_exporter.dumpImageToFile(ctx, BASE_DIR + lss::commonDirName::texDir,
+                                 albedoTexFilename,
+                                 materialData.getColorTexture().getImageView()->image());
+      const std::string albedoTexPath = str::format(BASE_DIR + lss::commonDirName::texDir, albedoTexFilename);
+      lssMat.albedoTexPath = albedoTexPath;
+      // Collect sampler info
+      const auto& samplerCreateInfo = materialData.getSampler()->info();
+      lssMat.sampler.addrModeU = samplerCreateInfo.addressModeU;
+      lssMat.sampler.addrModeV = samplerCreateInfo.addressModeV;
+      lssMat.sampler.filter = samplerCreateInfo.magFilter;
+      lssMat.sampler.borderColor = samplerCreateInfo.borderColor;
+    } else if (materialData.hasUe3ConstantAlbedo) {
+      // texture-less (constant-color) materials export their color so the Toolkit
+      // shows the material's real appearance instead of an unbound white material
+      lssMat.hasAlbedoConstant = true;
+      lssMat.albedoConstant = pxr::GfVec3f(
+        std::clamp(materialData.ue3ConstantAlbedo.x, 0.0f, 1.0f),
+        std::clamp(materialData.ue3ConstantAlbedo.y, 0.0f, 1.0f),
+        std::clamp(materialData.ue3ConstantAlbedo.z, 0.0f, 1.0f));
+    }
     // Opacity
     lssMat.enableOpacity = bEnableOpacity;
-    // Collect sampler info
-    const auto& samplerCreateInfo = materialData.getSampler()->info();
-    lssMat.sampler.addrModeU = samplerCreateInfo.addressModeU;
-    lssMat.sampler.addrModeV = samplerCreateInfo.addressModeV;
-    lssMat.sampler.filter = samplerCreateInfo.magFilter;
-    lssMat.sampler.borderColor = samplerCreateInfo.borderColor;
 
     // Set populated LSS Material in our cache
     m_pCap->materials[materialData.getHash()].lssData = lssMat;

@@ -22,6 +22,8 @@
 
 #include "rtx_materials.h"
 
+#include <algorithm>
+
 #include "rtx_options.h"
 #include "../util/util_struct_hash.h"
 
@@ -153,6 +155,16 @@ template<> OpaqueMaterialData LegacyMaterialData::as() const {
   OpaqueMaterialData opaqueMat(defaultLegacyOpaqueMaterial);
   if (LegacyMaterialDefaults::useAlbedoTextureIfPresent()) {
     opaqueMat.setAlbedoOpacityTexture(getColorTexture());
+  }
+  // UE3 constant-color materials carry their color in UniformVector_* shader constants;
+  // without this they render plain white. Opacity stays at the default - the vector's
+  // w component rarely holds opacity.
+  if (hasUe3ConstantAlbedo && !getColorTexture().isValid()) {
+    const Vector3 clampedAlbedo(
+      std::clamp(ue3ConstantAlbedo.x, 0.0f, 1.0f),
+      std::clamp(ue3ConstantAlbedo.y, 0.0f, 1.0f),
+      std::clamp(ue3ConstantAlbedo.z, 0.0f, 1.0f));
+    opaqueMat.setAlbedoConstant(clampedAlbedo);
   }
   if (getColorTexture2().isValid()) {
     opaqueMat.setSecondaryTexture(getColorTexture2());
