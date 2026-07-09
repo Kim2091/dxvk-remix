@@ -3280,12 +3280,32 @@ namespace dxvk {
     if (!ue3LogClassification() && Logger::logLevel() > LogLevel::Debug)
       return;
 
+    XXH64_hash_t vsHash = 0;
+    if (m_parent->UseProgrammableVS() && d3d9State().vertexShader.ptr() != nullptr) {
+      vsHash = hashDxsoBytecode(d3d9State().vertexShader->GetCommonShader()->GetBytecode());
+    }
+    XXH64_hash_t psHash = 0;
+    if (m_parent->UseProgrammablePS() && d3d9State().pixelShader.ptr() != nullptr) {
+      psHash = hashDxsoBytecode(d3d9State().pixelShader->GetCommonShader()->GetBytecode());
+    }
+
+    uint32_t rtWidth = 0;
+    uint32_t rtHeight = 0;
+    if (d3d9State().renderTargets[kRenderTargetIndex] != nullptr) {
+      const auto& rtExt = d3d9State().renderTargets[kRenderTargetIndex]->GetSurfaceExtent();
+      rtWidth = rtExt.width;
+      rtHeight = rtExt.height;
+    }
+
     Logger::debug(str::format(
       "[RTX-Compatibility][UE3] draw=", m_activeDrawCallState.drawCallID,
       " vf=", describeUe3VertexFactory(m_currentUe3VertexFactory),
       " pass=", describeUe3PassType(passType),
       " status=", describeGeometryStatus(status),
       " prims=", drawContext.PrimitiveCount,
+      " vsHash=0x", std::hex, vsHash,
+      " psHash=0x", psHash, std::dec,
+      " rt=", rtWidth, "x", rtHeight,
       " reason=", reason));
   }
 
@@ -4287,6 +4307,11 @@ namespace dxvk {
     DrawCallTransforms& transformData = m_activeDrawCallState.transformData;
     m_forceIaTexcoordForOutlier = false;
 
+    // m_activeDrawCallState is reused across draws, so these fields need an explicit per-draw reset
+    m_activeDrawCallState.allowMainCameraUpdate = true;
+    m_activeDrawCallState.programmableVertexShaderBytecodeHash = 0;
+    m_activeDrawCallState.ue3PassDescription = describeUe3PassType(m_currentUe3PassType);
+
     const bool isUe3Mode = ue3EngineMode();
     const bool effectiveUe3Camera = ue3CameraFromShaderConstants() || isUe3Mode;
     const bool effectiveUe3ObjectToWorld = ue3ObjectToWorldFromShaderConstants() || isUe3Mode;
@@ -4546,6 +4571,8 @@ namespace dxvk {
         ? XXH3_64bits(bytecode.data(), bytecode.size())
         : 0;
 
+      m_activeDrawCallState.programmableVertexShaderBytecodeHash = shaderHash;
+
       if (shaderHash != 0) {
         auto it = m_ue3VsShaderCtabCache.find(shaderHash);
         if (it == m_ue3VsShaderCtabCache.end()) {
@@ -4644,6 +4671,34 @@ namespace dxvk {
         }
         transformData.worldToView = ue3WorldToView;
         transformData.viewToProjection = ue3ViewToProjection;
+
+        // Only draws whose CTAB explicitly names both camera constants may update the Main camera.
+        // Fallback-register extractions can be light-space matrices from engine utility shaders
+        // (e.g. shadow depth) that still reconstruct as a plausible camera.
+        const bool ctabVerifiedCamera =
+          ue3CtabInfoPtr != nullptr &&
+          ue3CtabInfoPtr->hasViewProjectionMatrix &&
+          ue3CtabInfoPtr->hasCameraPosition;
+
+        if ((ue3RequireCtabCameraConstants() || isUe3Mode) && !ctabVerifiedCamera) {
+          m_activeDrawCallState.allowMainCameraUpdate = false;
+        }
+
+        // Once per vertex shader, so info level stays low-volume
+        {
+          static fast_unordered_set s_loggedCameraSourceVsHashes;
+          const XXH64_hash_t vsHash = m_activeDrawCallState.programmableVertexShaderBytecodeHash;
+          if (vsHash != 0 && s_loggedCameraSourceVsHashes.insert(vsHash).second) {
+            Logger::info(str::format(
+              "[RTX-Compatibility][UE3] camera constants source for vsHash=0x", std::hex, vsHash, std::dec,
+              ": ", ctabVerifiedCamera ? "CTAB-verified" : "fallback registers",
+              " (ctabViewProj=", (ue3CtabInfoPtr != nullptr && ue3CtabInfoPtr->hasViewProjectionMatrix) ? "yes" : "no",
+              ", ctabCameraPos=", (ue3CtabInfoPtr != nullptr && ue3CtabInfoPtr->hasCameraPosition) ? "yes" : "no",
+              ", viewProjReg=c", viewProjReg, ", viewOriginReg=c", viewOriginReg,
+              ", vf=", describeUe3VertexFactory(m_currentUe3VertexFactory),
+              ", allowMainCameraUpdate=", m_activeDrawCallState.allowMainCameraUpdate ? "true" : "false", ")"));
+          }
+        }
       } else {
         if (Logger::logLevel() <= LogLevel::Debug &&
             viewProjReg + 3 < caps::MaxFloatConstantsSoftware && viewOriginReg < caps::MaxFloatConstantsSoftware) {

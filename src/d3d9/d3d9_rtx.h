@@ -155,6 +155,13 @@ namespace dxvk {
                "UE3 compat: world-space camera cell size used to refresh camera-sensitive vertex captures. Smaller values recapture more often; 0 disables camera-cell hashing.");
     RTX_OPTION("rtx.d3d9", bool, ue3NativeLocalMeshVertexCapture, false,
                "UE3 compat experimental: use input-assembler object-space positions directly for conservative static LocalVertexFactory draws instead of reconstructing positions from clip space.");
+    RTX_OPTION("rtx.d3d9", bool, ue3RequireCtabCameraConstants, false,
+               "UE3 compat: only allow a draw call to update the Main camera when its vertex shader CTAB explicitly "
+               "names both ViewProjectionMatrix and CameraPosition constants. Engine utility shaders (shadow depth, "
+               "filters, etc.) do not declare these, so whatever data happens to live in the fallback camera registers "
+               "(c0..c4) can otherwise be misinterpreted as a one-frame Main camera (e.g. a light-space matrix during "
+               "UE3 light environment updates). Geometry from unverified draws is still rendered normally. "
+               "Implicitly enabled by rtx.d3d9.ue3EngineMode.");
     RTX_OPTION("rtx.d3d9", bool, ue3LogClassification, false,
                "UE3 compat: log explicit pass and vertex factory classification decisions for draw-call routing diagnostics.");
     RTX_OPTION("rtx.d3d9", bool, ue3LogUvResolution, false,

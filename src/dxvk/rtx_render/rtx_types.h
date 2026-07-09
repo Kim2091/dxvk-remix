@@ -743,6 +743,20 @@ struct DrawCallState {
   DxsoProgramInfo programmableVertexShaderInfo;
   DxsoProgramInfo programmablePixelShaderInfo;
 
+  // Bytecode hash of the bound programmable vertex shader (0 when unavailable); lets camera-manager
+  // log lines be correlated back to the originating draw.
+  XXH64_hash_t programmableVertexShaderBytecodeHash = 0;
+
+  // False when the camera matrices came from unverified fallback shader-constant registers rather
+  // than CTAB-named ViewProjectionMatrix/CameraPosition constants (see
+  // rtx.d3d9.ue3RequireCtabCameraConstants). Such draws render normally but must not update the
+  // Main camera: engine utility passes (e.g. shadow depth) upload light-space matrices through
+  // those registers that can reconstruct as a plausible camera.
+  bool allowMainCameraUpdate = true;
+
+  // UE3 pass classification for diagnostics (points to a static string)
+  const char* ue3PassDescription = "Unknown";
+
   float minZ = 0.0f;
   float maxZ = 1.0f;
 

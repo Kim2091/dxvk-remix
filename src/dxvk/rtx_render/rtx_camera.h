@@ -326,7 +326,6 @@ namespace dxvk
       uint32_t frameIdx, const Matrix4& newWorldToView, const Matrix4& newViewToProjection,
       float fov, float aspectRatio, float nearPlane, float farPlane, bool isLHS, uint32_t flags = (uint32_t)UpdateFlag::UpdateNormal
     );
-    bool holdFrame(uint32_t frameIdx);
     bool updateFromSetting(uint32_t frameIdx, const RtCameraSetting& setting, uint32_t flags = (uint32_t) UpdateFlag::UpdateNormal);
     void getJittering(float jitter[2]) const;
     bool isLHS() const { return m_context.isLHS; }
@@ -341,7 +340,7 @@ namespace dxvk
 
     static void showImguiSettings();
 
-    const RtCameraSetting& getSetting() const;
+    const RtCameraSetting& getSetting();
 
   private:
     Matrix4d getShakenViewToWorldMatrix(Matrix4d& viewToWorld, uint32_t flags);

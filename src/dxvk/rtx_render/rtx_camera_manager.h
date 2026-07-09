@@ -52,7 +52,6 @@ namespace dxvk {
     
     bool isCameraValid(CameraType::Enum cameraType) const;
 
-    void finalizeFrameCameras();
     void onFrameEnd();
 
     // Calculates a camera type for the specified draw call.
@@ -80,35 +79,17 @@ namespace dxvk {
     }
 
   private:
-    struct PendingMainCameraJumpCandidate {
-      bool valid = false;
-      uint32_t frameId = 0;
-      Vector3 position = Vector3(0.0f);
-      Vector3 direction = Vector3(0.0f);
-      float fov = 0.0f;
-      float aspectRatio = 0.0f;
-    };
-
     std::array<RtCamera, CameraType::Count> m_cameras;
-    PendingMainCameraJumpCandidate m_pendingMainJumpCandidate;
     CameraType::Enum m_lastSetCameraType = CameraType::Unknown;
     uint32_t m_lastCameraCutFrameId = -1;
     uint32_t m_lastCameraViewHistoryInvalidationFrameId = -1;
-    mutable uint32_t m_lastRejectedMainCameraLogFrameId = -1;
-    uint32_t m_lastFinalizedFrameId = -1;
     fast_unordered_cache<DecomposeProjectionParams> m_decompositionCache;
 
     DecomposeProjectionParams getOrDecomposeProjection(const Matrix4& viewToProjection);
 
   public:
-    // todo: revisit this, it's a bit hacky
-    RTX_OPTION("rtx.cameraManager", bool, guardMainCameraFromOutliers, false,
-               "When enabled, the CameraManager will ignore obvious outlier candidates for the main camera "
-               "so they can't override the frame's main camera for a single frame.");
     RTX_OPTION("rtx.cameraManager", bool, logMainCameraUpdates, false,
-               "Logs main camera acceptance, rejection, camera-cut, and history-invalidation decisions.");
-    RTX_OPTION("rtx.cameraManager", bool, syncMainCameraFromRenderToTexture, false,
-               "When enabled, a valid RenderToTexture camera can seed the Main camera for games that render the scene through an offscreen target.");
+               "Logs main camera acceptance, skipped-update, camera-cut, and history-invalidation decisions.");
 
   private:
     RTX_OPTION("rtx", bool, rayPortalEnabled, false, "Enables ray portal support. Note this requires portal texture hashes to be set for the ray portal geometries in rtx.rayPortalModelTextureHashes.");
