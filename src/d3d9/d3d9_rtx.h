@@ -34,17 +34,24 @@ namespace dxvk {
   // Exact UV dataflow analysis types (shared between the PS coordinate-origin resolver,
   // the VS interpolant->IA trace, and the per-draw UV decision in D3D9Rtx).
   //
-  // A UvAffineTerm models one term of `value' = value * scale + offset` where the term is
-  // either a shader `def` immediate (immValid) or a draw-time float constant register
-  // component multiplied by a static factor (constReg >= 0). When neither is set the term
-  // is absent (identity for scale, zero for offset). `inexact` marks terms that encountered
-  // math not representable in this model (the origin may still be provable).
+  // A UvAffineTerm models one term of `value' = value * scale + offset` as a small sum:
+  //   term = imm + consts[constReg][constComp] * factor + consts[constReg2][constComp2] * factor2
+  // where each part is optional (immValid / constReg >= 0 / constReg2 >= 0; constReg2 is only
+  // used when constReg is). When no part is set the term is absent (identity for scale, zero
+  // for offset). Scale terms only ever carry a single part (immediate or one constant ref -
+  // products of two draw-time constants are not representable); offset terms may legitimately
+  // sum an immediate and up to two constant refs (UE3 materials add uniform-expression tile
+  // offsets and literal centering biases to one coordinate). `inexact` marks terms that
+  // encountered math not representable in this model (the origin may still be provable).
   struct UvAffineTerm {
     bool immValid = false;
     float imm = 0.0f;
     int16_t constReg = -1;
     uint8_t constComp = 0;
     float factor = 1.0f;
+    int16_t constReg2 = -1;
+    uint8_t constComp2 = 0;
+    float factor2 = 1.0f;
     bool inexact = false;
   };
 
@@ -183,6 +190,21 @@ namespace dxvk {
     RTX_OPTION("rtx.d3d9", bool, ue3LogUvResolution, false,
                "UE3 compat: log the deterministic UV resolution decision (proven IA set / captured interpolant / legacy fallback) "
                "once per unique pixel shader + stage combination, including ambiguity diagnostics.");
+    RTX_OPTION("rtx.d3d9", fast_unordered_set, ue3UvTraceShaderHashes, {},
+               "UE3 compat diagnostics: pixel shader bytecode hashes whose UV dataflow analysis is traced "
+               "instruction by instruction to the log ([RTX-UV-TRACE] lines: opcode, operands, and the "
+               "per-component origin/affine/constant-expression verdict after each write, plus every sampler "
+               "site decision). The trace runs once when the shader is first analyzed. Use together with "
+               "rtx.d3d9.ue3LogUvAffineDetail to root-cause atlas/tiling materials whose affine chain "
+               "resolves inexactly.");
+    RTX_OPTION("rtx.d3d9", bool, ue3LogUvAffineDetail, false,
+               "UE3 compat diagnostics: log the full UV affine chain behind the deterministic UV resolution of "
+               "shader-path draws: per-component scale/offset terms (immediate or constant-register component with "
+               "factor, and inexactness), the live resolved scale/offset values, the gates that allowed or rejected "
+               "writing the texture transform, and the pixel shader CTAB names/values of referenced constant "
+               "registers. On the first sighting of a pixel shader it also dumps every sampler's UV origin and "
+               "affine chain with the currently bound textures. Logs once per distinct resolved transform, capped "
+               "per shader+stage. Use this to diagnose texture-atlas materials whose tile offset is not applied.");
     RTX_OPTION("rtx.d3d9", bool, ue3LogAlbedoSelection, false,
                "UE3 compat diagnostics: log a per-sampler score breakdown of the shader-path albedo selection once per "
                "(pixel shader, bound texture set, sRGB states, vertex factory) key: texture hash, dimensions, sRGB state, "
@@ -564,6 +586,13 @@ namespace dxvk {
     };
     fast_unordered_cache<PsSamplerTexcoordEntry> m_psSamplerTexcoordCache;
     fast_unordered_set m_loggedUvResolutions;
+
+    // rtx.d3d9.ue3LogUvAffineDetail state: per-shader one-shot sampler dump, per distinct
+    // resolved transform dedup, and a per (shader, stage) cap so panner/frame-varying
+    // transforms cannot flood the log
+    fast_unordered_set m_loggedUvAffineShaderDumps;
+    fast_unordered_set m_loggedUvAffineDetails;
+    fast_unordered_cache<uint16_t> m_uvAffineDetailLogCounts;
 
     // Deterministic diffuse selection: the winning sampler stages for a given
     // (pixel shader, ordered bound texture set, sRGB states, vertex factory) key.

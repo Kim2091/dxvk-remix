@@ -13,13 +13,17 @@
 #include "../util/util_math.h"
 #include "d3d9_rtx_utils.h"
 #include "d3d9_texture.h"
+#include "../dxso/dxso_tables.h"
 #include "../dxvk/rtx_render/rtx_terrain_baker.h"
 #include "../dxvk/imgui/dxvk_imgui.h"
 
+#include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <sstream>
 
 namespace dxvk {
   static const bool s_isDxvkResolutionEnvVarSet = (env::getEnvVar("DXVK_RESOLUTION_WIDTH") != "") || (env::getEnvVar("DXVK_RESOLUTION_HEIGHT") != "");
@@ -210,11 +214,14 @@ namespace dxvk {
     }
 
     static bool uvAffineTermsEqual(const UvAffineTerm& a, const UvAffineTerm& b) {
-      if (a.inexact != b.inexact || a.immValid != b.immValid || a.constReg != b.constReg)
+      if (a.inexact != b.inexact || a.immValid != b.immValid ||
+          a.constReg != b.constReg || a.constReg2 != b.constReg2)
         return false;
       if (a.immValid && a.imm != b.imm)
         return false;
       if (a.constReg >= 0 && (a.constComp != b.constComp || a.factor != b.factor))
+        return false;
+      if (a.constReg2 >= 0 && (a.constComp2 != b.constComp2 || a.factor2 != b.factor2))
         return false;
       return true;
     }
@@ -229,8 +236,10 @@ namespace dxvk {
 
     static bool uvComponentAffineIsIdentity(const UvComponentAffine& a) {
       return uvComponentAffineExact(a) &&
-             (!uvAffineTermPresent(a.scale) || (a.scale.immValid && a.scale.imm == 1.0f)) &&
-             (!uvAffineTermPresent(a.offset) || (a.offset.immValid && a.offset.imm == 0.0f));
+             (!uvAffineTermPresent(a.scale) ||
+              (a.scale.immValid && a.scale.imm == 1.0f && a.scale.constReg < 0)) &&
+             (!uvAffineTermPresent(a.offset) ||
+              (a.offset.immValid && a.offset.imm == 0.0f && a.offset.constReg < 0));
     }
 
     static void uvAffineMarkInexact(UvComponentAffine& a) {
@@ -249,10 +258,15 @@ namespace dxvk {
         a.scale.imm = value;
       }
 
+      // the offset is a sum: multiplying by an immediate distributes over every part
+      if (a.offset.immValid) {
+        a.offset.imm *= value;
+      }
       if (a.offset.constReg >= 0) {
         a.offset.factor *= value;
-      } else if (a.offset.immValid) {
-        a.offset.imm *= value;
+      }
+      if (a.offset.constReg2 >= 0) {
+        a.offset.factor2 *= value;
       }
     }
 
@@ -275,6 +289,8 @@ namespace dxvk {
       }
 
       if (a.offset.constReg >= 0) {
+        // any existing constant part times a new draw-time constant is a product of two
+        // draw-time constants - not representable
         a.offset.inexact = true;
       } else if (a.offset.immValid) {
         if (a.offset.imm != 0.0f) {
@@ -294,25 +310,50 @@ namespace dxvk {
       if (value == 0.0f)
         return;
 
-      if (a.offset.constReg >= 0) {
-        // constant-register offset plus an immediate is a two-term offset - not representable
-        a.offset.inexact = true;
-      } else {
-        a.offset.immValid = true;
-        a.offset.imm += value;
-      }
+      a.offset.immValid = true;
+      a.offset.imm += value;
     }
 
     static void uvAffineAddConstant(UvComponentAffine& a, const int16_t reg, const uint8_t comp, const float factor) {
       if (a.offset.immValid && a.offset.imm == 0.0f)
         a.offset.immValid = false;
 
-      if (uvAffineTermPresent(a.offset)) {
-        a.offset.inexact = true;
-      } else {
+      if (a.offset.constReg >= 0 && a.offset.constComp == comp && a.offset.constReg == reg) {
+        // same component referenced twice: fold into the first part's factor
+        a.offset.factor += factor;
+        if (a.offset.factor == 0.0f) {
+          // cancelled out: promote the second part into the first slot to keep the
+          // "constReg2 only set when constReg is" invariant
+          a.offset.constReg = a.offset.constReg2;
+          a.offset.constComp = a.offset.constComp2;
+          a.offset.factor = a.offset.factor2;
+          a.offset.constReg2 = -1;
+          a.offset.constComp2 = 0;
+          a.offset.factor2 = 1.0f;
+        }
+        return;
+      }
+      if (a.offset.constReg2 >= 0 && a.offset.constComp2 == comp && a.offset.constReg2 == reg) {
+        a.offset.factor2 += factor;
+        if (a.offset.factor2 == 0.0f) {
+          a.offset.constReg2 = -1;
+          a.offset.constComp2 = 0;
+          a.offset.factor2 = 1.0f;
+        }
+        return;
+      }
+
+      if (a.offset.constReg < 0) {
         a.offset.constReg = reg;
         a.offset.constComp = comp;
         a.offset.factor = factor;
+      } else if (a.offset.constReg2 < 0) {
+        a.offset.constReg2 = reg;
+        a.offset.constComp2 = comp;
+        a.offset.factor2 = factor;
+      } else {
+        // more than two distinct constant parts - not representable
+        a.offset.inexact = true;
       }
     }
 
@@ -421,6 +462,145 @@ namespace dxvk {
         uvAffineAddConstant(a, ref.constReg, ref.constComp, sign * ref.factor);
     }
 
+    // -------------------------------------------------------------------------
+    // Formatting helpers for rtx.d3d9.ue3LogUvAffineDetail / ue3UvTraceShaderHashes
+    // -------------------------------------------------------------------------
+
+    // Renders one UV affine term (sum of a `def` immediate and up to two draw-time
+    // constant register components times static factors).
+    static std::string formatUvAffineTerm(const UvAffineTerm& term, const char* identity) {
+      std::string s;
+      auto appendConstPart = [&s](const int16_t reg, const uint8_t comp, const float factor) {
+        if (!s.empty()) {
+          s += "+";
+        }
+        s += str::format("c", reg, ".", "xyzw"[comp & 0x3u]);
+        if (factor != 1.0f) {
+          s += str::format("*", factor);
+        }
+      };
+      // suppress a redundant "0+" in front of constant parts
+      if (term.immValid && (term.imm != 0.0f || term.constReg < 0)) {
+        s = str::format(term.imm);
+      }
+      if (term.constReg >= 0) {
+        appendConstPart(term.constReg, term.constComp, term.factor);
+      }
+      if (term.constReg2 >= 0) {
+        appendConstPart(term.constReg2, term.constComp2, term.factor2);
+      }
+      if (s.empty()) {
+        s = identity;
+      }
+      if (term.inexact) {
+        s += "(INEXACT)";
+      }
+      return s;
+    }
+
+    static std::string formatUvComponentAffine(const UvComponentAffine& affine) {
+      return str::format("uv*", formatUvAffineTerm(affine.scale, "1"), "+", formatUvAffineTerm(affine.offset, "0"));
+    }
+
+    static std::string formatUvConstExpr(const UvConstComponentRef& ref) {
+      if (!ref.valid) {
+        return "-";
+      }
+      if (ref.isImmediate) {
+        return str::format(ref.immediate);
+      }
+      std::string s = str::format("c", ref.constReg, ".", "xyzw"[ref.constComp & 0x3u]);
+      if (ref.factor != 1.0f) {
+        s += str::format("*", ref.factor);
+      }
+      return s;
+    }
+
+    static const char* dxsoRegisterTypePrefix(const DxsoRegisterType type) {
+      switch (type) {
+      case DxsoRegisterType::Temp:          return "r";
+      case DxsoRegisterType::Input:         return "v";
+      case DxsoRegisterType::Const:         return "c";
+      case DxsoRegisterType::Texture:       return "t";   // Addr in VS
+      case DxsoRegisterType::RasterizerOut: return "rast";
+      case DxsoRegisterType::AttributeOut:  return "oD";
+      case DxsoRegisterType::Output:        return "o";   // TexcoordOut pre-3.0
+      case DxsoRegisterType::ConstInt:      return "i";
+      case DxsoRegisterType::ColorOut:      return "oC";
+      case DxsoRegisterType::DepthOut:      return "oDepth";
+      case DxsoRegisterType::Sampler:       return "s";
+      case DxsoRegisterType::Const2:        return "c2_";
+      case DxsoRegisterType::Const3:        return "c3_";
+      case DxsoRegisterType::Const4:        return "c4_";
+      case DxsoRegisterType::ConstBool:     return "b";
+      case DxsoRegisterType::Loop:          return "aL";
+      case DxsoRegisterType::TempFloat16:   return "rh";
+      case DxsoRegisterType::MiscType:      return "misc";
+      case DxsoRegisterType::Label:         return "label";
+      case DxsoRegisterType::Predicate:     return "p";
+      case DxsoRegisterType::PixelTexcoord: return "t";
+      default:                              return "reg";
+      }
+    }
+
+    static const char* dxsoRegModifierName(const DxsoRegModifier modifier) {
+      switch (modifier) {
+      case DxsoRegModifier::None:    return "";
+      case DxsoRegModifier::Neg:     return "_neg";
+      case DxsoRegModifier::Bias:    return "_bias";
+      case DxsoRegModifier::BiasNeg: return "_biasneg";
+      case DxsoRegModifier::Sign:    return "_bx2";
+      case DxsoRegModifier::SignNeg: return "_bx2neg";
+      case DxsoRegModifier::Comp:    return "_comp";
+      case DxsoRegModifier::X2:      return "_x2";
+      case DxsoRegModifier::X2Neg:   return "_x2neg";
+      case DxsoRegModifier::Dz:      return "_dz";
+      case DxsoRegModifier::Dw:      return "_dw";
+      case DxsoRegModifier::Abs:     return "_abs";
+      case DxsoRegModifier::AbsNeg:  return "_absneg";
+      case DxsoRegModifier::Not:     return "_not";
+      default:                       return "_mod?";
+      }
+    }
+
+    static std::string formatDxsoSrcRegister(const DxsoRegister& r) {
+      std::string s = str::format(dxsoRegisterTypePrefix(r.id.type), r.id.num);
+      if (r.hasRelative) {
+        s += "[rel]";
+      }
+      std::string swizzle;
+      bool identitySwizzle = true;
+      for (uint32_t c = 0; c < 4u; c++) {
+        const uint32_t sourceComponent = r.swizzle[c];
+        swizzle += "xyzw"[sourceComponent & 0x3u];
+        identitySwizzle &= sourceComponent == c;
+      }
+      if (!identitySwizzle) {
+        s += str::format(".", swizzle);
+      }
+      s += dxsoRegModifierName(r.modifier);
+      return s;
+    }
+
+    static std::string formatDxsoDstRegister(const DxsoRegister& r) {
+      std::string s = str::format(dxsoRegisterTypePrefix(r.id.type), r.id.num);
+      if (r.mask != IdentityWriteMask) {
+        s += ".";
+        for (uint32_t c = 0; c < 4u; c++) {
+          if (r.mask[c]) {
+            s += "xyzw"[c];
+          }
+        }
+      }
+      if (r.saturate) {
+        s += "_sat";
+      }
+      if (r.shift != 0) {
+        s += str::format("_shift", int32_t(r.shift));
+      }
+      return s;
+    }
+
     class UvDataflowTracer {
     public:
       UvDataflowTracer(const std::array<int8_t, 2 * DxsoMaxInterfaceRegs>& inputRegToTexcoord,
@@ -440,9 +620,42 @@ namespace dxvk {
         return m_outputOrigins[component & 0x3u];
       }
 
+      // diagnostics accessors for the instruction-level UV trace
+      const UvExactComponentOrigin& tempOrigin(const uint32_t reg, const uint32_t component) const {
+        return m_tempOrigins[reg % m_tempOrigins.size()][component & 0x3u];
+      }
+
+      const UvConstComponentRef& tempConstExpr(const uint32_t reg, const uint32_t component) const {
+        return m_tempConstExprs[reg % m_tempConstExprs.size()][component & 0x3u];
+      }
+
       UvConstComponentRef readConst(const DxsoRegister& r, const uint32_t dstComponent) const {
         UvConstComponentRef ref;
-        if (!isFloatConstantRegisterType(r.id.type) || r.hasRelative)
+        if (r.hasRelative)
+          return ref;
+
+        // temps holding tracked pure-constant expressions (fxc hoists constant
+        // subexpressions into temps before applying them to UVs) read like constants
+        if (r.id.type == DxsoRegisterType::Temp || r.id.type == DxsoRegisterType::TempFloat16) {
+          if (r.id.num >= m_tempConstExprs.size())
+            return ref;
+          const uint8_t comp = uint8_t(r.swizzle[dstComponent & 0x3u] & 0x3u);
+          const UvConstComponentRef& tracked = m_tempConstExprs[r.id.num][comp];
+          if (!tracked.valid)
+            return ref;
+          float modifierScale = 1.0f;
+          if (!decodeConstantModifierScale(r.modifier, modifierScale))
+            return ref;
+          ref = tracked;
+          if (ref.isImmediate) {
+            ref.immediate *= modifierScale;
+          } else {
+            ref.factor *= modifierScale;
+          }
+          return ref;
+        }
+
+        if (!isFloatConstantRegisterType(r.id.type))
           return ref;
 
         float modifierScale = 1.0f;
@@ -557,6 +770,8 @@ namespace dxvk {
         case DxsoOpcode::Label:
           for (auto& tempComponents : m_tempOrigins)
             tempComponents = {};
+          for (auto& tempConstExprComponents : m_tempConstExprs)
+            tempConstExprComponents = {};
           for (auto& outputComponent : m_outputOrigins)
             outputComponent = UvExactComponentOrigin{};
           return;
@@ -564,6 +779,8 @@ namespace dxvk {
         case DxsoOpcode::Ret:
           for (auto& tempComponents : m_tempOrigins)
             tempComponents = {};
+          for (auto& tempConstExprComponents : m_tempConstExprs)
+            tempConstExprComponents = {};
           return;
         default:
           break;
@@ -593,9 +810,13 @@ namespace dxvk {
             continue;
 
           UvExactComponentOrigin origin;
+          UvConstComponentRef constExpr;
           // predicated writes are conditional - the resulting value origin is unknowable
-          if (!ctx.instruction.predicated)
+          if (!ctx.instruction.predicated) {
             origin = traceComponent(ctx, c);
+            if (dstIsTemp && !origin.valid)
+              constExpr = traceConstExpr(ctx, c);
+          }
 
           if (origin.valid) {
             if (ctx.dst.shift != 0)
@@ -604,10 +825,31 @@ namespace dxvk {
               uvAffineMarkInexact(origin.affine);
           }
 
-          if (dstIsTemp)
+          if (constExpr.valid) {
+            if (ctx.dst.shift != 0) {
+              const float shiftScale = std::exp2(float(ctx.dst.shift));
+              if (constExpr.isImmediate) {
+                constExpr.immediate *= shiftScale;
+              } else {
+                constExpr.factor *= shiftScale;
+              }
+            }
+            if (ctx.dst.saturate) {
+              if (constExpr.isImmediate) {
+                constExpr.immediate = std::clamp(constExpr.immediate, 0.0f, 1.0f);
+              } else {
+                // clamped draw-time value: not representable as const * factor
+                constExpr = UvConstComponentRef{};
+              }
+            }
+          }
+
+          if (dstIsTemp) {
             m_tempOrigins[ctx.dst.id.num][c] = origin;
-          else
+            m_tempConstExprs[ctx.dst.id.num][c] = constExpr;
+          } else {
             m_outputOrigins[c] = origin;
+          }
         }
       }
 
@@ -780,9 +1022,14 @@ namespace dxvk {
           if (o0.valid && o1.valid)
             return uvMergeOrigins(o0, o1); // min(x,x) stays exact; differing affines go inexact
           if (o0.valid || o1.valid) {
-            // clamp against a constant/unknown keeps the base origin
+            // clamping an affine UV against a provable constant bound (atlas tile
+            // anti-bleed clamping: min/max against the tile edge) is identity for
+            // in-range coordinates - keep the affine exact. A bound that is arbitrary
+            // math keeps the origin but the affine is unknowable.
             UvExactComponentOrigin origin = o0.valid ? o0 : o1;
-            uvAffineMarkInexact(origin.affine);
+            const UvConstComponentRef bound = readConst(o0.valid ? ctx.src[1] : ctx.src[0], c);
+            if (!bound.valid)
+              uvAffineMarkInexact(origin.affine);
             return origin;
           }
           return UvExactComponentOrigin{};
@@ -793,9 +1040,22 @@ namespace dxvk {
           return uvMergeOrigins(readOrigin(ctx.src[1], c), readOrigin(ctx.src[2], c));
 
         case DxsoOpcode::Cmp:
-        case DxsoOpcode::Cnd:
+        case DxsoOpcode::Cnd: {
           // per-component select between src1/src2; src0 is the condition
-          return uvMergeOrigins(readOrigin(ctx.src[1], c), readOrigin(ctx.src[2], c));
+          const UvExactComponentOrigin o1 = readOrigin(ctx.src[1], c);
+          const UvExactComponentOrigin o2 = readOrigin(ctx.src[2], c);
+          if (o1.valid != o2.valid) {
+            // selecting between an affine UV and a provable constant is the
+            // conditional-move form of tile clamping (fxc emits cmp for the lower
+            // bound of clamp()): keep the affine branch exact
+            UvExactComponentOrigin origin = o1.valid ? o1 : o2;
+            const UvConstComponentRef bound = readConst(o1.valid ? ctx.src[2] : ctx.src[1], c);
+            if (!bound.valid)
+              uvAffineMarkInexact(origin.affine);
+            return origin;
+          }
+          return uvMergeOrigins(o1, o2);
+        }
 
         // single-source value-mangling math: register provenance survives, affine does not
         case DxsoOpcode::Rcp:
@@ -860,7 +1120,136 @@ namespace dxvk {
       bool m_originIsSemanticIndex = false;
       uint32_t m_trackedOutputReg = std::numeric_limits<uint32_t>::max();
 
+      // Tracks temp components holding pure constant expressions (no interpolant input).
+      // fxc hoists constant subexpressions - e.g. a def'd tiling literal times a uniform
+      // scalar - into temps before multiplying/adding them onto UVs; without this, such
+      // multiplies degrade to "origin times unknown factor" and the affine goes inexact.
+      // Only single-part values (immediate, or one constant-register component times a
+      // static factor) are representable; anything else invalidates the tracked value.
+      UvConstComponentRef traceConstExpr(const DxsoInstructionContext& ctx, const uint32_t c) const {
+        auto mulRefs = [](const UvConstComponentRef& a, const UvConstComponentRef& b) -> UvConstComponentRef {
+          UvConstComponentRef result;
+          if (!a.valid || !b.valid)
+            return result;
+          if (a.isImmediate && b.isImmediate) {
+            result.valid = true;
+            result.isImmediate = true;
+            result.immediate = a.immediate * b.immediate;
+            return result;
+          }
+          if (a.isImmediate != b.isImmediate) {
+            const UvConstComponentRef& constPart = a.isImmediate ? b : a;
+            const float immediatePart = a.isImmediate ? a.immediate : b.immediate;
+            result = constPart;
+            result.factor *= immediatePart;
+            return result;
+          }
+          return result; // product of two draw-time constants: not representable
+        };
+
+        switch (ctx.instruction.opcode) {
+        case DxsoOpcode::Mov:
+          return readConst(ctx.src[0], c);
+
+        case DxsoOpcode::Mul:
+          return mulRefs(readConst(ctx.src[0], c), readConst(ctx.src[1], c));
+
+        case DxsoOpcode::Add:
+        case DxsoOpcode::Sub: {
+          const UvConstComponentRef k0 = readConst(ctx.src[0], c);
+          const UvConstComponentRef k1 = readConst(ctx.src[1], c);
+          const float sign = ctx.instruction.opcode == DxsoOpcode::Sub ? -1.0f : 1.0f;
+          UvConstComponentRef result;
+          if (k0.valid && k1.valid && k0.isImmediate && k1.isImmediate) {
+            result.valid = true;
+            result.isImmediate = true;
+            result.immediate = k0.immediate + sign * k1.immediate;
+          }
+          // immediate + draw-time constant sums exceed the single-part model
+          return result;
+        }
+
+        case DxsoOpcode::Mad: {
+          const UvConstComponentRef product = mulRefs(readConst(ctx.src[0], c), readConst(ctx.src[1], c));
+          const UvConstComponentRef k2 = readConst(ctx.src[2], c);
+          UvConstComponentRef result;
+          if (product.valid && k2.valid) {
+            if (product.isImmediate && k2.isImmediate) {
+              result.valid = true;
+              result.isImmediate = true;
+              result.immediate = product.immediate + k2.immediate;
+            } else if (!product.isImmediate && k2.isImmediate && k2.immediate == 0.0f) {
+              result = product;
+            } else if (product.isImmediate && product.immediate == 0.0f && !k2.isImmediate) {
+              result = k2;
+            }
+          }
+          return result;
+        }
+
+        case DxsoOpcode::Min:
+        case DxsoOpcode::Max: {
+          const UvConstComponentRef k0 = readConst(ctx.src[0], c);
+          const UvConstComponentRef k1 = readConst(ctx.src[1], c);
+          UvConstComponentRef result;
+          if (k0.valid && k1.valid && k0.isImmediate && k1.isImmediate) {
+            result.valid = true;
+            result.isImmediate = true;
+            result.immediate = ctx.instruction.opcode == DxsoOpcode::Min
+              ? std::min(k0.immediate, k1.immediate)
+              : std::max(k0.immediate, k1.immediate);
+          }
+          return result;
+        }
+
+        // unary math on compile-time immediates stays computable
+        case DxsoOpcode::Frc:
+        case DxsoOpcode::Abs:
+        case DxsoOpcode::Rcp:
+        case DxsoOpcode::Rsq:
+        case DxsoOpcode::Exp:
+        case DxsoOpcode::Log: {
+          const UvConstComponentRef k0 = readConst(ctx.src[0], c);
+          UvConstComponentRef result;
+          if (k0.valid && k0.isImmediate && std::isfinite(k0.immediate)) {
+            float value = k0.immediate;
+            switch (ctx.instruction.opcode) {
+            case DxsoOpcode::Frc: value = value - std::floor(value); break;
+            case DxsoOpcode::Abs: value = std::abs(value); break;
+            case DxsoOpcode::Rcp:
+              if (value == 0.0f)
+                return result;
+              value = 1.0f / value;
+              break;
+            case DxsoOpcode::Rsq:
+              if (value <= 0.0f)
+                return result;
+              value = 1.0f / std::sqrt(value);
+              break;
+            case DxsoOpcode::Exp: value = std::exp2(value); break;
+            case DxsoOpcode::Log:
+              if (value == 0.0f)
+                return result;
+              value = std::log2(std::abs(value));
+              break;
+            default: break;
+            }
+            if (std::isfinite(value)) {
+              result.valid = true;
+              result.isImmediate = true;
+              result.immediate = value;
+            }
+          }
+          return result;
+        }
+
+        default:
+          return UvConstComponentRef{};
+        }
+      }
+
       std::array<std::array<UvExactComponentOrigin, 4>, 64> m_tempOrigins = {};
+      std::array<std::array<UvConstComponentRef, 4>, 64> m_tempConstExprs = {};
       std::array<UvExactComponentOrigin, 4> m_outputOrigins = {};
 
       std::array<uint8_t, 256> m_defConstValid = {};
@@ -869,6 +1258,7 @@ namespace dxvk {
 
     // Resolves the exact coordinate origin for every sampler of a pixel shader in one pass.
     static void analyzePsSamplerUvOrigins(const D3D9CommonShader* pixelShader,
+                                          const XXH64_hash_t psHash,
                                           std::array<PsSamplerUvOrigin, caps::MaxTexturesPS>& outOrigins) {
       for (auto& origin : outOrigins)
         origin = PsSamplerUvOrigin{};
@@ -883,6 +1273,18 @@ namespace dxvk {
       const auto& bytecode = pixelShader->GetBytecode();
       if (bytecode.size() < sizeof(uint32_t) || (bytecode.size() % sizeof(uint32_t)) != 0)
         return;
+
+      // rtx.d3d9.ue3UvTraceShaderHashes: instruction-level trace of the UV dataflow analysis
+      const bool traceInstructions =
+        psHash != 0 &&
+        !D3D9Rtx::ue3UvTraceShaderHashes().empty() &&
+        lookupHash(D3D9Rtx::ue3UvTraceShaderHashes(), psHash);
+      if (traceInstructions) {
+        Logger::info(str::format(
+          "[RTX-UV-TRACE] begin ps=0x", std::hex, psHash, std::dec,
+          " version=", info.majorVersion(), ".", info.minorVersion(),
+          " bytes=", bytecode.size()));
+      }
 
       std::array<int8_t, 2 * DxsoMaxInterfaceRegs> inputRegToTexcoord = {};
       inputRegToTexcoord.fill(-1);
@@ -1001,6 +1403,26 @@ namespace dxvk {
             }
           }
 
+          if (traceInstructions) {
+            std::string siteDetail;
+            if (site.valid) {
+              siteDetail = str::format(
+                " sem=", uint32_t(site.semanticIndex),
+                " comps=(", uint32_t(site.compU), ",", uint32_t(site.compV), ")",
+                " exact=", site.affineExact ? 1 : 0,
+                " U=[", formatUvComponentAffine(site.affineU), "]",
+                " V=[", formatUvComponentAffine(site.affineV), "]");
+            }
+            Logger::info(str::format(
+              "[RTX-UV-TRACE] #", ctx.instructionIdx, " SAMPLE s", sampledSampler,
+              coordReg != nullptr ? str::format(" coord=", formatDxsoSrcRegister(*coordReg)).c_str() : "",
+              directTexcoordSite ? " direct-texcoord" : "",
+              untraceableSite ? " untraceable-legacy-op" : "",
+              projected ? " projected" : "",
+              " => valid=", site.valid ? 1 : 0,
+              siteDetail));
+          }
+
           if (site.valid) {
             if (agg.validSiteCount < std::numeric_limits<uint16_t>::max())
               agg.validSiteCount++;
@@ -1034,6 +1456,89 @@ namespace dxvk {
         }
 
         tracer.processInstruction(ctx);
+
+        if (traceInstructions) {
+          std::ostringstream opName;
+          opName << op;
+          std::string line = str::format("[RTX-UV-TRACE] #", ctx.instructionIdx, " ", opName.str());
+
+          const bool isFlowOrMeta =
+            op == DxsoOpcode::Nop || op == DxsoOpcode::Comment || op == DxsoOpcode::End ||
+            op == DxsoOpcode::Phase || op == DxsoOpcode::If || op == DxsoOpcode::Ifc ||
+            op == DxsoOpcode::Else || op == DxsoOpcode::EndIf || op == DxsoOpcode::Loop ||
+            op == DxsoOpcode::EndLoop || op == DxsoOpcode::Rep || op == DxsoOpcode::EndRep ||
+            op == DxsoOpcode::Break || op == DxsoOpcode::BreakC || op == DxsoOpcode::BreakP ||
+            op == DxsoOpcode::Call || op == DxsoOpcode::CallNz || op == DxsoOpcode::Label ||
+            op == DxsoOpcode::Ret;
+
+          if (op == DxsoOpcode::Def) {
+            line += str::format(" c", ctx.dst.id.num,
+                                " = (", ctx.def.float32[0], ",", ctx.def.float32[1], ",",
+                                ctx.def.float32[2], ",", ctx.def.float32[3], ")");
+          } else if (op == DxsoOpcode::Dcl || op == DxsoOpcode::DefI || op == DxsoOpcode::DefB) {
+            line += str::format(" ", formatDxsoDstRegister(ctx.dst));
+          } else if (!isFlowOrMeta) {
+            line += str::format(" ", formatDxsoDstRegister(ctx.dst));
+
+            const uint32_t opcodeLength = DxsoGetDefaultOpcodeLength(op);
+            const uint32_t sourceCount = (opcodeLength != InvalidOpcodeLength && opcodeLength > 0u)
+              ? std::min<uint32_t>(opcodeLength - 1u, uint32_t(ctx.src.size()))
+              : 0u;
+            for (uint32_t s = 0; s < sourceCount; s++) {
+              line += str::format(", ", formatDxsoSrcRegister(ctx.src[s]));
+            }
+            if (ctx.instruction.predicated) {
+              line += " [predicated]";
+            }
+
+            // post-instruction provenance verdict for every written temp component
+            const bool dstIsTempForTrace =
+              ctx.dst.id.type == DxsoRegisterType::Temp ||
+              ctx.dst.id.type == DxsoRegisterType::TempFloat16;
+            if (dstIsTempForTrace) {
+              line += " =>";
+              for (uint32_t c = 0; c < 4u; c++) {
+                if (!ctx.dst.mask[c]) {
+                  continue;
+                }
+                const UvExactComponentOrigin& origin = tracer.tempOrigin(ctx.dst.id.num, c);
+                const UvConstComponentRef& constExpr = tracer.tempConstExpr(ctx.dst.id.num, c);
+                line += str::format(" ", "xyzw"[c]);
+                if (origin.valid) {
+                  line += str::format("{org=tc", uint32_t(origin.reg),
+                                      " srcmask=0x", std::hex, uint32_t(origin.componentMask), std::dec,
+                                      " aff=", formatUvComponentAffine(origin.affine), "}");
+                } else if (constExpr.valid) {
+                  line += str::format("{cexpr=", formatUvConstExpr(constExpr), "}");
+                } else {
+                  line += "{-}";
+                }
+              }
+            }
+          }
+
+          Logger::info(line);
+        }
+      }
+
+      if (traceInstructions) {
+        for (uint32_t s = 0; s < caps::MaxTexturesPS; s++) {
+          const PsSamplerUvOrigin& origin = outOrigins[s];
+          if (origin.validSiteCount == 0 && origin.invalidSiteCount == 0) {
+            continue;
+          }
+          Logger::info(str::format(
+            "[RTX-UV-TRACE] result s", s,
+            " origin=", origin.originValid ? 1 : 0,
+            " sem=", uint32_t(origin.semanticIndex),
+            " comps=(", uint32_t(origin.compU), ",", uint32_t(origin.compV), ")",
+            " sites=", origin.validSiteCount, "/", origin.invalidSiteCount,
+            " agree=", origin.sitesAgree ? 1 : 0,
+            " exact=", origin.affineExact ? 1 : 0,
+            " U=[", formatUvComponentAffine(origin.affineU), "]",
+            " V=[", formatUvComponentAffine(origin.affineV), "]"));
+        }
+        Logger::info(str::format("[RTX-UV-TRACE] end ps=0x", std::hex, psHash, std::dec));
       }
     }
 
@@ -1315,6 +1820,51 @@ namespace dxvk {
       }
 
       return s_ue3PsSamplerNameCache.emplace(psHash, std::move(names)).first->second;
+    }
+
+    // CTAB float-constant register -> declared name (UniformScalar_*/UniformVector_*/engine
+    // constants), for rtx.d3d9.ue3LogUvAffineDetail diagnostics. Cached per shader hash.
+    static const std::map<uint32_t, std::string>& getUe3PsFloatConstantNames(
+        const XXH64_hash_t psHash,
+        const std::vector<uint8_t>& bytecode) {
+      static fast_unordered_cache<std::map<uint32_t, std::string>> s_ue3PsFloatConstantNameCache;
+
+      auto it = s_ue3PsFloatConstantNameCache.find(psHash);
+      if (it != s_ue3PsFloatConstantNameCache.end()) {
+        return it->second;
+      }
+
+      std::map<uint32_t, std::string> names;
+      if (bytecode.size() >= sizeof(uint32_t) && (bytecode.size() % sizeof(uint32_t)) == 0) {
+        const uint32_t* tokens = reinterpret_cast<const uint32_t*>(bytecode.data());
+        const uint32_t headerToken = tokens[0];
+        if ((headerToken & 0xffff0000u) == 0xffff0000u) {
+          const uint32_t majorVersion = (headerToken >> 8) & 0xffu;
+          const uint32_t minorVersion = headerToken & 0xffu;
+          DxsoProgramInfo programInfo(DxsoProgramTypes::PixelShader, minorVersion, majorVersion);
+
+          DxsoDecodeContext decoder(programInfo);
+          DxsoCodeIter iter(tokens + 1);
+          while (decoder.decodeInstruction(iter)) {
+            if (decoder.getCtabInfo().m_size != 0)
+              break;
+          }
+
+          const DxsoCtab& ctab = decoder.getCtabInfo();
+          for (const DxsoCtab::Constant& c : ctab.m_constantData) {
+            if (c.registerSet != kD3dxRegisterSetFloat4 || c.registerCount == 0)
+              continue;
+            const uint32_t end = std::min<uint32_t>(c.registerIndex + c.registerCount, caps::MaxFloatConstantsPS);
+            for (uint32_t r = c.registerIndex; r < end; r++) {
+              names[r] = c.registerCount > 1u
+                ? str::format(c.name, "[", r - c.registerIndex, "]")
+                : c.name;
+            }
+          }
+        }
+      }
+
+      return s_ue3PsFloatConstantNameCache.emplace(psHash, std::move(names)).first->second;
     }
 
     // Churn threshold for warning about frame-varying constant registers: genuine
@@ -6655,7 +7205,7 @@ namespace dxvk {
       auto& entry = m_psSamplerTexcoordCache[outHash];
       if (!entry.initialized) {
         entry.initialized = true;
-        analyzePsSamplerUvOrigins(ps, entry.samplerUvOrigin);
+        analyzePsSamplerUvOrigins(ps, outHash, entry.samplerUvOrigin);
         entry.samplerToTexcoord.fill(-1);
         entry.samplerCoordCompValid.fill(0);
         entry.samplerCoordCompU.fill(0);
@@ -7919,18 +8469,26 @@ namespace dxvk {
         return &entry;
       };
 
-      // resolves an affine term against live draw-time shader constants
+      // resolves an affine term (imm + const*factor + const2*factor2 sum) against live
+      // draw-time shader constants; an absent term resolves to its identity value
       auto resolvePsAffineTermValue = [&](const UvAffineTerm& term, const float identity, float& outValue) -> bool {
         outValue = identity;
         if (term.inexact)
           return false;
+        if (!uvAffineTermPresent(term))
+          return true;
+        float value = term.immValid ? term.imm : 0.0f;
         if (term.constReg >= 0) {
           if (uint32_t(term.constReg) >= caps::MaxFloatConstantsPS)
             return false;
-          outValue = d3d9State().psConsts.fConsts[uint32_t(term.constReg)][term.constComp & 0x3u] * term.factor;
-        } else if (term.immValid) {
-          outValue = term.imm;
+          value += d3d9State().psConsts.fConsts[uint32_t(term.constReg)][term.constComp & 0x3u] * term.factor;
         }
+        if (term.constReg2 >= 0) {
+          if (uint32_t(term.constReg2) >= caps::MaxFloatConstantsPS)
+            return false;
+          value += d3d9State().psConsts.fConsts[uint32_t(term.constReg2)][term.constComp2 & 0x3u] * term.factor2;
+        }
+        outValue = value;
         return std::isfinite(outValue);
       };
 
@@ -7938,13 +8496,20 @@ namespace dxvk {
         outValue = identity;
         if (term.inexact)
           return false;
+        if (!uvAffineTermPresent(term))
+          return true;
+        float value = term.immValid ? term.imm : 0.0f;
         if (term.constReg >= 0) {
           if (uint32_t(term.constReg) >= caps::MaxFloatConstantsSoftware)
             return false;
-          outValue = d3d9State().vsConsts.fConsts[uint32_t(term.constReg)][term.constComp & 0x3u] * term.factor;
-        } else if (term.immValid) {
-          outValue = term.imm;
+          value += d3d9State().vsConsts.fConsts[uint32_t(term.constReg)][term.constComp & 0x3u] * term.factor;
         }
+        if (term.constReg2 >= 0) {
+          if (uint32_t(term.constReg2) >= caps::MaxFloatConstantsSoftware)
+            return false;
+          value += d3d9State().vsConsts.fConsts[uint32_t(term.constReg2)][term.constComp2 & 0x3u] * term.factor2;
+        }
+        outValue = value;
         return std::isfinite(outValue);
       };
 
@@ -7961,6 +8526,51 @@ namespace dxvk {
         if (entryPtr != nullptr && firstStage < caps::MaxTexturesPS) {
           const auto& entry = *entryPtr;
           const PsSamplerUvOrigin& uvOrigin = entry.samplerUvOrigin[firstStage];
+
+          // rtx.d3d9.ue3LogUvAffineDetail: one-shot per-shader dump of every sampler's UV
+          // origin and affine chain, with the textures bound on this draw
+          if (ue3LogUvAffineDetail() && ps != nullptr && psHash != 0 &&
+              m_loggedUvAffineShaderDumps.insert(psHash).second) {
+            const auto& samplerNames = getUe3PsSamplerNames(psHash, ps->GetBytecode());
+
+            std::string dump;
+            for (uint32_t s = 0; s < caps::MaxTexturesPS; s++) {
+              const PsSamplerUvOrigin& origin = entry.samplerUvOrigin[s];
+              if (origin.validSiteCount == 0 && origin.invalidSiteCount == 0)
+                continue;
+
+              XXH64_hash_t texHash = kEmptyHash;
+              uint32_t texWidth = 0;
+              uint32_t texHeight = 0;
+              if (s < SamplerCount && d3d9State().textures[s] != nullptr) {
+                D3D9CommonTexture* texture = GetCommonTexture(d3d9State().textures[s]);
+                if (texture != nullptr && texture->GetImage() != nullptr) {
+                  texHash = texture->GetImage()->getHash();
+                  texWidth = texture->Desc()->Width;
+                  texHeight = texture->Desc()->Height;
+                }
+              }
+
+              const auto nameIt = samplerNames.find(s);
+              dump += str::format(
+                "\n  s", s, "(", nameIt != samplerNames.end() ? nameIt->second.c_str() : "?", ")",
+                " tex=0x", std::hex, texHash, std::dec, " ", texWidth, "x", texHeight,
+                " origin=", origin.originValid ? 1 : 0,
+                " interp=", uint32_t(origin.semanticIndex),
+                " comps=(", uint32_t(origin.compU), ",", uint32_t(origin.compV), ")",
+                " sites=", origin.validSiteCount, "/", origin.invalidSiteCount,
+                " agree=", origin.sitesAgree ? 1 : 0,
+                " exact=", origin.affineExact ? 1 : 0,
+                " U:[", formatUvComponentAffine(origin.affineU), "]",
+                " V:[", formatUvComponentAffine(origin.affineV), "]");
+            }
+
+            Logger::info(str::format(
+              "[RTX-UV-AFFINE] shader dump ps=0x", std::hex, psHash, std::dec,
+              " vf=", describeUe3VertexFactory(m_currentUe3VertexFactory),
+              " albedoStage=", firstStage,
+              dump.empty() ? " (no traceable sample sites)" : dump.c_str()));
+          }
 
           const D3D9CommonShader* vs =
             (m_parent->UseProgrammableVS() && d3d9State().vertexShader.ptr() != nullptr)
@@ -8083,10 +8693,126 @@ namespace dxvk {
               texXform[3].x = finalOffsetU;
               texXform[3].y = finalOffsetV;
             }
+
+            // rtx.d3d9.ue3LogUvAffineDetail: per-draw affine resolution outcome, logged once
+            // per distinct resolved transform and capped per shader+stage
+            if (ue3LogUvAffineDetail()) {
+              const bool applied = !transformIsIdentity && transformIsUsable;
+
+              XXH64_hash_t detailKey = psHash;
+              auto mixDetail = [&](const uint64_t v) {
+                detailKey ^= v + 0x9E3779B97F4A7C15ull + (detailKey << 6) + (detailKey >> 2);
+              };
+              auto quantize = [](const float v) -> uint64_t {
+                return std::isfinite(v) ? uint64_t(std::llround(double(v) * 1024.0)) : ~0ull;
+              };
+              mixDetail(firstStage);
+              mixDetail(uint64_t(m_uvResolutionMode));
+              mixDetail(quantize(finalScaleU));
+              mixDetail(quantize(finalScaleV));
+              mixDetail(quantize(finalOffsetU));
+              mixDetail(quantize(finalOffsetV));
+              mixDetail(uint64_t(psAffineResolved ? 1 : 0) | (uint64_t(applied ? 1 : 0) << 1));
+
+              XXH64_hash_t capKey = psHash;
+              capKey ^= firstStage + 0x9E3779B97F4A7C15ull + (capKey << 6) + (capKey >> 2);
+
+              // check the cap before inserting the dedup key so frame-varying (panner)
+              // transforms cannot grow the dedup set without bound once capped
+              constexpr uint16_t kMaxAffineDetailLogsPerShaderStage = 32;
+              uint16_t& logCount = m_uvAffineDetailLogCounts[capKey];
+              if (logCount < kMaxAffineDetailLogsPerShaderStage &&
+                  m_loggedUvAffineDetails.insert(detailKey).second) {
+                ++logCount;
+                // CTAB names + live values of the PS constant registers the affine references
+                std::string ctabLog;
+                if (ps != nullptr && psHash != 0) {
+                  const auto& constNames = getUe3PsFloatConstantNames(psHash, ps->GetBytecode());
+                  std::array<int32_t, 8> referencedRegs = {
+                    uvOrigin.affineU.scale.constReg, uvOrigin.affineU.offset.constReg,
+                    uvOrigin.affineV.scale.constReg, uvOrigin.affineV.offset.constReg,
+                    uvOrigin.affineU.scale.constReg2, uvOrigin.affineU.offset.constReg2,
+                    uvOrigin.affineV.scale.constReg2, uvOrigin.affineV.offset.constReg2 };
+                  std::sort(referencedRegs.begin(), referencedRegs.end());
+                  int32_t lastLogged = -1;
+                  for (const int32_t reg : referencedRegs) {
+                    if (reg < 0 || reg == lastLogged || uint32_t(reg) >= caps::MaxFloatConstantsPS)
+                      continue;
+                    lastLogged = reg;
+                    const auto nameIt = constNames.find(uint32_t(reg));
+                    const Vector4& value = d3d9State().psConsts.fConsts[uint32_t(reg)];
+                    ctabLog += str::format(
+                      ctabLog.empty() ? "" : ", ",
+                      "c", reg, "=", nameIt != constNames.end() ? nameIt->second.c_str() : "?",
+                      "=(", value.x, ",", value.y, ",", value.z, ",", value.w, ")");
+                  }
+                }
+
+                XXH64_hash_t stageTexHash = kEmptyHash;
+                uint32_t stageTexWidth = 0;
+                uint32_t stageTexHeight = 0;
+                if (firstStage < SamplerCount && d3d9State().textures[firstStage] != nullptr) {
+                  D3D9CommonTexture* stageTexture = GetCommonTexture(d3d9State().textures[firstStage]);
+                  if (stageTexture != nullptr && stageTexture->GetImage() != nullptr) {
+                    stageTexHash = stageTexture->GetImage()->getHash();
+                    stageTexWidth = stageTexture->Desc()->Width;
+                    stageTexHeight = stageTexture->Desc()->Height;
+                  }
+                }
+
+                std::string vsLog;
+                if (vsAffineFold) {
+                  vsLog = str::format(" vs=(", vsScaleU, ",", vsScaleV, ",", vsOffsetU, ",", vsOffsetV, ")");
+                }
+
+                Logger::info(str::format(
+                  "[RTX-UV-AFFINE] ps=0x", std::hex, psHash,
+                  " tex=0x", stageTexHash, std::dec, " ", stageTexWidth, "x", stageTexHeight,
+                  " stage=", firstStage,
+                  " vf=", describeUe3VertexFactory(m_currentUe3VertexFactory),
+                  " mode=", m_uvResolutionMode == UvResolutionMode::ProvenIa
+                              ? "proven-ia"
+                              : m_uvResolutionMode == UvResolutionMode::CaptureInterpolant
+                                  ? "capture-interpolant"
+                                  : "legacy-tss",
+                  " interp=", texcoordIdx,
+                  " comps=(", uint32_t(m_texcoordCompU), ",", uint32_t(m_texcoordCompV), ")",
+                  " sites=", uvOrigin.validSiteCount, "/", uvOrigin.invalidSiteCount,
+                  " agree=", uvOrigin.sitesAgree ? 1 : 0,
+                  " exact=", uvOrigin.affineExact ? 1 : 0,
+                  " | U:[", formatUvComponentAffine(uvOrigin.affineU),
+                  "] V:[", formatUvComponentAffine(uvOrigin.affineV),
+                  "] | psResolved=", psAffineResolved ? 1 : 0,
+                  " ps=(", psScaleU, ",", psScaleV, ",", psOffsetU, ",", psOffsetV, ")",
+                  " vsFold=", vsAffineFold ? 1 : 0, vsLog,
+                  " final=(", finalScaleU, ",", finalScaleV, ",", finalOffsetU, ",", finalOffsetV, ")",
+                  " identity=", transformIsIdentity ? 1 : 0,
+                  " usable=", transformIsUsable ? 1 : 0,
+                  " applied=", applied ? 1 : 0,
+                  ctabLog.empty() ? "" : str::format(" | ctab: ", ctabLog).c_str()));
+              }
+            }
           } else {
             // the sampled coordinate has no provable interpolant origin (screen-space,
             // reflection-driven, or untraceable): keep upstream-style TSS behavior
             m_uvResolutionMode = UvResolutionMode::LegacyTss;
+
+            // rtx.d3d9.ue3LogUvAffineDetail: record the unprovable-origin outcome once per
+            // shader+stage - the transform can never apply on this path
+            if (ue3LogUvAffineDetail()) {
+              XXH64_hash_t noOriginKey = psHash;
+              noOriginKey ^= (0xA11FE00Dull + firstStage) + 0x9E3779B97F4A7C15ull +
+                             (noOriginKey << 6) + (noOriginKey >> 2);
+              if (m_loggedUvAffineDetails.insert(noOriginKey).second) {
+                Logger::info(str::format(
+                  "[RTX-UV-AFFINE] ps=0x", std::hex, psHash,
+                  " tex=0x", m_activeDrawCallState.materialData.colorTextures[0].getImageHash(), std::dec,
+                  " stage=", firstStage,
+                  " vf=", describeUe3VertexFactory(m_currentUe3VertexFactory),
+                  " originValid=0 sites=", uvOrigin.validSiteCount, "/", uvOrigin.invalidSiteCount,
+                  " - no provable interpolant origin; no texture transform derived (legacy TSS path)"));
+              }
+            }
           }
 
           if (ue3LogUvResolution() || Logger::logLevel() <= LogLevel::Debug) {

@@ -114,6 +114,23 @@ public:
                 "to all have identity xform matrices, enabling will attempt to correct this and\n"
                 "improve stage + mesh viewability in tools.\n"
                 "Hashes are unaffected.");
+  RTX_OPTION("rtx.capture", bool, perInstanceUvTransformMeshVariants, true,
+                "Captured USD bakes each surface's texture transform (tiling/panning/atlas tile\n"
+                "selection) into the exported texcoords, but a mesh shared by many instances is\n"
+                "exported only once - with the first-seen instance's transform. For texture-atlas\n"
+                "materials (e.g. UE3 crowd/decal atlases) every other instance then shows the\n"
+                "wrong tile in the captured stage. When enabled, instances whose texture transform\n"
+                "differs from the first-captured one get their own mesh variant (named\n"
+                "<meshHash>_uv<transform hash>) with correctly baked texcoords.\n"
+                "Note: variant mesh prims do not correspond to a runtime mesh hash, so mesh\n"
+                "replacements should be authored against the primary (unsuffixed) mesh prim;\n"
+                "variants are for capture fidelity. Capped per mesh to avoid blowing up captures\n"
+                "of meshes with continuously animated (panner) transforms.");
+  RTX_OPTION("rtx.capture", uint32_t, perInstanceUvTransformMeshVariantsLimit, 32,
+                "Maximum number of texture-transform mesh variants exported per shared mesh when\n"
+                "rtx.capture.perInstanceUvTransformMeshVariants is enabled. Instances beyond the\n"
+                "cap reference the primary mesh (first-seen transform). Guards against captures\n"
+                "of animated-transform (panner) materials minting a variant per instance.");
 
   GameCapturer(DxvkDevice* const pDevice, SceneManager& sceneManager, AssetExporter& exporter);
   ~GameCapturer();
@@ -189,6 +206,11 @@ private:
     XXH64_hash_t     matHash;
     MeshSync         meshSync;
     AtomicOriginCalc originCalc;
+    // rtx.capture.perInstanceUvTransformMeshVariants: the texture transform baked into this
+    // entry's exported texcoords, and (on primary entries only) how many transform variants
+    // of this mesh have been minted
+    Matrix4          capturedTextureTransform = Matrix4();
+    uint32_t         uvVariantCount = 0;
   };
 
   struct Instance {

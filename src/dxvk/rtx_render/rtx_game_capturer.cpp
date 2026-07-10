@@ -53,6 +53,7 @@
 #include "../util/util_global_time.h"
 
 #include <algorithm>
+#include <cstring>
 #include <filesystem>
 
 #define BASE_DIR (util::RtxFileSys::path(util::RtxFileSys::Captures).string())
@@ -504,24 +505,57 @@ namespace dxvk {
 
     bool bIsNewMesh = false;
     size_t instanceNum = 0;
+    XXH64_hash_t effectiveMeshHash = meshHash;
     {
       std::lock_guard lock(m_meshMutex);
-      bIsNewMesh = m_pCap->meshes.count(meshHash) == 0;
-      if (bIsNewMesh) {
-        m_pCap->meshes[meshHash] = std::make_shared<Mesh>();
-        m_pCap->meshes[meshHash]->instanceCount = 0;
-        m_pCap->meshes[meshHash]->matHash = matHash;
+      const bool bIsNewPrimaryMesh = m_pCap->meshes.count(meshHash) == 0;
+      if (bIsNewPrimaryMesh) {
+        auto pNewMesh = std::make_shared<Mesh>();
+        pNewMesh->matHash = matHash;
+        pNewMesh->capturedTextureTransform = rtInstance.surface.textureTransform;
+        m_pCap->meshes[meshHash] = std::move(pNewMesh);
+        bIsNewMesh = true;
+      } else if (perInstanceUvTransformMeshVariants()) {
+        // exported texcoords bake the first-seen instance's texture transform
+        // (captureMeshTexCoords); a shared mesh drawn by instances with a different
+        // transform (texture-atlas tile selection) would show the wrong tile in the
+        // captured stage - give such instances their own mesh variant
+        const std::shared_ptr<Mesh>& pPrimaryMesh = m_pCap->meshes[meshHash];
+        const Matrix4& instanceTransform = rtInstance.surface.textureTransform;
+        if (std::memcmp(&pPrimaryMesh->capturedTextureTransform, &instanceTransform, sizeof(Matrix4)) != 0) {
+          const XXH64_hash_t variantHash =
+            XXH3_64bits_withSeed(&instanceTransform, sizeof(Matrix4), meshHash);
+          if (m_pCap->meshes.count(variantHash) != 0) {
+            effectiveMeshHash = variantHash;
+          } else if (pPrimaryMesh->uvVariantCount < perInstanceUvTransformMeshVariantsLimit()) {
+            pPrimaryMesh->uvVariantCount++;
+            auto pVariantMesh = std::make_shared<Mesh>();
+            pVariantMesh->matHash = matHash;
+            pVariantMesh->capturedTextureTransform = instanceTransform;
+            // named after the primary mesh so the variant is attributable in the stage;
+            // replacements should still target the primary (runtime-hash-named) mesh
+            pVariantMesh->lssData.meshName =
+              hashToString(meshHash) + "_uv" + hashToString(variantHash);
+            m_pCap->meshes[variantHash] = std::move(pVariantMesh);
+            effectiveMeshHash = variantHash;
+            bIsNewMesh = true;
+            Logger::debug(str::format(
+              "[GameCapturer][", m_pCap->idStr, "][Mesh:", hashToString(meshHash),
+              "] UV-transform variant ", hashToString(variantHash)));
+          }
+          // over the variant cap: fall back to the primary mesh's baked transform
+        }
       }
-      instanceNum = m_pCap->meshes[meshHash]->instanceCount++;
+      instanceNum = m_pCap->meshes[effectiveMeshHash]->instanceCount++;
     }
     if (bIsNewMesh) {
-      captureMesh(ctx, meshHash, *pBlas, rtInstance.getCategoryFlags(), true, true, true, true, rtInstance.isFrontFaceFlipped,
+      captureMesh(ctx, effectiveMeshHash, *pBlas, rtInstance.getCategoryFlags(), true, true, true, true, rtInstance.isFrontFaceFlipped,
                   rtInstance.surface.textureTransform);
     }
 
     const XXH64_hash_t instanceId = rtInstance.getId();
     Instance& instance = m_pCap->instances[instanceId];
-    instance.meshHash = meshHash;
+    instance.meshHash = effectiveMeshHash;
     instance.matHash = matHash;
     instance.meshInstNum = instanceNum;
     instance.lssData.firstTime = m_pCap->currentFrameNum;
@@ -605,7 +639,10 @@ namespace dxvk {
       assert(pMesh->lssData.buffers.idxBufs.size() == 0);
       assert(pMesh->lssData.buffers.texcoordBufs.size() == 0);
       assert(pMesh->lssData.buffers.colorBufs.size() == 0);
-      pMesh->lssData.meshName = dxvk::hashToString(currentMeshHash);
+      // UV-transform mesh variants pre-set a suffixed name; only derive from the hash when unset
+      if (pMesh->lssData.meshName.empty()) {
+        pMesh->lssData.meshName = dxvk::hashToString(currentMeshHash);
+      }
       for (uint32_t i = 0; i < (uint32_t) HashComponents::Count; i++) {
         const HashComponents component = (HashComponents) i;
         pMesh->lssData.componentHashes[getHashComponentName(component)] = geomData.hashes[component];
