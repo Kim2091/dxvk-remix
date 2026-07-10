@@ -183,6 +183,11 @@ namespace dxvk {
     RTX_OPTION("rtx.d3d9", bool, ue3LogUvResolution, false,
                "UE3 compat: log the deterministic UV resolution decision (proven IA set / captured interpolant / legacy fallback) "
                "once per unique pixel shader + stage combination, including ambiguity diagnostics.");
+    RTX_OPTION("rtx.d3d9", bool, ue3LogAlbedoSelection, false,
+               "UE3 compat diagnostics: log a per-sampler score breakdown of the shader-path albedo selection once per "
+               "(pixel shader, bound texture set, sRGB states, vertex factory) key: texture hash, dimensions, sRGB state, "
+               "sample count, semantic/expression flags, final score, and the winning stages. Use this to diagnose draws "
+               "where the wrong texture (e.g. a normal or specular map) is chosen as the ray-traced albedo.");
     RTX_OPTION("rtx.d3d9", bool, ue3LogCapturePrecision, false,
                "UE3 compat: log camera-cell, hash, cache, and matrix diagnostics for vertex capture precision issues.");
     RTX_OPTION("rtx.d3d9", bool, ue3LogDrawStatusFlaps, false,
@@ -538,7 +543,7 @@ namespace dxvk {
       std::array<uint8_t, caps::MaxTexturesPS> samplerCoordCompU;
       std::array<uint8_t, caps::MaxTexturesPS> samplerCoordCompV;
       std::array<uint8_t, caps::MaxTexturesPS> samplerSemanticFlags;
-      std::array<uint8_t, caps::MaxTexturesPS> samplerExpressionFlags;
+      std::array<uint16_t, caps::MaxTexturesPS> samplerExpressionFlags;
       std::array<uint16_t, caps::MaxTexturesPS> samplerSampleCount;
       std::array<int16_t, caps::MaxTexturesPS> samplerScaleConstReg;
       std::array<uint8_t, caps::MaxTexturesPS> samplerScaleConstCompU;
@@ -569,10 +574,29 @@ namespace dxvk {
       uint8_t cubemapFallbackStage = 0xFF;
     };
     fast_unordered_cache<Ue3DiffuseSelectionEntry> m_ue3DiffuseSelectionCache;
-    // scoring reads the user-taggable lightmap/albedo-mask texture sets; drop cached
-    // decisions when those sets change so texture tagging in the UI takes effect live
+    // scoring reads the user-taggable lightmap/never-albedo/preferred-albedo texture sets; drop
+    // cached decisions when those sets change so texture tagging in the UI takes effect live
     size_t m_ue3DiffuseSelectionLightmapSetSize = 0;
-    size_t m_ue3DiffuseSelectionAlbedoMaskSetSize = 0;
+    size_t m_ue3DiffuseSelectionNeverAlbedoSetSize = 0;
+    size_t m_ue3DiffuseSelectionPreferredAlbedoSetSize = 0;
+
+    // selection cache keys already dumped by rtx.d3d9.ue3LogAlbedoSelection
+    fast_unordered_set m_loggedAlbedoSelections;
+
+    // per-texture spread over distinct pixel shaders: textures sampled by many unrelated
+    // materials are shared detail/pattern/tint overlays rather than surface identity albedo.
+    // Persisted across sessions (rtx-remix/ue3TextureSpread.cache) so the spread penalty is
+    // deterministic from the first frame instead of converging anew each run.
+    struct Ue3TextureMaterialSpread {
+      std::array<XXH64_hash_t, 12> psHashes = {};
+      uint8_t count = 0;
+    };
+    fast_unordered_cache<Ue3TextureMaterialSpread> m_ue3TextureMaterialSpread;
+    bool m_ue3TextureSpreadLoaded = false;
+    bool m_ue3TextureSpreadDirty = false;
+    uint32_t m_ue3TextureSpreadLastSaveFrame = 0;
+    void loadUe3TextureSpreadCache();
+    void saveUe3TextureSpreadCache();
 
     // Diagnostic state for rtx.d3d9.ue3LogDrawStatusFlaps: per draw identity, the
     // prepare-flags outcome of the previous sighting, to detect frame-to-frame flapping

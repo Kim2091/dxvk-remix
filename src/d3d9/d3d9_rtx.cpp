@@ -18,6 +18,7 @@
 
 #include <cassert>
 #include <cstring>
+#include <fstream>
 #include <map>
 
 namespace dxvk {
@@ -1138,6 +1139,7 @@ namespace dxvk {
     // into the same constant registers; the two are indistinguishable at the D3D9 level, so
     // shaders doing that must be opted out of constants-based identity via
     // rtx.d3d9.ue3MicConstantIdentityExcludedShaders.
+    constexpr uint16_t kD3dxRegisterSetFloat4 = 2u;
     constexpr uint16_t kD3dxRegisterSetSampler = 3u;
 
     // merged (start, count) register ranges of UniformVector_* / UniformScalar_* constants
@@ -1426,14 +1428,26 @@ namespace dxvk {
     constexpr uint8_t kPsSamplerSemanticMovieTexture    = 1u << 5;
 
     // expression-level hints inferred from shader opcode/dataflow around a sampler's UV path
-    constexpr uint8_t kPsSamplerExprUvTransform = 1u << 0;
-    constexpr uint8_t kPsSamplerExprUvOffset    = 1u << 1;
-    constexpr uint8_t kPsSamplerExprUvAnimated  = 1u << 2;
-    constexpr uint8_t kPsSamplerExprBlendMath   = 1u << 3;
-    constexpr uint8_t kPsSamplerExprUvTimeDriven = 1u << 4;
-    constexpr uint8_t kPsSamplerExprViewDependent = 1u << 5;
-    constexpr uint8_t kPsSamplerExprMaskControl = 1u << 6;
-    constexpr uint8_t kPsSamplerExprColorContribution = 1u << 7;
+    constexpr uint16_t kPsSamplerExprUvTransform = 1u << 0;
+    constexpr uint16_t kPsSamplerExprUvOffset    = 1u << 1;
+    constexpr uint16_t kPsSamplerExprUvAnimated  = 1u << 2;
+    constexpr uint16_t kPsSamplerExprBlendMath   = 1u << 3;
+    constexpr uint16_t kPsSamplerExprUvTimeDriven = 1u << 4;
+    constexpr uint16_t kPsSamplerExprViewDependent = 1u << 5;
+    constexpr uint16_t kPsSamplerExprMaskControl = 1u << 6;
+    constexpr uint16_t kPsSamplerExprColorContribution = 1u << 7;
+    // sampled value is decoded as a tangent-space normal (sign-expanded `t * 2 - 1` and/or normalized
+    // via nrm / self dot-product) - the UE3 material compiler emits this for every Normal-input texture
+    constexpr uint16_t kPsSamplerExprNormalDecode = 1u << 8;
+    // sampled value arithmetically reaches the output color register (oC0.rgb) as a color term,
+    // rather than only feeding coordinate/lighting math (dot products, kill tests, mask controls)
+    constexpr uint16_t kPsSamplerExprReachesOutputColor = 1u << 9;
+    // deterministic UE3 base-pass structure signal: the sampled value is multiplied (directly or
+    // transitively) with a lightmap sample (static geometry) or with the AmbientColorAndSkyFactor /
+    // sky color constants (dynamic geometry, unlit viewmode). In the generated base pass only the
+    // material's DIFFUSE expression is modulated this way - emissive adds directly, specular
+    // multiplies dot-product transfer chains, normal maps never contribute as color.
+    constexpr uint16_t kPsSamplerExprDiffuseAnchor = 1u << 10;
 
     static uint8_t classifyPixelSamplerSemanticFlags(const std::string& samplerName) {
       std::string lowerName;
@@ -1523,7 +1537,7 @@ namespace dxvk {
       return flags;
     }
 
-    static uint8_t classifyPixelSamplerExpressionFlagsFromName(const std::string& samplerName) {
+    static uint16_t classifyPixelSamplerExpressionFlagsFromName(const std::string& samplerName) {
       std::string lowerName;
       lowerName.reserve(samplerName.size());
       for (const char c : samplerName)
@@ -1533,7 +1547,7 @@ namespace dxvk {
         return lowerName.find(token) != std::string::npos;
       };
 
-      uint8_t flags = 0;
+      uint16_t flags = 0;
 
       if (contains("time") || contains("gametime") || contains("realtime") ||
           contains("panner") || contains("rotator") || contains("rotation") ||
@@ -1578,7 +1592,7 @@ namespace dxvk {
       uint8_t coordCompV = 1;
       uint16_t sampleCount = 0;
       uint8_t semanticFlags = 0;
-      uint8_t expressionFlags = 0;
+      uint16_t expressionFlags = 0;
       int32_t scaleConstReg = -1;
       uint8_t scaleConstCompU = 0;
       uint8_t scaleConstCompV = 1;
@@ -1653,10 +1667,29 @@ namespace dxvk {
       std::array<PsTexcoordScaleHint, 64> tempToScaleHint = {};
       std::array<uint8_t, 64> tempCoordProvenance = {};
       tempCoordProvenance.fill(0);
-      std::array<uint8_t, 64> tempCoordExpressionFlags = {};
+      std::array<uint16_t, 64> tempCoordExpressionFlags = {};
       tempCoordExpressionFlags.fill(0);
       std::array<uint8_t, 64> tempSamplerValueRole = {};
       tempSamplerValueRole.fill(0);
+
+      // per-temp decode state of this sampler's value, used to recognize the UE3 normal-map
+      // unpack `sample * (UnpackMax-UnpackMin) + UnpackMin` = `t * 2 - 1` and its split forms
+      constexpr uint8_t kValueStateSignExpanded = 1u << 0; // t * 2 - 1 applied
+      constexpr uint8_t kValueStateScaledX2     = 1u << 1; // t * 2 applied
+      constexpr uint8_t kValueStateBiasedHalf   = 1u << 2; // t - 0.5 applied
+      std::array<uint8_t, 64> tempSamplerValueState = {};
+      tempSamplerValueState.fill(0);
+
+      // diffuse anchor provenance: values derived from a lightmap sample or from the
+      // UE3 ambient/sky lighting constants (see kPsSamplerExprDiffuseAnchor)
+      constexpr uint8_t kAnchorLightmapValue = 1u << 0;
+      constexpr uint8_t kAnchorLightingConst = 1u << 1;
+      std::array<uint8_t, 64> tempAnchorBits = {};
+      tempAnchorBits.fill(0);
+      bool anchorInfoInitialized = false;
+      uint32_t anchorLightmapSamplerMask = 0;
+      std::array<uint8_t, caps::MaxFloatConstantsPS> anchorLightingConstRegs = {};
+      anchorLightingConstRegs.fill(0);
 
       constexpr uint8_t kCoordProvTexcoord = 1u << 0;
       constexpr uint8_t kCoordProvNonTexcoord = 1u << 1;
@@ -1710,15 +1743,15 @@ namespace dxvk {
         }
       };
 
-      auto getCoordExpressionFlagsFromRegister = [&](const DxsoRegister& r) -> uint8_t {
+      auto getCoordExpressionFlagsFromRegister = [&](const DxsoRegister& r) -> uint16_t {
         switch (r.id.type) {
         case DxsoRegisterType::Temp:
         case DxsoRegisterType::TempFloat16:
           return (r.id.num < tempCoordExpressionFlags.size())
             ? tempCoordExpressionFlags[r.id.num]
-            : 0u;
+            : uint16_t(0u);
         default:
-          return 0u;
+          return uint16_t(0u);
         }
       };
 
@@ -1753,6 +1786,58 @@ namespace dxvk {
           return uint8_t(baseRole | kSamplerValueRoleControl);
 
         return baseRole;
+      };
+
+      auto getSamplerValueStateFromRegister = [&](const DxsoRegister& r) -> uint8_t {
+        switch (r.id.type) {
+        case DxsoRegisterType::Temp:
+        case DxsoRegisterType::TempFloat16:
+          return (r.id.num < tempSamplerValueState.size())
+            ? tempSamplerValueState[r.id.num]
+            : 0u;
+        default:
+          return 0u;
+        }
+      };
+
+      auto getAnchorBitsFromRegister = [&](const DxsoRegister& r) -> uint8_t {
+        switch (r.id.type) {
+        case DxsoRegisterType::Temp:
+        case DxsoRegisterType::TempFloat16:
+          return (r.id.num < tempAnchorBits.size())
+            ? tempAnchorBits[r.id.num]
+            : 0u;
+        default:
+          if (isFloatConstantRegisterType(r.id.type) && !r.hasRelative) {
+            const int32_t reg = getFloatConstantRegisterIndex(r);
+            if (reg >= 0 && reg < int32_t(anchorLightingConstRegs.size()) && anchorLightingConstRegs[reg])
+              return kAnchorLightingConst;
+          }
+          return 0u;
+        }
+      };
+
+      // true when the source is a `def` literal constant whose swizzled rgb components all equal
+      // `target` (within tolerance) - used to recognize the folded normal unpack constants (2, -1)
+      auto isDefConstNearRgb = [&](const DxsoRegister& r, const float target) -> bool {
+        if (!isFloatConstantRegisterType(r.id.type) || r.hasRelative)
+          return false;
+
+        float modifierScale = 1.0f;
+        if (!decodeConstantModifierScale(r.modifier, modifierScale))
+          return false;
+
+        const int32_t reg = getFloatConstantRegisterIndex(r);
+        if (reg < 0 || reg >= int32_t(defFloatConstValid.size()) || !defFloatConstValid[reg])
+          return false;
+
+        constexpr float kTolerance = 0.01f;
+        for (uint32_t comp = 0; comp < 3; comp++) {
+          const float value = modifierScale * defFloatConsts[reg][r.swizzle[comp] & 0x3u];
+          if (std::abs(value - target) > kTolerance)
+            return false;
+        }
+        return true;
       };
 
       auto getScaleHintFromRegister = [&](const DxsoRegister& r, PsTexcoordScaleHint& outHint) -> bool {
@@ -1914,11 +1999,47 @@ namespace dxvk {
       std::array<ScaleHintAgg, 8> perTexcoordScaleHints = {};
       uint32_t texcoordDerivedSampleCount = 0;
       uint32_t nonTexcoordDerivedSampleCount = 0;
-      uint8_t sampledCoordExpressionFlags = 0;
+      uint16_t sampledCoordExpressionFlags = 0;
+      bool normalDecodeDetected = false;   // -> kPsSamplerExprNormalDecode
+      bool reachesOutputColor = false;     // -> kPsSamplerExprReachesOutputColor
+      bool diffuseAnchorDetected = false;  // -> kPsSamplerExprDiffuseAnchor
+
+      auto maskWritesRgb = [](const DxsoRegMask& mask) {
+        return mask.popCount() == 0 || mask[0] || mask[1] || mask[2];
+      };
 
       while (decoder.decodeInstruction(iter)) {
         const auto& ctx = decoder.getInstructionContext();
         const DxsoOpcode op = ctx.instruction.opcode;
+
+        // the CTAB comment token precedes all instructions; collect diffuse-anchor sources
+        // (lightmap samplers, UE3 ambient/sky lighting constants) as soon as it is decoded
+        if (!anchorInfoInitialized && decoder.getCtabInfo().m_size != 0) {
+          anchorInfoInitialized = true;
+          for (const DxsoCtab::Constant& c : decoder.getCtabInfo().m_constantData) {
+            if (c.registerCount == 0)
+              continue;
+            const std::string lowerName = toLowerAscii(c.name);
+            if (c.registerSet == kD3dxRegisterSetSampler) {
+              if (lowerName.find("lightmap") != std::string::npos) {
+                const uint32_t end = std::min<uint32_t>(c.registerIndex + c.registerCount, 32u);
+                for (uint32_t reg = c.registerIndex; reg < end; reg++)
+                  anchorLightmapSamplerMask |= 1u << reg;
+              }
+            } else if (c.registerSet == kD3dxRegisterSetFloat4) {
+              // BasePassPixelShader.usf: unlit/dynamic diffuse is multiplied by
+              // AmbientColorAndSkyFactor.rgb; sky-lit diffuse by Upper/LowerSkyColor
+              if (lowerName.find("ambientcolorandskyfactor") != std::string::npos ||
+                  lowerName.find("upperskycolor") != std::string::npos ||
+                  lowerName.find("lowerskycolor") != std::string::npos) {
+                const uint32_t end = std::min<uint32_t>(c.registerIndex + c.registerCount,
+                                                        uint32_t(anchorLightingConstRegs.size()));
+                for (uint32_t reg = c.registerIndex; reg < end; reg++)
+                  anchorLightingConstRegs[reg] = 1;
+              }
+            }
+          }
+        }
 
         if (op == DxsoOpcode::Def &&
             ctx.dst.id.type == DxsoRegisterType::Const &&
@@ -1931,15 +2052,27 @@ namespace dxvk {
             ctx.def.float32[3]);
         }
 
+        // diffuse anchor detection: this sampler's color value multiplied with a lightmap-derived
+        // value or a UE3 lighting constant. Only the product operands count (mad src2 is additive).
+        // Checked before the write below so same-register products still see pre-write state.
+        if (!diffuseAnchorDetected && (op == DxsoOpcode::Mul || op == DxsoOpcode::Mad)) {
+          const bool roleA = (getSamplerValueRoleFromRegister(ctx.src[0]) & kSamplerValueRoleColor) != 0;
+          const bool roleB = (getSamplerValueRoleFromRegister(ctx.src[1]) & kSamplerValueRoleColor) != 0;
+          const uint8_t anchorA = getAnchorBitsFromRegister(ctx.src[0]);
+          const uint8_t anchorB = getAnchorBitsFromRegister(ctx.src[1]);
+          if ((roleA && anchorB != 0) || (roleB && anchorA != 0))
+            diffuseAnchorDetected = true;
+        }
+
         if ((ctx.dst.id.type == DxsoRegisterType::Temp || ctx.dst.id.type == DxsoRegisterType::TempFloat16) &&
             ctx.dst.id.num < tempToTexcoord.size()) {
           int32_t derived = -1;
           bool writesTrackedTemp = false;
           PsTexcoordScaleHint derivedScaleHint;
-          uint8_t derivedExpressionFlags =
+          uint16_t derivedExpressionFlags = uint16_t(
             getCoordExpressionFlagsFromRegister(ctx.src[0]) |
             getCoordExpressionFlagsFromRegister(ctx.src[1]) |
-            getCoordExpressionFlagsFromRegister(ctx.src[2]);
+            getCoordExpressionFlagsFromRegister(ctx.src[2]));
           uint8_t derivedSamplerValueRole = 0;
           bool hasConstOnlyHint = false;
           PsTexcoordScaleHint constOnlyHint;
@@ -1984,6 +2117,9 @@ namespace dxvk {
                   (src0Prov & kCoordProvTexcoord) == 0) {
                 derivedExpressionFlags |= kPsSamplerExprViewDependent;
               }
+              // normalizing a sampled value = direction data, not color (normal/vector map)
+              if (getSamplerValueRoleFromRegister(ctx.src[0]) != 0)
+                normalDecodeDetected = true;
             }
             if (derived < 0) {
               hasConstOnlyHint = loadScaleHintFromConstant(ctx.src[0], constOnlyHint);
@@ -2154,6 +2290,28 @@ namespace dxvk {
               if ((srcProv & kCoordProvNonTexcoord) != 0 &&
                   (srcProv & kCoordProvTexcoord) == 0) {
                 derivedExpressionFlags |= kPsSamplerExprViewDependent;
+              }
+            }
+            if (op == DxsoOpcode::Dp3 || op == DxsoOpcode::Dp4) {
+              // normal-map decode signatures:
+              //  - self dot-product of a sampled value (the `normalize()` emitted by UE3's
+              //    CalcMaterialParameters compiles to `dp3 r.w, n, n; rsq; mul`)
+              //  - dot-product consumption of a sign-expanded (`t * 2 - 1`) sampled value
+              auto isSignExpandedUse = [&](const DxsoRegister& r) {
+                if ((getSamplerValueStateFromRegister(r) & kValueStateSignExpanded) != 0)
+                  return true;
+                // ps_1_x `_bx2` applies the expansion as a source modifier at the use site
+                return r.modifier == DxsoRegModifier::Sign || r.modifier == DxsoRegModifier::SignNeg;
+              };
+              const uint8_t role0 = getSamplerValueRoleFromRegister(ctx.src[0]);
+              const uint8_t role1 = getSamplerValueRoleFromRegister(ctx.src[1]);
+              const bool selfDot =
+                ctx.src[0].id.type == ctx.src[1].id.type &&
+                ctx.src[0].id.num == ctx.src[1].id.num;
+              if ((selfDot && role0 != 0) ||
+                  (role0 != 0 && isSignExpandedUse(ctx.src[0])) ||
+                  (role1 != 0 && isSignExpandedUse(ctx.src[1]))) {
+                normalDecodeDetected = true;
               }
             }
             break;
@@ -2333,6 +2491,22 @@ namespace dxvk {
               }
               break;
             }
+            case DxsoOpcode::Dp3:
+            case DxsoOpcode::Dp4:
+            case DxsoOpcode::Dp2Add:
+            case DxsoOpcode::Crs:
+            case DxsoOpcode::Nrm:
+            case DxsoOpcode::M4x4:
+            case DxsoOpcode::M4x3:
+            case DxsoOpcode::M3x4:
+            case DxsoOpcode::M3x3:
+            case DxsoOpcode::M3x2:
+              // dot products / normalizes / matrix transforms collapse a sampled color vector
+              // into direction or coefficient data. Terminate value tracking here: the result is
+              // neither this sampler's color (no output-color credit) nor a mask of it (no
+              // mask-control penalty for innocent downstream mixing).
+              derivedSamplerValueRole = 0;
+              break;
             default:
               derivedExpressionFlags |= kPsSamplerExprColorContribution;
               derivedSamplerValueRole |= kSamplerValueRoleColor;
@@ -2340,10 +2514,87 @@ namespace dxvk {
             }
           }
 
+          // normal-map unpack state for this sampler's value: recognize `t * 2 - 1`
+          // (UE3's TextureSample UnpackMin/UnpackMax expansion) and its split forms
+          uint8_t derivedValueState = 0;
+          switch (op) {
+          case DxsoOpcode::Mov:
+            derivedValueState = getSamplerValueStateFromRegister(ctx.src[0]);
+            break;
+          case DxsoOpcode::Mul: {
+            const bool role0 = getSamplerValueRoleFromRegister(ctx.src[0]) != 0;
+            const bool role1 = getSamplerValueRoleFromRegister(ctx.src[1]) != 0;
+            if (role0 && isDefConstNearRgb(ctx.src[1], 2.0f)) {
+              derivedValueState |= kValueStateScaledX2;
+              if ((getSamplerValueStateFromRegister(ctx.src[0]) & kValueStateBiasedHalf) != 0)
+                derivedValueState |= kValueStateSignExpanded; // (t - 0.5) * 2
+            } else if (role1 && isDefConstNearRgb(ctx.src[0], 2.0f)) {
+              derivedValueState |= kValueStateScaledX2;
+              if ((getSamplerValueStateFromRegister(ctx.src[1]) & kValueStateBiasedHalf) != 0)
+                derivedValueState |= kValueStateSignExpanded;
+            }
+            break;
+          }
+          case DxsoOpcode::Add:
+          case DxsoOpcode::Sub: {
+            const bool isSub = op == DxsoOpcode::Sub;
+            const uint8_t state0 = getSamplerValueStateFromRegister(ctx.src[0]);
+            const uint8_t state1 = getSamplerValueStateFromRegister(ctx.src[1]);
+            const bool role0 = getSamplerValueRoleFromRegister(ctx.src[0]) != 0;
+            const bool role1 = getSamplerValueRoleFromRegister(ctx.src[1]) != 0;
+            // t * 2 - 1 completing a sign expansion
+            if (role0 && (state0 & kValueStateScaledX2) != 0 &&
+                isDefConstNearRgb(ctx.src[1], isSub ? 1.0f : -1.0f))
+              derivedValueState |= kValueStateSignExpanded;
+            // commuted / mirrored forms: (-1) + t * 2, 1 - t * 2
+            if (role1 && (state1 & kValueStateScaledX2) != 0 &&
+                isDefConstNearRgb(ctx.src[0], isSub ? 1.0f : -1.0f))
+              derivedValueState |= kValueStateSignExpanded;
+            // t - 0.5 halfway through a (t - 0.5) * 2 expansion
+            if (role0 && isDefConstNearRgb(ctx.src[1], isSub ? 0.5f : -0.5f))
+              derivedValueState |= kValueStateBiasedHalf;
+            if (role1 && isDefConstNearRgb(ctx.src[0], isSub ? 0.5f : -0.5f))
+              derivedValueState |= kValueStateBiasedHalf;
+            break;
+          }
+          case DxsoOpcode::Mad: {
+            const bool role0 = getSamplerValueRoleFromRegister(ctx.src[0]) != 0;
+            const bool role1 = getSamplerValueRoleFromRegister(ctx.src[1]) != 0;
+            const bool offsetIsMinusOne = isDefConstNearRgb(ctx.src[2], -1.0f);
+            if (offsetIsMinusOne &&
+                ((role0 && isDefConstNearRgb(ctx.src[1], 2.0f)) ||
+                 (role1 && isDefConstNearRgb(ctx.src[0], 2.0f))))
+              derivedValueState |= kValueStateSignExpanded; // mad(t, 2, -1)
+            break;
+          }
+          default:
+            break;
+          }
+
+          // lightmap/lighting-constant provenance flows through all tracked arithmetic
+          const uint8_t derivedAnchorBits = uint8_t(
+            getAnchorBitsFromRegister(ctx.src[0]) |
+            getAnchorBitsFromRegister(ctx.src[1]) |
+            getAnchorBitsFromRegister(ctx.src[2]));
+
+          // the HLSL compiler packs scalar results into spare lanes of live registers
+          // (e.g. `dp3 r0.w, n, n` while r0.xyz still holds a tracked color value); a write
+          // that touches no rgb lane merges role/anchor and leaves the rgb unpack state alone
+          auto writeSamplerValueTracking = [&] {
+            if (maskWritesRgb(ctx.dst.mask)) {
+              tempSamplerValueRole[ctx.dst.id.num] = derivedSamplerValueRole;
+              tempSamplerValueState[ctx.dst.id.num] = derivedValueState;
+              tempAnchorBits[ctx.dst.id.num] = derivedAnchorBits;
+            } else {
+              tempSamplerValueRole[ctx.dst.id.num] |= derivedSamplerValueRole;
+              tempAnchorBits[ctx.dst.id.num] |= derivedAnchorBits;
+            }
+          };
+
           if (derived >= 0) {
             tempToTexcoord[ctx.dst.id.num] = int8_t(derived);
             tempCoordExpressionFlags[ctx.dst.id.num] = derivedExpressionFlags;
-            tempSamplerValueRole[ctx.dst.id.num] = derivedSamplerValueRole;
+            writeSamplerValueTracking();
             tempCoordProvenance[ctx.dst.id.num] =
               getCoordProvenanceFromRegister(ctx.src[0]) |
               getCoordProvenanceFromRegister(ctx.src[1]) |
@@ -2357,7 +2608,7 @@ namespace dxvk {
           } else if (writesTrackedTemp) {
             tempToTexcoord[ctx.dst.id.num] = -1;
             tempCoordExpressionFlags[ctx.dst.id.num] = derivedExpressionFlags;
-            tempSamplerValueRole[ctx.dst.id.num] = derivedSamplerValueRole;
+            writeSamplerValueTracking();
             tempCoordProvenance[ctx.dst.id.num] =
               getCoordProvenanceFromRegister(ctx.src[0]) |
               getCoordProvenanceFromRegister(ctx.src[1]) |
@@ -2371,9 +2622,23 @@ namespace dxvk {
           }
         }
 
+        // values that only feed lighting/coordinate math (dot products, kill tests, masks)
+        // carry a control-only role by the time they reach the output and are not counted
+        if (!reachesOutputColor &&
+            ctx.dst.id.type == DxsoRegisterType::ColorOut &&
+            ctx.dst.id.num == 0 &&
+            maskWritesRgb(ctx.dst.mask)) {
+          for (const DxsoRegister& srcReg : { ctx.src[0], ctx.src[1], ctx.src[2] }) {
+            if ((classifySamplerValueRoleWithSwizzle(srcReg) & kSamplerValueRoleColor) != 0) {
+              reachesOutputColor = true;
+              break;
+            }
+          }
+        }
+
         uint32_t sampledSampler = ~0u;
         uint8_t sampleOpSemanticFlags = 0;
-        uint8_t sampleOpExpressionFlags = 0;
+        uint16_t sampleOpExpressionFlags = 0;
         DxsoRegister coordRegStorage;
         const DxsoRegister* coordReg = nullptr;
         switch (op) {
@@ -2442,6 +2707,22 @@ namespace dxvk {
           break;
         }
 
+        // a sample write replaces the destination temp's contents: drop stale tracking, or the
+        // heavy r# register reuse would misattribute another sampler's usage (e.g. a normal-map
+        // unpack) to the sampler being analyzed
+        if (coordReg != nullptr &&
+            (ctx.dst.id.type == DxsoRegisterType::Temp || ctx.dst.id.type == DxsoRegisterType::TempFloat16) &&
+            ctx.dst.id.num < tempSamplerValueRole.size()) {
+          if (sampledSampler != samplerIdx) {
+            tempSamplerValueRole[ctx.dst.id.num] = 0;
+            tempSamplerValueState[ctx.dst.id.num] = 0;
+          }
+          tempAnchorBits[ctx.dst.id.num] =
+            (sampledSampler < 32u && ((anchorLightmapSamplerMask >> sampledSampler) & 1u) != 0)
+              ? kAnchorLightmapValue
+              : 0u;
+        }
+
         if (coordReg != nullptr && sampledSampler == samplerIdx) {
           result.sampleCount = result.sampleCount < std::numeric_limits<uint16_t>::max()
             ? uint16_t(result.sampleCount + 1u)
@@ -2453,13 +2734,14 @@ namespace dxvk {
             if ((sampleOpSemanticFlags & (kPsSamplerSemanticEngineAuxiliary | kPsSamplerSemanticNonDiffuse)) != 0)
               sampleRole |= kSamplerValueRoleControl;
             tempSamplerValueRole[ctx.dst.id.num] = sampleRole;
+            tempSamplerValueState[ctx.dst.id.num] = 0;
           }
 
           const DxsoRegister* swizzleReg = coordReg;
           int32_t tc = getTexcoordFromRegister(*swizzleReg);
           uint8_t coordProvenance = getCoordProvenanceFromRegister(*coordReg);
-          uint8_t coordExpressionFlags =
-            uint8_t(getCoordExpressionFlagsFromRegister(*coordReg) | sampleOpExpressionFlags);
+          uint16_t coordExpressionFlags =
+            uint16_t(getCoordExpressionFlagsFromRegister(*coordReg) | sampleOpExpressionFlags);
           if ((sampleOpSemanticFlags & kPsSamplerSemanticNonDiffuse) != 0)
             coordExpressionFlags |= kPsSamplerExprMaskControl;
           if ((sampleOpSemanticFlags & kPsSamplerSemanticEngineAuxiliary) == 0)
@@ -2644,6 +2926,21 @@ namespace dxvk {
           (result.semanticFlags & (kPsSamplerSemanticEngineAuxiliary | kPsSamplerSemanticLightmap)) == 0) {
         result.semanticFlags |= kPsSamplerSemanticNonDiffuse;
       }
+      // note: the decode flag intentionally does not imply kPsSamplerSemanticNonDiffuse here.
+      // Complex lit shaders remap many color terms by *2-1 (fresnel/rim/mask math), producing
+      // false positives on gamma-decoded textures; scoring applies the flag only for samplers
+      // bound without D3DSAMP_SRGBTEXTURE (UE3 always imports normal maps with SRGB=0).
+      if (normalDecodeDetected)
+        result.expressionFlags |= kPsSamplerExprNormalDecode;
+      // ps_1_x has no oC0 register; the final value of r0 is the output color
+      if (!reachesOutputColor && info.majorVersion() == 1 &&
+          (tempSamplerValueRole[0] & kSamplerValueRoleColor) != 0) {
+        reachesOutputColor = true;
+      }
+      if (reachesOutputColor)
+        result.expressionFlags |= kPsSamplerExprReachesOutputColor;
+      if (diffuseAnchorDetected)
+        result.expressionFlags |= kPsSamplerExprDiffuseAnchor;
 
       {
         const auto& ctab = decoder.getCtabInfo();
@@ -2658,8 +2955,8 @@ namespace dxvk {
               const uint8_t semanticFlagsFromName = classifyPixelSamplerSemanticFlags(c.name);
               result.semanticFlags |= semanticFlagsFromName;
               result.expressionFlags |= classifyPixelSamplerExpressionFlagsFromName(c.name);
-              if ((semanticFlagsFromName & kPsSamplerSemanticMaterialTexture) != 0)
-                result.expressionFlags |= kPsSamplerExprColorContribution;
+              // a generic material-texture name (Texture2D_*) deliberately does not imply color
+              // contribution; opcode dataflow decides that (see kPsSamplerExprReachesOutputColor)
               if ((semanticFlagsFromName & (kPsSamplerSemanticEngineAuxiliary | kPsSamplerSemanticNonDiffuse)) != 0)
                 result.expressionFlags |= kPsSamplerExprMaskControl;
             }
@@ -6503,15 +6800,20 @@ namespace dxvk {
       bool selectionFromCache = false;
       if ((ue3StableDiffuseSelection() || ue3EngineMode()) &&
           inferredPsEntry != nullptr && inferredPsHash != kEmptyHash) {
-        // scoring consults the user-taggable lightmap/albedo-mask sets; drop cached
+        // scoring consults the user-taggable lightmap/never-albedo/preferred-albedo sets; drop cached
         // decisions when those sets change so texture tagging takes effect immediately
         const size_t lightmapSetSize = RtxOptions::lightmapTextures().size();
-        const size_t albedoMaskSetSize = RtxOptions::albedoMaskTextures().size();
+        const size_t neverAlbedoSetSize = RtxOptions::neverAlbedoTextures().size();
+        const size_t preferredAlbedoSetSize = RtxOptions::preferredAlbedoTextures().size();
         if (lightmapSetSize != m_ue3DiffuseSelectionLightmapSetSize ||
-            albedoMaskSetSize != m_ue3DiffuseSelectionAlbedoMaskSetSize) {
+            neverAlbedoSetSize != m_ue3DiffuseSelectionNeverAlbedoSetSize ||
+            preferredAlbedoSetSize != m_ue3DiffuseSelectionPreferredAlbedoSetSize) {
           m_ue3DiffuseSelectionCache.clear();
+          // re-log re-scored selections so tag effects are visible in ue3LogAlbedoSelection output
+          m_loggedAlbedoSelections.clear();
           m_ue3DiffuseSelectionLightmapSetSize = lightmapSetSize;
-          m_ue3DiffuseSelectionAlbedoMaskSetSize = albedoMaskSetSize;
+          m_ue3DiffuseSelectionNeverAlbedoSetSize = neverAlbedoSetSize;
+          m_ue3DiffuseSelectionPreferredAlbedoSetSize = preferredAlbedoSetSize;
         }
 
         XXH64_hash_t key = inferredPsHash;
@@ -6552,6 +6854,14 @@ namespace dxvk {
         }
       }
 
+      // per-stage score breakdown for rtx.d3d9.ue3LogAlbedoSelection, dumped once per selection key
+      const bool logAlbedoSelection =
+        ue3LogAlbedoSelection() &&
+        selectionCacheUsable &&
+        !selectionFromCache &&
+        m_loggedAlbedoSelections.find(selectionCacheKey) == m_loggedAlbedoSelections.end();
+      std::string albedoSelectionLog;
+
       const uint32_t scoringTextureMask = selectionFromCache ? 0u : usedTextureMask;
       for (uint32_t stage : bit::BitMask(scoringTextureMask)) {
         if (stage >= SamplerCount || d3d9State().textures[stage] == nullptr)
@@ -6570,7 +6880,36 @@ namespace dxvk {
         const XXH64_hash_t texHash = texture->GetSampleView(false)->image()->getHash();
         if (lookupHash(RtxOptions::lightmapTextures(), texHash))
           continue;
-        const bool isKnownAlbedoMask = lookupHash(RtxOptions::albedoMaskTextures(), texHash);
+        const bool isNeverAlbedo = lookupHash(RtxOptions::neverAlbedoTextures(), texHash);
+        const bool isPreferredAlbedo = lookupHash(RtxOptions::preferredAlbedoTextures(), texHash);
+
+        // material spread: distinct pixel shaders sampling this texture. Identity albedos stay
+        // at 1-2 (material instances share their parent's bytecode); shared library assets -
+        // detail patterns, grunge/dirt overlays, tint ramps - appear across many unrelated shaders
+        uint32_t materialSpread = 0;
+        if (inferredPsHash != kEmptyHash && texHash != kEmptyHash) {
+          if (!m_ue3TextureSpreadLoaded)
+            loadUe3TextureSpreadCache();
+          Ue3TextureMaterialSpread& spread = m_ue3TextureMaterialSpread[texHash];
+          bool psKnown = false;
+          for (uint8_t i = 0; i < spread.count; i++) {
+            if (spread.psHashes[i] == inferredPsHash) {
+              psKnown = true;
+              break;
+            }
+          }
+          if (!psKnown && spread.count < spread.psHashes.size()) {
+            spread.psHashes[spread.count++] = inferredPsHash;
+            m_ue3TextureSpreadDirty = true;
+            // crossing the penalty threshold changes scores of already-pinned selections;
+            // drop them so every material re-evaluates against the discovered spread
+            if (spread.count == 8) {
+              m_ue3DiffuseSelectionCache.clear();
+              m_loggedAlbedoSelections.clear();
+            }
+          }
+          materialSpread = spread.count;
+        }
 
         const bool srgb = (d3d9State().samplerStates[stage][D3DSAMP_SRGBTEXTURE] & 0x1) != 0;
         const bool isRenderTarget = texture->IsRenderTarget();
@@ -6582,10 +6921,9 @@ namespace dxvk {
         const uint64_t area = desc ? uint64_t(desc->Width) * uint64_t(desc->Height) : 0;
         uint16_t sampleCount = 0;
         bool hasInferredTexcoord = false;
-        bool hasInferredUvHint = false;
         int8_t inferredTexcoordIdx = -1;
         uint8_t inferredSamplerSemanticFlags = 0;
-        uint8_t inferredSamplerExpressionFlags = 0;
+        uint16_t inferredSamplerExpressionFlags = 0;
         bool inferredSamplerLooksEngineAuxiliary = false;
         bool inferredSamplerLooksMaterialTexture = false;
         bool inferredSamplerLooksLightmap = false;
@@ -6600,6 +6938,9 @@ namespace dxvk {
         bool inferredSamplerExprMaskControl = false;
         bool inferredSamplerExprColorContribution = false;
         bool inferredSamplerExprBlendMath = false;
+        bool inferredSamplerExprNormalDecode = false;
+        bool inferredSamplerExprReachesOutputColor = false;
+        bool inferredSamplerExprDiffuseAnchor = false;
         bool inferredUsesZw = false;
         bool inferredUsesWz = false;
         bool inferredUsesXy = false;
@@ -6628,13 +6969,10 @@ namespace dxvk {
           inferredSamplerExprMaskControl = (inferredSamplerExpressionFlags & kPsSamplerExprMaskControl) != 0;
           inferredSamplerExprColorContribution = (inferredSamplerExpressionFlags & kPsSamplerExprColorContribution) != 0;
           inferredSamplerExprBlendMath = (inferredSamplerExpressionFlags & kPsSamplerExprBlendMath) != 0;
+          inferredSamplerExprNormalDecode = (inferredSamplerExpressionFlags & kPsSamplerExprNormalDecode) != 0;
+          inferredSamplerExprReachesOutputColor = (inferredSamplerExpressionFlags & kPsSamplerExprReachesOutputColor) != 0;
+          inferredSamplerExprDiffuseAnchor = (inferredSamplerExpressionFlags & kPsSamplerExprDiffuseAnchor) != 0;
           hasInferredTexcoord = inferredTexcoordIdx >= 0;
-          hasInferredUvHint =
-            inferredPsEntry->samplerScaleImmediateValid[stage] != 0 ||
-            inferredPsEntry->samplerOffsetImmediateValid[stage] != 0 ||
-            inferredPsEntry->samplerScaleConstReg[stage] >= 0 ||
-            inferredPsEntry->samplerOffsetConstReg[stage] >= 0 ||
-            (inferredSamplerExpressionFlags & (kPsSamplerExprUvTransform | kPsSamplerExprUvOffset)) != 0;
           inferredUsesZw =
             inferredPsEntry->samplerCoordCompValid[stage] != 0 &&
             inferredPsEntry->samplerCoordCompU[stage] == 2 &&
@@ -6663,7 +7001,7 @@ namespace dxvk {
             !inferredSamplerLooksNonDiffuse &&
             !inferredSamplerExprViewDependent &&
             !inferredSamplerExprMaskControl &&
-            !isKnownAlbedoMask &&
+            !isNeverAlbedo &&
             (inferredSamplerLooksMaterialTexture || inferredSamplerSemanticFlags == 0);
 
           if (looksMaterialCubemap) {
@@ -6688,18 +7026,47 @@ namespace dxvk {
         if (texHash == kEmptyHash)
           continue;
 
-        // heuristics
-        // sRGB textures are likely albedo
-        // prefer frequently sampled samplers from the active pixel shader
-        // favour samplers that produce an inferable texcoord (helps pick the true UV-driven stage)
-        // render targets are unlikely to be albedo for world geometry
-        // prefer larger textures (usually albedo/detail over tiny masks)
-        // prefer lower stage index for stability as a tie breaker
+        // effective area: a small texture tiled NxM times covers N*M times its pixel area
+        // (UE3 TexCoord UTiling/VTiling folded into shader literals, or held in a scalar-parameter
+        // constant resolved at decision time; ue3StableDiffuseSelection pins the resulting pick).
+        // Restricted to genuinely tiny authored tiles (e.g. a 64x128 window): tiled detail/dirt/
+        // tint overlays are usually 256x256+ and must not out-rank the albedo on size.
+        constexpr uint64_t kTilingCreditMaxRawArea = 128ull * 128ull;
+        constexpr uint64_t kTilingCreditMaxEffectiveArea = 2ull * 1024ull * 1024ull;
+        uint64_t effectiveArea = area;
+        if (inferredPsEntry != nullptr && stage < caps::MaxTexturesPS &&
+            area > 0 && area <= kTilingCreditMaxRawArea) {
+          float tilingU = 1.0f;
+          float tilingV = 1.0f;
+          bool tilingKnown = false;
+          if (inferredPsEntry->samplerScaleImmediateValid[stage] != 0) {
+            tilingU = std::abs(inferredPsEntry->samplerScaleImmediateU[stage]);
+            tilingV = std::abs(inferredPsEntry->samplerScaleImmediateV[stage]);
+            tilingKnown = true;
+          } else if (inferredPsEntry->samplerScaleConstReg[stage] >= 0 &&
+                     uint32_t(inferredPsEntry->samplerScaleConstReg[stage]) < caps::MaxFloatConstantsPS) {
+            const Vector4& scaleConst =
+              d3d9State().psConsts.fConsts[uint32_t(inferredPsEntry->samplerScaleConstReg[stage])];
+            tilingU = std::abs(scaleConst[inferredPsEntry->samplerScaleConstCompU[stage] & 0x3u] *
+                               inferredPsEntry->samplerScaleFactorU[stage]);
+            tilingV = std::abs(scaleConst[inferredPsEntry->samplerScaleConstCompV[stage] & 0x3u] *
+                               inferredPsEntry->samplerScaleFactorV[stage]);
+            tilingKnown = std::isfinite(tilingU) && std::isfinite(tilingV);
+          }
+          if (tilingKnown) {
+            const float tiles = std::min(std::max(tilingU * tilingV, 1.0f), 1024.0f);
+            effectiveArea = std::min(uint64_t(double(area) * double(tiles)), kTilingCreditMaxEffectiveArea);
+          }
+        }
+        // UV-math bonuses only apply where tiling resolved to an actual repeat factor: a tiled
+        // small texture is an identity albedo, a plain UV transform on one is an overlay tell
+        const bool hasResolvedTiling = effectiveArea > area;
+
         int64_t score = 0;
         score += srgb ? 1'000'000 : 0;
         score += int64_t(std::min<uint16_t>(sampleCount, 16u)) * 120'000ll;
         score += hasInferredTexcoord ? 250'000 : -150'000;
-        score += hasInferredUvHint ? 80'000 : 0;
+        score += hasResolvedTiling ? 80'000 : 0;
         score -= (isRenderTarget && !isMovieTexture) ? 500'000 : 0;
         score += isMovieTexture ? 4'000'000 : 0;
         score += inferredSamplerLooksMaterialTexture ? 230'000 : 0;
@@ -6709,7 +7076,20 @@ namespace dxvk {
         score -= inferredSamplerExprViewDependent ? 260'000 : 0;
         score -= inferredSamplerExprMaskControl ? 320'000 : 0;
         score -= inferredSamplerLooksVideo ? 8'000'000 : 0;
-        score -= isKnownAlbedoMask ? 6'000'000 : 0;
+        score -= isNeverAlbedo ? 6'000'000 : 0;
+        score += isPreferredAlbedo ? 8'000'000 : 0;
+        // bytecode-proven tangent-space normal decode (t * 2 - 1 into normalize/dot chains):
+        // decisive penalty - must outweigh typical size advantages. Only applies to linear
+        // (non-sRGB) samplers: UE3 imports normal maps with SRGB=0, while gamma-decoded color
+        // textures can pick up the flag spuriously in lit shaders full of *2-1 remap math.
+        const bool normalDecodeActive = inferredSamplerExprNormalDecode && !srgb;
+        score -= normalDecodeActive ? 1'500'000 : 0;
+        // only a high spread is directional: mid spreads (3-7) are just as often a legitimately
+        // reused diffuse (e.g. common city wall/plaster sheets) as a shared overlay
+        if (materialSpread >= 8)
+          score -= 2'600'000;
+        // tiny ramp/tint lookups (gradients, palettes) are material parameters, not albedo
+        score -= (area > 0 && area <= 1'024) ? 350'000 : 0;
         if (ue3EngineMode()) {
           // UE3 binds many scene buffers, shadow maps, exposure/color curves, and UI/video
           // surfaces alongside material samplers. Keep these out of legacy albedo slots.
@@ -6724,16 +7104,41 @@ namespace dxvk {
           !inferredSamplerLooksNonDiffuse &&
           !inferredSamplerExprViewDependent &&
           !inferredSamplerExprMaskControl &&
-          !isKnownAlbedoMask &&
+          !isNeverAlbedo &&
           (inferredSamplerLooksMaterialTexture || inferredSamplerSemanticFlags == 0);
-        score += (looksExpressionDrivenMaterial && inferredSamplerExprUvTransform) ? 95'000 : 0;
+        score += (looksExpressionDrivenMaterial && inferredSamplerExprUvTransform && hasResolvedTiling) ? 95'000 : 0;
         score += (looksExpressionDrivenMaterial && inferredSamplerExprUvOffset) ? 52'000 : 0;
         score += (looksExpressionDrivenMaterial && inferredSamplerExprUvAnimated) ? 115'000 : 0;
         score += (looksExpressionDrivenMaterial && inferredSamplerExprUvTimeDriven && sampleCount >= 2u) ? 140'000 : 0;
         score += (looksExpressionDrivenMaterial && inferredSamplerExprColorContribution) ? 65'000 : 0;
         score += (looksExpressionDrivenMaterial && inferredSamplerExprBlendMath && sampleCount >= 2u) ? 60'000 : 0;
-        score += int64_t(std::min<uint64_t>(area, 16ull * 1024ull * 1024ull));
-        score -= int64_t(stage);
+        // sampled value provably reaches oC0.rgb as color - the defining trait of a diffuse/emissive
+        // texture, which normal/lighting-input samplers lack (their values collapse in dot products)
+        score += (looksExpressionDrivenMaterial && inferredSamplerExprReachesOutputColor) ? 200'000 : 0;
+        // deterministic UE3 base-pass structure: only the diffuse expression is multiplied with the
+        // lightmap sample (static geometry) or the ambient/sky lighting constants (dynamic/unlit).
+        // Dominates the softer heuristics but stays below movie surfaces and user texture tags.
+        // Render targets are excluded: light-environment attenuation buffers also multiply into
+        // sky/ambient lighting terms but can never be a surface albedo.
+        score += (looksExpressionDrivenMaterial && !normalDecodeActive && !isRenderTarget &&
+                  inferredSamplerExprDiffuseAnchor) ? 2'500'000 : 0;
+        // normal maps get no size credit - resolution advantage must not offset the decode penalty
+        score += normalDecodeActive
+          ? 0
+          : int64_t(std::min<uint64_t>(effectiveArea, 16ull * 1024ull * 1024ull));
+        // near-exact ties among color-chain candidates (magnitudes stay below any real signal):
+        // prefer a UV transform (the tiled base material - overlays sample raw UVs), then the
+        // LATER sampler (the material translator assigns Texture2D_N slots in property compile
+        // order Normal -> Emissive -> Diffuse). Everywhere else prefer the earlier stage.
+        const bool diffuseChainCandidate =
+          looksExpressionDrivenMaterial && !normalDecodeActive && !isRenderTarget &&
+          inferredSamplerExprReachesOutputColor;
+        if (diffuseChainCandidate) {
+          score += inferredSamplerExprUvTransform ? 200 : 0;
+          score += int64_t(stage) * 4;
+        } else {
+          score -= int64_t(stage);
+        }
         if (likelyPackedUvConventions) {
           // UE3-style shader paths (skinned and non-skinned vertex factories) frequently pack
           // secondary UVs into non-`.xy` components, so we bias slot 0 toward diffuse-like UV usage
@@ -6799,6 +7204,50 @@ namespace dxvk {
               (likelyUe3FlexiblePackedUvPath || (likelyGpuSkinnedMesh && highConfidenceMaterialTexture))) {
             score += 45'000ll;
           }
+        }
+
+        if (logAlbedoSelection) {
+          std::string flagList;
+          auto appendFlag = [&](const bool set, const char* name) {
+            if (!set)
+              return;
+            if (!flagList.empty())
+              flagList += "|";
+            flagList += name;
+          };
+          appendFlag(inferredSamplerLooksMaterialTexture, "MAT");
+          appendFlag(inferredSamplerLooksEngineAuxiliary, "AUX");
+          appendFlag(inferredSamplerLooksLightmap, "LIGHTMAP");
+          appendFlag(inferredSamplerLooksNonDiffuse, "NONDIFFUSE");
+          appendFlag(inferredSamplerLooksVideo, "VIDEO");
+          appendFlag(inferredSamplerLooksMovieTexture, "MOVIE");
+          appendFlag(inferredSamplerExprUvTransform, "UVXFORM");
+          appendFlag(inferredSamplerExprUvOffset, "UVOFS");
+          appendFlag(inferredSamplerExprUvAnimated, "UVANIM");
+          appendFlag(inferredSamplerExprUvTimeDriven, "UVTIME");
+          appendFlag(inferredSamplerExprViewDependent, "VIEWDEP");
+          appendFlag(inferredSamplerExprMaskControl, "MASKCTL");
+          appendFlag(inferredSamplerExprColorContribution, "COLORCONTRIB");
+          appendFlag(inferredSamplerExprBlendMath, "BLEND");
+          appendFlag(normalDecodeActive, "NORMALDECODE");
+          appendFlag(inferredSamplerExprNormalDecode && !normalDecodeActive, "NORMALDECODE-SRGBVETO");
+          appendFlag(inferredSamplerExprReachesOutputColor, "REACHESOC0");
+          appendFlag(inferredSamplerExprDiffuseAnchor, "ANCHOR");
+          appendFlag(isNeverAlbedo, "TAG:NEVERALBEDO");
+          appendFlag(isPreferredAlbedo, "TAG:PREFERALBEDO");
+          appendFlag(isRenderTarget, "RT");
+
+          albedoSelectionLog += str::format(
+            "\n  s", stage,
+            " tex=0x", std::hex, texHash, std::dec,
+            " ", desc ? desc->Width : 0u, "x", desc ? desc->Height : 0u,
+            " srgb=", srgb ? 1 : 0,
+            " samples=", sampleCount,
+            " tc=", int32_t(inferredTexcoordIdx),
+            " effArea=", effectiveArea,
+            " spread=", materialSpread,
+            " flags=[", flagList.empty() ? "-" : flagList, "]",
+            " score=", score);
         }
 
         // insert into top-2 (simple selection sort)
@@ -6907,7 +7356,7 @@ namespace dxvk {
               score -= nonUv0Penalty;
 
             const uint8_t semanticFlags = inferredPsEntry->samplerSemanticFlags[stage];
-            const uint8_t expressionFlags = inferredPsEntry->samplerExpressionFlags[stage];
+            const uint16_t expressionFlags = inferredPsEntry->samplerExpressionFlags[stage];
             const bool looksMaterialTexture = (semanticFlags & kPsSamplerSemanticMaterialTexture) != 0;
             const bool looksEngineAuxiliary = (semanticFlags & kPsSamplerSemanticEngineAuxiliary) != 0;
             const bool looksNonDiffuse = (semanticFlags & kPsSamplerSemanticNonDiffuse) != 0;
@@ -6920,6 +7369,9 @@ namespace dxvk {
             const bool looksExprMaskControl = (expressionFlags & kPsSamplerExprMaskControl) != 0;
             const bool looksExprColorContribution = (expressionFlags & kPsSamplerExprColorContribution) != 0;
             const bool looksExprBlendMath = (expressionFlags & kPsSamplerExprBlendMath) != 0;
+            const bool looksExprNormalDecode = (expressionFlags & kPsSamplerExprNormalDecode) != 0;
+            const bool looksExprReachesOutputColor = (expressionFlags & kPsSamplerExprReachesOutputColor) != 0;
+            const bool looksExprDiffuseAnchor = (expressionFlags & kPsSamplerExprDiffuseAnchor) != 0;
             if ((semanticFlags & kPsSamplerSemanticMaterialTexture) != 0)
               score += 180;
             if ((semanticFlags & kPsSamplerSemanticEngineAuxiliary) != 0)
@@ -6936,6 +7388,11 @@ namespace dxvk {
               score -= 280;
             if (looksVideo)
               score -= 8000;
+            const bool candidateSrgb =
+              (d3d9State().samplerStates[stage][D3DSAMP_SRGBTEXTURE] & 0x1) != 0;
+            const bool candidateNormalDecode = looksExprNormalDecode && !candidateSrgb;
+            if (candidateNormalDecode)
+              score -= 3000;
             const bool looksExpressionDrivenMaterial =
               !looksEngineAuxiliary &&
               !looksNonDiffuse &&
@@ -6956,6 +7413,10 @@ namespace dxvk {
             if (looksExpressionDrivenMaterial && looksExprBlendMath &&
                 inferredPsEntry->samplerSampleCount[stage] >= 2u)
               score += 45;
+            if (looksExpressionDrivenMaterial && looksExprReachesOutputColor)
+              score += 80;
+            if (looksExpressionDrivenMaterial && !candidateNormalDecode && looksExprDiffuseAnchor)
+              score += 600;
 
             const bool candidateHasNonZeroOffset = hasNonZeroInferredSamplerOffset(inferredPsEntry, stage);
             const bool candidatePackedPairSuspicious =
@@ -7056,6 +7517,18 @@ namespace dxvk {
         cacheEntry.chosenStages[1] = chosenStages[1];
         cacheEntry.cubemapFallbackStage = strictCubemapFallbackStage;
         m_ue3DiffuseSelectionCache.emplace(selectionCacheKey, cacheEntry);
+      }
+
+      if (logAlbedoSelection) {
+        m_loggedAlbedoSelections.insert(selectionCacheKey);
+        auto stageName = [&](const uint8_t stage) {
+          return stage == kInvalidStage ? std::string("-") : str::format("s", uint32_t(stage));
+        };
+        Logger::info(str::format(
+          "[RTX-Compatibility][UE3-AlbedoSelection] ps=0x", std::hex, inferredPsHash,
+          " key=0x", selectionCacheKey, std::dec,
+          " chosen=[", stageName(chosenStages[0]), ",", stageName(chosenStages[1]), "]",
+          albedoSelectionLog.empty() ? "\n  (no scoreable candidates)" : albedoSelectionLog.c_str()));
       }
 
       uint32_t textureID = 0;
@@ -7788,8 +8261,83 @@ namespace dxvk {
     });
   }
 
+  namespace {
+    constexpr char kUe3TextureSpreadCachePath[] = "rtx-remix/ue3TextureSpread.cache";
+    constexpr uint64_t kUe3TextureSpreadCacheMagic = 0x3144525053334555ull; // "UE3SPRD1"
+    constexpr uint32_t kUe3TextureSpreadCacheMaxEntries = 1u << 20;
+    constexpr uint32_t kUe3TextureSpreadSaveIntervalFrames = 600;
+  }
+
+  void D3D9Rtx::loadUe3TextureSpreadCache() {
+    m_ue3TextureSpreadLoaded = true;
+
+    std::ifstream file(kUe3TextureSpreadCachePath, std::ios::binary);
+    if (!file.is_open())
+      return;
+
+    uint64_t magic = 0;
+    uint32_t entryCount = 0;
+    file.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+    file.read(reinterpret_cast<char*>(&entryCount), sizeof(entryCount));
+    if (!file || magic != kUe3TextureSpreadCacheMagic || entryCount > kUe3TextureSpreadCacheMaxEntries)
+      return;
+
+    for (uint32_t i = 0; i < entryCount; i++) {
+      XXH64_hash_t texHash = 0;
+      uint8_t count = 0;
+      file.read(reinterpret_cast<char*>(&texHash), sizeof(texHash));
+      file.read(reinterpret_cast<char*>(&count), sizeof(count));
+      Ue3TextureMaterialSpread spread;
+      if (!file || count > spread.psHashes.size())
+        return;
+      for (uint8_t p = 0; p < count; p++)
+        file.read(reinterpret_cast<char*>(&spread.psHashes[p]), sizeof(XXH64_hash_t));
+      if (!file)
+        return;
+      spread.count = count;
+      m_ue3TextureMaterialSpread[texHash] = spread;
+    }
+
+    Logger::info(str::format(
+      "[RTX-Compatibility][UE3] Loaded texture material-spread cache: ", entryCount, " textures"));
+  }
+
+  void D3D9Rtx::saveUe3TextureSpreadCache() {
+    if (!m_ue3TextureSpreadDirty)
+      return;
+    m_ue3TextureSpreadDirty = false;
+
+    std::ofstream file(kUe3TextureSpreadCachePath, std::ios::binary | std::ios::trunc);
+    if (!file.is_open())
+      return;
+
+    const uint32_t entryCount =
+      uint32_t(std::min<size_t>(m_ue3TextureMaterialSpread.size(), kUe3TextureSpreadCacheMaxEntries));
+    file.write(reinterpret_cast<const char*>(&kUe3TextureSpreadCacheMagic), sizeof(kUe3TextureSpreadCacheMagic));
+    file.write(reinterpret_cast<const char*>(&entryCount), sizeof(entryCount));
+
+    uint32_t written = 0;
+    for (const auto& entry : m_ue3TextureMaterialSpread) {
+      if (written >= entryCount)
+        break;
+      file.write(reinterpret_cast<const char*>(&entry.first), sizeof(entry.first));
+      file.write(reinterpret_cast<const char*>(&entry.second.count), sizeof(entry.second.count));
+      for (uint8_t p = 0; p < entry.second.count; p++)
+        file.write(reinterpret_cast<const char*>(&entry.second.psHashes[p]), sizeof(XXH64_hash_t));
+      written++;
+    }
+  }
+
   void D3D9Rtx::EndFrame(const Rc<DxvkImage>& targetImage, bool callInjectRtx) {
     const auto currentReflexFrameId = GetReflexFrameId();
+
+    // persist newly discovered texture material-spread so the next session scores
+    // deterministically from its first frame instead of re-converging
+    if (m_ue3TextureSpreadDirty &&
+        currentReflexFrameId >= m_ue3TextureSpreadLastSaveFrame + kUe3TextureSpreadSaveIntervalFrames) {
+      m_ue3TextureSpreadLastSaveFrame = uint32_t(currentReflexFrameId);
+      saveUe3TextureSpreadCache();
+    }
     
     // Flush any pending game and RTX work
     m_parent->Flush();

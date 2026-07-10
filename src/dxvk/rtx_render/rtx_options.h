@@ -190,9 +190,15 @@ namespace dxvk {
     RTX_OPTION("rtx", fast_unordered_set, lightmapTextures, {},
                   "Textures used for lightmapping (baked static lighting on surfaces) in older games.\n"
                   "These textures will be ignored when attempting to determine the desired textures from a draw to use for ray tracing.");
-    RTX_OPTION("rtx", fast_unordered_set, albedoMaskTextures, {},
-                  "Textures that are commonly used as overlay/mask inputs rather than true base color.\n"
-                  "These textures are given low priority when inferring the primary albedo sampler in D3D9 shader path draws.");
+    RTX_OPTION("rtx", fast_unordered_set, neverAlbedoTextures, {},
+                  "Textures that must never be selected as the primary albedo in D3D9 shader path draws.\n"
+                  "Use this for shared overlay content (dirt/grunge masks, detail patterns, tint ramps) that the albedo "
+                  "inference might otherwise pick over the intended diffuse; tagging the overlay once corrects every "
+                  "material that samples it.");
+    RTX_OPTION("rtx", fast_unordered_set, preferredAlbedoTextures, {},
+                  "Textures that should be strongly preferred as the primary albedo when bound to a draw.\n"
+                  "Use this to override the albedo sampler inference for D3D9 shader path draws where the heuristics pick "
+                  "the wrong texture (e.g. a specular or normal map is selected instead of the intended diffuse).");
     RTX_OPTION("rtx", fast_unordered_set, skyBoxTextures, {},
                   "Textures on draw calls used for the sky or are otherwise intended to be very far away from the camera at all times (no parallax).\n"
                   "Any draw calls using a texture in this list will be treated as sky and rendered as such in a manner different from typical geometry.");    
