@@ -49,13 +49,7 @@ dxvk-remix also contains a subproject in the `bridge` folder, which enables 32 b
 	- Note: UE3 employs frustum culling in native C++ land. This requires patching the executable to treat primitives as always visible (a dedicated patch script will come later). Note this has been tested only with the GOG version so far.
  		- Use a hex editor to locate offset 008E3C6C and patch `0F 84 EE 06 00 00` to `90 90 90 90 90 90`.
 
-### 3) Shadow enhancements
-
-Refined shadow visibility behavior. Includes better handling at grazing light angles
-
-Also includes smooth shadow shading for normals. This is targeted at the shadow level and, unlike the smooth shading categorisation, it is not a change to the renderer's mesh shading mode.
-
-### 4) Acknowledgements
+### 3) Acknowledgements
 - sambow23 for their physically based sky implementation.
 - xoxor4d for their research into UE3->Remix support and other tidbits of info that helped guide the initial work around this.
 
