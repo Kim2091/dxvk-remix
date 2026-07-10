@@ -4,6 +4,9 @@
 #include "../dxso/dxso_module.h"
 #include "d3d9_shader_permutations.h"
 #include "d3d9_util.h"
+// NV-DXVK start: cached bytecode hash for per-draw RTX lookups
+#include "../util/xxHash/xxhash.h"
+// NV-DXVK end
 
 #include <array>
 
@@ -45,6 +48,15 @@ namespace dxvk {
       return m_bytecode;
     }
 
+    // NV-DXVK start: cached bytecode hash for per-draw RTX lookups
+    // XXH3 hash of the original DXSO bytecode, computed once at shader creation.
+    // Identical to XXH3_64bits(GetBytecode().data(), GetBytecode().size()), so all
+    // hash-keyed caches and user-tagged hashes remain bit-compatible.
+    XXH64_hash_t GetBytecodeHash() const {
+      return m_bytecodeHash;
+    }
+    // NV-DXVK end
+
     const DxsoIsgn& GetIsgn() const {
       return m_isgn;
     }
@@ -81,6 +93,10 @@ namespace dxvk {
     DxsoPermutations      m_shaders;
 
     std::vector<uint8_t>  m_bytecode;
+
+    // NV-DXVK start: cached bytecode hash for per-draw RTX lookups
+    XXH64_hash_t          m_bytecodeHash = 0;
+    // NV-DXVK end
 
   };
 

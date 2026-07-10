@@ -85,8 +85,6 @@ public:
 
 private:
   void createLutResources(Rc<DxvkContext> ctx);
-  void dispatchTransmittanceLut(Rc<DxvkContext> ctx);
-  void dispatchMultiscatteringLut(Rc<DxvkContext> ctx);
   void dispatchSkyViewLut(Rc<DxvkContext> ctx);
 
   // LUT dimensions
@@ -105,6 +103,7 @@ private:
   Resources::Resource m_skyViewLut;
   
   Rc<DxvkBuffer> m_constantsBuffer;
+  Rc<DxvkSampler> m_lutSampler;
 
   AtmosphereArgs m_cachedArgs;
   bool m_initialized = false;

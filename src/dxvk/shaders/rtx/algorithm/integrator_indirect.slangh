@@ -470,7 +470,9 @@ void integratePathVertex(
     else if (cb.skyMode == 1)
     {
       // Physical atmosphere mode
-      skyRadiance = evalSkyRadiance(pathState.direction, cb.atmosphereArgs, cb.isZUp != 0);
+      skyRadiance = cb.atmosphereArgs.useSkyViewLut != 0
+        ? sampleSkyViewLutRadiance(AtmosphereSkyViewLut, pathState.direction, cb.atmosphereArgs, cb.isZUp != 0)
+        : evalSkyRadiance(pathState.direction, cb.atmosphereArgs, cb.isZUp != 0);
     }
 #endif
     else

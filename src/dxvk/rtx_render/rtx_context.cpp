@@ -917,7 +917,9 @@ namespace dxvk {
     const RasterGeometry& geoData = drawCallState.getGeometryData();
     DrawCallTransforms& transformData = drawCallState.modifyTransformData();
 
-    assert(geoData.futureGeometryHashes.valid());
+    // NV-DXVK start: static geometry hash memoization can pre-populate hashes without a future
+    assert(geoData.futureGeometryHashes.valid() || geoData.hashes[HashComponents::VertexPosition] != kEmptyHash);
+    // NV-DXVK end
     assert(geoData.positionBuffer.defined());
 
     const auto fusedMode = RtxOptions::fusedWorldViewMode();

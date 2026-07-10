@@ -5,6 +5,7 @@
 #include "../util/util_threadpool.h"
 
 #include <array>
+#include <atomic>
 #include <memory>
 #include <vector>
 #include <optional>
@@ -158,6 +159,12 @@ namespace dxvk {
                "UE3 compat: for stable static LocalVertexFactory draws, reuse previously captured vertex shader output instead of preserving a new vertex-capture draw.");
     RTX_OPTION("rtx.d3d9", uint32_t, ue3StaticLocalMeshVertexCaptureCacheWarmupFrames, 2,
                "UE3 compat: number of matching captures before a static LocalVertexFactory draw can reuse cached vertex-capture output.");
+    RTX_OPTION("rtx.d3d9", bool, ue3StaticGeometryHashMemoization, true,
+               "UE3 CPU optimization: reuse geometry hash and bounding box results across frames for stable static "
+               "LocalVertexFactory draws instead of re-hashing the full vertex/index data every frame. Uses the same "
+               "static-buffer identity as the vertex-capture cache (buffer handles, offsets, draw parameters, stable "
+               "shader constants, camera cell) plus a per-buffer content generation counter, so results can never go "
+               "stale. Only active when rtx.d3d9.ue3StaticLocalMeshVertexCaptureCache is enabled.");
     RTX_OPTION("rtx.d3d9", float, ue3VertexCaptureCameraCellSize, 2000.0f,
                "UE3 compat: world-space camera cell size used to refresh camera-sensitive vertex captures. Smaller values recapture more often; 0 disables camera-cell hashing.");
     RTX_OPTION("rtx.d3d9", bool, ue3NativeLocalMeshVertexCapture, false,
@@ -693,6 +700,22 @@ namespace dxvk {
 
     fast_unordered_cache<Ue3VertexCaptureCacheEntry> m_ue3VertexCaptureCache;
 
+    // Cross-frame memo of geometry hash + bounding box results for stable static local
+    // meshes, keyed by the same identity as the static vertex-capture cache. Entries are
+    // heap-pinned via shared_ptr: a geometry worker publishes results into the entry
+    // (release store on the ready flag) while the main thread owns the map and serves
+    // published results on later frames (acquire load), skipping the per-frame re-hash
+    // of the full vertex/index data.
+    struct Ue3GeometryMemoEntry {
+      std::atomic<bool> hashesReady { false };
+      std::atomic<bool> aabbReady { false };
+      GeometryHashes hashes;
+      AxisAlignedBoundingBox boundingBox;
+      uint32_t lastFrameTouched = 0;
+    };
+    fast_unordered_cache<std::shared_ptr<Ue3GeometryMemoEntry>> m_ue3GeometryMemoCache;
+    void pruneUe3GeometryMemoCache();
+
     struct Ue3CameraHashCell {
       int32_t x = 0;
       int32_t y = 0;
@@ -712,7 +735,14 @@ namespace dxvk {
     bool canUseUe3NativeLocalVertexCapture(const IndexContext& indexContext,
                                            const VertexContext vertexContext[caps::MaxStreams],
                                            const RasterGeometry& geoData) const;
-    XXH64_hash_t computeUe3StableVertexShaderHash() const;
+    XXH64_hash_t computeUe3StableVertexShaderHash(bool* outHashedFloatConstsWithExclusions = nullptr) const;
+
+    // Per-draw memo of computeUe3StableVertexShaderHash (VS bytecode + camera-excluded
+    // constants). The same value feeds both the geometry hash (computeHash) and the static
+    // vertex-capture cache key, so it is computed once per draw in internalPrepareDraw
+    // instead of hashing up to 4KB of shader constants twice.
+    XXH64_hash_t m_activeStableVsHash = 0;
+    bool m_activeStableVsHashUsedExclusions = false;
     XXH64_hash_t computeUe3StaticVertexCaptureCacheKey(const IndexContext& indexContext,
                                                        const VertexContext vertexContext[caps::MaxStreams],
                                                        const DrawContext& drawContext,
@@ -759,9 +789,13 @@ namespace dxvk {
 
     Future<SkinningData> processSkinning(const RasterGeometry& geoData);
 
-    Future<AxisAlignedBoundingBox> computeAxisAlignedBoundingBox(const RasterGeometry& geoData);
+    // When publishTo is non-null, the worker additionally publishes the computed result
+    // into the memo entry so later frames can reuse it without recomputing.
+    Future<AxisAlignedBoundingBox> computeAxisAlignedBoundingBox(const RasterGeometry& geoData,
+                                                                 const std::shared_ptr<Ue3GeometryMemoEntry>& publishTo = {});
 
-    Future<GeometryHashes> computeHash(const RasterGeometry& geoData, const uint32_t maxIndexValue);
+    Future<GeometryHashes> computeHash(const RasterGeometry& geoData, const uint32_t maxIndexValue,
+                                       const std::shared_ptr<Ue3GeometryMemoEntry>& publishTo = {});
 
     void submitActiveDrawCallState();
   };

@@ -22,6 +22,10 @@ namespace dxvk {
     m_bytecode.resize(bytecodeLength);
     std::memcpy(m_bytecode.data(), pShaderBytecode, bytecodeLength);
 
+    // NV-DXVK start: cached bytecode hash for per-draw RTX lookups
+    m_bytecodeHash = bytecodeLength != 0 ? XXH3_64bits(m_bytecode.data(), bytecodeLength) : 0;
+    // NV-DXVK end
+
     const std::string name = Key.toString();
     Logger::debug(str::format("Compiling shader ", name));
     

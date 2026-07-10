@@ -1282,6 +1282,10 @@ namespace dxvk {
                "Sky rendering mode. SkyboxRasterization uses traditional skybox rasterization, PhysicalAtmosphere uses Hillaire atmospheric scattering.");
 
     // Atmosphere parameters
+    RTX_OPTION("rtx.atmosphere", bool, useSkyViewLut, true,
+               "Sample the precomputed sky-view LUT for sky radiance on ray misses instead of ray marching the atmosphere per ray. "
+               "The LUT is generated with the same scattering evaluation, so the result is visually identical at a fraction of the GPU cost. "
+               "Disable only to A/B compare against the reference inline evaluation.");
     RTX_OPTION("rtx.atmosphere", bool, sunDisc, true, "Include the sun itself in the output.");
     RTX_OPTION("rtx.atmosphere", float, sunSize, 0.545f, "Size of sun disc in degrees.");
     RTX_OPTION("rtx.atmosphere", float, sunIntensity, 1.0f, "Strength of Sun.");

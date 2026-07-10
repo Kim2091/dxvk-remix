@@ -309,7 +309,10 @@ namespace dxvk {
 
   bool DrawCallState::finalizeGeometryHashes() {
     if (!geometryData.futureGeometryHashes.valid()) {
-      return false;
+      // NV-DXVK start: hashes may have been served directly from the static geometry
+      // hash memoization cache (D3D9Rtx), in which case there is no future to resolve.
+      return geometryData.hashes[HashComponents::VertexPosition] != kEmptyHash;
+      // NV-DXVK end
     }
 
     geometryData.hashes = geometryData.futureGeometryHashes.get();
@@ -373,52 +376,135 @@ namespace dxvk {
     categories.clr(category);
   }
 
+  // REMIX-231: merged category lookup table. Maps a tagged hash to a bitmask of the
+  // categories whose option sets contain it, so per-draw categorization is 2-3 table
+  // probes instead of ~23 option accesses (each takes the global option mutex) times
+  // 3 hash tiers of set probes. Rebuilt when any source set changes size (UI tagging);
+  // refreshed once per frame from D3D9Rtx::EndFrame and lazily on first use.
+  // Accessed only from the app thread that submits draw calls.
+  namespace {
+    struct CategoryLookupTable {
+      size_t fingerprint = SIZE_MAX;
+      fast_unordered_cache<uint32_t> bits;
+
+      uint32_t lookup(const XXH64_hash_t h) const {
+        if (h == kEmptyHash) {
+          return 0u;
+        }
+        const auto it = bits.find(h);
+        return it != bits.end() ? it->second : 0u;
+      }
+    };
+    CategoryLookupTable s_categoryLookupTable;
+
+    constexpr uint32_t categoryBit(const InstanceCategories category) {
+      return 1u << static_cast<uint32_t>(category);
+    }
+  }
+
+  void DrawCallState::refreshCategoryLookupTable() {
+    static_assert(static_cast<uint32_t>(InstanceCategories::Count) <= 32, "Category bits must fit in uint32_t");
+
+    const std::pair<InstanceCategories, const fast_unordered_set*> categorySets[] = {
+      { InstanceCategories::WorldUI, &RtxOptions::worldSpaceUiTextures() },
+      { InstanceCategories::WorldMatte, &RtxOptions::worldSpaceUiBackgroundTextures() },
+      { InstanceCategories::Ignore, &RtxOptions::ignoreTextures() },
+      { InstanceCategories::IgnoreLights, &RtxOptions::ignoreLights() },
+      { InstanceCategories::IgnoreAntiCulling, &RtxOptions::antiCullingTextures() },
+      { InstanceCategories::IgnoreMotionBlur, &RtxOptions::motionBlurMaskOutTextures() },
+      { InstanceCategories::IgnoreOpacityMicromap, &RtxOptions::opacityMicromapIgnoreTextures() },
+      { InstanceCategories::IgnoreAlphaChannel, &RtxOptions::ignoreAlphaOnTextures() },
+      { InstanceCategories::IgnoreBakedLighting, &RtxOptions::ignoreBakedLightingTextures() },
+      { InstanceCategories::Hidden, &RtxOptions::hideInstanceTextures() },
+      { InstanceCategories::Particle, &RtxOptions::particleTextures() },
+      { InstanceCategories::Beam, &RtxOptions::beamTextures() },
+      { InstanceCategories::IgnoreTransparencyLayer, &RtxOptions::ignoreTransparencyLayerTextures() },
+      { InstanceCategories::DecalStatic, &RtxOptions::decalTextures() },
+      { InstanceCategories::DecalDynamic, &RtxOptions::dynamicDecalTextures() },
+      { InstanceCategories::DecalSingleOffset, &RtxOptions::singleOffsetDecalTextures() },
+      { InstanceCategories::DecalNoOffset, &RtxOptions::nonOffsetDecalTextures() },
+      { InstanceCategories::AnimatedWater, &RtxOptions::animatedWaterTextures() },
+      { InstanceCategories::ThirdPersonPlayerModel, &RtxOptions::playerModelTextures() },
+      { InstanceCategories::ThirdPersonPlayerBody, &RtxOptions::playerModelBodyTextures() },
+      { InstanceCategories::Terrain, &RtxOptions::terrainTextures() },
+      { InstanceCategories::Sky, &RtxOptions::skyBoxTextures() },
+      { InstanceCategories::ParticleEmitter, &RtxOptions::particleEmitterTextures() },
+    };
+
+    // Position-weighted size fingerprint: any single-set tagging change (add/remove via
+    // the UI) alters it, including moves between sets.
+    size_t fingerprint = 0;
+    size_t weight = 1;
+    for (const auto& [category, set] : categorySets) {
+      fingerprint += set->size() * (weight++);
+    }
+
+    if (fingerprint == s_categoryLookupTable.fingerprint) {
+      return;
+    }
+
+    s_categoryLookupTable.fingerprint = fingerprint;
+    s_categoryLookupTable.bits.clear();
+    for (const auto& [category, set] : categorySets) {
+      const uint32_t bit = categoryBit(category);
+      for (const XXH64_hash_t hash : *set) {
+        s_categoryLookupTable.bits[hash] |= bit;
+      }
+    }
+  }
+
   void DrawCallState::setupCategoriesForTexture() {
-    // TODO (REMIX-231): It would probably be much more efficient to use a map of texture hash to category flags, rather
-    //                   than doing N lookups per texture hash for each category.
+    // lazy first-frame initialization; steady-state refreshes happen once per frame
+    if (unlikely(s_categoryLookupTable.fingerprint == SIZE_MAX)) {
+      refreshCategoryLookupTable();
+    }
+
     // support tagging at every UE3 MaterialInstanceConstant identity tier:
     //   child (materialHash), shader+texture-set group (textureSetShaderHash), parent (textureHash)
     const XXH64_hash_t textureHash = materialData.getColorTexture().getImageHash();
     const XXH64_hash_t materialHash = materialData.getHash();
     const XXH64_hash_t textureSetShaderHash = materialData.getTextureSetAndShaderHash();
 
-    auto lookupMaterialOrTexture = [&](const fast_unordered_set& hashSet) {
-      return lookupHash(hashSet, materialHash) || lookupHash(hashSet, textureHash) ||
-             (textureSetShaderHash != kEmptyHash && textureSetShaderHash != materialHash &&
-              lookupHash(hashSet, textureSetShaderHash));
+    uint32_t matchedBits = s_categoryLookupTable.lookup(materialHash) | s_categoryLookupTable.lookup(textureHash);
+    if (textureSetShaderHash != kEmptyHash && textureSetShaderHash != materialHash) {
+      matchedBits |= s_categoryLookupTable.lookup(textureSetShaderHash);
+    }
+
+    auto matched = [matchedBits](const InstanceCategories category) {
+      return (matchedBits & categoryBit(category)) != 0;
     };
 
-    setCategory(InstanceCategories::WorldUI, lookupMaterialOrTexture(RtxOptions::worldSpaceUiTextures()));
-    setCategory(InstanceCategories::WorldMatte, lookupMaterialOrTexture(RtxOptions::worldSpaceUiBackgroundTextures()));
+    setCategory(InstanceCategories::WorldUI, matched(InstanceCategories::WorldUI));
+    setCategory(InstanceCategories::WorldMatte, matched(InstanceCategories::WorldMatte));
 
-    setCategory(InstanceCategories::Ignore, lookupMaterialOrTexture(RtxOptions::ignoreTextures()));
-    setCategory(InstanceCategories::IgnoreLights, lookupMaterialOrTexture(RtxOptions::ignoreLights()));
-    setCategory(InstanceCategories::IgnoreAntiCulling, lookupMaterialOrTexture(RtxOptions::antiCullingTextures()));
-    setCategory(InstanceCategories::IgnoreMotionBlur, lookupMaterialOrTexture(RtxOptions::motionBlurMaskOutTextures()));
-    setCategory(InstanceCategories::IgnoreOpacityMicromap, lookupMaterialOrTexture(RtxOptions::opacityMicromapIgnoreTextures()) || isUsingRaytracedRenderTarget);
-    setCategory(InstanceCategories::IgnoreAlphaChannel, lookupMaterialOrTexture(RtxOptions::ignoreAlphaOnTextures()));
-    setCategory(InstanceCategories::IgnoreBakedLighting, lookupMaterialOrTexture(RtxOptions::ignoreBakedLightingTextures()));
+    setCategory(InstanceCategories::Ignore, matched(InstanceCategories::Ignore));
+    setCategory(InstanceCategories::IgnoreLights, matched(InstanceCategories::IgnoreLights));
+    setCategory(InstanceCategories::IgnoreAntiCulling, matched(InstanceCategories::IgnoreAntiCulling));
+    setCategory(InstanceCategories::IgnoreMotionBlur, matched(InstanceCategories::IgnoreMotionBlur));
+    setCategory(InstanceCategories::IgnoreOpacityMicromap, matched(InstanceCategories::IgnoreOpacityMicromap) || isUsingRaytracedRenderTarget);
+    setCategory(InstanceCategories::IgnoreAlphaChannel, matched(InstanceCategories::IgnoreAlphaChannel));
+    setCategory(InstanceCategories::IgnoreBakedLighting, matched(InstanceCategories::IgnoreBakedLighting));
 
-    setCategory(InstanceCategories::Hidden, lookupMaterialOrTexture(RtxOptions::hideInstanceTextures()));
+    setCategory(InstanceCategories::Hidden, matched(InstanceCategories::Hidden));
 
-    setCategory(InstanceCategories::Particle, lookupMaterialOrTexture(RtxOptions::particleTextures()));
-    setCategory(InstanceCategories::Beam, lookupMaterialOrTexture(RtxOptions::beamTextures()));
-    setCategory(InstanceCategories::IgnoreTransparencyLayer, lookupMaterialOrTexture(RtxOptions::ignoreTransparencyLayerTextures()));
+    setCategory(InstanceCategories::Particle, matched(InstanceCategories::Particle));
+    setCategory(InstanceCategories::Beam, matched(InstanceCategories::Beam));
+    setCategory(InstanceCategories::IgnoreTransparencyLayer, matched(InstanceCategories::IgnoreTransparencyLayer));
 
-    setCategory(InstanceCategories::DecalStatic, lookupMaterialOrTexture(RtxOptions::decalTextures()));
-    setCategory(InstanceCategories::DecalDynamic, lookupMaterialOrTexture(RtxOptions::dynamicDecalTextures()));
-    setCategory(InstanceCategories::DecalSingleOffset, lookupMaterialOrTexture(RtxOptions::singleOffsetDecalTextures()));
-    setCategory(InstanceCategories::DecalNoOffset, lookupMaterialOrTexture(RtxOptions::nonOffsetDecalTextures()));
+    setCategory(InstanceCategories::DecalStatic, matched(InstanceCategories::DecalStatic));
+    setCategory(InstanceCategories::DecalDynamic, matched(InstanceCategories::DecalDynamic));
+    setCategory(InstanceCategories::DecalSingleOffset, matched(InstanceCategories::DecalSingleOffset));
+    setCategory(InstanceCategories::DecalNoOffset, matched(InstanceCategories::DecalNoOffset));
 
-    setCategory(InstanceCategories::AnimatedWater, lookupMaterialOrTexture(RtxOptions::animatedWaterTextures()));
+    setCategory(InstanceCategories::AnimatedWater, matched(InstanceCategories::AnimatedWater));
 
-    setCategory(InstanceCategories::ThirdPersonPlayerModel, lookupMaterialOrTexture(RtxOptions::playerModelTextures()));
-    setCategory(InstanceCategories::ThirdPersonPlayerBody, lookupMaterialOrTexture(RtxOptions::playerModelBodyTextures()));
+    setCategory(InstanceCategories::ThirdPersonPlayerModel, matched(InstanceCategories::ThirdPersonPlayerModel));
+    setCategory(InstanceCategories::ThirdPersonPlayerBody, matched(InstanceCategories::ThirdPersonPlayerBody));
 
-    setCategory(InstanceCategories::Terrain, lookupMaterialOrTexture(RtxOptions::terrainTextures()));
-    setCategory(InstanceCategories::Sky, lookupMaterialOrTexture(RtxOptions::skyBoxTextures()));
+    setCategory(InstanceCategories::Terrain, matched(InstanceCategories::Terrain));
+    setCategory(InstanceCategories::Sky, matched(InstanceCategories::Sky));
 
-    setCategory(InstanceCategories::ParticleEmitter, lookupMaterialOrTexture(RtxOptions::particleEmitterTextures()));
+    setCategory(InstanceCategories::ParticleEmitter, matched(InstanceCategories::ParticleEmitter));
   }
 
   void DrawCallState::setupCategoriesForGeometry() {

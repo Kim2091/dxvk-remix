@@ -131,6 +131,7 @@ namespace dxvk {
       { "rtx.d3d9.ue3StaticLocalMeshVertexCaptureCache",             "True" },
       { "rtx.d3d9.ue3StaticLocalMeshVertexCaptureCacheWarmupFrames", "2" },
       { "rtx.d3d9.ue3NativeLocalMeshVertexCapture",                  "True" },
+      { "rtx.numGeometryProcessingThreads",                          "4" },
     }} },
     /* Star Wars Battlefront (2015)               */
     { R"(\\starwarsbattlefront(trial)?\.exe$)", {{

@@ -127,7 +127,8 @@ namespace dxvk {
     }
   }
 
-  Future<GeometryHashes> D3D9Rtx::computeHash(const RasterGeometry& geoData, const uint32_t maxIndexValue) {
+  Future<GeometryHashes> D3D9Rtx::computeHash(const RasterGeometry& geoData, const uint32_t maxIndexValue,
+                                              const std::shared_ptr<Ue3GeometryMemoEntry>& publishTo) {
     ScopedCpuProfileZone();
 
     const uint32_t indexCount = geoData.indexCount;
@@ -158,114 +159,16 @@ namespace dxvk {
     const size_t indexStride = geoData.indexBuffer.stride();
     const size_t indexDataSize = indexCount * indexStride;
 
-    // Assume the GPU changed the data via shaders, include the constant buffer data in hash
+    // Assume the GPU changed the data via shaders, include the constant buffer data in hash.
+    // The bytecode + constant hashing (with UE3 camera-register exclusions) is computed once
+    // per draw in internalPrepareDraw (m_activeStableVsHash) and shared with the static
+    // vertex-capture cache key; only the geometry-hash-specific folds happen here.
     XXH64_hash_t vertexShaderHash = kEmptyHash;
     if (m_parent->UseProgrammableVS() && useVertexCapture()) {
       if (RtxOptions::geometryHashGenerationRule().test(HashComponents::GeometryDescriptor)) {
-        const D3D9ConstantSets& cb = m_parent->m_consts[DxsoProgramTypes::VertexShader];
-        auto& shaderByteCode = d3d9State().vertexShader->GetCommonShader()->GetBytecode();
-        vertexShaderHash = XXH3_64bits(shaderByteCode.data(), shaderByteCode.size());
+        vertexShaderHash = m_activeStableVsHash;
 
-        const uint32_t floatConstRegCount = cb.meta.maxConstIndexF;
-        const uint8_t* const floatConstBase = reinterpret_cast<const uint8_t*>(&d3d9State().vsConsts.fConsts[0]);
-
-        auto hashFloatConstRange = [&](uint32_t beginReg, uint32_t endReg) {
-          beginReg = std::min(beginReg, floatConstRegCount);
-          endReg = std::min(endReg, floatConstRegCount);
-          if (beginReg >= endReg)
-            return;
-
-          const size_t offsetBytes = size_t(beginReg) * sizeof(Vector4);
-          const size_t sizeBytes = size_t(endReg - beginReg) * sizeof(Vector4);
-          vertexShaderHash = XXH3_64bits_withSeed(floatConstBase + offsetBytes, sizeBytes, vertexShaderHash);
-        };
-
-        bool hashedFloatConstsWithExclusions = false;
-        if ((ue3CameraFromShaderConstants() || ue3EngineMode()) && floatConstRegCount > 0) {
-          // UE3 compat/perf to avoid camera-motion-only hash churn by excluding known
-          // camera constants (ViewProjection + CameraPosition) from the VS constant hash
-          constexpr uint32_t kFallbackViewProjReg = 0;
-          constexpr uint32_t kFallbackViewProjRegCount = 4;
-          constexpr uint32_t kFallbackViewOriginReg = 4;
-          constexpr uint32_t kFallbackViewOriginRegCount = 1;
-
-          uint32_t viewProjReg = kFallbackViewProjReg;
-          uint32_t viewProjRegCount = kFallbackViewProjRegCount;
-          uint32_t viewOriginReg = kFallbackViewOriginReg;
-          uint32_t viewOriginRegCount = kFallbackViewOriginRegCount;
-
-          if (m_currentUe3CtabInfo.has_value()) {
-            const Ue3VsShaderCtabInfo& ctabInfo = *m_currentUe3CtabInfo;
-            if (ctabInfo.hasViewProjectionMatrix && ctabInfo.viewProjectionMatrixRegisterCount > 0) {
-              viewProjReg = ctabInfo.viewProjectionMatrixRegisterIndex;
-              viewProjRegCount = ctabInfo.viewProjectionMatrixRegisterCount;
-            }
-            if (ctabInfo.hasCameraPosition && ctabInfo.cameraPositionRegisterCount > 0) {
-              viewOriginReg = ctabInfo.cameraPositionRegisterIndex;
-              viewOriginRegCount = ctabInfo.cameraPositionRegisterCount;
-            }
-          }
-
-          struct RegRange {
-            uint32_t begin = 0;
-            uint32_t end = 0;
-          };
-
-          std::array<RegRange, 2> ranges = {{
-            { viewProjReg, viewProjReg + viewProjRegCount },
-            { viewOriginReg, viewOriginReg + viewOriginRegCount },
-          }};
-
-          std::array<RegRange, 2> validRanges = {};
-          uint32_t validRangeCount = 0;
-          for (const RegRange& r : ranges) {
-            RegRange clamped;
-            clamped.begin = std::min(r.begin, floatConstRegCount);
-            clamped.end = std::min(r.end, floatConstRegCount);
-            if (clamped.begin < clamped.end)
-              validRanges[validRangeCount++] = clamped;
-          }
-
-          if (validRangeCount > 0) {
-            if (validRangeCount == 2 && validRanges[1].begin < validRanges[0].begin)
-              std::swap(validRanges[0], validRanges[1]);
-
-            if (validRangeCount == 2 && validRanges[1].begin <= validRanges[0].end) {
-              validRanges[0].end = std::max(validRanges[0].end, validRanges[1].end);
-              validRangeCount = 1;
-            }
-
-            uint32_t cursor = 0;
-            for (uint32_t i = 0; i < validRangeCount; i++) {
-              hashFloatConstRange(cursor, validRanges[i].begin);
-              cursor = std::max(cursor, validRanges[i].end);
-            }
-            hashFloatConstRange(cursor, floatConstRegCount);
-            hashedFloatConstsWithExclusions = true;
-          }
-        }
-
-        if (!hashedFloatConstsWithExclusions && floatConstRegCount > 0) {
-          vertexShaderHash = XXH3_64bits_withSeed(
-            &d3d9State().vsConsts.fConsts[0],
-            size_t(floatConstRegCount) * sizeof(Vector4),
-            vertexShaderHash);
-        }
-
-        if (cb.meta.maxConstIndexI > 0) {
-          vertexShaderHash = XXH3_64bits_withSeed(
-            &d3d9State().vsConsts.iConsts[0],
-            size_t(cb.meta.maxConstIndexI) * sizeof(int) * 4,
-            vertexShaderHash);
-        }
-        if (cb.meta.maxConstIndexB > 0) {
-          vertexShaderHash = XXH3_64bits_withSeed(
-            &d3d9State().vsConsts.bConsts[0],
-            size_t(cb.meta.maxConstIndexB) * sizeof(uint32_t) / 32,
-            vertexShaderHash);
-        }
-
-        if (hashedFloatConstsWithExclusions) {
+        if (m_activeStableVsHashUsedExclusions) {
           // refresh geometry as the camera travels by folding a coarse camera anchor into the hash
           // doing this to avoid the distortion that grows with distance from the location where RT was enabled
           // todo: revisit this, it still doesn't solve scene capture distortion
@@ -280,7 +183,7 @@ namespace dxvk {
           if (ue3LogCapturePrecision() && Logger::logLevel() <= LogLevel::Debug) {
             ONCE(Logger::debug(str::format(
               "[RTX-Compatibility][UE3-Capture] VS camera constants excluded from geometry hash, cameraCellEnabled=",
-              shouldUseUe3CameraHashCell(), ", floatConstRegCount=", floatConstRegCount)));
+              shouldUseUe3CameraHashCell())));
           }
         }
 
@@ -315,7 +218,7 @@ namespace dxvk {
     return m_pGeometryWorkers->Schedule([vertexRegions, indexBufferRef = indexBufferRef.ptr(),
                                  pIndexData, indexStride, indexDataSize, indexCount,
                                  maxIndexValue, vertexShaderHash, geometryDescriptorHash,
-                                 vertexLayoutHash]() -> GeometryHashes {
+                                 vertexLayoutHash, publishTo]() -> GeometryHashes {
       ScopedCpuProfileZone();
 
       GeometryHashes hashes;
@@ -342,11 +245,19 @@ namespace dxvk {
 
       hashes.precombine();
 
+      // Publish into the static-geometry memo entry so later frames can reuse the
+      // result without recomputing (entry storage is heap-pinned via shared_ptr).
+      if (publishTo != nullptr) {
+        publishTo->hashes = hashes;
+        publishTo->hashesReady.store(true, std::memory_order_release);
+      }
+
       return hashes;
     });
   }
 
-  Future<AxisAlignedBoundingBox> D3D9Rtx::computeAxisAlignedBoundingBox(const RasterGeometry& geoData) {
+  Future<AxisAlignedBoundingBox> D3D9Rtx::computeAxisAlignedBoundingBox(const RasterGeometry& geoData,
+                                                                        const std::shared_ptr<Ue3GeometryMemoEntry>& publishTo) {
     ScopedCpuProfileZone();
 
     if (!RtxOptions::needsMeshBoundingBox()) {
@@ -364,7 +275,7 @@ namespace dxvk {
     auto vertexBuffer = geoData.positionBuffer.buffer().ptr();
     vertexBuffer->incRef();
 
-    return m_pGeometryWorkers->Schedule([pVertexData, vertexCount, vertexStride, vertexBuffer]()->AxisAlignedBoundingBox {
+    return m_pGeometryWorkers->Schedule([pVertexData, vertexCount, vertexStride, vertexBuffer, publishTo]()->AxisAlignedBoundingBox {
       ScopedCpuProfileZone();
 
 #if defined(_M_ARM64) || defined(_M_ARM64EC)
@@ -410,6 +321,12 @@ namespace dxvk {
 #endif
 
       vertexBuffer->decRef();
+
+      // Publish into the static-geometry memo entry for cross-frame reuse
+      if (publishTo != nullptr) {
+        publishTo->boundingBox = boundingBox;
+        publishTo->aabbReady.store(true, std::memory_order_release);
+      }
 
       return boundingBox;
     });

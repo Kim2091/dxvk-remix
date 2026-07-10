@@ -25,37 +25,18 @@
 #include "rtx_options.h"
 #include "rtx_context.h"
 #include "rtx_render/rtx_shader_manager.h"
-#include <rtx_shaders/transmittance_lut.h>
-#include <rtx_shaders/multiscattering_lut.h>
 #include <rtx_shaders/sky_view_lut.h>
 #include <cmath>
 #include <cstring>
 
 namespace dxvk {
   // Shader definitions for atmosphere LUT generation
+  // Note: the transmittance and multiscattering LUT passes are no longer dispatched -
+  // sky-view LUT generation and all runtime paths use the analytical transmittance and
+  // multiscattering approximations in atmosphere_common.slangh, so those two LUTs were
+  // computed but never read. Their images are still created because the runtime binding
+  // layout (common_bindings.slangh) declares them.
   namespace {
-    class TransmittanceLutShader : public ManagedShader {
-      SHADER_SOURCE(TransmittanceLutShader, VK_SHADER_STAGE_COMPUTE_BIT, transmittance_lut)
-      
-      BEGIN_PARAMETER()
-        CONSTANT_BUFFER(0)
-        RW_TEXTURE2D(1)
-      END_PARAMETER()
-    };
-    PREWARM_SHADER_PIPELINE(TransmittanceLutShader);
-
-    class MultiscatteringLutShader : public ManagedShader {
-      SHADER_SOURCE(MultiscatteringLutShader, VK_SHADER_STAGE_COMPUTE_BIT, multiscattering_lut)
-      
-      BEGIN_PARAMETER()
-        CONSTANT_BUFFER(0)
-        TEXTURE2D(1)
-        SAMPLER(2)
-        RW_TEXTURE2D(3)
-      END_PARAMETER()
-    };
-    PREWARM_SHADER_PIPELINE(MultiscatteringLutShader);
-
     class SkyViewLutShader : public ManagedShader {
       SHADER_SOURCE(SkyViewLutShader, VK_SHADER_STAGE_COMPUTE_BIT, sky_view_lut)
       
@@ -144,6 +125,8 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
   // View Altitude (converted m to km)
   args.viewAltitude = RtxOptions::altitude() * 0.001f;
 
+  args.useSkyViewLut = RtxOptions::useSkyViewLut() ? 1u : 0u;
+
   // LUT dimensions
   args.transmittanceLutWidth = kTransmittanceLutWidth;
   args.transmittanceLutHeight = kTransmittanceLutHeight;
@@ -155,7 +138,6 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
   args.atmosphereRadius = args.planetRadius + args.atmosphereThickness;
   args.rayleighScaleHeight = kRayleighScaleHeight;
   args.mieScaleHeight = kMieScaleHeight;
-  args.pad2 = 0;
 
   return args;
 }
@@ -230,29 +212,9 @@ void RtxAtmosphere::computeLuts(Rc<DxvkContext> ctx) {
   // Update cached args
   m_cachedArgs = getAtmosphereArgs();
 
-  // Dispatch compute shaders to generate LUTs
-  // Note: Barriers are needed between dispatches since each LUT depends on previous ones
-  dispatchTransmittanceLut(ctx);
-  
-  // Barrier: Ensure transmittance LUT is written before reading in subsequent passes
-  ctx->emitMemoryBarrier(0,
-    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-    VK_ACCESS_SHADER_WRITE_BIT,
-    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-    VK_ACCESS_SHADER_READ_BIT);
-  
-  dispatchMultiscatteringLut(ctx);
-  
-  // Barrier: Ensure multiscattering LUT is written before reading in sky view pass
-  ctx->emitMemoryBarrier(0,
-    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-    VK_ACCESS_SHADER_WRITE_BIT,
-    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-    VK_ACCESS_SHADER_READ_BIT);
-  
   dispatchSkyViewLut(ctx);
   
-  // Final barrier: Ensure all LUTs are written before use in ray tracing
+  // Final barrier: Ensure the LUT is written before use in ray tracing
   ctx->emitMemoryBarrier(0,
     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
     VK_ACCESS_SHADER_WRITE_BIT,
@@ -260,68 +222,6 @@ void RtxAtmosphere::computeLuts(Rc<DxvkContext> ctx) {
     VK_ACCESS_SHADER_READ_BIT);
 
   m_lutsNeedRecompute = false;
-}
-
-void RtxAtmosphere::dispatchTransmittanceLut(Rc<DxvkContext> ctx) {
-  ScopedGpuProfileZone(ctx, "Atmosphere Transmittance LUT");
-  
-  // Update atmosphere args buffer
-  AtmosphereArgs args = getAtmosphereArgs();
-  ctx->updateBuffer(m_constantsBuffer, 0, sizeof(AtmosphereArgs), &args);
-  ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_constantsBuffer);
-  
-  // Bind resources
-  ctx->bindResourceBuffer(0, DxvkBufferSlice(m_constantsBuffer, 0, m_constantsBuffer->info().size));
-  ctx->bindResourceView(1, m_transmittanceLut.view, nullptr);
-  
-  // Track resources
-  ctx->getCommandList()->trackResource<DxvkAccess::Write>(m_transmittanceLut.image);
-  
-  // Bind shader and dispatch
-  ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, TransmittanceLutShader::getShader());
-  
-  // Dispatch with 16x16 thread groups
-  uint32_t groupsX = (kTransmittanceLutWidth + 15) / 16;
-  uint32_t groupsY = (kTransmittanceLutHeight + 15) / 16;
-  ctx->dispatch(groupsX, groupsY, 1);
-}
-
-void RtxAtmosphere::dispatchMultiscatteringLut(Rc<DxvkContext> ctx) {
-  ScopedGpuProfileZone(ctx, "Atmosphere Multiscattering LUT");
-  
-  // Update atmosphere args buffer
-  AtmosphereArgs args = getAtmosphereArgs();
-  ctx->updateBuffer(m_constantsBuffer, 0, sizeof(AtmosphereArgs), &args);
-  ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_constantsBuffer);
-  
-  // Bind resources
-  ctx->bindResourceBuffer(0, DxvkBufferSlice(m_constantsBuffer, 0, m_constantsBuffer->info().size));
-  ctx->bindResourceView(1, m_transmittanceLut.view, nullptr);
-  
-  // Create and bind a linear sampler
-  DxvkSamplerCreateInfo samplerInfo = {};
-  samplerInfo.magFilter = VK_FILTER_LINEAR;
-  samplerInfo.minFilter = VK_FILTER_LINEAR;
-  samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-  samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-  samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-  samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-  Rc<DxvkSampler> linearSampler = m_device->createSampler(samplerInfo);
-  ctx->bindResourceSampler(2, linearSampler);
-  
-  ctx->bindResourceView(3, m_multiscatteringLut.view, nullptr);
-  
-  // Track resources
-  ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_transmittanceLut.image);
-  ctx->getCommandList()->trackResource<DxvkAccess::Write>(m_multiscatteringLut.image);
-  
-  // Bind shader and dispatch
-  ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, MultiscatteringLutShader::getShader());
-  
-  // Dispatch with 16x16 thread groups
-  uint32_t groupsX = (kMultiscatteringLutSize + 15) / 16;
-  uint32_t groupsY = (kMultiscatteringLutSize + 15) / 16;
-  ctx->dispatch(groupsX, groupsY, 1);
 }
 
 void RtxAtmosphere::dispatchSkyViewLut(Rc<DxvkContext> ctx) {
@@ -333,20 +233,23 @@ void RtxAtmosphere::dispatchSkyViewLut(Rc<DxvkContext> ctx) {
   ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_constantsBuffer);
   
   // Bind resources
+  // Note: the transmittance/multiscattering LUT inputs are still declared by the shader
+  // interface but the generation code evaluates both analytically and never samples them.
   ctx->bindResourceBuffer(0, DxvkBufferSlice(m_constantsBuffer, 0, m_constantsBuffer->info().size));
   ctx->bindResourceView(1, m_transmittanceLut.view, nullptr);
   ctx->bindResourceView(2, m_multiscatteringLut.view, nullptr);
   
-  // Create and bind a linear sampler
-  DxvkSamplerCreateInfo samplerInfo = {};
-  samplerInfo.magFilter = VK_FILTER_LINEAR;
-  samplerInfo.minFilter = VK_FILTER_LINEAR;
-  samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-  samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-  samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-  samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-  Rc<DxvkSampler> linearSampler = m_device->createSampler(samplerInfo);
-  ctx->bindResourceSampler(3, linearSampler);
+  if (m_lutSampler == nullptr) {
+    DxvkSamplerCreateInfo samplerInfo = {};
+    samplerInfo.magFilter = VK_FILTER_LINEAR;
+    samplerInfo.minFilter = VK_FILTER_LINEAR;
+    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    m_lutSampler = m_device->createSampler(samplerInfo);
+  }
+  ctx->bindResourceSampler(3, m_lutSampler);
   
   ctx->bindResourceView(4, m_skyViewLut.view, nullptr);
   

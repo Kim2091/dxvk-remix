@@ -2952,6 +2952,9 @@ namespace dxvk {
 
           ImGui::Separator();
 
+          RemixGui::Checkbox("Use Sky View LUT", &RtxOptions::useSkyViewLutObject());
+          RemixGui::SetTooltipToLastWidgetOnHover("Sample the precomputed sky-view LUT on ray misses instead of ray marching the atmosphere per ray.\nVisually identical at a fraction of the GPU cost; disable only to A/B compare against the reference inline evaluation.");
+
           if (ImGui::TreeNode("Atmosphere Parameters")) {
             RemixGui::DragFloat("Sun Size", &RtxOptions::sunSizeObject(), 0.01f, 0.0f, 10.0f, "%.3f deg", sliderFlags);
             RemixGui::SetTooltipToLastWidgetOnHover("Size of sun disc in degrees");

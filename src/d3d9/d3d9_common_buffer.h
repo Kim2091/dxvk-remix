@@ -216,6 +216,11 @@ namespace dxvk {
     };
     using RemixIboMemoizer = MemoryRegionMemoizer<RemixIndexBufferMemoizationData>;
     RemixIboMemoizer remixMemoization;
+
+    // Monotonic content generation: incremented whenever the CPU may have written the
+    // buffer (any non-readonly lock, see D3D9DeviceEx::LockBuffer). Folded into
+    // static-geometry memoization keys so cached hashes/AABBs can never go stale.
+    uint64_t remixContentGeneration = 0;
     // NV-DXVK end
 
   private:

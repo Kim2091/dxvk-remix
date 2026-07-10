@@ -1911,7 +1911,9 @@ void geometryResolverVertex(
     else if (cb.skyMode == 1)
     {
       // Physical atmosphere mode
-      skyRadiance = evalSkyRadiance(ray.direction, cb.atmosphereArgs, cb.isZUp != 0);
+      skyRadiance = cb.atmosphereArgs.useSkyViewLut != 0
+        ? sampleSkyViewLutRadiance(AtmosphereSkyViewLut, ray.direction, cb.atmosphereArgs, cb.isZUp != 0)
+        : evalSkyRadiance(ray.direction, cb.atmosphereArgs, cb.isZUp != 0);
     }
 #endif
     else
@@ -2572,7 +2574,9 @@ void geometryPSRResolverVertex(
     else if (cb.skyMode == 1)
     {
       // Physical atmosphere mode.
-      vec3 skyRadiance = evalSkyRadiance(ray.direction, cb.atmosphereArgs, cb.isZUp != 0);
+      vec3 skyRadiance = cb.atmosphereArgs.useSkyViewLut != 0
+        ? sampleSkyViewLutRadiance(AtmosphereSkyViewLut, ray.direction, cb.atmosphereArgs, cb.isZUp != 0)
+        : evalSkyRadiance(ray.direction, cb.atmosphereArgs, cb.isZUp != 0);
       emissiveRadiance += skyRadiance * radianceAttenuation;
     }
 #endif

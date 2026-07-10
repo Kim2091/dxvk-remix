@@ -776,6 +776,12 @@ struct DrawCallState {
 
   void setupCategoriesForTexture();
   void setupCategoriesForGeometry();
+
+  // REMIX-231: rebuilds the merged hash->category-bits lookup table used by
+  // setupCategoriesForTexture when any category option set changed. Called once per
+  // frame (D3D9Rtx::EndFrame) and lazily on first use; must only be called from the
+  // thread that submits draw calls.
+  static void refreshCategoryLookupTable();
   void setupCategoriesForHeuristics(uint32_t prevFrameSeenCamerasCount,
                                     std::vector<Vector3>& seenCameraPositions);
 

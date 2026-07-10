@@ -139,12 +139,6 @@ namespace dxvk {
       return s.find(token) != std::string::npos;
     }
 
-    static XXH64_hash_t hashDxsoBytecode(const std::vector<uint8_t>& bytecode) {
-      if (bytecode.empty())
-        return 0;
-      return XXH3_64bits(bytecode.data(), bytecode.size());
-    }
-
     static uint32_t findVsTexcoordOutputRegister(const D3D9CommonShader* shader, uint32_t usageIndex) {
       if (shader == nullptr)
         return std::numeric_limits<uint32_t>::max();
@@ -1742,6 +1736,14 @@ namespace dxvk {
       return info;
     }
 
+    // Reused XXH3 streaming state: created once per thread instead of heap
+    // allocating/freeing a state per hash operation on the per-draw path. The state is
+    // fully reset before each use, so digests are identical to a fresh state.
+    static XXH3_state_t* getThreadLocalXxh3State() {
+      static thread_local XXH3_state_t* const state = XXH3_createState();
+      return state;
+    }
+
     // Returns kEmptyHash when ranges is empty: without CTAB info, a raw register-range
     // fallback would fold per-view/per-mesh constants into the hash.
     static XXH64_hash_t hashUe3MaterialConstants(
@@ -1750,7 +1752,7 @@ namespace dxvk {
       if (ranges.empty())
         return kEmptyHash;
 
-      XXH3_state_t* const state = XXH3_createState();
+      XXH3_state_t* const state = getThreadLocalXxh3State();
       if (state == nullptr)
         return kEmptyHash;
       XXH3_64bits_reset(state);
@@ -1763,9 +1765,7 @@ namespace dxvk {
         anyRegisterHashed = true;
       }
 
-      const XXH64_hash_t result = anyRegisterHashed ? XXH3_64bits_digest(state) : kEmptyHash;
-      XXH3_freeState(state);
-      return result;
+      return anyRegisterHashed ? XXH3_64bits_digest(state) : kEmptyHash;
     }
 
     static fast_unordered_cache<Ue3PsMaterialIdentityInfo> s_ue3PsMaterialIdentityCache;
@@ -3940,7 +3940,7 @@ namespace dxvk {
       return empty;
 
     const auto& bytecode = shader->GetBytecode();
-    const XXH64_hash_t shaderHash = hashDxsoBytecode(bytecode);
+    const XXH64_hash_t shaderHash = shader->GetBytecodeHash();
     if (shaderHash == 0)
       return empty;
 
@@ -4078,17 +4078,6 @@ namespace dxvk {
       (m_parent->GetActiveRTTextures() & m_parent->m_psShaderMasks.samplerMask) != 0;
     const bool likelyFullscreen = !depthEnabled && !zWriteEnabled && drawContext.PrimitiveCount <= 4;
 
-    const D3D9CommonShader* vertexShaderCommon =
-      m_parent->UseProgrammableVS() && d3d9State().vertexShader.ptr() != nullptr
-        ? d3d9State().vertexShader->GetCommonShader()
-        : nullptr;
-    const D3D9CommonShader* pixelShaderCommon =
-      m_parent->UseProgrammablePS() && d3d9State().pixelShader.ptr() != nullptr
-        ? d3d9State().pixelShader->GetCommonShader()
-        : nullptr;
-
-    const Ue3ShaderFeatureInfo vsInfo = getUe3ShaderFeatureInfo(vertexShaderCommon);
-    const Ue3ShaderFeatureInfo psInfo = getUe3ShaderFeatureInfo(pixelShaderCommon);
     const bool isWorldGeometry =
       m_currentUe3VertexFactory == Ue3VertexFactoryType::Local ||
       m_currentUe3VertexFactory == Ue3VertexFactoryType::LocalDecal ||
@@ -4102,6 +4091,8 @@ namespace dxvk {
       m_currentUe3VertexFactory == Ue3VertexFactoryType::ParticleBeamTrail ||
       m_currentUe3VertexFactory == Ue3VertexFactoryType::LensFlare;
 
+    // Cheap early-outs first: depth prepass and shadow depth draws are the most common
+    // skipped passes and need no shader feature information.
     if (m_currentUe3VertexFactory == Ue3VertexFactoryType::PositionOnly)
       return Ue3PassType::DepthPrepass;
 
@@ -4116,6 +4107,18 @@ namespace dxvk {
         return Ue3PassType::ShadowDepth;
       }
     }
+
+    const D3D9CommonShader* vertexShaderCommon =
+      m_parent->UseProgrammableVS() && d3d9State().vertexShader.ptr() != nullptr
+        ? d3d9State().vertexShader->GetCommonShader()
+        : nullptr;
+    const D3D9CommonShader* pixelShaderCommon =
+      m_parent->UseProgrammablePS() && d3d9State().pixelShader.ptr() != nullptr
+        ? d3d9State().pixelShader->GetCommonShader()
+        : nullptr;
+
+    const Ue3ShaderFeatureInfo vsInfo = getUe3ShaderFeatureInfo(vertexShaderCommon);
+    const Ue3ShaderFeatureInfo psInfo = getUe3ShaderFeatureInfo(pixelShaderCommon);
 
     if (psInfo.hasBinkConstants) {
       if (likelyFullscreen && !isWorldGeometry) {
@@ -4259,11 +4262,11 @@ namespace dxvk {
 
     XXH64_hash_t vsHash = 0;
     if (m_parent->UseProgrammableVS() && d3d9State().vertexShader.ptr() != nullptr) {
-      vsHash = hashDxsoBytecode(d3d9State().vertexShader->GetCommonShader()->GetBytecode());
+      vsHash = d3d9State().vertexShader->GetCommonShader()->GetBytecodeHash();
     }
     XXH64_hash_t psHash = 0;
     if (m_parent->UseProgrammablePS() && d3d9State().pixelShader.ptr() != nullptr) {
-      psHash = hashDxsoBytecode(d3d9State().pixelShader->GetCommonShader()->GetBytecode());
+      psHash = d3d9State().pixelShader->GetCommonShader()->GetBytecodeHash();
     }
 
     uint32_t rtWidth = 0;
@@ -4579,14 +4582,17 @@ namespace dxvk {
     return true;
   }
 
-  XXH64_hash_t D3D9Rtx::computeUe3StableVertexShaderHash() const {
+  XXH64_hash_t D3D9Rtx::computeUe3StableVertexShaderHash(bool* outHashedFloatConstsWithExclusions) const {
+    if (outHashedFloatConstsWithExclusions != nullptr) {
+      *outHashedFloatConstsWithExclusions = false;
+    }
+
     if (d3d9State().vertexShader.ptr() == nullptr) {
       return kEmptyHash;
     }
 
     const D3D9ConstantSets& cb = m_parent->m_consts[DxsoProgramTypes::VertexShader];
-    const auto& shaderByteCode = d3d9State().vertexShader->GetCommonShader()->GetBytecode();
-    XXH64_hash_t hash = XXH3_64bits(shaderByteCode.data(), shaderByteCode.size());
+    XXH64_hash_t hash = d3d9State().vertexShader->GetCommonShader()->GetBytecodeHash();
 
     const uint32_t floatConstRegCount = cb.meta.maxConstIndexF;
     const uint8_t* const floatConstBase = reinterpret_cast<const uint8_t*>(&d3d9State().vsConsts.fConsts[0]);
@@ -4686,6 +4692,10 @@ namespace dxvk {
         hash);
     }
 
+    if (outHashedFloatConstsWithExclusions != nullptr) {
+      *outHashedFloatConstsWithExclusions = hashedFloatConstsWithExclusions;
+    }
+
     return hash;
   }
 
@@ -4714,8 +4724,8 @@ namespace dxvk {
     mix(m_forceIaTexcoordForOutlier);
     mix(ue3NativeLocalMeshVertexCapture());
 
-    const XXH64_hash_t stableVsHash = computeUe3StableVertexShaderHash();
-    mix(stableVsHash);
+    // computed once per draw in internalPrepareDraw and shared with computeHash
+    mix(m_activeStableVsHash);
     mix(m_activeDrawCallState.transformData.objectToWorld);
     Ue3CameraHashCell cameraCell;
     if (computeUe3CameraHashCell(cameraCell)) {
@@ -4728,6 +4738,10 @@ namespace dxvk {
     mix(indexSlice.handle);
     mix(indexSlice.offset);
     mix(indexSlice.length);
+    if (indexContext.ibo != nullptr) {
+      // content generation makes stale reuse impossible if the game rewrites the buffer
+      mix(indexContext.ibo->remixContentGeneration);
+    }
 
     const auto& elements = d3d9State().vertexDecl->GetElements();
     hash = XXH3_64bits_withSeed(elements.data(), elements.size() * sizeof(D3DVERTEXELEMENT9), hash);
@@ -4740,6 +4754,9 @@ namespace dxvk {
       mix(vertexSlice.handle);
       mix(vertexSlice.offset);
       mix(vertexSlice.length);
+      if (ctx.pVBO != nullptr) {
+        mix(ctx.pVBO->remixContentGeneration);
+      }
     }
 
     return hash;
@@ -4786,6 +4803,15 @@ namespace dxvk {
     const uint32_t currentFrame = m_parent->GetDXVKDevice()->getCurrentFrameId();
     m_ue3VertexCaptureCache.erase_if([&](auto it) {
       return currentFrame - it->second.lastFrameTouched > kMaxUntouchedFrames;
+    });
+  }
+
+  void D3D9Rtx::pruneUe3GeometryMemoCache() {
+    constexpr uint32_t kMaxUntouchedFrames = 600;
+    const uint32_t currentFrame = m_parent->GetDXVKDevice()->getCurrentFrameId();
+    // In-flight workers hold the entry via shared_ptr, so erasing here is always safe.
+    m_ue3GeometryMemoCache.erase_if([&](auto it) {
+      return currentFrame - it->second->lastFrameTouched > kMaxUntouchedFrames;
     });
   }
 
@@ -5544,9 +5570,7 @@ namespace dxvk {
       };
 
       const auto& bytecode = vertexShaderCommon->GetBytecode();
-      const XXH64_hash_t shaderHash = (bytecode.size() > 0)
-        ? XXH3_64bits(bytecode.data(), bytecode.size())
-        : 0;
+      const XXH64_hash_t shaderHash = vertexShaderCommon->GetBytecodeHash();
 
       m_activeDrawCallState.programmableVertexShaderBytecodeHash = shaderHash;
 
@@ -5860,10 +5884,8 @@ namespace dxvk {
     // skips them (visibility flicker that follows the camera)
     if (ue3EngineMode() && usesProgrammableVs && d3d9State().vertexShader.ptr() != nullptr &&
         d3d9State().pixelShader.ptr() != nullptr) {
-      const auto& vsBytecode = d3d9State().vertexShader->GetCommonShader()->GetBytecode();
-      const auto& psBytecode = d3d9State().pixelShader->GetCommonShader()->GetBytecode();
-      const XXH64_hash_t vsHash = vsBytecode.empty() ? 0 : XXH3_64bits(vsBytecode.data(), vsBytecode.size());
-      const XXH64_hash_t psHash = psBytecode.empty() ? 0 : XXH3_64bits(psBytecode.data(), psBytecode.size());
+      const XXH64_hash_t vsHash = d3d9State().vertexShader->GetCommonShader()->GetBytecodeHash();
+      const XXH64_hash_t psHash = d3d9State().pixelShader->GetCommonShader()->GetBytecodeHash();
       const XXH64_hash_t vsPsHash = vsHash ^ (psHash * 0x9E3779B97F4A7C15ull);
 
       XXH64_hash_t boundTextureHash = 0;
@@ -6390,11 +6412,11 @@ namespace dxvk {
 
       XXH64_hash_t vsHash = 0;
       if (d3d9State().vertexShader.ptr() != nullptr) {
-        vsHash = hashDxsoBytecode(d3d9State().vertexShader->GetCommonShader()->GetBytecode());
+        vsHash = d3d9State().vertexShader->GetCommonShader()->GetBytecodeHash();
       }
       XXH64_hash_t psHash = 0;
       if (d3d9State().pixelShader.ptr() != nullptr) {
-        psHash = hashDxsoBytecode(d3d9State().pixelShader->GetCommonShader()->GetBytecode());
+        psHash = d3d9State().pixelShader->GetCommonShader()->GetBytecodeHash();
       }
 
       Logger::warn(str::format(
@@ -6700,14 +6722,68 @@ namespace dxvk {
       }
     }
 
-    geoData.futureGeometryHashes = computeHash(geoData, maxOffsetedIndex);
-    geoData.futureBoundingBox = computeAxisAlignedBoundingBox(geoData);
-    
+    // Stable VS hash (bytecode + camera-excluded constants), computed once per draw and
+    // shared between the geometry hash below and the static vertex-capture cache key.
+    m_activeStableVsHashUsedExclusions = false;
+    m_activeStableVsHash = (m_parent->UseProgrammableVS() && useVertexCapture())
+      ? computeUe3StableVertexShaderHash(&m_activeStableVsHashUsedExclusions)
+      : kEmptyHash;
+
+    // Static-draw identity, computed before geometry hashing so the hash/AABB memo and
+    // the vertex-capture cache can share one key.
+    const bool canUseCachedVertexCapture =
+      canUseUe3StaticVertexCaptureCache(indexContext, vertexContext, geoData);
+    const XXH64_hash_t vertexCaptureCacheKey =
+      canUseCachedVertexCapture
+        ? computeUe3StaticVertexCaptureCacheKey(indexContext, vertexContext, drawContext, geoData)
+        : kEmptyHash;
+
+    // Geometry hash + bounding box memoization: static local meshes hash to the same
+    // result every frame, so serve published results instead of re-hashing the full
+    // vertex/index data per draw. First sighting schedules the normal worker compute,
+    // which additionally publishes into the (heap-pinned) memo entry.
+    bool servedGeometryFromMemo = false;
+    std::shared_ptr<Ue3GeometryMemoEntry> geometryMemoPublishTo;
+    if (ue3StaticGeometryHashMemoization() && canUseCachedVertexCapture) {
+      const uint32_t currentFrame = m_parent->GetDXVKDevice()->getCurrentFrameId();
+      const auto memoIt = m_ue3GeometryMemoCache.find(vertexCaptureCacheKey);
+      if (memoIt != m_ue3GeometryMemoCache.end()) {
+        Ue3GeometryMemoEntry& entry = *memoIt->second;
+        entry.lastFrameTouched = currentFrame;
+        if (entry.hashesReady.load(std::memory_order_acquire)) {
+          geoData.hashes = entry.hashes;
+          servedGeometryFromMemo = true;
+          if (entry.aabbReady.load(std::memory_order_acquire)) {
+            geoData.boundingBox = entry.boundingBox;
+          } else {
+            geoData.futureBoundingBox = computeAxisAlignedBoundingBox(geoData);
+          }
+        }
+        // hashes not ready yet (worker still busy from an earlier frame): fall through
+        // and compute normally this draw, without publishing a second time
+      } else {
+        geometryMemoPublishTo = std::make_shared<Ue3GeometryMemoEntry>();
+        geometryMemoPublishTo->lastFrameTouched = currentFrame;
+        m_ue3GeometryMemoCache.emplace(vertexCaptureCacheKey, geometryMemoPublishTo);
+      }
+    }
+
+    if (!servedGeometryFromMemo) {
+      geoData.futureGeometryHashes = computeHash(geoData, maxOffsetedIndex, geometryMemoPublishTo);
+      geoData.futureBoundingBox = computeAxisAlignedBoundingBox(geoData, geometryMemoPublishTo);
+
+      if (geometryMemoPublishTo != nullptr && !geoData.futureGeometryHashes.valid()) {
+        // hashing could not be scheduled (e.g. undefined position region): drop the
+        // placeholder entry so it does not linger unfilled
+        m_ue3GeometryMemoCache.erase(vertexCaptureCacheKey);
+      }
+    }
+
     // Process skinning data
     m_activeDrawCallState.futureSkinningData = processSkinning(geoData);
 
-    // Hash material data
-    m_activeDrawCallState.materialData.updateCachedHash();
+    // Note: the material hash was already updated inside processTextures; nothing
+    // mutates material data after that point, so no second update is needed here.
 
     const bool useUe3NativeLocalCapture =
       canUseUe3NativeLocalVertexCapture(indexContext, vertexContext, geoData);
@@ -6724,12 +6800,6 @@ namespace dxvk {
       }
     }
 
-    const bool canUseCachedVertexCapture =
-      canUseUe3StaticVertexCaptureCache(indexContext, vertexContext, geoData);
-    const XXH64_hash_t vertexCaptureCacheKey =
-      canUseCachedVertexCapture
-        ? computeUe3StaticVertexCaptureCacheKey(indexContext, vertexContext, drawContext, geoData)
-        : kEmptyHash;
     const bool reusedCachedVertexCapture =
       canUseCachedVertexCapture &&
       tryReuseUe3StaticVertexCapture(vertexCaptureCacheKey, geoData);
@@ -7201,7 +7271,7 @@ namespace dxvk {
       if (ps == nullptr)
         return nullptr;
 
-      outHash = hashDxsoBytecode(ps->GetBytecode());
+      outHash = ps->GetBytecodeHash();
       auto& entry = m_psSamplerTexcoordCache[outHash];
       if (!entry.initialized) {
         entry.initialized = true;
@@ -8219,8 +8289,9 @@ namespace dxvk {
       // must run before setupCategoriesForTexture so category lookups use the full material hash
       if constexpr (!FixedFunction) {
         if ((ue3MaterialInstanceConstantHash() || ue3EngineMode()) && m_parent->UseProgrammablePS() && d3d9State().pixelShader.ptr() != nullptr) {
-          const auto& bytecode = d3d9State().pixelShader->GetCommonShader()->GetBytecode();
-          const XXH64_hash_t psHash = hashDxsoBytecode(bytecode);
+          const D3D9CommonShader* psCommonShader = d3d9State().pixelShader->GetCommonShader();
+          const auto& bytecode = psCommonShader->GetBytecode();
+          const XXH64_hash_t psHash = psCommonShader->GetBytecodeHash();
           if (psHash != 0) {
             const Ue3PsMaterialIdentityInfo& identityInfo = getOrParseUe3PsMaterialIdentityInfo(psHash, bytecode);
 
@@ -8233,7 +8304,7 @@ namespace dxvk {
             std::string micTextureListLog;
             XXH64_hash_t textureSetHash = kEmptyHash;
             if (identityInfo.materialSamplerMask != 0) {
-              XXH3_state_t* const state = XXH3_createState();
+              XXH3_state_t* const state = getThreadLocalXxh3State();
               if (state != nullptr) {
                 XXH3_64bits_reset(state);
                 bool anyTextureHashed = false;
@@ -8255,7 +8326,6 @@ namespace dxvk {
                 }
                 if (anyTextureHashed)
                   textureSetHash = XXH3_64bits_digest(state);
-                XXH3_freeState(state);
               }
             }
             m_activeDrawCallState.materialData.setMaterialTextureSetHashForMaterialInstance(textureSetHash);
@@ -8399,6 +8469,10 @@ namespace dxvk {
         // Only poke decal hashes when option is enabled.
         m_forceGeometryCopy |= m_activeDrawCallState.testCategoryFlags(CATEGORIES_REQUIRE_GEOMETRY_COPY);
       }
+    } else {
+      // No texture / MIC identity: still refresh the material hash once so the
+      // submitted draw state carries a valid hash.
+      m_activeDrawCallState.materialData.updateCachedHash();
     }
 
     // only keep the passthrough texcoord index for selecting the vertex declaration element
@@ -8442,7 +8516,7 @@ namespace dxvk {
         if (vs == nullptr || outputReg == std::numeric_limits<uint32_t>::max())
           return nullptr;
 
-        const XXH64_hash_t vsHash = hashDxsoBytecode(vs->GetBytecode());
+        const XXH64_hash_t vsHash = vs->GetBytecodeHash();
         if (vsHash == 0)
           return nullptr;
 
@@ -9074,6 +9148,9 @@ namespace dxvk {
     });
 
     pruneUe3StaticVertexCaptureCache();
+    pruneUe3GeometryMemoCache();
+
+    DrawCallState::refreshCategoryLookupTable();
 
     // Reset for the next frame
     m_rtxInjectTriggered = false;
