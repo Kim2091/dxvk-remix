@@ -122,15 +122,16 @@ namespace dxvk {
     }} },
     /* Mirror's Edge (2008)                       */
     { R"(\\MirrorsEdge\.exe$)", {{
-      { "rtx.d3d9.ue3EngineMode",                       "True" },
-      { "rtx.zUp",                               "True" },
-      { "rtx.sceneScale",                        "1.0" },
-      // medge renders the main scene to an offscreen RT and composites/upscales later
+      { "rtx.d3d9.ue3EngineMode",                                    "True" },
+      { "rtx.zUp",                                                   "True" },
+      { "rtx.sceneScale",                                            "1.0" },
       { "rtx.d3d9.autoRaytracedRenderTargetFromFullscreenComposite", "True" },
-      { "rtx.d3d9.rasterizeFullscreenCompositeToPrimary",           "True" },
+      { "rtx.d3d9.rasterizeFullscreenCompositeToPrimary",            "True" },
       { "rtx.d3d9.ue3StaticLocalMeshVertexCaptureCache",             "True" },
-      { "rtx.d3d9.ue3StaticLocalMeshVertexCaptureCacheWarmupFrames", "2" },
       { "rtx.d3d9.ue3NativeLocalMeshVertexCapture",                  "True" },
+      { "rtx.d3d9.ue3VertexCaptureCameraCellSize",                   "0" },
+      { "rtx.ignoreAllVertexColorBakedLighting",                     "True" },
+      { "rtx.fallbackLightMode",                                     "0" },
       { "rtx.numGeometryProcessingThreads",                          "4" },
     }} },
     /* Star Wars Battlefront (2015)               */
