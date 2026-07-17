@@ -183,6 +183,18 @@ namespace dxvk {
                "registers per draw for panner/time/view-driven materials) can flip the chosen sampler between frames "
                "or with camera position, making a surface's albedo switch to an unrelated texture. "
                "Implicitly enabled by rtx.d3d9.ue3EngineMode.");
+    RTX_OPTION("rtx.d3d9", bool, ue3StreamingStableTextureHashing, true,
+               "UE3 compat: derive Remix texture hashes from the small-mip tail (mips at or below 64px, plus format and "
+               "aspect ratio) instead of the top mip. UE3 texture streaming creates a new D3D9 texture object per "
+               "mip-count change, so a top-mip hash differs per streamed variant of one logical texture and everything "
+               "keyed on texture hashes (replacements, categories, tags, material identity) stops matching while a "
+               "lower-mip variant is bound. The tail mips are present in every variant and copied byte-identically "
+               "between them by the engine, so this hash is stable across streaming and texture LOD settings by "
+               "construction - stateless and deterministic, no runtime learning. Unmipped textures and render targets "
+               "keep the standard top-mip hash. "
+               "Note: the two schemes produce different hashes, so texture tags and replacements only match under the "
+               "setting they were authored with. "
+               "Only active when rtx.d3d9.ue3EngineMode is enabled.");
     RTX_OPTION("rtx.d3d9", bool, ue3MicAutoExcludeFrameVaryingConstants, true,
                "UE3 MaterialInstanceConstant support: automatically detect pixel shaders whose UniformVector_*/"
                "UniformScalar_* constant registers are frame-varying (Time/panner/fade/sub-UV expressions) and "
@@ -605,9 +617,13 @@ namespace dxvk {
     // (pixel shader, ordered bound texture set, sRGB states, vertex factory) key.
     // Reusing the first decision keeps the albedo pick stable when scoring inputs
     // read live shader constants that UE3 rewrites per draw.
+    // decisionAreaSum is the total bound texel area the decision was scored against:
+    // streamed mip variants share this key (streaming-stable hashes), and a set bound
+    // with more area re-scores and supersedes a decision made on streamed-down mips.
     struct Ue3DiffuseSelectionEntry {
       uint8_t chosenStages[2] = { 0xFF, 0xFF };
       uint8_t cubemapFallbackStage = 0xFF;
+      uint64_t decisionAreaSum = 0;
     };
     fast_unordered_cache<Ue3DiffuseSelectionEntry> m_ue3DiffuseSelectionCache;
     // scoring reads the user-taggable lightmap/never-albedo/preferred-albedo texture sets; drop

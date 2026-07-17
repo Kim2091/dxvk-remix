@@ -7418,6 +7418,7 @@ namespace dxvk {
       XXH64_hash_t selectionCacheKey = kEmptyHash;
       bool selectionCacheUsable = false;
       bool selectionFromCache = false;
+      uint64_t selectionBoundAreaSum = 0;
       if ((ue3StableDiffuseSelection() || ue3EngineMode()) &&
           inferredPsEntry != nullptr && inferredPsHash != kEmptyHash) {
         // scoring consults the user-taggable lightmap/never-albedo/preferred-albedo sets; drop cached
@@ -7454,6 +7455,11 @@ namespace dxvk {
             texture->GetImage()->getHash(),
           };
           key = XXH3_64bits_withSeed(&tuple, sizeof(tuple), key);
+
+          const auto* desc = texture->Desc();
+          if (desc != nullptr) {
+            selectionBoundAreaSum += uint64_t(desc->Width) * uint64_t(desc->Height);
+          }
         }
         // score-relevant vertex factory context (packed UV biases differ per factory)
         const uint32_t vfContext =
@@ -7465,12 +7471,20 @@ namespace dxvk {
         selectionCacheKey = key;
         selectionCacheUsable = true;
 
+        // Streaming-stable hashes give every mip variant of a material the same key, so a
+        // decision scored against streamed-down mips (smaller bound texel area) is only
+        // authoritative for equal or smaller sets; a larger set re-scores and supersedes it.
         const auto cachedSelection = m_ue3DiffuseSelectionCache.find(selectionCacheKey);
         if (cachedSelection != m_ue3DiffuseSelectionCache.end()) {
-          chosenStages[0] = cachedSelection->second.chosenStages[0];
-          chosenStages[1] = cachedSelection->second.chosenStages[1];
-          strictCubemapFallbackStage = cachedSelection->second.cubemapFallbackStage;
-          selectionFromCache = true;
+          if (selectionBoundAreaSum <= cachedSelection->second.decisionAreaSum) {
+            chosenStages[0] = cachedSelection->second.chosenStages[0];
+            chosenStages[1] = cachedSelection->second.chosenStages[1];
+            strictCubemapFallbackStage = cachedSelection->second.cubemapFallbackStage;
+            selectionFromCache = true;
+          } else {
+            // superseding re-score: let ue3LogAlbedoSelection dump the authoritative decision
+            m_loggedAlbedoSelections.erase(selectionCacheKey);
+          }
         }
       }
 
@@ -8130,13 +8144,15 @@ namespace dxvk {
         }
       }
 
-      // remember the final (post-fallback, post-promotion) decision for this material key
+      // remember the final (post-fallback, post-promotion) decision for this material key,
+      // overwriting any decision made against a smaller (streamed-down) texel area
       if (selectionCacheUsable && !selectionFromCache) {
         Ue3DiffuseSelectionEntry cacheEntry;
         cacheEntry.chosenStages[0] = chosenStages[0];
         cacheEntry.chosenStages[1] = chosenStages[1];
         cacheEntry.cubemapFallbackStage = strictCubemapFallbackStage;
-        m_ue3DiffuseSelectionCache.emplace(selectionCacheKey, cacheEntry);
+        cacheEntry.decisionAreaSum = selectionBoundAreaSum;
+        m_ue3DiffuseSelectionCache[selectionCacheKey] = cacheEntry;
       }
 
       if (logAlbedoSelection) {
