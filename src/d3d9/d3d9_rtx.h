@@ -68,6 +68,9 @@ namespace dxvk {
     bool originValid = false;    // U/V proven to originate from one TEXCOORD interpolant
     bool sitesAgree = true;      // all valid sample sites agreed on origin + affine
     bool affineExact = false;    // affine chain fully representable for both components
+    // disagreeing static-tiling sites resolved by keeping the highest-frequency one
+    // (UE3 distance-fade anti-tiling idiom) instead of first-in-bytecode order
+    bool preferredHighestFrequencySite = false;
     uint8_t semanticIndex = 0;   // TEXCOORD usage index of the source interpolant
     uint8_t compU = 0;           // interpolant component feeding sample U
     uint8_t compV = 1;           // interpolant component feeding sample V

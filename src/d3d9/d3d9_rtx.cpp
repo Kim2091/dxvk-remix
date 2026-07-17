@@ -236,6 +236,35 @@ namespace dxvk {
               (a.offset.immValid && a.offset.imm == 0.0f && a.offset.constReg < 0));
     }
 
+    // Compile-time scale magnitude of a static-tiling sample site. Identity scales do
+    // not qualify: a plain-uv base layer blended with a tiled detail layer is not the
+    // dual-tiling idiom. Neither do panner offsets (constant registers): scrolling
+    // layers are simultaneously visible, so no site is more authoritative than another.
+    static bool uvSiteStaticTilingMagnitude(const UvComponentAffine& affU,
+                                            const UvComponentAffine& affV,
+                                            float& outMagnitude) {
+      auto explicitImmediateScale = [](const UvAffineTerm& term, float& outValue) {
+        if (term.inexact || !term.immValid || term.constReg >= 0)
+          return false;
+        outValue = term.imm;
+        return true;
+      };
+      auto compileTimeOffset = [](const UvAffineTerm& term) {
+        return !term.inexact && term.constReg < 0;
+      };
+
+      if (!compileTimeOffset(affU.offset) || !compileTimeOffset(affV.offset))
+        return false;
+
+      float scaleU = 1.0f;
+      float scaleV = 1.0f;
+      if (!explicitImmediateScale(affU.scale, scaleU) || !explicitImmediateScale(affV.scale, scaleV))
+        return false;
+
+      outMagnitude = std::abs(scaleU * scaleV);
+      return std::isfinite(outMagnitude) && outMagnitude > 0.0f;
+    }
+
     static void uvAffineMarkInexact(UvComponentAffine& a) {
       a.scale.inexact = true;
       a.offset.inexact = true;
@@ -1422,7 +1451,8 @@ namespace dxvk {
               agg.validSiteCount++;
 
             if (!agg.originValid) {
-              // first valid site is authoritative; later disagreements only clear sitesAgree
+              // first valid site seeds the aggregate; later disagreements clear sitesAgree
+              // and may supersede the affine via the static-tiling frequency preference
               agg.originValid = true;
               agg.semanticIndex = site.semanticIndex;
               agg.compU = site.compU;
@@ -1431,15 +1461,35 @@ namespace dxvk {
               agg.affineV = site.affineV;
               agg.affineExact = site.affineExact;
             } else {
-              const bool matches =
+              const bool sameOriginPair =
                 agg.semanticIndex == site.semanticIndex &&
                 agg.compU == site.compU &&
-                agg.compV == site.compV &&
+                agg.compV == site.compV;
+              const bool matches =
+                sameOriginPair &&
                 agg.affineExact == site.affineExact &&
                 uvComponentAffinesEqual(agg.affineU, site.affineU) &&
                 uvComponentAffinesEqual(agg.affineV, site.affineV);
-              if (!matches)
+              if (!matches) {
                 agg.sitesAgree = false;
+
+                // UE3 distance-fade anti-tiling materials sample the same texture at two
+                // literal tilings and lerp by a saturated depth fade that is 0 near the
+                // camera: the highest-frequency static-tiling site is the surface's
+                // ground-truth mapping, not whichever site fxc emitted first.
+                float aggMagnitude = 0.0f;
+                float siteMagnitude = 0.0f;
+                if (sameOriginPair &&
+                    agg.affineExact && site.affineExact &&
+                    uvSiteStaticTilingMagnitude(agg.affineU, agg.affineV, aggMagnitude) &&
+                    uvSiteStaticTilingMagnitude(site.affineU, site.affineV, siteMagnitude)) {
+                  agg.preferredHighestFrequencySite = true;
+                  if (siteMagnitude > aggMagnitude) {
+                    agg.affineU = site.affineU;
+                    agg.affineV = site.affineV;
+                  }
+                }
+              }
             }
           } else {
             if (agg.invalidSiteCount < std::numeric_limits<uint16_t>::max())
@@ -1528,6 +1578,7 @@ namespace dxvk {
             " comps=(", uint32_t(origin.compU), ",", uint32_t(origin.compV), ")",
             " sites=", origin.validSiteCount, "/", origin.invalidSiteCount,
             " agree=", origin.sitesAgree ? 1 : 0,
+            " preferHF=", origin.preferredHighestFrequencySite ? 1 : 0,
             " exact=", origin.affineExact ? 1 : 0,
             " U=[", formatUvComponentAffine(origin.affineU), "]",
             " V=[", formatUvComponentAffine(origin.affineV), "]"));
@@ -8650,6 +8701,7 @@ namespace dxvk {
                 " comps=(", uint32_t(origin.compU), ",", uint32_t(origin.compV), ")",
                 " sites=", origin.validSiteCount, "/", origin.invalidSiteCount,
                 " agree=", origin.sitesAgree ? 1 : 0,
+                " preferHF=", origin.preferredHighestFrequencySite ? 1 : 0,
                 " exact=", origin.affineExact ? 1 : 0,
                 " U:[", formatUvComponentAffine(origin.affineU), "]",
                 " V:[", formatUvComponentAffine(origin.affineV), "]");
@@ -8869,6 +8921,7 @@ namespace dxvk {
                   " comps=(", uint32_t(m_texcoordCompU), ",", uint32_t(m_texcoordCompV), ")",
                   " sites=", uvOrigin.validSiteCount, "/", uvOrigin.invalidSiteCount,
                   " agree=", uvOrigin.sitesAgree ? 1 : 0,
+                  " preferHF=", uvOrigin.preferredHighestFrequencySite ? 1 : 0,
                   " exact=", uvOrigin.affineExact ? 1 : 0,
                   " | U:[", formatUvComponentAffine(uvOrigin.affineU),
                   "] V:[", formatUvComponentAffine(uvOrigin.affineV),
@@ -8938,6 +8991,13 @@ namespace dxvk {
                 }
               }
 
+              const char* siteDisagreementNote = "";
+              if (!uvOrigin.sitesAgree) {
+                siteDisagreementNote = uvOrigin.preferredHighestFrequencySite
+                  ? " [sites disagree: preferred highest-frequency tiling]"
+                  : " [AMBIGUOUS: sample sites disagree]";
+              }
+
               const std::string msg = str::format(
                 "[RTX-UV] ", modeName,
                 ": ps=0x", std::hex, psHash,
@@ -8949,7 +9009,7 @@ namespace dxvk {
                 ", iaSet=", iaTexcoordIdx,
                 ", vsTrace=", traceKindName,
                 ", sites=", uvOrigin.validSiteCount, " valid/", uvOrigin.invalidSiteCount, " invalid",
-                uvOrigin.sitesAgree ? "" : " [AMBIGUOUS: sample sites disagree]",
+                siteDisagreementNote,
                 uvOrigin.affineExact ? "" : " [affine-inexact]",
                 m_forceIaTexcoordForOutlier ? " [outlier-override]" : "");
               if (ue3LogUvResolution()) {
