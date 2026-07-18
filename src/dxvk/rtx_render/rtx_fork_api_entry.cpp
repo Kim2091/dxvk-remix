@@ -755,6 +755,18 @@ namespace fork_hooks {
           // so we don't alias an entry that releaseTexture will invalidate.
           TextureRef toRelease = textureRef;
           textureManager.releaseTexture(toRelease);
+          // The freed table slot may still be referenced by PRESERVED
+          // instances whose surface materials baked its index at translation
+          // time -- they render black while the slot is invalid and sample
+          // whatever unrelated texture recycles into it next (FORK-DIAG
+          // "preserved instance STALE albedo slot"; user-visible as objects
+          // textured with someone else's normal map). Bump the texture cache
+          // generation so every external draw re-translates next frame,
+          // exactly like clear() does. Cost: one dynamic frame per destroy
+          // batch -- destroys arrive in bursts (LRU sweeps, texture
+          // upgrades), and the generation compare collapses N bumps in one
+          // frame into a single re-translation.
+          textureManager.bumpTextureCacheGeneration();
           break;
         }
       }

@@ -112,6 +112,20 @@ namespace dxvk {
       return m_textureCacheGeneration;
     }
 
+    // Invalidate the preserve path's baked texture-table indices without a
+    // full clear(). Called by fork_hooks::destroyTexture: releasing a table
+    // entry frees its slot, and a preserved instance whose surface material
+    // baked that albedo/normal/roughness index keeps sampling the slot --
+    // rendering black while it is invalid and, worse, sampling whatever
+    // UNRELATED texture the SparseUniqueCache recycles into it next (the
+    // "objects textured with someone else's normal map" corruption,
+    // FORK-DIAG "preserved instance STALE albedo slot"). Bumping the
+    // generation sends every external draw down the dynamic path for one
+    // frame, re-resolving material texture indices against the live table.
+    void bumpTextureCacheGeneration() {
+      ++m_textureCacheGeneration;
+    }
+
     void prepareSamplerFeedback(DxvkContext* ctx);
     void copySamplerFeedbackToHost(DxvkContext* ctx);
 

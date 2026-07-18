@@ -171,11 +171,16 @@ namespace {
 
 
   // from rtx_mod_usd.cpp
+  // Lock-free on purpose: this is called from buildExternalMeshSurfacesFromOwned
+  // on the CS thread (applyPendingMeshCreatesOnCs). The CS thread must NEVER
+  // block on s_mutex — an API entry point can hold s_mutex while waiting on the
+  // device lock that Present holds across its GPU wait, and Present's completion
+  // depends on the CS thread: CS-thread s_mutex wait = 3-thread deadlock
+  // (dump-proven live hang, 2026-07-12).
   XXH64_hash_t hack_getNextGeomHash() {
-    static uint64_t s_id = UINT64_MAX;
-    std::lock_guard lock { s_mutex };
-    --s_id;
-    return XXH64(&s_id, sizeof(s_id), 0);
+    static std::atomic<uint64_t> s_id { UINT64_MAX };
+    const uint64_t id = s_id.fetch_sub(1, std::memory_order_relaxed) - 1;
+    return XXH64(&id, sizeof(id), 0);
   }
 
 
@@ -994,6 +999,12 @@ namespace {
 
     // async load
     std::lock_guard lock { s_mutex };
+    // Caller-thread EmitCs must hold the device lock: the CS chunk is swapped
+    // out under the device lock by the Present/DrawInstance flush, and a bare
+    // EmitCs races that swap (dump-proven AV in DxvkCsChunk::push from this
+    // exact call, 2026-07-12 hang #3 — the CreateMesh flavor of the same race
+    // was hang-fixed in 355ba09 via the batched path).
+    auto devLock = remixDevice->LockDevice();
     remixDevice->EmitCs([cHandle = handle,
                          cMaterialData = convert::toRtMaterialWithoutTexturePreload(*info),
                          cPreloadSrc = convert::makePreloadSource(*info)](dxvk::DxvkContext* ctx) {
@@ -1012,6 +1023,7 @@ namespace {
     remixapi_MaterialHandle handle) {
     if (auto remixDevice = tryAsDxvk()) {
       std::lock_guard lock { s_mutex };
+      auto devLock = remixDevice->LockDevice(); // serialize EmitCs vs flush chunk-swap
       remixDevice->EmitCs([cHandle = handle](dxvk::DxvkContext* ctx) {
         auto& assets = ctx->getCommonObjects()->getSceneManager().getAssetReplacer();
         assets->destroyExternalMaterial(cHandle);
@@ -1140,6 +1152,7 @@ namespace {
       allocatedSurfaces.push_back(std::move(dst));
     }
     std::lock_guard lock { s_mutex };
+    auto devLock = remixDevice->LockDevice(); // serialize EmitCs vs flush chunk-swap
 
     remixDevice->EmitCs([cHandle = handle, cSurfaces = std::move(allocatedSurfaces)](dxvk::DxvkContext* ctx) mutable {
       auto& assets = ctx->getCommonObjects()->getSceneManager().getAssetReplacer();
@@ -1268,17 +1281,76 @@ namespace {
     }
   }
 
+  // Bounded drain of s_pendingMeshCreates (2026-07-17 hang fix). The old
+  // full swap materialized EVERY queued mesh in one applyPendingMeshCreates
+  // pass on the CS thread; a streaming burst's backlog (hundreds of meshes,
+  // multi-MB of vertex data each) turned that into a multi-second CS grind.
+  // While it runs, Present parks in synchronizeSubmission / FlushCsChunk
+  // backpressure HOLDING the device spinlock, and the game thread spins
+  // unboundedly in LockDevice inside its next create call (live dumps
+  // FO4Remix_hang_9140 / _37396: dump-proven 3-thread convoy, no lock
+  // cycle -- the spinlock is unfair, so the spinner can starve for the
+  // whole grind). Cap the surface bytes materialized per FRAME; the
+  // remainder stays queued FIFO for later flushes / the next frame. Draws
+  // referencing a still-queued handle are safe: accessExternalMesh returns
+  // an empty submesh list and the instance simply appears a frame or two
+  // later -- indistinguishable from ordinary pop-in. Caller holds s_mutex.
+  std::vector<PendingMeshCreate> takePendingMeshCreatesBounded(uint64_t frameId) {
+    constexpr size_t kMeshMaterializeBytesPerFrame = 48ull << 20;
+    static uint64_t s_budgetFrameId = ~0ull;  // guarded by s_mutex
+    static size_t   s_budgetSpent = 0;        // guarded by s_mutex
+    if (frameId != s_budgetFrameId) {
+      s_budgetFrameId = frameId;
+      s_budgetSpent = 0;
+    }
+    std::vector<PendingMeshCreate> taken;
+    if (s_pendingMeshCreates.empty() ||
+        s_budgetSpent >= kMeshMaterializeBytesPerFrame) {
+      return taken;
+    }
+    size_t n = 0;
+    for (; n < s_pendingMeshCreates.size(); ++n) {
+      size_t mcBytes = 0;
+      for (const OwnedSurface& s : s_pendingMeshCreates[n].surfaces) {
+        mcBytes += s.vertices.size() * sizeof(remixapi_HardcodedVertex)
+                 + s.indices.size() * sizeof(uint32_t)
+                 + s.blendWeights.size() * sizeof(float)
+                 + s.blendIndices.size() * sizeof(uint32_t);
+      }
+      // Always take at least one per under-budget call so a single
+      // over-budget mesh still lands (next same-frame calls early-out on
+      // the spent check above).
+      if (n > 0 && s_budgetSpent + mcBytes > kMeshMaterializeBytesPerFrame) {
+        break;
+      }
+      s_budgetSpent += mcBytes;
+    }
+    if (n >= s_pendingMeshCreates.size()) {
+      taken.swap(s_pendingMeshCreates);
+    } else {
+      taken.assign(std::make_move_iterator(s_pendingMeshCreates.begin()),
+                   std::make_move_iterator(s_pendingMeshCreates.begin() + n));
+      s_pendingMeshCreates.erase(s_pendingMeshCreates.begin(),
+                                 s_pendingMeshCreates.begin() + n);
+    }
+    return taken;
+  }
+
   // Flush pending mesh creates immediately on the calling thread via EmitCs.
   // Used from the DrawInstance path to make batched meshes available before
   // the first draw that references them.
   void flushPendingMeshes(dxvk::D3D9DeviceEx* remixDevice) {
+    const uint64_t frameId = remixDevice->GetDXVKDevice()->getCurrentFrameId();
     std::vector<PendingMeshCreate> meshCreates;
     {
       std::lock_guard lock { s_mutex };
       if (s_pendingMeshCreates.empty()) {
         return;
       }
-      meshCreates.swap(s_pendingMeshCreates);
+      meshCreates = takePendingMeshCreatesBounded(frameId);
+    }
+    if (meshCreates.empty()) {
+      return;  // this frame's materialization budget is spent
     }
 
     auto devLock = remixDevice->LockDevice();
@@ -1359,6 +1431,7 @@ namespace {
       return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
     }
     std::lock_guard lock { s_mutex };
+    auto devLock = remixDevice->LockDevice(); // serialize EmitCs vs flush chunk-swap
     remixDevice->EmitCs([cHandle = handle](dxvk::DxvkContext* ctx) {
       ctx->getCommonObjects()->getSceneManager().destroyExternalMesh(cHandle);
     });
@@ -1403,6 +1476,7 @@ namespace {
     const remixapi_MaterialHandle handle = info->medium;
 
     std::lock_guard lock { s_mutex };
+    auto devLock = remixDevice->LockDevice(); // serialize EmitCs vs flush chunk-swap
     remixDevice->EmitCs([handle](dxvk::DxvkContext* ctx) {
       auto& sceneManager = ctx->getCommonObjects()->getSceneManager();
       if (handle == nullptr) {
@@ -1618,6 +1692,7 @@ namespace {
 
     // async load
     std::lock_guard lock { s_mutex };
+    auto devLock = remixDevice->LockDevice(); // serialize EmitCs vs flush chunk-swap
     remixDevice->EmitCs([lightHandle](dxvk::DxvkContext* ctx) {
       auto& lightMgr = ctx->getCommonObjects()->getSceneManager().getLightManager();
       lightMgr.addExternalLightInstance(lightHandle);
@@ -1932,6 +2007,7 @@ namespace {
     }
 
     std::lock_guard lock { s_mutex };
+    auto devLock = remixDevice->LockDevice(); // serialize EmitCs vs flush chunk-swap
 
     // Pass in the backbuffer incase we need it
     IDirect3DSurface9* pSurface = nullptr;
@@ -1939,7 +2015,7 @@ namespace {
     dxvk::D3D9Surface* backBufferSurface = static_cast<dxvk::D3D9Surface*>(pSurface);
     dxvk::Rc<dxvk::DxvkImage> backbuffer0 = backBufferSurface->GetCommonTexture()->GetImage();
 
-    remixDevice->EmitCs([cDest = std::move(destImage), 
+    remixDevice->EmitCs([cDest = std::move(destImage),
                          cDestView = std::move(destImageView),
                          cBackbuffer = std::move(backbuffer0),
                          type = type] (dxvk::DxvkContext* dxvkCtx) {
@@ -1999,6 +2075,7 @@ namespace {
     }
 
     std::lock_guard lock { s_mutex };
+    auto devLock = remixDevice->LockDevice(); // serialize EmitCs vs flush chunk-swap
     remixDevice->EmitCs([type, cColor = *color](dxvk::DxvkContext* ctx) {
       dxvk::RtxGlobals& globals = ctx->getCommonObjects()->getSceneManager().getGlobals();
       switch (type) {
@@ -2140,12 +2217,19 @@ namespace {
       updates.swap(s_pendingLightUpdates);
       domeUpdates.swap(s_pendingDomeUpdates);
       destroys.swap(s_pendingLightDestroys);
-      meshCreates.swap(s_pendingMeshCreates);
+      meshCreates = takePendingMeshCreatesBounded(
+          remixDevice->GetDXVKDevice()->getCurrentFrameId());
     }
     // Build tombstone set for this frame to avoid re-adding deleted lights
     std::unordered_set<remixapi_LightHandle> tombstones;
     tombstones.insert(destroys.begin(), destroys.end());
 
+    // The device lock must NOT be held across the native Present call below:
+    // D3D9SwapChainEx::Present runs remixapi_AutoInstancePersistentLights,
+    // which takes s_mutex, and API entry points (CreateTexture et al.) hold
+    // s_mutex while acquiring the device lock — keeping devLock held past this
+    // EmitCs closes a dump-proven ABBA deadlock (2026-07-12 hang #2).
+    {
     auto devLock = remixDevice->LockDevice();
     remixDevice->EmitCs([creates = std::move(creates), updates = std::move(updates), domeUpdates = std::move(domeUpdates), destroys = std::move(destroys), tombstones = std::move(tombstones), meshCreates = std::move(meshCreates)](dxvk::DxvkContext* ctx) mutable {
       auto& lightMgr = ctx->getCommonObjects()->getSceneManager().getLightManager();
@@ -2238,6 +2322,7 @@ namespace {
 
       lightMgr.queueAutoInstancePersistent();
     });
+    }
 
     // Forward any pending screen overlay to the render thread for this frame.
     dxvk::fork_hooks::presentScreenOverlayFlush(remixDevice);
@@ -2332,7 +2417,8 @@ extern "C"
       updates.swap(s_pendingLightUpdates);
       domeUpdates.swap(s_pendingDomeUpdates);
       destroys.swap(s_pendingLightDestroys);
-      meshCreates.swap(s_pendingMeshCreates);
+      meshCreates = takePendingMeshCreatesBounded(
+          remixDevice->GetDXVKDevice()->getCurrentFrameId());
     }
     // Native-present fast path. If no C-API scene work is queued this frame and
     // no external light has ever been registered, there is nothing to apply or

@@ -485,12 +485,18 @@ namespace dxvk {
     m_parent->m_rtx.EndFrame(m_backBuffers[0]->GetCommonTexture()->GetImage());
     // NV-DXVK end
 
-    D3D9DeviceLock lock = m_parent->LockDevice();
     // NV-DXVK: Flush pending Remix API light updates safely once per frame.
     // This only enqueues into LightManager; actual mutations apply at frame start.
     // Covers mixed-path consumers that create lights via the C API but present
     // through the native D3D9 COM path (bypassing remixapi_Present).
+    // MUST run BEFORE LockDevice(): it takes the api-bridge s_mutex, and API
+    // entry points (remixapi_CreateTexture et al.) hold s_mutex while acquiring
+    // the device lock — calling it under the device lock is a lock-order
+    // inversion (dump-proven ABBA deadlock vs a game-thread CreateTexture,
+    // 2026-07-12). It takes its own device lock internally when it has work.
     (void)remixapi_AutoInstancePersistentLights();
+
+    D3D9DeviceLock lock = m_parent->LockDevice();
 
     uint32_t presentInterval = m_presentParams.PresentationInterval;
 
