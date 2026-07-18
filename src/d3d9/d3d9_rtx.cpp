@@ -2173,13 +2173,17 @@ namespace dxvk {
     constexpr uint32_t kUe3MicChurnWarnThreshold = 32;
 
     // Runtime auto-exclusion of frame-varying constants from material identity
-    // (rtx.d3d9.ue3MicAutoExcludeFrameVaryingConstants): per (shader, texture set) group,
-    // remember the most recent distinct constants hashes in a bounded ring. Legit sibling
-    // groups stay within the ring, so re-seeing a sibling's hash costs nothing; a shader
-    // whose constants are frame-varying (Time/panner/fade/sub-UV expressions) mints a new
-    // hash every draw, blows past the ring, and crosses the distinct-count threshold within
-    // a second - after which its constants are dropped from identity for the session, the
-    // same effect as listing it in rtx.d3d9.ue3MicConstantIdentityExcludedShaders.
+    // (rtx.d3d9.ue3MicAutoExcludeFrameVaryingConstants): per (identity seed, texture set)
+    // group, remember the most recent distinct constants hashes in a bounded ring. Re-seeing
+    // a sibling's hash is a ring hit and DECAYS the distinct count: stable siblings redraw
+    // every frame, so legitimate constant-differentiated families - however many siblings
+    // accumulate across levels - hit far more than they miss and never trip. Frame-varying
+    // constants (Time/panner/fade/sub-UV expressions) mint a new hash every draw, never hit
+    // the ring, and cross the threshold within a second - after which the GROUP's constants
+    // are dropped from identity for the session. Exclusion is keyed per group, never per
+    // seed: the canonical seed is only a sampler-name signature shared by many unrelated
+    // materials, and excluding it wholesale would collapse the identity - and break the
+    // replacement matching - of every material that shares it.
     constexpr uint32_t kUe3MicConstantHashRingSize = kUe3MicChurnWarnThreshold;
 
     struct Ue3MicConstantChurnEntry {
@@ -2189,24 +2193,30 @@ namespace dxvk {
     };
 
     static fast_unordered_cache<Ue3MicConstantChurnEntry> s_ue3MicConstantChurnPerGroup;
-    static fast_unordered_set s_ue3MicAutoExcludedShaders;
+    static fast_unordered_set s_ue3MicAutoExcludedGroups;
 
-    static bool isUe3MicShaderAutoExcluded(const XXH64_hash_t shaderIdentityKey) {
-      return s_ue3MicAutoExcludedShaders.find(shaderIdentityKey) != s_ue3MicAutoExcludedShaders.end();
+    static XXH64_hash_t makeUe3MicChurnGroupKey(const XXH64_hash_t shaderIdentitySeed,
+                                                const XXH64_hash_t textureSetHash) {
+      return XXH3_64bits_withSeed(&textureSetHash, sizeof(textureSetHash), shaderIdentitySeed);
     }
 
-    // Returns true when the shader identity was newly auto-excluded on this call.
-    // shaderIdentityKey is the material identity seed: the bytecode hash, or the canonical
-    // CTAB signature for lightmap-permutation-invariant shaders (so exclusion decisions are
-    // shared by every permutation of the same material).
-    static bool trackUe3MicConstantChurn(const XXH64_hash_t shaderIdentityKey,
+    static bool isUe3MicGroupAutoExcluded(const XXH64_hash_t churnGroupKey) {
+      return s_ue3MicAutoExcludedGroups.find(churnGroupKey) != s_ue3MicAutoExcludedGroups.end();
+    }
+
+    // Returns true when the group was newly auto-excluded on this call.
+    static bool trackUe3MicConstantChurn(const XXH64_hash_t churnGroupKey,
+                                         const XXH64_hash_t psHash,
+                                         const XXH64_hash_t shaderIdentitySeed,
                                          const XXH64_hash_t textureSetHash,
                                          const XXH64_hash_t constantsHash) {
-      const XXH64_hash_t groupKey = XXH3_64bits_withSeed(&textureSetHash, sizeof(textureSetHash), shaderIdentityKey);
-      Ue3MicConstantChurnEntry& entry = s_ue3MicConstantChurnPerGroup[groupKey];
+      Ue3MicConstantChurnEntry& entry = s_ue3MicConstantChurnPerGroup[churnGroupKey];
 
       for (const XXH64_hash_t seenHash : entry.recentHashes) {
         if (seenHash == constantsHash) {
+          if (entry.distinctCount > 0) {
+            --entry.distinctCount;
+          }
           return false;
         }
       }
@@ -2216,14 +2226,16 @@ namespace dxvk {
       ++entry.distinctCount;
 
       if (entry.distinctCount >= kUe3MicChurnWarnThreshold &&
-          s_ue3MicAutoExcludedShaders.insert(shaderIdentityKey).second) {
+          s_ue3MicAutoExcludedGroups.insert(churnGroupKey).second) {
         Logger::warn(str::format(
-          "[RTX-Compatibility][UE3-MIC] Shader identity 0x", std::hex, shaderIdentityKey,
-          " minted ", std::dec, kUe3MicChurnWarnThreshold,
-          "+ distinct constant hashes for a single texture set (0x", std::hex, textureSetHash, std::dec,
-          ") - its constant registers are frame-varying (Time/panner/fade/sub-UV expressions). "
-          "Excluding its constants from material identity for this session; add the reported "
-          "identity to rtx.d3d9.ue3MicConstantIdentityExcludedShaders to make this permanent."));
+          "[RTX-Compatibility][UE3-MIC] Material group (seed=0x", std::hex, shaderIdentitySeed,
+          ", ps=0x", psHash,
+          ", textureSet=0x", textureSetHash, std::dec,
+          ") minted ", kUe3MicChurnWarnThreshold,
+          "+ distinct constant hashes - its constant registers are frame-varying "
+          "(Time/panner/fade/sub-UV expressions). Excluding this group's constants from "
+          "material identity for this session; add the shader hash or seed to "
+          "rtx.d3d9.ue3MicConstantIdentityExcludedShaders to exclude it permanently."));
         return true;
       }
 
@@ -9514,13 +9526,15 @@ namespace dxvk {
             m_activeDrawCallState.materialData.setMaterialTextureSetHashForMaterialInstance(textureSetHash);
 
             const bool autoExcludeEnabled = ue3MicAutoExcludeFrameVaryingConstants();
-            // Exclusion and churn tracking key on the identity seed so decisions are
-            // permutation-consistent for invariant-identity shaders. The raw bytecode hash is
-            // still honoured in the manual list for existing configs.
+            // Manual exclusion honours both the raw bytecode hash (existing configs) and the
+            // identity seed; auto-exclusion is scoped to the (seed, texture set) group, which
+            // is permutation-consistent for invariant-identity shaders yet never wider than
+            // the one churning material family.
+            const XXH64_hash_t micChurnGroupKey = makeUe3MicChurnGroupKey(shaderIdentitySeed, textureSetHash);
             bool constantsExcluded =
               lookupHash(ue3MicConstantIdentityExcludedShaders(), psHash) ||
               (useInvariantShaderIdentity && lookupHash(ue3MicConstantIdentityExcludedShaders(), shaderIdentitySeed)) ||
-              (autoExcludeEnabled && isUe3MicShaderAutoExcluded(shaderIdentitySeed));
+              (autoExcludeEnabled && isUe3MicGroupAutoExcluded(micChurnGroupKey));
             // Invariant-identity shaders hash constants by uniform name and leading register:
             // lightmap policy permutations shift uniform registers and trim per-permutation
             // unreferenced elements, so the raw register-range stream is not comparable
@@ -9533,9 +9547,9 @@ namespace dxvk {
                 : hashUe3MaterialConstants(d3d9State().psConsts.fConsts, identityInfo.constRanges);
             }
             // frame-varying constant registers would mint a new material identity every
-            // draw; detect that here and drop constants-based identity for the shader
+            // draw; detect that here and drop constants-based identity for the group
             if (!constantsExcluded && psConstsHash != kEmptyHash && autoExcludeEnabled &&
-                trackUe3MicConstantChurn(shaderIdentitySeed, textureSetHash, psConstsHash)) {
+                trackUe3MicConstantChurn(micChurnGroupKey, psHash, shaderIdentitySeed, textureSetHash, psConstsHash)) {
               constantsExcluded = true;
               psConstsHash = kEmptyHash;
             }
@@ -9553,15 +9567,21 @@ namespace dxvk {
                   std::array<Ue3PresentMaterialUniform, kUe3BridgeMaxUniforms> presentUniforms;
                   uint32_t presentUniformCount = 0;
                   bool presentUniformsOverflowed = false;
-                  for (const auto& [uniformNameKey, uniformRegister] : identityInfo.namedUniformFirstRegistersByNameOrder) {
-                    if (uniformRegister >= caps::MaxFloatConstantsPS)
-                      continue;
-                    if (presentUniformCount < presentUniforms.size()) {
-                      presentUniforms[presentUniformCount++] =
-                        Ue3PresentMaterialUniform { uniformNameKey, d3d9State().psConsts.fConsts[uniformRegister] };
-                    } else {
-                      presentUniformsOverflowed = true;
-                      break;
+                  // Excluded constants collapse every sibling onto one identity; baking the
+                  // first-seen sibling's live values into the memoized variants would make
+                  // bridge results depend on draw order. Structural (constants-free) variants
+                  // only for those.
+                  if (!constantsExcluded) {
+                    for (const auto& [uniformNameKey, uniformRegister] : identityInfo.namedUniformFirstRegistersByNameOrder) {
+                      if (uniformRegister >= caps::MaxFloatConstantsPS)
+                        continue;
+                      if (presentUniformCount < presentUniforms.size()) {
+                        presentUniforms[presentUniformCount++] =
+                          Ue3PresentMaterialUniform { uniformNameKey, d3d9State().psConsts.fConsts[uniformRegister] };
+                      } else {
+                        presentUniformsOverflowed = true;
+                        break;
+                      }
                     }
                   }
                   it = s_ue3AlternateHashCache.emplace(

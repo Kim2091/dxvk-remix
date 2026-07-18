@@ -255,13 +255,15 @@ namespace dxvk {
                "setting they were authored with. "
                "Only active when rtx.d3d9.ue3EngineMode is enabled.");
     RTX_OPTION("rtx.d3d9", bool, ue3MicAutoExcludeFrameVaryingConstants, true,
-               "UE3 MaterialInstanceConstant support: automatically detect pixel shaders whose UniformVector_*/"
+               "UE3 MaterialInstanceConstant support: automatically detect materials whose UniformVector_*/"
                "UniformScalar_* constant registers are frame-varying (Time/panner/fade/sub-UV expressions) and "
                "exclude their constants from material identity hashing at runtime, as if they were listed in "
-               "rtx.d3d9.ue3MicConstantIdentityExcludedShaders. Without this, such shaders mint a new material hash "
-               "every frame, churning instance identity (visible as temporal instability/flicker and per-frame BLAS "
-               "rebuilds) until each shader is excluded manually. Detection triggers once a single shader + texture "
-               "set group has minted an abnormal number of distinct constant hashes. Only active when material "
+               "rtx.d3d9.ue3MicConstantIdentityExcludedShaders. Without this, such materials mint a new material "
+               "hash every frame, churning instance identity (visible as temporal instability/flicker and per-frame "
+               "BLAS rebuilds) until each is excluded manually. Detection and exclusion are scoped to a single "
+               "(identity seed, texture set) group - one churning material family never widens to other materials "
+               "sharing its shader or signature - and re-seen sibling hashes decay the churn count, so legitimate "
+               "constant-differentiated sibling sets of any size do not trip it. Only active when material "
                "instance hashing is enabled (rtx.d3d9.ue3MaterialInstanceConstantHash or rtx.d3d9.ue3EngineMode).");
     RTX_OPTION("rtx.d3d9", bool, ue3LogClassification, false,
                "UE3 compat: log explicit pass and vertex factory classification decisions for draw-call routing diagnostics.");
