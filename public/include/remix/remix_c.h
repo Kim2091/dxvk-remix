@@ -502,6 +502,11 @@ extern "C" {
     REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_TRANSPARENCY_LAYER = 1 << 22,
     REMIXAPI_INSTANCE_CATEGORY_BIT_PARTICLE_EMITTER          = 1 << 23,
     REMIXAPI_INSTANCE_CATEGORY_BIT_SMOOTH_NORMALS            = 1 << 24,
+    // Fork extension (2026-07-18, additive/opt-in): renders the instance
+    // with the VIEW_MODEL camera (SetupCamera type
+    // REMIXAPI_CAMERA_TYPE_VIEW_MODEL) and the runtime's view-model
+    // handling. Clients that never set the bit are unaffected.
+    REMIXAPI_INSTANCE_CATEGORY_BIT_VIEW_MODEL                = 1 << 25,
   } remixapi_InstanceCategoryBit;
 
   typedef uint32_t remixapi_InstanceCategoryFlags;
