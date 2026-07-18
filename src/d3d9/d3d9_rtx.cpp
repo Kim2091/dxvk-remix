@@ -4114,6 +4114,25 @@ namespace dxvk {
     return info;
   }
 
+  bool D3D9Rtx::isUe3WorldGeometryVertexFactory(const Ue3VertexFactoryType type) {
+    switch (type) {
+    case Ue3VertexFactoryType::Local:
+    case Ue3VertexFactoryType::LocalDecal:
+    case Ue3VertexFactoryType::GPUSkin:
+    case Ue3VertexFactoryType::GPUSkinMorph:
+    case Ue3VertexFactoryType::Terrain:
+    case Ue3VertexFactoryType::TerrainMorph:
+    case Ue3VertexFactoryType::SpeedTree:
+    case Ue3VertexFactoryType::Foliage:
+    case Ue3VertexFactoryType::Particle:
+    case Ue3VertexFactoryType::ParticleBeamTrail:
+    case Ue3VertexFactoryType::LensFlare:
+      return true;
+    default:
+      return false;
+    }
+  }
+
   D3D9Rtx::Ue3PassType D3D9Rtx::classifyUe3Pass(const DrawContext& drawContext) {
     if (!ue3EngineMode())
       return Ue3PassType::Unknown;
@@ -4129,18 +4148,7 @@ namespace dxvk {
       (m_parent->GetActiveRTTextures() & m_parent->m_psShaderMasks.samplerMask) != 0;
     const bool likelyFullscreen = !depthEnabled && !zWriteEnabled && drawContext.PrimitiveCount <= 4;
 
-    const bool isWorldGeometry =
-      m_currentUe3VertexFactory == Ue3VertexFactoryType::Local ||
-      m_currentUe3VertexFactory == Ue3VertexFactoryType::LocalDecal ||
-      m_currentUe3VertexFactory == Ue3VertexFactoryType::GPUSkin ||
-      m_currentUe3VertexFactory == Ue3VertexFactoryType::GPUSkinMorph ||
-      m_currentUe3VertexFactory == Ue3VertexFactoryType::Terrain ||
-      m_currentUe3VertexFactory == Ue3VertexFactoryType::TerrainMorph ||
-      m_currentUe3VertexFactory == Ue3VertexFactoryType::SpeedTree ||
-      m_currentUe3VertexFactory == Ue3VertexFactoryType::Foliage ||
-      m_currentUe3VertexFactory == Ue3VertexFactoryType::Particle ||
-      m_currentUe3VertexFactory == Ue3VertexFactoryType::ParticleBeamTrail ||
-      m_currentUe3VertexFactory == Ue3VertexFactoryType::LensFlare;
+    const bool isWorldGeometry = isUe3WorldGeometryVertexFactory(m_currentUe3VertexFactory);
 
     // Cheap early-outs first: depth prepass and shadow depth draws are the most common
     // skipped passes and need no shader feature information.
@@ -6082,13 +6090,15 @@ namespace dxvk {
 
     // UE3 depth test disabled translucency -  NeedsDepthTestDisabled materials, fog volume composites,
     // and fullscreen overlays use alpha blend + depth test off + depth write off
-    // exclude UI tagged draws since they also match this pattern but need rasterisation with RTX injection
+    // exclude UI tagged draws since they also match this pattern but need rasterisation with RTX injection,
+    // and deferred-UI tagged draws which need capture for post-injection replay
     if ((ue3SkipDepthTestDisabledTranslucency() || ue3EngineMode()) &&
         d3d9State().renderStates[D3DRS_ALPHABLENDENABLE] &&
         (d3d9State().renderStates[D3DRS_ZENABLE] == D3DZB_FALSE ||
          d3d9State().renderStates[D3DRS_ZFUNC] == D3DCMP_ALWAYS) &&
         d3d9State().renderStates[D3DRS_ZWRITEENABLE] == FALSE &&
-        !checkBoundTextureCategory(RtxOptions::uiTextures())) {
+        !checkBoundTextureCategory(RtxOptions::uiTextures()) &&
+        !isDeferredUiTaggedDraw()) {
       m_ue3LastDrawDecision = "depth-test-disabled translucency skip";
       ONCE(Logger::info("[RTX-Compatibility-Info] Ignored UE3 depth-test-disabled translucent draw."));
       return { RtxGeometryStatus::Ignored, false };
@@ -6152,6 +6162,108 @@ namespace dxvk {
       return { RtxGeometryStatus::Rasterized, false };
     default:
       break;
+    }
+
+    // Deferred UI overlays (rtx.deferredUiTextures / rtx.d3d9.deferredUiPixelShaders, e.g. UE3
+    // MaterialEffect fullscreen fades): rasterized on top of the ray-traced image WITHOUT
+    // triggering RTX injection - the draw is captured and replayed after injection fires later
+    // in the frame. Placed after the pass switch above so UI composites and video passes can
+    // never be deferred, and before the fullscreen-composite/post-process filters below so
+    // tagging wins over those. World geometry and depth-writing draws are never deferred even
+    // when tagged: shared textures (e.g. a scene-color render target sampled by translucent
+    // meshes) must not pull geometry out of the ray-traced scene.
+    if (!RtxOptions::deferredUiTextures().empty() || !deferredUiPixelShaders().empty()) {
+      XXH64_hash_t matchedTextureHash = 0;
+      bool matchedTextureIsRenderTarget = false;
+      XXH64_hash_t matchedRtDescriptorHash = 0;
+
+      if (isDeferredUiTaggedDraw(&matchedTextureHash, &matchedTextureIsRenderTarget, &matchedRtDescriptorHash)) {
+        const bool matchedByPixelShaderTag = matchedTextureHash == 0;
+        const bool zWriteEnabled = d3d9State().renderStates[D3DRS_ZWRITEENABLE] != FALSE;
+        const bool isWorldGeometryVertexFactory = isUe3WorldGeometryVertexFactory(m_currentUe3VertexFactory);
+
+        // Engine post-process/composite shaders (gamma-correction scene copy, tone mapping,
+        // motion blur, distortion, fog) legitimately sample the scene render target but must
+        // never be deferred: replaying e.g. the gamma copy over the ray-traced image uniformly
+        // brightens the whole screen and, being opaque and later in the frame, overwrites the
+        // real overlay effects. Only texture tags skip them - an explicit pixel shader tag is
+        // taken as user intent and still defers.
+        bool isEnginePostProcessShader = false;
+        if (!matchedByPixelShaderTag && m_parent->UseProgrammablePS() && d3d9State().pixelShader != nullptr) {
+          const Ue3ShaderFeatureInfo psInfo = getUe3ShaderFeatureInfo(d3d9State().pixelShader->GetCommonShader());
+          isEnginePostProcessShader = psInfo.hasGammaConstants ||
+                                      psInfo.hasToneMapConstants ||
+                                      psInfo.hasExposureOrToneSampler ||
+                                      psInfo.hasMotionBlurConstants ||
+                                      psInfo.hasVelocitySampler ||
+                                      psInfo.hasDistortionSampler ||
+                                      psInfo.hasFogConstants ||
+                                      psInfo.hasHazeConstants;
+        }
+
+        // Fullscreen overlay tiles (UE3 MaterialEffect quads via FTileRenderer) use a
+        // Local-style vertex declaration (position/tangents/color/uv) and would be caught by
+        // the world-geometry guard. A tiny primitive count with depth testing disabled
+        // distinguishes them from real world geometry: even small world quads (glass panes,
+        // monitors) depth-test against the scene, overlay tiles never do.
+        const bool depthTestDisabled = d3d9State().renderStates[D3DRS_ZENABLE] == D3DZB_FALSE ||
+                                       d3d9State().renderStates[D3DRS_ZFUNC] == D3DCMP_ALWAYS;
+        const bool looksLikeOverlayTile = drawContext.PrimitiveCount <= 4 && depthTestDisabled && !zWriteEnabled;
+
+        const bool eligible = !zWriteEnabled && !isEnginePostProcessShader &&
+                              (!isWorldGeometryVertexFactory || looksLikeOverlayTile);
+        const char* refusalReason = isEnginePostProcessShader
+                                    ? "engine post-process shader"
+                                    : "world geometry or depth write";
+
+        // One-shot diagnostics per (pixel shader, decision): prints the stable pixel shader
+        // hash so tags on unstable render-target textures can be moved to
+        // rtx.d3d9.deferredUiPixelShaders.
+        const XXH64_hash_t psHash = (m_parent->UseProgrammablePS() && d3d9State().pixelShader != nullptr)
+                                    ? d3d9State().pixelShader->GetCommonShader()->GetBytecodeHash() : 0;
+        const XXH64_hash_t vsHash = (m_parent->UseProgrammableVS() && d3d9State().vertexShader != nullptr)
+                                    ? d3d9State().vertexShader->GetCommonShader()->GetBytecodeHash() : 0;
+        const XXH64_hash_t logKey = psHash ^ (eligible ? 0xD1B54A32D192ED03ull
+                                                       : (isEnginePostProcessShader ? 0x2545F4914F6CDD1Dull
+                                                                                    : 0x9E3779B97F4A7C15ull));
+        if (m_deferredUiLoggedDecisions.insert(logKey).second) {
+          const std::string matchedDescription = matchedTextureHash != 0
+            ? str::format(" matchedTexture=0x", std::hex, matchedTextureHash, std::dec)
+            : std::string(" matchedBy=pixelShaderTag");
+
+          Logger::info(str::format(
+            "[RTX-DeferredUI] ",
+            eligible ? std::string("Deferring overlay draw")
+                     : str::format("Tagged draw NOT deferred (", refusalReason, ")"),
+            ": ps=0x", std::hex, psHash,
+            " vs=0x", vsHash, std::dec,
+            " vertexFactory=", describeUe3VertexFactory(m_currentUe3VertexFactory),
+            " pass=", describeUe3PassType(m_currentUe3PassType),
+            " prims=", drawContext.PrimitiveCount,
+            " ztest=", depthTestDisabled ? 0 : 1,
+            " zwrite=", zWriteEnabled ? 1 : 0,
+            matchedDescription));
+
+          if (eligible && matchedTextureIsRenderTarget) {
+            Logger::info(str::format(
+              "[RTX-DeferredUI] Tagged texture 0x", std::hex, matchedTextureHash, std::dec,
+              " is a render target: its texture hash changes every time the game recreates it "
+              "(respawn/level load). For a stable tag use the pixel shader instead: add 0x",
+              std::hex, psHash, std::dec, " to rtx.d3d9.deferredUiPixelShaders",
+              matchedRtDescriptorHash != 0
+                ? str::format(" (the render target's stable descriptor hash 0x", std::hex, matchedRtDescriptorHash, std::dec, " also matches this category)")
+                : std::string(),
+              "."));
+          }
+        }
+
+        if (eligible) {
+          m_ue3LastDrawDecision = "deferred UI overlay";
+          logUe3Classification(drawContext, m_currentUe3PassType, RtxGeometryStatus::Rasterized, "deferred UI overlay");
+          return { RtxGeometryStatus::Rasterized, false, true };
+        }
+        // Ineligible tagged draws fall through to normal classification - never suppressed.
+      }
     }
 
     // Attempt to detect shadow mask draws and ignore them
@@ -6379,6 +6491,588 @@ namespace dxvk {
 
     // Check if UI texture bound
     return checkBoundTextureCategory(RtxOptions::uiTextures());
+  }
+
+  bool D3D9Rtx::isDeferredUiTaggedDraw(XXH64_hash_t* pMatchedTextureHash,
+                                       bool* pMatchedTextureIsRenderTarget,
+                                       XXH64_hash_t* pMatchedRtDescriptorHash) const {
+    // Pixel shader tag: stable across texture streaming and render target recreation
+    if (!deferredUiPixelShaders().empty() &&
+        m_parent->UseProgrammablePS() && d3d9State().pixelShader != nullptr) {
+      const XXH64_hash_t psHash = d3d9State().pixelShader->GetCommonShader()->GetBytecodeHash();
+      if (lookupHash(deferredUiPixelShaders(), psHash)) {
+        return true;
+      }
+    }
+
+    if (RtxOptions::deferredUiTextures().empty()) {
+      return false;
+    }
+
+    const uint32_t usedSamplerMask = m_parent->m_psShaderMasks.samplerMask | m_parent->m_vsShaderMasks.samplerMask;
+    const uint32_t usedTextureMask = m_parent->m_activeTextures & usedSamplerMask;
+    for (const uint32_t idx : bit::BitMask(usedTextureMask)) {
+      if (!d3d9State().textures[idx]) {
+        continue;
+      }
+
+      D3D9CommonTexture* texture = GetCommonTexture(d3d9State().textures[idx]);
+      if (texture == nullptr || texture->GetSampleView(false) == nullptr) {
+        continue;
+      }
+
+      const bool isRenderTarget = texture->IsRenderTarget();
+      const XXH64_hash_t descriptorHash = (isRenderTarget && texture->GetImage() != nullptr)
+                                          ? texture->GetImage()->getDescriptorHash() : 0;
+
+      const auto reportMatch = [&](XXH64_hash_t matchedHash, bool matchedIsRenderTarget) {
+        if (pMatchedTextureHash) {
+          *pMatchedTextureHash = matchedHash;
+        }
+        if (pMatchedTextureIsRenderTarget) {
+          *pMatchedTextureIsRenderTarget = matchedIsRenderTarget;
+        }
+        if (pMatchedRtDescriptorHash) {
+          *pMatchedRtDescriptorHash = descriptorHash;
+        }
+        return true;
+      };
+
+      const XXH64_hash_t texHash = texture->GetSampleView(false)->image()->getHash();
+      if (texHash != 0 && lookupHash(RtxOptions::deferredUiTextures(), texHash)) {
+        return reportMatch(texHash, isRenderTarget);
+      }
+
+      // Render targets: also match by descriptor hash, which is derived from the target's
+      // properties and thus stable across recreation (the image hash embeds a creation-order
+      // counter and changes on every respawn/level load).
+      if (descriptorHash != 0 && lookupHash(RtxOptions::deferredUiTextures(), descriptorHash)) {
+        return reportMatch(descriptorHash, true);
+      }
+    }
+
+    return false;
+  }
+
+  Rc<DxvkImage> D3D9Rtx::getCurrentRenderTargetImage() const {
+    if (d3d9State().renderTargets[kRenderTargetIndex] == nullptr) {
+      return nullptr;
+    }
+
+    D3D9CommonTexture* texInfo = d3d9State().renderTargets[kRenderTargetIndex]->GetCommonTexture();
+    if (texInfo == nullptr) {
+      return nullptr;
+    }
+
+    return texInfo->GetImage();
+  }
+
+  // Snapshots a draw tagged via rtx.deferredUiTextures so it can be replayed on top of the
+  // ray-traced image after RTX injection. The referenced vertex/index ranges are copied to CPU
+  // memory (the game may re-lock its dynamic buffers between capture and replay) and the draw
+  // is later re-issued through the regular D3D9 UP draw path with the captured pipeline state.
+  // Multi-stream draws (UE3 static meshes split position/tangents/UVs across streams) are
+  // interleaved into a single stream-0 layout with a remapped vertex declaration.
+  bool D3D9Rtx::captureDeferredUiDraw(const IndexContext& indexContext,
+                                      const VertexContext vertexContext[caps::MaxStreams],
+                                      const DrawContext& drawContext) {
+    if (m_deferredUiDraws.size() >= kMaxDeferredUiDrawsPerFrame) {
+      ONCE(Logger::warn("[RTX-DeferredUI] Too many deferred UI overlay draws in one frame; suppressing the rest. Check the rtx.deferredUiTextures tagging."));
+      return false;
+    }
+
+    // Only the programmable pipeline is supported (UE3 MaterialEffect overlays are always
+    // shader draws); fixed-function overlays would additionally need transform and texture
+    // stage state capture.
+    if (!m_parent->UseProgrammableVS() || !m_parent->UseProgrammablePS() ||
+        d3d9State().vertexShader == nullptr || d3d9State().pixelShader == nullptr) {
+      ONCE(Logger::warn("[RTX-DeferredUI] Fixed-function draw tagged as deferred UI overlay is not supported for replay; suppressing."));
+      return false;
+    }
+
+    if (d3d9State().vertexDecl == nullptr) {
+      return false;
+    }
+
+    // Instanced draws cannot be replayed through the UP path
+    if ((d3d9State().streamFreq[0] & 0x7FFFFFu) > 1) {
+      ONCE(Logger::warn("[RTX-DeferredUI] Instanced draw tagged as deferred UI overlay is not supported for replay; suppressing."));
+      return false;
+    }
+
+    uint32_t usedStreamMask = 0;
+    for (const auto& element : d3d9State().vertexDecl->GetElements()) {
+      if (element.Stream == 0xFF) {
+        continue; // D3DDECL_END
+      }
+      if (element.Stream >= caps::MaxStreams) {
+        return false;
+      }
+      usedStreamMask |= 1u << element.Stream;
+    }
+
+    if (usedStreamMask == 0) {
+      return false;
+    }
+
+    // Per-stream layout of the interleaved stream-0 vertex record used for replay
+    uint32_t streamBase[caps::MaxStreams] = {};
+    uint32_t combinedStride = 0;
+    for (const uint32_t s : bit::BitMask(usedStreamMask)) {
+      const VertexContext& v = vertexContext[s];
+      if (v.stride == 0 || v.mappedSlice.mapPtr == nullptr) {
+        return false;
+      }
+      if ((d3d9State().streamFreq[s] & D3DSTREAMSOURCE_INSTANCEDATA) != 0) {
+        ONCE(Logger::warn("[RTX-DeferredUI] Instance-data stream on a draw tagged as deferred UI overlay is not supported for replay; suppressing."));
+        return false;
+      }
+      streamBase[s] = combinedStride;
+      combinedStride += v.stride;
+    }
+
+    if (combinedStride == 0 || combinedStride > 0xFFFF) {
+      return false;
+    }
+
+    DeferredUiDraw draw;
+    draw.primitiveType = drawContext.PrimitiveType;
+    draw.primitiveCount = drawContext.PrimitiveCount;
+    draw.indexed = drawContext.Indexed != FALSE;
+    draw.vertexStride = combinedStride;
+
+    int64_t firstVertex = 0;
+    uint32_t vertexCount = 0;
+
+    if (draw.indexed) {
+      const uint32_t indexCount = GetVertexCount(drawContext.PrimitiveType, drawContext.PrimitiveCount);
+      if (indexCount == 0 || indexCount > kMaxDeferredUiIndices) {
+        ONCE(Logger::warn("[RTX-DeferredUI] Draw tagged as deferred UI overlay has too many indices for replay; suppressing."));
+        return false;
+      }
+
+      if (indexContext.indexType == VK_INDEX_TYPE_NONE_KHR || indexContext.indexBuffer.mapPtr == nullptr) {
+        return false;
+      }
+
+      const bool is16Bit = indexContext.indexType == VK_INDEX_TYPE_UINT16;
+      const uint32_t indexStride = is16Bit ? 2 : 4;
+      const size_t indexByteOffset = size_t(indexStride) * drawContext.StartIndex;
+      if (indexByteOffset + size_t(indexStride) * indexCount > indexContext.indexBuffer.length) {
+        return false;
+      }
+
+      const uint8_t* pIndexBase = static_cast<const uint8_t*>(indexContext.indexBuffer.mapPtr) + indexByteOffset;
+
+      uint32_t minIndex = std::numeric_limits<uint32_t>::max();
+      uint32_t maxIndex = 0;
+
+      // Scan the used index range, then rebase the copied indices onto the copied vertex
+      // window (widened to 32-bit for the replay draw)
+      draw.indexData.resize(indexCount);
+      const auto scanAndRebase = [&](const auto* pSrc) {
+        for (uint32_t i = 0; i < indexCount; i++) {
+          minIndex = std::min<uint32_t>(minIndex, pSrc[i]);
+          maxIndex = std::max<uint32_t>(maxIndex, pSrc[i]);
+        }
+        for (uint32_t i = 0; i < indexCount; i++) {
+          draw.indexData[i] = uint32_t(pSrc[i]) - minIndex;
+        }
+      };
+      if (is16Bit) {
+        scanAndRebase(reinterpret_cast<const uint16_t*>(pIndexBase));
+      } else {
+        scanAndRebase(reinterpret_cast<const uint32_t*>(pIndexBase));
+      }
+
+      vertexCount = maxIndex - minIndex + 1;
+      firstVertex = int64_t(drawContext.BaseVertexIndex) + minIndex;
+    } else {
+      vertexCount = GetVertexCount(drawContext.PrimitiveType, drawContext.PrimitiveCount);
+      firstVertex = drawContext.BaseVertexIndex; // StartVertex for DrawPrimitive, 0 for the UP path
+    }
+
+    if (vertexCount == 0 || firstVertex < 0) {
+      return false;
+    }
+
+    const size_t vertexBytes = size_t(vertexCount) * combinedStride;
+    if (vertexBytes > kMaxDeferredUiVertexBytes ||
+        m_deferredUiFrameVertexBytes + vertexBytes > kMaxDeferredUiFrameVertexBytes) {
+      ONCE(Logger::warn("[RTX-DeferredUI] Draw tagged as deferred UI overlay exceeds the vertex data replay budget; suppressing. Check the rtx.deferredUiTextures tagging."));
+      return false;
+    }
+
+    // Validate source ranges for every referenced stream before copying anything
+    for (const uint32_t s : bit::BitMask(usedStreamMask)) {
+      const VertexContext& v = vertexContext[s];
+      const size_t streamByteOffset = size_t(v.offset) + size_t(firstVertex) * v.stride;
+      if (streamByteOffset + size_t(vertexCount) * v.stride > v.mappedSlice.length) {
+        return false;
+      }
+    }
+
+    draw.vertexCount = vertexCount;
+    draw.vertexData.resize(vertexBytes);
+    for (const uint32_t s : bit::BitMask(usedStreamMask)) {
+      const VertexContext& v = vertexContext[s];
+      const uint8_t* pSrc = static_cast<const uint8_t*>(v.mappedSlice.mapPtr) + v.offset + size_t(firstVertex) * v.stride;
+      uint8_t* pDst = draw.vertexData.data() + streamBase[s];
+      for (uint32_t i = 0; i < vertexCount; i++) {
+        std::memcpy(pDst + size_t(i) * combinedStride, pSrc + size_t(i) * v.stride, v.stride);
+      }
+    }
+
+    // Vertex declaration for the replay: the original when everything already lives on
+    // stream 0, otherwise an internally created remap onto the interleaved stream-0 layout
+    if (usedStreamMask == 1u) {
+      draw.replayDecl = d3d9State().vertexDecl.ptr();
+    } else {
+      std::vector<D3DVERTEXELEMENT9> remappedElements;
+      remappedElements.reserve(d3d9State().vertexDecl->GetElements().size() + 1);
+      for (const auto& element : d3d9State().vertexDecl->GetElements()) {
+        if (element.Stream == 0xFF) {
+          continue;
+        }
+        D3DVERTEXELEMENT9 remapped = element;
+        remapped.Stream = 0;
+        remapped.Offset = WORD(streamBase[element.Stream] + element.Offset);
+        remappedElements.push_back(remapped);
+      }
+      remappedElements.push_back(D3DDECL_END());
+
+      Com<IDirect3DVertexDeclaration9> remappedDecl;
+      if (FAILED(m_parent->CreateVertexDeclaration(remappedElements.data(), &remappedDecl)) || remappedDecl == nullptr) {
+        ONCE(Logger::warn("[RTX-DeferredUI] Failed to create the remapped vertex declaration for a deferred UI overlay draw; suppressing."));
+        return false;
+      }
+      draw.replayDecl = remappedDecl;
+    }
+
+    m_deferredUiFrameVertexBytes += uint32_t(vertexBytes);
+
+    draw.vertexShader = d3d9State().vertexShader;
+    draw.pixelShader = d3d9State().pixelShader;
+
+    // Constants: only the ranges the shaders actually declare
+    const auto& vsMeta = d3d9State().vertexShader->GetCommonShader()->GetMeta();
+    const auto& psMeta = d3d9State().pixelShader->GetCommonShader()->GetMeta();
+
+    const uint32_t vsFloatCount = std::min<uint32_t>(vsMeta.maxConstIndexF, caps::MaxFloatConstantsVS);
+    const uint32_t psFloatCount = std::min<uint32_t>(psMeta.maxConstIndexF, caps::MaxFloatConstantsPS);
+    const uint32_t vsIntCount = std::min<uint32_t>(vsMeta.maxConstIndexI, caps::MaxOtherConstants);
+    const uint32_t psIntCount = std::min<uint32_t>(psMeta.maxConstIndexI, caps::MaxOtherConstants);
+    const uint32_t vsBoolDwords = (std::min<uint32_t>(vsMeta.maxConstIndexB, caps::MaxOtherConstants) + 31u) / 32u;
+    const uint32_t psBoolDwords = (std::min<uint32_t>(psMeta.maxConstIndexB, caps::MaxOtherConstants) + 31u) / 32u;
+
+    draw.vsFloatConsts.assign(d3d9State().vsConsts.fConsts, d3d9State().vsConsts.fConsts + vsFloatCount);
+    draw.psFloatConsts.assign(d3d9State().psConsts.fConsts, d3d9State().psConsts.fConsts + psFloatCount);
+    draw.vsIntConsts.assign(d3d9State().vsConsts.iConsts, d3d9State().vsConsts.iConsts + vsIntCount);
+    draw.psIntConsts.assign(d3d9State().psConsts.iConsts, d3d9State().psConsts.iConsts + psIntCount);
+    draw.vsBoolConsts.assign(d3d9State().vsConsts.bConsts, d3d9State().vsConsts.bConsts + vsBoolDwords);
+    draw.psBoolConsts.assign(d3d9State().psConsts.bConsts, d3d9State().psConsts.bConsts + psBoolDwords);
+
+    // Texture bindings for every sampler the shaders use (including used-but-unbound slots so
+    // the replay never samples whatever the app happens to have bound at replay time)
+    const uint32_t usedSamplerMask = m_parent->m_psShaderMasks.samplerMask | m_parent->m_vsShaderMasks.samplerMask;
+    for (const uint32_t idx : bit::BitMask(usedSamplerMask)) {
+      if (idx >= SamplerCount) {
+        continue;
+      }
+
+      DeferredUiDraw::TextureBinding binding;
+      binding.slot = idx;
+      binding.texture = d3d9State().textures[idx];
+      binding.samplerStates = d3d9State().samplerStates[idx];
+
+      // Track sampled render targets (scene color candidates for the refresh blit)
+      if (d3d9State().textures[idx] != nullptr && (m_parent->GetActiveRTTextures() & (1u << idx)) != 0) {
+        if (D3D9CommonTexture* texInfo = GetCommonTexture(d3d9State().textures[idx])) {
+          binding.renderTargetImage = texInfo->GetImage();
+        }
+      }
+
+      draw.textures.push_back(std::move(binding));
+    }
+
+    for (size_t i = 0; i < kDeferredUiRenderStates.size(); i++) {
+      draw.renderStates[i] = d3d9State().renderStates[kDeferredUiRenderStates[i]];
+    }
+
+    draw.viewport = d3d9State().viewport;
+    draw.scissorRect = d3d9State().scissorRect;
+
+    if (d3d9State().renderTargets[kRenderTargetIndex] != nullptr) {
+      const auto rtExtent = d3d9State().renderTargets[kRenderTargetIndex]->GetSurfaceExtent();
+      draw.sourceRenderTargetWidth = rtExtent.width;
+      draw.sourceRenderTargetHeight = rtExtent.height;
+    }
+
+    m_deferredUiDraws.push_back(std::move(draw));
+
+    ONCE(Logger::info("[RTX-DeferredUI] Captured a deferred UI overlay draw for post-injection replay."));
+    return true;
+  }
+
+  // Replays the deferred UI overlay draws captured this frame on top of the ray-traced image.
+  // Called right after RTX injection is queued (mid-frame UI trigger, or the EndFrame fallback)
+  // so the overlays land between the ray-traced blit and the game's UI rasterization.
+  void D3D9Rtx::replayDeferredUiDraws(IDirect3DSurface9* pOverrideRenderTarget,
+                                      const Rc<DxvkImage>& injectionTargetImage) {
+    if (m_deferredUiDraws.empty()) {
+      return;
+    }
+
+    // Take ownership up front: every early-out below must drop the captured draws rather
+    // than leave them queued for a later, incorrectly ordered replay point
+    std::vector<DeferredUiDraw> draws = std::move(m_deferredUiDraws);
+    m_deferredUiDraws.clear();
+
+    if (!deferredUiReplay()) {
+      return;
+    }
+
+    if (m_parent->ShouldRecord()) {
+      // Mid state-block recording: internal Set* calls would be recorded instead of applied
+      ONCE(Logger::warn("[RTX-DeferredUI] Skipping deferred UI overlay replay while a state block is being recorded."));
+      return;
+    }
+
+    ScopedCpuProfileZone();
+
+    // Refreshes the scene-color textures a replayed overlay samples with the current content
+    // of the injection target, so scene-reading overlay materials (fade lerps, scope warps,
+    // damage effects) composite over the ray-traced image instead of the stale rasterized
+    // scene. Invoked before every replayed draw: an overlay's output on the target is picked
+    // up by the next overlay's scene input, matching the game's own effect chaining.
+    auto refreshSampledSceneTargets = [&](const DeferredUiDraw& draw) {
+      if (!deferredUiRefreshSceneColor() || injectionTargetImage == nullptr) {
+        return;
+      }
+
+      for (const auto& binding : draw.textures) {
+        const Rc<DxvkImage>& sceneImage = binding.renderTargetImage;
+        if (sceneImage == nullptr || sceneImage == injectionTargetImage) {
+          continue;
+        }
+
+        // Only refresh plausible scene-color targets (aspect ratio matching the final
+        // image); small utility render targets keep their game-rendered content.
+        const VkExtent3D dstExtent = sceneImage->info().extent;
+        const VkExtent3D srcExtent = injectionTargetImage->info().extent;
+        const double a = double(dstExtent.width) * double(srcExtent.height);
+        const double b = double(dstExtent.height) * double(srcExtent.width);
+        const double denom = std::max(a, b);
+        if (denom <= 0.0 || (std::abs(a - b) / denom) >= 0.01) {
+          continue;
+        }
+
+        m_parent->EmitCs([cSrcImage = injectionTargetImage, cDstImage = sceneImage](DxvkContext* ctx) {
+          RtxContext::blitImageHelper(ctx, cSrcImage, cDstImage, VkFilter::VK_FILTER_NEAREST);
+        });
+      }
+    };
+
+    // ---- save every piece of application state the replay overrides ----
+
+    uint32_t maxVsFloat = 0, maxPsFloat = 0, maxVsInt = 0, maxPsInt = 0, maxVsBool = 0, maxPsBool = 0;
+    uint32_t touchedTextureSlots = 0;
+    for (const auto& draw : draws) {
+      maxVsFloat = std::max<uint32_t>(maxVsFloat, uint32_t(draw.vsFloatConsts.size()));
+      maxPsFloat = std::max<uint32_t>(maxPsFloat, uint32_t(draw.psFloatConsts.size()));
+      maxVsInt = std::max<uint32_t>(maxVsInt, uint32_t(draw.vsIntConsts.size()));
+      maxPsInt = std::max<uint32_t>(maxPsInt, uint32_t(draw.psIntConsts.size()));
+      maxVsBool = std::max<uint32_t>(maxVsBool, uint32_t(draw.vsBoolConsts.size()));
+      maxPsBool = std::max<uint32_t>(maxPsBool, uint32_t(draw.psBoolConsts.size()));
+      for (const auto& binding : draw.textures) {
+        touchedTextureSlots |= 1u << binding.slot;
+      }
+    }
+
+    Com<IDirect3DVertexDeclaration9> savedDecl(d3d9State().vertexDecl.ptr());
+    Com<IDirect3DVertexShader9> savedVertexShader(d3d9State().vertexShader.ptr());
+    Com<IDirect3DPixelShader9> savedPixelShader(d3d9State().pixelShader.ptr());
+    Com<IDirect3DSurface9> savedRenderTarget(pOverrideRenderTarget != nullptr ? d3d9State().renderTargets[kRenderTargetIndex].ptr() : nullptr);
+    Com<IDirect3DSurface9> savedDepthStencil(d3d9State().depthStencil.ptr());
+    Com<IDirect3DVertexBuffer9> savedStream0(d3d9State().vertexBuffers[0].vertexBuffer.ptr());
+    const UINT savedStream0Offset = d3d9State().vertexBuffers[0].offset;
+    const UINT savedStream0Stride = d3d9State().vertexBuffers[0].stride;
+    Com<IDirect3DIndexBuffer9> savedIndices(d3d9State().indices.ptr());
+    const UINT savedStream0Freq = d3d9State().streamFreq[0];
+
+    std::vector<Vector4> savedVsFloat(d3d9State().vsConsts.fConsts, d3d9State().vsConsts.fConsts + maxVsFloat);
+    std::vector<Vector4> savedPsFloat(d3d9State().psConsts.fConsts, d3d9State().psConsts.fConsts + maxPsFloat);
+    std::vector<Vector4i> savedVsInt(d3d9State().vsConsts.iConsts, d3d9State().vsConsts.iConsts + maxVsInt);
+    std::vector<Vector4i> savedPsInt(d3d9State().psConsts.iConsts, d3d9State().psConsts.iConsts + maxPsInt);
+    std::vector<uint32_t> savedVsBool(d3d9State().vsConsts.bConsts, d3d9State().vsConsts.bConsts + maxVsBool);
+    std::vector<uint32_t> savedPsBool(d3d9State().psConsts.bConsts, d3d9State().psConsts.bConsts + maxPsBool);
+
+    struct SavedTextureSlot {
+      uint32_t slot;
+      Com<IDirect3DBaseTexture9> texture;
+      std::array<DWORD, SamplerStateCount> samplerStates;
+    };
+    std::vector<SavedTextureSlot> savedTextureSlots;
+    for (const uint32_t idx : bit::BitMask(touchedTextureSlots)) {
+      SavedTextureSlot saved;
+      saved.slot = idx;
+      saved.texture = d3d9State().textures[idx];
+      saved.samplerStates = d3d9State().samplerStates[idx];
+      savedTextureSlots.push_back(std::move(saved));
+    }
+
+    std::array<DWORD, kDeferredUiRenderStates.size()> savedRenderStates;
+    for (size_t i = 0; i < kDeferredUiRenderStates.size(); i++) {
+      savedRenderStates[i] = d3d9State().renderStates[kDeferredUiRenderStates[i]];
+    }
+
+    const D3DVIEWPORT9 savedViewport = d3d9State().viewport;
+    const RECT savedScissor = d3d9State().scissorRect;
+
+    // ---- replay ----
+
+    m_replayingDeferredUiDraws = true;
+
+    if (pOverrideRenderTarget != nullptr) {
+      m_parent->SetRenderTarget(0, pOverrideRenderTarget);
+    }
+
+    // Overlays composite over the final image: depth/stencil contents at this point in the
+    // frame are meaningless, and an incompatible depth surface must not clip the render area.
+    m_parent->SetDepthStencilSurface(nullptr);
+    m_parent->SetStreamSourceFreq(0, 1);
+
+    uint32_t replayTargetWidth = 0, replayTargetHeight = 0;
+    if (d3d9State().renderTargets[kRenderTargetIndex] != nullptr) {
+      const auto rtExtent = d3d9State().renderTargets[kRenderTargetIndex]->GetSurfaceExtent();
+      replayTargetWidth = rtExtent.width;
+      replayTargetHeight = rtExtent.height;
+    }
+
+    for (const auto& draw : draws) {
+      // Sync the overlay's scene inputs with the target's current content (ray-traced blit
+      // plus any previously replayed overlays) before it draws
+      refreshSampledSceneTargets(draw);
+
+      m_parent->SetVertexDeclaration(draw.replayDecl.ptr());
+      m_parent->SetVertexShader(draw.vertexShader.ptr());
+      m_parent->SetPixelShader(draw.pixelShader.ptr());
+
+      if (!draw.vsFloatConsts.empty()) {
+        m_parent->SetVertexShaderConstantF(0, reinterpret_cast<const float*>(draw.vsFloatConsts.data()), UINT(draw.vsFloatConsts.size()));
+      }
+      if (!draw.psFloatConsts.empty()) {
+        m_parent->SetPixelShaderConstantF(0, reinterpret_cast<const float*>(draw.psFloatConsts.data()), UINT(draw.psFloatConsts.size()));
+      }
+      if (!draw.vsIntConsts.empty()) {
+        m_parent->SetVertexShaderConstantI(0, reinterpret_cast<const int*>(draw.vsIntConsts.data()), UINT(draw.vsIntConsts.size()));
+      }
+      if (!draw.psIntConsts.empty()) {
+        m_parent->SetPixelShaderConstantI(0, reinterpret_cast<const int*>(draw.psIntConsts.data()), UINT(draw.psIntConsts.size()));
+      }
+      for (uint32_t i = 0; i < draw.vsBoolConsts.size(); i++) {
+        m_parent->SetVertexBoolBitfield(i, ~0u, draw.vsBoolConsts[i]);
+      }
+      for (uint32_t i = 0; i < draw.psBoolConsts.size(); i++) {
+        m_parent->SetPixelBoolBitfield(i, ~0u, draw.psBoolConsts[i]);
+      }
+
+      for (const auto& binding : draw.textures) {
+        m_parent->SetStateTexture(binding.slot, binding.texture.ptr());
+        for (uint32_t type = D3DSAMP_ADDRESSU; type < SamplerStateCount; type++) {
+          m_parent->SetStateSamplerState(binding.slot, D3DSAMPLERSTATETYPE(type), binding.samplerStates[type]);
+        }
+      }
+
+      for (size_t i = 0; i < kDeferredUiRenderStates.size(); i++) {
+        m_parent->SetRenderState(kDeferredUiRenderStates[i], draw.renderStates[i]);
+      }
+      m_parent->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
+      m_parent->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+      m_parent->SetRenderState(D3DRS_STENCILENABLE, FALSE);
+
+      // Rescale the captured viewport/scissor when the capture-time render target and the
+      // replay target differ in size (e.g. overlays captured on a scaled scene target)
+      D3DVIEWPORT9 viewport = draw.viewport;
+      RECT scissor = draw.scissorRect;
+      if (replayTargetWidth != 0 && replayTargetHeight != 0 &&
+          draw.sourceRenderTargetWidth != 0 && draw.sourceRenderTargetHeight != 0 &&
+          (draw.sourceRenderTargetWidth != replayTargetWidth || draw.sourceRenderTargetHeight != replayTargetHeight)) {
+        const double scaleX = double(replayTargetWidth) / double(draw.sourceRenderTargetWidth);
+        const double scaleY = double(replayTargetHeight) / double(draw.sourceRenderTargetHeight);
+        viewport.X = DWORD(viewport.X * scaleX);
+        viewport.Y = DWORD(viewport.Y * scaleY);
+        viewport.Width = std::max<DWORD>(1, DWORD(viewport.Width * scaleX));
+        viewport.Height = std::max<DWORD>(1, DWORD(viewport.Height * scaleY));
+        scissor.left = LONG(scissor.left * scaleX);
+        scissor.right = LONG(scissor.right * scaleX);
+        scissor.top = LONG(scissor.top * scaleY);
+        scissor.bottom = LONG(scissor.bottom * scaleY);
+      }
+      m_parent->SetViewport(&viewport);
+      m_parent->SetScissorRect(&scissor);
+
+      if (draw.indexed) {
+        m_parent->DrawIndexedPrimitiveUP(draw.primitiveType, 0, draw.vertexCount, draw.primitiveCount,
+                                         draw.indexData.data(), D3DFMT_INDEX32,
+                                         draw.vertexData.data(), draw.vertexStride);
+      } else {
+        m_parent->DrawPrimitiveUP(draw.primitiveType, draw.primitiveCount,
+                                  draw.vertexData.data(), draw.vertexStride);
+      }
+    }
+
+    // ---- restore the application state ----
+
+    if (pOverrideRenderTarget != nullptr && savedRenderTarget != nullptr) {
+      m_parent->SetRenderTarget(0, savedRenderTarget.ptr());
+    }
+    m_parent->SetDepthStencilSurface(savedDepthStencil.ptr());
+
+    m_parent->SetVertexDeclaration(savedDecl.ptr());
+    m_parent->SetVertexShader(savedVertexShader.ptr());
+    m_parent->SetPixelShader(savedPixelShader.ptr());
+
+    if (maxVsFloat != 0) {
+      m_parent->SetVertexShaderConstantF(0, reinterpret_cast<const float*>(savedVsFloat.data()), maxVsFloat);
+    }
+    if (maxPsFloat != 0) {
+      m_parent->SetPixelShaderConstantF(0, reinterpret_cast<const float*>(savedPsFloat.data()), maxPsFloat);
+    }
+    if (maxVsInt != 0) {
+      m_parent->SetVertexShaderConstantI(0, reinterpret_cast<const int*>(savedVsInt.data()), maxVsInt);
+    }
+    if (maxPsInt != 0) {
+      m_parent->SetPixelShaderConstantI(0, reinterpret_cast<const int*>(savedPsInt.data()), maxPsInt);
+    }
+    for (uint32_t i = 0; i < maxVsBool; i++) {
+      m_parent->SetVertexBoolBitfield(i, ~0u, savedVsBool[i]);
+    }
+    for (uint32_t i = 0; i < maxPsBool; i++) {
+      m_parent->SetPixelBoolBitfield(i, ~0u, savedPsBool[i]);
+    }
+
+    for (const auto& saved : savedTextureSlots) {
+      m_parent->SetStateTexture(saved.slot, saved.texture.ptr());
+      for (uint32_t type = D3DSAMP_ADDRESSU; type < SamplerStateCount; type++) {
+        m_parent->SetStateSamplerState(saved.slot, D3DSAMPLERSTATETYPE(type), saved.samplerStates[type]);
+      }
+    }
+
+    for (size_t i = 0; i < kDeferredUiRenderStates.size(); i++) {
+      m_parent->SetRenderState(kDeferredUiRenderStates[i], savedRenderStates[i]);
+    }
+
+    m_parent->SetViewport(&savedViewport);
+    m_parent->SetScissorRect(&savedScissor);
+
+    m_parent->SetStreamSource(0, savedStream0.ptr(), savedStream0Offset, savedStream0Stride);
+    m_parent->SetIndices(savedIndices.ptr());
+    m_parent->SetStreamSourceFreq(0, savedStream0Freq);
+
+    m_replayingDeferredUiDraws = false;
+
+    ONCE(Logger::info(str::format("[RTX-DeferredUI] Replayed ", draws.size(), " deferred UI overlay draw(s) after RTX injection.")));
   }
 
   // Folds the per-instance VS transform constants (LocalToWorld, or the leading bone
@@ -6636,7 +7330,7 @@ namespace dxvk {
       }
     }
 
-    const auto [status, triggerRtxInjection] = makeDrawCallType(drawContext);
+    const auto [status, triggerRtxInjection, deferUntilInjection] = makeDrawCallType(drawContext);
 
     // When raytracing is enabled we want to completely remove the ignored drawcalls from further processing as early as possible
     const PrepareDrawFlags prepareFlagsForIgnoredDraws = RtxOptions::enableRaytracing()
@@ -6647,6 +7341,20 @@ namespace dxvk {
       return finishPrepare(prepareFlagsForIgnoredDraws);
     }
 
+    // Deferred UI overlay: snapshot the draw for post-injection replay and suppress it here.
+    // Executing it now would rasterize into a pre-injection target that the ray-traced blit
+    // overwrites; letting it trigger injection would end the ray-traced scene mid-frame.
+    if (deferUntilInjection) {
+      if (deferredUiReplay() && captureDeferredUiDraw(indexContext, vertexContext, drawContext)) {
+        m_ue3LastDrawDecision = "deferred UI overlay (captured for post-injection replay)";
+      } else {
+        m_ue3LastDrawDecision = deferredUiReplay()
+                                ? "deferred UI overlay (capture unsupported, suppressed)"
+                                : "deferred UI overlay (suppressed)";
+      }
+      return finishPrepare(prepareFlagsForIgnoredDraws);
+    }
+
     if (triggerRtxInjection) {
       // Bind all resources required for this drawcall to context first (i.e. render targets)
       m_parent->PrepareDraw(drawContext.PrimitiveType);
@@ -6654,6 +7362,14 @@ namespace dxvk {
       triggerInjectRTX();
 
       m_rtxInjectTriggered = true;
+
+      // Replay deferred overlays now, before this triggering UI draw executes: the required
+      // order is ray-traced blit, then deferred overlays, then the game's genuine UI on top.
+      // Replaying any later would put overlays above draws tagged via rtx.uiTextures.
+      if (!m_deferredUiDraws.empty()) {
+        replayDeferredUiDraws(nullptr, getCurrentRenderTargetImage());
+      }
+
       return finishPrepare(PrepareDrawFlag::PreserveDrawCallAndItsState);
     }
 
@@ -9030,6 +9746,12 @@ namespace dxvk {
   }
 
   PrepareDrawFlags D3D9Rtx::PrepareDrawGeometryForRT(const bool indexed, const DrawContext& context) {
+    // Draws issued internally by the deferred UI overlay replay bypass classification and
+    // execute as plain raster draws
+    if (m_replayingDeferredUiDraws) {
+      return PrepareDrawFlag::PreserveDrawCallAndItsState;
+    }
+
     if (!RtxOptions::enableRaytracing() || !m_enableDrawCallConversion) {
       return PrepareDrawFlag::PreserveDrawCallAndItsState;
     }
@@ -9079,6 +9801,12 @@ namespace dxvk {
                                                        const uint32_t vertexSize,
                                                        const uint32_t vertexStride,
                                                        const DrawContext& drawContext) {
+    // Draws issued internally by the deferred UI overlay replay bypass classification and
+    // execute as plain raster draws
+    if (m_replayingDeferredUiDraws) {
+      return PrepareDrawFlag::PreserveDrawCallAndItsState;
+    }
+
     if (!RtxOptions::enableRaytracing() || !m_enableDrawCallConversion) {
       return PrepareDrawFlag::PreserveDrawCallAndItsState;
     }
@@ -9222,6 +9950,24 @@ namespace dxvk {
     m_parent->EmitCs([currentReflexFrameId, targetImage, callInjectRtx](DxvkContext* ctx) { 
       static_cast<RtxContext*>(ctx)->endFrame(currentReflexFrameId, targetImage, callInjectRtx); 
     });
+
+    // Replay any deferred overlays that no mid-frame injection flushed. Typically this means
+    // no trigger draw fired this frame and the endFrame call above performs the fallback
+    // injection onto the backbuffer; the overlays then composite on top of that blit.
+    if (!m_deferredUiDraws.empty()) {
+      if (callInjectRtx) {
+        Com<IDirect3DSurface9> backBuffer;
+        if (SUCCEEDED(m_parent->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backBuffer)) && backBuffer != nullptr) {
+          replayDeferredUiDraws(backBuffer.ptr(), targetImage);
+        } else {
+          m_deferredUiDraws.clear();
+        }
+      } else {
+        // Not presenting normally (e.g. alt-tab end-of-frame events): drop leftovers
+        m_deferredUiDraws.clear();
+      }
+    }
+    m_deferredUiFrameVertexBytes = 0;
 
     pruneUe3StaticVertexCaptureCache();
     pruneUe3GeometryMemoCache();

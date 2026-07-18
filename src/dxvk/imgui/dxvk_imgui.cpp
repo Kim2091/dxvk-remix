@@ -174,6 +174,7 @@ namespace dxvk {
 
   std::vector<RtxTextureOption> rtxTextureOptions = {
     {"uitextures", "UI Texture", &RtxOptions::uiTexturesObject()},
+    {"deferreduitextures", "Deferred UI Texture (overlay)", &RtxOptions::deferredUiTexturesObject()},
     {"worldspaceuitextures", "World Space UI Texture", &RtxOptions::worldSpaceUiTexturesObject()},
     {"worldspaceuibackgroundtextures", "World Space UI Background Texture", &RtxOptions::worldSpaceUiBackgroundTexturesObject()},
     {"skytextures", "Sky Texture", &RtxOptions::skyBoxTexturesObject()},

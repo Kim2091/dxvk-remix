@@ -239,6 +239,28 @@ namespace dxvk {
                "between nearby frames and log the transition with pass classification and shader hashes. A draw whose "
                "status flaps frame-to-frame manifests as geometry flickering in and out of the raytraced scene; this "
                "probe identifies which submission-side decision is responsible. Logs are capped per draw identity.");
+    RTX_OPTION("rtx.d3d9", bool, deferredUiReplay, true,
+               "Replay behavior for deferred UI overlay draws (rtx.deferredUiTextures / rtx.d3d9.deferredUiPixelShaders): "
+               "when enabled, each tagged draw is snapshotted (vertex/index data, shaders, constants, textures, blend "
+               "state) and re-issued on top of the ray-traced image immediately after RTX injection, below any UI the "
+               "game rasterizes afterwards. This preserves the overlay's visual contribution without ending the "
+               "ray-traced scene at the overlay's mid-frame draw position. When disabled, tagged draws are simply "
+               "suppressed before injection (overlays become invisible while ray tracing, but still never break the scene).");
+    RTX_OPTION("rtx.d3d9", fast_unordered_set, deferredUiPixelShaders, {},
+               "Pixel shader bytecode hashes whose draws are treated as deferred UI overlays (see rtx.deferredUiTextures).\n"
+               "Prefer this over texture tagging when the overlay samples a render target (e.g. UE3's scene color copy): "
+               "render-target texture hashes change every time the game recreates the target (respawn/level load), while "
+               "the overlay material's pixel shader hash is stable across respawns, level loads and sessions. Whenever a "
+               "tagged texture matches a draw, the runtime logs that draw's pixel shader hash ([RTX-DeferredUI] log lines) "
+               "so the tag can be moved into this option.\n"
+               "A pixel shader tag is treated as explicit intent: unlike texture tags it is not subject to the engine "
+               "post-process shader exclusion (the world-geometry and depth-write guards still apply).");
+    RTX_OPTION("rtx.d3d9", bool, deferredUiRefreshSceneColor, true,
+               "When replaying deferred UI overlay draws, first copy the ray-traced output into any scene-color "
+               "render-target texture the overlay samples (e.g. UE3's resolved SceneColorTexture). Overlay materials "
+               "that read the scene (fade lerps, scope distortion, damage effects) then composite over the ray-traced "
+               "image instead of the stale rasterized scene. The copy runs before each replayed draw, so chained "
+               "effects see the previous overlay's output. Disable if a replayed overlay shows artifacts.");
     RTX_OPTION("rtx", bool, enableIndexBufferMemoization, true, "CPU performance optimization, should generally be enabled.  Will reduce main thread time by caching processIndexBuffer operations and reusing when possible, this will come at the expense of some CPU RAM.");
     RTX_OPTION("rtx", uint32_t, numGeometryProcessingThreads, 2, "The desired number of CPU threads to dedicate to geometry processing  Will be limited by the number of CPU cores.  There may be some advantage to lowering this number in games which are fairly simple and use a low number of draw calls per frame.  The default was determined by looking at a game with around 2000 draw calls per frame, and with a reasonably high average triangle count per draw.");
 
@@ -483,6 +505,7 @@ namespace dxvk {
     fast_unordered_cache<Ue3VertexFactoryType> m_ue3VertexFactoryCache;
 
     static Ue3VertexFactoryType classifyUe3VertexFactory(const D3D9VertexElements& elements);
+    static bool isUe3WorldGeometryVertexFactory(Ue3VertexFactoryType type);
 
     struct Ue3ShaderFeatureInfo {
       bool initialized = false;
@@ -795,10 +818,107 @@ namespace dxvk {
 
     void triggerInjectRTX();
 
+    // rtx.deferredUiTextures support: self-contained snapshots of overlay draws captured
+    // mid-scene and replayed on top of the ray-traced image once RTX injection has fired.
+    // The snapshot copies the referenced vertex/index ranges to CPU memory (immune to the
+    // game re-locking its dynamic buffers between capture and replay) and is re-issued
+    // through the regular D3D9 UP draw path.
+    static constexpr std::array<D3DRENDERSTATETYPE, 25> kDeferredUiRenderStates = {
+      D3DRS_ALPHABLENDENABLE, D3DRS_SRCBLEND, D3DRS_DESTBLEND, D3DRS_BLENDOP,
+      D3DRS_SEPARATEALPHABLENDENABLE, D3DRS_SRCBLENDALPHA, D3DRS_DESTBLENDALPHA, D3DRS_BLENDOPALPHA,
+      D3DRS_BLENDFACTOR,
+      D3DRS_ALPHATESTENABLE, D3DRS_ALPHAREF, D3DRS_ALPHAFUNC,
+      D3DRS_CULLMODE, D3DRS_FILLMODE, D3DRS_SHADEMODE,
+      D3DRS_COLORWRITEENABLE,
+      D3DRS_FOGENABLE,
+      D3DRS_SRGBWRITEENABLE,
+      D3DRS_SCISSORTESTENABLE,
+      D3DRS_CLIPPING, D3DRS_CLIPPLANEENABLE,
+      // captured for save/restore symmetry; forced off while replaying (overlays composite
+      // over the final image, depth/stencil contents at replay time are meaningless)
+      D3DRS_ZENABLE, D3DRS_ZWRITEENABLE, D3DRS_ZFUNC, D3DRS_STENCILENABLE,
+    };
+
+    static constexpr uint32_t kMaxDeferredUiDrawsPerFrame = 16;
+    static constexpr uint32_t kMaxDeferredUiVertexBytes = 1024 * 1024;      // per draw, across all streams
+    static constexpr uint32_t kMaxDeferredUiFrameVertexBytes = 8 * 1024 * 1024; // per frame, across all draws
+    static constexpr uint32_t kMaxDeferredUiIndices = 256 * 1024;
+
+    struct DeferredUiDraw {
+      D3DPRIMITIVETYPE primitiveType = D3DPT_TRIANGLELIST;
+      UINT primitiveCount = 0;
+      bool indexed = false;
+      uint32_t vertexCount = 0;
+
+      // vertex data for the window [firstVertex, firstVertex + vertexCount), with all
+      // referenced streams interleaved into a single stream-0 layout for UP replay
+      uint32_t vertexStride = 0;
+      std::vector<uint8_t> vertexData;
+
+      // rebased onto the copied vertex window, widened to 32-bit
+      std::vector<uint32_t> indexData;
+
+      // the declaration to replay with: the original when it only references stream 0,
+      // otherwise an internally created remap of every element onto the interleaved stream 0
+      Com<IDirect3DVertexDeclaration9> replayDecl;
+      Com<D3D9VertexShader, false> vertexShader;
+      Com<D3D9PixelShader, false> pixelShader;
+
+      std::vector<Vector4> vsFloatConsts;
+      std::vector<Vector4> psFloatConsts;
+      std::vector<Vector4i> vsIntConsts;
+      std::vector<Vector4i> psIntConsts;
+      std::vector<uint32_t> vsBoolConsts;
+      std::vector<uint32_t> psBoolConsts;
+
+      struct TextureBinding {
+        uint32_t slot = 0;
+        Com<IDirect3DBaseTexture9> texture;
+        std::array<DWORD, SamplerStateCount> samplerStates = {};
+        // non-null when the bound texture is a render target (scene color candidate for
+        // the rtx.d3d9.deferredUiRefreshSceneColor blit)
+        Rc<DxvkImage> renderTargetImage;
+      };
+      std::vector<TextureBinding> textures;
+
+      std::array<DWORD, kDeferredUiRenderStates.size()> renderStates = {};
+      D3DVIEWPORT9 viewport = {};
+      RECT scissorRect = {};
+      uint32_t sourceRenderTargetWidth = 0;
+      uint32_t sourceRenderTargetHeight = 0;
+    };
+
+    std::vector<DeferredUiDraw> m_deferredUiDraws;
+    uint32_t m_deferredUiFrameVertexBytes = 0;
+    bool m_replayingDeferredUiDraws = false;
+
+    // one-shot log keys (pixel shader hash mixed with the defer/refuse decision) for the
+    // [RTX-DeferredUI] tag diagnostics
+    fast_unordered_set m_deferredUiLoggedDecisions;
+
+    // Checks whether the draw matches rtx.deferredUiTextures (by texture image hash, or by the
+    // stable descriptor hash for render-target textures) or rtx.d3d9.deferredUiPixelShaders.
+    bool isDeferredUiTaggedDraw(XXH64_hash_t* pMatchedTextureHash = nullptr,
+                                bool* pMatchedTextureIsRenderTarget = nullptr,
+                                XXH64_hash_t* pMatchedRtDescriptorHash = nullptr) const;
+
+    bool captureDeferredUiDraw(const IndexContext& indexContext,
+                               const VertexContext vertexContext[caps::MaxStreams],
+                               const DrawContext& drawContext);
+    // pOverrideRenderTarget: bind this surface as RT0 for the replay (EndFrame fallback path,
+    // where the app's current RT0 is unrelated); nullptr replays onto the currently bound RT0
+    // (mid-frame injection path). injectionTargetImage: the image the ray-traced result was
+    // blitted to, used as the source for the scene-color refresh blit (may be null to skip).
+    void replayDeferredUiDraws(IDirect3DSurface9* pOverrideRenderTarget,
+                               const Rc<DxvkImage>& injectionTargetImage);
+    Rc<DxvkImage> getCurrentRenderTargetImage() const;
 
     struct DrawCallType {
       RtxGeometryStatus status;
       bool triggerRtxInjection;
+      // rtx.deferredUiTextures: rasterize on top of the ray-traced image without triggering
+      // injection - the draw is captured and replayed after injection fires later in the frame
+      bool deferUntilInjection = false;
     };
     DrawCallType makeDrawCallType(const DrawContext& drawContext);
 

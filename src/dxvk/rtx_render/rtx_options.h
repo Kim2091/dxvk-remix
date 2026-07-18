@@ -215,6 +215,13 @@ namespace dxvk {
                   "Textures on draw calls that should be treated as screenspace UI elements.\n"
                   "All exclusively UI-related textures should be classified this way and doing so allows the UI to be rasterized on top of the ray traced scene like usual.\n"
                   "Note that currently the first UI texture encountered triggers RTX injection (though this may change in the future as this does cause issues with games that draw UI mid-frame).");
+    RTX_OPTION("rtx", fast_unordered_set, deferredUiTextures, {},
+                  "Textures on overlay draw calls (fullscreen fades, scope/damage screen effects) that the game renders mid-scene, before 3D rendering has finished for the frame.\n"
+                  "Like rtx.uiTextures these draws are rasterized on top of the ray-traced image, but they never trigger RTX injection; instead each tagged draw is captured and replayed right after RTX injection fires later in the frame (at the first real UI draw, or at the end-of-frame fallback).\n"
+                  "Use this for post-process style overlays (e.g. UE3 MaterialEffect fades) that would otherwise end the ray-traced scene early and force later geometry (such as first-person meshes) back to rasterization.\n"
+                  "For render-target textures the stable descriptor hash matches in addition to the (recreation-dependent) image hash, and rtx.d3d9.deferredUiPixelShaders can tag the overlay's pixel shader instead.\n"
+                  "Tagging is not absolute: depth-writing draws, world geometry (anything beyond trivial depth-test-off overlay quads), and engine post-process shaders are refused deferral and classified normally, so shared textures cannot pull scene geometry out of the ray-traced world.\n"
+                  "See rtx.d3d9.deferredUiReplay and rtx.d3d9.deferredUiRefreshSceneColor for the replay behavior.");
     RTX_OPTION("rtx", fast_unordered_set, worldSpaceUiTextures, {},
                   "Textures on draw calls that should be treated as worldspace UI elements.\n"
                   "Unlike typical UI textures this option is useful for improved rendering of UI elements which appear as part of the scene (moving around in 3D space rather than as a screenspace element).");
