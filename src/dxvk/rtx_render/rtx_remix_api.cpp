@@ -744,6 +744,13 @@ namespace {
       if (flags & REMIXAPI_INSTANCE_CATEGORY_BIT_SKY) {
         return CameraType::Sky;
       }
+      // Fork (2026-07-18): external view-model draws. Routes the draw through
+      // the VIEW_MODEL camera set up via remixapi SetupCamera, giving external
+      // 1st-person geometry its own FOV and the runtime's view-model handling
+      // (same DrawCallState::cameraType path the D3D9 frontend uses).
+      if (flags & REMIXAPI_INSTANCE_CATEGORY_BIT_VIEW_MODEL) {
+        return CameraType::ViewModel;
+      }
       return CameraType::Main;
     }
 
@@ -899,7 +906,13 @@ dxvk::ExternalDrawState dxvk::RemixAPIPrivateAccessor::toRtDrawState(const remix
 {
   auto prototype = DrawCallState {};
   {
-    prototype.cameraType = CameraType::Main;
+    // Fork (2026-07-18): external draws tagged with the fork-added
+    // VIEW_MODEL category bit opt into the runtime's view-model path
+    // (DrawCallState::cameraType, same as the D3D9 frontend's vm draws).
+    // Everything else keeps the historical hardcoded Main -- deliberately
+    // NOT deriving Sky here so existing API clients stay byte-identical.
+    prototype.cameraType = (info.categoryFlags & REMIXAPI_INSTANCE_CATEGORY_BIT_VIEW_MODEL)
+        ? CameraType::ViewModel : CameraType::Main;
     prototype.transformData.objectToWorld = convert::tomat4(info.transform);
     prototype.transformData.textureTransform = Matrix4 {};
     prototype.transformData.texgenMode = TexGenMode::None;
