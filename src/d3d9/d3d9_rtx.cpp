@@ -4793,6 +4793,18 @@ namespace dxvk {
     o.vertexColorIsBakedLighting = RtxOptions::vertexColorIsBakedLightingObject().get();
     o.drawCallRange = RtxOptions::drawCallRangeObject().get();
 
+    o.uiTextures = &RtxOptions::uiTexturesObject().get();
+    o.deferredUiTextures = &RtxOptions::deferredUiTexturesObject().get();
+    o.deferredUiPixelShaders = &deferredUiPixelShadersObject().get();
+    o.lightmapTextures = &RtxOptions::lightmapTexturesObject().get();
+    o.neverAlbedoTextures = &RtxOptions::neverAlbedoTexturesObject().get();
+    o.preferredAlbedoTextures = &RtxOptions::preferredAlbedoTexturesObject().get();
+    o.smoothNormalsTextures = &RtxOptions::smoothNormalsTexturesObject().get();
+    o.ignoreBakedLightingTextures = &RtxOptions::ignoreBakedLightingTexturesObject().get();
+    o.raytracedRenderTargetTextures = &RtxOptions::raytracedRenderTargetTexturesObject().get();
+    o.vsTexcoordCaptureOutlierTextures = &vsTexcoordCaptureOutlierTexturesObject().get();
+    o.ue3MicConstantIdentityExcludedShaders = &ue3MicConstantIdentityExcludedShadersObject().get();
+
     o.valid = true;
   }
 
@@ -5852,7 +5864,7 @@ namespace dxvk {
       case D3DDECLUSAGE_COLOR:
         if (element.UsageIndex == 0 &&
             !m_frameOptions.ignoreAllVertexColorBakedLighting && !m_frameOptions.ue3EngineMode &&
-            !lookupHash(RtxOptions::ignoreBakedLightingTextures(), m_activeDrawCallState.materialData.colorTextures[0].getImageHash())) {
+            !lookupHash(*m_frameOptions.ignoreBakedLightingTextures, m_activeDrawCallState.materialData.colorTextures[0].getImageHash())) {
           // only treat COLOR0 as a packed 8-bit UNORM color, UE3 can use COLOR semantics for non-color data which the rtx interleaver does not interpret as vertex color
           const VkFormat fmt = DecodeDecltype(D3DDECLTYPE(element.Type));
           if (fmt == VK_FORMAT_B8G8R8A8_UNORM || fmt == VK_FORMAT_R8G8B8A8_UNORM) {
@@ -6246,6 +6258,9 @@ namespace dxvk {
 
         for (const Ue3CameraConstantsCache& slot : m_ue3CameraConstantsCache) {
           if (slot.valid && slot.hash == constantsHash) {
+            if (slot.extractionFailed) {
+              return false;
+            }
             outWorldToView = slot.worldToView;
             outViewToProjection = slot.viewToProjection;
             outUsedTranspose = slot.usedTranspose;
@@ -6258,18 +6273,22 @@ namespace dxvk {
         Matrix4 ue3ViewToProjection;
         bool usedTranspose = false;
         float reconstructionError = 0.0f;
-        if (!tryExtractUe3WorldToViewAndProjectionFromShaderConstants(d3d9State().vsConsts, viewProjReg, viewOriginReg, ue3WorldToView, ue3ViewToProjection, &usedTranspose, &reconstructionError)) {
-          return false;
-        }
+        const bool extracted = tryExtractUe3WorldToViewAndProjectionFromShaderConstants(
+            d3d9State().vsConsts, viewProjReg, viewOriginReg, ue3WorldToView, ue3ViewToProjection, &usedTranspose, &reconstructionError);
 
         Ue3CameraConstantsCache& slot = m_ue3CameraConstantsCache[m_ue3CameraConstantsCacheNextSlot];
         m_ue3CameraConstantsCacheNextSlot = (m_ue3CameraConstantsCacheNextSlot + 1u) % kUe3CameraConstantsCacheSlots;
         slot.hash = constantsHash;
         slot.valid = true;
+        slot.extractionFailed = !extracted;
         slot.usedTranspose = usedTranspose;
         slot.worldToView = ue3WorldToView;
         slot.viewToProjection = ue3ViewToProjection;
         slot.reconstructionError = reconstructionError;
+
+        if (!extracted) {
+          return false;
+        }
 
         outWorldToView = ue3WorldToView;
         outViewToProjection = ue3ViewToProjection;
@@ -6690,7 +6709,7 @@ namespace dxvk {
           continue;
 
         const XXH64_hash_t texDescHash = texture->GetImage()->getDescriptorHash();
-        if (lookupHash(RtxOptions::raytracedRenderTargetTextures(), texDescHash) ||
+        if (lookupHash(*m_frameOptions.raytracedRenderTargetTextures, texDescHash) ||
             lookupHash(m_autoRaytracedRenderTargetDescHashes, texDescHash)) {
           m_activeDrawCallState.isUsingRaytracedRenderTarget = true;
         }
@@ -6748,7 +6767,7 @@ namespace dxvk {
         (d3d9State().renderStates[D3DRS_ZENABLE] == D3DZB_FALSE ||
          d3d9State().renderStates[D3DRS_ZFUNC] == D3DCMP_ALWAYS) &&
         d3d9State().renderStates[D3DRS_ZWRITEENABLE] == FALSE &&
-        !checkBoundTextureCategory(RtxOptions::uiTextures()) &&
+        !checkBoundTextureCategory(*m_frameOptions.uiTextures) &&
         !isDeferredUiTagged()) {
       m_ue3LastDrawDecision = "depth-test-disabled translucency skip";
       ONCE(Logger::info("[RTX-Compatibility-Info] Ignored UE3 depth-test-disabled translucent draw."));
@@ -6827,7 +6846,7 @@ namespace dxvk {
     // tagging wins over those. World geometry and depth-writing draws are never deferred even
     // when tagged: shared textures (e.g. a scene-color render target sampled by translucent
     // meshes) must not pull geometry out of the ray-traced scene.
-    if (!RtxOptions::deferredUiTextures().empty() || !deferredUiPixelShaders().empty()) {
+    if (!m_frameOptions.deferredUiTextures->empty() || !m_frameOptions.deferredUiPixelShaders->empty()) {
       const XXH64_hash_t& matchedTextureHash = deferredUiMatchedTextureHash;
       const bool& matchedTextureIsRenderTarget = deferredUiMatchedTextureIsRenderTarget;
       const XXH64_hash_t& matchedRtDescriptorHash = deferredUiMatchedRtDescriptorHash;
@@ -6959,7 +6978,7 @@ namespace dxvk {
         const Rc<DxvkImage> image = texture->GetImage();
         if (image != nullptr) {
           const XXH64_hash_t descHash = image->getDescriptorHash();
-          if (lookupHash(RtxOptions::raytracedRenderTargetTextures(), descHash) ||
+          if (lookupHash(*m_frameOptions.raytracedRenderTargetTextures, descHash) ||
               lookupHash(m_autoRaytracedRenderTargetDescHashes, descHash)) {
             m_activeDrawCallState.isDrawingToRaytracedRenderTarget = true;
             return { RtxGeometryStatus::RayTraced, false };
@@ -7039,7 +7058,7 @@ namespace dxvk {
         }
 
         if (bestHash != 0 &&
-            !lookupHash(RtxOptions::raytracedRenderTargetTextures(), bestHash) &&
+            !lookupHash(*m_frameOptions.raytracedRenderTargetTextures, bestHash) &&
             m_autoRaytracedRenderTargetDescHashes.insert(bestHash).second) {
           Logger::info(str::format(
             "[RTX-Compatibility] Auto-selected Raytraced Render Target from fullscreen composite: texDescHash=0x",
@@ -7174,22 +7193,22 @@ namespace dxvk {
     }
 
     // Check if UI texture bound
-    return checkBoundTextureCategory(RtxOptions::uiTextures());
+    return checkBoundTextureCategory(*m_frameOptions.uiTextures);
   }
 
   bool D3D9Rtx::isDeferredUiTaggedDraw(XXH64_hash_t* pMatchedTextureHash,
                                        bool* pMatchedTextureIsRenderTarget,
                                        XXH64_hash_t* pMatchedRtDescriptorHash) const {
     // Pixel shader tag: stable across texture streaming and render target recreation
-    if (!deferredUiPixelShaders().empty() &&
+    if (!m_frameOptions.deferredUiPixelShaders->empty() &&
         m_parent->UseProgrammablePS() && d3d9State().pixelShader != nullptr) {
       const XXH64_hash_t psHash = d3d9State().pixelShader->GetCommonShader()->GetBytecodeHash();
-      if (lookupHash(deferredUiPixelShaders(), psHash)) {
+      if (lookupHash(*m_frameOptions.deferredUiPixelShaders, psHash)) {
         return true;
       }
     }
 
-    if (RtxOptions::deferredUiTextures().empty()) {
+    if (m_frameOptions.deferredUiTextures->empty()) {
       return false;
     }
 
@@ -7219,14 +7238,14 @@ namespace dxvk {
       };
 
       const XXH64_hash_t texHash = entry.imageHash;
-      if (texHash != 0 && lookupHash(RtxOptions::deferredUiTextures(), texHash)) {
+      if (texHash != 0 && lookupHash(*m_frameOptions.deferredUiTextures, texHash)) {
         return reportMatch(texHash, isRenderTarget);
       }
 
       // Render targets: also match by descriptor hash, which is derived from the target's
       // properties and thus stable across recreation (the image hash embeds a creation-order
       // counter and changes on every respawn/level load).
-      if (descriptorHash != 0 && lookupHash(RtxOptions::deferredUiTextures(), descriptorHash)) {
+      if (descriptorHash != 0 && lookupHash(*m_frameOptions.deferredUiTextures, descriptorHash)) {
         return reportMatch(descriptorHash, true);
       }
     }
@@ -7986,7 +8005,7 @@ namespace dxvk {
           if (image != nullptr) {
             const XXH64_hash_t descHash = image->getDescriptorHash();
             isRaytracedRenderTarget =
-              lookupHash(RtxOptions::raytracedRenderTargetTextures(), descHash) ||
+              lookupHash(*m_frameOptions.raytracedRenderTargetTextures, descHash) ||
               lookupHash(m_autoRaytracedRenderTargetDescHashes, descHash);
           }
         }
@@ -8110,7 +8129,7 @@ namespace dxvk {
         for (uint32_t i : bit::BitMask(m_parent->GetActiveRTTextures())) {
           D3D9CommonTexture* texture = GetCommonTexture(d3d9State().textures[i]);
           auto hash = texture->GetImage()->getDescriptorHash();
-          if (lookupHash(RtxOptions::raytracedRenderTargetTextures(), hash)) {
+          if (lookupHash(*m_frameOptions.raytracedRenderTargetTextures, hash)) {
             // Mark this as a valid Raytraced Render Target draw call
             m_activeDrawCallState.isUsingRaytracedRenderTarget = true;
           }
@@ -8621,7 +8640,7 @@ namespace dxvk {
         const XXH64_hash_t texHash = texture->GetSampleView(true)->image()->getHash();
 
         // Currently we only support regular textures, skip lightmaps.
-        if (lookupHash(RtxOptions::lightmapTextures(), texHash)) {
+        if (lookupHash(*m_frameOptions.lightmapTextures, texHash)) {
           continue;
         }
 
@@ -8641,7 +8660,7 @@ namespace dxvk {
 
         // Check if texture factor blending is enabled
         if (isCurrentStageTextureFactorBlendingEnabled &&
-            lookupHash(RtxOptions::ignoreBakedLightingTextures(), texHash)) {
+            lookupHash(*m_frameOptions.ignoreBakedLightingTextures, texHash)) {
           useStageTextureFactorBlending = false;
           useMultipleStageTextureFactorBlending = false;
         }
@@ -8900,9 +8919,9 @@ namespace dxvk {
           inferredPsEntry != nullptr && inferredPsHash != kEmptyHash) {
         // scoring consults the user-taggable lightmap/never-albedo/preferred-albedo sets; drop cached
         // decisions when those sets change so texture tagging takes effect immediately
-        const size_t lightmapSetSize = RtxOptions::lightmapTextures().size();
-        const size_t neverAlbedoSetSize = RtxOptions::neverAlbedoTextures().size();
-        const size_t preferredAlbedoSetSize = RtxOptions::preferredAlbedoTextures().size();
+        const size_t lightmapSetSize = m_frameOptions.lightmapTextures->size();
+        const size_t neverAlbedoSetSize = m_frameOptions.neverAlbedoTextures->size();
+        const size_t preferredAlbedoSetSize = m_frameOptions.preferredAlbedoTextures->size();
         if (lightmapSetSize != m_ue3DiffuseSelectionLightmapSetSize ||
             neverAlbedoSetSize != m_ue3DiffuseSelectionNeverAlbedoSetSize ||
             preferredAlbedoSetSize != m_ue3DiffuseSelectionPreferredAlbedoSetSize) {
@@ -8991,10 +9010,10 @@ namespace dxvk {
           continue;
 
         const XXH64_hash_t texHash = texture->GetSampleView(false)->image()->getHash();
-        if (lookupHash(RtxOptions::lightmapTextures(), texHash))
+        if (lookupHash(*m_frameOptions.lightmapTextures, texHash))
           continue;
-        const bool isNeverAlbedo = lookupHash(RtxOptions::neverAlbedoTextures(), texHash);
-        const bool isPreferredAlbedo = lookupHash(RtxOptions::preferredAlbedoTextures(), texHash);
+        const bool isNeverAlbedo = lookupHash(*m_frameOptions.neverAlbedoTextures, texHash);
+        const bool isPreferredAlbedo = lookupHash(*m_frameOptions.preferredAlbedoTextures, texHash);
 
         // material spread: distinct pixel shaders sampling this texture. Identity albedos stay
         // at 1-2 (material instances share their parent's bytecode); shared library assets -
@@ -9890,8 +9909,8 @@ namespace dxvk {
             // the one churning material family.
             const XXH64_hash_t micChurnGroupKey = makeUe3MicChurnGroupKey(shaderIdentitySeed, textureSetHash);
             bool constantsExcluded =
-              lookupHash(ue3MicConstantIdentityExcludedShaders(), psHash) ||
-              (useInvariantShaderIdentity && lookupHash(ue3MicConstantIdentityExcludedShaders(), shaderIdentitySeed)) ||
+              lookupHash(*m_frameOptions.ue3MicConstantIdentityExcludedShaders, psHash) ||
+              (useInvariantShaderIdentity && lookupHash(*m_frameOptions.ue3MicConstantIdentityExcludedShaders, shaderIdentitySeed)) ||
               (autoExcludeEnabled && isUe3MicGroupAutoExcluded(micChurnGroupKey));
             // Invariant-identity shaders hash constants by uniform name and leading register:
             // lightmap policy permutations shift uniform registers and trim per-permutation
@@ -10045,11 +10064,10 @@ namespace dxvk {
       }
 
       // Flag smooth normals category at the d3d9 layer
-      m_activeDrawCallState.setCategory(InstanceCategories::SmoothNormals, lookupHash(RtxOptions::smoothNormalsTextures(), textureHash) || lookupHash(RtxOptions::smoothNormalsTextures(), materialHash));
+      m_activeDrawCallState.setCategory(InstanceCategories::SmoothNormals, lookupHash(*m_frameOptions.smoothNormalsTextures, textureHash) || lookupHash(*m_frameOptions.smoothNormalsTextures, materialHash));
       if (materialHash != kEmptyHash) {
-        m_parent->EmitCs([materialHash](DxvkContext* ctx) {
-          static_cast<RtxContext*>(ctx)->getSceneManager().trackReplacementMaterialHash(materialHash);
-        });
+        // batched into a single CS command in EndFrame (see m_pendingReplacementMaterialHashes)
+        m_pendingReplacementMaterialHashes.push_back(materialHash);
       }
       
       // Check if an ignore texture is bound
@@ -10091,7 +10109,7 @@ namespace dxvk {
     m_uvResolutionMode = UvResolutionMode::LegacyTss;
 
     m_forceIaTexcoordForOutlier = [&]() {
-      const auto& outlierSet = vsTexcoordCaptureOutlierTextures();
+      const auto& outlierSet = *m_frameOptions.vsTexcoordCaptureOutlierTextures;
       if (outlierSet.empty()) {
         return false;
       }
@@ -10772,6 +10790,23 @@ namespace dxvk {
     // Refresh the per-frame option snapshot: EndFrame's own consumers (deferred UI
     // replay) read fresh values and the next frame's draws see this frame's resolution.
     refreshFrameOptionCache();
+
+    // Flush this frame's replacement-material-hash tracking as one CS command. Must be
+    // emitted before the endFrame command below: the consumers (graph components) read
+    // the per-frame map during SceneManager::onFrameEnd, and the map clears there too.
+    if (!m_pendingReplacementMaterialHashes.empty()) {
+      const size_t flushedCount = m_pendingReplacementMaterialHashes.size();
+      m_parent->EmitCs([cHashes = std::move(m_pendingReplacementMaterialHashes)](DxvkContext* ctx) {
+        SceneManager& sceneManager = static_cast<RtxContext*>(ctx)->getSceneManager();
+        for (const XXH64_hash_t hash : cHashes) {
+          sceneManager.trackReplacementMaterialHash(hash);
+        }
+      });
+      // the move donates the capacity to the lambda; re-establish a defined empty state
+      // and pre-size for the next frame's roughly equal draw count
+      m_pendingReplacementMaterialHashes.clear();
+      m_pendingReplacementMaterialHashes.reserve(flushedCount);
+    }
 
     const auto currentReflexFrameId = GetReflexFrameId();
 

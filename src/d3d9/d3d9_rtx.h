@@ -659,6 +659,11 @@ namespace dxvk {
     struct Ue3CameraConstantsCache {
       XXH64_hash_t hash = 0;
       bool valid = false;
+      // Failed extractions are cached too: engine utility shaders whose declared camera
+      // registers never decompose would otherwise re-run the full extraction every draw.
+      // Extraction is deterministic on the register contents (the key), so a cached
+      // failure can never mask a would-be success.
+      bool extractionFailed = false;
       bool usedTranspose = false;
       Matrix4 worldToView;
       Matrix4 viewToProjection;
@@ -666,10 +671,11 @@ namespace dxvk {
     };
 
     // Small N-way cache: the main view, capture probes and engine utility shaders carry
-    // distinct camera constant blocks that interleave within a frame, so a single slot
-    // thrashes and re-runs the heavy matrix extraction (4x4 inverse, two projection
-    // decompositions) once per draw instead of once per unique camera.
-    static constexpr uint32_t kUe3CameraConstantsCacheSlots = 4;
+    // distinct camera constant blocks (including cached failures) that interleave within
+    // a frame, so a single slot thrashes and re-runs the heavy matrix extraction (4x4
+    // inverse, two projection decompositions) once per draw instead of once per unique
+    // camera.
+    static constexpr uint32_t kUe3CameraConstantsCacheSlots = 8;
     std::array<Ue3CameraConstantsCache, kUe3CameraConstantsCacheSlots> m_ue3CameraConstantsCache;
     uint32_t m_ue3CameraConstantsCacheNextSlot = 0;
 
@@ -1125,9 +1131,33 @@ namespace dxvk {
       bool ignoreAllVertexColorBakedLighting = false;
       bool vertexColorIsBakedLighting = false;
       Vector2i drawCallRange = Vector2i(0, 0);
+
+      // Set-typed options, cached as pointers: each option's resolved hash set is
+      // allocated once at construction and only mutated in place during option
+      // resolution, so a per-frame pointer is exactly as safe as the per-call
+      // reference the locked accessor hands out - both are read outside the option
+      // mutex between resolution points.
+      const fast_unordered_set* uiTextures = nullptr;
+      const fast_unordered_set* deferredUiTextures = nullptr;
+      const fast_unordered_set* deferredUiPixelShaders = nullptr;
+      const fast_unordered_set* lightmapTextures = nullptr;
+      const fast_unordered_set* neverAlbedoTextures = nullptr;
+      const fast_unordered_set* preferredAlbedoTextures = nullptr;
+      const fast_unordered_set* smoothNormalsTextures = nullptr;
+      const fast_unordered_set* ignoreBakedLightingTextures = nullptr;
+      const fast_unordered_set* raytracedRenderTargetTextures = nullptr;
+      const fast_unordered_set* vsTexcoordCaptureOutlierTextures = nullptr;
+      const fast_unordered_set* ue3MicConstantIdentityExcludedShaders = nullptr;
     };
     FrameOptionCache m_frameOptions;
     void refreshFrameOptionCache();
+
+    // Material hashes tracked this frame for SceneManager::trackReplacementMaterialHash,
+    // flushed as one CS command in EndFrame instead of one EmitCs per draw. The only
+    // consumers (graph components via getReplacementMaterialHashUsageCount) read the
+    // per-frame map during SceneManager::onFrameEnd, which executes after the flush on
+    // the CS timeline, so batching is invisible to them.
+    std::vector<XXH64_hash_t> m_pendingReplacementMaterialHashes;
 
     bool isRenderingUI();
 
