@@ -679,6 +679,7 @@ namespace dxvk {
 
   void DrawCallState::setupCategoriesForHeuristics(uint32_t prevFrameSeenCamerasCount,
                                                    std::vector<Vector3>& seenCameraPositions) {
+    ScopedCpuProfileZone();
     const SkyDetectionSource skySource = shouldBakeSky(*this,
                                                        futureSkinningData.valid(),
                                                        prevFrameSeenCamerasCount,

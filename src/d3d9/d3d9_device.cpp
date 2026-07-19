@@ -7429,7 +7429,9 @@ namespace dxvk {
 
 
   bool D3D9DeviceEx::UseProgrammableVS() {
-    ScopedCpuProfileZone();
+    // NV-DXVK start: profile zone removed - trivial getter called tens of thousands of
+    // times per frame; the Tracy event cost dwarfs the body and distorts captures
+    // NV-DXVK end
     return m_state.vertexShader != nullptr
       && m_state.vertexDecl != nullptr
       && !m_state.vertexDecl->TestFlag(D3D9VertexDeclFlag::HasPositionT);
@@ -7437,7 +7439,8 @@ namespace dxvk {
 
 
   bool D3D9DeviceEx::UseProgrammablePS() {
-    ScopedCpuProfileZone();
+    // NV-DXVK start: profile zone removed - see UseProgrammableVS
+    // NV-DXVK end
     return m_state.pixelShader != nullptr;
   }
 

@@ -13,6 +13,7 @@
 namespace dxvk {
   struct D3D9BufferSlice;
   class DxvkDevice;
+  class D3D9CommonTexture;
 
   enum class D3D9RtxFlag : uint32_t {
     DirtyLights,
@@ -219,11 +220,13 @@ namespace dxvk {
     RTX_OPTION("rtx.d3d9", uint32_t, ue3StaticLocalMeshVertexCaptureCacheWarmupFrames, 2,
                "UE3 compat: number of matching captures before a static LocalVertexFactory draw can reuse cached vertex-capture output.");
     RTX_OPTION("rtx.d3d9", bool, ue3StaticGeometryHashMemoization, true,
-               "UE3 CPU optimization: reuse geometry hash and bounding box results across frames for stable static "
-               "LocalVertexFactory draws instead of re-hashing the full vertex/index data every frame. Uses the same "
-               "static-buffer identity as the vertex-capture cache (buffer handles, offsets, draw parameters, stable "
-               "shader constants, camera cell) plus a per-buffer content generation counter, so results can never go "
-               "stale. Only active when rtx.d3d9.ue3StaticLocalMeshVertexCaptureCache is enabled.");
+               "UE3 CPU optimization: reuse geometry hash and bounding box results across frames for draws whose "
+               "input-assembler vertex/index buffers are static (any vertex factory, including the bind-pose buffers "
+               "of GPU-skinned meshes) instead of re-hashing the full vertex/index data every draw. Entries are keyed "
+               "purely on the IA identity (buffer handles, offsets, draw parameters, per-buffer content generation "
+               "counters), so one entry serves every instance of a mesh and results can never go stale; the per-draw "
+               "vertex-shader-constants hash component is recombined live so served hashes are bit-identical to a "
+               "fresh compute.");
     RTX_OPTION("rtx.d3d9", float, ue3VertexCaptureCameraCellSize, 2000.0f,
                "UE3 compat: world-space camera cell size used to refresh camera-sensitive vertex captures. Smaller values recapture more often; 0 disables camera-cell hashing.");
     RTX_OPTION("rtx.d3d9", bool, ue3NativeLocalMeshVertexCapture, false,
@@ -662,7 +665,21 @@ namespace dxvk {
       float reconstructionError = 0.0f;
     };
 
-    Ue3CameraConstantsCache m_ue3CameraConstantsCache;
+    // Small N-way cache: the main view, capture probes and engine utility shaders carry
+    // distinct camera constant blocks that interleave within a frame, so a single slot
+    // thrashes and re-runs the heavy matrix extraction (4x4 inverse, two projection
+    // decompositions) once per draw instead of once per unique camera.
+    static constexpr uint32_t kUe3CameraConstantsCacheSlots = 4;
+    std::array<Ue3CameraConstantsCache, kUe3CameraConstantsCacheSlots> m_ue3CameraConstantsCache;
+    uint32_t m_ue3CameraConstantsCacheNextSlot = 0;
+
+    // ObjectToWorld extraction memo: the LocalToWorld (+ optional WorldToLocal) constant
+    // block resolves to the same transpose/affinity/inverse disambiguation result whenever
+    // the register contents repeat (static placements re-upload identical matrices every
+    // frame). All inputs are part of the key, so entries can never go stale; the map is
+    // cleared wholesale when it exceeds a size cap.
+    static constexpr size_t kUe3ObjectToWorldCacheMaxEntries = 32768;
+    fast_unordered_cache<Matrix4> m_ue3ObjectToWorldCache;
 
     // pixel shader texcoord inference cache (for shader-path UV selection)
     struct PsSamplerTexcoordEntry {
@@ -807,21 +824,38 @@ namespace dxvk {
 
     fast_unordered_cache<Ue3VertexCaptureCacheEntry> m_ue3VertexCaptureCache;
 
-    // Cross-frame memo of geometry hash + bounding box results for stable static local
-    // meshes, keyed by the same identity as the static vertex-capture cache. Entries are
-    // heap-pinned via shared_ptr: a geometry worker publishes results into the entry
-    // (release store on the ready flag) while the main thread owns the map and serves
-    // published results on later frames (acquire load), skipping the per-frame re-hash
-    // of the full vertex/index data.
+    // Cross-frame memo of geometry hash + bounding box results for draws whose IA
+    // vertex/index buffers are static (any vertex factory - a skinned mesh's bind-pose
+    // buffers are as immutable as a static mesh's; only its bone constants animate).
+    // Keyed purely on the IA identity (buffers, offsets, generations, draw range, decl,
+    // texcoord selection), so one entry serves every instance of a mesh regardless of
+    // transform. The entry holds the hash components computed from that identity; the
+    // per-draw VertexShader component (stable VS-constant hash, camera cell) is
+    // recombined live by the consumer, making served hashes bit-identical to a fresh
+    // compute. Entries are heap-pinned via shared_ptr: a geometry worker publishes
+    // results into the entry (release store on the ready flag) while the main thread
+    // owns the map and serves published results on later frames (acquire load).
     struct Ue3GeometryMemoEntry {
       std::atomic<bool> hashesReady { false };
       std::atomic<bool> aabbReady { false };
-      GeometryHashes hashes;
+      // per-component hashes; the VertexShader slot is intentionally left empty
+      std::array<XXH64_hash_t, size_t(HashComponents::Count)> componentHashes = {};
       AxisAlignedBoundingBox boundingBox;
       uint32_t lastFrameTouched = 0;
     };
     fast_unordered_cache<std::shared_ptr<Ue3GeometryMemoEntry>> m_ue3GeometryMemoCache;
     void pruneUe3GeometryMemoCache();
+
+    bool canMemoizeUe3IaGeometryHashes(const IndexContext& indexContext,
+                                       const VertexContext vertexContext[caps::MaxStreams],
+                                       const RasterGeometry& geoData) const;
+    XXH64_hash_t computeUe3IaGeometryMemoKey(const IndexContext& indexContext,
+                                             const VertexContext vertexContext[caps::MaxStreams],
+                                             const DrawContext& drawContext,
+                                             const RasterGeometry& geoData) const;
+    // The geometry-hash VertexShader component for the current draw (stable VS-constant
+    // hash plus camera-cell/outlier folds); shared by computeHash and the memo hit path.
+    XXH64_hash_t computeLiveGeometryVertexShaderHashComponent();
 
     struct Ue3CameraHashCell {
       int32_t x = 0;
@@ -830,6 +864,14 @@ namespace dxvk {
     };
     bool m_hasLoggedUe3CameraHashCell = false;
     Ue3CameraHashCell m_lastLoggedUe3CameraHashCell = {};
+
+    // single-entry memo for computeUe3CameraHashCell, keyed on the exact inputs
+    // (worldToView content + cell size)
+    mutable Matrix4 m_ue3CameraCellMemoWorldToView;
+    mutable Ue3CameraHashCell m_ue3CameraCellMemoCell = {};
+    mutable float m_ue3CameraCellMemoCellSize = -1.0f;
+    mutable bool m_ue3CameraCellMemoResult = false;
+    mutable bool m_ue3CameraCellMemoValid = false;
 
     bool shouldUseUe3CameraHashCell() const;
     bool computeUe3CameraHashCell(Ue3CameraHashCell& outCell) const;
@@ -988,6 +1030,104 @@ namespace dxvk {
     DrawCallType makeDrawCallType(const DrawContext& drawContext);
 
     bool checkBoundTextureCategory(const fast_unordered_set& textureCategory) const;
+
+    // Per-draw snapshot of the bound texture slots (common texture pointer, cached image
+    // hash, render-target descriptor hash), lazily built and shared by the per-draw
+    // consumers that would otherwise each re-walk the texture stages: UI/deferred-UI tag
+    // checks, the MIC texture-set hash, the diffuse-selection cache key and the
+    // two-sided-translucency dedup.
+    // Invalidated at the top of internalPrepareDraw; bindings cannot change within a draw.
+    struct BoundTextureSnapshotEntry {
+      D3D9CommonTexture* texture = nullptr;
+      XXH64_hash_t imageHash = kEmptyHash;
+      XXH64_hash_t rtDescriptorHash = 0;
+      bool hasImage = false;
+      bool hasSampleView = false;
+      bool isRenderTarget = false;
+    };
+    struct BoundTextureSnapshot {
+      uint32_t mask = 0; // bound slots with a valid common texture
+      std::array<BoundTextureSnapshotEntry, SamplerCount> entries;
+    };
+    mutable BoundTextureSnapshot m_boundTextureSnapshot;
+    mutable bool m_boundTextureSnapshotValid = false;
+    const BoundTextureSnapshot& ensureBoundTextureSnapshot() const;
+
+    // Per-frame snapshot of the scalar options read on the per-draw hot path. Every
+    // RtxOption read acquires the global option update mutex; the per-draw pipeline
+    // (makeDrawCallType, classifyUe3Pass, processRenderState, processTextures, the
+    // geometry identity keys) reads dozens of options per draw, which at UE3 draw
+    // counts (~2400/frame) is >100k mutex acquisitions per frame. Option values only
+    // resolve once per frame anyway, so a per-frame value snapshot is exactly as fresh
+    // as the underlying resolution model. Refreshed in EndFrame (the same cadence as
+    // DrawCallState::refreshCategoryLookupTable) and lazily on the first frame's draw.
+    // Set-typed options are intentionally not snapshotted: their accessors return
+    // references to stable storage and are read far less often per draw.
+    // Field names mirror the option accessors they cache.
+    struct FrameOptionCache {
+      bool valid = false;
+
+      // D3D9Rtx options
+      bool orthographicIsUI = false;
+      bool preTransformedVerticesIsUI = false;
+      bool allowCubemaps = false;
+      bool useVertexCapture = false;
+      bool useVertexCapturedNormals = false;
+      bool useWorldMatricesForShaders = false;
+      bool ue3EngineMode = false;
+      bool ue3CameraFromShaderConstants = false;
+      bool ue3ObjectToWorldFromShaderConstants = false;
+      bool autoRaytracedRenderTargetFromFullscreenComposite = false;
+      bool rasterizeFullscreenCompositeToPrimary = false;
+      bool shaderPathTexcoordIndexFromPixelShader = false;
+      bool ue3MaterialInstanceConstantHash = false;
+      bool ue3LightmapPermutationInvariantHash = false;
+      bool ue3LightmapPermutationBridgeLookup = false;
+      bool ue3LogMaterialInstanceHash = false;
+      bool ue3SkipDepthPrepass = false;
+      bool ue3SkipShadowDepthPasses = false;
+      bool ue3SkipDepthTestDisabledTranslucency = false;
+      bool ue3SkipSceneCapturePasses = false;
+      bool ue3StaticLocalMeshVertexCaptureCache = false;
+      uint32_t ue3StaticLocalMeshVertexCaptureCacheWarmupFrames = 0;
+      bool ue3StaticGeometryHashMemoization = false;
+      float ue3VertexCaptureCameraCellSize = 0.0f;
+      bool ue3NativeLocalMeshVertexCapture = false;
+      bool ue3RequireCtabCameraConstants = false;
+      bool ue3StableDiffuseSelection = false;
+      bool ue3MicAutoExcludeFrameVaryingConstants = false;
+      bool ue3LogClassification = false;
+      bool ue3LogUvResolution = false;
+      bool ue3LogUvAffineDetail = false;
+      bool ue3LogAlbedoSelection = false;
+      bool ue3LogCapturePrecision = false;
+      bool ue3LogDrawStatusFlaps = false;
+      bool deferredUiReplay = false;
+      bool deferredUiRefreshSceneColor = false;
+      bool enableIndexBufferMemoization = false;
+
+      // upstream RtxOptions (raytracedRenderTargetEnable caches
+      // RtxOptions::RaytracedRenderTarget::enable, needsMeshBoundingBox the
+      // derived RtxOptions::needsMeshBoundingBox result)
+      bool enableRaytracing = false;
+      bool enableAlphaTest = false;
+      bool enableAlphaBlend = false;
+      bool raytracedRenderTargetEnable = false;
+      bool skipDrawCallsPostRTXInjection = false;
+      bool useBuffersDirectly = false;
+      bool fogIgnoreSky = false;
+      bool needsMeshBoundingBox = false;
+      bool validateCPUIndexData = false;
+      bool alwaysCopyDecalGeometries = false;
+      bool terrainAsDecalsEnabledIfNoBaker = false;
+      bool terrainAsDecalsAllowOverModulate = false;
+      bool enableMultiStageTextureFactorBlending = false;
+      bool ignoreAllVertexColorBakedLighting = false;
+      bool vertexColorIsBakedLighting = false;
+      Vector2i drawCallRange = Vector2i(0, 0);
+    };
+    FrameOptionCache m_frameOptions;
+    void refreshFrameOptionCache();
 
     bool isRenderingUI();
 
