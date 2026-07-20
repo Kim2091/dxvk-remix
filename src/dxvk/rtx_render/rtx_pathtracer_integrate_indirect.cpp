@@ -499,7 +499,10 @@ namespace dxvk {
 
     // Trace indirect ray
     {
-      ScopedGpuProfileZone(ctx, "Integrate Indirect Raytracing");
+      // Named distinctly from the wrapping "Integrate Indirect Raytracing" zone in
+      // RtxContext::dispatchIntegrate — same-name nested zones double-count in the
+      // fork GPU timer (each frame's cost was reported twice as x2.0/frame).
+      ScopedGpuProfileZone(ctx, "Integrate Indirect: Trace");
       const NeeCachePass& neeCache = ctx->getCommonObjects()->metaNeeCache();
       const bool neeCacheEnabled = neeCache.isActive();
       const VkExtent3D workgroups = util::computeBlockCount(rayDims, VkExtent3D { 16, 8, 1 });

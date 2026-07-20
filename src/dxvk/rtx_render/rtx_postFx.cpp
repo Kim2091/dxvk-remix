@@ -188,7 +188,9 @@ namespace dxvk {
     const Resources::Resource& motionBlurInputTexture,
     const Resources::Resource& motionBlurOutputTexture)
   {
-    ScopedGpuProfileZone(ctx, "PostFx Motion Blur");
+    // Named distinctly from the caller's "PostFx Motion Blur" zone —
+    // same-name nesting double-counts in the fork GPU timer.
+    ScopedGpuProfileZone(ctx, "PostFx Motion Blur: Filter");
 
     dispatchMotionBlurPrefilterPass(ctx,
                                     rtOutput.m_primarySurfaceFlags,
