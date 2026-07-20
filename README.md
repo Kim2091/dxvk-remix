@@ -31,7 +31,7 @@ All UE3-specific behavior sits behind a single master `rtx.d3d9.ue3EngineMode` t
 
 2. Disable the game's lightmaps - this is easiest done with [Mirror's Edge Tweaks](https://github.com/softsoundd/MirrorsEdgeTweaks). Disabling lightmaps is recommended for both compatibility and, more importantly, when authoring assets, as scene exports with lightmaps active produce different material hashes that cannot survive in non-lightmapped states. If you wish to keep lightmaps enabled for before/after comparisons, that is supported and will not throw off hashes (provided authoring had been in a non-lightmapped mode).
 
-3. Make a text file titled "remix" (no extension) and paste the following set of commands:
+3. Make a text file titled "remix" (no extension) in `<path-to-game>\Binaries` and paste the following set of commands:
 ```
 scale set TdBicubicFiltering false
 scale set TdTonemapping false
@@ -61,11 +61,10 @@ show scenecapture
 show dynamicshadows
 show fog
 ```
-Then, place the text file in `<path-to-game>\Binaries`.
 > [!NOTE]
 > The above commands ensures maximum compatibility with Remix. That being said, a lot of consideration has gone into this fork into ensuring that games with less flexibility around commands can still play somewhat nice with these graphics systems active, though game-side modding is recommended to disable them.
 
-4. By default `MirrorsEdge.exe` whitelists only a select few launch arguments. This can be fully unlocked with [Mirror's Edge Tweaks](https://github.com/softsoundd/MirrorsEdgeTweaks) via the launch argument patcher. Then, add `-exec=remix` into your game libray's launch arguments/other shortcuts, or alternatively within the launch argument field in [Mirror's Edge Tweaks](https://github.com/softsoundd/MirrorsEdgeTweaks) followed by launching via the `Launch Game w/ Args` button.
+4. By default `MirrorsEdge.exe` whitelists only a select few launch arguments, so the above commands will not work out of the box. This can be fully unlocked with [Mirror's Edge Tweaks](https://github.com/softsoundd/MirrorsEdgeTweaks) via the launch argument patcher. Once patched, add `-exec=remix` into your game libray's launch arguments/other shortcuts, or alternatively within the launch argument field in [Mirror's Edge Tweaks](https://github.com/softsoundd/MirrorsEdgeTweaks) followed by launching via the `Launch Game w/ Args` button.
 5. *(Optional)* UE3 employs frustum culling in native C++ land. This requires patching the executable to treat primitives as always visible. Doing this looks nicer compared to relying on Remix's anti-culling system, but note that performance will take a hit!
 	- Use a hex editor to locate offset 008E3C6C and patch `0F 84 EE 06 00 00` to `90 90 90 90 90 90`. This has been tested against the GOG version only.
 
