@@ -1082,6 +1082,12 @@ namespace dxvk {
                 "frame's translation, rather than retranslating the draw call into raytrace-ready scene data.\n"
                 "When false, every submit uses full dynamic geometry and instance processing (drawReplacements / processDrawCallState).\n"
                 "Disable for debugging or compatibility when suspecting preserve-path regressions.");
+    RTX_OPTION_ARGS("rtx", bool, enablePreservePathForBatchedDraws, true,
+                "When true, external (Remix API) draws that carry a GPU-instancing transform array (InstanceInfoGpuInstancingEXT)\n"
+                "are eligible for the preserve path like any other external draw. The draw identity hash folds in the entire\n"
+                "transform array, so any change to the batch routes through the full dynamic path as before.\n"
+                "When false, batched draws always take the dynamic path (pre-2026-07 behavior).\n"
+                "Requires rtx.enablePreservePath. Disable to A/B the batched-draw preserve gate in isolation.");
     RTX_OPTION_ARGS("rtx", bool, enableInstanceDebuggingTools, false,
                     "NOTE: This will disable temporal correllation for instances, but allow the use of instance developer debug tools",
                     args.flags = RtxOptionFlags::NoSave | RtxOptionFlags::InvalidatesDrawcallTranslation);
