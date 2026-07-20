@@ -273,6 +273,15 @@ initializer list and can't be lifted into a separate TU.
 
 ---
 
+## src/dxvk/dxvk_scoped_annotation.cpp
+
+**Category:** hook dispatch
+
+- **Hook** in `__ScopedAnnotation` ctor/dtor → `fork_hooks::gpuTimerBegin`/`gpuTimerEnd` in `rtx_render/rtx_fork_gpu_timer.cpp` (2026-07-20).
+  *Fork GPU pass timer: timestamp-query pairs on every annotated render pass, aggregated CPU-side and logged as a ranked per-pass GPU-ms table every `rtx.gpuTimerLogIntervalFrames` (enable: `rtx.gpuTimerEnable`, default off — a branch + thread-local push/pop per annotation when disabled). Built as the in-process replacement for the bundled Tracy v0.8 client, whose on-demand stream stalls the game under Remix zone volume (2026-07-20 FO4 field sessions). Requires Vulkan 1.2 `hostQueryReset` (enabled on the d3d9 device path); self-disables with a log line otherwise.*
+
+---
+
 ## src/dxvk/meson.build
 
 **Pre-refactor fork footprint:** +4 / -0 LOC (audit 2026-04-18)
@@ -290,6 +299,9 @@ initializer list and can't be lifted into a separate TU.
 
 - **Inline tweak** at `dxvk_src` files list (rtx_render block) — 2-line addition registering weather sources.
   *Registers `'rtx_render/rtx_fork_weather.cpp'` and `'rtx_render/rtx_fork_weather.h'` in the DXVK build source list.*
+
+- **Inline tweak** at `dxvk_src` files list (rtx_render block) — 2-line addition registering GPU-timer sources (2026-07-20).
+  *Registers `'rtx_render/rtx_fork_gpu_timer.cpp'` and `'rtx_render/rtx_fork_gpu_timer.h'` in the DXVK build source list.*
 
 ---
 

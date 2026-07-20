@@ -1784,7 +1784,11 @@ void RtxAtmosphere::dispatchCloudNvdfOccupancy(Rc<DxvkContext> ctx) {
 void RtxAtmosphere::dispatchCloudNvdfJfaPass(Rc<DxvkContext> ctx, uint32_t mode,
                                              uint32_t jumpSizeVoxels,
                                              uint32_t srcIdx, uint32_t dstIdx) {
-  ScopedGpuProfileZone(ctx, mode == 0u ? "Atmosphere Cloud NVDF JFA Seed" : "Atmosphere Cloud NVDF JFA Jump");
+  // Single literal zone name: Tracy's ZoneScopedN bakes the name into a
+  // static constexpr source-location, so a runtime ternary fails to compile
+  // under -Denable_tracy (C2131). Seed vs jump is visible from the dispatch
+  // count within the zone.
+  ScopedGpuProfileZone(ctx, "Atmosphere Cloud NVDF JFA");
 
   AtmosphereArgs args = getAtmosphereArgs();
   ctx->updateBuffer(m_constantsBuffer, 0, sizeof(AtmosphereArgs), &args);
