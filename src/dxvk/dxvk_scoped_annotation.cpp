@@ -25,6 +25,7 @@
 #include "dxvk_context.h"
 #include "dxvk_device.h"
 #include "client/TracyProfiler.hpp"
+#include "rtx_render/rtx_fork_gpu_timer.h"
 
 // Global overload
 TRACY_OBJECT_MEMORY_PROFILING
@@ -39,9 +40,11 @@ namespace dxvk {
     // NV-DXVK start: Integrate Aftermath
     m_ctx->deviceDiagnosticCheckpoint(name);
     // NV-DXVK end
+    fork_hooks::gpuTimerBegin(m_ctx.ptr(), name);
   }
 
   __ScopedAnnotation::~__ScopedAnnotation() {
+    fork_hooks::gpuTimerEnd(m_ctx.ptr());
     m_ctx->endDebugLabel();
   }
 

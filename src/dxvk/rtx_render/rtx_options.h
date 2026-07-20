@@ -1082,6 +1082,15 @@ namespace dxvk {
                 "frame's translation, rather than retranslating the draw call into raytrace-ready scene data.\n"
                 "When false, every submit uses full dynamic geometry and instance processing (drawReplacements / processDrawCallState).\n"
                 "Disable for debugging or compatibility when suspecting preserve-path regressions.");
+    RTX_OPTION("rtx", bool, gpuTimerEnable, false,
+               "Fork GPU pass timer: hangs timestamp-query pairs on every annotated render pass\n"
+               "(the __ScopedAnnotation brackets) and logs a ranked per-pass table of average GPU\n"
+               "milliseconds per frame to the log every rtx.gpuTimerLogIntervalFrames frames.\n"
+               "In-process alternative to the bundled Tracy client for GPU-time attribution.\n"
+               "Off by default; near-zero overhead when disabled.");
+    RTX_OPTION("rtx", uint32_t, gpuTimerLogIntervalFrames, 900,
+               "How many frames each rtx.gpuTimerEnable aggregation window spans before the\n"
+               "ranked per-pass GPU-time table is written to the log (minimum 60).");
     RTX_OPTION_ARGS("rtx", bool, enablePreservePathForBatchedDraws, true,
                 "When true, external (Remix API) draws that carry a GPU-instancing transform array (InstanceInfoGpuInstancingEXT)\n"
                 "are eligible for the preserve path like any other external draw. The draw identity hash folds in the entire\n"

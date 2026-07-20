@@ -239,6 +239,8 @@ dxvk_src = files([
   'rtx_render/rtx_fork_fsr_framegen.cpp',
   'rtx_render/rtx_fork_fsr_framegen.h',
   'rtx_render/rtx_fork_game_state.h',
+  'rtx_render/rtx_fork_gpu_timer.cpp',
+  'rtx_render/rtx_fork_gpu_timer.h',
   'rtx_render/rtx_fork_hooks.h',
   'rtx_render/rtx_fork_light.cpp',
   'rtx_render/rtx_fork_overlay.cpp',
