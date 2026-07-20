@@ -24,23 +24,32 @@
 #include "rtx/pass/common_binding_indices.h"
 #include "rtx/utility/shader_types.h"
 
+// Fused single-dispatch layout (2026-07-20): per-batch state lives in a
+// structured buffer of PointInstancerBatchDescGpu; the constant buffer keeps
+// only the camera/culling globals shared by every batch. Previously each
+// batch carried its own constant block and its own dispatch, which at
+// thousands of small batches serialized the queue on the shared transforms
+// buffer (write-after-read barrier per batch).
 struct PointInstancerCullingConstants {
-  mat4 objectToWorld;         // Column-major object-to-world matrix for this instancer
-  mat4 prevObjectToWorld;     // Column-major previous-frame object-to-world (for motion vectors)
   vec3 cameraPosition;
   float cullingRadius;        // Maximum distance from camera before culling
-  uint totalInstanceCount;    // Number of input transforms
-  uint baseSurfaceIndex;      // surfaceIndexOfFirstInstance for instanceCustomIndex
+  uint totalInstanceCount;    // Total input transforms across all batches
   float fadeStartRadius;      // Distance at which density starts reducing (0 = no fade)
+  uint pad0;
+  uint pad1;
+};
+
+struct PointInstancerBatchDescGpu {
+  mat4 objectToWorld;         // Column-major object-to-world matrix for this instancer
+  mat4 prevObjectToWorld;     // Column-major previous-frame object-to-world (for motion vectors)
+  uint firstInstanceIndex;    // Offset of this batch's first instance in the fused arrays
+  uint baseSurfaceIndex;      // surfaceIndexOfFirstInstance for instanceCustomIndex
   uint customIndexFlags;      // Upper bits of instanceCustomIndex (material type, view model flag)
-  uint instanceMask;          // 8-bit visibility mask for this instance
+  uint instanceMask;          // 8-bit visibility mask for this batch's instances
   uint sbtOffsetAndFlags;     // Packed: instanceShaderBindingTableRecordOffset:24 | flags:8
   uint blasRefLo;             // Lower 32 bits of BLAS device address
   uint blasRefHi;             // Upper 32 bits of BLAS device address
   uint instanceBufferOffset;  // Byte offset of first placeholder in the TLAS instance buffer
-  uint pad0;
-  uint pad1;
-  uint pad2;
 };
 
 #define POINT_INSTANCER_CULLING_BINDING_CONSTANTS         50
@@ -48,6 +57,8 @@ struct PointInstancerCullingConstants {
 #define POINT_INSTANCER_CULLING_BINDING_INSTANCE_BUFFER   52
 #define POINT_INSTANCER_CULLING_BINDING_SURFACE_BUFFER    53
 #define POINT_INSTANCER_CULLING_BINDING_MATERIAL_BUFFER   54
+#define POINT_INSTANCER_CULLING_BINDING_BATCH_DESCS       55
+#define POINT_INSTANCER_CULLING_BINDING_BATCH_INDICES     56
 
 #define POINT_INSTANCER_CULLING_MIN_BINDING  POINT_INSTANCER_CULLING_BINDING_CONSTANTS
 

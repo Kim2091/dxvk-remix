@@ -144,7 +144,15 @@ namespace dxvk {
 
     // -- GPU resources ------------------------------------------------------
 
-    Rc<DxvkBuffer> m_cb;            // Per-dispatch constant buffer
-    Rc<DxvkBuffer> m_transformsGpu; // Reused upload buffer for input transforms
+    Rc<DxvkBuffer> m_cb;              // Global constant buffer (camera/culling params)
+    Rc<DxvkBuffer> m_transformsGpu;   // All batches' transforms, concatenated (one upload/frame)
+    Rc<DxvkBuffer> m_batchDescsGpu;   // Per-batch PointInstancerBatchDescGpu array
+    Rc<DxvkBuffer> m_batchIndicesGpu; // Per-instance batch index into the desc array
+
+    // CPU staging for the fused upload; members so capacity persists across
+    // frames (a few hundred KB, no per-frame allocations in steady state).
+    std::vector<Matrix4> m_transformsCpu;
+    std::vector<PointInstancerBatchDescGpu> m_descsCpu;
+    std::vector<uint32_t> m_batchIdxCpu;
   };
 }

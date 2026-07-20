@@ -45,3 +45,11 @@ RWStructuredBuffer<Surface> surfaceBuffer;
 // Output: direct write into the surface material buffer (per-instance material copies)
 layout(binding = POINT_INSTANCER_CULLING_BINDING_MATERIAL_BUFFER)
 RWStructuredBuffer<MemoryPolymorphicSurfaceMaterial> materialBuffer;
+
+// Input: per-batch state for the fused single dispatch
+layout(binding = POINT_INSTANCER_CULLING_BINDING_BATCH_DESCS)
+StructuredBuffer<PointInstancerBatchDescGpu> batchDescs;
+
+// Input: per-instance batch index into batchDescs
+layout(binding = POINT_INSTANCER_CULLING_BINDING_BATCH_INDICES)
+StructuredBuffer<uint> instanceBatchIndices;

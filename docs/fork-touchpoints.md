@@ -282,6 +282,15 @@ initializer list and can't be lifted into a separate TU.
 
 ---
 
+## src/dxvk/rtx_render/rtx_point_instancer_system.cpp / .h + shaders/rtx/pass/instance_culling/*
+
+**Category:** perf rework (upstream-PR candidate)
+
+- **Rework** of `RtxPointInstancerSystem::dispatchCulling` + `point_instancer_culling.comp.slang` — fused single dispatch (2026-07-20).
+  *The upstream implementation looped over point-instancer batches, re-writing ONE shared transforms buffer and issuing one tiny compute dispatch per batch; each iteration's write-after-read hazard forced a full barrier between batches, serializing the queue. At thousands of small GPU-instanced batches (FO4 external draws: ~1700 batches averaging ~4 instances) the pass measured ~4.4ms GPU. Now all batch transforms are concatenated and uploaded once, per-batch constants moved from the per-dispatch CB into a `StructuredBuffer<PointInstancerBatchDescGpu>` (new bindings 55/56: batch descs + per-instance batch index map), and ONE dispatch covers every instance. `PointInstancerCullingConstants` slimmed to camera/culling globals. Shader hashes the batch-relative index for the density fade so the pattern matches the per-batch dispatch era. Outputs bit-identical; no behavior change.*
+
+---
+
 ## src/dxvk/meson.build
 
 **Pre-refactor fork footprint:** +4 / -0 LOC (audit 2026-04-18)
