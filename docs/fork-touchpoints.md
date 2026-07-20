@@ -323,6 +323,18 @@ initializer list and can't be lifted into a separate TU.
 
 ---
 
+## src/dxvk/rtx_render/rtx_accel_manager.cpp
+
+**Category:** instrumentation (inline)
+
+- **Inline tweak** — BLAS build categorization + stats (2026-07-20).
+  *`mergeInstancesIntoBlas`'s GPU zone renamed to its own name (it shared "buildBLAS" with the nested `buildBlases` zone, double-counting the build in name-keyed profiling). `buildBlases` wraps `uploadSurfaceData` in an "Upload Surface Data" zone and splits the single `vkCmdBuildAccelerationStructuresKHR` into three back-to-back categorized calls — "buildBLAS: dynamic refit" (update mode), "buildBLAS: dynamic full build", "buildBLAS: merged buckets" — no barriers between (disjoint outputs/scratch), GPU behavior unchanged; adds a `[BLAS-Stats]` per-900-frame log of build counts + primitive volume per category. Feeds the fork GPU pass timer's per-pass attribution.*
+
+- **Inline tweak** — merged-bucket primitive budget (2026-07-20, same day as the categorization that measured it).
+  *`BlasBucket::tryAddInstance` rejects additions past `rtx.maxPrimsPerMergedBucket` (default 128K prims; 0 = legacy unlimited), making the existing couldn't-merge path start a fresh bucket for the key. Rationale: one dirty member rebuilds its WHOLE bucket, and FO4 field data showed 1.1-2.5M prims of merged BLAS rebuilt EVERY frame (~90% of buildBLAS GPU) because streaming/TexUpgrade churn kept dirtying scene-sized buckets. The cap bounds per-change rebuild cost at the price of more (finer) buckets/TLAS instances. `BlasBucket` gains a `totalPrims` running counter (rtx_accel_manager.h).*
+
+---
+
 ## src/dxvk/rtx_render/rtx_camera_manager.cpp
 
 **Pre-refactor fork footprint:** +10 / -10 LOC (audit 2026-04-18)

@@ -456,6 +456,12 @@ namespace dxvk {
 
     RTX_OPTION("rtx", uint32_t, minPrimsInDynamicBLAS, 1000, "The minimum number of triangles required to promote a mesh to it's own BLAS, otherwise it lands in the merged BLAS with multiple other meshes.");
     RTX_OPTION("rtx", uint32_t, maxPrimsInMergedBLAS, 50000, "The maximum number of triangles for a mesh that can be in the merged BLAS.  ");
+    RTX_OPTION("rtx", uint32_t, maxPrimsPerMergedBucket, 131072,
+               "Primitive budget per merged-BLAS bucket. A bucket is rebuilt WHOLE whenever any member\n"
+               "instance changes (streaming, texture upgrades), so bucket size bounds the per-change GPU\n"
+               "rebuild cost; when a bucket reaches this budget a new bucket is started for the same key.\n"
+               "Smaller values = cheaper incremental rebuilds but more merged BLASes/TLAS instances.\n"
+               "0 = unlimited (pre-2026-07 behavior: one bucket per compatibility key).");
     RTX_OPTION_FLAG("rtx", bool, forceMergeAllMeshes, false, RtxOptionFlags::NoSave, "Force merges all meshes into as few BLAS as possible.  This is generally not desirable for performance, but can be a useful debugging tool.");
     RTX_OPTION_FLAG("rtx", bool, minimizeBlasMerging, false, RtxOptionFlags::NoSave, "Minimize BLAS merging to the minimum possible, this option tries to give all meshes their own BLAS.  This is generally not desirable forperformance, but can be a useful debugging tool.");
 

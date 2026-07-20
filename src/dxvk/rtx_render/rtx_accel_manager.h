@@ -60,6 +60,10 @@ class AccelManager : public CommonDeviceObject {
     uint32_t reorderedSurfacesOffset = UINT32_MAX;
     bool hasOmmInstances = false;
     bool hasSssInstances = false;
+    // Running primitive total, for the rtx.maxPrimsPerMergedBucket budget:
+    // any dirty instance forces a rebuild of its WHOLE bucket, so bucket
+    // size bounds the merged-BLAS rebuild cost per change.
+    uint64_t totalPrims = 0;
 
     // The PooledBlas assigned to this bucket by createBlasBuffersAndInstances.
     // Stored here so the per-bucket cache can capture it after buildBlases.

@@ -181,12 +181,32 @@ namespace dxvk {
 
     BlasEntry* blasEntry = instance->getBlas();
 
+    // Primitive budget (2026-07-20): one dirty instance rebuilds its WHOLE
+    // bucket, so unbounded buckets turn every streaming change / texture
+    // upgrade into a multi-hundred-K-prim GPU rebuild ([BLAS-Stats] measured
+    // 1.1-2.5M prims rebuilt EVERY frame in FO4 = ~90% of buildBLAS time).
+    // Rejecting here makes the caller start a fresh bucket for this key —
+    // rebuild granularity becomes the cap instead of the whole scene slice.
+    // An empty bucket always accepts (single meshes above the cap can't
+    // occur: meshes > maxPrimsInMergedBLAS never take the merged path).
+    const uint64_t maxBucketPrims = RtxOptions::maxPrimsPerMergedBucket();
+    if (!geometries.empty() && maxBucketPrims != 0) {
+      uint64_t instancePrims = 0;
+      for (const auto& range : blasEntry->buildRanges) {
+        instancePrims += range.primitiveCount;
+      }
+      if (totalPrims + instancePrims > maxBucketPrims) {
+        return false;
+      }
+    }
+
     geometries.insert(geometries.end(), blasEntry->buildGeometries.begin(), blasEntry->buildGeometries.end());
     ranges.insert(ranges.end(), blasEntry->buildRanges.begin(), blasEntry->buildRanges.end());
 
     for (auto& range : blasEntry->buildRanges) {
       originalInstances.push_back(instance);
       primitiveCounts.push_back(range.primitiveCount);
+      totalPrims += range.primitiveCount;
     }
     instanceBillboardIndices.insert(instanceBillboardIndices.end(), instance->billboardIndices.begin(), instance->billboardIndices.end());
     indexOffsets.insert(indexOffsets.end(), instance->indexOffsets.begin(), instance->indexOffsets.end());
@@ -428,7 +448,10 @@ namespace dxvk {
                                             const CameraManager& cameraManager,
                                             InstanceManager& instanceManager,
                                             OpacityMicromapManager* opacityMicromapManager) {
-    ScopedGpuProfileZone(ctx, "buildBLAS");
+    // Distinct name from buildBlases' "buildBLAS" zone: the two used to share
+    // it, which double-counted the whole build in name-keyed profiling (the
+    // fork GPU pass timer sums same-name zones).
+    ScopedGpuProfileZone(ctx, "mergeInstancesIntoBlas");
 
     auto& instances = instanceManager.getInstanceTable();
     const uint32_t currentFrame = m_device->getCurrentFrameId();
@@ -1728,8 +1751,16 @@ namespace dxvk {
                                  std::vector<VkAccelerationStructureBuildRangeInfoKHR*>& blasRangesToBuild,
                                  size_t& totalScratchMemory) {
     ScopedGpuProfileZone(ctx, "buildBLAS");
+    // Entries in [0, dynamicBlasCount) came from mergeInstancesIntoBlas's
+    // dynamic-BLAS loop; createBlasBuffersAndInstances appends the merged-
+    // bucket builds after them. Recorded here to categorize the build call.
+    const size_t dynamicBlasCount = blasToBuild.size();
+
     // Upload surfaces before opacity micromap generation which reads the surface data on the GPU
-    uploadSurfaceData(ctx);
+    {
+      ScopedGpuProfileZone(ctx, "Upload Surface Data");
+      uploadSurfaceData(ctx);
+    }
 
     // Clear any stale OMM bindings from cached geometry data.  This must happen
     // unconditionally because buildGeometries are cached across frames and the
@@ -1788,7 +1819,66 @@ namespace dxvk {
         desc.scratchData.deviceAddress += m_scratchBuffer->getDeviceAddress();
       }
       assert(blasToBuild.size() == blasRangesToBuild.size());
-      ctx->vkCmdBuildAccelerationStructuresKHR(blasToBuild.size(), blasToBuild.data(), blasRangesToBuild.data());
+
+      // Categorized build submission (2026-07-20): dynamic refits (update
+      // mode), dynamic full builds, and merged-bucket builds go out as three
+      // back-to-back vkCmdBuild calls — no barriers between them (disjoint
+      // outputs and scratch slices), so GPU behavior is unchanged, but the
+      // GPU pass timer now attributes cost per category and [BLAS-Stats]
+      // reports counts + primitive volume per window.
+      static std::vector<VkAccelerationStructureBuildGeometryInfoKHR> s_catInfos[3];
+      static std::vector<VkAccelerationStructureBuildRangeInfoKHR*> s_catRanges[3];
+      uint64_t catPrims[3] = { 0, 0, 0 };
+      for (int c = 0; c < 3; ++c) {
+        s_catInfos[c].clear();
+        s_catRanges[c].clear();
+      }
+      for (size_t i = 0; i < blasToBuild.size(); ++i) {
+        const auto& desc = blasToBuild[i];
+        const int cat = i < dynamicBlasCount
+            ? (desc.mode == VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR ? 0 : 1)
+            : 2;
+        for (uint32_t g = 0; g < desc.geometryCount; ++g) {
+          catPrims[cat] += blasRangesToBuild[i][g].primitiveCount;
+        }
+        s_catInfos[cat].push_back(desc);
+        s_catRanges[cat].push_back(blasRangesToBuild[i]);
+      }
+
+      if (!s_catInfos[0].empty()) {
+        ScopedGpuProfileZone(ctx, "buildBLAS: dynamic refit");
+        ctx->vkCmdBuildAccelerationStructuresKHR(s_catInfos[0].size(), s_catInfos[0].data(), s_catRanges[0].data());
+      }
+      if (!s_catInfos[1].empty()) {
+        ScopedGpuProfileZone(ctx, "buildBLAS: dynamic full build");
+        ctx->vkCmdBuildAccelerationStructuresKHR(s_catInfos[1].size(), s_catInfos[1].data(), s_catRanges[1].data());
+      }
+      if (!s_catInfos[2].empty()) {
+        ScopedGpuProfileZone(ctx, "buildBLAS: merged buckets");
+        ctx->vkCmdBuildAccelerationStructuresKHR(s_catInfos[2].size(), s_catInfos[2].data(), s_catRanges[2].data());
+      }
+
+      // Per-window build-volume stats (function-local statics: buildBlases
+      // runs on the device's single CS thread).
+      static uint64_t s_statCount[3] = {};
+      static uint64_t s_statPrims[3] = {};
+      static uint32_t s_statFrames = 0;
+      for (int c = 0; c < 3; ++c) {
+        s_statCount[c] += s_catInfos[c].size();
+        s_statPrims[c] += catPrims[c];
+      }
+      if (++s_statFrames >= 900) {
+        const double f = (double)s_statFrames;
+        Logger::info(str::format("[BLAS-Stats] over ", s_statFrames, " build frames, avg/frame: "
+                                 "refits=", s_statCount[0] / f, " (", s_statPrims[0] / f / 1000.0, "K prims), "
+                                 "builds=", s_statCount[1] / f, " (", s_statPrims[1] / f / 1000.0, "K prims), "
+                                 "merged=", s_statCount[2] / f, " (", s_statPrims[2] / f / 1000.0, "K prims)"));
+        s_statFrames = 0;
+        for (int c = 0; c < 3; ++c) {
+          s_statCount[c] = 0;
+          s_statPrims[c] = 0;
+        }
+      }
 
       execBarriers.accessBuffer(
        m_scratchBuffer->getSliceHandle(),
