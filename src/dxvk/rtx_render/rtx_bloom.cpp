@@ -189,7 +189,10 @@ namespace dxvk {
     const Resources::Resource& inOutColorBuffer,
     const Resources::Resource& bloomBuffer)
   {
-    ScopedGpuProfileZone(ctx, "Composite");
+    // "Bloom: Composite" not "Composite": the frame's composite pass
+    // (RtxContext::dispatchComposite) uses that name; sharing it merges the
+    // two passes into one row in the fork GPU timer table.
+    ScopedGpuProfileZone(ctx, "Bloom: Composite");
 
     VkExtent3D outputSize = inOutColorBuffer.image->info().extent;
 

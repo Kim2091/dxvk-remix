@@ -82,7 +82,9 @@ namespace dxvk {
     const Resources::Resource& primaryScreenSpaceMotionVector,
     const Resources::Resource& colorTextureOutput,
     const bool isUpscale) {
-    ScopedGpuProfileZone(ctx, "TAA");
+    // "TAA: Resolve" not "TAA": RtxContext::dispatchTemporalAA already opens a "TAA"
+    // zone around this call; same-name nesting double-counts in the fork GPU timer.
+    ScopedGpuProfileZone(ctx, "TAA: Resolve");
 
     const VkExtent3D& inputSize = colorTextureInput.image->info().extent;
     const VkExtent3D& outputSize = colorTextureOutput.image->info().extent;
