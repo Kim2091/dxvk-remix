@@ -23,11 +23,15 @@ All UE3-specific behavior sits behind a single master `rtx.d3d9.ue3EngineMode` t
 - Albedo selection is deterministic per material, with `rtx.preferredAlbedoTextures/rtx.neverAlbedoTextures` as overrides where albedo selection is missed. Textureless, constant colour materials supported too.
 - Mid-frame fullscreen overlays (fades, scope/damage effects) cannot terminate the raytraced scene; they're replayed on top after RTX injection (`rtx.deferredUiTextures`).
 
-### 2) Mirror's Edge/UE3 setup/requirements:
+### 2) Mirror's Edge/UE3 setup:
 
-1. Disable the game's lightmaps - this is easiest done with [Mirror's Edge Tweaks](https://github.com/softsoundd/MirrorsEdgeTweaks). Disabling lightmaps is recommended for both compatibility and, more importantly, when authoring assets, as scene exports with lightmaps active produce different material hashes that cannot survive in non-lightmapped states. If you wish to keep lightmaps enabled for before/after comparisons, that is supported and will not throw off hashes (provided authoring had been in a non-lightmapped mode).
+1. Enable the bridge's redundant state filtering. Create (or edit) `.trex\bridge.conf` and add `eliminateRedundantSetterCalls = True`.
+> [!NOTE]
+> UE3's D3D9 renderer doesn't filter redundant state on its own. Sampler and render state get resubmitted with nearly every texture bind, roughly 9 state calls per draw even when nothing's changed which can stack to tens of thousands per frame. Under Remix, each of those is handled twice where it gets serialised over the bridge IPC and then replayed by the runtime. This setting has the bridge client drop no-op state calls before they cross the process boundary. UE3 titles often run noticeably faster with it on.
 
-2. Make a text file titled "remix" (no extension) and paste the following set of commands:
+2. Disable the game's lightmaps - this is easiest done with [Mirror's Edge Tweaks](https://github.com/softsoundd/MirrorsEdgeTweaks). Disabling lightmaps is recommended for both compatibility and, more importantly, when authoring assets, as scene exports with lightmaps active produce different material hashes that cannot survive in non-lightmapped states. If you wish to keep lightmaps enabled for before/after comparisons, that is supported and will not throw off hashes (provided authoring had been in a non-lightmapped mode).
+
+3. Make a text file titled "remix" (no extension) and paste the following set of commands:
 ```
 scale set TdBicubicFiltering false
 scale set TdTonemapping false
@@ -61,8 +65,7 @@ Then, place the text file in `<path-to-game>\Binaries`.
 > [!NOTE]
 > The above commands ensures maximum compatibility with Remix. That being said, a lot of consideration has gone into this fork into ensuring that games with less flexibility around commands can still play somewhat nice with these graphics systems active, though game-side modding is recommended to disable them.
 
-3. By default `MirrorsEdge.exe` whitelists only a select few launch arguments. This can be fully unlocked with [Mirror's Edge Tweaks](https://github.com/softsoundd/MirrorsEdgeTweaks) via the launch argument patcher.
-4. Add `-exec=remix` into your game libray's launch arguments/other shortcuts, or alternatively within the launch argument field in [Mirror's Edge Tweaks](https://github.com/softsoundd/MirrorsEdgeTweaks) followed by launching via the `Launch Game w/ Args` button.
+4. By default `MirrorsEdge.exe` whitelists only a select few launch arguments. This can be fully unlocked with [Mirror's Edge Tweaks](https://github.com/softsoundd/MirrorsEdgeTweaks) via the launch argument patcher. Then, add `-exec=remix` into your game libray's launch arguments/other shortcuts, or alternatively within the launch argument field in [Mirror's Edge Tweaks](https://github.com/softsoundd/MirrorsEdgeTweaks) followed by launching via the `Launch Game w/ Args` button.
 5. *(Optional)* UE3 employs frustum culling in native C++ land. This requires patching the executable to treat primitives as always visible. Doing this looks nicer compared to relying on Remix's anti-culling system, but note that performance will take a hit!
 	- Use a hex editor to locate offset 008E3C6C and patch `0F 84 EE 06 00 00` to `90 90 90 90 90 90`. This has been tested against the GOG version only.
 
