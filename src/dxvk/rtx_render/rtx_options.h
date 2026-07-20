@@ -2145,6 +2145,21 @@ namespace dxvk {
                "reflected/indirect clouds match the primary Nubis look. Disable "
                "to make secondary sky-miss rays cloudless.");
 
+    // Bake cadence for the secondary-ray cloud LUT (fork — 2026-07-20, perf).
+    // The LUT is a coarse blurred dome consumed only by secondary rays, and
+    // its content drifts on the seconds scale (wind scroll / sun motion), so
+    // a few frames of staleness is imperceptible while the bake + mip chain
+    // cost ~1.3 ms/frame (FO4 field data, 2026-07-20 GPU-timer table). A
+    // change-driven key (the voxel-grid pattern) would never go quiet here
+    // because wind scroll advances every frame — hence a frame interval.
+    RTX_OPTION("rtx.atmosphere", uint32_t, cloudSecondaryLutIntervalFrames, 1,
+               "Bake the secondary-ray cloud dome LUT once every N frames "
+               "instead of every frame. Secondary rays (indirect bounces, PSR, "
+               "reflections) then see up to N-1 frames of cloud-drift "
+               "staleness, imperceptible at small N since cloud motion is "
+               "seconds-scale. 1 = legacy every-frame bake; 2-4 recoups most "
+               "of the bake cost.");
+
     // Cloud voxel-grid re-bake granularity (fork — 2026-06-11, perf). The
     // D_sun / D_ambient grids re-baked every frame; the perf-bisect freeze
     // showed a large win with only slowly-accumulating staleness (the bake

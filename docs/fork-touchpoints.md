@@ -326,6 +326,15 @@ initializer list and can't be lifted into a separate TU.
 
 ---
 
+## src/dxvk/rtx_render/rtx_pathtracer_integrate_indirect.cpp / rtx_taa.cpp / rtx_bloom.cpp / rtx_postFx.cpp
+
+**Category:** instrumentation (inline)
+
+- **Inline tweak** — GPU profile zone de-duplication renames (2026-07-20), one string literal each.
+  *Four upstream `ScopedGpuProfileZone` names collided with a wrapping or sibling zone, corrupting the fork GPU pass timer's name-keyed aggregation (same bug class as the `mergeInstancesIntoBlas` rename above). Nested same-name pairs double-count — the 2026-07-20 field tables reported "Integrate Indirect Raytracing" at 8.2 ms (x2.0/frame) when the real cost was ~4.1 ms. Renames, inner zone in each pair: `"Integrate Indirect Raytracing"` → `"Integrate Indirect: Trace"` (rtx_pathtracer_integrate_indirect.cpp; outer wrapper in `RtxContext::dispatchIntegrate` keeps the canonical name), `"TAA"` → `"TAA: Resolve"` (rtx_taa.cpp), `"PostFx Motion Blur"` → `"PostFx Motion Blur: Filter"` (rtx_postFx.cpp), and sibling-collision `"Composite"` → `"Bloom: Composite"` (rtx_bloom.cpp, collided with the frame composite pass in `RtxContext::dispatchComposite`). The mutually-exclusive per-RaytraceMode trios in rtx_pathtracer_gbuffer.cpp ("Primary Rays"/"Reflection PSR"/"Transmission PSR") were audited and left alone — only one branch runs per frame.*
+
+---
+
 ## src/dxvk/rtx_render/rtx_camera_manager.cpp
 
 **Pre-refactor fork footprint:** +10 / -10 LOC (audit 2026-04-18)
@@ -615,6 +624,9 @@ initializer list and can't be lifted into a separate TU.
   *2026-05-13 tonemap refactor: simplified from three-mode selector to global operator dropdown. 2026-05-15: local tonemap path removed entirely. 2026-05-XX: dead-code cleanup + snake_case shader rename.*
 
 - **Inline tweak** — weather-preset cold-default alignment (2026-05-26). Ten cold defaults aligned to `WEATHER_PRESET_VALUES_overcast` in `rtx_fork_weather.h` (the macro the codebase comments call "current default look"): `cloudShadowStrength` 1.0 → 0.10, `cloudCoverageMean` 0.85 → 0.64, `cloudCoverageSpread` 1.0 → 0.16, `cloudTypeMean` 0.75 → 0.5, `cloudTypeSpread` 0.5 → 0.2, `cloudTypeNoiseScale` 0.001 → 0.0034, `cloudDensity` 1.65 → 1.8, `cloudThickness` 2.75 → 3.05, `aerosolDensity` 1.0 → 1.1, `sunIlluminance` (20,20,20) → (15,15,15). Fixes the regression introduced by the 2026-05-19 `cloudShadowStrength` 0→1 flip: users sitting on the dormant "(none / dormant)" weather preset saw ground geometry crushed dark by full-strength cloud-voxel shadows over 85% default coverage. The dormant blender path leaves cold RTX_OPTIONs untouched, so the cold values themselves had to move.
+
+- **Inline tweak** at `RtxOptions` class body (secondary-LUT bake cadence) — +15 LOC (2026-07-20).
+  *Adds `cloudSecondaryLutIntervalFrames` RTX_OPTION (uint32, default 1 = legacy every-frame bake) under `rtx.atmosphere`, immediately after `cloudSecondaryLutEnable`. Bakes the secondary-ray cloud dome LUT once every N frames; the LUT feeds only secondary rays and its content drifts on the seconds scale, so small-N staleness is imperceptible while the bake + mip chain cost ~1.3 ms/frame (FO4 GPU-timer field data). A change-driven key (the voxel-grid pattern) can't go quiet here because wind scroll advances every frame. Consumed by the bake gate in `RtxAtmosphere::computeLuts` (fork-owned `rtx_atmosphere.cpp`), with a saturating frames-since-bake counter so the first eligible frame always bakes (an unbaked LUT reads as opaque black).*
 
 ---
 
