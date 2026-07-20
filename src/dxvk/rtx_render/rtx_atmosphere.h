@@ -440,8 +440,14 @@ private:
   VkExtent2D          m_cloudRenderFullExtent = { 0u, 0u };
 
   // Secondary-ray cloud LUT (fork — 2026-06-10, perf). 256x128 RGBA16F,
-  // baked every frame by dispatchCloudSecondaryLut.
+  // baked by dispatchCloudSecondaryLut every
+  // cloudSecondaryLutIntervalFrames frames.
   RtxMipmap::Resource m_cloudSecondaryLut;
+
+  // Frames since the last Secondary LUT bake (fork — 2026-07-20, perf
+  // cadence). Starts saturated so the first eligible frame always bakes —
+  // an unbaked LUT reads as "no cloud but fully opaque" (zero clear).
+  uint32_t m_cloudSecondaryLutFramesSinceBake = UINT32_MAX;
 
   // Cloud placement map (fork — 2026-06-11, column-shaping rework). 512x512
   // RGBA8, baked at init + on input change by dispatchCloudPlacementMapBake.

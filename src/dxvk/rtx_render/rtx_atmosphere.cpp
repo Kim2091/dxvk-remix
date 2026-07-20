@@ -1468,14 +1468,28 @@ void RtxAtmosphere::computeLuts(Rc<DxvkContext> ctx) {
   // Secondary-ray cloud LUT bake (fork — 2026-06-10, perf). Runs after the
   // voxel-grid bakes (the march reads D_sun / D_ambient) behind the same
   // write→read barrier pattern. Gated on the same option the shader-side
-  // consumer checks, so the LUT is always fresh on any frame it is sampled.
+  // consumer checks; between bakes the shader samples the last-baked
+  // content (up to cloudSecondaryLutIntervalFrames - 1 frames of
+  // cloud-drift staleness, secondary rays only).
   if (RtxOptions::cloudSecondaryLutEnable() && m_cloudSecondaryLut.isValid()) {
-    ctx->emitMemoryBarrier(0,
-      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-      VK_ACCESS_SHADER_WRITE_BIT,
-      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-      VK_ACCESS_SHADER_READ_BIT);
-    dispatchCloudSecondaryLut(ctx);
+    // Saturating counter: starts at UINT32_MAX so the first eligible frame
+    // after creation/re-enable always bakes (an unbaked LUT is opaque black).
+    uint32_t interval = RtxOptions::cloudSecondaryLutIntervalFrames();
+    if (interval == 0u) {
+      interval = 1u;
+    }
+    if (m_cloudSecondaryLutFramesSinceBake != UINT32_MAX) {
+      m_cloudSecondaryLutFramesSinceBake++;
+    }
+    if (m_cloudSecondaryLutFramesSinceBake >= interval) {
+      ctx->emitMemoryBarrier(0,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_ACCESS_SHADER_WRITE_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_ACCESS_SHADER_READ_BIT);
+      dispatchCloudSecondaryLut(ctx);
+      m_cloudSecondaryLutFramesSinceBake = 0u;
+    }
   }
 
   // NOTE (perf-bisect rationale): this dispatch runs whenever the RT is
