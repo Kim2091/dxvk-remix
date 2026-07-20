@@ -102,6 +102,18 @@ namespace dxvk {
       data.gpuInstancingHash = XXH3_64bits(
           gpuInstancingTransforms.data(),
           gpuInstancingTransforms.size() * sizeof(Matrix4));
+    } else if (transforms.instancesToObject != nullptr) {
+      // submitExternalDraw moves gpuInstancingTransforms into
+      // drawCall.transformData.instancesToObject before this hash runs, so
+      // the member vector is empty by then. Without this fallback every
+      // batched draw hashed its transform array as absent — harmless while
+      // batched draws were always dynamic, but with the batched preserve
+      // path (2026-07-20) a batch whose membership changed kept last
+      // frame's identity and rendered a STALE instance array (vanishing /
+      // ghost statics as streaming edits the batch).
+      data.gpuInstancingHash = XXH3_64bits(
+          transforms.instancesToObject->data(),
+          transforms.instancesToObject->size() * sizeof(Matrix4));
     }
 
     data.texgenMode = transforms.texgenMode;
@@ -2447,8 +2459,15 @@ namespace dxvk {
     //   - single submesh: preserveReplacementInstance's pReplacements==nullptr
     //     branch refreshes only prims[0]'s BlasEntry::input, so multi-submesh
     //     draws stay dynamic;
-    //   - non-batched: instancesToObject forces a replicated/dynamic BLAS in
-    //     AccelManager regardless, so batched submits gain nothing here;
+    //   - batched (instancesToObject) draws ARE preserve-eligible (gated by
+    //     enablePreservePathForBatchedDraws): the identity hash folds in the
+    //     whole transform array, so a preserved batch is bit-identical to last
+    //     frame. Preserve keeps surface.instancesToObject from the last
+    //     dynamic update (shared_ptr, identical content) and AccelManager's
+    //     point-instancer expansion + dynamic-BLAS reuse read that per frame
+    //     regardless of path; what preserve skips is processDrawCallState
+    //     (surface-material translation + instance matching), which at
+    //     thousands of batched buckets per frame dominates CS-thread time;
     //   - no particle desc: processDrawCallState owns particle spawning;
     //   - RI fully set up by a prior dynamic frame (fresh RIs have clear
     //     dirtyFlags but no prims yet).
@@ -2518,7 +2537,8 @@ namespace dxvk {
     const bool useExternalPreservePath =
         RtxOptions::enablePreservePath() &&
         submeshes.size() == 1 &&
-        state.drawCall.transformData.instancesToObject == nullptr &&
+        (state.drawCall.transformData.instancesToObject == nullptr ||
+         RtxOptions::enablePreservePathForBatchedDraws()) &&
         riReadyForPreserve &&
         replacementInstance->dirtyFlags.isClear() &&
         replacementInstance->frameLastSeen != currentFrameId &&  // second submission this frame -> dynamic
