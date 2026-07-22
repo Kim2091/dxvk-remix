@@ -215,7 +215,7 @@ namespace dxvk {
 
     // Single status line (DLSS state + resolutions), shared between the developer panel and
     // the user menu (the stock DLSS object's state is meaningless while this mode is active)
-    void showImguiStatusLine();
+    void showImguiStatusLine(bool includeInjectionPoint = true);
 
     // True when DLSS evaluated successfully last frame (for UI/status display)
     bool isDlssActive() const {

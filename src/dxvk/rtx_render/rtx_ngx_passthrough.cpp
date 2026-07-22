@@ -29,6 +29,7 @@
 #include "rtx_scene_manager.h"
 #include "rtx_ngx_wrapper.h"
 #include "rtx_dlfg.h"
+#include "rtx_dlss.h"
 #include "rtx_postFx.h"
 #include "rtx_auto_exposure.h"
 #include "rtx_imgui.h"
@@ -1550,12 +1551,32 @@ namespace dxvk {
     }
   }
 
-  void RtxNgxPassthrough::showImguiStatusLine() {
+  void RtxNgxPassthrough::showImguiStatusLine(bool includeInjectionPoint) {
     if (m_dlssActive) {
-      ImGui::TextWrapped(str::format("DLSS active: ", m_renderExtent.width, "x", m_renderExtent.height,
-                                     " -> ", m_displayExtent.width, "x", m_displayExtent.height,
-                                     (m_renderExtent.width == m_displayExtent.width ? " (DLAA" : " (Super Resolution"),
-                                     (m_lastDispatchPrePost ? ", pre-post-process)" : ", final output)")).c_str());
+      const DLSSProfile profile = RtxOptions::qualityDLSS();
+
+      const char* profileName = nullptr;
+      switch (profile) {
+      case DLSSProfile::MaxQuality: profileName = "Quality"; break;
+      case DLSSProfile::MaxPerf: profileName = "Performance"; break;
+      default: profileName = dlssProfileToString(profile); break;
+      }
+
+      const std::string profilePart = (profile == DLSSProfile::FullResolution)
+        ? str::format(profileName, " / DLAA")
+        : str::format(profileName, ", Super Resolution");
+
+      if (includeInjectionPoint) {
+        const char* injectionPoint = m_lastDispatchPrePost ? "pre-post-process" : "late injection";
+        ImGui::TextWrapped(str::format("DLSS active (", profilePart, "): ",
+                                       m_renderExtent.width, "x", m_renderExtent.height,
+                                       " -> ", m_displayExtent.width, "x", m_displayExtent.height,
+                                       ", ", injectionPoint).c_str());
+      } else {
+        ImGui::TextWrapped(str::format("DLSS active (", profilePart, "): ",
+                                       m_renderExtent.width, "x", m_renderExtent.height,
+                                       " -> ", m_displayExtent.width, "x", m_displayExtent.height).c_str());
+      }
     } else {
       ImGui::TextWrapped(str::format("DLSS inactive: ", m_statusReason).c_str());
     }

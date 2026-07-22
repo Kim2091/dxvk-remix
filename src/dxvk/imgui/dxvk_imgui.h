@@ -223,10 +223,6 @@ namespace dxvk {
       const Rc<DxvkContext>& ctx,
       const int subItemWidth,
       const int subItemIndent);
-    void showUserContentSettings(
-      const Rc<DxvkContext>& ctx,
-      const int subItemWidth,
-      const int subItemIndent);
 
     void showHudMessages(const Rc<DxvkContext>& ctx);
 

@@ -33,12 +33,7 @@
 #include "rtx_render/rtx_ray_reconstruction.h"
 #include "rtx_render/rtx_xess.h"
 #include "rtx_render/rtx_postFx.h"
-#include "rtx_render/rtx_rtxdi_rayquery.h"
-#include "rtx_render/rtx_restir_gi_rayquery.h"
-#include "rtx_render/rtx_neural_radiance_cache.h"
-#include "rtx_render/rtx_global_volumetrics.h"
 #include "rtx_render/rtx_option_layer_gui.h"
-#include "rtx_render/rtx_scene_manager.h"
 #include "../util/util_string.h"
 
 namespace ImGui {
@@ -80,65 +75,6 @@ namespace dxvk {
         {TaauPreset::Balanced, "Balanced"},
         {TaauPreset::Quality, "Quality"},
         {TaauPreset::Fullscreen, "Fullscreen"},
-    } }
-  };
-
-  static RemixGui::ComboWithKey<GraphicsPreset> graphicsPresetCombo{
-    "Graphics Preset",
-    RemixGui::ComboWithKey<GraphicsPreset>::ComboEntries{ {
-        {GraphicsPreset::Ultra, "Ultra"},
-        {GraphicsPreset::High, "High"},
-        {GraphicsPreset::Medium, "Medium"},
-        {GraphicsPreset::Low, "Low"},
-        {GraphicsPreset::Custom, "Custom"},
-    } }
-  };
-
-  static RemixGui::ComboWithKey<int> minPathBouncesCombo {
-    "Min Light Bounces",
-    RemixGui::ComboWithKey<int>::ComboEntries { {
-        {0, "0"},
-        {1, "1"},
-    } }
-  };
-
-  static RemixGui::ComboWithKey<int> maxPathBouncesCombo {
-    "Max Light Bounces",
-    RemixGui::ComboWithKey<int>::ComboEntries { {
-        {1, "1"},
-        {2, "2"},
-        {3, "3"},
-        {4, "4"},
-        {5, "5"},
-        {6, "6"},
-        {7, "7"},
-        {8, "8"},
-    } }
-  };
-
-  static RemixGui::ComboWithKey<int> indirectLightingParticlesCombo {
-    "Particle Light",
-    RemixGui::ComboWithKey<int>::ComboEntries { {
-        {0, "None"},
-        {1, "Low"},
-        {2, "High"},
-    } }
-  };
-
-  static RemixGui::ComboWithKey<NeuralRadianceCache::QualityPreset> neuralRadianceCacheQualityPresetCombo {
-    "RTX Neural Radiance Cache Quality",
-    RemixGui::ComboWithKey<NeuralRadianceCache::QualityPreset>::ComboEntries { {
-        {NeuralRadianceCache::QualityPreset::Ultra, "Ultra"},
-        {NeuralRadianceCache::QualityPreset::High, "High"},
-        {NeuralRadianceCache::QualityPreset::Medium, "Medium"}
-    } }
-  };
-
-  static RemixGui::ComboWithKey<bool> denoiserQualityCombo {
-    "NRD Denoising Quality",
-    RemixGui::ComboWithKey<bool>::ComboEntries { {
-        {true, "High"},
-        {false,"Low"},
     } }
   };
 
@@ -186,12 +122,6 @@ namespace dxvk {
       const static ImGuiTabBarFlags tab_bar_flags = ImGuiTabBarFlags_NoCloseWithMiddleMouseButton;
       const static ImGuiTabItemFlags tab_item_flags = ImGuiTabItemFlags_NoCloseWithMiddleMouseButton;
 
-      {
-        ImGui::TextSeparator("Display Settings");
-        RemixGui::SliderInt("Brightness##user", &RtxOptions::userBrightnessObject(), 0, 100, "%d", ImGuiSliderFlags_AlwaysClamp);
-        ImGui::Dummy({ 0.f, 4.f });
-      }
-
       ImGui::PopStyleVar();
 
       auto beginTabChild = [&windowPaddingHalfX, &childSize, &itemWidth](const char* tabID) -> void {
@@ -223,13 +153,6 @@ namespace dxvk {
         if (ImGui::BeginTabItem("Graphics", nullptr, tab_item_flags)) {
           beginTabChild("##tab_child_graphics");
           showUserRenderingSettings(ctx, subItemWidth, subItemIndent);
-          endTabChild();
-          ImGui::EndTabItem();
-        }
-
-        if (ImGui::BeginTabItem("Content", nullptr, tab_item_flags)) {
-          beginTabChild("##tab_child_content");
-          showUserContentSettings(ctx, subItemWidth, subItemIndent);
           endTabChild();
           ImGui::EndTabItem();
         }
@@ -322,7 +245,6 @@ namespace dxvk {
 
     const bool dlssSupported = dlss.supportsDLSS();
     const bool dlfgSupported = dlfg.supportsDLFG();
-    const bool dlssRRSupported = rayReconstruction.supportsRayReconstruction();
     const bool reflexInitialized = reflex.reflexInitialized();
 
     // Describe the tab
@@ -373,7 +295,6 @@ namespace dxvk {
 
       // Note: Use a different combo box without DLSS's upscaler listed if DLSS overall is unsupported.
       auto oldUpscalerType = RtxOptions::upscalerType();
-      bool oldDLSSRREnabled = RtxOptions::enableRayReconstruction();
 
       if (dlss.supportsDLSS()) {
         getUpscalerCombo(dlss, rayReconstruction).getKey(&RtxOptions::upscalerTypeObject());
@@ -382,15 +303,12 @@ namespace dxvk {
       ImGui::PushItemWidth(static_cast<float>(subItemWidth));
       ImGui::Indent(static_cast<float>(subItemIndent));
 
-      if (dlss.supportsDLSS()) {
-        showRayReconstructionEnable(dlssRRSupported);
-
-        // If DLSS-RR is toggled, need to update some path tracer options accordingly to improve quality
-        if (oldUpscalerType != RtxOptions::upscalerType() || oldDLSSRREnabled != RtxOptions::enableRayReconstruction()) {
-          RtxOptions::updateLightingSetting();
-        }
-      } else {
+      if (!dlss.supportsDLSS()) {
         getUpscalerCombo(dlss, rayReconstruction).getKey(&RtxOptions::upscalerTypeObject());
+      }
+
+      if (oldUpscalerType != RtxOptions::upscalerType()) {
+        RtxOptions::updateLightingSetting();
       }
 
       // Upscaler Preset
@@ -405,7 +323,7 @@ namespace dxvk {
           if (RtxNgxPassthrough::ngxPassthroughMode()) {
             ImGui::EndDisabled();
             dlssProfileCombo.getKey(&RtxOptions::qualityDLSSObject());
-            common->metaNgxPassthrough().showImguiStatusLine();
+            common->metaNgxPassthrough().showImguiStatusLine(false);
             ImGui::BeginDisabled(disableNonPresetSettings);
             break;
           }
@@ -512,111 +430,31 @@ namespace dxvk {
     const int subItemIndent) {
     auto common = ctx->getCommonObjects();
     DxvkPostFx& postFx = common->metaPostFx();
-    DxvkRtxdiRayQuery& rtxdiRayQuery = common->metaRtxdiRayQuery();
-    DxvkReSTIRGIRayQuery& restirGiRayQuery = common->metaReSTIRGIRayQuery();
 
-    // Describe the tab
-
-    ImGui::TextWrapped("Rendering-specific settings. Complexity of rendering may be adjusted to balance between performance and quality.");
+    ImGui::TextWrapped("Post-processing and display settings for the NGX passthrough pipeline.");
 
     ImGui::Dummy(ImVec2(0.0f, 5.0f));
 
-    // Preset Settings
-
-    ImGui::TextSeparator("Preset Settings");
-
-    graphicsPresetCombo.getKey(&RtxOptions::graphicsPresetObject());
-
-    // Map settings to indirect particle level
-    int indirectLightParticlesLevel = 0;
-    if (RtxOptions::enableUnorderedResolveInIndirectRays()) {
-      indirectLightParticlesLevel = RtxOptions::enableUnorderedEmissiveParticlesInIndirectRays() ? 2 : 1;
-    }
-
-    // Path Tracing Settings
-
-    ImGui::Dummy(ImVec2(0.0f, 3.0f));
-    ImGui::TextSeparator("Path Tracing Settings");
-
-    {
-      // Note: Disabled flags should match preset mapping above to prevent changing settings when a preset overrides them.
-      ImGui::BeginDisabled(RtxOptions::graphicsPreset() != GraphicsPreset::Custom);
-
-      minPathBouncesCombo.getKey(&RtxOptions::pathMinBouncesObject());
-      maxPathBouncesCombo.getKey(&RtxOptions::pathMaxBouncesObject());
-      indirectLightingParticlesCombo.getKey(&indirectLightParticlesLevel);
-      RemixGui::SetTooltipToLastWidgetOnHover("Controls the quality of particles in indirect (reflection/GI) rays.");
-
-      // NRC Quality Preset dropdown
-      NeuralRadianceCache& nrc = common->metaNeuralRadianceCache();
-      if (nrc.checkIsSupported(m_device)) {
-        bool enableNeuralRadianceCache = RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::NeuralRadianceCache;
-
-        // Disable NRC quality preset combo when NRC is not enabled.
-        ImGui::BeginDisabled(!enableNeuralRadianceCache);
-        
-        neuralRadianceCacheQualityPresetCombo.getKey(&NeuralRadianceCache::NrcOptions::qualityPresetObject());
-
-        ImGui::EndDisabled();
-      }
-
-      // Hide NRD denoiser quality list when DLSS-RR is enabled.
-      bool useRayReconstruction = RtxOptions::isRayReconstructionEnabled();
-      if (!useRayReconstruction) {
-        denoiserQualityCombo.getKey(&RtxOptions::denoiseDirectAndIndirectLightingSeparatelyObject());
-      }
-
-      ImGui::EndDisabled();
-    }
-
-    // Volumetrics Settings
-
-    ImGui::Dummy(ImVec2(0.0f, 3.0f));
-    ImGui::TextSeparator("RTX Volumetrics Settings");
-    {
-      // Volumetrics being enabled/disabled is not controlled by the graphics preset, so show the user settings regardless of preset.
-      RemixGui::Checkbox("Enable Volumetric Lighting", &RtxGlobalVolumetrics::enableObject());
-      // Volumetrics quality settings are set by the graphics preset, so only show the user settings if the preset is Custom and the volumetrics are enabled.
-      ImGui::BeginDisabled(!RtxGlobalVolumetrics::enable() || RtxOptions::graphicsPreset() != GraphicsPreset::Custom);
-      ImGui::Indent(static_cast<float>(subItemIndent));
-      common->metaGlobalVolumetrics().showImguiUserSettings();
-      ImGui::EndDisabled();
-      ImGui::Unindent(static_cast<float>(subItemIndent));
-    }
-
     // Post Effect Settings
 
-    ImGui::Dummy(ImVec2(0.0f, 3.0f));
     ImGui::TextSeparator("Post Effect Settings");
 
     {
-      {
-        // Note: All presets aside from Custom will overwrite this, so only enable for Custom.
-        ImGui::BeginDisabled(RtxOptions::graphicsPreset() != GraphicsPreset::Custom);
-        RemixGui::Checkbox("Enable Post Effects", &postFx.enableObject());
-        ImGui::EndDisabled();
-      }
+      RemixGui::Checkbox("Enable Post Effects", &postFx.enableObject());
 
-      // Note: Medium and Low presets disable all post effects, so no value in changing the individual settings.
-      // High and Ultra allow these to be changed without requiring Custom, so leave enabled for those.
-      ImGui::BeginDisabled(RtxOptions::graphicsPreset() == GraphicsPreset::Medium || RtxOptions::graphicsPreset() == GraphicsPreset::Low);
-      {
-        ImGui::PushItemWidth(static_cast<float>(subItemWidth));
-        ImGui::Indent(static_cast<float>(subItemIndent));
+      ImGui::PushItemWidth(static_cast<float>(subItemWidth));
+      ImGui::Indent(static_cast<float>(subItemIndent));
 
-        ImGui::BeginDisabled(!postFx.enable());
+      ImGui::BeginDisabled(!postFx.enable());
 
-        RemixGui::Checkbox("Enable Motion Blur", &postFx.enableMotionBlurObject());
-        RemixGui::Checkbox("Enable Chromatic Aberration", &postFx.enableChromaticAberrationObject());
-        RemixGui::Checkbox("Enable Vignette", &postFx.enableVignetteObject());
-
-        ImGui::EndDisabled();
-
-        ImGui::Unindent(static_cast<float>(subItemIndent));
-        ImGui::PopItemWidth();
-      }
+      RemixGui::Checkbox("Enable Motion Blur", &postFx.enableMotionBlurObject());
+      RemixGui::Checkbox("Enable Chromatic Aberration", &postFx.enableChromaticAberrationObject());
+      RemixGui::Checkbox("Enable Vignette", &postFx.enableVignetteObject());
 
       ImGui::EndDisabled();
+
+      ImGui::Unindent(static_cast<float>(subItemIndent));
+      ImGui::PopItemWidth();
     }
 
     // Other Settings
@@ -627,61 +465,6 @@ namespace dxvk {
     {
       showVsyncOptions(true);
     }
-
-    // Map indirect particle level back to settings
-    if (RtxOptions::graphicsPreset() == GraphicsPreset::Custom) {
-      switch (indirectLightParticlesLevel) {
-      case 0:
-        RtxOptions::enableUnorderedEmissiveParticlesInIndirectRays.setDeferred(false);
-        RtxOptions::enableUnorderedResolveInIndirectRays.setDeferred(false);
-        break;
-      case 1:
-        RtxOptions::enableUnorderedEmissiveParticlesInIndirectRays.setDeferred(false);
-        RtxOptions::enableUnorderedResolveInIndirectRays.setDeferred(true);
-        break;
-      case 2:
-        RtxOptions::enableUnorderedEmissiveParticlesInIndirectRays.setDeferred(true);
-        RtxOptions::enableUnorderedResolveInIndirectRays.setDeferred(true);
-        break;
-      }
-    }
-
-    ImGui::Dummy(ImVec2(0.0f, 5.0f));
-  }
-
-  void ImGUI::showUserContentSettings(
-    const Rc<DxvkContext>& ctx,
-    const int subItemWidth,
-    const int subItemIndent) {
-    auto common = ctx->getCommonObjects();
-
-    // Describe the tab
-
-    ImGui::TextWrapped("Content-specific settings. Allows control of what types of assets Remix should replace (if any).");
-
-    ImGui::Dummy(ImVec2(0.0f, 5.0f));
-
-    ImGui::BeginDisabled(!common->getSceneManager().areAllReplacementsLoaded());
-
-    RemixGui::Checkbox("Enable All Enhanced Assets", &RtxOptions::enableReplacementAssetsObject());
-
-    {
-      ImGui::PushItemWidth(static_cast<float>(subItemWidth));
-      ImGui::Indent(static_cast<float>(subItemIndent));
-
-      ImGui::BeginDisabled(!RtxOptions::enableReplacementAssets());
-
-      RemixGui::Checkbox("Enable Enhanced Materials", &RtxOptions::enableReplacementMaterialsObject());
-      RemixGui::Checkbox("Enable Enhanced Meshes", &RtxOptions::enableReplacementMeshesObject());
-      RemixGui::Checkbox("Enable Enhanced Lights", &RtxOptions::enableReplacementLightsObject());
-
-      ImGui::EndDisabled();
-
-      ImGui::Unindent(static_cast<float>(subItemIndent));
-      ImGui::PopItemWidth();
-    }
-
-    ImGui::EndDisabled();
 
     ImGui::Dummy(ImVec2(0.0f, 5.0f));
   }
