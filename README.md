@@ -30,8 +30,9 @@ How it works:
 Notes and limitations:
 
 - Options under `rtx.ngxPassthrough.*`; Rendering -> General shows DLSS stats and depth/MV visualisers.
-- Default DLSS model is the transformer preset (rtx.ngxPassthrough.dlssRenderPreset = 10, preset J), which keeps more detail than NGX's default CNN presets; the developer menu can switch presets live.
-- Ghosting issues with particles and with textures on transparent planes (chain link fences). Will investigate solutions for this at a later date.
+- Default DLSS model is the transformer preset (`rtx.ngxPassthrough.dlssRenderPreset = 10`, preset J), which keeps more detail than NGX's default CNN presets; the developer menu can switch presets live.
+- At certain internal render resolution percentages, the UI in Mirror's Edge becomes pixelated. This does not occur in Full Resolution and Performance modes.
+- Ghosting issues with particles and textures on transparent planes (chain link fences). Will investigate solutions for this in the future.
 
 ## Build instructions
 
