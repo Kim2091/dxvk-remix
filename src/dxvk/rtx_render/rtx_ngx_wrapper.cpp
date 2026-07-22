@@ -447,8 +447,20 @@ namespace dxvk
                                   bool depthInverted,
                                   bool autoExposure,
                                   bool sharpening,
-                                  NVSDK_NGX_PerfQuality_Value perfQuality) {
+                                  NVSDK_NGX_PerfQuality_Value perfQuality,
+                                  NVSDK_NGX_DLSS_Hint_Render_Preset renderPreset) {
     ScopedCpuProfileZone();
+
+    // Render preset hint (model selection) - set for every quality slot so the choice
+    // follows whatever perf quality the feature is created with. Written unconditionally:
+    // the parameter block outlives feature recreation, so a previously set preset must be
+    // explicitly overwritten with Default (0) to actually revert to the snippet's choice.
+    m_parameters->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, renderPreset);
+    m_parameters->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraQuality, renderPreset);
+    m_parameters->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality, renderPreset);
+    m_parameters->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced, renderPreset);
+    m_parameters->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance, renderPreset);
+    m_parameters->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance, renderPreset);
 
     const unsigned int CreationNodeMask = 1;
     const unsigned int VisibilityNodeMask = 1;
@@ -868,6 +880,7 @@ namespace dxvk
                                                           VkCommandBuffer clientCommandList,
                                                           Rc<DxvkImageView> interpolatedOutput,
                                                           Rc<DxvkImageView> compositedColorBuffer,
+                                                          Rc<DxvkImageView> hudlessColorBuffer,
                                                           Rc<DxvkImageView> motionVectors,
                                                           Rc<DxvkImageView> depth,
                                                           const RtCamera& camera,
@@ -882,10 +895,17 @@ namespace dxvk
     auto ngxDepth = ViewToResourceVK(depth, false);
     auto ngxOutput = ViewToResourceVK(interpolatedOutput, true);
 
+    // Optional: must stay alive until the evaluate call below
+    NVSDK_NGX_Resource_VK ngxHudless = {};
+    if (hudlessColorBuffer != nullptr) {
+      ngxHudless = ViewToResourceVK(hudlessColorBuffer, false);
+    }
+
     NVSDK_NGX_VK_DLSSG_Eval_Params evalParams = {};
     evalParams.pBackbuffer = &ngxColorBuffer;
     evalParams.pMVecs = &ngxMVec;
     evalParams.pDepth = &ngxDepth;
+    evalParams.pHudless = hudlessColorBuffer != nullptr ? &ngxHudless : nullptr;
     evalParams.pOutputInterpFrame = &ngxOutput;
 
     const Matrix4& viewToProjection = camera.getViewToProjection();

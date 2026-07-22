@@ -12,6 +12,7 @@
 #include <numeric>
 #include <sstream>
 #include "../dxvk/imgui/dxvk_imgui.h"
+#include "../dxvk/rtx_render/rtx_ngx_passthrough.h"
 
 #include <charconv>
 
@@ -321,6 +322,18 @@ namespace dxvk {
     // it is going to be used by the game.
     if (imageInfo.tiling == VK_IMAGE_TILING_OPTIMAL && imageInfo.sharing.mode == DxvkSharedHandleMode::None)
       imageInfo.layout = OptimizeLayout(imageInfo.usage);
+
+    // NV-DXVK start: [NGX passthrough] game depth buffers are sampled by the motion vector
+    // generation pass, which requires a shader-compatible canonical layout (attachment-only
+    // depth-stencil surfaces would otherwise settle on DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+    if (RtxNgxPassthrough::ngxPassthroughMode() &&
+        (m_desc.Usage & D3DUSAGE_DEPTHSTENCIL) &&
+        imageInfo.tiling == VK_IMAGE_TILING_OPTIMAL) {
+      imageInfo.layout = VK_IMAGE_LAYOUT_GENERAL;
+      imageInfo.stages |= m_device->GetEnabledShaderStages();
+      imageInfo.access |= VK_ACCESS_SHADER_READ_BIT;
+    }
+    // NV-DXVK end
 
     // For some formats, we need to enable render target
     // capabilities if available, but these should

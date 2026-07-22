@@ -15,6 +15,9 @@
 #include "d3d9_texture.h"
 #include "../dxso/dxso_tables.h"
 #include "../dxvk/rtx_render/rtx_terrain_baker.h"
+#include "../dxvk/rtx_render/rtx_ngx_passthrough.h"
+#include "../dxvk/rtx_render/rtx_dlfg.h"
+#include "../dxvk/rtx_render/rtx_camera.h"
 #include "../dxvk/imgui/dxvk_imgui.h"
 
 #include <algorithm>
@@ -24,6 +27,9 @@
 #include <fstream>
 #include <map>
 #include <sstream>
+
+// Process/module snapshots for the cross-process NGX passthrough ScreenPercentage driver.
+#include <tlhelp32.h>
 
 namespace dxvk {
   static const bool s_isDxvkResolutionEnvVarSet = (env::getEnvVar("DXVK_RESOLUTION_WIDTH") != "") || (env::getEnvVar("DXVK_RESOLUTION_HEIGHT") != "");
@@ -4682,6 +4688,13 @@ namespace dxvk {
     , m_pGeometryWorkers(enableDrawCallConversion ? std::make_unique<GeometryProcessor>(numGeometryProcessingThreads(), "geometry-processing") : nullptr) {
   }
 
+  D3D9Rtx::~D3D9Rtx() {
+    // Close the game process handle opened for the ScreenPercentage driver (only when it is
+    // a real opened handle - the single-process path uses the GetCurrentProcess pseudo-handle).
+    if (m_ngxGameProcessOwned && m_ngxGameProcess != nullptr)
+      ::CloseHandle(m_ngxGameProcess);
+  }
+
   void D3D9Rtx::SkinningMatrixPool::clear() {
     m_blockIndex = 0;
     m_nextIndexInBlock = 0;
@@ -4774,6 +4787,20 @@ namespace dxvk {
     o.ue3LogDrawStatusFlaps = ue3LogDrawStatusFlapsObject().get();
     o.deferredUiReplay = deferredUiReplayObject().get();
     o.deferredUiRefreshSceneColor = deferredUiRefreshSceneColorObject().get();
+    o.ngxPassthroughMode = RtxNgxPassthrough::ngxPassthroughMode();
+    o.ngxPassthroughJitter = RtxNgxPassthrough::enableJitter();
+    o.ngxPrePostProcess = RtxNgxPassthrough::prePostProcess();
+    o.ngxDlfgHudless = RtxNgxPassthrough::dlfgHudlessInput() && DxvkDLFG::enable() &&
+                       m_parent->GetDXVKDevice()->getCommon()->metaNGXContext().supportsDLFG();
+    o.ngxObjectVelocities = RtxNgxPassthrough::objectVelocities();
+    o.ngxDebugVisualization = RtxNgxPassthrough::debugVisualization();
+
+    // On-demand post-chain dump (one-shot: consumed here, option resets itself)
+    if (o.ngxPassthroughMode && RtxNgxPassthrough::dumpPostChainFrames() > 0 && m_ngxPostChainDumpFramesLeft == 0) {
+      m_ngxPostChainDumpFramesLeft = uint32_t(RtxNgxPassthrough::dumpPostChainFrames());
+      RtxNgxPassthrough::dumpPostChainFramesObject().setDeferred(0);
+      Logger::info(str::format("[RTX NGX Passthrough][dump] On-demand dump armed for ", m_ngxPostChainDumpFramesLeft, " frames."));
+    }
     o.enableIndexBufferMemoization = enableIndexBufferMemoizationObject().get();
 
     o.enableRaytracing = RtxOptions::enableRaytracingObject().get();
@@ -5924,6 +5951,187 @@ namespace dxvk {
     }
   }
 
+  bool D3D9Rtx::tryGetUe3CameraFromConstantsCached(uint32_t viewProjReg,
+                                                   uint32_t viewOriginReg,
+                                                   Matrix4& outWorldToView,
+                                                   Matrix4& outViewToProjection,
+                                                   bool& outUsedTranspose,
+                                                   float& outReconstructionError,
+                                                   XXH64_hash_t* outConstantsHash) {
+    if (viewProjReg + 3 >= caps::MaxFloatConstantsSoftware || viewOriginReg >= caps::MaxFloatConstantsSoftware)
+      return false;
+
+    // cache by raw constant values to avoid repeated heavy extraction work per draw call
+    struct Ue3CameraConstsKey {
+      uint32_t viewProjReg;
+      uint32_t viewOriginReg;
+      Vector4 regs[5];
+    };
+
+    Ue3CameraConstsKey key {};
+    key.viewProjReg = viewProjReg;
+    key.viewOriginReg = viewOriginReg;
+    key.regs[0] = d3d9State().vsConsts.fConsts[viewProjReg + 0];
+    key.regs[1] = d3d9State().vsConsts.fConsts[viewProjReg + 1];
+    key.regs[2] = d3d9State().vsConsts.fConsts[viewProjReg + 2];
+    key.regs[3] = d3d9State().vsConsts.fConsts[viewProjReg + 3];
+    key.regs[4] = d3d9State().vsConsts.fConsts[viewOriginReg];
+
+    const XXH64_hash_t constantsHash = XXH3_64bits(&key, sizeof(key));
+
+    if (outConstantsHash != nullptr) {
+      *outConstantsHash = constantsHash;
+    }
+
+    for (const Ue3CameraConstantsCache& slot : m_ue3CameraConstantsCache) {
+      if (slot.valid && slot.hash == constantsHash) {
+        if (slot.extractionFailed) {
+          return false;
+        }
+        outWorldToView = slot.worldToView;
+        outViewToProjection = slot.viewToProjection;
+        outUsedTranspose = slot.usedTranspose;
+        outReconstructionError = slot.reconstructionError;
+        return true;
+      }
+    }
+
+    Matrix4 ue3WorldToView;
+    Matrix4 ue3ViewToProjection;
+    bool usedTranspose = false;
+    float reconstructionError = 0.0f;
+    const bool extracted = tryExtractUe3WorldToViewAndProjectionFromShaderConstants(
+        d3d9State().vsConsts, viewProjReg, viewOriginReg, ue3WorldToView, ue3ViewToProjection, &usedTranspose, &reconstructionError);
+
+    Ue3CameraConstantsCache& slot = m_ue3CameraConstantsCache[m_ue3CameraConstantsCacheNextSlot];
+    m_ue3CameraConstantsCacheNextSlot = (m_ue3CameraConstantsCacheNextSlot + 1u) % kUe3CameraConstantsCacheSlots;
+    slot.hash = constantsHash;
+    slot.valid = true;
+    slot.extractionFailed = !extracted;
+    slot.usedTranspose = usedTranspose;
+    slot.worldToView = ue3WorldToView;
+    slot.viewToProjection = ue3ViewToProjection;
+    slot.reconstructionError = reconstructionError;
+
+    if (!extracted) {
+      return false;
+    }
+
+    outWorldToView = ue3WorldToView;
+    outViewToProjection = ue3ViewToProjection;
+    outUsedTranspose = usedTranspose;
+    outReconstructionError = reconstructionError;
+    return true;
+  }
+
+  Matrix4 D3D9Rtx::extractUe3ObjectToWorld(uint32_t reg, bool hasWorldToLocal, uint32_t w2lReg, bool cameraUsedTranspose) {
+    // Memo lookup: every input to the transpose/affinity/inverse disambiguation below
+    // (register contents and the camera transpose convention tiebreaker) is folded into
+    // the key, so a hit returns exactly what the computation would produce. Static
+    // placements re-upload identical matrices every frame, making this a per-draw
+    // matrix-inverse saving.
+    XXH64_hash_t o2wKeyHash = XXH3_64bits(&d3d9State().vsConsts.fConsts[reg], 4 * sizeof(Vector4));
+    if (hasWorldToLocal) {
+      o2wKeyHash = XXH3_64bits_withSeed(&d3d9State().vsConsts.fConsts[w2lReg], 3 * sizeof(Vector4), o2wKeyHash);
+    }
+    const uint32_t o2wKeyFlags = (hasWorldToLocal ? 1u : 0u) | (cameraUsedTranspose ? 2u : 0u);
+    o2wKeyHash = XXH3_64bits_withSeed(&o2wKeyFlags, sizeof(o2wKeyFlags), o2wKeyHash);
+
+    const auto o2wIt = m_ue3ObjectToWorldCache.find(o2wKeyHash);
+    if (o2wIt != m_ue3ObjectToWorldCache.end()) {
+      return o2wIt->second;
+    }
+
+    const Matrix4 localToWorldRaw = [&] {
+      Matrix4 m;
+      m[0] = d3d9State().vsConsts.fConsts[reg + 0];
+      m[1] = d3d9State().vsConsts.fConsts[reg + 1];
+      m[2] = d3d9State().vsConsts.fConsts[reg + 2];
+      m[3] = d3d9State().vsConsts.fConsts[reg + 3];
+      return m;
+    }();
+
+    const Matrix4 localToWorldTransposed = transpose(localToWorldRaw);
+
+    auto isAffineColumnVector = [](const Matrix4& m) {
+      constexpr float kEps = 1e-3f;
+      return std::abs(m[0].w) < kEps &&
+             std::abs(m[1].w) < kEps &&
+             std::abs(m[2].w) < kEps &&
+             std::abs(m[3].w - 1.0f) < kEps;
+    };
+
+    const bool rawAffine = isAffineColumnVector(localToWorldRaw);
+    const bool transAffine = isAffineColumnVector(localToWorldTransposed);
+
+    // optionally use WorldToLocal (if present) to disambiguate transpose/packing
+    Matrix4 worldToLocalRaw;
+    Matrix4 worldToLocalTransposed;
+    if (hasWorldToLocal) {
+      const Vector4 c0 = d3d9State().vsConsts.fConsts[w2lReg + 0];
+      const Vector4 c1 = d3d9State().vsConsts.fConsts[w2lReg + 1];
+      const Vector4 c2 = d3d9State().vsConsts.fConsts[w2lReg + 2];
+
+      worldToLocalRaw = Matrix4();
+      worldToLocalRaw[0] = Vector4(c0.x, c0.y, c0.z, 0.0f);
+      worldToLocalRaw[1] = Vector4(c1.x, c1.y, c1.z, 0.0f);
+      worldToLocalRaw[2] = Vector4(c2.x, c2.y, c2.z, 0.0f);
+      worldToLocalRaw[3] = Vector4(0.0f, 0.0f, 0.0f, 1.0f);
+      worldToLocalTransposed = transpose(worldToLocalRaw);
+    }
+
+    auto l1Error3x3 = [](const Matrix4& a, const Matrix4& b) {
+      float err = 0.0f;
+      for (uint32_t c = 0; c < 3; c++) {
+        for (uint32_t r = 0; r < 3; r++) {
+          err += std::abs(a[c][r] - b[c][r]);
+        }
+      }
+      return err;
+    };
+
+    Matrix4 localToWorld = localToWorldRaw;
+    if (hasWorldToLocal && rawAffine && transAffine) {
+      // both candidates look affine, so we choose the one whose inverse best matches the provided WorldToLocal basis
+      const Matrix4 invRaw = inverseAffine(localToWorldRaw);
+      const Matrix4 invTrans = inverseAffine(localToWorldTransposed);
+
+      float bestErr = std::numeric_limits<float>::infinity();
+      bool bestIsTransposed = false;
+
+      const float errRaw0 = l1Error3x3(invRaw, worldToLocalRaw);
+      const float errRaw1 = l1Error3x3(invRaw, worldToLocalTransposed);
+      const float errTrans0 = l1Error3x3(invTrans, worldToLocalRaw);
+      const float errTrans1 = l1Error3x3(invTrans, worldToLocalTransposed);
+
+      bestErr = errRaw0;
+      bestIsTransposed = false;
+      if (errRaw1 < bestErr) { bestErr = errRaw1; bestIsTransposed = false; }
+      if (errTrans0 < bestErr) { bestErr = errTrans0; bestIsTransposed = true; }
+      if (errTrans1 < bestErr) { bestErr = errTrans1; bestIsTransposed = true; }
+
+      constexpr float kMaxWorldToLocalMatchError = 0.25f;
+      if (std::isfinite(bestErr) && bestErr <= kMaxWorldToLocalMatchError) {
+        localToWorld = bestIsTransposed ? localToWorldTransposed : localToWorldRaw;
+      } else {
+        localToWorld = cameraUsedTranspose ? localToWorldTransposed : localToWorldRaw;
+      }
+    } else if (rawAffine && transAffine) {
+      localToWorld = cameraUsedTranspose ? localToWorldTransposed : localToWorldRaw;
+    } else if (!rawAffine && transAffine) {
+      localToWorld = localToWorldTransposed;
+    } else {
+      localToWorld = localToWorldRaw;
+    }
+
+    if (m_ue3ObjectToWorldCache.size() >= kUe3ObjectToWorldCacheMaxEntries) {
+      m_ue3ObjectToWorldCache.clear();
+    }
+    m_ue3ObjectToWorldCache.emplace(o2wKeyHash, localToWorld);
+
+    return localToWorld;
+  }
+
   bool D3D9Rtx::processRenderState(const DrawContext& drawContext) {
     ScopedCpuProfileZone();
     DrawCallTransforms& transformData = m_activeDrawCallState.transformData;
@@ -6234,69 +6442,6 @@ namespace dxvk {
           viewOriginReg = ue3CtabInfoPtr->cameraPositionRegisterIndex;
       }
 
-      // cache by raw constant values to avoid repeated heavy extraction work per draw call
-      struct Ue3CameraConstsKey {
-        uint32_t viewProjReg;
-        uint32_t viewOriginReg;
-        Vector4 regs[5];
-      };
-
-      auto tryApplyFromConstants = [&](Matrix4& outWorldToView, Matrix4& outViewToProjection, bool& outUsedTranspose, float& outReconstructionError) -> bool {
-        if (viewProjReg + 3 >= caps::MaxFloatConstantsSoftware || viewOriginReg >= caps::MaxFloatConstantsSoftware)
-          return false;
-
-        Ue3CameraConstsKey key {};
-        key.viewProjReg = viewProjReg;
-        key.viewOriginReg = viewOriginReg;
-        key.regs[0] = d3d9State().vsConsts.fConsts[viewProjReg + 0];
-        key.regs[1] = d3d9State().vsConsts.fConsts[viewProjReg + 1];
-        key.regs[2] = d3d9State().vsConsts.fConsts[viewProjReg + 2];
-        key.regs[3] = d3d9State().vsConsts.fConsts[viewProjReg + 3];
-        key.regs[4] = d3d9State().vsConsts.fConsts[viewOriginReg];
-
-        const XXH64_hash_t constantsHash = XXH3_64bits(&key, sizeof(key));
-
-        for (const Ue3CameraConstantsCache& slot : m_ue3CameraConstantsCache) {
-          if (slot.valid && slot.hash == constantsHash) {
-            if (slot.extractionFailed) {
-              return false;
-            }
-            outWorldToView = slot.worldToView;
-            outViewToProjection = slot.viewToProjection;
-            outUsedTranspose = slot.usedTranspose;
-            outReconstructionError = slot.reconstructionError;
-            return true;
-          }
-        }
-
-        Matrix4 ue3WorldToView;
-        Matrix4 ue3ViewToProjection;
-        bool usedTranspose = false;
-        float reconstructionError = 0.0f;
-        const bool extracted = tryExtractUe3WorldToViewAndProjectionFromShaderConstants(
-            d3d9State().vsConsts, viewProjReg, viewOriginReg, ue3WorldToView, ue3ViewToProjection, &usedTranspose, &reconstructionError);
-
-        Ue3CameraConstantsCache& slot = m_ue3CameraConstantsCache[m_ue3CameraConstantsCacheNextSlot];
-        m_ue3CameraConstantsCacheNextSlot = (m_ue3CameraConstantsCacheNextSlot + 1u) % kUe3CameraConstantsCacheSlots;
-        slot.hash = constantsHash;
-        slot.valid = true;
-        slot.extractionFailed = !extracted;
-        slot.usedTranspose = usedTranspose;
-        slot.worldToView = ue3WorldToView;
-        slot.viewToProjection = ue3ViewToProjection;
-        slot.reconstructionError = reconstructionError;
-
-        if (!extracted) {
-          return false;
-        }
-
-        outWorldToView = ue3WorldToView;
-        outViewToProjection = ue3ViewToProjection;
-        outUsedTranspose = usedTranspose;
-        outReconstructionError = reconstructionError;
-        return true;
-      };
-
       Matrix4 ue3WorldToView;
       Matrix4 ue3ViewToProjection;
       float ue3CameraReconstructionError = 0.0f;
@@ -6328,7 +6473,7 @@ namespace dxvk {
         logUe3Classification(drawContext, m_currentUe3PassType, RtxGeometryStatus::Ignored, reason);
       };
 
-      if (tryApplyFromConstants(ue3WorldToView, ue3ViewToProjection, ue3CameraUsedTranspose, ue3CameraReconstructionError)) {
+      if (tryGetUe3CameraFromConstantsCached(viewProjReg, viewOriginReg, ue3WorldToView, ue3ViewToProjection, ue3CameraUsedTranspose, ue3CameraReconstructionError)) {
         // Mirrored view detection: a reflection view premultiplies a mirror (householder)
         // matrix into the view, flipping the sign of the ViewProjection 3x3 determinant.
         // UE3's LH view (axis-swap permutation, det +1) and perspective projection keep the
@@ -6425,111 +6570,7 @@ namespace dxvk {
           const uint32_t w2lReg = ctabInfo.worldToLocalRegisterIndex;
           const bool hasWorldToLocal = ctabInfo.hasWorldToLocal && w2lReg + 2 < caps::MaxFloatConstantsSoftware;
 
-          // Memo lookup: every input to the transpose/affinity/inverse disambiguation
-          // below (register contents and the camera transpose convention tiebreaker) is
-          // folded into the key, so a hit returns exactly what the computation would
-          // produce. Static placements re-upload identical matrices every frame, making
-          // this a per-draw matrix-inverse saving.
-          XXH64_hash_t o2wKeyHash = XXH3_64bits(&d3d9State().vsConsts.fConsts[reg], 4 * sizeof(Vector4));
-          if (hasWorldToLocal) {
-            o2wKeyHash = XXH3_64bits_withSeed(&d3d9State().vsConsts.fConsts[w2lReg], 3 * sizeof(Vector4), o2wKeyHash);
-          }
-          const uint32_t o2wKeyFlags = (hasWorldToLocal ? 1u : 0u) | (ue3CameraUsedTranspose ? 2u : 0u);
-          o2wKeyHash = XXH3_64bits_withSeed(&o2wKeyFlags, sizeof(o2wKeyFlags), o2wKeyHash);
-
-          const auto o2wIt = m_ue3ObjectToWorldCache.find(o2wKeyHash);
-          if (o2wIt != m_ue3ObjectToWorldCache.end()) {
-            transformData.objectToWorld = o2wIt->second;
-          } else {
-            const Matrix4 localToWorldRaw = [&] {
-              Matrix4 m;
-              m[0] = d3d9State().vsConsts.fConsts[reg + 0];
-              m[1] = d3d9State().vsConsts.fConsts[reg + 1];
-              m[2] = d3d9State().vsConsts.fConsts[reg + 2];
-              m[3] = d3d9State().vsConsts.fConsts[reg + 3];
-              return m;
-            }();
-
-            const Matrix4 localToWorldTransposed = transpose(localToWorldRaw);
-
-            auto isAffineColumnVector = [](const Matrix4& m) {
-              constexpr float kEps = 1e-3f;
-              return std::abs(m[0].w) < kEps &&
-                     std::abs(m[1].w) < kEps &&
-                     std::abs(m[2].w) < kEps &&
-                     std::abs(m[3].w - 1.0f) < kEps;
-            };
-
-            const bool rawAffine = isAffineColumnVector(localToWorldRaw);
-            const bool transAffine = isAffineColumnVector(localToWorldTransposed);
-
-            // optinally use WorldToLocal (if present) to disambiguate transpose/packing
-            Matrix4 worldToLocalRaw;
-            Matrix4 worldToLocalTransposed;
-            if (hasWorldToLocal) {
-              const Vector4 c0 = d3d9State().vsConsts.fConsts[w2lReg + 0];
-              const Vector4 c1 = d3d9State().vsConsts.fConsts[w2lReg + 1];
-              const Vector4 c2 = d3d9State().vsConsts.fConsts[w2lReg + 2];
-
-              worldToLocalRaw = Matrix4();
-              worldToLocalRaw[0] = Vector4(c0.x, c0.y, c0.z, 0.0f);
-              worldToLocalRaw[1] = Vector4(c1.x, c1.y, c1.z, 0.0f);
-              worldToLocalRaw[2] = Vector4(c2.x, c2.y, c2.z, 0.0f);
-              worldToLocalRaw[3] = Vector4(0.0f, 0.0f, 0.0f, 1.0f);
-              worldToLocalTransposed = transpose(worldToLocalRaw);
-            }
-
-            auto l1Error3x3 = [](const Matrix4& a, const Matrix4& b) {
-              float err = 0.0f;
-              for (uint32_t c = 0; c < 3; c++) {
-                for (uint32_t r = 0; r < 3; r++) {
-                  err += std::abs(a[c][r] - b[c][r]);
-                }
-              }
-              return err;
-            };
-
-            Matrix4 localToWorld = localToWorldRaw;
-            if (hasWorldToLocal && rawAffine && transAffine) {
-              // both candidates look affine, so we choose the one whose inverse best matches the provided WorldToLocal basis
-              const Matrix4 invRaw = inverseAffine(localToWorldRaw);
-              const Matrix4 invTrans = inverseAffine(localToWorldTransposed);
-
-              float bestErr = std::numeric_limits<float>::infinity();
-              bool bestIsTransposed = false;
-
-              const float errRaw0 = l1Error3x3(invRaw, worldToLocalRaw);
-              const float errRaw1 = l1Error3x3(invRaw, worldToLocalTransposed);
-              const float errTrans0 = l1Error3x3(invTrans, worldToLocalRaw);
-              const float errTrans1 = l1Error3x3(invTrans, worldToLocalTransposed);
-
-              bestErr = errRaw0;
-              bestIsTransposed = false;
-              if (errRaw1 < bestErr) { bestErr = errRaw1; bestIsTransposed = false; }
-              if (errTrans0 < bestErr) { bestErr = errTrans0; bestIsTransposed = true; }
-              if (errTrans1 < bestErr) { bestErr = errTrans1; bestIsTransposed = true; }
-
-              constexpr float kMaxWorldToLocalMatchError = 0.25f;
-              if (std::isfinite(bestErr) && bestErr <= kMaxWorldToLocalMatchError) {
-                localToWorld = bestIsTransposed ? localToWorldTransposed : localToWorldRaw;
-              } else {
-                localToWorld = ue3CameraUsedTranspose ? localToWorldTransposed : localToWorldRaw;
-              }
-            } else if (rawAffine && transAffine) {
-              localToWorld = ue3CameraUsedTranspose ? localToWorldTransposed : localToWorldRaw;
-            } else if (!rawAffine && transAffine) {
-              localToWorld = localToWorldTransposed;
-            } else {
-              localToWorld = localToWorldRaw;
-            }
-
-            if (m_ue3ObjectToWorldCache.size() >= kUe3ObjectToWorldCacheMaxEntries) {
-              m_ue3ObjectToWorldCache.clear();
-            }
-            m_ue3ObjectToWorldCache.emplace(o2wKeyHash, localToWorld);
-
-            transformData.objectToWorld = localToWorld;
-          }
+          transformData.objectToWorld = extractUe3ObjectToWorld(reg, hasWorldToLocal, w2lReg, ue3CameraUsedTranspose);
 
           ONCE(Logger::info("[RTX-Compatibility] UE3 LocalToWorld extracted from vertex shader constants (CTAB)"));
         }
@@ -10589,6 +10630,2156 @@ namespace dxvk {
     return true;
   }
 
+  D3D9Rtx::NgxCameraCtabRegs D3D9Rtx::scanNgxCameraCtabRegs(const std::vector<uint8_t>& bytecode) const {
+    // Compact variant of the UE3 CTAB parse used by the ray traced path: only the two camera
+    // symbols matter here, and only shaders declaring BOTH may steer the main camera
+    // (fallback-register extraction can pick up light-space matrices from utility shaders).
+    NgxCameraCtabRegs result;
+
+    try {
+      if (bytecode.size() < sizeof(uint32_t) || (bytecode.size() % sizeof(uint32_t)) != 0)
+        return result;
+
+      const uint32_t* tokens = reinterpret_cast<const uint32_t*>(bytecode.data());
+      const uint32_t headerToken = tokens[0];
+      const uint32_t headerTypeMask = headerToken & 0xffff0000u;
+
+      DxsoProgramType programType;
+      if (headerTypeMask == 0xffff0000u)
+        programType = DxsoProgramTypes::PixelShader;
+      else if (headerTypeMask == 0xfffe0000u)
+        programType = DxsoProgramTypes::VertexShader;
+      else
+        return result;
+
+      const uint32_t majorVersion = (headerToken >> 8) & 0xffu;
+      const uint32_t minorVersion = headerToken & 0xffu;
+      DxsoProgramInfo programInfo { programType, minorVersion, majorVersion };
+
+      DxsoDecodeContext decoder(programInfo);
+      DxsoCodeIter iter(tokens + 1);
+
+      // Full instruction walk (the CTAB comment arrives early; the rest determines the
+      // GPU skin replay parameters): a mul/mad reading the BLENDINDICES input means the
+      // shader scales raw bone indices by the 3-registers-per-bone stride itself; without
+      // one the vertex data is pre-scaled and feeds the address register directly. The
+      // BLENDWEIGHT swizzles reveal how many influences the shader variant blends.
+      uint32_t blendIndicesInputRegister = UINT32_MAX;
+      uint32_t blendWeightsInputRegister = UINT32_MAX;
+      bool blendIndicesScaledInShader = false;
+      bool blendIndicesRead = false;
+      uint32_t weightComponentsRead = 0;  // bitmask of BLENDWEIGHT components consumed
+
+      // The decode context reuses its source array across instructions, so only the
+      // operands the opcode actually consumes may be inspected
+      const auto sourceOperandCount = [](DxsoOpcode op) -> uint32_t {
+        switch (op) {
+          case DxsoOpcode::Mov:
+          case DxsoOpcode::Rcp:
+          case DxsoOpcode::Rsq:
+          case DxsoOpcode::Exp:
+          case DxsoOpcode::Log:
+          case DxsoOpcode::Frc:
+            return 1;
+          case DxsoOpcode::Mad:
+          case DxsoOpcode::Lrp:
+            return 3;
+          default:
+            return 2;
+        }
+      };
+
+      while (decoder.decodeInstruction(iter)) {
+        const DxsoInstructionContext& instructionCtx = decoder.getInstructionContext();
+        const DxsoOpcode opcode = instructionCtx.instruction.opcode;
+
+        if (opcode == DxsoOpcode::Dcl &&
+            instructionCtx.dst.id.type == DxsoRegisterType::Input &&
+            instructionCtx.dcl.semantic.usageIndex == 0) {
+          if (instructionCtx.dcl.semantic.usage == DxsoUsage::BlendIndices) {
+            blendIndicesInputRegister = instructionCtx.dst.id.num;
+          } else if (instructionCtx.dcl.semantic.usage == DxsoUsage::BlendWeight) {
+            blendWeightsInputRegister = instructionCtx.dst.id.num;
+          }
+        }
+
+        if ((blendIndicesInputRegister != UINT32_MAX || blendWeightsInputRegister != UINT32_MAX) &&
+            opcode != DxsoOpcode::Dcl && opcode != DxsoOpcode::Def && opcode != DxsoOpcode::Comment) {
+          const uint32_t sourceCount = std::min(sourceOperandCount(opcode), uint32_t(instructionCtx.src.size()));
+          for (uint32_t s = 0; s < sourceCount; s++) {
+            const DxsoRegister& source = instructionCtx.src[s];
+            if (source.id.type != DxsoRegisterType::Input) {
+              continue;
+            }
+
+            if (source.id.num == blendIndicesInputRegister) {
+              blendIndicesRead = true;
+              if (opcode == DxsoOpcode::Mul || opcode == DxsoOpcode::Mad) {
+                blendIndicesScaledInShader = true;
+              }
+            }
+
+            if (source.id.num == blendWeightsInputRegister) {
+              for (uint32_t component = 0; component < 4; component++) {
+                weightComponentsRead |= 1u << source.swizzle[component];
+              }
+            }
+          }
+        }
+      }
+
+      result.boneIndicesPreScaled = blendIndicesInputRegister != UINT32_MAX && !blendIndicesScaledInShader;
+
+      // Influence count: distinct weight components consumed; indices without weights =
+      // the rigid-skin variant (single bone, implicit weight 1)
+      if (blendIndicesRead) {
+        uint32_t weightCount = 0;
+        for (uint32_t component = 0; component < 4; component++) {
+          weightCount += (weightComponentsRead >> component) & 1u;
+        }
+        result.skinInfluenceCount = std::max(weightCount, 1u);
+      }
+
+      const DxsoCtab& ctab = decoder.getCtabInfo();
+      if (ctab.m_size == 0 || ctab.m_constantData.empty())
+        return result;
+
+      auto lower = [](const std::string& s) {
+        std::string out;
+        out.reserve(s.size());
+        for (const char c : s)
+          out.push_back(char(std::tolower(static_cast<unsigned char>(c))));
+        return out;
+      };
+
+      auto contains = [](const std::string& s, const char* needle) {
+        return s.find(needle) != std::string::npos;
+      };
+
+      bool hasViewProjectionMatrix = false;
+      bool hasCameraPosition = false;
+      uint32_t viewProjRegister = 0;
+      uint32_t viewOriginRegister = 0;
+
+      for (const DxsoCtab::Constant& c : ctab.m_constantData) {
+        const std::string name = lower(c.name);
+
+        if (!hasViewProjectionMatrix && c.registerCount >= 4) {
+          const bool looksLikeViewProj =
+            contains(name, "viewprojectionmatrix") ||
+            contains(name, "viewprojmatrix") ||
+            contains(name, "view_projection_matrix") ||
+            contains(name, "view_proj_matrix");
+          const bool isPreviousViewProj =
+            contains(name, "prevviewprojectionmatrix") ||
+            contains(name, "prevviewprojmatrix") ||
+            contains(name, "previousviewprojectionmatrix") ||
+            contains(name, "previousviewprojmatrix") ||
+            contains(name, "prev_view_projection_matrix") ||
+            contains(name, "prev_view_proj_matrix");
+          if (looksLikeViewProj && !isPreviousViewProj) {
+            hasViewProjectionMatrix = true;
+            viewProjRegister = c.registerIndex;
+          }
+        }
+
+        if (!hasCameraPosition && c.registerCount >= 1) {
+          const bool looksLikeCameraPosition =
+            contains(name, "cameraposition") ||
+            contains(name, "vieworigin") ||
+            contains(name, "cameraworldpos") ||
+            contains(name, "cameraworldposition") ||
+            contains(name, "camerapos") ||
+            contains(name, "eyeposition");
+          const bool isPreviousCameraPosition =
+            contains(name, "prevcameraposition") ||
+            contains(name, "prevvieworigin") ||
+            contains(name, "previouscameraposition") ||
+            contains(name, "previousvieworigin") ||
+            contains(name, "prevcameraworldposition") ||
+            contains(name, "previouseyeposition");
+          if (looksLikeCameraPosition && !isPreviousCameraPosition) {
+            hasCameraPosition = true;
+            viewOriginRegister = c.registerIndex;
+          }
+        }
+
+        // Object velocity capture inputs: rigid LocalToWorld (4 registers), the optional
+        // WorldToLocal basis (transpose disambiguation), and the skinning marker that
+        // excludes a draw from rigid capture
+        if (!result.hasLocalToWorld && c.registerCount >= 4 &&
+            (contains(name, "localtoworld") || contains(name, "local_to_world")) &&
+            !contains(name, "prev")) {
+          result.hasLocalToWorld = true;
+          result.localToWorldRegister = c.registerIndex;
+        }
+
+        if (!result.hasWorldToLocal && c.registerCount >= 3 &&
+            (contains(name, "worldtolocal") || contains(name, "world_to_local"))) {
+          result.hasWorldToLocal = true;
+          result.worldToLocalRegister = c.registerIndex;
+        }
+
+        if (!result.hasBoneMatrices && c.registerCount >= 3 && contains(name, "bone")) {
+          result.hasBoneMatrices = true;
+          result.boneMatricesRegister = c.registerIndex;
+          result.boneMatricesRegisterCount = c.registerCount;
+        }
+      }
+
+      result.hasViewProjection = hasViewProjectionMatrix;
+      if (hasViewProjectionMatrix) {
+        result.viewProjRegister = viewProjRegister;
+      }
+
+      if (hasViewProjectionMatrix && hasCameraPosition) {
+        result.ctabVerified = true;
+        result.viewOriginRegister = viewOriginRegister;
+      }
+    } catch (...) {
+      return result;
+    }
+
+    return result;
+  }
+
+  void D3D9Rtx::tryNgxPassthroughCameraCapture() {
+    const D3D9CommonShader* vertexShaderCommon = d3d9State().vertexShader->GetCommonShader();
+    if (vertexShaderCommon == nullptr)
+      return;
+
+    const XXH64_hash_t shaderHash = vertexShaderCommon->GetBytecodeHash();
+    if (shaderHash == 0)
+      return;
+
+    auto it = m_ngxCameraCtabCache.find(shaderHash);
+    if (it == m_ngxCameraCtabCache.end()) {
+      it = m_ngxCameraCtabCache.emplace(shaderHash, scanNgxCameraCtabRegs(vertexShaderCommon->GetBytecode())).first;
+    }
+
+    const NgxCameraCtabRegs& ctabRegs = it->second;
+    if (!ctabRegs.ctabVerified)
+      return;
+
+    const uint32_t viewProjReg = ctabRegs.viewProjRegister;
+    const uint32_t viewOriginReg = ctabRegs.viewOriginRegister;
+
+    if (viewProjReg + 3 >= caps::MaxFloatConstantsSoftware || viewOriginReg >= caps::MaxFloatConstantsSoftware)
+      return;
+
+    // Mirrored view rejection (SceneCapture reflection/portal probes premultiply a mirror
+    // matrix into the view, flipping the 3x3 determinant sign; the main view is always
+    // positive). Checked on the raw registers - the sign is transpose-invariant.
+    {
+      const Vector4& vpRow0 = d3d9State().vsConsts.fConsts[viewProjReg + 0];
+      const Vector4& vpRow1 = d3d9State().vsConsts.fConsts[viewProjReg + 1];
+      const Vector4& vpRow2 = d3d9State().vsConsts.fConsts[viewProjReg + 2];
+      const float vpDet3 =
+        vpRow0.x * (vpRow1.y * vpRow2.z - vpRow1.z * vpRow2.y) -
+        vpRow0.y * (vpRow1.x * vpRow2.z - vpRow1.z * vpRow2.x) +
+        vpRow0.z * (vpRow1.x * vpRow2.y - vpRow1.y * vpRow2.x);
+      if (!std::isfinite(vpDet3) || vpDet3 < 0.0f)
+        return;
+    }
+
+    // Only the main scene view may steer the main camera and scene targets. It renders at
+    // backbuffer * ScreenPercentage / 100 (full at 100), while auxiliary camera passes -
+    // shadow cascades, SceneCapture probes, velocity/blur - use unrelated sizes. Matching the
+    // viewport against the known ScreenPercentage separates them; a viewport-fraction gate
+    // cannot, since a low ScreenPercentage main view is as small as an auxiliary pass.
+    if (m_activePresentParams.has_value()) {
+      const D3DVIEWPORT9& vp = d3d9State().viewport;
+      const uint32_t bbW = m_activePresentParams->BackBufferWidth;
+      const uint32_t bbH = m_activePresentParams->BackBufferHeight;
+
+      if (bbW != 0 && bbH != 0) {
+        const float sp = m_ngxGameScreenPercentage;
+        if (sp > 0.0f && sp <= 100.0f) {
+          const int32_t expectedW = int32_t(float(bbW) * sp / 100.0f);
+          const int32_t expectedH = int32_t(float(bbH) * sp / 100.0f);
+          const int32_t sizeTolerance = 16;
+          if (int32_t(vp.Width)  < expectedW - sizeTolerance || int32_t(vp.Width)  > expectedW + sizeTolerance ||
+              int32_t(vp.Height) < expectedH - sizeTolerance || int32_t(vp.Height) > expectedH + sizeTolerance)
+            return;
+        } else if (vp.Width * 2 < bbW || vp.Height * 2 < bbH) {
+          // ScreenPercentage not resolved yet (first frame): fall back to the near-backbuffer
+          // heuristic, safe for >= 50% and self-correcting once it resolves.
+          return;
+        }
+      }
+    }
+
+    Matrix4 worldToView;
+    Matrix4 viewToProjection;
+    bool usedTranspose = false;
+    float reconstructionError = 0.0f;
+    XXH64_hash_t constantsHash = 0;
+
+    if (!tryGetUe3CameraFromConstantsCached(viewProjReg, viewOriginReg, worldToView, viewToProjection,
+                                            usedTranspose, reconstructionError, &constantsHash))
+      return;
+
+    // Record the scene color/depth targets from depth-writing scene draws: the depth image
+    // feeds the motion vector pass, the color image anchors the viewport jitter scope, the
+    // resolve tracking, and the pre-post-process trigger
+    if (d3d9State().renderStates[D3DRS_ZWRITEENABLE] != FALSE &&
+        d3d9State().renderTargets[kRenderTargetIndex] != nullptr &&
+        d3d9State().depthStencil != nullptr) {
+      D3D9CommonTexture* renderTargetTexture = d3d9State().renderTargets[kRenderTargetIndex]->GetCommonTexture();
+      D3D9CommonTexture* depthStencilTexture = d3d9State().depthStencil->GetCommonTexture();
+
+      if (renderTargetTexture != nullptr && depthStencilTexture != nullptr &&
+          renderTargetTexture->GetImage() != nullptr && depthStencilTexture->GetImage() != nullptr) {
+        // The frame's accepted camera (validity gate for the velocity capture, transpose
+        // flag for LocalToWorld disambiguation). Only depth-writing draws with bound
+        // color+depth targets donate it: the velocity raster depth-tests against the depth
+        // these very draws produce, so their constants are by construction the camera that
+        // buffer was rasterized with. Draws outside the scene (utility passes early in the
+        // frame) may carry stale view constants from the previous frame.
+        if (!m_ngxFrameCameraValid) {
+          m_ngxFrameCameraValid = true;
+          m_ngxFrameCameraUsedTranspose = usedTranspose;
+        }
+
+        const bool sceneTargetsChanged = m_ngxSceneColorImage != renderTargetTexture->GetImage();
+
+        m_ngxSceneColorImage = renderTargetTexture->GetImage();
+        m_ngxSceneDepthImage = depthStencilTexture->GetImage();
+        m_ngxSceneTargetsLastSeenFrame = m_ue3FrameCounter;
+
+        // The viewport of the scene draws is the subrect the game renders into; when the
+        // game runs with a reduced ScreenPercentage this is smaller than the backbuffer
+        m_ngxSceneViewport = d3d9State().viewport;
+        m_ngxSceneViewportValid = true;
+
+        if (sceneTargetsChanged) {
+          ONCE(Logger::info(str::format("[RTX NGX Passthrough] Scene color/depth targets identified. color=0x",
+                                        std::hex, uintptr_t(m_ngxSceneColorImage.ptr()),
+                                        " depth=0x", uintptr_t(m_ngxSceneDepthImage.ptr()), std::dec,
+                                        " extent=", m_ngxSceneColorImage->info().extent.width, "x",
+                                        m_ngxSceneColorImage->info().extent.height,
+                                        " format=", int(m_ngxSceneColorImage->info().format))));
+          // Automatic dump on target changes (level transitions): validates the pre-post
+          // injection point against the game's compositing without user action
+          if (m_frameOptions.ngxPrePostProcess) {
+            m_ngxPostChainDumpFramesLeft = 2;
+          }
+          // Rebind the viewport so this draw already gets the sub-pixel jitter
+          m_parent->m_flags.set(D3D9DeviceFlag::DirtyViewportScissor);
+        }
+      }
+    }
+
+    // Feed the main camera once per unique constants; RtCamera keeps the first update per frame
+    if (constantsHash == m_ngxLastCameraConstantsHash)
+      return;
+    m_ngxLastCameraConstantsHash = constantsHash;
+
+    ONCE(Logger::info(str::format("[RTX NGX Passthrough] UE3 camera captured from shader constants (viewProjReg=c",
+                                  viewProjReg, "..c", viewProjReg + 3, ", viewOriginReg=c", viewOriginReg, ").")));
+
+    m_parent->EmitCs([cWorldToView = worldToView, cViewToProjection = viewToProjection](DxvkContext* ctx) {
+      static_cast<RtxContext*>(ctx)->getSceneManager().getCameraManager().processExternalCamera(
+        CameraType::Main, cWorldToView, cViewToProjection);
+    });
+  }
+
+  void D3D9Rtx::tryCaptureNgxVelocityDraw(const DrawContext& drawContext) {
+    // Dynamic object draws for the velocity raster: indexed triangle lists into the scene
+    // color with depth writes and a known camera, in both scene phases (world/intermediate
+    // and, after the mid-scene depth clear, the foreground DPG). Rigid draws are captured
+    // when their LocalToWorld moved believably since the previous frame; skinned draws
+    // (UE3 GPU skin) additionally when their bone palette animated (see the emission
+    // gates below). Sightings are matched against per-identity instance history.
+    constexpr size_t kMaxVelocityDrawsPerFrame = 256;
+
+    if (!m_frameOptions.ngxObjectVelocities) {
+      return;
+    }
+
+    if (!drawContext.Indexed || drawContext.PrimitiveType != D3DPT_TRIANGLELIST || drawContext.PrimitiveCount == 0) {
+      return;
+    }
+
+    if (m_ngxSceneColorImage == nullptr || d3d9State().renderTargets[kRenderTargetIndex] == nullptr) {
+      return;
+    }
+
+    D3D9CommonTexture* renderTargetTexture = d3d9State().renderTargets[kRenderTargetIndex]->GetCommonTexture();
+    if (renderTargetTexture == nullptr || renderTargetTexture->GetImage().ptr() != m_ngxSceneColorImage.ptr()) {
+      return;
+    }
+
+    // Depth-tested draws only; depth WRITES are re-checked after classification (the
+    // CPU-modified meshes' shaded pass composites without z-writes during motion blur,
+    // with their depth coming from a prepass - the raster's two-sided depth test anchors
+    // visibility either way). Scene draws with the CPU-modified-mesh buffer signature
+    // (large dedicated dynamic VB) are counted when rejected here: a nonzero counter
+    // means such meshes render z-test-disabled in some game state.
+    if (d3d9State().renderStates[D3DRS_ZENABLE] != D3DZB_TRUE) {
+      D3D9CommonBuffer* zGateVertexBuffer = GetCommonBuffer(d3d9State().vertexBuffers[0].vertexBuffer);
+      D3D9CommonBuffer* zGateIndexBuffer = GetCommonBuffer(d3d9State().indices);
+      if (zGateVertexBuffer != nullptr && zGateIndexBuffer != nullptr &&
+          (zGateVertexBuffer->Desc()->Usage & D3DUSAGE_DYNAMIC) != 0 &&
+          (zGateIndexBuffer->Desc()->Usage & D3DUSAGE_DYNAMIC) == 0 &&
+          d3d9State().vertexBuffers[0].offset == 0 &&
+          zGateVertexBuffer->Desc()->Size > 100000) {
+        m_ngxVelocityStats.skippedZDisabled++;
+      }
+      return;
+    }
+    const bool zWriteEnabled = d3d9State().renderStates[D3DRS_ZWRITEENABLE] != FALSE;
+
+    // Draws after the game's mid-scene depth clear are the UE3 foreground DPG (first
+    // person meshes and their attachments); they depth-test against the live foreground
+    // depth and carry the foreground phase marker in the velocity raster
+    const bool foregroundPhase = m_ngxDepthSnapshotTakenThisFrame;
+
+    // The remaining gates run after draw qualification so their skip counters describe
+    // scene draws that would otherwise have been considered
+    if (m_ngxVelocityDraws.size() >= kMaxVelocityDrawsPerFrame) {
+      m_ngxVelocityStats.skippedBudget++;
+      return;
+    }
+
+    if (!m_ngxFrameCameraValid || !m_ngxPrevCameraValid) {
+      m_ngxVelocityStats.skippedNoCamera++;
+      return;
+    }
+
+    if (!m_parent->UseProgrammableVS() || d3d9State().vertexShader.ptr() == nullptr || d3d9State().vertexDecl == nullptr) {
+      return;
+    }
+
+    const D3D9CommonShader* vertexShaderCommon = d3d9State().vertexShader->GetCommonShader();
+    if (vertexShaderCommon == nullptr) {
+      return;
+    }
+
+    const XXH64_hash_t shaderHash = vertexShaderCommon->GetBytecodeHash();
+    if (shaderHash == 0) {
+      return;
+    }
+
+    auto ctabIt = m_ngxCameraCtabCache.find(shaderHash);
+    if (ctabIt == m_ngxCameraCtabCache.end()) {
+      ctabIt = m_ngxCameraCtabCache.emplace(shaderHash, scanNgxCameraCtabRegs(vertexShaderCommon->GetBytecode())).first;
+    }
+
+    const NgxCameraCtabRegs& ctabRegs = ctabIt->second;
+
+    // Buffers and the CPU-modified-mesh shape, established early: the gate relaxations
+    // below depend on them
+    D3D9CommonBuffer* vertexBufferCommon = GetCommonBuffer(d3d9State().vertexBuffers[0].vertexBuffer);
+    D3D9CommonBuffer* indexBufferCommon = GetCommonBuffer(d3d9State().indices);
+    if (vertexBufferCommon == nullptr || indexBufferCommon == nullptr) {
+      return;
+    }
+
+    const bool vbDynamic = (vertexBufferCommon->Desc()->Usage & D3DUSAGE_DYNAMIC) != 0;
+    const bool ibDynamic = (indexBufferCommon->Desc()->Usage & D3DUSAGE_DYNAMIC) != 0;
+    const bool dynamicMeshShape = vbDynamic && !ibDynamic && !ctabRegs.hasBoneMatrices &&
+                                  d3d9State().vertexBuffers[0].offset == 0;
+
+    if (!ctabRegs.hasLocalToWorld) {
+      return;
+    }
+
+    // The full camera verification (ViewProjection + CameraPosition) guards camera
+    // steering; the velocity capture itself only needs the per-draw ViewProjection and
+    // LocalToWorld. CPU-modified-mesh-shaped draws are accepted on that weaker contract
+    // (their motion-blur shader variants may lack the camera position symbol).
+    if (!ctabRegs.ctabVerified && !(dynamicMeshShape && ctabRegs.hasViewProjection)) {
+      return;
+    }
+
+    if (ctabRegs.viewProjRegister + 3 >= caps::MaxFloatConstantsSoftware) {
+      return;
+    }
+
+    // Skinned draws (UE3 GPU skin): motion is bone palette + rigid transform combined.
+    // The velocity raster replays the skinning with both frames' palettes.
+    const bool skinned = ctabRegs.hasBoneMatrices;
+
+    if (skinned) {
+      if (ctabRegs.boneMatricesRegisterCount == 0 ||
+          ctabRegs.boneMatricesRegisterCount > kNgxVelocityBonePaletteRegisters ||
+          ctabRegs.boneMatricesRegister + ctabRegs.boneMatricesRegisterCount > caps::MaxFloatConstantsSoftware) {
+        return;
+      }
+      if (m_ngxVelocitySkinnedDraws >= kNgxVelocityMaxSkinnedDraws) {
+        m_ngxVelocityStats.skippedBudget++;
+        return;
+      }
+    }
+
+    const uint32_t l2wReg = ctabRegs.localToWorldRegister;
+    if (l2wReg + 3 >= caps::MaxFloatConstantsSoftware) {
+      return;
+    }
+
+    const bool hasWorldToLocal = ctabRegs.hasWorldToLocal &&
+                                 ctabRegs.worldToLocalRegister + 2 < caps::MaxFloatConstantsSoftware;
+
+    // The packed ViewProjection at THIS draw (oriented): scene phases render with their
+    // own projections (the foreground DPG uses a first-person FOV), so every velocity
+    // draw composes with its draw-time matrix - the game's exact vertex transform.
+    Matrix4 drawWorldToProjection;
+    drawWorldToProjection[0] = d3d9State().vsConsts.fConsts[ctabRegs.viewProjRegister + 0];
+    drawWorldToProjection[1] = d3d9State().vsConsts.fConsts[ctabRegs.viewProjRegister + 1];
+    drawWorldToProjection[2] = d3d9State().vsConsts.fConsts[ctabRegs.viewProjRegister + 2];
+    drawWorldToProjection[3] = d3d9State().vsConsts.fConsts[ctabRegs.viewProjRegister + 3];
+    if (m_ngxFrameCameraUsedTranspose) {
+      drawWorldToProjection = transpose(drawWorldToProjection);
+    }
+
+    // Vertex layout on stream 0: position always; skinned draws additionally need the
+    // UE3 GPU skin blend attributes (UBYTE4 indices, UBYTE4N weights)
+    const auto& vertexElements = d3d9State().vertexDecl->GetElements();
+    uint32_t positionOffset = 0;
+    VkFormat positionFormat = VK_FORMAT_UNDEFINED;
+    uint32_t blendIndicesOffset = 0;
+    uint32_t blendWeightsOffset = 0;
+    bool hasBlendIndices = false;
+    bool hasBlendWeights = false;
+
+    for (const D3DVERTEXELEMENT9& element : vertexElements) {
+      if (element.Stream != 0 || element.UsageIndex != 0) {
+        continue;
+      }
+
+      if (element.Usage == D3DDECLUSAGE_POSITION) {
+        if (element.Type == D3DDECLTYPE_FLOAT3) {
+          positionFormat = VK_FORMAT_R32G32B32_SFLOAT;
+        } else if (element.Type == D3DDECLTYPE_FLOAT4) {
+          positionFormat = VK_FORMAT_R32G32B32A32_SFLOAT;
+        }
+        positionOffset = element.Offset;
+      } else if (element.Usage == D3DDECLUSAGE_BLENDINDICES && element.Type == D3DDECLTYPE_UBYTE4) {
+        hasBlendIndices = true;
+        blendIndicesOffset = element.Offset;
+      } else if (element.Usage == D3DDECLUSAGE_BLENDWEIGHT && element.Type == D3DDECLTYPE_UBYTE4N) {
+        hasBlendWeights = true;
+        blendWeightsOffset = element.Offset;
+      }
+    }
+
+    if (positionFormat == VK_FORMAT_UNDEFINED) {
+      return;
+    }
+
+    if (skinned && (!hasBlendIndices || !hasBlendWeights)) {
+      ONCE(Logger::info("[RTX NGX Passthrough] Skinned draw with an unsupported blend attribute layout; not captured."));
+      return;
+    }
+
+    // Dynamic-buffer draws split into two kinds. CPU-modified meshes (UE3 CPU-skins
+    // morph/cloth-augmented skeletal meshes into DEDICATED dynamic buffers, e.g. the
+    // first person arms) carry their motion in the vertex positions and are captured
+    // with a position snapshot below; they are recognizable by a bone-less shader, a
+    // whole-buffer stream (offset 0) and a static index buffer. Everything else on
+    // dynamic buffers is ring-pool geometry (particles, trails, canvas) whose
+    // allocation offsets shift every frame - untrackable, and skipped.
+    const bool dynamicMesh = dynamicMeshShape && !skinned;
+
+    if ((vbDynamic || ibDynamic) && !dynamicMesh) {
+      return;
+    }
+
+    // Depth-writing draws only, except CPU-modified meshes (see the z gate above)
+    if (!zWriteEnabled && !dynamicMesh) {
+      return;
+    }
+
+    // Snapshot the CPU-modified mesh's current positions from the dynamic buffer's CPU
+    // mapping (tightly packed, whole buffer: the index/base-vertex ranges then apply to
+    // the snapshot exactly as to the live stream)
+    std::vector<Vector3> currentPositions;
+
+    if (dynamicMesh) {
+      if (m_ngxVelocityDynamicDraws >= kNgxVelocityMaxDynamicDraws) {
+        m_ngxVelocityStats.skippedBudget++;
+        return;
+      }
+
+      const uint32_t stride = d3d9State().vertexBuffers[0].stride;
+      const uint32_t vertexCount = stride != 0 ? uint32_t(vertexBufferCommon->Desc()->Size / stride) : 0;
+      const DxvkBufferSliceHandle mappedSlice = vertexBufferCommon->GetMappedSlice();
+
+      if (vertexCount == 0 || vertexCount > kNgxVelocityMaxDynamicVertices || mappedSlice.mapPtr == nullptr) {
+        return;
+      }
+
+      currentPositions.resize(vertexCount);
+      const uint8_t* positionBytes = reinterpret_cast<const uint8_t*>(mappedSlice.mapPtr) + positionOffset;
+      for (uint32_t vertex = 0; vertex < vertexCount; vertex++) {
+        std::memcpy(&currentPositions[vertex], positionBytes + size_t(vertex) * stride, sizeof(Vector3));
+      }
+    }
+
+    // Draw identity: geometry references plus draw parameters. Stable for UE3 static
+    // meshes; buffer reallocation across level loads simply re-registers the object.
+    // CPU-modified meshes swap between vertex buffer objects when re-skinned (double
+    // buffering), so their identity anchors on the buffer SIZE instead of its address -
+    // the static index buffer and the draw parameters still separate mesh sections.
+    // Hashed from an explicitly packed array: hashing a struct with pointer members would
+    // include compiler tail padding, which aggregate initialization leaves uninitialized,
+    // making identities jitter with incidental stack contents and breaking the pairing.
+    const uint64_t identityData[5] = {
+      dynamicMesh ? uint64_t(vertexBufferCommon->Desc()->Size)
+                  : uint64_t(reinterpret_cast<uintptr_t>(vertexBufferCommon)),
+      uint64_t(reinterpret_cast<uintptr_t>(indexBufferCommon)),
+      (uint64_t(drawContext.StartIndex) << 32) | uint64_t(uint32_t(drawContext.PrimitiveCount)),
+      (uint64_t(uint32_t(drawContext.BaseVertexIndex)) << 32) | uint64_t(d3d9State().vertexBuffers[0].stride),
+      uint64_t(positionOffset),
+    };
+    const XXH64_hash_t identity = XXH3_64bits(identityData, sizeof(identityData));
+
+    const Vector4* localToWorldRows = &d3d9State().vsConsts.fConsts[l2wReg];
+    const Vector4* boneRegisters = skinned ? &d3d9State().vsConsts.fConsts[ctabRegs.boneMatricesRegister] : nullptr;
+    const uint32_t boneRegisterCount = skinned ? ctabRegs.boneMatricesRegisterCount : 0;
+
+    NgxVelocityObjectState& objectState = m_ngxVelocityObjectCache[identity];
+
+    // Shared draw construction for the emission sites below. previousBones is the
+    // instance's cached palette; when unusable (first skinned sighting of the identity),
+    // the current palette stands in for both sides - transform-only motion that frame.
+    const auto appendVelocityDraw = [&](const Matrix4& objectToWorldCurrent,
+                                        const Matrix4& worldToProjectionPrevious,
+                                        const Matrix4& objectToWorldPrevious,
+                                        const std::vector<Vector4>& previousBones,
+                                        const std::vector<Vector3>& previousPositions) {
+      NgxVelocityDraw velocityDraw;
+      velocityDraw.vertexBuffer = vertexBufferCommon->GetBufferSlice<D3D9_COMMON_BUFFER_TYPE_REAL>(d3d9State().vertexBuffers[0].offset);
+      velocityDraw.vertexStride = d3d9State().vertexBuffers[0].stride;
+      velocityDraw.positionOffset = positionOffset;
+      velocityDraw.positionFormat = positionFormat;
+      velocityDraw.indexBuffer = indexBufferCommon->GetBufferSlice<D3D9_COMMON_BUFFER_TYPE_REAL>();
+      velocityDraw.indexType = DecodeIndexType(static_cast<D3D9Format>(indexBufferCommon->Desc()->Format));
+      velocityDraw.indexCount = drawContext.PrimitiveCount * 3;
+      velocityDraw.firstIndex = drawContext.StartIndex;
+      velocityDraw.vertexOffset = drawContext.BaseVertexIndex;
+
+      velocityDraw.clipFromLocal = drawWorldToProjection * objectToWorldCurrent;
+      velocityDraw.prevClipFromLocal = worldToProjectionPrevious * objectToWorldPrevious;
+      velocityDraw.foregroundPhase = foregroundPhase;
+      velocityDraw.viewportMinZ = d3d9State().viewport.MinZ;
+      velocityDraw.viewportMaxZ = d3d9State().viewport.MaxZ;
+
+      if (foregroundPhase && (d3d9State().viewport.MinZ != 0.0f || d3d9State().viewport.MaxZ != 1.0f)) {
+        ONCE(Logger::info(str::format("[RTX NGX Passthrough] Foreground DPG renders with a squashed viewport depth range: [",
+                                      d3d9State().viewport.MinZ, ", ", d3d9State().viewport.MaxZ, "].")));
+      }
+
+      if (skinned) {
+        velocityDraw.blendIndicesOffset = blendIndicesOffset;
+        velocityDraw.blendWeightsOffset = blendWeightsOffset;
+        velocityDraw.boneIndexScale = ctabRegs.boneIndicesPreScaled ? 1u : 3u;
+        velocityDraw.skinInfluenceCount = std::clamp(ctabRegs.skinInfluenceCount, 1u, 4u);
+
+        ONCE(Logger::info(str::format("[RTX NGX Passthrough] Skinned velocity capture active (bone index addressing: ",
+                                      ctabRegs.boneIndicesPreScaled ? "pre-scaled" : "shader-scaled",
+                                      ", influences: ", velocityDraw.skinInfluenceCount, ").")));
+
+        velocityDraw.bonesPrevious.resize(kNgxVelocityBonePaletteRegisters, Vector4(0.0f));
+        velocityDraw.bonesCurrent.resize(kNgxVelocityBonePaletteRegisters, Vector4(0.0f));
+
+        const Vector4* previousPalette =
+          previousBones.size() == boneRegisterCount ? previousBones.data() : boneRegisters;
+        std::memcpy(velocityDraw.bonesPrevious.data(), previousPalette, boneRegisterCount * sizeof(Vector4));
+        std::memcpy(velocityDraw.bonesCurrent.data(), boneRegisters, boneRegisterCount * sizeof(Vector4));
+
+        m_ngxVelocitySkinnedDraws++;
+        m_ngxVelocityStats.capturedSkinned++;
+      }
+
+      if (dynamicMesh) {
+        velocityDraw.previousPositions =
+          previousPositions.size() == currentPositions.size() ? previousPositions : currentPositions;
+        m_ngxVelocityDynamicDraws++;
+        m_ngxVelocityStats.capturedDynamic++;
+      }
+
+      if (foregroundPhase) {
+        m_ngxVelocityStats.capturedForeground++;
+      }
+
+      m_ngxVelocityDraws.push_back(std::move(velocityDraw));
+      m_ngxVelocityStats.captured++;
+    };
+
+    // Position delta against a cached snapshot (CPU-modified meshes animate their
+    // vertex data with a typically static LocalToWorld)
+    const auto dynamicPositionsChangedFrom = [&](const std::vector<Vector3>& cachedPositions) {
+      if (!dynamicMesh) {
+        return false;
+      }
+      if (cachedPositions.size() != currentPositions.size()) {
+        return true;
+      }
+      return std::memcmp(cachedPositions.data(), currentPositions.data(),
+                         cachedPositions.size() * sizeof(Vector3)) != 0;
+    };
+
+    // Bone palette delta against a cached palette (epsilon like the transform rows)
+    const auto bonesChangedFrom = [&](const std::vector<Vector4>& cachedBones) {
+      if (!skinned || cachedBones.size() != boneRegisterCount) {
+        return false;
+      }
+      for (uint32_t reg = 0; reg < boneRegisterCount; reg++) {
+        const Vector4 delta = boneRegisters[reg] - cachedBones[reg];
+        if (std::abs(delta.x) > 1e-5f || std::abs(delta.y) > 1e-5f ||
+            std::abs(delta.z) > 1e-5f || std::abs(delta.w) > 1e-5f) {
+          return true;
+        }
+      }
+      return false;
+    };
+
+    // Exact register match: a static placement re-uploading the same matrix every frame,
+    // or a repeat draw of an instance already handled this frame (depth prepass + base
+    // pass, multi-pass lighting). Static placements get no velocity draw - the camera
+    // reprojection is exact for them. Skinned instances with a changed palette are
+    // animation in place: same placement, no swap ambiguity, always emitted.
+    for (NgxVelocityObjectInstance& instance : objectState.instances) {
+      bool rowsEqual = true;
+      for (uint32_t row = 0; row < 4 && rowsEqual; row++) {
+        const Vector4 delta = localToWorldRows[row] - instance.localToWorldRows[row];
+        rowsEqual = std::abs(delta.x) <= 1e-5f && std::abs(delta.y) <= 1e-5f &&
+                    std::abs(delta.z) <= 1e-5f && std::abs(delta.w) <= 1e-5f;
+      }
+
+      if (rowsEqual) {
+        // Static placement, but the content may animate in place: skinned palettes or
+        // CPU-modified positions changing under an unchanged LocalToWorld - no swap
+        // ambiguity, always emitted
+        const bool contentAnimated = (skinned && bonesChangedFrom(instance.bones)) ||
+                                     (dynamicMesh && dynamicPositionsChangedFrom(instance.dynamicPositions));
+
+        if (contentAnimated) {
+          const Matrix4 objectToWorld = extractUe3ObjectToWorld(l2wReg, hasWorldToLocal, ctabRegs.worldToLocalRegister,
+                                                                m_ngxFrameCameraUsedTranspose);
+          appendVelocityDraw(objectToWorld, instance.worldToProjection, instance.objectToWorld,
+                             instance.bones, instance.dynamicPositions);
+          instance.lastEmitFrame = m_ue3FrameCounter;
+          instance.lastEmitDrawIndex = uint32_t(m_ngxVelocityDraws.size() - 1);
+          instance.lastEmitPrevObjectToWorld = instance.objectToWorld;
+          instance.lastEmitPrevWorldToProjection = instance.worldToProjection;
+        }
+
+        if (skinned) {
+          instance.bones.assign(boneRegisters, boneRegisters + boneRegisterCount);
+        }
+        if (dynamicMesh) {
+          // Last use of the snapshot (appendVelocityDraw above copied what it needed)
+          instance.dynamicPositions = std::move(currentPositions);
+        }
+
+        // Same-frame repeat draw in the other scene phase: re-emit this frame's draw for
+        // this phase so both velocity targets receive the object, with both clip
+        // transforms recomposed for this phase's projection (the foreground DPG renders
+        // with its own first-person projection; each target depth-tests against its own
+        // phase's depth, discarding any copy that does not belong)
+        if (instance.lastEmitFrame == m_ue3FrameCounter &&
+            instance.lastPhaseDuplicateFrame != m_ue3FrameCounter &&
+            instance.lastEmitDrawIndex < m_ngxVelocityDraws.size() &&
+            m_ngxVelocityDraws.size() < kMaxVelocityDrawsPerFrame) {
+          const NgxVelocityDraw& emittedDraw = m_ngxVelocityDraws[instance.lastEmitDrawIndex];
+
+          if (emittedDraw.foregroundPhase != foregroundPhase &&
+              (emittedDraw.bonesCurrent.empty() || m_ngxVelocitySkinnedDraws < kNgxVelocityMaxSkinnedDraws) &&
+              (emittedDraw.previousPositions.empty() || m_ngxVelocityDynamicDraws < kNgxVelocityMaxDynamicDraws)) {
+            NgxVelocityDraw duplicateDraw = emittedDraw;
+            duplicateDraw.foregroundPhase = foregroundPhase;
+            duplicateDraw.clipFromLocal = drawWorldToProjection * instance.objectToWorld;
+            duplicateDraw.prevClipFromLocal = instance.lastEmitPrevWorldToProjection * instance.lastEmitPrevObjectToWorld;
+            duplicateDraw.viewportMinZ = d3d9State().viewport.MinZ;
+            duplicateDraw.viewportMaxZ = d3d9State().viewport.MaxZ;
+
+            if (!duplicateDraw.bonesCurrent.empty()) {
+              m_ngxVelocitySkinnedDraws++;
+              m_ngxVelocityStats.capturedSkinned++;
+            }
+            if (!duplicateDraw.previousPositions.empty()) {
+              m_ngxVelocityDynamicDraws++;
+              m_ngxVelocityStats.capturedDynamic++;
+            }
+            if (duplicateDraw.foregroundPhase) {
+              m_ngxVelocityStats.capturedForeground++;
+            }
+
+            m_ngxVelocityDraws.push_back(std::move(duplicateDraw));
+            m_ngxVelocityStats.captured++;
+            instance.lastPhaseDuplicateFrame = m_ue3FrameCounter;
+          }
+        }
+
+        instance.lastSeenFrame = m_ue3FrameCounter;
+        instance.worldToProjection = drawWorldToProjection;
+
+        // Confirmed-mover status decays after a couple seconds at rest: a stale latch
+        // is an instant-emit backdoor for visibility swaps pairing against this
+        // instance, while a real mover restarting re-confirms through the gentle-onset
+        // path with zero frames lost (motion from rest is always gentle at first)
+        constexpr uint32_t kWasMovingDecayFrames = 120;
+        if (instance.wasMoving && m_ue3FrameCounter - instance.lastEmitFrame > kWasMovingDecayFrames) {
+          instance.wasMoving = false;
+        }
+
+        m_ngxVelocityStats.exactMatches++;
+        return;
+      }
+    }
+
+    // Disambiguated transform in the same convention the camera reconstruction uses;
+    // composed exactly like the motion vector pass composes its reprojection chain
+    const Matrix4 objectToWorld = extractUe3ObjectToWorld(l2wReg, hasWorldToLocal, ctabRegs.worldToLocalRegister,
+                                                          m_ngxFrameCameraUsedTranspose);
+
+    // Near match against instances seen exactly one frame ago: the same object having
+    // moved. Static placements are consumed by the exact match above, so the bounds only
+    // arbitrate between simultaneously moving identical movers - the nearest-score pairs
+    // each with its own history even when both fit the bounds (double door leaves).
+    // Generous bounds: a frame hitch multiplies every per-frame delta, and a delta pushed
+    // past the bounds costs two frames of velocity.
+    constexpr float kMaxFrameTranslation = 250.0f;  // world units per frame
+    constexpr float kMaxFrameRotScaleL1 = 3.0f;     // L1 delta over the 3x3 rotation/scale
+    const uint32_t previousFrame = m_ue3FrameCounter - 1;
+
+    NgxVelocityObjectInstance* matchedInstance = nullptr;
+    float matchedScore = 0.0f;
+    float matchedTranslationDelta = 0.0f;
+    float matchedRotScaleDelta = 0.0f;
+
+    // Nearest last-frame candidate regardless of bounds: consumed by the single-candidate
+    // acceptance below and by the pairing-miss diagnostics
+    NgxVelocityObjectInstance* nearestCandidate = nullptr;
+    float nearestScore = 0.0f;
+    float nearestTranslationDelta = 0.0f;
+    float nearestRotScaleDelta = 0.0f;
+    uint32_t lastFrameCandidates = 0;
+
+    // Placements sighted within the last couple frames: the cache also holds stale
+    // instances from previously visited areas (pruned lazily), which must not count
+    // against the identity-stability assessment below
+    uint32_t activeInstances = 0;
+
+    for (NgxVelocityObjectInstance& instance : objectState.instances) {
+      if (instance.lastSeenFrame + 2 >= m_ue3FrameCounter) {
+        activeInstances++;
+      }
+
+      if (instance.lastSeenFrame != previousFrame) {
+        continue;
+      }
+      lastFrameCandidates++;
+
+      const float translationDelta = length(objectToWorld[3].xyz() - instance.objectToWorld[3].xyz());
+
+      float rotScaleDelta = 0.0f;
+      for (uint32_t col = 0; col < 3; col++) {
+        const Vector4 delta = objectToWorld[col] - instance.objectToWorld[col];
+        rotScaleDelta += std::abs(delta.x) + std::abs(delta.y) + std::abs(delta.z);
+      }
+
+      const float score = translationDelta / kMaxFrameTranslation + rotScaleDelta / kMaxFrameRotScaleL1;
+
+      if (nearestCandidate == nullptr || score < nearestScore) {
+        nearestCandidate = &instance;
+        nearestScore = score;
+        nearestTranslationDelta = translationDelta;
+        nearestRotScaleDelta = rotScaleDelta;
+      }
+
+      if (translationDelta > kMaxFrameTranslation || rotScaleDelta > kMaxFrameRotScaleL1) {
+        continue;
+      }
+
+      if (matchedInstance == nullptr || score < matchedScore) {
+        matchedInstance = &instance;
+        matchedScore = score;
+        matchedTranslationDelta = translationDelta;
+        matchedRotScaleDelta = rotScaleDelta;
+      }
+    }
+
+    // The bounds exist to disambiguate between multiple placements sharing an identity;
+    // with exactly one unclaimed last-frame instance the pairing is unambiguous by
+    // elimination, so faster-than-bounds motion (trains cover hundreds of units per
+    // frame; frame hitches multiply every delta) may pair too.
+    if (matchedInstance == nullptr && lastFrameCandidates == 1) {
+      matchedInstance = nearestCandidate;
+      matchedTranslationDelta = nearestTranslationDelta;
+      matchedRotScaleDelta = nearestRotScaleDelta;
+    }
+
+    if (matchedInstance != nullptr) {
+      const Vector3 moveDelta = objectToWorld[3].xyz() - matchedInstance->objectToWorld[3].xyz();
+
+      // Emission gate: a pairing only produces velocity when the motion is believable.
+      //  - Negligible deltas (one-time transform settles) are claimed silently: sub-pixel
+      //    motion is served equally well by camera reprojection.
+      //  - Confirmed movers (wasMoving) emit unconditionally.
+      //  - Unconfirmed instances emit immediately only for gentle motion, plausible for
+      //    an object accelerating from rest. Larger first deltas - what a visibility swap
+      //    between two static placements of the same asset looks like - must repeat
+      //    consistently for one frame first: a real fast mover sustains its per-frame
+      //    delta, a swap does not repeat.
+      constexpr float kNegligibleTranslation = 0.05f;
+      constexpr float kNegligibleRotScale = 1e-3f;
+      constexpr float kOnsetTranslationTrust = 8.0f;   // ~480 units/s at 60 fps
+      constexpr float kOnsetRotScaleTrust = 0.35f;     // ~3 degrees/frame
+
+      // Animating content (skinned palettes / CPU-modified positions changing) is proof
+      // of identity: a static placement's vertex data never animates, so this pairing
+      // cannot be a visibility swap between two static copies - the anti-swap gates
+      // below do not apply and the sighting emits unconditionally (first person meshes
+      // pair through camera-attached transform deltas that routinely exceed the gates)
+      const bool contentAnimated = bonesChangedFrom(matchedInstance->bones) ||
+                                   dynamicPositionsChangedFrom(matchedInstance->dynamicPositions);
+
+      const bool negligibleMotion = !contentAnimated &&
+                                    matchedTranslationDelta <= kNegligibleTranslation &&
+                                    matchedRotScaleDelta <= kNegligibleRotScale;
+
+      bool emitVelocity = false;
+
+      if (contentAnimated) {
+        emitVelocity = true;
+      } else if (!negligibleMotion) {
+        if (matchedInstance->wasMoving) {
+          emitVelocity = true;
+        } else if (matchedTranslationDelta <= kOnsetTranslationTrust &&
+                   matchedRotScaleDelta <= kOnsetRotScaleTrust) {
+          emitVelocity = true;
+        } else {
+          // Consistency confirmation is only trusted for identities with few placements
+          // currently in view: real movers have one or two, while grids of instanced
+          // meshes produce repeating pop-in deltas under steady camera movement that
+          // pass any repetition test (those may only confirm through gentle onset, which
+          // pop-in distances can never satisfy). A single active placement is
+          // unambiguous and skips the churn-recency requirement - its own first
+          // registration would otherwise defer its confirmation.
+          const bool identityStable = activeInstances <= 4 &&
+                                      (activeInstances <= 1 ||
+                                       m_ue3FrameCounter > objectState.lastNewRegistrationFrame + 2);
+
+          const bool hadMotion = lengthSqr(matchedInstance->lastMoveDelta) > 0.0f ||
+                                 matchedInstance->lastRotScaleDelta > 0.0f;
+          const bool translationConsistent =
+            length(moveDelta - matchedInstance->lastMoveDelta) <= std::max(0.25f * matchedTranslationDelta, 2.0f);
+          const bool rotScaleConsistent =
+            std::abs(matchedRotScaleDelta - matchedInstance->lastRotScaleDelta) <= std::max(0.25f * matchedRotScaleDelta, 0.05f);
+
+          emitVelocity = identityStable && hadMotion && translationConsistent && rotScaleConsistent;
+        }
+      }
+
+      if (emitVelocity) {
+        appendVelocityDraw(objectToWorld, matchedInstance->worldToProjection, matchedInstance->objectToWorld,
+                           matchedInstance->bones, matchedInstance->dynamicPositions);
+        matchedInstance->lastEmitPrevObjectToWorld = matchedInstance->objectToWorld;
+        matchedInstance->lastEmitPrevWorldToProjection = matchedInstance->worldToProjection;
+      } else {
+        // Claimed without velocity (negligible motion or deferred onset confirmation)
+        m_ngxVelocityStats.newRegistrations++;
+      }
+
+      // Claim the instance: repeat draws this frame exact-match the updated rows, other
+      // instances cannot pair with it anymore. The movement history feeds the emission
+      // gate above on the next sighting.
+      for (uint32_t row = 0; row < 4; row++) {
+        matchedInstance->localToWorldRows[row] = localToWorldRows[row];
+      }
+      matchedInstance->objectToWorld = objectToWorld;
+      matchedInstance->worldToProjection = drawWorldToProjection;
+      matchedInstance->lastSeenFrame = m_ue3FrameCounter;
+      matchedInstance->lastMoveDelta = moveDelta;
+      matchedInstance->lastRotScaleDelta = matchedRotScaleDelta;
+      if (skinned) {
+        matchedInstance->bones.assign(boneRegisters, boneRegisters + boneRegisterCount);
+      } else {
+        matchedInstance->bones.clear();
+      }
+      if (dynamicMesh) {
+        // Last use of the snapshot (appendVelocityDraw above copied what it needed)
+        matchedInstance->dynamicPositions = std::move(currentPositions);
+      } else {
+        matchedInstance->dynamicPositions.clear();
+      }
+      if (emitVelocity) {
+        matchedInstance->wasMoving = true;
+        matchedInstance->lastEmitFrame = m_ue3FrameCounter;
+        matchedInstance->lastEmitDrawIndex = uint32_t(m_ngxVelocityDraws.size() - 1);
+      }
+      return;
+    }
+
+    // Self-triggering pairing-miss dump: a moving object failing to pair with its own
+    // one-frame-ago history is the exact failure mode behind velocity dropouts, and the
+    // log line carries everything needed to tell apart the possible causes (no last-frame
+    // sighting at all vs a candidate rejected by the bounds, and by how much).
+    {
+      constexpr uint32_t kPairingLogMaxLinesPerFrame = 6;
+      constexpr uint32_t kPairingLogCooldownFrames = 120;
+
+      // One burst of lines per cooldown window: the burst frame is latched and its
+      // remaining lines stay allowed, further frames wait out the cooldown
+      const bool inActiveBurst = m_ngxVelocityPairingLogFrame == m_ue3FrameCounter;
+
+      if (inActiveBurst || m_ue3FrameCounter >= m_ngxVelocityPairingLogNextAllowedFrame) {
+        if (!inActiveBurst) {
+          m_ngxVelocityPairingLogFrame = m_ue3FrameCounter;
+          m_ngxVelocityPairingLogLines = 0;
+          m_ngxVelocityPairingLogNextAllowedFrame = m_ue3FrameCounter + kPairingLogCooldownFrames;
+        }
+
+        if (m_ngxVelocityPairingLogLines < kPairingLogMaxLinesPerFrame) {
+          m_ngxVelocityPairingLogLines++;
+
+          const Vector3 translation = objectToWorld[3].xyz();
+          std::string line = str::format(
+            "[RTX NGX Passthrough][pairing miss] frame=", m_ue3FrameCounter,
+            " identity=0x", std::hex, identity, std::dec,
+            " instances=", objectState.instances.size(),
+            " lastFrameCandidates=", lastFrameCandidates,
+            " o2wPos=(", translation.x, ",", translation.y, ",", translation.z, ")",
+            " camTranspose=", int(m_ngxFrameCameraUsedTranspose));
+
+          if (nearestCandidate != nullptr) {
+            const Vector3 nearestTranslation = nearestCandidate->objectToWorld[3].xyz();
+            line += str::format(
+              " nearest: dPos=", nearestTranslationDelta,
+              " dRotScale=", nearestRotScaleDelta,
+              " pos=(", nearestTranslation.x, ",", nearestTranslation.y, ",", nearestTranslation.z, ")");
+          } else {
+            line += " nearest: none seen last frame";
+          }
+
+          Logger::info(line);
+        }
+      }
+    }
+
+    // No usable history: a new placement of this mesh (or a sighting after a visibility
+    // gap, where a one-frame velocity cannot be derived). Register it without velocity;
+    // replace the stalest slot when the identity is heavily instanced.
+    constexpr size_t kMaxInstancesPerIdentity = 64;
+
+    NgxVelocityObjectInstance* targetInstance = nullptr;
+    if (objectState.instances.size() >= kMaxInstancesPerIdentity) {
+      for (NgxVelocityObjectInstance& instance : objectState.instances) {
+        if (targetInstance == nullptr || instance.lastSeenFrame < targetInstance->lastSeenFrame) {
+          targetInstance = &instance;
+        }
+      }
+    } else {
+      targetInstance = &objectState.instances.emplace_back();
+    }
+
+    // Fresh occupancy: recycled slots must not inherit the previous occupant's movement
+    // history (a stale confirmed-mover latch would instant-emit for the next pairing)
+    for (uint32_t row = 0; row < 4; row++) {
+      targetInstance->localToWorldRows[row] = localToWorldRows[row];
+    }
+    targetInstance->objectToWorld = objectToWorld;
+    targetInstance->worldToProjection = drawWorldToProjection;
+    targetInstance->lastSeenFrame = m_ue3FrameCounter;
+    targetInstance->wasMoving = false;
+    targetInstance->lastMoveDelta = Vector3(0.0f, 0.0f, 0.0f);
+    targetInstance->lastRotScaleDelta = 0.0f;
+    targetInstance->lastEmitFrame = 0;
+    targetInstance->lastEmitDrawIndex = 0;
+    targetInstance->lastPhaseDuplicateFrame = 0;
+    if (skinned) {
+      targetInstance->bones.assign(boneRegisters, boneRegisters + boneRegisterCount);
+    } else {
+      targetInstance->bones.clear();
+    }
+    if (dynamicMesh) {
+      targetInstance->dynamicPositions = std::move(currentPositions);
+    } else {
+      targetInstance->dynamicPositions.clear();
+    }
+
+    objectState.lastNewRegistrationFrame = m_ue3FrameCounter;
+    m_ngxVelocityStats.newRegistrations++;
+  }
+
+  namespace {
+    // Signature for the head of FSystemSettings::ScaleViewportByScreenPercentage in Mirror's
+    // Edge (shared by every patchable 1.0.1.0 / 1.1.0.0 variant - GOG, Steam, Retail, DLC):
+    //   movss   xmm0, [&GSystemSettings.ScreenPercentage]   F3 0F 10 05 <abs32>
+    //   sub     esp, 8                                       83 EC 08
+    //   ucomiss xmm0, [&Const_100f]                          0F 2E 05 <abs32>
+    // The first absolute operand is &GSystemSettings.ScreenPercentage (a float). The game
+    // ships without ASLR, so the operand is the runtime address as-is; the UBOOL
+    // bUpscaleScreenPercentage is the adjacent struct field at +4 (confirmed against
+    // NeedsUpscale: ScreenPercentage at base+0x178, bUpscaleScreenPercentage at base+0x17c).
+    constexpr uint32_t kUe3ScreenPercentageSigLen = 14;
+
+    bool matchUe3ScreenPercentageSig(const uint8_t* p) {
+      return p[0] == 0xF3 && p[1] == 0x0F && p[2] == 0x10 && p[3] == 0x05 &&
+             p[8] == 0x83 && p[9] == 0xEC && p[10] == 0x08 &&
+             p[11] == 0x0F && p[12] == 0x2E && p[13] == 0x05;
+    }
+
+    // Parent process id of the current process (the game, when this dxvk-remix module runs
+    // inside the RTX Remix bridge's NvRemixBridge.exe host).
+    DWORD ngxGetParentPid() {
+      const DWORD selfPid = ::GetCurrentProcessId();
+      HANDLE snapshot = ::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+      if (snapshot == INVALID_HANDLE_VALUE)
+        return 0;
+
+      PROCESSENTRY32W entry = {};
+      entry.dwSize = sizeof(entry);
+      DWORD parentPid = 0;
+      if (::Process32FirstW(snapshot, &entry)) {
+        do {
+          if (entry.th32ProcessID == selfPid) {
+            parentPid = entry.th32ParentProcessID;
+            break;
+          }
+        } while (::Process32NextW(snapshot, &entry));
+      }
+
+      ::CloseHandle(snapshot);
+      return parentPid;
+    }
+
+    // Base address and image size of a process's main module (its executable). Uses a 32-bit
+    // module snapshot so the 64-bit bridge host can see the 32-bit game's module.
+    bool ngxGetMainModule(DWORD pid, uintptr_t& outBase, uint32_t& outSize) {
+      HANDLE snapshot = ::CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+      if (snapshot == INVALID_HANDLE_VALUE)
+        return false;
+
+      MODULEENTRY32W module = {};
+      module.dwSize = sizeof(module);
+      bool ok = false;
+      if (::Module32FirstW(snapshot, &module)) {
+        outBase = reinterpret_cast<uintptr_t>(module.modBaseAddr);
+        outSize = module.modBaseSize;
+        ok = true;
+      }
+
+      ::CloseHandle(snapshot);
+      return ok;
+    }
+
+    // Reads the (32-bit PE) headers of the module at base in process proc and scans its
+    // executable sections for the signature above, returning the absolute address of
+    // GSystemSettings.ScreenPercentage or 0. Rejects non-32-bit modules by the optional
+    // header magic, so pointing this at the 64-bit bridge host simply yields 0.
+    uintptr_t ngxLocateScreenPercentage(HANDLE proc, uintptr_t base, uint32_t moduleSize) {
+      uint8_t headers[0x1000];
+      SIZE_T bytesRead = 0;
+      if (!::ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(base), headers, sizeof(headers), &bytesRead) ||
+          bytesRead < sizeof(IMAGE_DOS_HEADER))
+        return 0;
+
+      const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(headers);
+      if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+        return 0;
+
+      const uint32_t ntOffset = uint32_t(dos->e_lfanew);
+      if (ntOffset + sizeof(IMAGE_NT_HEADERS32) > sizeof(headers))
+        return 0;
+
+      const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS32*>(headers + ntOffset);
+      if (nt->Signature != IMAGE_NT_SIGNATURE ||
+          nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC)
+        return 0;
+
+      // IMAGE_NT_HEADERS32 = DWORD Signature; IMAGE_FILE_HEADER; IMAGE_OPTIONAL_HEADER32.
+      // The section table follows the optional header (whose size is declared, so this is
+      // robust to layout differences).
+      const uint32_t sectionTableOffset =
+        ntOffset + uint32_t(sizeof(uint32_t) + sizeof(IMAGE_FILE_HEADER)) + nt->FileHeader.SizeOfOptionalHeader;
+      const uint32_t sectionCount = nt->FileHeader.NumberOfSections;
+
+      std::vector<uint8_t> sectionBuffer;
+      for (uint32_t i = 0; i < sectionCount; i++) {
+        const uint32_t entryOffset = sectionTableOffset + i * uint32_t(sizeof(IMAGE_SECTION_HEADER));
+        if (entryOffset + sizeof(IMAGE_SECTION_HEADER) > sizeof(headers))
+          break;
+
+        const auto* section = reinterpret_cast<const IMAGE_SECTION_HEADER*>(headers + entryOffset);
+        if ((section->Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0)
+          continue;
+
+        uint32_t size = section->Misc.VirtualSize != 0 ? section->Misc.VirtualSize : section->SizeOfRawData;
+        if (size < kUe3ScreenPercentageSigLen)
+          continue;
+        if (moduleSize != 0 && section->VirtualAddress + size > moduleSize)
+          size = moduleSize - section->VirtualAddress;
+
+        sectionBuffer.resize(size);
+        SIZE_T sectionRead = 0;
+        if (!::ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(base + section->VirtualAddress),
+                                 sectionBuffer.data(), size, &sectionRead) ||
+            sectionRead < kUe3ScreenPercentageSigLen)
+          continue;
+
+        const size_t scanLen = size_t(sectionRead);
+        for (size_t off = 0; off + kUe3ScreenPercentageSigLen <= scanLen; off++) {
+          if (matchUe3ScreenPercentageSig(sectionBuffer.data() + off)) {
+            uint32_t absoluteAddress = 0;
+            std::memcpy(&absoluteAddress, sectionBuffer.data() + off + 4, sizeof(absoluteAddress));
+            return uintptr_t(absoluteAddress);
+          }
+        }
+      }
+
+      return 0;
+    }
+
+    // Maps the Remix DLSS mode (rtx.qualityDLSS) to a UE3 ScreenPercentage: the linear
+    // dimension ratio DLSS renders at, times 100. Full Resolution is native (DLAA, no
+    // upscale); the Super Resolution tiers use DLSS's standard scaling factors so the
+    // resulting render ratio round-trips back to the same NGX quality value
+    // (see perfQualityFromResolutionRatio). Auto mirrors DxvkDLSS::getAutoProfile's
+    // display-height buckets.
+    float ue3ScreenPercentageForDlssProfile(DLSSProfile profile, uint32_t displayHeight) {
+      DLSSProfile resolved = profile;
+      if (resolved == DLSSProfile::Auto) {
+        if (displayHeight == 0 || displayHeight <= 1080) {
+          resolved = DLSSProfile::MaxQuality;
+        } else if (displayHeight < 2160) {
+          resolved = DLSSProfile::Balanced;
+        } else if (displayHeight < 4320) {
+          resolved = DLSSProfile::MaxPerf;
+        } else {
+          resolved = DLSSProfile::UltraPerf;
+        }
+      }
+
+      switch (resolved) {
+      case DLSSProfile::UltraPerf:      return 100.0f / 3.0f;   // 0.333x
+      case DLSSProfile::MaxPerf:        return 50.0f;           // 0.5x
+      case DLSSProfile::Balanced:       return 58.0f;           // 0.58x
+      case DLSSProfile::MaxQuality:     return 200.0f / 3.0f;   // 0.667x
+      case DLSSProfile::FullResolution: return 100.0f;          // DLAA
+      default:                          return 100.0f;
+      }
+    }
+  }
+
+  void D3D9Rtx::applyNgxPassthroughScreenPercentage() {
+    const bool driving = m_frameOptions.ngxPassthroughMode &&
+                         RtxNgxPassthrough::driveGameScreenPercentage();
+
+    // Locate the field once whenever the mode is on (even when not driving: the scene-camera
+    // gate still needs the game's ScreenPercentage). The game is either this process
+    // (single-process DXVK) or the parent that launched NvRemixBridge.exe (the bridge); scan
+    // the current process first, then the parent, and keep whichever module has the signature.
+    if (!m_ngxScreenPercentageScanDone && m_frameOptions.ngxPassthroughMode) {
+      m_ngxScreenPercentageScanDone = true;
+
+      struct Candidate { HANDLE handle; DWORD pid; bool ownsHandle; };
+      std::vector<Candidate> candidates;
+      candidates.push_back({ ::GetCurrentProcess(), ::GetCurrentProcessId(), false });
+
+      const DWORD parentPid = ngxGetParentPid();
+      if (parentPid != 0) {
+        HANDLE parent = ::OpenProcess(PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_QUERY_INFORMATION,
+                                      FALSE, parentPid);
+        if (parent != nullptr)
+          candidates.push_back({ parent, parentPid, true });
+      }
+
+      for (const Candidate& candidate : candidates) {
+        uintptr_t moduleBase = 0;
+        uint32_t moduleSize = 0;
+        if (!ngxGetMainModule(candidate.pid, moduleBase, moduleSize))
+          continue;
+
+        const uintptr_t address = ngxLocateScreenPercentage(candidate.handle, moduleBase, moduleSize);
+        if (address == 0)
+          continue;
+
+        m_ngxGameProcess = candidate.handle;
+        m_ngxGameProcessOwned = candidate.ownsHandle;
+        m_ngxScreenPercentageRemoteAddr = address;
+
+        float current = 100.0f;
+        SIZE_T bytesRead = 0;
+        if (::ReadProcessMemory(candidate.handle, reinterpret_cast<LPCVOID>(address), &current, sizeof(current), &bytesRead) &&
+            bytesRead == sizeof(current) && std::isfinite(current) && current > 0.0f)
+          m_ngxScreenPercentageOriginal = current;
+
+        Logger::info(str::format("[RTX NGX Passthrough] Game ScreenPercentage located at 0x",
+                                 std::hex, address, std::dec, " in ",
+                                 (candidate.ownsHandle ? "the parent game process (RTX Remix bridge)" : "the current process"),
+                                 " (current ", m_ngxScreenPercentageOriginal,
+                                 "); the DLSS mode selector now drives it."));
+        break;
+      }
+
+      // Release any opened parent handle we did not keep.
+      for (const Candidate& candidate : candidates) {
+        if (candidate.ownsHandle && candidate.handle != m_ngxGameProcess)
+          ::CloseHandle(candidate.handle);
+      }
+
+      if (m_ngxScreenPercentageRemoteAddr == 0) {
+        Logger::warn("[RTX NGX Passthrough] Could not locate the game's ScreenPercentage field; "
+                     "the DLSS mode selector will not drive the render resolution. Use the in-game "
+                     "'scale set ScreenPercentage <value>' console command instead.");
+      }
+    }
+
+    if (m_ngxScreenPercentageRemoteAddr == 0 || m_ngxGameProcess == nullptr) {
+      m_ngxGameScreenPercentage = 0.0f;
+      return;
+    }
+
+    if (!driving) {
+      // Restore the game's own value once when driving disengages (mode or option turned
+      // off), so a reduced ScreenPercentage does not persist as a stuck low resolution.
+      if (m_ngxScreenPercentageDriven) {
+        ::WriteProcessMemory(m_ngxGameProcess, reinterpret_cast<LPVOID>(m_ngxScreenPercentageRemoteAddr),
+                             &m_ngxScreenPercentageOriginal, sizeof(float), nullptr);
+        m_ngxScreenPercentageDriven = false;
+        Logger::info(str::format("[RTX NGX Passthrough] Restored game ScreenPercentage to ",
+                                 m_ngxScreenPercentageOriginal, "."));
+      }
+
+      // While the mode is on but we are not driving, keep the gate informed with the game's
+      // live value (whatever the player set via the console).
+      if (m_frameOptions.ngxPassthroughMode) {
+        float live = 0.0f;
+        SIZE_T bytesRead = 0;
+        if (::ReadProcessMemory(m_ngxGameProcess, reinterpret_cast<LPCVOID>(m_ngxScreenPercentageRemoteAddr),
+                                &live, sizeof(live), &bytesRead) &&
+            bytesRead == sizeof(live) && std::isfinite(live) && live > 0.0f)
+          m_ngxGameScreenPercentage = live;
+      }
+      return;
+    }
+
+    uint32_t displayHeight = 0;
+    if (m_activePresentParams.has_value())
+      displayHeight = m_activePresentParams->BackBufferHeight;
+
+    const float screenPercentage = ue3ScreenPercentageForDlssProfile(RtxOptions::qualityDLSS(), displayHeight);
+
+    // Force UpscaleScreenPercentage on (the adjacent field at +4) so Super Resolution engages:
+    // UE3 renders into a reduced subrect and stretches to the primary target, which the D3D9
+    // layer replaces with DLSS. At 100 (DLAA) NeedsUpscale is false regardless, so it is a
+    // no-op there.
+    const int32_t upscaleOn = 1;
+    ::WriteProcessMemory(m_ngxGameProcess, reinterpret_cast<LPVOID>(m_ngxScreenPercentageRemoteAddr + sizeof(float)),
+                         &upscaleOn, sizeof(upscaleOn), nullptr);
+    ::WriteProcessMemory(m_ngxGameProcess, reinterpret_cast<LPVOID>(m_ngxScreenPercentageRemoteAddr),
+                         &screenPercentage, sizeof(screenPercentage), nullptr);
+    m_ngxScreenPercentageDriven = true;
+    // The game applies this next frame; the gate then expects a main view at this scale.
+    m_ngxGameScreenPercentage = screenPercentage;
+
+    if (screenPercentage != m_ngxScreenPercentageLastLogged) {
+      m_ngxScreenPercentageLastLogged = screenPercentage;
+      Logger::info(str::format("[RTX NGX Passthrough] DLSS mode '",
+                               dlssProfileToString(RtxOptions::qualityDLSS()),
+                               "' -> game ScreenPercentage ", screenPercentage,
+                               (screenPercentage >= 99.5f ? " (DLAA)." : " (DLSS Super Resolution).")));
+    }
+  }
+
+  void D3D9Rtx::emitNgxPassthroughFrameData() {
+    if (m_ngxFrameDataEmitted)
+      return;
+    m_ngxFrameDataEmitted = true;
+
+    Rc<DxvkImage> sceneDepth = m_ngxSceneDepthImage;
+
+    // A scene rendered into a reduced subrect (both dimensions - a single reduced dimension
+    // is letterboxing, which full-rect DLAA handles fine) without the Super Resolution
+    // interception (the engine's upscale stretch went undetected, e.g. UE3 with
+    // UpscaleScreenPercentage=false) means the depth subrect does not correspond to the
+    // full-resolution color the injection sees; skip the DLSS inputs rather than feeding
+    // mismatched data.
+    if (m_ngxUpscaleSourceImage == nullptr && m_ngxSceneViewportValid && m_activePresentParams.has_value()) {
+      const uint32_t backBufferWidth = m_activePresentParams->BackBufferWidth;
+      const uint32_t backBufferHeight = m_activePresentParams->BackBufferHeight;
+
+      if (backBufferWidth != 0 && backBufferHeight != 0 &&
+          uint64_t(m_ngxSceneViewport.Width) * 100 <= uint64_t(backBufferWidth) * 97 &&
+          uint64_t(m_ngxSceneViewport.Height) * 100 <= uint64_t(backBufferHeight) * 97) {
+        ONCE(Logger::warn("[RTX NGX Passthrough] Scene rendered into a reduced subrect without Super Resolution interception; DLSS is skipped. "
+                          "Set the game's UpscaleScreenPercentage=true for DLSS Super Resolution, or ScreenPercentage to 100 for DLAA."));
+        sceneDepth = nullptr;
+      }
+    }
+
+    m_ngxVelocityStats.frameCameraValid = m_ngxFrameCameraValid;
+    m_ngxVelocityStats.depthClears = m_ngxDepthClearsThisFrame;
+    m_ngxVelocityStats.cameraTransposeFlips = m_ngxCameraTransposeFlips;
+
+    m_parent->EmitCs([cSceneDepth = sceneDepth,
+                      cColorTarget = m_ngxColorTargetImage,
+                      cColorMirror = m_ngxColorMirrorImage,
+                      cUpscaleSource = m_ngxUpscaleSourceImage,
+                      cSubrect = m_ngxSubrect,
+                      cVelocityDraws = std::move(m_ngxVelocityDraws),
+                      cVelocityStats = m_ngxVelocityStats,
+                      cJitterX = m_ngxFrameJitter[0],
+                      cJitterY = m_ngxFrameJitter[1]](DxvkContext* ctx) mutable {
+      static_cast<RtxContext*>(ctx)->setNgxPassthroughFrameData(cSceneDepth, cColorTarget, cColorMirror, cUpscaleSource, cSubrect,
+                                                                std::move(cVelocityDraws), cVelocityStats, cJitterX, cJitterY);
+    });
+
+    m_ngxVelocityDraws.clear();
+  }
+
+  const char* D3D9Rtx::classifyNgxImageForDump(const DxvkImage* image) const {
+    if (image == nullptr)
+      return "null";
+    if (m_ngxSceneColorImage != nullptr && image == m_ngxSceneColorImage.ptr())
+      return "sceneColor";
+    if (m_ngxSceneDepthImage != nullptr && image == m_ngxSceneDepthImage.ptr())
+      return "sceneDepth";
+    if (m_ngxFrameBackbufferImage != nullptr && image == m_ngxFrameBackbufferImage.ptr())
+      return "backbuffer";
+    for (uint32_t i = 0; i < m_ngxSceneColorResolveCount; i++) {
+      if (m_ngxSceneColorResolves[i].ptr() == image)
+        return "sceneColorResolve";
+    }
+    return "other";
+  }
+
+  // Line cap shared by the per-draw and StretchRect dump paths (heavy frames would
+  // otherwise flood the log)
+  static constexpr uint32_t kNgxPostChainDumpMaxLinesPerFrame = 160;
+
+  void D3D9Rtx::dumpNgxPostChainDraw(const DrawContext& drawContext) {
+    if (m_ngxPostChainDumpLinesThisFrame >= kNgxPostChainDumpMaxLinesPerFrame)
+      return;
+
+    D3D9CommonTexture* renderTargetTexture = d3d9State().renderTargets[kRenderTargetIndex] != nullptr
+      ? d3d9State().renderTargets[kRenderTargetIndex]->GetCommonTexture() : nullptr;
+    const DxvkImage* renderTargetImage = (renderTargetTexture != nullptr && renderTargetTexture->GetImage() != nullptr)
+      ? renderTargetTexture->GetImage().ptr() : nullptr;
+
+    const uint32_t rtSamplerMask = m_parent->GetActiveRTTextures() & m_parent->m_psShaderMasks.samplerMask;
+
+    // Plain scene geometry (into the scene color, no render-target textures sampled) would
+    // flood the log; the interesting flow is everything else: post passes, composites, UI
+    const bool rtIsSceneColor = m_ngxSceneColorImage != nullptr && renderTargetImage == m_ngxSceneColorImage.ptr();
+    if (rtIsSceneColor && rtSamplerMask == 0)
+      return;
+
+    m_ngxPostChainDumpLinesThisFrame++;
+
+    std::string line = str::format(
+      "[RTX NGX Passthrough][dump] draw=", m_drawCallID,
+      (m_rtxInjectTriggered ? " (post-inject)" : ""),
+      " rt=", classifyNgxImageForDump(renderTargetImage), "(0x", std::hex, uintptr_t(renderTargetImage), std::dec);
+
+    if (renderTargetImage != nullptr) {
+      line += str::format(",", renderTargetImage->info().extent.width, "x", renderTargetImage->info().extent.height,
+                          ",fmt=", int(renderTargetImage->info().format));
+    }
+
+    const D3DVIEWPORT9& vp = d3d9State().viewport;
+    line += str::format(") vp=", vp.Width, "x", vp.Height,
+                        " prims=", drawContext.PrimitiveCount,
+                        " z=", int(d3d9State().renderStates[D3DRS_ZENABLE]),
+                        " zw=", int(d3d9State().renderStates[D3DRS_ZWRITEENABLE]),
+                        " st=", int(d3d9State().renderStates[D3DRS_STENCILENABLE]),
+                        " ab=", int(d3d9State().renderStates[D3DRS_ALPHABLENDENABLE]));
+
+    for (const uint32_t i : bit::BitMask(rtSamplerMask)) {
+      D3D9CommonTexture* texture = GetCommonTexture(d3d9State().textures[i]);
+      const DxvkImage* sampledImage = (texture != nullptr && texture->GetImage() != nullptr) ? texture->GetImage().ptr() : nullptr;
+
+      line += str::format(" s", i, "=", classifyNgxImageForDump(sampledImage), "(0x", std::hex, uintptr_t(sampledImage), std::dec);
+      if (sampledImage != nullptr) {
+        line += str::format(",", sampledImage->info().extent.width, "x", sampledImage->info().extent.height);
+      }
+      line += ")";
+    }
+
+    Logger::info(line);
+  }
+
+  void D3D9Rtx::NotifyStretchRect(const Rc<DxvkImage>& sourceImage, const Rc<DxvkImage>& destImage) {
+    if (!m_frameOptions.ngxPassthroughMode)
+      return;
+
+    if (m_ngxPostChainDumpFramesLeft > 0 && m_ngxPostChainDumpLinesThisFrame < kNgxPostChainDumpMaxLinesPerFrame) {
+      m_ngxPostChainDumpLinesThisFrame++;
+      Logger::info(str::format(
+        "[RTX NGX Passthrough][dump] StretchRect",
+        (m_rtxInjectTriggered ? " (post-inject)" : ""),
+        " src=", classifyNgxImageForDump(sourceImage.ptr()), "(0x", std::hex, uintptr_t(sourceImage.ptr()), std::dec,
+        (sourceImage != nullptr ? str::format(",", sourceImage->info().extent.width, "x", sourceImage->info().extent.height) : ""),
+        ") dst=", classifyNgxImageForDump(destImage.ptr()), "(0x", std::hex, uintptr_t(destImage.ptr()), std::dec,
+        (destImage != nullptr ? str::format(",", destImage->info().extent.width, "x", destImage->info().extent.height) : ""), ")"));
+    }
+
+    if (!m_frameOptions.ngxPrePostProcess || m_rtxInjectTriggered)
+      return;
+
+    if (m_ngxSceneColorImage == nullptr || sourceImage == nullptr || destImage == nullptr ||
+        sourceImage.ptr() != m_ngxSceneColorImage.ptr())
+      return;
+
+    // Only full-size copies qualify as scene color resolves (UE3's CopyToResolveTarget for
+    // a dedicated scene color surface); reduced-size copies are downsamples
+    if (destImage->info().extent.width != sourceImage->info().extent.width ||
+        destImage->info().extent.height != sourceImage->info().extent.height)
+      return;
+
+    for (uint32_t i = 0; i < m_ngxSceneColorResolveCount; i++) {
+      if (m_ngxSceneColorResolves[i].ptr() == destImage.ptr())
+        return;
+    }
+
+    if (m_ngxSceneColorResolveCount < m_ngxSceneColorResolves.size()) {
+      m_ngxSceneColorResolves[m_ngxSceneColorResolveCount++] = destImage;
+    }
+  }
+
+  void D3D9Rtx::NotifyClear(DWORD clearFlags) {
+    if (!m_frameOptions.ngxPassthroughMode || m_rtxInjectTriggered)
+      return;
+
+    if ((clearFlags & D3DCLEAR_ZBUFFER) == 0)
+      return;
+
+    // Only depth clears AFTER world geometry was drawn matter (frame-start clears and
+    // SceneCapture probe clears precede any accepted scene camera draw)
+    if (!m_ngxSceneViewportValid || m_ngxSceneDepthImage == nullptr)
+      return;
+
+    if (d3d9State().depthStencil == nullptr)
+      return;
+
+    D3D9CommonTexture* depthStencilTexture = d3d9State().depthStencil->GetCommonTexture();
+    if (depthStencilTexture == nullptr || depthStencilTexture->GetImage().ptr() != m_ngxSceneDepthImage.ptr())
+      return;
+
+    // The world depth is about to be destroyed (UE3 clears depth ahead of its foreground
+    // DPG; with occlusion culling enabled an extra clear precedes that one); snapshot it
+    // at the FIRST clear for this frame's motion vector generation. Emitted before the
+    // clear itself is recorded, so the copy is ordered ahead of it on the CS timeline.
+    // Later clears only advance the counter (the world depth is already gone; the
+    // foreground DPG following the last clear stays live in the depth buffer through the
+    // injection point).
+    m_ngxDepthClearsThisFrame++;
+    if (m_ngxDepthClearsThisFrame > 1)
+      return;
+
+    m_ngxDepthSnapshotTakenThisFrame = true;
+
+    m_parent->EmitCs([cSceneDepth = m_ngxSceneDepthImage](DxvkContext* ctx) {
+      static_cast<RtxContext*>(ctx)->snapshotNgxPassthroughDepth(cSceneDepth);
+    });
+  }
+
+  bool D3D9Rtx::GetNgxPassthroughViewportJitter(float* pJitterX, float* pJitterY) const {
+    if (!m_frameOptions.ngxPassthroughMode || !m_ngxFrameJitterValid || m_rtxInjectTriggered)
+      return false;
+
+    if (m_ngxFrameJitter[0] == 0.0f && m_ngxFrameJitter[1] == 0.0f)
+      return false;
+
+    if (m_ngxSceneColorImage == nullptr || d3d9State().renderTargets[kRenderTargetIndex] == nullptr)
+      return false;
+
+    D3D9CommonTexture* renderTargetTexture = d3d9State().renderTargets[kRenderTargetIndex]->GetCommonTexture();
+
+    bool jitterThisDraw = renderTargetTexture != nullptr &&
+                          renderTargetTexture->GetImage().ptr() == m_ngxSceneColorImage.ptr();
+
+    // Screen space passes that render into other full-size targets while testing against
+    // the scene depth-stencil (dynamic shadow projections and their stencil marking into
+    // the light attenuation buffer, distortion accumulation) must shift with the scene:
+    // their output is consumed at scene-aligned coordinates and their stencil/depth tests
+    // run against the jittered scene depth. Reduced-size targets (bloom, AO) and the UI/
+    // post chain (no scene depth bound) stay untouched.
+    if (!jitterThisDraw &&
+        m_ngxSceneDepthImage != nullptr &&
+        renderTargetTexture != nullptr && renderTargetTexture->GetImage() != nullptr &&
+        d3d9State().depthStencil != nullptr) {
+      D3D9CommonTexture* depthStencilTexture = d3d9State().depthStencil->GetCommonTexture();
+
+      if (depthStencilTexture != nullptr && depthStencilTexture->GetImage() != nullptr &&
+          depthStencilTexture->GetImage().ptr() == m_ngxSceneDepthImage.ptr()) {
+        const VkExtent3D& rtExtent = renderTargetTexture->GetImage()->info().extent;
+        const VkExtent3D& sceneExtent = m_ngxSceneColorImage->info().extent;
+
+        jitterThisDraw = rtExtent.width == sceneExtent.width && rtExtent.height == sceneExtent.height;
+      }
+    }
+
+    if (!jitterThisDraw)
+      return false;
+
+    *pJitterX = m_ngxFrameJitter[0];
+    *pJitterY = m_ngxFrameJitter[1];
+    return true;
+  }
+
+  float D3D9Rtx::GetNgxPassthroughSamplerLodBias() const {
+    if (!m_frameOptions.ngxPassthroughMode || m_rtxInjectTriggered)
+      return 0.0f;
+
+    if (!m_ngxSceneViewportValid || m_ngxSceneColorImage == nullptr || !m_activePresentParams.has_value())
+      return 0.0f;
+
+    // Scene-color draws only: the same reduced-resolution content DLSS upscales. UI and
+    // post passes (different targets, or post-injection) stay unbiased.
+    if (d3d9State().renderTargets[kRenderTargetIndex] == nullptr)
+      return 0.0f;
+
+    D3D9CommonTexture* renderTargetTexture = d3d9State().renderTargets[kRenderTargetIndex]->GetCommonTexture();
+    if (renderTargetTexture == nullptr || renderTargetTexture->GetImage().ptr() != m_ngxSceneColorImage.ptr())
+      return 0.0f;
+
+    // Meaningfully reduced in both dimensions = the Super Resolution subrect configuration
+    // (the same 97% test the stretch interception uses); DLAA yields log2(1) = 0 naturally
+    const uint32_t backBufferWidth = m_activePresentParams->BackBufferWidth;
+    const uint32_t backBufferHeight = m_activePresentParams->BackBufferHeight;
+
+    if (backBufferWidth == 0 || backBufferHeight == 0 ||
+        uint64_t(m_ngxSceneViewport.Width) * 100 > uint64_t(backBufferWidth) * 97 ||
+        uint64_t(m_ngxSceneViewport.Height) * 100 > uint64_t(backBufferHeight) * 97)
+      return 0.0f;
+
+    // The standard DLSS integration bias: mip selection matches the upscaled output's
+    // texel density instead of the reduced render resolution
+    const float bias = std::log2(float(m_ngxSceneViewport.Width) / float(backBufferWidth));
+    return std::clamp(bias, -4.0f, 0.0f);
+  }
+
+  D3D9Rtx::NgxSpsbCtabReg D3D9Rtx::scanNgxSpsbCtabReg(const std::vector<uint8_t>& bytecode) const {
+    NgxSpsbCtabReg result;
+
+    try {
+      if (bytecode.size() < sizeof(uint32_t) || (bytecode.size() % sizeof(uint32_t)) != 0)
+        return result;
+
+      const uint32_t* tokens = reinterpret_cast<const uint32_t*>(bytecode.data());
+      const uint32_t headerToken = tokens[0];
+      const uint32_t headerTypeMask = headerToken & 0xffff0000u;
+
+      DxsoProgramType programType;
+      if (headerTypeMask == 0xffff0000u)
+        programType = DxsoProgramTypes::PixelShader;
+      else if (headerTypeMask == 0xfffe0000u)
+        programType = DxsoProgramTypes::VertexShader;
+      else
+        return result;
+
+      const uint32_t majorVersion = (headerToken >> 8) & 0xffu;
+      const uint32_t minorVersion = headerToken & 0xffu;
+      DxsoProgramInfo programInfo { programType, minorVersion, majorVersion };
+
+      DxsoDecodeContext decoder(programInfo);
+      DxsoCodeIter iter(tokens + 1);
+
+      while (decoder.decodeInstruction(iter)) {
+        if (decoder.getCtabInfo().m_size != 0)
+          break;
+      }
+
+      const DxsoCtab& ctab = decoder.getCtabInfo();
+      if (ctab.m_size == 0 || ctab.m_constantData.empty())
+        return result;
+
+      for (const DxsoCtab::Constant& c : ctab.m_constantData) {
+        if (c.registerCount < 1)
+          continue;
+
+        std::string name;
+        name.reserve(c.name.size());
+        for (const char ch : c.name)
+          name.push_back(char(std::tolower(static_cast<unsigned char>(ch))));
+
+        if (name.find("screenpositionscalebias") != std::string::npos) {
+          result.present = true;
+          result.reg = c.registerIndex;
+          break;
+        }
+      }
+    } catch (...) {
+      return result;
+    }
+
+    return result;
+  }
+
+  void D3D9Rtx::PatchNgxScreenPositionScaleBias(DxsoProgramType stage, void* floatConstants, uint32_t floatConstantCount) const {
+    if (!m_ngxSpsbPatchActive)
+      return;
+
+    const NgxSpsbCtabReg& patch = stage == DxsoProgramTypes::VertexShader ? m_ngxSpsbPatchVs : m_ngxSpsbPatchPs;
+    if (!patch.present || patch.reg >= floatConstantCount)
+      return;
+
+    // UV.x = clip.x * SPSB.x + SPSB.w; UV.y = clip.y * SPSB.y + SPSB.z (UE3 samples with
+    // ".xy * SPSB.xy + SPSB.wz"): shift the bias so lookups follow the jittered content
+    float* constant = reinterpret_cast<float*>(floatConstants) + size_t(patch.reg) * 4;
+    constant[3] += m_ngxSpsbPatchAdd[0];
+    constant[2] += m_ngxSpsbPatchAdd[1];
+  }
+
+  // Detects the first UI-classified draw on the backbuffer after a pre-post-process
+  // injection and captures the backbuffer as this frame's HUD-less frame generation input
+  // (the game's post chain has written its final output by then, the UI has not). Uses the
+  // same UI classification as the late injection trigger.
+  void D3D9Rtx::maybeCaptureNgxHudless(const DrawContext& drawContext) {
+    if (m_ngxHudlessCapturedThisFrame || !m_frameOptions.ngxDlfgHudless ||
+        m_ngxFrameBackbufferImage == nullptr) {
+      return;
+    }
+
+    if (drawContext.PrimitiveCount == 0 || d3d9State().renderTargets[kRenderTargetIndex] == nullptr) {
+      return;
+    }
+
+    D3D9CommonTexture* renderTargetTexture = d3d9State().renderTargets[kRenderTargetIndex]->GetCommonTexture();
+    if (renderTargetTexture == nullptr || renderTargetTexture->GetImage().ptr() != m_ngxFrameBackbufferImage.ptr()) {
+      return;
+    }
+
+    // Per-draw state the UI classification depends on (the post-injection path skips the
+    // regular per-draw setup)
+    m_boundTextureSnapshotValid = false;
+
+    m_currentUe3VertexFactory = Ue3VertexFactoryType::Unknown;
+    if (m_frameOptions.ue3EngineMode && d3d9State().vertexDecl != nullptr) {
+      const auto& elements = d3d9State().vertexDecl->GetElements();
+      XXH64_hash_t declKey = XXH3_64bits(elements.data(), elements.size() * sizeof(D3DVERTEXELEMENT9));
+      auto it = m_ue3VertexFactoryCache.find(declKey);
+      if (it != m_ue3VertexFactoryCache.end()) {
+        m_currentUe3VertexFactory = it->second;
+      } else {
+        m_currentUe3VertexFactory = classifyUe3VertexFactory(elements);
+        m_ue3VertexFactoryCache.emplace(declKey, m_currentUe3VertexFactory);
+      }
+    }
+
+    const bool isUiDraw =
+      classifyUe3Pass(drawContext) == Ue3PassType::UiComposite ||
+      isRenderingUI() ||
+      (m_frameOptions.preTransformedVerticesIsUI &&
+       d3d9State().vertexDecl != nullptr &&
+       d3d9State().vertexDecl->TestFlag(D3D9VertexDeclFlag::HasPositionT));
+
+    if (!isUiDraw) {
+      return;
+    }
+
+    m_ngxHudlessCapturedThisFrame = true;
+
+    m_parent->EmitCs([cBackbuffer = m_ngxFrameBackbufferImage](DxvkContext* ctx) {
+      static_cast<RtxContext*>(ctx)->captureNgxPassthroughHudless(cBackbuffer);
+    });
+  }
+
+  PrepareDrawFlags D3D9Rtx::prepareDrawForNgxPassthrough(const DrawContext& drawContext) {
+    ScopedCpuProfileZone();
+
+    // Per-frame draw index for the diagnostics (nothing else advances it in this mode)
+    m_drawCallID++;
+
+    if (unlikely(m_ngxPostChainDumpFramesLeft > 0)) {
+      dumpNgxPostChainDraw(drawContext);
+    }
+
+    // Super Resolution texture LOD bias transitions: the bias is folded into the sampler
+    // keys at bind time (see GetNgxPassthroughSamplerLodBias), but samplers are only
+    // (re)created when their stage is dirtied - so whenever this draw's effective bias
+    // differs from the last draw's (scene <-> UI target switches, the injection trigger),
+    // every stage must re-bind or draws would sample with the previous scope's bias.
+    {
+      const float samplerLodBias = GetNgxPassthroughSamplerLodBias();
+      if (samplerLodBias != m_ngxAppliedSamplerLodBias) {
+        m_ngxAppliedSamplerLodBias = samplerLodBias;
+        m_parent->m_dirtySamplerStates = (1u << uint32_t(d3d9State().samplerStates.size())) - 1u;
+      }
+    }
+
+    // Every draw executes as plain rasterization in this mode. The remaining per-draw work:
+    // UE3 camera extraction, scene target identification, and the thin injection trigger.
+    if (m_rtxInjectTriggered) {
+      maybeCaptureNgxHudless(drawContext);
+      return PrepareDrawFlag::PreserveDrawCallAndItsState;
+    }
+
+    m_boundTextureSnapshotValid = false;
+
+    // Decide this frame's sub-pixel jitter before the first draw that may consume it
+    if (!m_ngxFrameJitterValid) {
+      m_ngxFrameJitterValid = true;
+      m_ngxFrameJitter[0] = 0.0f;
+      m_ngxFrameJitter[1] = 0.0f;
+
+      // DLSS upscaler selected (ray reconstruction cannot exist without the path tracer, so
+      // no need to exclude it here) and actually supported on this system
+      const bool dlssUsable = RtxOptions::isDLSSOrRayReconstructionEnabled() &&
+                              m_parent->GetDXVKDevice()->getCommon()->metaNGXContext().supportsDLSS();
+
+      if (m_frameOptions.ngxPassthroughJitter && dlssUsable) {
+        const Vector2 jitter = calculateHaltonJitter(m_parent->GetDXVKDevice()->getCurrentFrameId(),
+                                                     RtxOptions::cameraJitterSequenceLength());
+        m_ngxFrameJitter[0] = jitter.x;
+        m_ngxFrameJitter[1] = jitter.y;
+      }
+
+      // The viewport carries the previous frame's jitter offset until rebound
+      m_parent->m_flags.set(D3D9DeviceFlag::DirtyViewportScissor);
+
+      // The GPU constant buffers may carry the previous frame's ScreenPositionScaleBias
+      // patch (a different jitter): force one fresh upload per stage this frame
+      m_parent->m_consts[DxsoProgramTypes::VertexShader].dirty = true;
+      m_parent->m_consts[DxsoProgramTypes::PixelShader].dirty = true;
+      m_ngxSpsbLastVsReg = -1;
+      m_ngxSpsbLastPsReg = -1;
+
+      // Resolve this frame's backbuffer image (backbuffers rotate every present) for the
+      // scene-end trigger: description-based primary checks also match offscreen buffers
+      // allocated at backbuffer size (e.g. ME's TdUI compositing targets), which would make
+      // the injection run against - and DLSS write into - the wrong image on some frames.
+      m_ngxFrameBackbufferImage = nullptr;
+
+      Com<IDirect3DSurface9> backBuffer;
+      if (SUCCEEDED(m_parent->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backBuffer)) && backBuffer != nullptr) {
+        if (D3D9CommonTexture* backBufferTexture = static_cast<D3D9Surface*>(backBuffer.ptr())->GetCommonTexture()) {
+          m_ngxFrameBackbufferImage = backBufferTexture->GetImage();
+        }
+      }
+    }
+
+    // ScreenPositionScaleBias jitter compensation for this draw's shaders: screen space
+    // lookups (shadow projections reading scene depth from the scene color alpha,
+    // translucency, distortion, fog) compute UVs from clip-space varyings, which do not
+    // follow the viewport jitter; the bias constant is shifted by the jitter at constant
+    // upload so those lookups sample the jittered content aligned. Without this, passes
+    // whose result depends sharply on the sampled depth (dynamic shadow projections with
+    // tight bias) oscillate with the per-frame jitter sign.
+    //
+    // Decided before any early-out below: the patch must always describe the shaders bound
+    // for whatever the device uploads next, including degenerate draws that skip the rest
+    // of the per-draw work.
+    m_ngxSpsbPatchActive = false;
+
+    if ((m_ngxFrameJitter[0] != 0.0f || m_ngxFrameJitter[1] != 0.0f) && m_ngxSceneColorImage != nullptr) {
+      auto lookupSpsbReg = [&](const D3D9CommonShader* shader) -> NgxSpsbCtabReg {
+        if (shader == nullptr)
+          return NgxSpsbCtabReg();
+
+        const XXH64_hash_t shaderHash = shader->GetBytecodeHash();
+        if (shaderHash == 0)
+          return NgxSpsbCtabReg();
+
+        auto it = m_ngxSpsbCtabCache.find(shaderHash);
+        if (it == m_ngxSpsbCtabCache.end()) {
+          m_ngxSpsbCtabCache.emplace(shaderHash, scanNgxSpsbCtabReg(shader->GetBytecode()));
+          it = m_ngxSpsbCtabCache.find(shaderHash);
+        }
+        return it->second;
+      };
+
+      m_ngxSpsbPatchVs = lookupSpsbReg(m_parent->UseProgrammableVS() && d3d9State().vertexShader.ptr() != nullptr
+                                         ? d3d9State().vertexShader->GetCommonShader() : nullptr);
+      m_ngxSpsbPatchPs = lookupSpsbReg(d3d9State().pixelShader.ptr() != nullptr
+                                         ? d3d9State().pixelShader->GetCommonShader() : nullptr);
+
+      if (m_ngxSpsbPatchVs.present || m_ngxSpsbPatchPs.present) {
+        const VkExtent3D& sceneExtent = m_ngxSceneColorImage->info().extent;
+
+        if (sceneExtent.width != 0 && sceneExtent.height != 0) {
+          m_ngxSpsbPatchAdd[0] = m_ngxFrameJitter[0] / float(sceneExtent.width);
+          m_ngxSpsbPatchAdd[1] = m_ngxFrameJitter[1] / float(sceneExtent.height);
+          m_ngxSpsbPatchActive = true;
+        }
+      }
+    }
+
+    // Force a fresh constant upload when the patch register moved (shader switch without a
+    // constant change): the buffered copy carries the previous shader's patch layout
+    {
+      const int32_t vsReg = (m_ngxSpsbPatchActive && m_ngxSpsbPatchVs.present) ? int32_t(m_ngxSpsbPatchVs.reg) : -1;
+      const int32_t psReg = (m_ngxSpsbPatchActive && m_ngxSpsbPatchPs.present) ? int32_t(m_ngxSpsbPatchPs.reg) : -1;
+
+      if (vsReg != m_ngxSpsbLastVsReg) {
+        m_parent->m_consts[DxsoProgramTypes::VertexShader].dirty = true;
+        m_ngxSpsbLastVsReg = vsReg;
+      }
+      if (psReg != m_ngxSpsbLastPsReg) {
+        m_parent->m_consts[DxsoProgramTypes::PixelShader].dirty = true;
+        m_ngxSpsbLastPsReg = psReg;
+      }
+    }
+
+    if (drawContext.PrimitiveCount == 0 || d3d9State().renderTargets[kRenderTargetIndex] == nullptr) {
+      return PrepareDrawFlag::PreserveDrawCallAndItsState;
+    }
+
+    // UE3 vertex factory classification (cached by vertex declaration) feeds classifyUe3Pass
+    m_currentUe3VertexFactory = Ue3VertexFactoryType::Unknown;
+    m_currentUe3PassType = Ue3PassType::Unknown;
+    if (m_frameOptions.ue3EngineMode && d3d9State().vertexDecl != nullptr) {
+      const auto& elements = d3d9State().vertexDecl->GetElements();
+      XXH64_hash_t declKey = XXH3_64bits(elements.data(), elements.size() * sizeof(D3DVERTEXELEMENT9));
+      auto it = m_ue3VertexFactoryCache.find(declKey);
+      if (it != m_ue3VertexFactoryCache.end()) {
+        m_currentUe3VertexFactory = it->second;
+      } else {
+        m_currentUe3VertexFactory = classifyUe3VertexFactory(elements);
+        m_ue3VertexFactoryCache.emplace(declKey, m_currentUe3VertexFactory);
+      }
+    }
+
+    // Camera extraction from UE3 reserved shader constants (CTAB-verified draws only)
+    if (m_parent->UseProgrammableVS() && d3d9State().vertexShader.ptr() != nullptr) {
+      tryNgxPassthroughCameraCapture();
+    }
+
+    // Dynamic object capture for the velocity raster pass
+    tryCaptureNgxVelocityDraw(drawContext);
+
+    // Scene end detection: the first UI draw on the primary render target ends the scene and
+    // triggers the thin injection (DLSS on the game's post-processed output, pre-UI). When
+    // the game renders its scene into a reduced ScreenPercentage subrect, the engine's final
+    // bilinear stretch onto the primary target ends the scene instead: that draw is
+    // suppressed and DLSS performs the upscale (true Super Resolution).
+    bool triggerInjection = false;
+    bool suppressDraw = false;
+
+    if (m_activePresentParams.has_value()) {
+      const uint32_t backBufferWidth = m_activePresentParams->BackBufferWidth;
+      const uint32_t backBufferHeight = m_activePresentParams->BackBufferHeight;
+
+      D3D9CommonTexture* renderTargetTexture = d3d9State().renderTargets[kRenderTargetIndex]->GetCommonTexture();
+
+      // Pre-post-process injection point: the first fullscreen composite quad that samples
+      // the scene color (the render surface directly, or a same-size resolve copy of it -
+      // UE3's D3D9 RHI gives the scene color a dedicated render surface and resolves it
+      // into a texture for sampling) while rendering into a different target is the start
+      // of the game's post-process chain (UE3 renders all scene DPGs - world and foreground
+      // - before its post chain reads scene color). DLSS runs on the linear scene color
+      // here and writes the result back to the image the pass consumes, so bloom/
+      // tonemapping/dynamic contrast operate on the anti-aliased, unjittered image the way
+      // a native engine integration would.
+      //
+      // The quad requirements (depth disabled, no z-write, no stencil, no blending, few
+      // primitives, fullscreen viewport) exist because mid-scene lighting passes also
+      // sample the scene color resolve into other targets: dynamic shadow projections read
+      // the scene depth from the resolve alpha while rendering into the light attenuation
+      // buffer or modulating the scene color as fullscreen-viewport frustum geometry, with
+      // depth testing frequently disabled - but always stencil-masked, blended, and more
+      // than 4 primitives (observed in ME via the post-chain dump). Triggering on one of
+      // those would run DLSS before the scene is complete.
+      //
+      // Only engages for a full-size scene (a ScreenPercentage subrect is handled by the
+      // stretch-replacement path below) and while the debug visualization is off (the
+      // debug image would be mangled by the game's post chain; the late injection point
+      // writes it to the final output instead). If this trigger never fires (post
+      // disabled, no scene color identified), the backbuffer trigger below is the fallback.
+      const bool likelyPostProcessQuad =
+        drawContext.PrimitiveCount <= 4 &&
+        (d3d9State().renderStates[D3DRS_ZENABLE] == D3DZB_FALSE ||
+         d3d9State().renderStates[D3DRS_ZFUNC] == D3DCMP_ALWAYS) &&
+        d3d9State().renderStates[D3DRS_ZWRITEENABLE] == FALSE &&
+        d3d9State().renderStates[D3DRS_STENCILENABLE] == FALSE &&
+        d3d9State().renderStates[D3DRS_ALPHABLENDENABLE] == FALSE &&
+        d3d9State().viewport.Width + 1 >= backBufferWidth &&
+        d3d9State().viewport.Height + 1 >= backBufferHeight;
+
+      // Structural mid-scene guard: in frames that have a foreground DPG depth clear (all
+      // normal gameplay frames), every world DPG pass - lighting, dynamic shadow
+      // projections, translucency - precedes that clear, and the post chain follows it.
+      // Requiring the clear before the trigger makes a world-DPG pass firing the injection
+      // impossible regardless of its render state. Frames without the clear (menus,
+      // sequences without a foreground DPG) are detected via the previous frame and skip
+      // the requirement.
+      const bool sceneCompletionGateOpen = !m_ngxDepthClearSeenPrevFrame || m_ngxDepthSnapshotTakenThisFrame;
+
+      if (m_frameOptions.ngxPrePostProcess &&
+          m_frameOptions.ngxDebugVisualization == 0 &&
+          likelyPostProcessQuad &&
+          sceneCompletionGateOpen &&
+          m_ngxSceneColorImage != nullptr && m_ngxSceneViewportValid &&
+          backBufferWidth != 0 && backBufferHeight != 0 &&
+          uint64_t(m_ngxSceneViewport.Width) * 100 >= uint64_t(backBufferWidth) * 97 &&
+          uint64_t(m_ngxSceneViewport.Height) * 100 >= uint64_t(backBufferHeight) * 97 &&
+          (renderTargetTexture == nullptr || renderTargetTexture->GetImage().ptr() != m_ngxSceneColorImage.ptr())) {
+        const uint32_t rtSamplerMask = m_parent->GetActiveRTTextures() & m_parent->m_psShaderMasks.samplerMask;
+
+        for (const uint32_t i : bit::BitMask(rtSamplerMask)) {
+          D3D9CommonTexture* texture = GetCommonTexture(d3d9State().textures[i]);
+          if (texture == nullptr || texture->GetImage() == nullptr) {
+            continue;
+          }
+
+          const DxvkImage* sampledImage = texture->GetImage().ptr();
+
+          Rc<DxvkImage> matchedTarget;
+          if (sampledImage == m_ngxSceneColorImage.ptr()) {
+            matchedTarget = m_ngxSceneColorImage;
+          } else {
+            for (uint32_t r = 0; r < m_ngxSceneColorResolveCount; r++) {
+              if (m_ngxSceneColorResolves[r].ptr() == sampledImage) {
+                matchedTarget = m_ngxSceneColorResolves[r];
+                break;
+              }
+            }
+          }
+
+          if (matchedTarget == nullptr) {
+            continue;
+          }
+
+          m_ngxColorTargetImage = matchedTarget;
+          // When the consumed image is a resolve copy, mirror the DLSS output into the
+          // scene color surface as well: later post passes may re-resolve from it (UE3
+          // scene color resolves are surface -> texture copies)
+          m_ngxColorMirrorImage = (matchedTarget.ptr() != m_ngxSceneColorImage.ptr()) ? m_ngxSceneColorImage : nullptr;
+          m_ngxSubrect.offset = { int32_t(m_ngxSceneViewport.X), int32_t(m_ngxSceneViewport.Y) };
+          m_ngxSubrect.extent = { m_ngxSceneViewport.Width, m_ngxSceneViewport.Height };
+
+          triggerInjection = true;
+
+          ONCE(Logger::info(str::format("[RTX NGX Passthrough] Pre-post-process injection engaged: DLSS runs on the ",
+                                        (m_ngxColorMirrorImage != nullptr ? "resolved scene color" : "scene color"),
+                                        " before the game's post-process chain.")));
+          break;
+        }
+      }
+
+      // The trigger requires the actual backbuffer image, not just a backbuffer-sized
+      // description: offscreen composition buffers (e.g. ME's TdUI targets) share the
+      // description and would otherwise receive the injection on some frames, making DLSS
+      // alternate between the real backbuffer and an offscreen image
+      bool isPrimary;
+
+      if (m_ngxFrameBackbufferImage != nullptr) {
+        isPrimary = renderTargetTexture != nullptr &&
+                    renderTargetTexture->GetImage().ptr() == m_ngxFrameBackbufferImage.ptr();
+      } else {
+        isPrimary = s_isDxvkResolutionEnvVarSet ||
+          isRenderTargetPrimary(*m_activePresentParams, renderTargetTexture->Desc());
+      }
+
+      if (!triggerInjection && isPrimary) {
+        // ScreenPercentage upscale replacement: only engages when this frame's scene provably
+        // rendered into a subrect meaningfully smaller than the backbuffer in both dimensions
+        // (a reduced height alone would match letterboxed cinematics)
+        const bool sceneIsSubrect =
+          m_ngxSceneViewportValid &&
+          backBufferWidth != 0 && backBufferHeight != 0 &&
+          uint64_t(m_ngxSceneViewport.Width) * 100 <= uint64_t(backBufferWidth) * 97 &&
+          uint64_t(m_ngxSceneViewport.Height) * 100 <= uint64_t(backBufferHeight) * 97;
+
+        if (sceneIsSubrect) {
+          const D3DVIEWPORT9& vp = d3d9State().viewport;
+          const bool depthTestDisabled = d3d9State().renderStates[D3DRS_ZENABLE] == D3DZB_FALSE ||
+                                         d3d9State().renderStates[D3DRS_ZFUNC] == D3DCMP_ALWAYS;
+          const bool zWriteEnabled = d3d9State().renderStates[D3DRS_ZWRITEENABLE] != FALSE;
+
+          // The stretch is the first fullscreen-viewport composite quad targeting the primary
+          // render target after the scene (the post chain writes to offscreen targets while
+          // an upscale is pending)
+          const bool likelyUpscaleStretch =
+            drawContext.PrimitiveCount <= 4 &&
+            depthTestDisabled && !zWriteEnabled &&
+            vp.Width + 1 >= backBufferWidth && vp.Height + 1 >= backBufferHeight;
+
+          if (likelyUpscaleStretch) {
+            // The stretch source: the largest render-target texture the pixel shader samples
+            // that covers the scene subrect
+            Rc<DxvkImage> sourceImage;
+            const uint32_t rtSamplerMask = m_parent->GetActiveRTTextures() & m_parent->m_psShaderMasks.samplerMask;
+
+            for (const uint32_t i : bit::BitMask(rtSamplerMask)) {
+              D3D9CommonTexture* texture = GetCommonTexture(d3d9State().textures[i]);
+              if (texture == nullptr || texture->GetImage() == nullptr) {
+                continue;
+              }
+
+              const VkExtent3D& sourceExtent = texture->GetImage()->info().extent;
+              if (sourceExtent.width < m_ngxSceneViewport.X + m_ngxSceneViewport.Width ||
+                  sourceExtent.height < m_ngxSceneViewport.Y + m_ngxSceneViewport.Height) {
+                continue;
+              }
+
+              if (sourceImage == nullptr ||
+                  uint64_t(sourceExtent.width) * sourceExtent.height >
+                  uint64_t(sourceImage->info().extent.width) * sourceImage->info().extent.height) {
+                sourceImage = texture->GetImage();
+              }
+            }
+
+            if (sourceImage != nullptr) {
+              m_ngxUpscaleSourceImage = sourceImage;
+              m_ngxSubrect.offset = { int32_t(m_ngxSceneViewport.X), int32_t(m_ngxSceneViewport.Y) };
+              m_ngxSubrect.extent = { m_ngxSceneViewport.Width, m_ngxSceneViewport.Height };
+
+              triggerInjection = true;
+              suppressDraw = true;
+
+              ONCE(Logger::info(str::format(
+                "[RTX NGX Passthrough] ScreenPercentage upscale detected and replaced with DLSS Super Resolution (",
+                m_ngxSceneViewport.Width, "x", m_ngxSceneViewport.Height, " -> ",
+                backBufferWidth, "x", backBufferHeight, ").")));
+            }
+          }
+        }
+
+        if (!triggerInjection) {
+          m_currentUe3PassType = classifyUe3Pass(drawContext);
+
+          if (m_currentUe3PassType == Ue3PassType::UiComposite) {
+            triggerInjection = true;
+          } else if (isRenderingUI()) {
+            triggerInjection = true;
+          } else if (m_frameOptions.preTransformedVerticesIsUI &&
+                     d3d9State().vertexDecl != nullptr &&
+                     d3d9State().vertexDecl->TestFlag(D3D9VertexDeclFlag::HasPositionT)) {
+            triggerInjection = true;
+          }
+        }
+      }
+    }
+
+    if (triggerInjection) {
+      // Everything from the trigger draw on samples the un-jittered DLSS output: stop the
+      // ScreenPositionScaleBias patch and force fresh (unpatched) constant uploads
+      m_ngxSpsbPatchActive = false;
+      m_parent->m_consts[DxsoProgramTypes::VertexShader].dirty = true;
+      m_parent->m_consts[DxsoProgramTypes::PixelShader].dirty = true;
+      m_ngxSpsbLastVsReg = -1;
+      m_ngxSpsbLastPsReg = -1;
+
+      // Late/Super Resolution injection targets the pre-UI backbuffer, so the dispatch
+      // captures the HUD-less copy inline; only the pre-post-process injection needs the
+      // UI-boundary capture later in the frame
+      if (m_ngxColorTargetImage == nullptr) {
+        m_ngxHudlessCapturedThisFrame = true;
+      }
+
+      // Bind all resources required for this drawcall to context first (i.e. render targets)
+      m_parent->PrepareDraw(drawContext.PrimitiveType);
+
+      emitNgxPassthroughFrameData();
+
+      triggerInjectRTX();
+
+      m_rtxInjectTriggered = true;
+
+      // The UI must not inherit the scene's sub-pixel jitter
+      m_parent->m_flags.set(D3D9DeviceFlag::DirtyViewportScissor);
+    }
+
+    return suppressDraw ? PrepareDrawFlag::Ignore : PrepareDrawFlag::PreserveDrawCallAndItsState;
+  }
+
   PrepareDrawFlags D3D9Rtx::PrepareDrawGeometryForRT(const bool indexed, const DrawContext& context) {
     // Draws issued internally by the deferred UI overlay replay bypass classification and
     // execute as plain raster draws
@@ -10599,6 +12790,12 @@ namespace dxvk {
     // first-frame lazy init; steady-state refreshes happen once per frame in EndFrame
     if (unlikely(!m_frameOptions.valid)) {
       refreshFrameOptionCache();
+    }
+
+    // NGX passthrough mode: no scene capture, everything rasterizes; takes precedence over
+    // the ray traced path
+    if (m_frameOptions.ngxPassthroughMode && m_enableDrawCallConversion) {
+      return prepareDrawForNgxPassthrough(context);
     }
 
     if (!m_frameOptions.enableRaytracing || !m_enableDrawCallConversion) {
@@ -10659,6 +12856,12 @@ namespace dxvk {
     // first-frame lazy init; steady-state refreshes happen once per frame in EndFrame
     if (unlikely(!m_frameOptions.valid)) {
       refreshFrameOptionCache();
+    }
+
+    // NGX passthrough mode: no scene capture, everything rasterizes; takes precedence over
+    // the ray traced path
+    if (m_frameOptions.ngxPassthroughMode && m_enableDrawCallConversion) {
+      return prepareDrawForNgxPassthrough(drawContext);
     }
 
     if (!m_frameOptions.enableRaytracing || !m_enableDrawCallConversion) {
@@ -10791,6 +12994,11 @@ namespace dxvk {
     // replay) read fresh values and the next frame's draws see this frame's resolution.
     refreshFrameOptionCache();
 
+    // Drive the game's ScreenPercentage from the Remix DLSS mode selector. Done here (at
+    // present time) so the value is in place before the next frame's scene viewport setup
+    // reads it; also restores the game's own value when the feature is turned off.
+    applyNgxPassthroughScreenPercentage();
+
     // Flush this frame's replacement-material-hash tracking as one CS command. Must be
     // emitted before the endFrame command below: the consumers (graph components) read
     // the per-frame map during SceneManager::onFrameEnd, and the map clears there too.
@@ -10817,7 +13025,25 @@ namespace dxvk {
       m_ue3TextureSpreadLastSaveFrame = uint32_t(currentReflexFrameId);
       saveUe3TextureSpreadCache();
     }
-    
+
+    // NGX passthrough mode: no scene end trigger fired this frame (e.g. no UI drawn), so the
+    // fallback injection below runs on the backbuffer; hand over this frame's data first
+    if (m_frameOptions.ngxPassthroughMode && !m_rtxInjectTriggered && callInjectRtx) {
+      emitNgxPassthroughFrameData();
+    }
+
+    // HUD-less fallback: the injection ran (pre-post-process) but no UI-classified draw
+    // followed, so the presented frame is its own HUD-less copy
+    if (m_frameOptions.ngxPassthroughMode && m_rtxInjectTriggered && callInjectRtx &&
+        m_frameOptions.ngxDlfgHudless && !m_ngxHudlessCapturedThisFrame &&
+        m_ngxFrameBackbufferImage != nullptr) {
+      m_ngxHudlessCapturedThisFrame = true;
+
+      m_parent->EmitCs([cBackbuffer = m_ngxFrameBackbufferImage](DxvkContext* ctx) {
+        static_cast<RtxContext*>(ctx)->captureNgxPassthroughHudless(cBackbuffer);
+      });
+    }
+
     // Flush any pending game and RTX work
     m_parent->Flush();
 
@@ -10854,6 +13080,66 @@ namespace dxvk {
     m_drawCallID = 0;
     m_seenCameraPositionsPrev = std::move(m_seenCameraPositions);
     ++m_ue3FrameCounter;
+
+    // NGX passthrough per-frame state
+    m_ngxDepthClearSeenPrevFrame = m_ngxDepthSnapshotTakenThisFrame;
+    m_ngxSpsbPatchActive = false;
+    m_ngxFrameJitterValid = false;
+    m_ngxFrameDataEmitted = false;
+    m_ngxDepthSnapshotTakenThisFrame = false;
+    m_ngxDepthClearsThisFrame = 0;
+    m_ngxHudlessCapturedThisFrame = false;
+
+    // Object velocity per-frame state: rotate the accepted camera, drop uncaptured
+    // leftovers, and bound the identity cache (level transitions leave stale entries
+    // behind; re-registration costs one frame of velocity)
+    if (m_ngxFrameCameraValid && m_ngxPrevCameraValid &&
+        m_ngxFrameCameraUsedTranspose != m_ngxPrevCameraUsedTranspose) {
+      m_ngxCameraTransposeFlips++;
+    }
+    m_ngxPrevCameraValid = m_ngxFrameCameraValid;
+    m_ngxPrevCameraUsedTranspose = m_ngxFrameCameraUsedTranspose;
+    m_ngxFrameCameraValid = false;
+    m_ngxVelocityStats = NgxVelocityCaptureStats();
+    m_ngxVelocitySkinnedDraws = 0;
+    m_ngxVelocityDynamicDraws = 0;
+    m_ngxVelocityDraws.clear();
+    // Periodically drop instances not sighted for a while (left behind by level streaming
+    // and visibility changes), then empty identities; emergency-clear pathological growth
+    if ((m_ue3FrameCounter & 0xFF) == 0) {
+      m_ngxVelocityObjectCache.erase_if([frame = m_ue3FrameCounter](auto it) {
+        auto& instances = it->second.instances;
+        instances.erase(std::remove_if(instances.begin(), instances.end(),
+                                       [frame](const NgxVelocityObjectInstance& instance) {
+                                         return instance.lastSeenFrame + 1024 < frame;
+                                       }),
+                        instances.end());
+        return instances.empty();
+      });
+    }
+    if (m_ngxVelocityObjectCache.size() > 8192) {
+      m_ngxVelocityObjectCache.clear();
+    }
+    m_ngxLastCameraConstantsHash = 0;
+    m_ngxSceneViewportValid = false;
+    m_ngxUpscaleSourceImage = nullptr;
+    m_ngxColorTargetImage = nullptr;
+    m_ngxColorMirrorImage = nullptr;
+    m_ngxSubrect = { { 0, 0 }, { 0, 0 } };
+    for (uint32_t i = 0; i < m_ngxSceneColorResolveCount; i++) {
+      m_ngxSceneColorResolves[i] = nullptr;
+    }
+    m_ngxSceneColorResolveCount = 0;
+    if (m_ngxPostChainDumpFramesLeft > 0) {
+      m_ngxPostChainDumpFramesLeft--;
+      Logger::info(str::format("[RTX NGX Passthrough][dump] ---- end of frame ", m_ue3FrameCounter, " ----"));
+    }
+    m_ngxPostChainDumpLinesThisFrame = 0;
+    // Drop scene target references when unseen for a while (level transitions recreate them)
+    if (m_ngxSceneColorImage != nullptr && m_ue3FrameCounter - m_ngxSceneTargetsLastSeenFrame > 60) {
+      m_ngxSceneColorImage = nullptr;
+      m_ngxSceneDepthImage = nullptr;
+    }
 
     // two-pass translucency dedup state must not span frames
     m_prevDrawVsPsHash = 0;

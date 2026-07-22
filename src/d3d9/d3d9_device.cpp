@@ -1070,6 +1070,10 @@ namespace dxvk {
     Rc<DxvkImage> dstImage = dstTextureInfo->GetImage();
     Rc<DxvkImage> srcImage = srcTextureInfo->GetImage();
 
+    // NV-DXVK start: NGX passthrough scene color resolve tracking
+    m_rtx.NotifyStretchRect(srcImage, dstImage);
+    // NV-DXVK end
+
     const DxvkFormatInfo* dstFormatInfo = imageFormatInfo(dstImage->info().format);
     const DxvkFormatInfo* srcFormatInfo = imageFormatInfo(srcImage->info().format);
 
@@ -1574,6 +1578,10 @@ namespace dxvk {
       return D3D_OK;
 
     D3D9DeviceLock lock = LockDevice();
+
+    // NV-DXVK start: [NGX passthrough] snapshot world depth before mid-scene depth clears
+    m_rtx.NotifyClear(Flags);
+    // NV-DXVK end
 
     const auto& vp = m_state.viewport;
     const auto& sc = m_state.scissorRect;
@@ -4210,6 +4218,10 @@ namespace dxvk {
     key.MipFilter = D3DTEXTUREFILTERTYPE(state[D3DSAMP_MIPFILTER]);
     key.MaxAnisotropy = state[D3DSAMP_MAXANISOTROPY];
     key.MipmapLodBias = bit::cast<float>(state[D3DSAMP_MIPMAPLODBIAS]);
+    // NV-DXVK start: [NGX passthrough] DLSS Super Resolution texture LOD bias for scene
+    // draws (mip selection matches the upscaled output's texel density; 0 out of scope)
+    key.MipmapLodBias += m_rtx.GetNgxPassthroughSamplerLodBias();
+    // NV-DXVK end
     key.MaxMipLevel = state[D3DSAMP_MAXMIPLEVEL];
     key.BorderColor = D3DCOLOR(state[D3DSAMP_BORDERCOLOR]);
     key.Depth = m_depthTextures & (1u << SamplerStage);
@@ -5563,6 +5575,12 @@ namespace dxvk {
           data[constant.uboIdx] = *reinterpret_cast<const Vector4*>(constant.float32);
       }
     }
+
+    // NV-DXVK start: [NGX passthrough] ScreenPositionScaleBias jitter compensation. Patched
+    // in the mapped upload copy only - the staged game state is never modified. (Not wired
+    // into the SWVP path: the passthrough mode targets UE3 titles, which use HWVP.)
+    m_rtx.PatchNgxScreenPositionScaleBias(ShaderStage, dst->fConsts, floatCount);
+    // NV-DXVK end
   }
 
 
@@ -6109,6 +6127,20 @@ namespace dxvk {
       float(vp.Width),        -float(vp.Height),
       vp.MinZ,                 vp.MaxZ,
     };
+
+    // NV-DXVK start: [NGX passthrough] sub-pixel viewport jitter for DLSS/DLAA
+    // Offsetting the viewport by a fraction of a pixel shifts all rasterized geometry
+    // exactly like a jittered projection matrix would. Scoping (scene-aligned draws only,
+    // pre-injection phase) lives in GetNgxPassthroughViewportJitter; the game's own screen
+    // space lookups are kept aligned via PatchNgxScreenPositionScaleBias.
+    {
+      float jitterX, jitterY;
+      if (m_rtx.GetNgxPassthroughViewportJitter(&jitterX, &jitterY)) {
+        viewport.x += jitterX;
+        viewport.y += jitterY;
+      }
+    }
+    // NV-DXVK end
 
     // Scissor rectangles. Vulkan does not provide an easy way
     // to disable the scissor test, so we'll have to set scissor

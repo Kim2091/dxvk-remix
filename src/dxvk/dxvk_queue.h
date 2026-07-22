@@ -80,6 +80,9 @@ namespace dxvk {
     bool              resetHistory;
     // number of requested interpolated frames; must be at least 1, actual count may be lower depending on hardware support for MFG
     uint32_t          interpolatedFrameCount = 0;
+    // optional (may be null): the composited color without the UI drawn, letting the
+    // interpolator separate UI from scene exactly instead of heuristically detecting it
+    Rc<DxvkImageView> hudless;
     
     bool valid() const {
       return motionVectors.ptr() &&

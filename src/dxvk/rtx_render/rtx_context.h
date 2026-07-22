@@ -26,6 +26,7 @@
 #include "rtx_asset_exporter.h"
 #include "rtx_camera_manager.h"
 #include "rtx_atmosphere.h"
+#include "rtx_ngx_passthrough.h"
 #include "rtx/pass/nrd_args.h"
 
 #include <cstdint>
@@ -90,6 +91,32 @@ namespace dxvk {
       */
     void injectRTX(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targetImage = nullptr);
     void endFrame(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targetImage = nullptr, bool callInjectRtx = true);
+
+    // NGX passthrough mode: per-frame data handed over from the D3D9 layer - the game's scene
+    // depth image, the pre-post-process color target (the game's scene color when the
+    // injection point is before the game's post chain, null when DLSS runs on the final
+    // output), the suppressed ScreenPercentage-upscale source (null when the game renders
+    // at full resolution), the scene subrect, the captured dynamic object draws with their
+    // capture diagnostics, and the sub-pixel viewport jitter the frame was rasterized with
+    void setNgxPassthroughFrameData(const Rc<DxvkImage>& sceneDepthImage,
+                                    const Rc<DxvkImage>& colorTargetImage,
+                                    const Rc<DxvkImage>& colorMirrorImage,
+                                    const Rc<DxvkImage>& upscaleSourceImage,
+                                    const VkRect2D& sourceSubrect,
+                                    std::vector<NgxVelocityDraw>&& velocityDraws,
+                                    const NgxVelocityCaptureStats& velocityStats,
+                                    float jitterX, float jitterY);
+
+    // NGX passthrough mode: copies the pre-UI backbuffer into the HUD-less frame generation
+    // input slot. Emitted by the D3D9 layer at the first UI-classified backbuffer draw
+    // after a pre-post-process injection (or at frame end when no UI was drawn).
+    void captureNgxPassthroughHudless(const Rc<DxvkImage>& backbufferImage);
+
+    // NGX passthrough mode: copies the game's depth buffer into a runtime-owned snapshot.
+    // Emitted by the D3D9 layer right before the game's first mid-scene depth clear (UE3
+    // clears the depth buffer ahead of its foreground DPG, which would otherwise destroy
+    // the world depth needed for motion vector generation).
+    void snapshotNgxPassthroughDepth(const Rc<DxvkImage>& sceneDepthImage);
 
     void onPresent(Rc<DxvkImage> targetImage = nullptr);
 
@@ -207,6 +234,7 @@ namespace dxvk {
     void dispatchDebugView(Rc<DxvkImage>& srcImage, const Resources::RaytracingOutput& rtOutput, bool captureScreenImage);
     void dispatchObjectPicking(Resources::RaytracingOutput& rtOutput, const VkExtent3D& srcExtent, const VkExtent3D& targetExtent);
     void dispatchDLFG();
+    void dispatchNgxPassthrough(Rc<DxvkImage> targetImage);
     void updateMetrics(const float gpuIdleTimeMilliseconds) const;
     void rasterizeToSkyMatte(const DrawParameters& params, const DrawCallState& drawCallState);
     void initSkyProbe();
@@ -255,6 +283,15 @@ namespace dxvk {
     uint64_t m_cachedReflexFrameId = 0;
 
     bool m_resetHistory = true;    // Discards use of temporal data in passes
+
+    // NGX passthrough mode inputs from the D3D9 layer (valid for the current frame only)
+    Rc<DxvkImage> m_ngxPassthroughSceneDepth;
+    Rc<DxvkImage> m_ngxPassthroughColorTarget;
+    Rc<DxvkImage> m_ngxPassthroughColorMirror;
+    Rc<DxvkImage> m_ngxPassthroughUpscaleSource;
+    VkRect2D m_ngxPassthroughSubrect = { { 0, 0 }, { 0, 0 } };
+    std::vector<NgxVelocityDraw> m_ngxPassthroughVelocityDraws;
+    float m_ngxPassthroughJitter[2] = { 0.0f, 0.0f };
 
     std::chrono::time_point<std::chrono::steady_clock> m_prevRunningTime;
     uint64_t m_prevGpuIdleTicks = 0;

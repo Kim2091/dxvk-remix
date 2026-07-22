@@ -40,6 +40,20 @@ namespace dxvk {
     DxvkPostFx(DxvkDevice* device);
     ~DxvkPostFx();
 
+    // Individual motion blur inputs; the path traced pipeline packs these from the
+    // raytracing output bundle, the NGX passthrough mode from its synthesized equivalents.
+    // All pointers must be valid; color extents may differ from the G-buffer inputs
+    // (mainCameraResolution describes the motion vector / flags / view-Z resolution).
+    struct MotionBlurInputs {
+      const Resources::Resource* inOutColor;              // blurred in place (via intermediateColor)
+      const Resources::Resource* intermediateColor;       // scratch, same extent/format as inOutColor
+      const Resources::Resource* screenSpaceMotionVector; // RG float, pixels, current -> previous
+      const Resources::Resource* surfaceFlags;            // R8_UINT motion blur surface flags
+      const Resources::AliasedResource* surfaceFlagsScratch1; // R8_UINT, prefilter ping
+      const Resources::AliasedResource* surfaceFlagsScratch2; // R8_UINT, prefilter pong
+      const Resources::Resource* linearViewZ;             // R32F linear view-space Z
+    };
+
     // Motion blur phase. Runs before tonemapping while the image is still in linear HDR space.
     // Reads m_finalOutput, writes back to m_finalOutput (via intermediate texture).
     void dispatchMotionBlur(
@@ -51,6 +65,16 @@ namespace dxvk {
       const Resources::RaytracingOutput& rtOutput,
       const bool cameraCutDetected);
 
+    // Motion blur on explicitly provided inputs (see MotionBlurInputs)
+    void dispatchMotionBlur(
+      Rc<RtxContext> ctx,
+      Rc<DxvkSampler> nearestSampler,
+      Rc<DxvkSampler> linearSampler,
+      const uvec2& mainCameraResolution,
+      const uint32_t frameIdx,
+      const MotionBlurInputs& inputs,
+      const bool cameraCutDetected);
+
     // Lens effects phase (chromatic aberration + vignette). Runs after tonemapping
     // so it operates on post-tonemap LDR data — these are display-space lens artifacts.
     // Reads and writes m_finalOutput in place.
@@ -60,6 +84,15 @@ namespace dxvk {
       const uvec2& mainCameraResolution,
       const uint32_t frameIdx,
       const Resources::RaytracingOutput& rtOutput);
+
+    // Lens effects on an explicitly provided color (blurred in place via the intermediate)
+    void dispatchLensEffects(
+      Rc<RtxContext> ctx,
+      Rc<DxvkSampler> linearSampler,
+      const uvec2& mainCameraResolution,
+      const uint32_t frameIdx,
+      const Resources::Resource& inOutColor,
+      const Resources::Resource& intermediateColor);
 
     void dispatchHighlighting(
       Rc<RtxContext> ctx,

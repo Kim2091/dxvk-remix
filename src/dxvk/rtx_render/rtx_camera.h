@@ -328,6 +328,18 @@ namespace dxvk
     );
     bool updateFromSetting(uint32_t frameIdx, const RtCameraSetting& setting, uint32_t flags = (uint32_t) UpdateFlag::UpdateNormal);
     void getJittering(float jitter[2]) const;
+
+    // Overrides the jitter reported for the current frame. Used by the NGX passthrough mode,
+    // where the sub-pixel jitter is applied on the D3D9 side (viewport offset) rather than
+    // through the ray tracing projection matrix, so the camera must report exactly the value
+    // the frame was rasterized with (consumed by DLSS and DLFG).
+    void setExternalJitter(const float jitter[2]) {
+      m_jitter[0] = jitter[0];
+      m_jitter[1] = jitter[1];
+      m_context.jitter[0] = jitter[0];
+      m_context.jitter[1] = jitter[1];
+    }
+
     bool isLHS() const { return m_context.isLHS; }
 
     Vector2 calcPixelJitter(uint32_t jitterFrameIdx) const;

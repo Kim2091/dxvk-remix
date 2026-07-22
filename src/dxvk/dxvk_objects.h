@@ -41,6 +41,7 @@
 #include "rtx_render/rtx_nee_cache.h"
 #include "rtx_render/rtx_denoise.h"
 #include "rtx_render/rtx_ngx_wrapper.h"
+#include "rtx_render/rtx_ngx_passthrough.h"
 #include "rtx_render/rtx_dlfg.h"
 #include "rtx_render/rtx_dlss.h"
 #include "rtx_render/rtx_nis.h"
@@ -196,6 +197,10 @@ namespace dxvk {
 
     NGXContext& metaNGXContext() {
       return m_ngxContext.get();
+    }
+
+    RtxNgxPassthrough& metaNgxPassthrough() {
+      return m_ngxPassthrough.get();
     }
 
     DxvkDenoise& metaReferenceDenoiserSecondLobe0() {
@@ -380,6 +385,7 @@ namespace dxvk {
     Active<DxvkDenoise>                     m_primaryCombinedLightDenoiser;
     Active<DxvkDenoise>                     m_secondaryCombinedLightDenoiser;
     Active<NGXContext>                      m_ngxContext;
+    Active<RtxNgxPassthrough>               m_ngxPassthrough;
     Active<DxvkDLFG>                        m_dlfg;
     // Secondary reference denoisers used for a second lobe when non-combined signal reference denoising is enabled
     Active<DxvkDenoise>                     m_referenceDenoiserSecondLobe0;

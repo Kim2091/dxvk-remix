@@ -28,6 +28,7 @@
 #include "rtx_render/rtx_options.h"
 #include "rtx_render/rtx_dlss.h"
 #include "rtx_render/rtx_dlfg.h"
+#include "rtx_render/rtx_ngx_passthrough.h"
 #include "rtx_render/rtx_reflex.h"
 #include "rtx_render/rtx_ray_reconstruction.h"
 #include "rtx_render/rtx_xess.h"
@@ -397,6 +398,18 @@ namespace dxvk {
 
       switch (RtxOptions::upscalerType()) {
         case UpscalerType::DLSS: {
+          // In NGX passthrough mode the DLSS mode selector maps to the game's ScreenPercentage
+          // (see rtx.ngxPassthrough.driveGameScreenPercentage). Keep it live even when a
+          // non-Custom DLSS preset would gray the section out (End/BeginDisabled), then show
+          // the passthrough status instead of the stock DLSS object's (meaningless) state.
+          if (RtxNgxPassthrough::ngxPassthroughMode()) {
+            ImGui::EndDisabled();
+            dlssProfileCombo.getKey(&RtxOptions::qualityDLSSObject());
+            common->metaNgxPassthrough().showImguiStatusLine();
+            ImGui::BeginDisabled(disableNonPresetSettings);
+            break;
+          }
+
           dlssProfileCombo.getKey(&RtxOptions::qualityDLSSObject());
 
           // Display DLSS Upscaling Information

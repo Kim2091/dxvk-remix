@@ -43,6 +43,7 @@
 #include "rtx_restir_gi_rayquery.h"
 #include "rtx_composite.h"
 #include "rtx_debug_view.h"
+#include "rtx_ngx_passthrough.h"
 
 #include "rtx/pass/sparse_rendering/sparse_rendering.h"
 
@@ -290,8 +291,13 @@ namespace dxvk {
     // Calculate extents based on if DLSS is enabled or not
     const VkExtent3D downscaleExtent = setDownscaleExtent(upscaleExtent);
 
-    // Resize the RT screen dependant buffers (if needed)
-    getResourceManager().onResize(this, downscaleExtent, upscaleExtent);
+    // Resize the RT screen dependant buffers (if needed). The NGX passthrough mode never
+    // touches the path tracer's output resources, so skip the (large) allocation there;
+    // should the mode be disabled at runtime, the ray traced path recreates them inline
+    // via onInjectRtxFrameBegin's validateRaytracingOutput check.
+    if (!RtxNgxPassthrough::ngxPassthroughMode()) {
+      getResourceManager().onResize(this, downscaleExtent, upscaleExtent);
+    }
 
     uint32_t renderSize[] = { downscaleExtent.width, downscaleExtent.height };
     uint32_t displaySize[] = { upscaleExtent.width, upscaleExtent.height };
@@ -572,9 +578,32 @@ namespace dxvk {
 
     bool raytracedThisFrame = false;
 
+    // NGX passthrough mode: the game's rasterized output is presented as-is while DLSS /
+    // DLSS Frame Generation / Reflex run on top of it. Takes precedence over path tracing.
+    // Note: deliberately not gated on asyncShaderCompilationActive - that flag tracks the
+    // background prewarming of the path tracer's shader set (which runs for minutes after
+    // launch and oscillates), while this path only needs its own small compute shader.
+    const bool ngxPassthroughActive = RtxNgxPassthrough::ngxPassthroughMode();
+
+    if (ngxPassthroughActive && isCameraValid) {
+      if (targetImage == nullptr) {
+        targetImage = m_state.om.renderTargets.color[0].view->image();
+      }
+
+      // Signal Reflex rendering start for this frame's submit
+      RtxReflex& reflex = m_common->metaReflex();
+      reflex.updateMode();
+
+      m_submitContainsInjectRtx = true;
+      m_cachedReflexFrameId = cachedReflexFrameId;
+
+      dispatchNgxPassthrough(targetImage);
+
+      m_framesWithoutValidScene = 0;
+    } else
     // Note: Only engage ray tracing when it is enabled, the camera is valid and when no shaders are currently being compiled asynchronously (as
     // trying to render before shaders are done compiling will cause Remix to block).
-    if (isRaytracingEnabled && isCameraValid && !asyncShaderCompilationActive) {
+    if (!ngxPassthroughActive && isRaytracingEnabled && isCameraValid && !asyncShaderCompilationActive) {
       if (targetImage == nullptr) {
         targetImage = m_state.om.renderTargets.color[0].view->image();  
       }
@@ -792,6 +821,12 @@ namespace dxvk {
 
       m_framesWithoutValidScene = 0;
     } else {
+      // NGX passthrough diagnostic: count frames where the injection ran without a valid
+      // main camera (dispatch skipped entirely; reported in the periodic summary log)
+      if (ngxPassthroughActive && !isCameraValid) {
+        m_common->metaNgxPassthrough().noteCameraInvalidFrame();
+      }
+
       // If raytracing is only disabled because we don't have shaders available, we don't want to clear the scene.
       // This frequently happens for a single frame when a cached shader is being fetched, and causes the Logic 
       // graph state to be reset - which is problematic since Logic graphs often trigger shader fetches.
@@ -2236,6 +2271,72 @@ namespace dxvk {
       std::move(objectPickingValues),
       {},
       color);
+  }
+
+  void RtxContext::snapshotNgxPassthroughDepth(const Rc<DxvkImage>& sceneDepthImage) {
+    ScopedGpuProfileZone(this, "NGX Passthrough Depth Snapshot");
+    m_common->metaNgxPassthrough().captureDepthSnapshot(this, sceneDepthImage);
+  }
+
+  void RtxContext::captureNgxPassthroughHudless(const Rc<DxvkImage>& backbufferImage) {
+    ScopedGpuProfileZone(this, "NGX Passthrough HUD-less Capture");
+    spillRenderPass(false);
+    m_common->metaNgxPassthrough().captureHudless(this, backbufferImage);
+  }
+
+  void RtxContext::setNgxPassthroughFrameData(const Rc<DxvkImage>& sceneDepthImage,
+                                              const Rc<DxvkImage>& colorTargetImage,
+                                              const Rc<DxvkImage>& colorMirrorImage,
+                                              const Rc<DxvkImage>& upscaleSourceImage,
+                                              const VkRect2D& sourceSubrect,
+                                              std::vector<NgxVelocityDraw>&& velocityDraws,
+                                              const NgxVelocityCaptureStats& velocityStats,
+                                              float jitterX, float jitterY) {
+    m_ngxPassthroughSceneDepth = sceneDepthImage;
+    m_ngxPassthroughColorTarget = colorTargetImage;
+    m_ngxPassthroughColorMirror = colorMirrorImage;
+    m_ngxPassthroughUpscaleSource = upscaleSourceImage;
+    m_ngxPassthroughSubrect = sourceSubrect;
+    m_ngxPassthroughVelocityDraws = std::move(velocityDraws);
+    m_ngxPassthroughJitter[0] = jitterX;
+    m_ngxPassthroughJitter[1] = jitterY;
+
+    m_common->metaNgxPassthrough().setVelocityCaptureStats(velocityStats);
+  }
+
+  void RtxContext::dispatchNgxPassthrough(Rc<DxvkImage> targetImage) {
+    ScopedCpuProfileZone();
+
+    // Flush any pending game rasterization out of the active render pass before compute work
+    this->spillRenderPass(false);
+    m_execBarriers.recordCommands(m_cmd);
+
+    RtCamera& camera = getSceneManager().getCameraManager().getCamera(CameraType::Main);
+
+    const bool resetHistory = m_resetHistory || camera.isViewHistoryInvalidated(m_device->getCurrentFrameId());
+
+    // Pre-post-process injection: DLSS reads and writes the game's scene color instead of
+    // the render target bound at the trigger draw (the first post pass's own output target)
+    const bool prePostProcess = m_ngxPassthroughColorTarget != nullptr;
+    if (prePostProcess) {
+      targetImage = m_ngxPassthroughColorTarget;
+    }
+
+    m_common->metaNgxPassthrough().dispatch(this, m_state, m_execBarriers, targetImage,
+                                            m_ngxPassthroughColorMirror,
+                                            m_ngxPassthroughSceneDepth,
+                                            m_ngxPassthroughUpscaleSource, m_ngxPassthroughSubrect,
+                                            prePostProcess,
+                                            m_ngxPassthroughVelocityDraws,
+                                            m_ngxPassthroughJitter, resetHistory);
+
+    // Do not hold references to the game's resources across frames
+    m_ngxPassthroughSceneDepth = nullptr;
+    m_ngxPassthroughColorTarget = nullptr;
+    m_ngxPassthroughColorMirror = nullptr;
+    m_ngxPassthroughUpscaleSource = nullptr;
+    m_ngxPassthroughSubrect = { { 0, 0 }, { 0, 0 } };
+    m_ngxPassthroughVelocityDraws.clear();
   }
 
   void RtxContext::dispatchDLFG() {

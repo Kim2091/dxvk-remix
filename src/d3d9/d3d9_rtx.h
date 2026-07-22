@@ -94,6 +94,7 @@ namespace dxvk {
     friend class ImGUI; // <-- we want to modify these values directly.
 
     D3D9Rtx(D3D9DeviceEx* d3d9Device, bool enableDrawCallConversion = true);
+    ~D3D9Rtx();
 
     RTX_OPTION("rtx", bool, orthographicIsUI, true, "When enabled, draw calls that are orthographic will be considered as UI.");
     RTX_OPTION("rtx", bool, preTransformedVerticesIsUI, false, "When enabled, draw calls using pre-transformed (screen-space) vertices will be considered as UI. This is typical for D3D8/D3D9 games that render UI with RHW vertices.");
@@ -453,6 +454,52 @@ namespace dxvk {
       return m_reflexFrameId;
     }
 
+    /**
+      * \brief: NGX passthrough mode: returns the sub-pixel jitter offset (in pixels) to apply to
+      * the Vulkan viewport of the current draw, or false when the draw must not be jittered.
+      * Called from D3D9DeviceEx::BindViewportAndScissor on the application thread. Draws
+      * rendering into the detected scene color target - and full-size screen space passes
+      * depth/stencil-tested against the scene depth (light attenuation shadow projections,
+      * distortion accumulation) - are jittered during the pre-injection (scene) phase of the
+      * frame; UI and other offscreen passes are left untouched.
+      */
+    bool GetNgxPassthroughViewportJitter(float* pJitterX, float* pJitterY) const;
+
+    /**
+      * \brief: NGX passthrough mode: patches the shader stage's ScreenPositionScaleBias
+      * constant in the mapped constant buffer copy (staged game state is never modified) so
+      * clip-space-derived screen texture UVs follow the viewport-jittered content. Called
+      * from D3D9DeviceEx::UploadConstantSet with the destination float constant array.
+      */
+    void PatchNgxScreenPositionScaleBias(DxsoProgramType stage, void* floatConstants, uint32_t floatConstantCount) const;
+
+    /**
+      * \brief: NGX passthrough mode: returns the texture LOD bias to fold into the current
+      * draw's sampler keys, or 0 when out of scope. DLSS Super Resolution renders the scene
+      * at a reduced resolution, so scene material sampling must bias mip selection by
+      * log2(render / display) to match the upscaled output's texel density (the standard
+      * DLSS integration bias). Scene-color draws during the pre-injection phase only; UI
+      * and post passes sample unbiased. Called from D3D9DeviceEx::CreateSamplerKey.
+      */
+    float GetNgxPassthroughSamplerLodBias() const;
+
+    /**
+      * \brief: NGX passthrough mode: called from D3D9DeviceEx::Clear before the clear executes.
+      * A mid-scene depth clear on the scene depth buffer (UE3 clears depth ahead of its
+      * foreground DPG) destroys the world depth needed for motion vector generation, so the
+      * depth buffer is snapshotted just before the first such clear each frame.
+      */
+    void NotifyClear(DWORD clearFlags);
+
+    /**
+      * \brief: NGX passthrough mode: called from D3D9DeviceEx::StretchRect. UE3's D3D9 RHI
+      * gives the scene color a dedicated render surface and resolves it into a separate
+      * texture that the post-process chain samples; tracking these copies lets the
+      * pre-post-process injection recognize the first post pass (it samples a resolve
+      * destination, never the render surface itself).
+      */
+    void NotifyStretchRect(const Rc<DxvkImage>& sourceImage, const Rc<DxvkImage>& destImage);
+
   private: 
     // Reused fixed-size blocks: once allocated, a block is never reallocated, so background
     // skinning can keep raw Matrix4* into a prior copy. m_blocks can grow, but the heap
@@ -655,6 +702,191 @@ namespace dxvk {
     // keyed by XXH3 hash of the vertex shader DXSO bytecode
     fast_unordered_cache<Ue3VsShaderCtabInfo> m_ue3VsShaderCtabCache;
     std::optional<Ue3VsShaderCtabInfo> m_currentUe3CtabInfo;
+
+    // NGX passthrough mode: minimal CTAB scan for the camera symbols plus what the object
+    // velocity capture needs. Kept as a separate cache from m_ue3VsShaderCtabCache so the
+    // passthrough path never populates partial entries into the full ray tracing parse cache.
+    struct NgxCameraCtabRegs {
+      bool ctabVerified = false;   // shader declares both ViewProjectionMatrix and CameraPosition
+      uint32_t viewProjRegister = 0;
+      uint32_t viewOriginRegister = 0;
+
+      // ViewProjection presence independent of the full verification (ctabVerified
+      // additionally requires the camera position symbol; the velocity capture accepts
+      // CPU-modified-mesh draws on ViewProjection + LocalToWorld alone)
+      bool hasViewProjection = false;
+      bool hasLocalToWorld = false;
+      uint32_t localToWorldRegister = 0;
+      bool hasWorldToLocal = false;
+      uint32_t worldToLocalRegister = 0;
+      bool hasBoneMatrices = false;
+      uint32_t boneMatricesRegister = 0;
+      uint32_t boneMatricesRegisterCount = 0;
+      // UE3 GPU skin index addressing: false = the shader multiplies BLENDINDICES by 3
+      // before the address register (raw bone indices in the vertex data), true = the
+      // indices are pre-scaled at mesh build and feed the address register directly.
+      // Detected from the bytecode (a mul/mad reading the BLENDINDICES input).
+      bool boneIndicesPreScaled = false;
+      // Bone influences the shader actually consumes (UE3 builds 1/2/4-influence
+      // variants): the count of distinct BLENDWEIGHT components read by arithmetic
+      // instructions; 1 when only indices are read (rigid-skin, implicit weight 1)
+      uint32_t skinInfluenceCount = 0;
+    };
+    fast_unordered_cache<NgxCameraCtabRegs> m_ngxCameraCtabCache;
+    NgxCameraCtabRegs scanNgxCameraCtabRegs(const std::vector<uint8_t>& bytecode) const;
+
+    // Object velocity capture (see RtxNgxPassthrough::objectVelocities): per draw-identity
+    // transform state from previous sightings. The identity hash covers geometry and draw
+    // parameters only, so every placement of the same mesh asset in the level aliases onto
+    // one identity - each placement is tracked as an instance and draws are matched against
+    // the previous frame's instances (exact = static, near = the same object moved, far =
+    // a different placement). The raw register rows give a cheap exact-match test; the
+    // disambiguated objectToWorld feeds the previous-frame clip transform and the distance
+    // metric for the near-match.
+    struct NgxVelocityObjectInstance {
+      Vector4 localToWorldRows[4];
+      Matrix4 objectToWorld;
+      // The packed ViewProjection at the sighting's draw (oriented): scene phases render
+      // with their own projections (UE3's foreground DPG uses a first-person FOV), so
+      // both sides of a velocity delta must compose with the projection their draw
+      // actually used
+      Matrix4 worldToProjection;
+      uint32_t lastSeenFrame = 0;
+      // Movement history gating velocity emission: wasMoving latches once the instance
+      // is a confirmed mover (decaying after a period at rest - see the exact-match
+      // path), the last per-frame deltas feed the two-frame consistency confirmation
+      // for objects first sighted with non-gentle motion, lastEmitFrame drives the
+      // decay. Together they ensure static placements swapping visibility (culling
+      // pop-in/out) cannot fabricate velocity.
+      bool wasMoving = false;
+      Vector3 lastMoveDelta = Vector3(0.0f, 0.0f, 0.0f);
+      float lastRotScaleDelta = 0.0f;
+      uint32_t lastEmitFrame = 0;
+      // This frame's emitted draw (index into m_ngxVelocityDraws) and the phase
+      // duplication guard: a same-frame repeat draw in the other scene phase (UE3
+      // renders the first person meshes into both the intermediate and foreground DPGs
+      // in some movestates) re-emits the recorded draw for its own phase, once. The
+      // previous-side state is preserved at emit time so the duplicate can recompose
+      // with its own phase's projection.
+      uint32_t lastEmitDrawIndex = 0;
+      uint32_t lastPhaseDuplicateFrame = 0;
+      Matrix4 lastEmitPrevObjectToWorld;
+      Matrix4 lastEmitPrevWorldToProjection;
+      // Skinned instances: the bone palette from the last sighting (raw registers,
+      // shader-declared count); empty for rigid draws. Animation with a static
+      // LocalToWorld is detected and emitted through palette deltas.
+      std::vector<Vector4> bones;
+      // CPU-modified mesh instances: the vertex positions from the last sighting
+      // (snapshotted from the dynamic buffer's CPU mapping); empty otherwise
+      std::vector<Vector3> dynamicPositions;
+    };
+    struct NgxVelocityObjectState {
+      std::vector<NgxVelocityObjectInstance> instances;
+      // Frame of the last brand-new registration (a sighting pairing with nothing):
+      // recent pop-ins mark the identity as churning, distrusting motion-consistency
+      // confirmation (grids of instanced meshes produce repeating pop-in deltas under
+      // steady camera movement, indistinguishable from consistent object motion)
+      uint32_t lastNewRegistrationFrame = 0;
+    };
+    fast_unordered_cache<NgxVelocityObjectState> m_ngxVelocityObjectCache;
+    std::vector<NgxVelocityDraw> m_ngxVelocityDraws;
+
+    // The frame's accepted main camera validity (plus the previous frame's), gating the
+    // velocity capture. The clip transforms themselves compose with the packed
+    // ViewProjection captured per draw (see NgxVelocityObjectInstance::
+    // worldToProjection) - the game's exact vertex transform, which the velocity
+    // raster's depth compare depends on. The reconstruction's transpose flag
+    // disambiguates LocalToWorld packing.
+    bool m_ngxFrameCameraUsedTranspose = false;
+    bool m_ngxFrameCameraValid = false;
+    bool m_ngxPrevCameraValid = false;
+    bool m_ngxPrevCameraUsedTranspose = false;
+
+    // Capture diagnostics for the developer menu (reset per frame; the transpose flip
+    // count is cumulative and detects an unstable packing-convention tiebreaker)
+    NgxVelocityCaptureStats m_ngxVelocityStats;
+    uint32_t m_ngxCameraTransposeFlips = 0;
+
+    // Skinned / CPU-modified draws captured this frame (bound their upload buffers;
+    // reset per frame)
+    uint32_t m_ngxVelocitySkinnedDraws = 0;
+    uint32_t m_ngxVelocityDynamicDraws = 0;
+
+    // Self-triggering pairing-miss dump: when sightings fail to pair with their history,
+    // a few lines with the exact comparison values go to the log (rate limited; the burst
+    // frame latch starts out of range of any real frame counter value)
+    uint32_t m_ngxVelocityPairingLogFrame = UINT32_MAX;
+    uint32_t m_ngxVelocityPairingLogLines = 0;
+    uint32_t m_ngxVelocityPairingLogNextAllowedFrame = 0;
+
+    void tryCaptureNgxVelocityDraw(const DrawContext& drawContext);
+
+    // Shared UE3 LocalToWorld extraction (transpose/packing disambiguation + memo cache);
+    // used by the ray traced path's transform setup and the NGX velocity capture
+    Matrix4 extractUe3ObjectToWorld(uint32_t reg, bool hasWorldToLocal, uint32_t w2lReg, bool cameraUsedTranspose);
+
+    // NGX passthrough mode: ScreenPositionScaleBias register per shader (UE3's shared
+    // clip-space-to-scene-texture-UV constant, used by every screen space lookup: shadow
+    // projections reading the scene depth from the scene color alpha, translucency reading
+    // the resolved scene, distortion, fog). The viewport jitter shifts rendered content
+    // physically but clip-space-derived UVs do not follow it, so the bias components (w for
+    // U, z for V) are shifted by the frame jitter at constant upload time; consumers then
+    // sample the jittered content aligned. Cached per shader bytecode hash (VS and PS).
+    struct NgxSpsbCtabReg {
+      bool present = false;
+      uint32_t reg = 0;
+    };
+    fast_unordered_cache<NgxSpsbCtabReg> m_ngxSpsbCtabCache;
+    NgxSpsbCtabReg scanNgxSpsbCtabReg(const std::vector<uint8_t>& bytecode) const;
+
+    // Per-draw ScreenPositionScaleBias patch state, decided in prepareDrawForNgxPassthrough
+    // and consumed by the device's constant upload (cleared before the injection trigger
+    // draw: everything after the injection samples un-jittered DLSS output)
+    bool m_ngxSpsbPatchActive = false;
+    NgxSpsbCtabReg m_ngxSpsbPatchVs;
+    NgxSpsbCtabReg m_ngxSpsbPatchPs;
+    float m_ngxSpsbPatchAdd[2] = { 0.0f, 0.0f };
+
+    // Constant uploads only happen when the game dirties them; when the bound shader's
+    // patch register differs from what the last upload patched (shader switch without a
+    // constant change - the bridge's redundant-setter filtering makes this reachable), a
+    // fresh upload is forced so the patch lands at the right register (-1 = no patch)
+    int32_t m_ngxSpsbLastVsReg = -1;
+    int32_t m_ngxSpsbLastPsReg = -1;
+
+    // The Super Resolution sampler LOD bias folded into the last draw's sampler keys
+    // (see GetNgxPassthroughSamplerLodBias); samplers are only re-created when dirtied,
+    // so every change forces a full sampler re-bind
+    float m_ngxAppliedSamplerLodBias = 0.0f;
+
+    // NGX passthrough ScreenPercentage driver (see applyNgxPassthroughScreenPercentage). The
+    // field is read/written cross-process because under the RTX Remix bridge this module runs
+    // in NvRemixBridge.exe, separate from the game: m_ngxGameProcess owns it (the current
+    // process for a single-process DXVK build, else the parent game process, hence
+    // m_ngxGameProcessOwned for handle cleanup) and m_ngxScreenPercentageRemoteAddr is its
+    // address there, resolved once by scanning the game module (0 = not located, inactive).
+    // m_ngxScreenPercentageOriginal is restored when driving disengages.
+    bool m_ngxScreenPercentageScanDone = false;
+    bool m_ngxScreenPercentageDriven = false;
+    bool m_ngxGameProcessOwned = false;
+    HANDLE m_ngxGameProcess = nullptr;
+    uintptr_t m_ngxScreenPercentageRemoteAddr = 0;
+    float m_ngxScreenPercentageOriginal = 100.0f;
+    float m_ngxScreenPercentageLastLogged = 0.0f;
+    // The game's current ScreenPercentage, cached for the scene-camera gate to size-match the
+    // main view against backbuffer * ScreenPercentage / 100. 0 = unknown.
+    float m_ngxGameScreenPercentage = 0.0f;
+
+    // Cache-backed UE3 camera extraction from the current vertex shader constants (shares
+    // m_ue3CameraConstantsCache with the ray traced path; entries are keyed by the raw
+    // register contents so both modes derive identical values).
+    bool tryGetUe3CameraFromConstantsCached(uint32_t viewProjReg,
+                                            uint32_t viewOriginReg,
+                                            Matrix4& outWorldToView,
+                                            Matrix4& outViewToProjection,
+                                            bool& outUsedTranspose,
+                                            float& outReconstructionError,
+                                            XXH64_hash_t* outConstantsHash = nullptr);
 
     struct Ue3CameraConstantsCache {
       XXH64_hash_t hash = 0;
@@ -1037,6 +1269,90 @@ namespace dxvk {
 
     bool checkBoundTextureCategory(const fast_unordered_set& textureCategory) const;
 
+    // --- NGX passthrough mode (see RtxNgxPassthrough) ---
+    // All draws rasterize as-is; the per-draw work reduces to UE3 camera extraction, scene
+    // color/depth target identification (for viewport jitter and DLSS inputs) and the thin
+    // RTX injection trigger at scene end.
+    PrepareDrawFlags prepareDrawForNgxPassthrough(const DrawContext& drawContext);
+    void tryNgxPassthroughCameraCapture();
+    void emitNgxPassthroughFrameData();
+
+    // NGX passthrough: writes the game's GSystemSettings.ScreenPercentage from the Remix
+    // DLSS mode selector (rtx.qualityDLSS) once per frame while the mode and the
+    // driveGameScreenPercentage option are active, and restores the game's own value when
+    // the feature disengages. Resolves the field address lazily on first use.
+    void applyNgxPassthroughScreenPercentage();
+
+    // Scene targets identified from CTAB-verified camera draws with depth writes. Kept across
+    // frames (UE3 render targets are stable between resolution changes) so the jitter can
+    // engage from the first draw of a frame; dropped when unseen for a while.
+    Rc<DxvkImage> m_ngxSceneColorImage;
+    Rc<DxvkImage> m_ngxSceneDepthImage;
+    uint32_t m_ngxSceneTargetsLastSeenFrame = 0;
+
+    // Per-frame sub-pixel jitter (pixels), decided on the app thread at the first draw of the
+    // frame and forwarded to the CS side so DLSS/DLFG report exactly the rasterized value
+    float m_ngxFrameJitter[2] = { 0.0f, 0.0f };
+    bool m_ngxFrameJitterValid = false;
+    bool m_ngxFrameDataEmitted = false;
+    bool m_ngxDepthSnapshotTakenThisFrame = false;
+    // Qualifying mid-scene depth clears seen this frame (first = foreground DPG boundary,
+    // second = occlusion query pass wiping the foreground depth)
+    uint32_t m_ngxDepthClearsThisFrame = 0;
+    XXH64_hash_t m_ngxLastCameraConstantsHash = 0;
+
+    // The swapchain backbuffer image for this frame (backbuffers rotate every present).
+    // The scene-end trigger only accepts draws rendering to THIS image: description-based
+    // primary checks also match offscreen buffers allocated at backbuffer size (e.g. ME's
+    // TdUI compositing buffers), which would make the injection target the wrong image.
+    Rc<DxvkImage> m_ngxFrameBackbufferImage;
+
+    // ScreenPercentage upscaling (Super Resolution): the viewport of this frame's scene draws
+    // (the subrect the game rendered into) and, once the engine's stretch onto the primary
+    // target was detected and suppressed, its source texture plus the scene subrect
+    D3DVIEWPORT9 m_ngxSceneViewport = {};
+    bool m_ngxSceneViewportValid = false;
+    Rc<DxvkImage> m_ngxUpscaleSourceImage;
+    VkRect2D m_ngxSubrect = { { 0, 0 }, { 0, 0 } };
+
+    // Pre-post-process injection: when the scene end trigger was the first post-process pass
+    // sampling the scene color, DLSS reads and writes the image that pass consumes - the
+    // scene color render surface or one of its resolve destinations (m_ngxSubrect carries
+    // the scene viewport rect) - and the game's post chain picks up the result. The mirror
+    // is the scene color surface when the target is a resolve destination, so later
+    // re-resolves of the surface propagate the anti-aliased content too.
+    Rc<DxvkImage> m_ngxColorTargetImage;
+    Rc<DxvkImage> m_ngxColorMirrorImage;
+
+    // Same-size StretchRect destinations copied from the scene color surface this frame
+    // (UE3 D3D9 scene color resolves); sampled by the post chain in place of the surface
+    std::array<Rc<DxvkImage>, 4> m_ngxSceneColorResolves;
+    uint32_t m_ngxSceneColorResolveCount = 0;
+
+    // Whether the previous frame had a mid-scene depth clear (UE3 foreground DPG prepass).
+    // The clear separates all world-DPG rendering (including dynamic shadow projections,
+    // which sample the scene color resolve) from the foreground DPG and the post chain;
+    // when the previous frame had one, the pre-post-process trigger requires it this frame
+    // before firing so no world-DPG pass can ever be mistaken for the start of post.
+    bool m_ngxDepthClearSeenPrevFrame = false;
+
+    // HUD-less capture for frame generation: when the injection ran pre-post-process, the
+    // pre-UI backbuffer state is captured at the first UI-classified backbuffer draw after
+    // the injection (or at frame end when no UI is drawn)
+    bool m_ngxHudlessCapturedThisFrame = false;
+
+    void maybeCaptureNgxHudless(const DrawContext& drawContext);
+
+    // Diagnostic dump of the post-chain flow (draws sampling render targets, StretchRect
+    // copies, render state): armed for the first frames after scene target identification
+    // and on demand (rtx.ngxPassthrough.dumpPostChainFrames); validates the pre-post
+    // injection against the game's real compositing
+    uint32_t m_ngxPostChainDumpFramesLeft = 0;
+    uint32_t m_ngxPostChainDumpLinesThisFrame = 0;
+
+    void dumpNgxPostChainDraw(const DrawContext& drawContext);
+    const char* classifyNgxImageForDump(const DxvkImage* image) const;
+
     // Per-draw snapshot of the bound texture slots (common texture pointer, cached image
     // hash, render-target descriptor hash), lazily built and shared by the per-draw
     // consumers that would otherwise each re-walk the texture stages: UI/deferred-UI tag
@@ -1111,6 +1427,12 @@ namespace dxvk {
       bool deferredUiReplay = false;
       bool deferredUiRefreshSceneColor = false;
       bool enableIndexBufferMemoization = false;
+      bool ngxPassthroughMode = false;
+      bool ngxPassthroughJitter = false;
+      bool ngxPrePostProcess = false;
+      bool ngxDlfgHudless = false;
+      bool ngxObjectVelocities = false;
+      int ngxDebugVisualization = 0;
 
       // upstream RtxOptions (raytracedRenderTargetEnable caches
       // RtxOptions::RaytracedRenderTarget::enable, needsMeshBoundingBox the

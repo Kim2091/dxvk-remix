@@ -3643,6 +3643,20 @@ namespace dxvk {
         RemixGui::Separator();
       }
 
+      {
+        IMGUI_ADD_TOOLTIP(
+          RemixGui::Checkbox("NGX Passthrough Mode", &RtxNgxPassthrough::ngxPassthroughModeObject()),
+          "Presents the game's own rasterized rendering (no path tracing) with DLSS/DLAA, Frame Generation and Reflex on top.\nMust be enabled at launch for the game's depth buffer to be shader-readable.");
+
+        if (RtxNgxPassthrough::ngxPassthroughMode()) {
+          ImGui::Indent();
+          common->metaNgxPassthrough().showImguiSettings();
+          ImGui::Unindent();
+        }
+
+        RemixGui::Separator();
+      }
+
       showDLFGOptions(ctx);
 
       RemixGui::Separator();

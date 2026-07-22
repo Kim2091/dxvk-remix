@@ -174,6 +174,8 @@ namespace dxvk {
     OptimalSettings queryOptimalSettings(const uint32_t displaySize[2], NVSDK_NGX_PerfQuality_Value perfQuality) const;
 
     // initialize DLSS context, throws exception on failure
+    // renderPreset selects the DLSS model (e.g. transformer presets); Default leaves the
+    // choice to the snippet/driver
     void initialize(
       Rc<DxvkContext> renderContext,
       uint32_t maxRenderSize[2],
@@ -182,7 +184,8 @@ namespace dxvk {
       bool depthInverted,
       bool autoExposure,
       bool sharpening,
-      NVSDK_NGX_PerfQuality_Value perfQuality = NVSDK_NGX_PerfQuality_Value_MaxPerf);
+      NVSDK_NGX_PerfQuality_Value perfQuality = NVSDK_NGX_PerfQuality_Value_MaxPerf,
+      NVSDK_NGX_DLSS_Hint_Render_Preset renderPreset = NVSDK_NGX_DLSS_Hint_Render_Preset_Default);
 
     /** Release DLSS.
     */
@@ -327,11 +330,14 @@ namespace dxvk {
     // interpolates one frame
     // DLFG keeps copies of each real frame, so we only need to pass in the current frame here
     // the first kNumWarmUpFrames won't be interpolated so interpolatedOutput may not be valid, this function returns true if interpolation happened
+    // hudlessColorBuffer (optional, may be null): the composited color without the UI drawn;
+    // lets the snippet separate UI from scene exactly instead of heuristically detecting it
     EvaluateResult evaluate(
       Rc<DxvkContext> renderContext,
       VkCommandBuffer clientCommandList,
       Rc<DxvkImageView> interpolatedOutput,
       Rc<DxvkImageView> compositedColorBuffer,
+      Rc<DxvkImageView> hudlessColorBuffer,
       Rc<DxvkImageView> motionVectors,
       Rc<DxvkImageView> depth,
       const RtCamera& camera,

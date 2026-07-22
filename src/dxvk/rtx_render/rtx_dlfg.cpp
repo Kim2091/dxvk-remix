@@ -413,6 +413,7 @@ namespace dxvk {
                   present.frameInterpolation.camera,
                   m_swapchainImageViews[swapchainImage.index],
                   m_backbufferViews[present.acquiredImageIndex],
+                  present.frameInterpolation.hudless,
                   present.frameInterpolation.motionVectors,
                   present.frameInterpolation.depth,
                   interpolatedFrameIndex,
@@ -1239,6 +1240,7 @@ namespace dxvk {
                           const RtCamera& camera,
                           Rc<DxvkImageView> outputImage,                       // VK_IMAGE_LAYOUT_GENERAL
                           Rc<DxvkImageView> colorBuffer,                       // VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                          Rc<DxvkImageView> hudlessColorBuffer,                // optional (may be null): colorBuffer without the UI drawn
                           Rc<DxvkImageView> primaryScreenSpaceMotionVector,    // VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
                           Rc<DxvkImageView> primaryDepth,                      // VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
                           uint32_t interpolatedFrameIndex,                     // starts at 0
@@ -1281,6 +1283,9 @@ namespace dxvk {
     commandList->trackResource<DxvkAccess::Read>(colorBuffer);
     commandList->trackResource<DxvkAccess::Read>(primaryScreenSpaceMotionVector);
     commandList->trackResource<DxvkAccess::Read>(primaryDepth);
+    if (hudlessColorBuffer != nullptr) {
+      commandList->trackResource<DxvkAccess::Read>(hudlessColorBuffer);
+    }
 
     {
       ScopedGpuProfileZone_Present(m_device, commandList->getCmdBuffer(), "DLFG evaluate");
@@ -1291,6 +1296,7 @@ namespace dxvk {
                                                     commandList->getCmdBuffer(),
                                                     outputImage,
                                                     colorBuffer,
+                                                    hudlessColorBuffer,
                                                     primaryScreenSpaceMotionVector,
                                                     primaryDepth,
                                                     camera,

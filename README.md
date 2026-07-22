@@ -10,67 +10,28 @@ While dxvk-remix is a fork of DXVK, please report bugs encountered with dxvk-rem
 
 dxvk-remix also contains a subproject in the `bridge` folder, which enables 32 bit games to communicate with the 64 bit dxvk-remix runtime.
 
-## WIP fork containing Mirror's Edge/UE3 specific modifications
+## NGX passthrough branch (`mirrors-edge-ngx`)
 
-### 1) Mirror's Edge (UE3/D3D9) compatibility improvements
+This branch adds an NGX passthrough mode where Mirror's Edge's own rasterised rendering is presented unchanged (no path tracing, no scene capture) while DLSS Super Resolution / DLAA, DLSS Frame Generation, Reflex, and a subset of Remix's PostFX runs on top of it.
 
-All UE3-specific behavior sits behind a single master `rtx.d3d9.ue3EngineMode` toggle which the Mirror's Edge game profile turns on automatically. The main differences from upstream:
+### NGX mode setup
 
-- Camera and object transforms are read from UE3's reserved shader constants (CTAB parsing).
-- Depth prepass, shadow depth, SceneCapture, and depth-test-disabled translucency passes are skipped so only real base-pass geometry gets ray traced.
-- Texture and material identity is stable at the [MaterialInstanceConstant](https://docs.unrealengine.com/udk/Three/MaterialInstanceConstant.html) level: tags, categories and asset replacements survive texture streaming, settings changes, and restarts.
-- Sampler UVs (tiling, panning, atlas tiles) are resolved, including UE3's distance fade based anti-tiling materials.
-- Albedo selection is deterministic per material, with `rtx.preferredAlbedoTextures/rtx.neverAlbedoTextures` as overrides where albedo selection is missed. Textureless, constant colour materials supported too.
-- Mid-frame fullscreen overlays (fades, scope/damage effects) cannot terminate the raytraced scene; they're replayed on top after RTX injection (`rtx.deferredUiTextures`).
+**The game's MSAA *must* be off, depth cannot be resolved while it is active** - plus you want DLSS/DLAA anyway, right? Also, set `rtx.ngxPassthroughMode` at launch (rtx.conf / game profile). Depth buffers only get a shader-readable layout when the mode is active at creation. This is already pre-configured for Mirror's Edge in this branch.
 
-### 2) Mirror's Edge/UE3 setup:
+How it works:
 
-1. Enable the bridge's redundant state filtering. Create (or edit) `.trex\bridge.conf` and add `eliminateRedundantSetterCalls = True`.
-> [!NOTE]
-> UE3's D3D9 renderer doesn't filter redundant state on its own. Sampler and render state get resubmitted with nearly every texture bind, roughly 9 state calls per draw even when nothing's changed which can stack to tens of thousands per frame. Under Remix, each of those is handled twice where it gets serialised over the bridge IPC and then replayed by the runtime. This setting has the bridge client drop no-op state calls before they cross the process boundary. UE3 titles often run noticeably faster with it on.
+- The frame is intercepted before the game's postprocess chain. The first fullscreen composite quad that samples the scene color (in Mirror's Edge this is a fullsize FP16 scene colour resolve; the runtime tracks resolve `StretchRect`s) triggers injection. DLSS takes the linear HDR scene colour in NGX HDR mode and writes the antialiased result back; bloom, tonemapping, and dynamic contrast then run on the stabilised, unjittered image (`rtx.ngxPassthrough.prePostProcess`). Scene colour alpha stores depth so the write-back remerges the original alpha with DLSS RGB. The trigger requires a depth-test-disabled fullscreen quad so mid-scene lighting samples of the resolve do not fire early. If no post pass samples scene colour, injection falls back to the late scene-end point (post-processed LDR, before UI).
+- Screen-space motion vectors come from depth reprojected through the current and previous cameras (UE3 reserved shader constants, same as path traced mode). A small velocity raster overrides that with true object motion for DLSS, Frame Generation, and Remix's PostFX motion blur (`rtx.ngxPassthrough.objectVelocities`): rigid movers (CTAB `LocalToWorld` changes), GPU-skinned meshes (current/previous bone palettes), and CPU-skinned dynamic buffers (per-frame vertex snapshots), all depth-tested against the game depth. UE3 clears depth mid-scene before the foreground DPG, so the runtime snapshots depth before the first clear and merges it at injection: world / SDPG_Intermediate from the snapshot, SDPG_Foreground from the live buffer. A phase ownership marker on the shared velocity target keeps camera-locked first person motion from leaking across intermediate/foreground movestates (depth alone cannot separate them when both DPGs draw at the same depth). Missed pixels fall back to camera reprojection.
+- Sub-pixel Halton jitter is applied as a fractional viewport offset on draws to the scene render target and on fullsize screen-space passes tested against scene depth (shadow projections, distortion), so those buffers shift with the scene. UE3's `ScreenPositionScaleBias` upload is compensated by the same jitter so clip-derived UVs (shadows reading depth from scene-color alpha, translucency, distortion, fog) stay aligned. Game state is untouched; the patch stops at injection, where DLSS output is unjittered.
+- Remix menu's DLSS mode selector (Full Resolution, Quality, Balanced, Performance, Ultra Performance, Auto) drives the game's internal render resolution and LOD biasing directly. Full Resolution renders natively as DLAA on the post-processed scene before the UI; the other tiers render at a reduced render resolution and DLSS upscales to the output resolution as Super Resolution.
+- Frame Generation uses the synthesised depth/MVs and camera via the standard Remix DLFG presenter and interpolates the post-UI backbuffer like stock Remix. Object velocities cover first-person meshes, so they move with true motion. A HUD-less frame captured at the scene-end/UI boundary is also supplied so UI is separated from the scene without heuristics (`rtx.ngxPassthrough.dlfgHudlessInput`; stock Remix does not provide this).
+- Remix post FX (`rtx.postfx.*`, Rendering -> Post FX): motion blur uses the synthesised MVs, linear view-Z, and surface flags (geometry marked static; object velocity carries real motion). First person meshes blur with the scene by default; `rtx.ngxPassthrough.motionBlurFirstPerson = False` excludes them (crisp view model). Chromatic aberration and vignette share that pass too.
 
-2. Disable the game's lightmaps - this is easiest done with [Mirror's Edge Tweaks](https://github.com/softsoundd/MirrorsEdgeTweaks). Disabling lightmaps is recommended for both compatibility and, more importantly, when authoring assets, as scene exports with lightmaps active produce different material hashes that cannot survive in non-lightmapped states. If you wish to keep lightmaps enabled for before/after comparisons, that is supported and will not throw off hashes (provided authoring had been in a non-lightmapped mode).
+Notes and limitations:
 
-3. Make a text file titled "remix" (no extension) in `<path-to-game>\Binaries` and paste the following set of commands:
-```
-scale set TdBicubicFiltering false
-scale set TdTonemapping false
-scale set MaxMultisamples 0
-scale set MaxAnisotropy 0
-scale set DynamicLights false
-scale set DynamicShadows false
-scale set AmbientOcclusion false
-scale set Distortion false
-scale set DropParticleDistortion true
-scale set MotionBlur false
-scale set DepthOfField false
-scale set Bloom false
-scale set LightEnvironmentShadows false
-scale set LensFlares false
-scale set FogVolumes false
-scale set TdSunHaze false
-scale set TdMotionBlur false
-scale set Trilinear false
-scale set UpscaleScreenPercentage false
-scale set ScreenPercentage 100
-scale set OnlyStreamInTextures true
-toggleocclusion
-ToggleDynamicContrast
-viewmode unlit
-show scenecapture
-show dynamicshadows
-show fog
-```
-> [!NOTE]
-> The above commands ensures maximum compatibility with Remix. That being said, a lot of consideration has gone into this fork into ensuring that games with less flexibility around commands can still play somewhat nice with these graphics systems active, though game-side modding is recommended to disable them.
-
-4. By default `MirrorsEdge.exe` whitelists only a select few launch arguments, so the above commands will not work out of the box. This can be fully unlocked with [Mirror's Edge Tweaks](https://github.com/softsoundd/MirrorsEdgeTweaks) via the launch argument patcher. Once patched, add `-exec=remix` into your game libray's launch arguments/other shortcuts, or alternatively within the launch argument field in [Mirror's Edge Tweaks](https://github.com/softsoundd/MirrorsEdgeTweaks) followed by launching via the `Launch Game w/ Args` button.
-5. *(Optional)* UE3 employs frustum culling in native C++ land. This requires patching the executable to treat primitives as always visible. Doing this looks nicer compared to relying on Remix's anti-culling system, but note that performance will take a hit!
-	- Use a hex editor to locate offset 008E3C6C and patch `0F 84 EE 06 00 00` to `90 90 90 90 90 90`. This has been tested against the GOG version only.
-
-### 3) Acknowledgements
-- sambow23 for their [physically based sky implementation](https://github.com/sambow23/dxvk-remix-gmod/tree/atmos).
-- xoxor4d for their research into UE3->Remix support and other tidbits of info that helped guide the initial work around this.
+- Options under `rtx.ngxPassthrough.*`; Rendering -> General shows DLSS stats and depth/MV visualisers.
+- Default DLSS model is the transformer preset (rtx.ngxPassthrough.dlssRenderPreset = 10, preset J), which keeps more detail than NGX's default CNN presets; the developer menu can switch presets live.
+- Ghosting issues with particles and with textures on transparent planes (chain link fences). Will investigate solutions for this at a later date.
 
 ## Build instructions
 
