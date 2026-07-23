@@ -32,6 +32,7 @@
 namespace dxvk {
   class DxvkDevice;
   class DxvkBarrierSet;
+  class DxvkPipelineManager;
   class RtxContext;
   class RtCamera;
   class NGXDLSSContext;
@@ -172,6 +173,11 @@ namespace dxvk {
     ~RtxNgxPassthrough() override;
 
     void onDestroy() override;
+
+    // Registers the passthrough compute shaders (motion vector synthesis, alpha merge) for
+    // pipeline prewarming. The velocity raster's vertex/fragment shaders are graphics-stage
+    // and compile with their full pipeline state on first use instead.
+    void prewarmShaders(DxvkPipelineManager& pipelineManager) const;
 
     // Runs the passthrough pipeline at the injection point. targetImage is the game's color
     // target DLSS reads from and writes back to, sceneDepthImage the depth-stencil image

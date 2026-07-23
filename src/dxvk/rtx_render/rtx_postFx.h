@@ -34,11 +34,16 @@
 namespace dxvk {
 
   class DxvkDevice;
+  class DxvkPipelineManager;
 
   class DxvkPostFx {
   public:
     DxvkPostFx(DxvkDevice* device);
     ~DxvkPostFx();
+
+    // Registers the frame path's post FX compute shaders for pipeline prewarming. The
+    // highlighting shader is a development picking feature and is left to compile on first use.
+    void prewarmShaders(DxvkPipelineManager& pipelineManager) const;
 
     // Individual motion blur inputs; the path traced pipeline packs these from the
     // raytracing output bundle, the NGX passthrough mode from its synthesized equivalents.

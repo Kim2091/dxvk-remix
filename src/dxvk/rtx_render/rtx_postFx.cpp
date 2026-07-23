@@ -114,6 +114,13 @@ namespace dxvk {
   {
   }
 
+  void DxvkPostFx::prewarmShaders(DxvkPipelineManager& pipelineManager) const
+  {
+    PostFxShader::getShader();
+    PostFxMotionBlurShader::getShader();
+    PostFxMotionBlurPrefilterShader::getShader();
+  }
+
   void DxvkPostFx::showImguiSettings()
   {
     RemixGui::Checkbox("Post Effect Enabled", &enableObject());

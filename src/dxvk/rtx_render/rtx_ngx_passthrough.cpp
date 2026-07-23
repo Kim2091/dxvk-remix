@@ -38,6 +38,7 @@
 #include "rtx_postFx.h"
 #include "rtx_auto_exposure.h"
 #include "rtx_imgui.h"
+#include "rtx_initializer.h"
 #include "rtx_render/rtx_shader_manager.h"
 #include "rtx/pass/ngx_passthrough/ngx_passthrough_args.h"
 
@@ -57,6 +58,13 @@ namespace dxvk {
 
   void RtxNgxPassthrough::ngxPassthroughModeOnChange(DxvkDevice* device) {
     enforceRaytracingDisabledForPassthrough();
+
+    // Only the passthrough shader set is prewarmed while the mode is active, so a runtime
+    // disable kicks off the full prewarm; the async compilation gate in RtxContext::injectRTX
+    // holds path tracing back until it completes. device is null during initial config parsing.
+    if (device != nullptr && !ngxPassthroughMode()) {
+      device->getCommon()->getRtxInitializer().startPrewarmShaders();
+    }
   }
 
   namespace {
@@ -147,6 +155,11 @@ namespace dxvk {
       INTERFACE_INPUT_SLOTS(0b11);
       INTERFACE_OUTPUT_SLOTS(0b1);
     };
+  }
+
+  void RtxNgxPassthrough::prewarmShaders(DxvkPipelineManager& pipelineManager) const {
+    NgxPassthroughMvShader::getShader();
+    NgxPassthroughAlphaMergeShader::getShader();
   }
 
   RtxNgxPassthrough::RtxNgxPassthrough(DxvkDevice* device)

@@ -39,6 +39,7 @@
 #include "rtx_neural_radiance_cache.h"
 #include "rtx_ray_reconstruction.h"
 #include "rtx_ngx_passthrough.h"
+#include "rtx_postFx.h"
 
 namespace dxvk {
   RtxInitializer::RtxInitializer(DxvkDevice* device)
@@ -169,6 +170,28 @@ namespace dxvk {
     }
 
     DxvkObjects* pCommon = m_device->getCommon();
+
+    // NGX passthrough mode: path tracing never runs (rtx.enableRaytracing is forced off), so
+    // only prewarm the shaders the passthrough frame path actually dispatches instead of
+    // spending minutes of background CPU on the path traced frame's pipelines. If the mode
+    // is disabled at runtime the full set is prewarmed then (see ngxPassthroughModeOnChange).
+    if (RtxNgxPassthrough::ngxPassthroughMode()) {
+      pCommon->metaNgxPassthrough().prewarmShaders(pCommon->pipelineManager());
+      pCommon->metaPostFx().prewarmShaders(pCommon->pipelineManager());
+
+      // Non-DLSS upscaler options for the passthrough mode (self-gated on rtx.upscalerType)
+      pCommon->metaTAA().prewarmShaders(pCommon->pipelineManager());
+      pCommon->metaNIS().prewarmShaders(pCommon->pipelineManager());
+
+      return;
+    }
+
+    // Runs once; repeat requests come from a runtime NGX passthrough mode disable and from
+    // the forced onChange replay during initialization.
+    if (m_fullPrewarmStarted) {
+      return;
+    }
+    m_fullPrewarmStarted = true;
 
     // Prewarm all the shaders we'll need for RT by registering them (per-pass) with the driver
     pCommon->metaPathtracerGbuffer().prewarmShaders(pCommon->pipelineManager());

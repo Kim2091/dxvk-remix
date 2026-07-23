@@ -51,12 +51,17 @@ namespace dxvk {
       return m_warmupComplete;
     }
 
+    // Kicks off shader prewarming: the passthrough set while NGX passthrough mode is active,
+    // the full path tracing set otherwise. Called on initialization and again when the
+    // passthrough mode is disabled at runtime; the full prewarm only ever runs once.
+    void startPrewarmShaders();
+
   private:
     bool m_warmupComplete = false;
     bool m_assetsLoaded = false;
+    bool m_fullPrewarmStarted = false;
 
     void loadAssets();
-    void startPrewarmShaders();
 
     dxvk::thread m_asyncAssetLoadThread;
 
