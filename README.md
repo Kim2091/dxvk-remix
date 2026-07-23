@@ -12,7 +12,7 @@ dxvk-remix also contains a subproject in the `bridge` folder, which enables 32 b
 
 ## NGX passthrough branch (`mirrors-edge-ngx`)
 
-This branch adds an NGX passthrough mode where Mirror's Edge's own rasterised rendering is presented unchanged (no path tracing, no scene capture) while DLSS Super Resolution / DLAA, DLSS Frame Generation, Reflex, and a subset of Remix's PostFX runs on top of it.
+This branch adds an NGX passthrough mode where Mirror's Edge's own rasterised rendering is presented unchanged (no path tracing, no scene capture) while DLSS Super Resolution / DLAA, DLSS Frame Generation, Reflex, and Remix's PostFX runs on top of it. Remix's other upscalers supported too.
 
 ### NGX mode setup
 
@@ -31,7 +31,6 @@ Notes and limitations:
 
 - Options under `rtx.ngxPassthrough.*`; Rendering -> General shows DLSS stats and depth/MV visualisers.
 - Default DLSS model is the transformer preset (`rtx.ngxPassthrough.dlssRenderPreset = 10`, preset J), which keeps more detail than NGX's default CNN presets; the developer menu can switch presets live.
-- At certain internal render resolution percentages, the UI in Mirror's Edge becomes pixelated. This does not occur in Full Resolution and Performance modes.
 - Ghosting issues with particles and textures on transparent planes (chain link fences). Will investigate solutions for this in the future.
 
 ## Build instructions
