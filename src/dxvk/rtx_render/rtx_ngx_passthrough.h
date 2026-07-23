@@ -310,12 +310,14 @@ namespace dxvk {
                "which pixels are UI instead of detecting them heuristically, which strongly reduces UI warping over busy\n"
                "moving backgrounds.");
     RTX_OPTION("rtx.ngxPassthrough", bool, driveGameScreenPercentage, true,
-               "Lets the Remix upscaler quality preset drive the game's ScreenPercentage directly, so the render\n"
-               "resolution is chosen from the menu instead of the in-game 'scale set ScreenPercentage' console command.\n"
-               "Full Resolution renders natively (DLAA for DLSS, 100% for NIS/TAA-U/XeSS); the other tiers render at the\n"
-               "upscaler's standard scaling factors and are upscaled on output. The D3D9 layer writes the value into the\n"
-               "game each frame while this mode is active and restores the game's own value when disabled. Only meaningful\n"
-               "with rtx.ngxPassthroughMode; harmless if the game's ScreenPercentage field cannot be located.");
+               "Lets the Remix upscaler quality preset choose the game's effective render resolution.\n"
+               "Full Resolution renders natively (DLAA for DLSS, 100% for NIS/TAA-U/XeSS); other tiers use the upscaler's\n"
+               "standard scaling factors. In-memory only (saved game settings unchanged); when disabled, follows live\n"
+               "game values. Requires rtx.ngxPassthroughMode and locatable game readers.");
+    RTX_OPTION("rtx.ngxPassthrough", bool, disableGameMsaa, true,
+               "Forces effective renderer MSAA off in-memory (saved setting unchanged). Latched at D3D device setup;\n"
+               "changing it needs device recreation or restart. Required because multisampled depth cannot be resolved\n"
+               "for NGX inputs. Requires rtx.ngxPassthroughMode and locatable game readers.");
     RTX_OPTION("rtx.ngxPassthrough", int, dlssRenderPreset, 10,
                "DLSS render preset (model selection) hint for the NGX feature. 0: Default (snippet/driver decides, typically an\n"
                "older CNN model), 1-6: presets A-F (CNN models), 10: preset J (transformer model - noticeably better detail\n"

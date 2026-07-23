@@ -726,7 +726,9 @@ namespace dxvk {
 
     if (sceneDepthImage->info().sampleCount != VK_SAMPLE_COUNT_1_BIT) {
       liveFailureReason = "multisampled depth unsupported";
-      ONCE(Logger::warn("[RTX NGX Passthrough] The game's depth buffer is multisampled which is not supported; disable MSAA in the game."));
+      ONCE(Logger::warn("[RTX NGX Passthrough] The game's depth buffer is multisampled which is not supported; "
+                        "leave rtx.ngxPassthrough.disableGameMsaa enabled or disable MSAA in the game "
+                        "('scale set MaxMultisamples 0' in the console), then restart."));
     } else if (sceneDepthImage->info().layout != VK_IMAGE_LAYOUT_GENERAL) {
       // Game depth-stencil images are created with a GENERAL layout when the mode is enabled
       // at launch (see D3D9CommonTexture::CreateImage). Anything else means the image predates

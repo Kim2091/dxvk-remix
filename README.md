@@ -12,11 +12,13 @@ dxvk-remix also contains a subproject in the `bridge` folder, which enables 32 b
 
 ## NGX passthrough branch (`mirrors-edge-ngx`)
 
-This branch adds an NGX passthrough mode where Mirror's Edge's own rasterised rendering is presented unchanged (no path tracing, no scene capture) while DLSS Super Resolution / DLAA, DLSS Frame Generation, Reflex, and Remix's PostFX runs on top of it. Remix's other upscalers supported too.
+This branch adds an NGX passthrough mode where Mirror's Edge's own rasterised rendering is presented unchanged (no path tracing, no scene capture) while DLSS Super Resolution / DLAA, DLSS Frame Generation, Reflex, and Remix's Post FX runs on top of it. Like the rest of this fork, this mode may work for other Unreal Engine 3 titles, but support is not guaranteed.
 
 ### NGX mode setup
 
-**The game's MSAA *must* be off, depth cannot be resolved while it is active** - plus you want DLSS/DLAA anyway, right? Also, set `rtx.ngxPassthroughMode` at launch (rtx.conf / game profile). Depth buffers only get a shader-readable layout when the mode is active at creation. This is already pre-configured for Mirror's Edge in this branch.
+**The game's MSAA must be off** because depth cannot be resolved while it is active - plus you want DLSS/DLAA anyway, right? By default NGX mode will attempt to force MSAA off at runtime via `rtx.ngxPassthrough.disableGameMsaa`, though in cases where that fails MSAA will need to be disabled manually either via the game's settings/configs.
+
+Set `rtx.ngxPassthroughMode` at launch (already configured for Mirror's Edge in this branch) so depth buffers are created shader-readable.
 
 How it works:
 

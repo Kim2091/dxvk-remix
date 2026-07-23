@@ -865,22 +865,34 @@ namespace dxvk {
     // so every change forces a full sampler re-bind
     float m_ngxAppliedSamplerLodBias = 0.0f;
 
-    // NGX passthrough ScreenPercentage driver (see applyNgxPassthroughScreenPercentage). The
-    // field is read/written cross-process because under the RTX Remix bridge this module runs
-    // in NvRemixBridge.exe, separate from the game: m_ngxGameProcess owns it (the current
-    // process for a single-process DXVK build, else the parent game process, hence
-    // m_ngxGameProcessOwned for handle cleanup) and m_ngxScreenPercentageRemoteAddr is its
-    // address there, resolved once by scanning the game module (0 = not located, inactive).
-    // m_ngxScreenPercentageOriginal is restored when driving disengages.
+    // Isolated renderer shadow (GSystemSettings untouched). Bridge path owns the parent handle.
     bool m_ngxScreenPercentageScanDone = false;
     bool m_ngxScreenPercentageDriven = false;
     bool m_ngxGameProcessOwned = false;
     HANDLE m_ngxGameProcess = nullptr;
+    DWORD m_ngxGameProcessId = 0;
     uintptr_t m_ngxScreenPercentageRemoteAddr = 0;
-    float m_ngxScreenPercentageOriginal = 100.0f;
+    uintptr_t m_ngxGameSettingsShadowRemoteAddr = 0;
+    bool m_ngxGameSettingsRedirectsValid = false;
     float m_ngxScreenPercentageLastLogged = 0.0f;
-    // The game's current ScreenPercentage, cached for the scene-camera gate to size-match the
-    // main view against backbuffer * ScreenPercentage / 100. 0 = unknown.
+    uint32_t m_ngxScreenPercentageScanAttempts = 0;
+    uint64_t m_ngxScreenPercentageNextScanMs = 0;
+    struct NgxGameSettingsCodePatch {
+      uintptr_t operandAddress = 0;
+      uint32_t originalOperand = 0;
+      uint32_t redirectedOperand = 0;
+      DWORD originalProtection = 0;
+      bool originalProtectionKnown = false;
+      bool forceRestore = false;
+    };
+    std::vector<NgxGameSettingsCodePatch> m_ngxGameSettingsCodePatches;
+    // MSAA redirects install only during device setup (resource-creation latch).
+    bool m_ngxMsaaSetupDecisionCaptured = false;
+    bool m_ngxMsaaRedirectSetupAllowed = false;
+    bool m_ngxMsaaOverrideRequestedAtSetup = false;
+    bool m_ngxMsaaOverrideLatched = false;
+    bool m_ngxGameMsaaDriven = false;
+    // Scene-camera viewport gate; 0 = unknown.
     float m_ngxGameScreenPercentage = 0.0f;
     bool m_ngxPassthroughBootstrapped = false;
 
@@ -1290,11 +1302,10 @@ namespace dxvk {
     void tryNgxPassthroughCameraCapture();
     void emitNgxPassthroughFrameData();
 
-    // NGX passthrough: writes the game's GSystemSettings.ScreenPercentage from the Remix
-    // DLSS mode selector (rtx.qualityDLSS) once per frame while the mode and the
-    // driveGameScreenPercentage option are active, and restores the game's own value when
-    // the feature disengages. Resolves the field address lazily on first use.
     void applyNgxPassthroughScreenPercentage();
+    void locateNgxPassthroughGameSettings();
+    void restoreNgxGameSettingsRedirects();
+    void applyNgxPassthroughMsaaDisable();
 
     // Scene targets identified from CTAB-verified camera draws with depth writes. Kept across
     // frames (UE3 render targets are stable between resolution changes) so the jitter can

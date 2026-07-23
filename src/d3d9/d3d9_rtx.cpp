@@ -29,7 +29,7 @@
 #include <map>
 #include <sstream>
 
-// Process/module snapshots for the cross-process NGX passthrough ScreenPercentage driver.
+// Toolhelp snapshots for cross-process game-settings driving.
 #include <tlhelp32.h>
 
 namespace dxvk {
@@ -4690,8 +4690,9 @@ namespace dxvk {
   }
 
   D3D9Rtx::~D3D9Rtx() {
-    // Close the game process handle opened for the ScreenPercentage driver (only when it is
-    // a real opened handle - the single-process path uses the GetCurrentProcess pseudo-handle).
+    restoreNgxGameSettingsRedirects();
+
+    // Owned bridge parent handle only; GetCurrentProcess() is a pseudo-handle.
     if (m_ngxGameProcessOwned && m_ngxGameProcess != nullptr)
       ::CloseHandle(m_ngxGameProcess);
   }
@@ -10909,10 +10910,11 @@ namespace dxvk {
             int32_t(vp.Width)  >= expectedW - sizeTolerance && int32_t(vp.Width)  <= expectedW + sizeTolerance &&
             int32_t(vp.Height) >= expectedH - sizeTolerance && int32_t(vp.Height) <= expectedH + sizeTolerance;
           if (!viewportMatchesExpected) {
-            // The D3D9 layer may have written a reduced ScreenPercentage before the game has
-            // applied it (typically one frame). Accept the main view at full backbuffer size
-            // during that window so scene targets and the camera stay valid; once the viewport
-            // shrinks the gate enforces the reduced size and Super Resolution engages.
+            // The D3D9 layer may have updated the isolated ScreenPercentage shadow before the
+            // game has consumed it (typically one frame). Accept the main view at full
+            // backbuffer size during that window so scene targets and the camera stay valid;
+            // once the viewport shrinks the gate enforces the reduced size and Super
+            // Resolution engages.
             const bool viewportNearFullSize =
               int32_t(vp.Width) >= int32_t(bbW) - sizeTolerance &&
               int32_t(vp.Height) >= int32_t(bbH) - sizeTolerance;
@@ -11730,16 +11732,13 @@ namespace dxvk {
   }
 
   namespace {
-    // Signature for the head of FSystemSettings::ScaleViewportByScreenPercentage in Mirror's
-    // Edge (shared by every patchable 1.0.1.0 / 1.1.0.0 variant - GOG, Steam, Retail, DLC):
+    // Anchor for FSystemSettings::ScaleViewportByScreenPercentage:
     //   movss   xmm0, [&GSystemSettings.ScreenPercentage]   F3 0F 10 05 <abs32>
     //   sub     esp, 8                                       83 EC 08
     //   ucomiss xmm0, [&Const_100f]                          0F 2E 05 <abs32>
-    // The first absolute operand is &GSystemSettings.ScreenPercentage (a float). The game
-    // ships without ASLR, so the operand is the runtime address as-is; the UBOOL
-    // bUpscaleScreenPercentage is the adjacent struct field at +4 (confirmed against
-    // NeedsUpscale: ScreenPercentage at base+0x178, bUpscaleScreenPercentage at base+0x17c).
+    // Both absolute operands are validated before any reader is patched.
     constexpr uint32_t kUe3ScreenPercentageSigLen = 14;
+    constexpr uint32_t kUe3ScreenPercentageSigScanLen = kUe3ScreenPercentageSigLen + sizeof(uint32_t);
 
     bool matchUe3ScreenPercentageSig(const uint8_t* p) {
       return p[0] == 0xF3 && p[1] == 0x0F && p[2] == 0x10 && p[3] == 0x05 &&
@@ -11747,8 +11746,422 @@ namespace dxvk {
              p[11] == 0x0F && p[12] == 0x2E && p[13] == 0x05;
     }
 
-    // Parent process id of the current process (the game, when this dxvk-remix module runs
-    // inside the RTX Remix bridge's NvRemixBridge.exe host).
+    // Mirror's Edge FSystemSettings offsets.
+    constexpr uint32_t kUe3ScreenPercentageFromSystemSettings = 0x178;
+    constexpr uint32_t kUe3UpscaleScreenPercentageFromSystemSettings = 0x17c;
+    constexpr uintptr_t kUe3MaxMultisamplesFromScreenPercentage = 0x14;
+    constexpr uintptr_t kUe3RtMaxMultisamplesFromScreenPercentage = 0x2c;
+
+    // Reject an unexpected layout before redirecting MSAA readers.
+    constexpr int32_t kUe3MaxMultisamplesPlausibleLimit = 64;
+
+    // Bound retries for transient process/module read failures.
+    constexpr uint32_t kNgxSettingsScanMaxAttempts = 30;
+    constexpr uint64_t kNgxSettingsScanRetryIntervalMs = 1000;
+
+    // Renderer-only values; GSystemSettings remains authoritative for game configuration.
+    struct NgxGameSettingsShadow {
+      float screenPercentage;
+      int32_t upscaleScreenPercentage;
+      int32_t maxMultisamples;
+    };
+    static_assert(sizeof(NgxGameSettingsShadow) == 12);
+
+    constexpr uintptr_t kNgxShadowScreenPercentageOffset =
+      offsetof(NgxGameSettingsShadow, screenPercentage);
+    constexpr uintptr_t kNgxShadowUpscaleScreenPercentageOffset =
+      offsetof(NgxGameSettingsShadow, upscaleScreenPercentage);
+    constexpr uintptr_t kNgxShadowMaxMultisamplesOffset =
+      offsetof(NgxGameSettingsShadow, maxMultisamples);
+
+    struct NgxOperandSite {
+      uintptr_t address = 0;
+      uint32_t original = 0;
+    };
+
+    struct NgxOperandRedirect {
+      uintptr_t address = 0;
+      uint32_t original = 0;
+      uint32_t redirected = 0;
+      DWORD originalProtection = 0;
+      bool originalProtectionKnown = false;
+      bool forceRestore = false;
+    };
+
+    struct NgxLocatedGameSettings {
+      uintptr_t screenPercentageAddress = 0;
+      float currentScreenPercentage = 100.0f;
+      int32_t currentUpscaleScreenPercentage = 1;
+      int32_t currentMaxMultisamples = 0;
+      int32_t currentRtMaxMultisamples = 0;
+      std::vector<NgxOperandSite> directScreenPercentageSites;
+      std::vector<NgxOperandSite> relativeScreenPercentageSites;
+      std::vector<NgxOperandSite> relativeUpscaleScreenPercentageSites;
+      std::vector<NgxOperandSite> directRtMaxMultisamplesSites;
+      uint32_t over100CaveReaderCount = 0;
+      bool msaaReadersValid = false;
+    };
+
+    template <typename T>
+    bool ngxReadProcessExact(HANDLE process, uintptr_t address, T& value) {
+      SIZE_T bytesRead = 0;
+      return ::ReadProcessMemory(process, reinterpret_cast<LPCVOID>(address),
+                                 &value, sizeof(value), &bytesRead) &&
+             bytesRead == sizeof(value);
+    }
+
+    template <typename T>
+    bool ngxWriteProcessExact(HANDLE process, uintptr_t address, const T& value) {
+      SIZE_T bytesWritten = 0;
+      return ::WriteProcessMemory(process, reinterpret_cast<LPVOID>(address),
+                                  &value, sizeof(value), &bytesWritten) &&
+             bytesWritten == sizeof(value);
+    }
+
+    template <typename T>
+    bool ngxWriteProcessExactRetry(HANDLE process, uintptr_t address,
+                                   const T& value) {
+      for (uint32_t attempt = 0; attempt < 3; attempt++) {
+        if (ngxWriteProcessExact(process, address, value))
+          return true;
+      }
+      return false;
+    }
+
+    bool ngxUpdateScreenPercentageShadow(HANDLE process, uintptr_t shadowAddress,
+                                         float screenPercentage, int32_t upscale,
+                                         bool* outRollbackVerified = nullptr) {
+      if (outRollbackVerified != nullptr)
+        *outRollbackVerified = true;
+      float oldScreenPercentage = 0.0f;
+      int32_t oldUpscale = 0;
+      if (!ngxReadProcessExact(
+            process, shadowAddress + kNgxShadowScreenPercentageOffset,
+            oldScreenPercentage) ||
+          !ngxReadProcessExact(
+            process, shadowAddress + kNgxShadowUpscaleScreenPercentageOffset,
+            oldUpscale))
+        return false;
+
+      const auto writeScreenPercentage = [&](float value) {
+        return ngxWriteProcessExactRetry(
+          process, shadowAddress + kNgxShadowScreenPercentageOffset, value);
+      };
+      const auto writeUpscale = [&](int32_t value) {
+        return ngxWriteProcessExactRetry(
+          process, shadowAddress + kNgxShadowUpscaleScreenPercentageOffset,
+          value);
+      };
+      const auto pairEquals = [&](float expectedScreenPercentage,
+                                  int32_t expectedUpscale) {
+        float verifiedScreenPercentage = 0.0f;
+        int32_t verifiedUpscale = 0;
+        return
+          ngxReadProcessExact(
+            process, shadowAddress + kNgxShadowScreenPercentageOffset,
+            verifiedScreenPercentage) &&
+          ngxReadProcessExact(
+            process, shadowAddress + kNgxShadowUpscaleScreenPercentageOffset,
+            verifiedUpscale) &&
+          std::memcmp(&verifiedScreenPercentage, &expectedScreenPercentage,
+                      sizeof(expectedScreenPercentage)) == 0 &&
+          verifiedUpscale == expectedUpscale;
+      };
+      const auto writePairSafely = [&](float targetScreenPercentage,
+                                       int32_t targetUpscale) {
+        bool firstRestored = false;
+        bool secondRestored = false;
+        if (targetUpscale != 0) {
+          firstRestored = writeUpscale(targetUpscale);
+          if (firstRestored)
+            secondRestored = writeScreenPercentage(targetScreenPercentage);
+        } else {
+          firstRestored = writeScreenPercentage(targetScreenPercentage);
+          if (firstRestored)
+            secondRestored = writeUpscale(targetUpscale);
+        }
+        return firstRestored && secondRestored;
+      };
+      const auto rollbackOldPair = [&]() {
+        return writePairSafely(oldScreenPercentage, oldUpscale) &&
+               pairEquals(oldScreenPercentage, oldUpscale);
+      };
+
+      if (!writePairSafely(screenPercentage, upscale)) {
+        const bool rollbackVerified = rollbackOldPair();
+        if (outRollbackVerified != nullptr)
+          *outRollbackVerified = rollbackVerified;
+        return false;
+      }
+
+      const bool verified = pairEquals(screenPercentage, upscale);
+      if (!verified) {
+        const bool rollbackVerified = rollbackOldPair();
+        if (outRollbackVerified != nullptr)
+          *outRollbackVerified = rollbackVerified;
+      }
+      return verified;
+    }
+
+    bool ngxRestoreCodeProtection(HANDLE process, uintptr_t address,
+                                  DWORD protection) {
+      for (uint32_t attempt = 0; attempt < 3; attempt++) {
+        DWORD ignoredProtection = 0;
+        if (::VirtualProtectEx(
+              process, reinterpret_cast<LPVOID>(address), sizeof(uint32_t),
+              protection, &ignoredProtection))
+          return true;
+      }
+      return false;
+    }
+
+    bool ngxCodeProtectionMatches(HANDLE process, uintptr_t address,
+                                  DWORD protection) {
+      MEMORY_BASIC_INFORMATION memoryInfo = {};
+      return ::VirtualQueryEx(
+               process, reinterpret_cast<LPCVOID>(address),
+               &memoryInfo, sizeof(memoryInfo)) == sizeof(memoryInfo) &&
+             memoryInfo.Protect == protection;
+    }
+
+    // Restore the exact pre-write Protect (WRITECOPY pages cannot always regain it).
+    bool ngxWriteCodeOperand(HANDLE process, NgxOperandRedirect& redirect) {
+      if (!redirect.originalProtectionKnown) {
+        MEMORY_BASIC_INFORMATION memoryInfo = {};
+        if (::VirtualQueryEx(
+              process, reinterpret_cast<LPCVOID>(redirect.address),
+              &memoryInfo, sizeof(memoryInfo)) != sizeof(memoryInfo))
+          return false;
+        redirect.originalProtection = memoryInfo.Protect;
+        redirect.originalProtectionKnown = true;
+      }
+
+      DWORD oldProtection = 0;
+      if (!::VirtualProtectEx(
+            process, reinterpret_cast<LPVOID>(redirect.address),
+            sizeof(redirect.redirected), PAGE_EXECUTE_READWRITE,
+            &oldProtection))
+        return false;
+
+      if (oldProtection != redirect.originalProtection) {
+        redirect.originalProtection = oldProtection;
+        ngxRestoreCodeProtection(process, redirect.address, oldProtection);
+        return false;
+      }
+
+      const bool wrote =
+        ngxWriteProcessExact(process, redirect.address, redirect.redirected);
+      const bool flushed = wrote &&
+        ::FlushInstructionCache(
+          process, reinterpret_cast<LPCVOID>(redirect.address),
+          sizeof(redirect.redirected));
+      const bool restoredProtection =
+        ngxRestoreCodeProtection(
+          process, redirect.address, redirect.originalProtection) &&
+        ngxCodeProtectionMatches(
+          process, redirect.address, redirect.originalProtection);
+      return wrote && flushed && restoredProtection;
+    }
+
+    bool ngxRestoreCodeOperand(HANDLE process,
+                               const NgxOperandRedirect& redirect) {
+      if (!redirect.originalProtectionKnown)
+        return false;
+
+      DWORD ignoredProtection = 0;
+      if (!::VirtualProtectEx(
+            process, reinterpret_cast<LPVOID>(redirect.address),
+            sizeof(uint32_t), PAGE_EXECUTE_READWRITE, &ignoredProtection))
+        return false;
+
+      const bool wrote =
+        ngxWriteProcessExactRetry(
+          process, redirect.address, redirect.original);
+      const bool flushed = wrote &&
+        ::FlushInstructionCache(
+          process, reinterpret_cast<LPCVOID>(redirect.address),
+          sizeof(uint32_t));
+      const bool protectionRestored =
+        ngxRestoreCodeProtection(
+          process, redirect.address, redirect.originalProtection) &&
+        ngxCodeProtectionMatches(
+          process, redirect.address, redirect.originalProtection);
+      uint32_t verified = 0;
+      return wrote && flushed && protectionRestored &&
+             ngxReadProcessExact(process, redirect.address, verified) &&
+             verified == redirect.original;
+    }
+
+    // Quiesce target threads while unaligned x86 operands are changed.
+    class NgxScopedThreadSuspension {
+    public:
+      explicit NgxScopedThreadSuspension(DWORD processId) {
+        const DWORD currentProcessId = ::GetCurrentProcessId();
+        const DWORD currentThreadId = ::GetCurrentThreadId();
+
+        // Repeat snapshots to close the thread-creation race. Fixed storage avoids allocating
+        // from a heap that a suspended single-process thread may own.
+        uint32_t stablePasses = 0;
+        for (uint32_t pass = 0; pass < 8; pass++) {
+          HANDLE snapshot =
+            ::CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+          if (snapshot == INVALID_HANDLE_VALUE)
+            return;
+
+          THREADENTRY32 entry = {};
+          entry.dwSize = sizeof(entry);
+          if (!::Thread32First(snapshot, &entry)) {
+            ::CloseHandle(snapshot);
+            return;
+          }
+
+          bool discoveredThread = false;
+          bool transientThreadExit = false;
+          DWORD enumerationError = ERROR_SUCCESS;
+          for (;;) {
+            if (entry.th32OwnerProcessID == processId &&
+                !(processId == currentProcessId &&
+                  entry.th32ThreadID == currentThreadId) &&
+                !isTracked(entry.th32ThreadID)) {
+              discoveredThread = true;
+              if (m_threadCount >= m_threads.size()) {
+                ::CloseHandle(snapshot);
+                return;
+              }
+
+              HANDLE thread =
+                ::OpenThread(THREAD_SUSPEND_RESUME, FALSE,
+                             entry.th32ThreadID);
+              if (thread == nullptr) {
+                if (::GetLastError() == ERROR_INVALID_PARAMETER) {
+                  transientThreadExit = true;
+                } else {
+                  ::CloseHandle(snapshot);
+                  return;
+                }
+              } else if (::SuspendThread(thread) == DWORD(-1)) {
+                transientThreadExit = true;
+                ::CloseHandle(thread);
+              } else {
+                m_threadIds[m_threadCount] = entry.th32ThreadID;
+                m_threads[m_threadCount] = thread;
+                m_threadCount++;
+              }
+            }
+
+            ::SetLastError(ERROR_SUCCESS);
+            if (!::Thread32Next(snapshot, &entry)) {
+              enumerationError = ::GetLastError();
+              break;
+            }
+          }
+
+          ::CloseHandle(snapshot);
+          if (enumerationError != ERROR_NO_MORE_FILES)
+            return;
+
+          if (!discoveredThread && !transientThreadExit) {
+            if (++stablePasses >= 2) {
+              m_complete = true;
+              return;
+            }
+          } else {
+            stablePasses = 0;
+          }
+        }
+      }
+
+      ~NgxScopedThreadSuspension() {
+        for (size_t i = m_threadCount; i > 0; i--)
+          ::ResumeThread(m_threads[i - 1]);
+        for (size_t i = 0; i < m_threadCount; i++)
+          ::CloseHandle(m_threads[i]);
+      }
+
+      bool complete() const {
+        return m_complete;
+      }
+
+    private:
+      bool isTracked(DWORD threadId) const {
+        for (size_t i = 0; i < m_threadCount; i++) {
+          if (m_threadIds[i] == threadId)
+            return true;
+        }
+        return false;
+      }
+
+      bool m_complete = false;
+      size_t m_threadCount = 0;
+      std::array<HANDLE, 256> m_threads = {};
+      std::array<DWORD, 256> m_threadIds = {};
+    };
+
+    bool ngxApplyOperandRedirects(HANDLE process,
+                                  std::vector<NgxOperandRedirect>& redirects,
+                                  std::vector<NgxOperandRedirect>& outActive) {
+      outActive.clear();
+      // Caller must reserve before threads are suspended (no heap growth while suspended).
+      if (outActive.capacity() < redirects.size())
+        return false;
+
+      for (NgxOperandRedirect& redirect : redirects) {
+        uint32_t current = 0;
+        if (!ngxReadProcessExact(process, redirect.address, current) ||
+            current != redirect.original)
+          return false;
+        MEMORY_BASIC_INFORMATION memoryInfo = {};
+        if (::VirtualQueryEx(
+              process, reinterpret_cast<LPCVOID>(redirect.address),
+              &memoryInfo, sizeof(memoryInfo)) != sizeof(memoryInfo))
+          return false;
+        redirect.originalProtection = memoryInfo.Protect;
+        redirect.originalProtectionKnown = true;
+      }
+
+      size_t attemptedCount = 0;
+      bool applySucceeded = true;
+      for (size_t i = 0; i < redirects.size(); i++) {
+        NgxOperandRedirect& redirect = redirects[i];
+        attemptedCount = i + 1;
+        if (!ngxWriteCodeOperand(process, redirect)) {
+          applySucceeded = false;
+          break;
+        }
+        uint32_t verified = 0;
+        if (!ngxReadProcessExact(process, redirect.address, verified) ||
+            verified != redirect.redirected) {
+          applySucceeded = false;
+          break;
+        }
+      }
+
+      if (applySucceeded) {
+        for (const NgxOperandRedirect& redirect : redirects)
+          outActive.push_back(redirect);
+        return true;
+      }
+
+      // A failed write may have landed before protection/cache restoration failed.
+      for (size_t i = attemptedCount; i > 0; i--) {
+        if (!ngxRestoreCodeOperand(process, redirects[i - 1]))
+          redirects[i - 1].forceRestore = true;
+      }
+
+      for (NgxOperandRedirect& redirect : redirects) {
+        uint32_t current = 0;
+        if (redirect.forceRestore ||
+            !ngxReadProcessExact(process, redirect.address, current) ||
+            current != redirect.original) {
+          redirect.forceRestore = true;
+          outActive.push_back(redirect);
+        }
+      }
+
+      return false;
+    }
+
+    // Bridge host: parent PID is the game process.
     DWORD ngxGetParentPid() {
       const DWORD selfPid = ::GetCurrentProcessId();
       HANDLE snapshot = ::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -11771,8 +12184,7 @@ namespace dxvk {
       return parentPid;
     }
 
-    // Base address and image size of a process's main module (its executable). Uses a 32-bit
-    // module snapshot so the 64-bit bridge host can see the 32-bit game's module.
+    // SNAPMODULE32 so the 64-bit bridge host can see the 32-bit game module.
     bool ngxGetMainModule(DWORD pid, uintptr_t& outBase, uint32_t& outSize) {
       HANDLE snapshot = ::CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
       if (snapshot == INVALID_HANDLE_VALUE)
@@ -11791,29 +12203,35 @@ namespace dxvk {
       return ok;
     }
 
-    // Reads the (32-bit PE) headers of the module at base in process proc and scans its
-    // executable sections for the signature above, returning the absolute address of
-    // GSystemSettings.ScreenPercentage or 0. Rejects non-32-bit modules by the optional
-    // header magic, so pointing this at the 64-bit bridge host simply yields 0.
-    uintptr_t ngxLocateScreenPercentage(HANDLE proc, uintptr_t base, uint32_t moduleSize) {
+    enum class NgxLocateResult {
+      Found,
+      Miss,
+      Incomplete,
+    };
+
+    // Finds and validates the renderer-facing settings operands in a 32-bit game module.
+    NgxLocateResult ngxLocateGameSettings(HANDLE proc, uintptr_t base, uint32_t moduleSize,
+                                          NgxLocatedGameSettings& outSettings) {
+      outSettings = {};
+
       uint8_t headers[0x1000];
       SIZE_T bytesRead = 0;
       if (!::ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(base), headers, sizeof(headers), &bytesRead) ||
           bytesRead < sizeof(IMAGE_DOS_HEADER))
-        return 0;
+        return NgxLocateResult::Incomplete;
 
       const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(headers);
       if (dos->e_magic != IMAGE_DOS_SIGNATURE)
-        return 0;
+        return NgxLocateResult::Miss;
 
       const uint32_t ntOffset = uint32_t(dos->e_lfanew);
       if (ntOffset + sizeof(IMAGE_NT_HEADERS32) > sizeof(headers))
-        return 0;
+        return NgxLocateResult::Miss;
 
       const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS32*>(headers + ntOffset);
       if (nt->Signature != IMAGE_NT_SIGNATURE ||
           nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC)
-        return 0;
+        return NgxLocateResult::Miss;
 
       // IMAGE_NT_HEADERS32 = DWORD Signature; IMAGE_FILE_HEADER; IMAGE_OPTIONAL_HEADER32.
       // The section table follows the optional header (whose size is declared, so this is
@@ -11821,41 +12239,332 @@ namespace dxvk {
       const uint32_t sectionTableOffset =
         ntOffset + uint32_t(sizeof(uint32_t) + sizeof(IMAGE_FILE_HEADER)) + nt->FileHeader.SizeOfOptionalHeader;
       const uint32_t sectionCount = nt->FileHeader.NumberOfSections;
+      if (sectionCount == 0 || sectionCount > 96)
+        return NgxLocateResult::Miss;
 
-      std::vector<uint8_t> sectionBuffer;
+      struct ExecutableSectionCopy {
+        uintptr_t address = 0;
+        std::vector<uint8_t> bytes;
+      };
+      std::vector<ExecutableSectionCopy> executableSections;
+
       for (uint32_t i = 0; i < sectionCount; i++) {
         const uint32_t entryOffset = sectionTableOffset + i * uint32_t(sizeof(IMAGE_SECTION_HEADER));
         if (entryOffset + sizeof(IMAGE_SECTION_HEADER) > sizeof(headers))
-          break;
+          return NgxLocateResult::Incomplete;
 
         const auto* section = reinterpret_cast<const IMAGE_SECTION_HEADER*>(headers + entryOffset);
         if ((section->Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0)
           continue;
 
         uint32_t size = section->Misc.VirtualSize != 0 ? section->Misc.VirtualSize : section->SizeOfRawData;
-        if (size < kUe3ScreenPercentageSigLen)
+        if (size < kUe3ScreenPercentageSigScanLen)
           continue;
-        if (moduleSize != 0 && section->VirtualAddress + size > moduleSize)
-          size = moduleSize - section->VirtualAddress;
+        if (moduleSize != 0) {
+          if (section->VirtualAddress >= moduleSize)
+            return NgxLocateResult::Incomplete;
+          size = std::min(size,
+                          moduleSize - uint32_t(section->VirtualAddress));
+        }
+        if (size < kUe3ScreenPercentageSigScanLen)
+          continue;
 
-        sectionBuffer.resize(size);
+        ExecutableSectionCopy copy;
+        copy.address = base + section->VirtualAddress;
+        copy.bytes.resize(size);
         SIZE_T sectionRead = 0;
-        if (!::ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(base + section->VirtualAddress),
-                                 sectionBuffer.data(), size, &sectionRead) ||
-            sectionRead < kUe3ScreenPercentageSigLen)
-          continue;
+        const bool readSucceeded =
+          ::ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(copy.address),
+                              copy.bytes.data(), size, &sectionRead) != FALSE;
+        if (!readSucceeded || sectionRead < size)
+          return NgxLocateResult::Incomplete;
+        executableSections.push_back(std::move(copy));
+      }
 
-        const size_t scanLen = size_t(sectionRead);
-        for (size_t off = 0; off + kUe3ScreenPercentageSigLen <= scanLen; off++) {
-          if (matchUe3ScreenPercentageSig(sectionBuffer.data() + off)) {
-            uint32_t absoluteAddress = 0;
-            std::memcpy(&absoluteAddress, sectionBuffer.data() + off + 4, sizeof(absoluteAddress));
-            return uintptr_t(absoluteAddress);
-          }
+      uintptr_t scaleViewportInstruction = 0;
+      uint32_t screenPercentageAddress = 0;
+      uint32_t validatedConst100Address = 0;
+
+      // The anchor supplies the real field and comparison-constant addresses.
+      for (const ExecutableSectionCopy& section : executableSections) {
+        const size_t scanLen = section.bytes.size();
+        for (size_t off = 0; off + kUe3ScreenPercentageSigScanLen <= scanLen; off++) {
+          const uint8_t* p = section.bytes.data() + off;
+          if (!matchUe3ScreenPercentageSig(p))
+            continue;
+
+          uint32_t candidateScreenPercentageAddress = 0;
+          uint32_t const100Address = 0;
+          std::memcpy(&candidateScreenPercentageAddress, p + 4,
+                      sizeof(candidateScreenPercentageAddress));
+          std::memcpy(&const100Address, p + kUe3ScreenPercentageSigLen,
+                      sizeof(const100Address));
+
+          const uintptr_t moduleEnd = base + moduleSize;
+          if (moduleSize != 0 &&
+              (uintptr_t(candidateScreenPercentageAddress) < base ||
+               uintptr_t(candidateScreenPercentageAddress) + kUe3RtMaxMultisamplesFromScreenPercentage +
+                 sizeof(int32_t) > moduleEnd ||
+               uintptr_t(const100Address) < base ||
+               uintptr_t(const100Address) + sizeof(float) > moduleEnd))
+            continue;
+
+          float const100 = 0.0f;
+          float currentScreenPercentage = 0.0f;
+          if (!ngxReadProcessExact(proc, uintptr_t(const100Address), const100) ||
+              const100 != 100.0f ||
+              !ngxReadProcessExact(proc, uintptr_t(candidateScreenPercentageAddress),
+                                   currentScreenPercentage) ||
+              !std::isfinite(currentScreenPercentage) ||
+              currentScreenPercentage <= 0.0f || currentScreenPercentage > 400.0f)
+            continue;
+
+          if (scaleViewportInstruction != 0)
+            return NgxLocateResult::Miss;
+
+          scaleViewportInstruction = section.address + off;
+          screenPercentageAddress = candidateScreenPercentageAddress;
+          validatedConst100Address = const100Address;
+          outSettings.currentScreenPercentage = currentScreenPercentage;
         }
       }
 
-      return 0;
+      if (scaleViewportInstruction == 0)
+        return NgxLocateResult::Miss;
+
+      outSettings.screenPercentageAddress = uintptr_t(screenPercentageAddress);
+
+      const uintptr_t upscaleAddress =
+        outSettings.screenPercentageAddress + sizeof(float);
+      const uintptr_t gameMaxMultisamplesAddress =
+        outSettings.screenPercentageAddress + kUe3MaxMultisamplesFromScreenPercentage;
+      const uintptr_t rtMaxMultisamplesAddress =
+        outSettings.screenPercentageAddress + kUe3RtMaxMultisamplesFromScreenPercentage;
+
+      if (!ngxReadProcessExact(proc, upscaleAddress,
+                               outSettings.currentUpscaleScreenPercentage) ||
+          (outSettings.currentUpscaleScreenPercentage != 0 &&
+           outSettings.currentUpscaleScreenPercentage != 1) ||
+          !ngxReadProcessExact(proc, gameMaxMultisamplesAddress,
+                               outSettings.currentMaxMultisamples) ||
+          !ngxReadProcessExact(proc, rtMaxMultisamplesAddress,
+                               outSettings.currentRtMaxMultisamples))
+        return NgxLocateResult::Incomplete;
+
+      const auto appendUnique = [](std::vector<NgxOperandSite>& sites,
+                                   uintptr_t address, uint32_t original) {
+        for (const NgxOperandSite& site : sites) {
+          if (site.address == address)
+            return;
+        }
+        sites.push_back({ address, original });
+      };
+
+      const auto bytesAt = [&](uintptr_t address, size_t length)
+          -> const uint8_t* {
+        for (const ExecutableSectionCopy& section : executableSections) {
+          if (address >= section.address &&
+              address - section.address <= section.bytes.size() &&
+              length <= section.bytes.size() - size_t(address - section.address))
+            return section.bytes.data() + (address - section.address);
+        }
+        return nullptr;
+      };
+
+      // Full instruction context at fixed offsets establishes the secondary boundaries;
+      // branch bytes are intentionally ignored.
+      if (scaleViewportInstruction < 0x390)
+        return NgxLocateResult::Miss;
+      const uintptr_t needsUpscaleInstruction =
+        scaleViewportInstruction - 0x390;
+      const uintptr_t computeUpscaleInstruction =
+        scaleViewportInstruction + 0x100;
+      const uint8_t* needsUpscale =
+        bytesAt(needsUpscaleInstruction, 27);
+      const uint8_t* computeUpscale =
+        bytesAt(computeUpscaleInstruction, 56);
+      if (needsUpscale == nullptr || computeUpscale == nullptr)
+        return NgxLocateResult::Miss;
+
+      uint32_t needsUpscaleDisplacement = 0;
+      uint32_t needsScreenPercentageDisplacement = 0;
+      uint32_t needsConst100Address = 0;
+      std::memcpy(&needsUpscaleDisplacement, needsUpscale + 2,
+                  sizeof(needsUpscaleDisplacement));
+      std::memcpy(&needsConst100Address, needsUpscale + 13,
+                  sizeof(needsConst100Address));
+      std::memcpy(&needsScreenPercentageDisplacement, needsUpscale + 20,
+                  sizeof(needsScreenPercentageDisplacement));
+      const bool needsUpscaleValid =
+        needsUpscale[0] == 0x83 && needsUpscale[1] == 0xB9 &&
+        needsUpscale[6] == 0x00 &&
+        needsUpscaleDisplacement ==
+          kUe3UpscaleScreenPercentageFromSystemSettings &&
+        needsUpscale[9] == 0xF3 && needsUpscale[10] == 0x0F &&
+        needsUpscale[11] == 0x10 && needsUpscale[12] == 0x05 &&
+        needsConst100Address == validatedConst100Address &&
+        needsUpscale[17] == 0x0F && needsUpscale[18] == 0x2F &&
+        needsUpscale[19] == 0x81 &&
+        needsScreenPercentageDisplacement ==
+          kUe3ScreenPercentageFromSystemSettings;
+
+      uint32_t computeUpscaleDisplacement = 0;
+      uint32_t computeScreenPercentageDisplacement = 0;
+      uint32_t computeConst100Address = 0;
+      uint32_t computeDirectScreenPercentageAddress = 0;
+      std::memcpy(&computeUpscaleDisplacement, computeUpscale + 3,
+                  sizeof(computeUpscaleDisplacement));
+      std::memcpy(&computeConst100Address, computeUpscale + 18,
+                  sizeof(computeConst100Address));
+      std::memcpy(&computeScreenPercentageDisplacement,
+                  computeUpscale + 25,
+                  sizeof(computeScreenPercentageDisplacement));
+      std::memcpy(&computeDirectScreenPercentageAddress,
+                  computeUpscale + 0x34,
+                  sizeof(computeDirectScreenPercentageAddress));
+      const bool computeUpscaleValid =
+        computeUpscale[0] == 0x51 &&
+        computeUpscale[1] == 0x83 && computeUpscale[2] == 0xB9 &&
+        computeUpscale[7] == 0x00 &&
+        computeUpscaleDisplacement ==
+          kUe3UpscaleScreenPercentageFromSystemSettings &&
+        computeUpscale[14] == 0xF3 && computeUpscale[15] == 0x0F &&
+        computeUpscale[16] == 0x10 && computeUpscale[17] == 0x05 &&
+        computeConst100Address == validatedConst100Address &&
+        computeUpscale[22] == 0x0F && computeUpscale[23] == 0x2F &&
+        computeUpscale[24] == 0x81 &&
+        computeScreenPercentageDisplacement ==
+          kUe3ScreenPercentageFromSystemSettings &&
+        computeUpscale[0x30] == 0xF3 &&
+        computeUpscale[0x31] == 0x0F &&
+        computeUpscale[0x32] == 0x10 &&
+        computeUpscale[0x33] == 0x05 &&
+        computeDirectScreenPercentageAddress == screenPercentageAddress;
+      if (!needsUpscaleValid || !computeUpscaleValid)
+        return NgxLocateResult::Miss;
+
+      appendUnique(outSettings.directScreenPercentageSites,
+                   scaleViewportInstruction + 4, screenPercentageAddress);
+      appendUnique(outSettings.directScreenPercentageSites,
+                   computeUpscaleInstruction + 0x34,
+                   screenPercentageAddress);
+      appendUnique(outSettings.relativeUpscaleScreenPercentageSites,
+                   needsUpscaleInstruction + 2,
+                   needsUpscaleDisplacement);
+      appendUnique(outSettings.relativeScreenPercentageSites,
+                   needsUpscaleInstruction + 20,
+                   needsScreenPercentageDisplacement);
+      appendUnique(outSettings.relativeUpscaleScreenPercentageSites,
+                   computeUpscaleInstruction + 3,
+                   computeUpscaleDisplacement);
+      appendUnique(outSettings.relativeScreenPercentageSites,
+                   computeUpscaleInstruction + 25,
+                   computeScreenPercentageDisplacement);
+
+      // Optional >100%-only cave readers remain stock: NGX never drives above 100, and their
+      // WRITECOPY pages cannot reliably regain their original protection after modification.
+      for (const ExecutableSectionCopy& section : executableSections) {
+        const uint8_t* bytes = section.bytes.data();
+        const size_t scanLen = section.bytes.size();
+        for (size_t off = 0; off + 23 <= scanLen; off++) {
+          if (bytes[off + 0] != 0xF3 || bytes[off + 1] != 0x0F ||
+              bytes[off + 2] != 0x10 || bytes[off + 3] != 0x05)
+            continue;
+
+          uint32_t operand = 0;
+          std::memcpy(&operand, bytes + off + 4, sizeof(operand));
+          const uintptr_t operandAddress = section.address + off + 4;
+          if (operand != screenPercentageAddress ||
+              operandAddress == scaleViewportInstruction + 4 ||
+              operandAddress == computeUpscaleInstruction + 0x34)
+            continue;
+
+          if (bytes[off + 8] != 0xF3 || bytes[off + 9] != 0x0F ||
+              bytes[off + 10] != 0x59 || bytes[off + 11] != 0x05 ||
+              bytes[off + 16] != 0x0F || bytes[off + 17] != 0x2F ||
+              bytes[off + 18] != 0x05)
+            return NgxLocateResult::Miss;
+
+          uint32_t const001Address = 0;
+          uint32_t const1Address = 0;
+          std::memcpy(&const001Address, bytes + off + 12,
+                      sizeof(const001Address));
+          std::memcpy(&const1Address, bytes + off + 19,
+                      sizeof(const1Address));
+          float const001 = 0.0f;
+          float const1 = 0.0f;
+          if (!ngxReadProcessExact(proc, uintptr_t(const001Address),
+                                   const001) ||
+              !ngxReadProcessExact(proc, uintptr_t(const1Address), const1) ||
+              const001 != 0.01f || const1 != 1.0f)
+            return NgxLocateResult::Miss;
+
+          outSettings.over100CaveReaderCount++;
+        }
+      }
+
+      if (outSettings.directScreenPercentageSites.size() != 2 ||
+          (outSettings.over100CaveReaderCount != 0 &&
+           outSettings.over100CaveReaderCount != 2) ||
+          (outSettings.over100CaveReaderCount == 2 &&
+           outSettings.currentScreenPercentage > 100.0f))
+        return NgxLocateResult::Miss;
+
+      // Match only the two resource-creation readers; the settings-sync reader stays real.
+      const uint32_t rtMaxMultisamples32 = uint32_t(rtMaxMultisamplesAddress);
+      constexpr uint8_t kMsaaReaderContextA[] = {
+        0x33, 0xFF, 0x3B, 0xC2,
+        0xC7, 0x44, 0x24, 0x28, 0x03, 0x00, 0x00, 0x00,
+        0x8B, 0xF2, 0x0F, 0x86,
+      };
+      constexpr uint8_t kMsaaReaderContextB[] = {
+        0x8B, 0x44, 0x24, 0x48,
+        0x33, 0xF6, 0x33, 0xFF, 0x83, 0xF9, 0x01,
+      };
+
+      for (const ExecutableSectionCopy& section : executableSections) {
+        const uint8_t* bytes = section.bytes.data();
+        const size_t scanLen = section.bytes.size();
+        for (size_t off = 0; off + sizeof(uint32_t) <= scanLen; off++) {
+          uint32_t operand = 0;
+          std::memcpy(&operand, bytes + off, sizeof(operand));
+          if (operand != rtMaxMultisamples32)
+            continue;
+
+          const bool readerA =
+            off >= 1 && bytes[off - 1] == 0xA1 &&
+            off + sizeof(uint32_t) + sizeof(kMsaaReaderContextA) <= scanLen &&
+            std::memcmp(bytes + off + sizeof(uint32_t),
+                        kMsaaReaderContextA,
+                        sizeof(kMsaaReaderContextA)) == 0;
+          const bool readerB =
+            off >= 2 && bytes[off - 2] == 0x8B &&
+            bytes[off - 1] == 0x0D &&
+            off + sizeof(uint32_t) + sizeof(kMsaaReaderContextB) <= scanLen &&
+            std::memcmp(bytes + off + sizeof(uint32_t),
+                        kMsaaReaderContextB,
+                        sizeof(kMsaaReaderContextB)) == 0;
+          if (!readerA && !readerB)
+            continue;
+
+          appendUnique(outSettings.directRtMaxMultisamplesSites,
+                       section.address + off, operand);
+        }
+      }
+
+      const bool msaaValuesPlausible =
+        outSettings.currentMaxMultisamples >= 0 &&
+        outSettings.currentMaxMultisamples <= kUe3MaxMultisamplesPlausibleLimit &&
+        outSettings.currentRtMaxMultisamples >= 0 &&
+        outSettings.currentRtMaxMultisamples <= kUe3MaxMultisamplesPlausibleLimit;
+
+      outSettings.msaaReadersValid =
+        msaaValuesPlausible &&
+        outSettings.directRtMaxMultisamplesSites.size() == 2;
+      if (!outSettings.msaaReadersValid)
+        outSettings.directRtMaxMultisamplesSites.clear();
+
+      return NgxLocateResult::Found;
     }
 
   }
@@ -11887,94 +12596,130 @@ namespace dxvk {
     const bool driving = m_frameOptions.ngxPassthroughMode &&
                          RtxNgxPassthrough::driveGameScreenPercentage();
 
-    // Locate the field whenever the mode is on and it has not been found yet (even when not
-    // driving: the scene-camera gate still needs the game's ScreenPercentage). The game is
-    // either this process (single-process DXVK) or the parent that launched NvRemixBridge.exe
-    // (the bridge); scan the current process first, then the parent, and keep whichever module
-    // has the signature. Retries until found so an early swap-chain reset before the game
-    // module is mapped does not permanently disable driving.
-    if (m_ngxScreenPercentageRemoteAddr == 0 && m_frameOptions.ngxPassthroughMode) {
+    // Rendering without ResetSwapChain has missed the safe MSAA setup window.
+    if (!m_ngxMsaaSetupDecisionCaptured &&
+        m_frameOptions.ngxPassthroughMode) {
+      m_ngxMsaaSetupDecisionCaptured = true;
+      m_ngxMsaaOverrideRequestedAtSetup =
+        RtxNgxPassthrough::disableGameMsaa();
+    }
 
-      struct Candidate { HANDLE handle; DWORD pid; bool ownsHandle; };
-      std::vector<Candidate> candidates;
-      candidates.push_back({ ::GetCurrentProcess(), ::GetCurrentProcessId(), false });
-
-      const DWORD parentPid = ngxGetParentPid();
-      if (parentPid != 0) {
-        HANDLE parent = ::OpenProcess(PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_QUERY_INFORMATION,
-                                      FALSE, parentPid);
-        if (parent != nullptr)
-          candidates.push_back({ parent, parentPid, true });
-      }
-
-      for (const Candidate& candidate : candidates) {
-        uintptr_t moduleBase = 0;
-        uint32_t moduleSize = 0;
-        if (!ngxGetMainModule(candidate.pid, moduleBase, moduleSize))
-          continue;
-
-        const uintptr_t address = ngxLocateScreenPercentage(candidate.handle, moduleBase, moduleSize);
-        if (address == 0)
-          continue;
-
-        m_ngxGameProcess = candidate.handle;
-        m_ngxGameProcessOwned = candidate.ownsHandle;
-        m_ngxScreenPercentageRemoteAddr = address;
-
-        float current = 100.0f;
-        SIZE_T bytesRead = 0;
-        if (::ReadProcessMemory(candidate.handle, reinterpret_cast<LPCVOID>(address), &current, sizeof(current), &bytesRead) &&
-            bytesRead == sizeof(current) && std::isfinite(current) && current > 0.0f)
-          m_ngxScreenPercentageOriginal = current;
-
-        Logger::info(str::format("[RTX NGX Passthrough] Game ScreenPercentage located at 0x",
-                                 std::hex, address, std::dec, " in ",
-                                 (candidate.ownsHandle ? "the parent game process (RTX Remix bridge)" : "the current process"),
-                                 " (current ", m_ngxScreenPercentageOriginal,
-                                 "); the DLSS mode selector now drives it."));
-        m_ngxScreenPercentageScanDone = true;
-        break;
-      }
-
-      // Release any opened parent handle we did not keep.
-      for (const Candidate& candidate : candidates) {
-        if (candidate.ownsHandle && candidate.handle != m_ngxGameProcess)
-          ::CloseHandle(candidate.handle);
-      }
-
-      if (m_ngxScreenPercentageRemoteAddr == 0) {
-        ONCE(Logger::warn("[RTX NGX Passthrough] Could not locate the game's ScreenPercentage field; "
-                          "the DLSS mode selector will not drive the render resolution. Use the in-game "
-                          "'scale set ScreenPercentage <value>' console command instead."));
+    // The camera gate needs ScreenPercentage even when automatic driving is disabled.
+    if (m_ngxScreenPercentageRemoteAddr == 0 && !m_ngxScreenPercentageScanDone &&
+        m_frameOptions.ngxPassthroughMode) {
+      const uint64_t nowMs = ::GetTickCount64();
+      if (nowMs >= m_ngxScreenPercentageNextScanMs) {
+        m_ngxScreenPercentageNextScanMs = nowMs + kNgxSettingsScanRetryIntervalMs;
+        locateNgxPassthroughGameSettings();
       }
     }
 
-    if (m_ngxScreenPercentageRemoteAddr == 0 || m_ngxGameProcess == nullptr) {
+    if (m_ngxScreenPercentageRemoteAddr == 0 ||
+        m_ngxGameSettingsShadowRemoteAddr == 0 ||
+        m_ngxGameProcess == nullptr) {
       m_ngxGameScreenPercentage = 0.0f;
       return;
     }
 
+    // A retained partial transaction is mirrored but never driven.
+    if (!m_ngxGameSettingsRedirectsValid) {
+      float liveScreenPercentage = 0.0f;
+      int32_t liveUpscale = 0;
+      int32_t liveRtMaxMultisamples = 0;
+      const bool screenValuesRead =
+        ngxReadProcessExact(m_ngxGameProcess,
+                            m_ngxScreenPercentageRemoteAddr,
+                            liveScreenPercentage) &&
+        ngxReadProcessExact(m_ngxGameProcess,
+                            m_ngxScreenPercentageRemoteAddr + sizeof(float),
+                            liveUpscale);
+      bool screenRollbackVerified = true;
+      const bool screenShadowUpdated =
+        screenValuesRead &&
+        ngxUpdateScreenPercentageShadow(
+          m_ngxGameProcess,
+          m_ngxGameSettingsShadowRemoteAddr,
+          liveScreenPercentage, liveUpscale,
+          &screenRollbackVerified);
+      const bool maxMultisamplesRead =
+        ngxReadProcessExact(
+          m_ngxGameProcess,
+          m_ngxScreenPercentageRemoteAddr +
+            kUe3RtMaxMultisamplesFromScreenPercentage,
+          liveRtMaxMultisamples);
+      const bool maxMultisamplesShadowUpdated =
+        maxMultisamplesRead &&
+        ngxWriteProcessExactRetry(
+          m_ngxGameProcess,
+          m_ngxGameSettingsShadowRemoteAddr +
+            kNgxShadowMaxMultisamplesOffset,
+          liveRtMaxMultisamples);
+
+      if (!screenShadowUpdated || !screenRollbackVerified ||
+          !maxMultisamplesShadowUpdated) {
+        ONCE(Logger::err(
+          "[RTX NGX Passthrough] A partially installed settings redirect could not be "
+          "fully mirrored from the game's live values; automatic driving remains disabled."));
+      }
+      if (screenShadowUpdated &&
+          m_frameOptions.ngxPassthroughMode &&
+          std::isfinite(liveScreenPercentage) &&
+          liveScreenPercentage > 0.0f)
+        m_ngxGameScreenPercentage = liveScreenPercentage;
+      if (!m_frameOptions.ngxPassthroughMode)
+        m_ngxGameScreenPercentage = 0.0f;
+      return;
+    }
+
+    applyNgxPassthroughMsaaDisable();
+
     if (!driving) {
-      // Restore the game's own value once when driving disengages (mode or option turned
-      // off), so a reduced ScreenPercentage does not persist as a stuck low resolution.
-      if (m_ngxScreenPercentageDriven) {
-        ::WriteProcessMemory(m_ngxGameProcess, reinterpret_cast<LPVOID>(m_ngxScreenPercentageRemoteAddr),
-                             &m_ngxScreenPercentageOriginal, sizeof(float), nullptr);
-        m_ngxScreenPercentageDriven = false;
-        Logger::info(str::format("[RTX NGX Passthrough] Restored game ScreenPercentage to ",
-                                 m_ngxScreenPercentageOriginal, "."));
+      float liveScreenPercentage = 0.0f;
+      int32_t liveUpscale = 0;
+      const bool liveValuesRead =
+        ngxReadProcessExact(m_ngxGameProcess, m_ngxScreenPercentageRemoteAddr,
+                            liveScreenPercentage) &&
+        ngxReadProcessExact(m_ngxGameProcess,
+                            m_ngxScreenPercentageRemoteAddr + sizeof(float),
+                            liveUpscale);
+
+      if (liveValuesRead) {
+        bool rollbackVerified = true;
+        const bool shadowUpdated =
+          ngxUpdateScreenPercentageShadow(
+            m_ngxGameProcess, m_ngxGameSettingsShadowRemoteAddr,
+            liveScreenPercentage, liveUpscale,
+            &rollbackVerified);
+        if (!shadowUpdated) {
+          ONCE(Logger::warn("[RTX NGX Passthrough] Could not commit the renderer-isolated "
+                            "ScreenPercentage shadow update; it will be retried next frame."));
+          if (!rollbackVerified) {
+            ONCE(Logger::err("[RTX NGX Passthrough] ScreenPercentage shadow rollback "
+                             "could not be verified after the failed update."));
+          }
+        } else {
+          if (m_frameOptions.ngxPassthroughMode &&
+              std::isfinite(liveScreenPercentage) &&
+              liveScreenPercentage > 0.0f)
+            m_ngxGameScreenPercentage = liveScreenPercentage;
+
+          if (m_ngxScreenPercentageDriven) {
+            Logger::info(str::format(
+              "[RTX NGX Passthrough] ScreenPercentage override released; renderer follows the "
+              "game's live value ", liveScreenPercentage, " (UpscaleScreenPercentage ",
+              liveUpscale, ")."));
+          }
+          m_ngxScreenPercentageDriven = false;
+          m_ngxScreenPercentageLastLogged = 0.0f;
+        }
+      } else {
+        ONCE(Logger::warn("[RTX NGX Passthrough] Could not read the game's live "
+                          "ScreenPercentage/UpscaleScreenPercentage; retaining the last "
+                          "effective shadow values."));
       }
 
-      // While the mode is on but we are not driving, keep the gate informed with the game's
-      // live value (whatever the player set via the console).
-      if (m_frameOptions.ngxPassthroughMode) {
-        float live = 0.0f;
-        SIZE_T bytesRead = 0;
-        if (::ReadProcessMemory(m_ngxGameProcess, reinterpret_cast<LPCVOID>(m_ngxScreenPercentageRemoteAddr),
-                                &live, sizeof(live), &bytesRead) &&
-            bytesRead == sizeof(live) && std::isfinite(live) && live > 0.0f)
-          m_ngxGameScreenPercentage = live;
-      }
+      if (!m_frameOptions.ngxPassthroughMode)
+        m_ngxGameScreenPercentage = 0.0f;
       return;
     }
 
@@ -11989,26 +12734,475 @@ namespace dxvk {
 
     const float screenPercentage = m_parent->GetDXVKDevice()->getCommon()->metaNgxPassthrough()
       .screenPercentageForDisplay(displayWidth, displayHeight);
+    if (!std::isfinite(screenPercentage) || screenPercentage <= 0.0f) {
+      ONCE(Logger::warn("[RTX NGX Passthrough] Upscaler returned an invalid "
+                        "ScreenPercentage; retaining the previous effective value."));
+      return;
+    }
 
-    // Force UpscaleScreenPercentage on (the adjacent field at +4) so Super Resolution engages:
-    // UE3 renders into a reduced subrect and stretches to the primary target, which the D3D9
-    // layer replaces with DLSS. At 100 (DLAA) NeedsUpscale is false regardless, so it is a
-    // no-op there.
+    // Reduced rendering requires the game's upscale gate; at 100 (DLAA) it is a no-op.
     const int32_t upscaleOn = 1;
-    ::WriteProcessMemory(m_ngxGameProcess, reinterpret_cast<LPVOID>(m_ngxScreenPercentageRemoteAddr + sizeof(float)),
-                         &upscaleOn, sizeof(upscaleOn), nullptr);
-    ::WriteProcessMemory(m_ngxGameProcess, reinterpret_cast<LPVOID>(m_ngxScreenPercentageRemoteAddr),
-                         &screenPercentage, sizeof(screenPercentage), nullptr);
+    bool rollbackVerified = true;
+    if (!ngxUpdateScreenPercentageShadow(
+          m_ngxGameProcess, m_ngxGameSettingsShadowRemoteAddr,
+          screenPercentage, upscaleOn, &rollbackVerified)) {
+      ONCE(Logger::warn("[RTX NGX Passthrough] Could not transactionally update the "
+                        "renderer-isolated ScreenPercentage shadow; it will be retried."));
+      if (!rollbackVerified) {
+        ONCE(Logger::err("[RTX NGX Passthrough] ScreenPercentage shadow rollback could "
+                         "not be verified after the failed update."));
+      }
+      return;
+    }
+
     m_ngxScreenPercentageDriven = true;
-    // The game applies this next frame; the gate then expects a main view at this scale.
     m_ngxGameScreenPercentage = screenPercentage;
 
     if (screenPercentage != m_ngxScreenPercentageLastLogged) {
       m_ngxScreenPercentageLastLogged = screenPercentage;
       Logger::info(str::format("[RTX NGX Passthrough] ", RtxNgxPassthrough::upscalerModeLabel(),
-                               " mode -> game ScreenPercentage ", screenPercentage,
+                               " mode -> effective ScreenPercentage ", screenPercentage,
                                (screenPercentage >= 99.5f ? " (native)." : " (Super Resolution).")));
     }
+  }
+
+  void D3D9Rtx::applyNgxPassthroughMsaaDisable() {
+    if (!m_ngxMsaaOverrideLatched)
+      return;
+
+    const uintptr_t shadowAddress =
+      m_ngxGameSettingsShadowRemoteAddr + kNgxShadowMaxMultisamplesOffset;
+    const int32_t msaaDisabled = 0;
+    if (!ngxWriteProcessExactRetry(
+          m_ngxGameProcess, shadowAddress, msaaDisabled)) {
+      ONCE(Logger::warn("[RTX NGX Passthrough] Could not update the renderer-isolated "
+                        "MaxMultisamples shadow; automatic MSAA disabling is unavailable."));
+      return;
+    }
+
+    if (!m_ngxGameMsaaDriven) {
+      m_ngxGameMsaaDriven = true;
+      int32_t gameMaxMultisamples = 0;
+      const bool gameValueRead = ngxReadProcessExact(
+        m_ngxGameProcess,
+        m_ngxScreenPercentageRemoteAddr +
+          kUe3MaxMultisamplesFromScreenPercentage,
+        gameMaxMultisamples);
+      if (!gameValueRead) {
+        Logger::info(
+          "[RTX NGX Passthrough] Effective MaxMultisamples pinned to 0.");
+      } else if (gameMaxMultisamples > 1) {
+        Logger::info(str::format(
+          "[RTX NGX Passthrough] Renderer MSAA disabled for this device: effective "
+          "MaxMultisamples 0 (game setting remains ", gameMaxMultisamples, ")."));
+      } else {
+        Logger::info("[RTX NGX Passthrough] Effective MaxMultisamples pinned to 0 for this "
+                     "device (the game's own MSAA setting was already off).");
+      }
+    }
+  }
+
+  void D3D9Rtx::locateNgxPassthroughGameSettings() {
+    // Current process + bridge parent; Incomplete results retry within the budget.
+    struct Candidate { HANDLE handle; DWORD pid; bool ownsHandle; };
+    std::vector<Candidate> candidates;
+    candidates.push_back({ ::GetCurrentProcess(), ::GetCurrentProcessId(), false });
+
+    bool anyIncomplete = false;
+
+    const DWORD parentPid = ngxGetParentPid();
+    if (parentPid != 0) {
+      HANDLE parent = ::OpenProcess(PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_QUERY_INFORMATION,
+                                    FALSE, parentPid);
+      if (parent != nullptr) {
+        candidates.push_back({ parent, parentPid, true });
+      } else {
+        anyIncomplete = true;
+      }
+    } else {
+      anyIncomplete = true;
+    }
+
+    for (const Candidate& candidate : candidates) {
+      uintptr_t moduleBase = 0;
+      uint32_t moduleSize = 0;
+      if (!ngxGetMainModule(candidate.pid, moduleBase, moduleSize)) {
+        anyIncomplete = true;
+        continue;
+      }
+
+      NgxLocatedGameSettings located;
+      const NgxLocateResult result =
+        ngxLocateGameSettings(candidate.handle, moduleBase, moduleSize, located);
+      if (result == NgxLocateResult::Incomplete)
+        anyIncomplete = true;
+      if (result != NgxLocateResult::Found)
+        continue;
+
+      void* shadowMemory =
+        ::VirtualAllocEx(candidate.handle, nullptr, sizeof(NgxGameSettingsShadow),
+                         MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+      const uintptr_t shadowAddress = reinterpret_cast<uintptr_t>(shadowMemory);
+      if (shadowMemory == nullptr ||
+          shadowAddress > uintptr_t(UINT32_MAX) - sizeof(NgxGameSettingsShadow)) {
+        if (shadowMemory != nullptr)
+          ::VirtualFreeEx(candidate.handle, shadowMemory, 0, MEM_RELEASE);
+        anyIncomplete = true;
+        continue;
+      }
+
+      NgxGameSettingsShadow shadow = {
+        located.currentScreenPercentage,
+        located.currentUpscaleScreenPercentage,
+        located.currentRtMaxMultisamples,
+      };
+      const bool msaaOverrideRequested =
+        m_ngxMsaaOverrideRequestedAtSetup;
+      const bool msaaOverrideAvailable =
+        msaaOverrideRequested &&
+        m_ngxMsaaRedirectSetupAllowed &&
+        located.msaaReadersValid;
+      // MSAA must be primed before the blocked resource-creation call resumes.
+      if (msaaOverrideAvailable)
+        shadow.maxMultisamples = 0;
+
+      if (!ngxWriteProcessExact(candidate.handle, shadowAddress, shadow)) {
+        ::VirtualFreeEx(candidate.handle, shadowMemory, 0, MEM_RELEASE);
+        anyIncomplete = true;
+        continue;
+      }
+
+      const uintptr_t systemSettingsAddress =
+        located.screenPercentageAddress -
+          kUe3ScreenPercentageFromSystemSettings;
+      const uint32_t shadowScreenPercentage =
+        uint32_t(shadowAddress + kNgxShadowScreenPercentageOffset);
+      const uint32_t shadowUpscaleScreenPercentage =
+        uint32_t(shadowAddress + kNgxShadowUpscaleScreenPercentageOffset);
+      const uint32_t shadowMaxMultisamples =
+        uint32_t(shadowAddress + kNgxShadowMaxMultisamplesOffset);
+      const uint32_t relativeShadowScreenPercentage =
+        uint32_t((shadowAddress + kNgxShadowScreenPercentageOffset) -
+                 systemSettingsAddress);
+      const uint32_t relativeShadowUpscaleScreenPercentage =
+        uint32_t((shadowAddress + kNgxShadowUpscaleScreenPercentageOffset) -
+                 systemSettingsAddress);
+
+      std::vector<NgxOperandRedirect> redirects;
+      redirects.reserve(
+        located.directScreenPercentageSites.size() +
+        located.relativeScreenPercentageSites.size() +
+        located.relativeUpscaleScreenPercentageSites.size() +
+        located.directRtMaxMultisamplesSites.size());
+
+      for (const NgxOperandSite& site : located.directScreenPercentageSites)
+        redirects.push_back({ site.address, site.original,
+                              shadowScreenPercentage });
+      for (const NgxOperandSite& site : located.relativeScreenPercentageSites)
+        redirects.push_back({ site.address, site.original,
+                              relativeShadowScreenPercentage });
+      for (const NgxOperandSite& site :
+           located.relativeUpscaleScreenPercentageSites)
+        redirects.push_back({ site.address, site.original,
+                              relativeShadowUpscaleScreenPercentage });
+      if (msaaOverrideAvailable) {
+        for (const NgxOperandSite& site :
+             located.directRtMaxMultisamplesSites)
+          redirects.push_back({ site.address, site.original,
+                                shadowMaxMultisamples });
+      }
+
+      std::vector<NgxOperandRedirect> activeRedirects;
+      activeRedirects.reserve(redirects.size());
+      bool redirectsApplied = false;
+      {
+        NgxScopedThreadSuspension suspended(candidate.pid);
+        if (suspended.complete()) {
+          redirectsApplied =
+            ngxApplyOperandRedirects(candidate.handle, redirects, activeRedirects);
+        }
+      }
+
+      if (!redirectsApplied) {
+        if (activeRedirects.empty()) {
+          ::VirtualFreeEx(candidate.handle, shadowMemory, 0, MEM_RELEASE);
+          anyIncomplete = true;
+          continue;
+        }
+
+        // Keep memory referenced by an operand that rollback could not restore.
+        m_ngxGameProcess = candidate.handle;
+        m_ngxGameProcessOwned = candidate.ownsHandle;
+        m_ngxGameProcessId = candidate.pid;
+        m_ngxScreenPercentageRemoteAddr =
+          located.screenPercentageAddress;
+        m_ngxGameSettingsShadowRemoteAddr = shadowAddress;
+        for (const NgxOperandRedirect& redirect : activeRedirects) {
+          m_ngxGameSettingsCodePatches.push_back({
+            redirect.address, redirect.original, redirect.redirected,
+            redirect.originalProtection,
+            redirect.originalProtectionKnown, true
+          });
+          uint32_t currentOperand = 0;
+          const bool currentReadable =
+            ngxReadProcessExact(candidate.handle, redirect.address,
+                                currentOperand);
+          MEMORY_BASIC_INFORMATION memoryInfo = {};
+          const bool protectionReadable =
+            ::VirtualQueryEx(
+              candidate.handle,
+              reinterpret_cast<LPCVOID>(redirect.address),
+              &memoryInfo, sizeof(memoryInfo)) == sizeof(memoryInfo);
+          Logger::err(str::format(
+            "[RTX NGX Passthrough] Outstanding operand at 0x", std::hex,
+            redirect.address, ": original=0x", redirect.original,
+            " redirected=0x", redirect.redirected,
+            " current=",
+            (currentReadable
+              ? str::format("0x", std::hex, currentOperand)
+              : std::string("<unreadable>")),
+            " originalProtect=0x", redirect.originalProtection,
+            " currentProtect=",
+            (protectionReadable
+              ? str::format("0x", std::hex, memoryInfo.Protect)
+              : std::string("<unreadable>")),
+            std::dec, "."));
+        }
+        m_ngxScreenPercentageScanDone = true;
+        Logger::err("[RTX NGX Passthrough] Game-settings operand redirection failed and "
+                    "could not be fully rolled back. Effective values remain mirrored from "
+                    "the game, but automatic ScreenPercentage/MSAA driving is disabled.");
+        break;
+      }
+
+      m_ngxGameProcess = candidate.handle;
+      m_ngxGameProcessOwned = candidate.ownsHandle;
+      m_ngxGameProcessId = candidate.pid;
+      m_ngxScreenPercentageRemoteAddr =
+        located.screenPercentageAddress;
+      m_ngxGameSettingsShadowRemoteAddr = shadowAddress;
+      m_ngxGameSettingsRedirectsValid = true;
+      m_ngxGameScreenPercentage = located.currentScreenPercentage;
+      m_ngxMsaaOverrideLatched = msaaOverrideAvailable;
+      m_ngxGameSettingsCodePatches.reserve(activeRedirects.size());
+      for (const NgxOperandRedirect& redirect : activeRedirects) {
+        m_ngxGameSettingsCodePatches.push_back({
+          redirect.address, redirect.original, redirect.redirected,
+          redirect.originalProtection,
+          redirect.originalProtectionKnown, false
+        });
+      }
+      m_ngxScreenPercentageScanDone = true;
+
+      Logger::info(str::format(
+        "[RTX NGX Passthrough] Game settings redirects installed in ",
+        (candidate.ownsHandle
+          ? "the parent game process (RTX Remix bridge)"
+          : "the current process"),
+        ": ScreenPercentage=0x", std::hex,
+        located.screenPercentageAddress, ", shadow=0x",
+        shadowAddress, std::dec, ", live=",
+        located.currentScreenPercentage, "/",
+        located.currentUpscaleScreenPercentage, "."));
+
+      if (msaaOverrideAvailable) {
+        Logger::info(str::format(
+          "[RTX NGX Passthrough] Renderer MSAA override installed (game/render-thread ",
+          located.currentMaxMultisamples, "/",
+          located.currentRtMaxMultisamples, ")."));
+      } else if (msaaOverrideRequested &&
+                 !m_ngxMsaaRedirectSetupAllowed) {
+        Logger::warn(
+          "[RTX NGX Passthrough] Game-settings scanning completed after the D3D device "
+          "setup window; MSAA readers were deliberately left stock because existing "
+          "resources cannot be changed safely. Recreate the device or restart the game "
+          "with rtx.ngxPassthrough.disableGameMsaa enabled.");
+      } else if (msaaOverrideRequested) {
+        Logger::warn(
+          "[RTX NGX Passthrough] Renderer MaxMultisamples readers failed validation; "
+          "the game's MSAA will not be disabled automatically. Use the in-game "
+          "'scale set MaxMultisamples 0' console command instead.");
+      }
+      break;
+    }
+
+    for (const Candidate& candidate : candidates) {
+      if (candidate.ownsHandle && candidate.handle != m_ngxGameProcess)
+        ::CloseHandle(candidate.handle);
+    }
+
+    if (m_ngxScreenPercentageRemoteAddr == 0 &&
+        m_ngxGameSettingsShadowRemoteAddr == 0) {
+      if (!anyIncomplete) {
+        m_ngxScreenPercentageScanDone = true;
+        Logger::warn(
+          "[RTX NGX Passthrough] The required game-settings reader signatures are not "
+          "present in this executable; the DLSS mode selector will not drive render "
+          "resolution and game MSAA will not be disabled automatically. Use the in-game "
+          "'scale set ScreenPercentage <value>' and 'scale set MaxMultisamples 0' console "
+          "commands instead.");
+      } else if (++m_ngxScreenPercentageScanAttempts >= kNgxSettingsScanMaxAttempts) {
+        m_ngxScreenPercentageScanDone = true;
+        Logger::warn(str::format(
+          "[RTX NGX Passthrough] Could not install the game-settings reader redirects after ",
+          kNgxSettingsScanMaxAttempts,
+          " attempts (game process/module not readable or patchable); giving up. The DLSS "
+          "mode selector will not drive render resolution. Use the in-game "
+          "'scale set ScreenPercentage <value>' console command instead."));
+      }
+    }
+  }
+
+  void D3D9Rtx::restoreNgxGameSettingsRedirects() {
+    if (m_ngxGameProcess == nullptr ||
+        m_ngxGameSettingsShadowRemoteAddr == 0)
+      return;
+
+    // Mirror live values first so any unrestorable redirect stays coherent.
+    bool screenShadowMirrored = false;
+    const uint32_t realRtMaxMultisamples =
+      uint32_t(m_ngxScreenPercentageRemoteAddr +
+               kUe3RtMaxMultisamplesFromScreenPercentage);
+    bool maxMultisamplesShadowReferenced = false;
+    for (const NgxGameSettingsCodePatch& patch :
+         m_ngxGameSettingsCodePatches) {
+      maxMultisamplesShadowReferenced |=
+        patch.originalOperand == realRtMaxMultisamples;
+    }
+    bool msaaShadowMirrored = !maxMultisamplesShadowReferenced;
+    if (m_ngxScreenPercentageRemoteAddr != 0) {
+      float liveScreenPercentage = 0.0f;
+      int32_t liveUpscale = 0;
+      if (ngxReadProcessExact(m_ngxGameProcess,
+                              m_ngxScreenPercentageRemoteAddr,
+                              liveScreenPercentage) &&
+          ngxReadProcessExact(m_ngxGameProcess,
+                              m_ngxScreenPercentageRemoteAddr + sizeof(float),
+                              liveUpscale)) {
+        bool rollbackVerified = true;
+        screenShadowMirrored =
+          ngxUpdateScreenPercentageShadow(
+            m_ngxGameProcess, m_ngxGameSettingsShadowRemoteAddr,
+            liveScreenPercentage, liveUpscale,
+            &rollbackVerified) &&
+          rollbackVerified;
+      }
+
+      int32_t liveRtMaxMultisamples = 0;
+      if (ngxReadProcessExact(
+            m_ngxGameProcess,
+            m_ngxScreenPercentageRemoteAddr +
+              kUe3RtMaxMultisamplesFromScreenPercentage,
+            liveRtMaxMultisamples)) {
+        msaaShadowMirrored = ngxWriteProcessExactRetry(
+          m_ngxGameProcess,
+          m_ngxGameSettingsShadowRemoteAddr +
+            kNgxShadowMaxMultisamplesOffset,
+          liveRtMaxMultisamples);
+      }
+    }
+
+    bool allRedirectsReleased = true;
+    bool suspensionComplete = false;
+    bool shadowReleased = false;
+    std::vector<uintptr_t> externallyChangedOperands;
+    externallyChangedOperands.reserve(m_ngxGameSettingsCodePatches.size());
+    {
+      NgxScopedThreadSuspension suspended(m_ngxGameProcessId);
+      suspensionComplete = suspended.complete();
+      if (suspensionComplete) {
+        for (auto it = m_ngxGameSettingsCodePatches.rbegin();
+             it != m_ngxGameSettingsCodePatches.rend(); ++it) {
+          NgxOperandRedirect redirect = {
+            it->operandAddress,
+            it->originalOperand,
+            it->redirectedOperand,
+            it->originalProtection,
+            it->originalProtectionKnown,
+            it->forceRestore,
+          };
+          uint32_t current = 0;
+          if (!ngxReadProcessExact(m_ngxGameProcess, it->operandAddress,
+                                   current)) {
+            allRedirectsReleased = false;
+            continue;
+          }
+
+          if (it->forceRestore ||
+              current == it->redirectedOperand) {
+            if (!ngxRestoreCodeOperand(m_ngxGameProcess, redirect))
+              allRedirectsReleased = false;
+          } else if (current != it->originalOperand) {
+            // External owner; do not clobber. Safe to free our shadow for this site.
+            externallyChangedOperands.push_back(it->operandAddress);
+          }
+        }
+
+        // Confirm no live operand still references the shadow before free.
+        for (const NgxGameSettingsCodePatch& patch :
+             m_ngxGameSettingsCodePatches) {
+          uint32_t current = 0;
+          if (!ngxReadProcessExact(m_ngxGameProcess, patch.operandAddress,
+                                   current) ||
+              current == patch.redirectedOperand ||
+              (patch.forceRestore && current != patch.originalOperand))
+            allRedirectsReleased = false;
+        }
+
+        // Free while still suspended so resumed threads cannot race the release.
+        if (allRedirectsReleased) {
+          shadowReleased =
+            ::VirtualFreeEx(
+              m_ngxGameProcess,
+              reinterpret_cast<LPVOID>(
+                m_ngxGameSettingsShadowRemoteAddr),
+              0, MEM_RELEASE) != FALSE;
+        }
+      }
+    }
+
+    if (!suspensionComplete) {
+      Logger::warn(
+        "[RTX NGX Passthrough] Could not quiesce the game threads to restore settings "
+        "reader operands; retaining the renderer shadow allocation.");
+      if (!screenShadowMirrored || !msaaShadowMirrored) {
+        Logger::err(
+          "[RTX NGX Passthrough] The retained renderer shadow could not be fully returned "
+          "to the game's live values before teardown.");
+      }
+      return;
+    }
+
+    for (const uintptr_t address : externallyChangedOperands) {
+      Logger::warn(str::format(
+        "[RTX NGX Passthrough] Settings reader operand at 0x", std::hex,
+        address, std::dec,
+        " changed by another component; leaving its value intact."));
+    }
+
+    if (allRedirectsReleased) {
+      if (!shadowReleased) {
+        Logger::warn(
+          "[RTX NGX Passthrough] Settings reader operands were restored, but the renderer "
+          "shadow allocation could not be released.");
+      }
+      m_ngxGameSettingsCodePatches.clear();
+      m_ngxGameSettingsShadowRemoteAddr = 0;
+    } else {
+      Logger::warn(
+        "[RTX NGX Passthrough] One or more settings reader operands could not be restored; "
+        "retaining the renderer shadow allocation so no game code points to freed memory.");
+      if (!screenShadowMirrored || !msaaShadowMirrored) {
+        Logger::err(
+          "[RTX NGX Passthrough] The retained renderer shadow could not be fully returned "
+          "to the game's live values.");
+      }
+    }
+
+    m_ngxScreenPercentageDriven = false;
+    m_ngxGameMsaaDriven = false;
+    m_ngxMsaaOverrideLatched = false;
+    m_ngxGameSettingsRedirectsValid = false;
   }
 
   void D3D9Rtx::emitNgxPassthroughFrameData() {
@@ -12950,13 +14144,24 @@ namespace dxvk {
     // Cache the present parameters
     m_activePresentParams = presentationParameters;
 
-    // Prime ScreenPercentage as soon as the display size is known so the first scene pass
-    // can render at the upscaler's target resolution instead of waiting for EndFrame.
+    const bool initialMsaaSetupWindow =
+      !m_ngxMsaaSetupDecisionCaptured;
+    if (initialMsaaSetupWindow) {
+      m_ngxMsaaSetupDecisionCaptured = true;
+      m_ngxMsaaOverrideRequestedAtSetup =
+        RtxNgxPassthrough::ngxPassthroughMode() &&
+        RtxNgxPassthrough::disableGameMsaa();
+    }
+
+    // Prime settings before the first scene pass.
     if (RtxNgxPassthrough::ngxPassthroughMode()) {
       if (!m_frameOptions.valid) {
         refreshFrameOptionCache();
       }
+      // Late scan retries may not change a resource-creation setting.
+      m_ngxMsaaRedirectSetupAllowed = initialMsaaSetupWindow;
       applyNgxPassthroughScreenPercentage();
+      m_ngxMsaaRedirectSetupAllowed = false;
     }
 
     // Inform the backend about potential presenter update
@@ -13038,9 +14243,7 @@ namespace dxvk {
     // replay) read fresh values and the next frame's draws see this frame's resolution.
     refreshFrameOptionCache();
 
-    // Drive the game's ScreenPercentage from the Remix upscaler quality preset. Done here
-    // (at present time) so the value is in place before the next frame's scene viewport
-    // setup reads it; also restores the game's own value when the feature is turned off.
+    // Update the effective settings before the next frame.
     applyNgxPassthroughScreenPercentage();
 
     // Flush this frame's replacement-material-hash tracking as one CS command. Must be
