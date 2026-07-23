@@ -26,6 +26,7 @@
 #include "d3d9_hud.h"
 #include "../util/util_env.h"
 #include "../dxvk/rtx_render/rtx_bridge_message_channel.h"
+#include "../dxvk/rtx_render/rtx_ngx_passthrough.h"
 #include "../dxvk/dxvk_scoped_annotation.h"
 
 
@@ -59,11 +60,17 @@ namespace dxvk {
 
     m_parent->m_rtx.EndFrame(targetImage);
 
-    m_parent->EmitCs([this, cTargetImage = targetImage, cSrcImage = srcImage](DxvkContext* ctx) {
-      dxvk::RtxContext::blitImageHelper(ctx, cSrcImage, cTargetImage, VkFilter::VK_FILTER_NEAREST);
-    });
+    // NGX passthrough writes the upscaled frame directly into the backbuffer during
+    // EndFrame/injectRTX. Blitting the path-traced finalOutput over it (the RT pipeline
+    // does not run in this mode) would replace the upscale with stale content every frame.
+    if (!RtxNgxPassthrough::ngxPassthroughMode()) {
+      m_parent->EmitCs([this, cTargetImage = targetImage, cSrcImage = srcImage](DxvkContext* ctx) {
+        dxvk::RtxContext::blitImageHelper(ctx, cSrcImage, cTargetImage, VkFilter::VK_FILTER_NEAREST);
+      });
 
-    m_parent->Flush();
+      m_parent->Flush();
+    }
+
     m_parent->SynchronizeCsThread();
 
     m_context->beginRecording(m_device->createCommandList());

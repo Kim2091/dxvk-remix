@@ -500,6 +500,12 @@ namespace dxvk {
       */
     void NotifyStretchRect(const Rc<DxvkImage>& sourceImage, const Rc<DxvkImage>& destImage);
 
+    /**
+      * \brief: NGX passthrough mode: one-time XeSS input-resolution sync once the display
+      * size is known (preset sync runs earlier in RtxInitializer).
+      */
+    void bootstrapNgxPassthroughUpscaler(uint32_t displayWidth, uint32_t displayHeight);
+
   private: 
     // Reused fixed-size blocks: once allocated, a block is never reallocated, so background
     // skinning can keep raw Matrix4* into a prior copy. m_blocks can grow, but the heap
@@ -876,6 +882,13 @@ namespace dxvk {
     // The game's current ScreenPercentage, cached for the scene-camera gate to size-match the
     // main view against backbuffer * ScreenPercentage / 100. 0 = unknown.
     float m_ngxGameScreenPercentage = 0.0f;
+    bool m_ngxPassthroughBootstrapped = false;
+
+    // Latest UE3 camera matrices accepted this frame; replayed into the CS camera at injection
+    // time so dispatch does not depend on earlier async processExternalCamera ordering.
+    Matrix4 m_ngxFrameWorldToView;
+    Matrix4 m_ngxFrameViewToProjection;
+    bool m_ngxFrameCameraMatricesValid = false;
 
     // Cache-backed UE3 camera extraction from the current vertex shader constants (shares
     // m_ue3CameraConstantsCache with the ray traced path; entries are keyed by the raw

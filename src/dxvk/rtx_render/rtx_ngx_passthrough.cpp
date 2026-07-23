@@ -30,6 +30,11 @@
 #include "rtx_ngx_wrapper.h"
 #include "rtx_dlfg.h"
 #include "rtx_dlss.h"
+#include "rtx_nis.h"
+#include "rtx_taa.h"
+#ifndef _M_ARM64
+#include "rtx_xess.h"
+#endif
 #include "rtx_postFx.h"
 #include "rtx_auto_exposure.h"
 #include "rtx_imgui.h"
@@ -44,6 +49,16 @@
 #include <rtx_shaders/ngx_passthrough_velocity_fragment.h>
 
 namespace dxvk {
+  void RtxNgxPassthrough::enforceRaytracingDisabledForPassthrough() {
+    if (ngxPassthroughMode() && RtxOptions::enableRaytracing()) {
+      RtxOptions::enableRaytracing.setImmediately(false);
+    }
+  }
+
+  void RtxNgxPassthrough::ngxPassthroughModeOnChange(DxvkDevice* device) {
+    enforceRaytracingDisabledForPassthrough();
+  }
+
   namespace {
     class NgxPassthroughMvShader : public ManagedShader {
       SHADER_SOURCE(NgxPassthroughMvShader, VK_SHADER_STAGE_COMPUTE_BIT, ngx_passthrough_mv)
@@ -910,6 +925,138 @@ namespace dxvk {
     return true;
   }
 
+#ifndef _M_ARM64
+  void RtxNgxPassthrough::syncXeSSInputResolution(uint32_t displayWidth, uint32_t displayHeight) {
+    if (!RtxOptions::isXeSSEnabled()) {
+      return;
+    }
+
+    if (displayWidth == 0 || displayHeight == 0) {
+      displayWidth = m_displayExtent.width;
+      displayHeight = m_displayExtent.height;
+    }
+
+    if (displayWidth == 0 || displayHeight == 0) {
+      return;
+    }
+
+    uint32_t displaySize[2] = { displayWidth, displayHeight };
+    uint32_t renderSize[2] = { 0, 0 };
+    m_device->getCommon()->metaXeSS().setSetting(displaySize, DxvkXeSS::XessOptions::preset(), renderSize);
+  }
+
+  void RtxNgxPassthrough::getXeSSInputResolution(uint32_t displayWidth, uint32_t displayHeight,
+                                                 uint32_t& inputWidth, uint32_t& inputHeight) {
+    syncXeSSInputResolution(displayWidth, displayHeight);
+    m_device->getCommon()->metaXeSS().getInputSize(inputWidth, inputHeight);
+  }
+#else
+  void RtxNgxPassthrough::syncXeSSInputResolution(uint32_t, uint32_t) {
+  }
+
+  void RtxNgxPassthrough::getXeSSInputResolution(uint32_t, uint32_t, uint32_t& inputWidth, uint32_t& inputHeight) {
+    inputWidth = 0;
+    inputHeight = 0;
+  }
+#endif
+
+  float RtxNgxPassthrough::screenPercentageForDisplay(uint32_t displayWidth, uint32_t displayHeight) {
+#ifndef _M_ARM64
+    if (RtxOptions::isXeSSEnabled() && displayWidth > 0 && displayHeight > 0) {
+      syncXeSSInputResolution(displayWidth, displayHeight);
+      const DxvkXeSS& xess = m_device->getCommon()->metaXeSS();
+      uint32_t inputWidth = 0;
+      uint32_t inputHeight = 0;
+      xess.getInputSize(inputWidth, inputHeight);
+      if (inputWidth > 0 && inputHeight > 0) {
+        return 100.0f * float(inputWidth) / float(displayWidth);
+      }
+    }
+#endif
+    return screenPercentageForUpscaler(displayWidth, displayHeight);
+  }
+
+  float RtxNgxPassthrough::screenPercentageForUpscaler(uint32_t displayWidth, uint32_t displayHeight) {
+    switch (RtxOptions::upscalerType()) {
+    case UpscalerType::DLSS: {
+      DLSSProfile profile = RtxOptions::qualityDLSS();
+      if (profile == DLSSProfile::Auto) {
+        if (displayHeight == 0 || displayHeight <= 1080) {
+          profile = DLSSProfile::MaxQuality;
+        } else if (displayHeight < 2160) {
+          profile = DLSSProfile::Balanced;
+        } else if (displayHeight < 4320) {
+          profile = DLSSProfile::MaxPerf;
+        } else {
+          profile = DLSSProfile::UltraPerf;
+        }
+      }
+
+      switch (profile) {
+      case DLSSProfile::UltraPerf:      return 100.0f / 3.0f;
+      case DLSSProfile::MaxPerf:        return 50.0f;
+      case DLSSProfile::Balanced:       return 58.0f;
+      case DLSSProfile::MaxQuality:     return 200.0f / 3.0f;
+      case DLSSProfile::FullResolution: return 100.0f;
+      default:                          return 100.0f;
+      }
+    }
+    case UpscalerType::NIS:
+      switch (RtxOptions::nisPreset()) {
+      case NisPreset::Performance: return 50.0f;
+      case NisPreset::Balanced:     return 66.0f;
+      case NisPreset::Quality:      return 75.0f;
+      default:                      return 100.0f;
+      }
+    case UpscalerType::TAAU:
+      switch (RtxOptions::taauPreset()) {
+      case TaauPreset::UltraPerformance: return 100.0f / 3.0f;
+      case TaauPreset::Performance:      return 50.0f;
+      case TaauPreset::Balanced:         return 66.0f;
+      case TaauPreset::Quality:          return 75.0f;
+      default:                           return 100.0f;
+      }
+#ifndef _M_ARM64
+    case UpscalerType::XeSS:
+      return DxvkXeSS::calcScreenPercentageForPreset(DxvkXeSS::XessOptions::preset());
+#endif
+    default:
+      return 100.0f;
+    }
+  }
+
+  const char* RtxNgxPassthrough::upscalerModeLabel() {
+    switch (RtxOptions::upscalerType()) {
+    case UpscalerType::DLSS: return "DLSS";
+    case UpscalerType::NIS:  return "NIS";
+    case UpscalerType::TAAU: return "TAA-U";
+    case UpscalerType::XeSS: return "XeSS";
+    default:                 return "None";
+    }
+  }
+
+  bool RtxNgxPassthrough::needsViewportJitter(DxvkDevice* device) {
+    switch (RtxOptions::upscalerType()) {
+    case UpscalerType::DLSS:
+      return device != nullptr && device->getCommon()->metaNGXContext().supportsDLSS();
+    case UpscalerType::TAAU:
+    case UpscalerType::XeSS:
+      return true;
+    default:
+      return false;
+    }
+  }
+
+  uint32_t RtxNgxPassthrough::viewportJitterSequenceLength(DxvkDevice* device) {
+#ifndef _M_ARM64
+    if (RtxOptions::isXeSSEnabled() && device != nullptr &&
+        DxvkXeSS::XessOptions::useRecommendedJitterSequenceLength()) {
+      return device->getCommon()->metaXeSS().calcRecommendedJitterSequenceLength();
+    }
+#endif
+    return RtxOptions::cameraJitterSequenceLength();
+  }
+
   namespace {
     // Maps an actual render/display resolution ratio onto the NGX quality value whose
     // standard scaling factor is closest (the game dictates the render resolution through
@@ -1064,6 +1211,118 @@ namespace dxvk {
     ctx->getCommandList()->trackResource<DxvkAccess::Write>(m_mergedOutput.image);
   }
 
+  void RtxNgxPassthrough::snapshotColorInput(RtxContext* ctx,
+                                             const Rc<DxvkImage>& colorSourceImage,
+                                             const VkOffset2D& colorSourceOffset) {
+    const DxvkFormatInfo* srcFormatInfo = imageFormatInfo(colorSourceImage->info().format);
+    const DxvkFormatInfo* dstFormatInfo = imageFormatInfo(m_colorInput.image->info().format);
+
+    VkImageBlit blitInfo = {};
+    blitInfo.srcSubresource = { srcFormatInfo->aspectMask, 0, 0, 1 };
+    blitInfo.dstSubresource = { dstFormatInfo->aspectMask, 0, 0, 1 };
+    blitInfo.srcOffsets[0] = { colorSourceOffset.x, colorSourceOffset.y, 0 };
+    blitInfo.srcOffsets[1] = { colorSourceOffset.x + int32_t(m_renderExtent.width),
+                               colorSourceOffset.y + int32_t(m_renderExtent.height), 1 };
+    blitInfo.dstOffsets[0] = { 0, 0, 0 };
+    blitInfo.dstOffsets[1] = { int32_t(m_renderExtent.width), int32_t(m_renderExtent.height), 1 };
+
+    const VkComponentMapping identityMap = {
+      VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+      VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+    };
+
+    ctx->blitImage(m_colorInput.image, identityMap, colorSourceImage, identityMap, blitInfo, VK_FILTER_NEAREST);
+  }
+
+  void RtxNgxPassthrough::copyColorInputToOutput(RtxContext* ctx) {
+    const DxvkFormatInfo* srcFormatInfo = imageFormatInfo(m_colorInput.image->info().format);
+    const DxvkFormatInfo* dstFormatInfo = imageFormatInfo(m_dlssOutput.image->info().format);
+
+    const VkFilter filter = (m_renderExtent.width != m_displayExtent.width ||
+                             m_renderExtent.height != m_displayExtent.height)
+      ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+
+    VkImageBlit blitInfo = {};
+    blitInfo.srcSubresource = { srcFormatInfo->aspectMask, 0, 0, 1 };
+    blitInfo.dstSubresource = { dstFormatInfo->aspectMask, 0, 0, 1 };
+    blitInfo.srcOffsets[0] = { 0, 0, 0 };
+    blitInfo.srcOffsets[1] = { int32_t(m_renderExtent.width), int32_t(m_renderExtent.height), 1 };
+    blitInfo.dstOffsets[0] = { 0, 0, 0 };
+    blitInfo.dstOffsets[1] = { int32_t(m_displayExtent.width), int32_t(m_displayExtent.height), 1 };
+
+    const VkComponentMapping identityMap = {
+      VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+      VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+    };
+
+    ctx->blitImage(m_dlssOutput.image, identityMap, m_colorInput.image, identityMap, blitInfo, filter);
+  }
+
+  bool RtxNgxPassthrough::evaluatePostFxOnly(RtxContext* ctx,
+                                             DxvkBarrierSet& barriers,
+                                             const Rc<DxvkImage>& colorSourceImage,
+                                             const VkOffset2D& colorSourceOffset,
+                                             const Rc<DxvkImage>& targetImage,
+                                             const VkOffset2D& targetOffset,
+                                             bool preserveTargetAlpha,
+                                             bool resetHistory) {
+    if (!m_device->getCommon()->metaPostFx().isPostFxEnabled()) {
+      return false;
+    }
+
+    snapshotColorInput(ctx, colorSourceImage, colorSourceOffset);
+    copyColorInputToOutput(ctx);
+
+    return applyPostFxAndWriteback(ctx, barriers, targetImage, targetOffset, preserveTargetAlpha, resetHistory);
+  }
+
+  bool RtxNgxPassthrough::applyPostFxAndWriteback(RtxContext* ctx,
+                                                  DxvkBarrierSet& barriers,
+                                                  const Rc<DxvkImage>& targetImage,
+                                                  const VkOffset2D& targetOffset,
+                                                  bool preserveTargetAlpha,
+                                                  bool resetHistory) {
+    {
+      DxvkPostFx& postFx = m_device->getCommon()->metaPostFx();
+
+      if (postFx.isPostFxEnabled()) {
+        ONCE(Logger::info("[RTX NGX Passthrough] Remix post effects (rtx.postfx) active on the anti-aliased output."));
+
+        const uvec2 renderResolution = { m_renderExtent.width, m_renderExtent.height };
+        const uint32_t frameIdx = RtxOptions::rngSeedWithFrameIndex() ? m_device->getCurrentFrameId() : 0;
+
+        Rc<DxvkSampler> nearestSampler =
+          ctx->getResourceManager().getSampler(VK_FILTER_NEAREST, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
+        Rc<DxvkSampler> linearSampler =
+          ctx->getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
+
+        DxvkPostFx::MotionBlurInputs motionBlurInputs = {};
+        motionBlurInputs.inOutColor = &m_dlssOutput;
+        motionBlurInputs.intermediateColor = &m_mergedOutput;
+        motionBlurInputs.screenSpaceMotionVector = &m_motionVectorQueue.get();
+        motionBlurInputs.surfaceFlags = &m_surfaceFlags;
+        motionBlurInputs.surfaceFlagsScratch1 = &m_surfaceFlagsScratch1;
+        motionBlurInputs.surfaceFlagsScratch2 = &m_surfaceFlagsScratch2;
+        motionBlurInputs.linearViewZ = &m_linearViewZ;
+
+        postFx.dispatchMotionBlur(ctx, nearestSampler, linearSampler, renderResolution, frameIdx,
+                                  motionBlurInputs, resetHistory);
+
+        postFx.dispatchLensEffects(ctx, linearSampler, renderResolution, frameIdx,
+                                   m_dlssOutput, m_mergedOutput);
+      }
+    }
+
+    if (preserveTargetAlpha) {
+      dispatchAlphaMerge(ctx, barriers);
+      blitToTargetRect(ctx, m_mergedOutput.image, m_displayExtent, targetImage, targetOffset);
+    } else {
+      blitToTargetRect(ctx, m_dlssOutput.image, m_displayExtent, targetImage, targetOffset);
+    }
+
+    return true;
+  }
+
   bool RtxNgxPassthrough::evaluateDlss(RtxContext* ctx,
                                        DxvkBarrierSet& barriers,
                                        const Rc<DxvkImage>& colorSourceImage,
@@ -1083,26 +1342,7 @@ namespace dxvk {
 
     // Snapshot the scene color subrect as the DLSS input (the DLSS output may be written
     // back over the same target, so it cannot be read in place)
-    {
-      const DxvkFormatInfo* srcFormatInfo = imageFormatInfo(colorSourceImage->info().format);
-      const DxvkFormatInfo* dstFormatInfo = imageFormatInfo(m_colorInput.image->info().format);
-
-      VkImageBlit blitInfo = {};
-      blitInfo.srcSubresource = { srcFormatInfo->aspectMask, 0, 0, 1 };
-      blitInfo.dstSubresource = { dstFormatInfo->aspectMask, 0, 0, 1 };
-      blitInfo.srcOffsets[0] = { colorSourceOffset.x, colorSourceOffset.y, 0 };
-      blitInfo.srcOffsets[1] = { colorSourceOffset.x + int32_t(m_renderExtent.width),
-                                 colorSourceOffset.y + int32_t(m_renderExtent.height), 1 };
-      blitInfo.dstOffsets[0] = { 0, 0, 0 };
-      blitInfo.dstOffsets[1] = { int32_t(m_renderExtent.width), int32_t(m_renderExtent.height), 1 };
-
-      const VkComponentMapping identityMap = {
-        VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
-        VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
-      };
-
-      ctx->blitImage(m_colorInput.image, identityMap, colorSourceImage, identityMap, blitInfo, VK_FILTER_NEAREST);
-    }
+    snapshotColorInput(ctx, colorSourceImage, colorSourceOffset);
 
     if (!m_dlssContext) {
       m_dlssContext = ngxContext.createDLSSContext();
@@ -1242,61 +1482,119 @@ namespace dxvk {
       return false;
     }
 
-    // Remix post-processing (rtx.postfx) on the anti-aliased image before the write-back:
-    // motion blur consumes the synthesized motion vectors, linear view-Z and surface flags
-    // (camera-locked foreground counts as view model and is excluded, exactly like the path
-    // tracer's first person exclusion); lens effects run on the same image. At the pre-post
-    // injection point the game's own post chain (bloom, tonemapping) then processes the
-    // result, so the blur lands pre-tonemap like the path traced pipeline's.
-    {
-      DxvkPostFx& postFx = m_device->getCommon()->metaPostFx();
-
-      if (postFx.isPostFxEnabled()) {
-        ONCE(Logger::info("[RTX NGX Passthrough] Remix post effects (rtx.postfx) active on the anti-aliased output."));
-
-        const uvec2 renderResolution = { m_renderExtent.width, m_renderExtent.height };
-        const uint32_t frameIdx = RtxOptions::rngSeedWithFrameIndex() ? m_device->getCurrentFrameId() : 0;
-
-        Rc<DxvkSampler> nearestSampler =
-          ctx->getResourceManager().getSampler(VK_FILTER_NEAREST, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
-        Rc<DxvkSampler> linearSampler =
-          ctx->getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
-
-        // m_mergedOutput doubles as the post-fx scratch: both passes copy their result
-        // back into m_dlssOutput, and the alpha merge below overwrites the scratch after.
-        // The blur consumes the synthesized motion vectors (true object motion included);
-        // motionBlurFirstPerson picks whether the camera-locked foreground participates
-        // or is excluded via the view model surface flag (crisp hands).
-        DxvkPostFx::MotionBlurInputs motionBlurInputs = {};
-        motionBlurInputs.inOutColor = &m_dlssOutput;
-        motionBlurInputs.intermediateColor = &m_mergedOutput;
-        motionBlurInputs.screenSpaceMotionVector = &m_motionVectorQueue.get();
-        motionBlurInputs.surfaceFlags = &m_surfaceFlags;
-        motionBlurInputs.surfaceFlagsScratch1 = &m_surfaceFlagsScratch1;
-        motionBlurInputs.surfaceFlagsScratch2 = &m_surfaceFlagsScratch2;
-        motionBlurInputs.linearViewZ = &m_linearViewZ;
-
-        postFx.dispatchMotionBlur(ctx, nearestSampler, linearSampler, renderResolution, frameIdx,
-                                  motionBlurInputs, resetHistory);
-
-        postFx.dispatchLensEffects(ctx, linearSampler, renderResolution, frameIdx,
-                                   m_dlssOutput, m_mergedOutput);
-      }
-    }
-
-    // Write the anti-aliased result back onto the game's color target: at the pre-post
-    // injection point the game's post chain consumes it, at the late one the game's UI
-    // rasterizes on top of it. Pre-post write-backs must carry the game's original alpha
-    // through (UE3 D3D9 stores the scene depth there; DLSS output alpha is undefined).
-    if (preserveTargetAlpha) {
-      dispatchAlphaMerge(ctx, barriers);
-      blitToTargetRect(ctx, m_mergedOutput.image, m_displayExtent, targetImage, targetOffset);
-    } else {
-      blitToTargetRect(ctx, m_dlssOutput.image, m_displayExtent, targetImage, targetOffset);
-    }
-
-    return true;
+    // Remix post-processing and write-back (shared with the other passthrough upscalers).
+    return applyPostFxAndWriteback(ctx, barriers, targetImage, targetOffset, preserveTargetAlpha, resetHistory);
   }
+
+  bool RtxNgxPassthrough::evaluateNis(RtxContext* ctx,
+                                      DxvkBarrierSet& barriers,
+                                      const Rc<DxvkImage>& colorSourceImage,
+                                      const VkOffset2D& colorSourceOffset,
+                                      const Rc<DxvkImage>& targetImage,
+                                      const VkOffset2D& targetOffset,
+                                      bool preserveTargetAlpha,
+                                      bool resetHistory) {
+    snapshotColorInput(ctx, colorSourceImage, colorSourceOffset);
+
+    {
+      ScopedGpuProfileZone(ctx, "NIS (NGX Passthrough)");
+      m_device->getCommon()->metaNIS().dispatch(ctx, m_colorInput, m_dlssOutput);
+    }
+
+    ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_colorInput.image);
+    ctx->getCommandList()->trackResource<DxvkAccess::Write>(m_dlssOutput.image);
+
+    return applyPostFxAndWriteback(ctx, barriers, targetImage, targetOffset, preserveTargetAlpha, resetHistory);
+  }
+
+  bool RtxNgxPassthrough::evaluateTaau(RtxContext* ctx,
+                                       DxvkBarrierSet& barriers,
+                                       const Rc<DxvkImage>& colorSourceImage,
+                                       const VkOffset2D& colorSourceOffset,
+                                       const Rc<DxvkImage>& targetImage,
+                                       const VkOffset2D& targetOffset,
+                                       bool preserveTargetAlpha,
+                                       const float jitter[2],
+                                       bool resetHistory) {
+    DxvkTemporalAA& taa = m_device->getCommon()->metaTAA();
+    if (!RtxOptions::isTAAEnabled()) {
+      m_statusReason = "rtx.upscalerType is not TAA-U";
+      return false;
+    }
+
+    snapshotColorInput(ctx, colorSourceImage, colorSourceOffset);
+
+    const VkExtent3D outputExtent = { m_displayExtent.width, m_displayExtent.height, 1 };
+    Rc<DxvkContext> dxvkCtx = ctx;
+    taa.ensureResources(dxvkCtx, outputExtent);
+
+    Rc<DxvkSampler> linearSampler =
+      ctx->getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
+
+    const uvec2 renderResolution = { m_renderExtent.width, m_renderExtent.height };
+
+    {
+      ScopedGpuProfileZone(ctx, "TAA-U (NGX Passthrough)");
+      taa.dispatch(ctx,
+                   linearSampler,
+                   renderResolution,
+                   jitter,
+                   m_colorInput,
+                   m_motionVectorQueue.get(),
+                   m_dlssOutput,
+                   true);
+    }
+
+    ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_colorInput.image);
+    ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_motionVectorQueue.get().image);
+    ctx->getCommandList()->trackResource<DxvkAccess::Write>(m_dlssOutput.image);
+
+    return applyPostFxAndWriteback(ctx, barriers, targetImage, targetOffset, preserveTargetAlpha, resetHistory);
+  }
+
+#ifndef _M_ARM64
+  bool RtxNgxPassthrough::evaluateXess(RtxContext* ctx,
+                                       DxvkBarrierSet& barriers,
+                                       const Rc<DxvkImage>& colorSourceImage,
+                                       const VkOffset2D& colorSourceOffset,
+                                       const Rc<DxvkImage>& targetImage,
+                                       const VkOffset2D& targetOffset,
+                                       bool preserveTargetAlpha,
+                                       bool resetHistory) {
+    DxvkXeSS& xess = m_device->getCommon()->metaXeSS();
+
+    Rc<DxvkContext> dxvkCtx = ctx;
+    const VkExtent3D renderExtent3D = { m_renderExtent.width, m_renderExtent.height, 1 };
+    const VkExtent3D displayExtent3D = { m_displayExtent.width, m_displayExtent.height, 1 };
+    xess.beginPassthroughFrame(dxvkCtx, renderExtent3D, displayExtent3D, resetHistory,
+                               ctx->getSceneManager().getCamera().isCameraCut());
+
+    if (!xess.isActive()) {
+      m_statusReason = "XeSS activation failed or is not supported on this system";
+      ONCE(Logger::warn("[RTX NGX Passthrough] XeSS is not active (activation failed or unsupported)."));
+      return false;
+    }
+
+    snapshotColorInput(ctx, colorSourceImage, colorSourceOffset);
+
+    uint32_t displaySize[2] = { m_displayExtent.width, m_displayExtent.height };
+    uint32_t renderSize[2] = { 0, 0 };
+    xess.setSetting(displaySize, DxvkXeSS::XessOptions::preset(), renderSize);
+
+    {
+      ScopedGpuProfileZone(ctx, "XeSS (NGX Passthrough)");
+      xess.dispatch(ctx,
+                    barriers,
+                    m_colorInput,
+                    m_motionVectorQueue.get(),
+                    m_depthQueue.get(),
+                    m_dlssOutput,
+                    resetHistory);
+    }
+
+    return applyPostFxAndWriteback(ctx, barriers, targetImage, targetOffset, preserveTargetAlpha, resetHistory);
+  }
+#endif
 
   void RtxNgxPassthrough::dispatch(RtxContext* ctx,
                                    DxvkContextState& dxvkCtxState,
@@ -1316,6 +1614,7 @@ namespace dxvk {
     m_lastJitter[0] = jitter[0];
     m_lastJitter[1] = jitter[1];
     m_lastDispatchPrePost = prePostProcess;
+    m_postFxActive = false;
 
     const bool dlfgSupported = m_device->getCommon()->metaNGXContext().supportsDLFG();
 
@@ -1347,6 +1646,12 @@ namespace dxvk {
     Rc<DxvkContext> dxvkCtx = ctx;
     createResources(dxvkCtx, renderExtent, displayExtent);
 
+#ifndef _M_ARM64
+    if (RtxOptions::isXeSSEnabled()) {
+      syncXeSSInputResolution(displayExtent.width, displayExtent.height);
+    }
+#endif
+
     RtCamera& camera = ctx->getSceneManager().getCameraManager().getCamera(CameraType::Main);
 
     const uint32_t renderSize[2] = { m_renderExtent.width, m_renderExtent.height };
@@ -1357,14 +1662,29 @@ namespace dxvk {
     // report exactly the value the frame was rasterized with so DLSS and DLFG agree with it
     camera.setExternalJitter(jitter);
 
-    const bool haveDlssInputs = generateMotionVectorsAndDepth(ctx, dxvkCtxState, barriers, sceneDepthImage, subrectOffset, camera,
-                                                              objectVelocities() ? velocityDraws : std::vector<NgxVelocityDraw>(),
-                                                              jitter);
+    const bool haveDepthMvInputs = generateMotionVectorsAndDepth(ctx, dxvkCtxState, barriers, sceneDepthImage, subrectOffset, camera,
+                                                                 objectVelocities() ? velocityDraws : std::vector<NgxVelocityDraw>(),
+                                                                 jitter);
 
-    // Computed into a local and stored once at the end: the imgui panel reads m_dlssActive
+    // Computed into a local and stored once at the end: the imgui panel reads m_upscalerActive
     // from the application thread while this dispatch runs on the CS thread, so a
     // clear-then-set pattern makes the displayed status flicker "inactive" mid-dispatch
-    bool dlssActive = false;
+    bool upscalerActive = false;
+
+    const bool preserveTargetAlpha = prePostProcess;
+    const VkOffset2D writebackOffset = prePostSubrectValid ? subrectOffset : VkOffset2D { 0, 0 };
+
+    const bool canRunNis = RtxOptions::isNISEnabled();
+    const bool canRunTaau = RtxOptions::isTAAEnabled() && haveDepthMvInputs;
+    // Ray Reconstruction is path-traced only. In NGX passthrough, DLSS Super Resolution /
+    // DLAA is selected purely by rtx.upscalerType (not enableRayReconstruction).
+    const bool canRunDlss = RtxOptions::upscalerType() == UpscalerType::DLSS && haveDepthMvInputs;
+#ifndef _M_ARM64
+    const bool canRunXess = RtxOptions::isXeSSEnabled() && haveDepthMvInputs;
+#else
+    const bool canRunXess = false;
+#endif
+    const bool canRunUpscaler = canRunNis || canRunTaau || canRunDlss || canRunXess;
 
     // Debug visualization only replaces the frame at the late injection point: the D3D9
     // layer stops the pre-post trigger while a debug mode is active (the game's post chain
@@ -1375,7 +1695,7 @@ namespace dxvk {
 
     bool wroteOutputToTarget = false;
 
-    if (haveDlssInputs && debugVisualizationActive) {
+    if (haveDepthMvInputs && debugVisualizationActive) {
       // The MV pass rendered an interpretable view of the synthesized inputs into the
       // output image (motion vectors centered at neutral gray, log-scale depth); it
       // replaces the frame and DLSS is skipped. The debug content is RENDER-resolution
@@ -1404,21 +1724,63 @@ namespace dxvk {
       wroteOutputToTarget = true;
       m_statusReason = "debug visualization active";
       m_statDebugVisCount++;
-    } else if (haveDlssInputs && !RtxOptions::isDLSSOrRayReconstructionEnabled()) {
-      // Note: checked against the DLSS upscaler type directly rather than isDLSSEnabled() -
-      // ray reconstruction (which that helper excludes) cannot exist without the path tracer,
-      // so a DLSS upscaler selection always means DLSS-SR/DLAA in this mode.
-      m_statusReason = "rtx.upscalerType is not DLSS";
+    } else if (!canRunUpscaler) {
+      if (RtxOptions::upscalerType() == UpscalerType::None) {
+        m_statusReason = "rtx.upscalerType is None";
+      } else if (RtxOptions::isRayReconstructionEnabled()) {
+        m_statusReason = "Ray Reconstruction is not available in NGX passthrough mode";
+      } else if (RtxOptions::isNISEnabled()) {
+        m_statusReason = "NIS upscaler inactive";
+      } else if (!haveDepthMvInputs) {
+        m_statusReason = "depth/MV inputs unavailable";
+        m_statNoInputsCount++;
+      } else {
+        m_statusReason = "selected upscaler unavailable";
+      }
       m_statUpscalerOffCount++;
-    } else if (haveDlssInputs) {
-      dlssActive = evaluateDlss(ctx, barriers, colorSourceImage, subrectOffset, targetImage,
-                                prePostSubrectValid ? subrectOffset : VkOffset2D { 0, 0 },
-                                /* preserveTargetAlpha = */ prePostProcess,
-                                jitter, resetHistory);
-      wroteOutputToTarget = dlssActive;
 
-      if (dlssActive) {
-        m_statusReason = "active";
+      if (evaluatePostFxOnly(ctx, barriers, colorSourceImage, subrectOffset, targetImage,
+                             writebackOffset, preserveTargetAlpha, resetHistory)) {
+        wroteOutputToTarget = true;
+        m_postFxActive = true;
+        m_statusReason = "active (postfx only)";
+      }
+    } else if (canRunNis) {
+      upscalerActive = evaluateNis(ctx, barriers, colorSourceImage, subrectOffset, targetImage,
+                                   writebackOffset, preserveTargetAlpha, resetHistory);
+      wroteOutputToTarget = upscalerActive;
+      if (upscalerActive) {
+        m_statusReason = "active (NIS)";
+      } else {
+        m_statEvaluateFailedCount++;
+      }
+    } else if (canRunTaau) {
+      upscalerActive = evaluateTaau(ctx, barriers, colorSourceImage, subrectOffset, targetImage,
+                                    writebackOffset, preserveTargetAlpha, jitter, resetHistory);
+      wroteOutputToTarget = upscalerActive;
+      if (upscalerActive) {
+        m_statusReason = "active (TAA-U)";
+      } else {
+        m_statEvaluateFailedCount++;
+      }
+#ifndef _M_ARM64
+    } else if (canRunXess) {
+      upscalerActive = evaluateXess(ctx, barriers, colorSourceImage, subrectOffset, targetImage,
+                                    writebackOffset, preserveTargetAlpha, resetHistory);
+      wroteOutputToTarget = upscalerActive;
+      if (upscalerActive) {
+        m_statusReason = "active (XeSS)";
+      } else {
+        m_statEvaluateFailedCount++;
+      }
+#endif
+    } else if (canRunDlss) {
+      upscalerActive = evaluateDlss(ctx, barriers, colorSourceImage, subrectOffset, targetImage,
+                                    writebackOffset, preserveTargetAlpha, jitter, resetHistory);
+      wroteOutputToTarget = upscalerActive;
+
+      if (upscalerActive) {
+        m_statusReason = "active (DLSS)";
       } else {
         m_statEvaluateFailedCount++;
       }
@@ -1437,13 +1799,13 @@ namespace dxvk {
                        prePostSubrectValid ? subrectOffset : VkOffset2D { 0, 0 });
     }
 
-    m_dlssActive = dlssActive;
+    m_upscalerActive = upscalerActive;
 
-    // Periodic diagnostic summary: makes intermittent dispatch/DLSS dropouts visible in the
+    // Periodic diagnostic summary: makes intermittent dispatch/upscaler dropouts visible in the
     // log with their reasons (the imgui status text alone cannot show fast alternation)
     m_statDispatchCount++;
-    if (dlssActive) {
-      m_statDlssActiveCount++;
+    if (upscalerActive) {
+      m_statUpscalerActiveCount++;
     }
     if (resetHistory) {
       // History resets discard DLSS's temporal accumulation; anything beyond rare camera
@@ -1457,21 +1819,21 @@ namespace dxvk {
     if (m_statDispatchCount >= 600) {
       const uint32_t currentFrameId = m_device->getCurrentFrameId();
 
-      if (m_statDlssActiveCount != m_statDispatchCount || m_statCameraInvalidCount != 0 || m_statResetHistoryCount != 0 ||
+      if (m_statUpscalerActiveCount != m_statDispatchCount || m_statCameraInvalidCount != 0 || m_statResetHistoryCount != 0 ||
           m_statPrePostCount != m_statDispatchCount) {
         Logger::info(str::format("[RTX NGX Passthrough] Dispatch summary (frames ", m_statWindowStartFrameId, "-", currentFrameId, "): ",
                                  m_statDispatchCount, " dispatches, ",
-                                 m_statDlssActiveCount, " with DLSS active, ",
+                                 m_statUpscalerActiveCount, " with upscaler active, ",
                                  m_statPrePostCount, " at the pre-post-process injection point, ",
                                  m_statResetHistoryCount, " with history reset, ",
                                  m_statDebugVisCount, " in debug visualization, ",
-                                 m_statEvaluateFailedCount, " with failed DLSS evaluation, ",
+                                 m_statEvaluateFailedCount, " with failed upscaler evaluation, ",
                                  m_statNoInputsCount, " without depth/MV inputs, ",
-                                 m_statUpscalerOffCount, " with non-DLSS upscaler, ",
+                                 m_statUpscalerOffCount, " with upscaler off/unavailable, ",
                                  m_statCameraInvalidCount, " frames skipped for invalid camera; last status: ", m_statusReason));
       }
       m_statDispatchCount = 0;
-      m_statDlssActiveCount = 0;
+      m_statUpscalerActiveCount = 0;
       m_statNoInputsCount = 0;
       m_statUpscalerOffCount = 0;
       m_statCameraInvalidCount = 0;
@@ -1509,7 +1871,7 @@ namespace dxvk {
     // Frame generation: hand this frame's camera + depth/motion vectors to the DLFG
     // presenter. The synthesized pair carries true object motion (foreground included),
     // so the interpolator moves dynamic objects and first person meshes geometrically.
-    if (haveDlssInputs && ctx->isDLFGEnabled()) {
+    if (haveDepthMvInputs && ctx->isDLFGEnabled()) {
       // Force vsync off if DLFG is enabled, as FG + vsync is not properly supported
       if (RtxOptions::enableVsyncState != EnableVsync::Off) {
         RtxOptions::enableVsync.setDeferred(EnableVsync::Off);
@@ -1552,33 +1914,32 @@ namespace dxvk {
   }
 
   void RtxNgxPassthrough::showImguiStatusLine(bool includeInjectionPoint) {
-    if (m_dlssActive) {
-      const DLSSProfile profile = RtxOptions::qualityDLSS();
-
-      const char* profileName = nullptr;
-      switch (profile) {
-      case DLSSProfile::MaxQuality: profileName = "Quality"; break;
-      case DLSSProfile::MaxPerf: profileName = "Performance"; break;
-      default: profileName = dlssProfileToString(profile); break;
-      }
-
-      const std::string profilePart = (profile == DLSSProfile::FullResolution)
-        ? str::format(profileName, " / DLAA")
-        : str::format(profileName, ", Super Resolution");
-
+    if (m_upscalerActive) {
       if (includeInjectionPoint) {
         const char* injectionPoint = m_lastDispatchPrePost ? "pre-post-process" : "late injection";
-        ImGui::TextWrapped(str::format("DLSS active (", profilePart, "): ",
+        ImGui::TextWrapped(str::format(m_statusReason, ": ",
                                        m_renderExtent.width, "x", m_renderExtent.height,
                                        " -> ", m_displayExtent.width, "x", m_displayExtent.height,
                                        ", ", injectionPoint).c_str());
       } else {
-        ImGui::TextWrapped(str::format("DLSS active (", profilePart, "): ",
+        ImGui::TextWrapped(str::format(m_statusReason, ": ",
+                                       m_renderExtent.width, "x", m_renderExtent.height,
+                                       " -> ", m_displayExtent.width, "x", m_displayExtent.height).c_str());
+      }
+    } else if (m_postFxActive) {
+      if (includeInjectionPoint) {
+        const char* injectionPoint = m_lastDispatchPrePost ? "pre-post-process" : "late injection";
+        ImGui::TextWrapped(str::format(m_statusReason, ": ",
+                                       m_renderExtent.width, "x", m_renderExtent.height,
+                                       " -> ", m_displayExtent.width, "x", m_displayExtent.height,
+                                       ", ", injectionPoint).c_str());
+      } else {
+        ImGui::TextWrapped(str::format(m_statusReason, ": ",
                                        m_renderExtent.width, "x", m_renderExtent.height,
                                        " -> ", m_displayExtent.width, "x", m_displayExtent.height).c_str());
       }
     } else {
-      ImGui::TextWrapped(str::format("DLSS inactive: ", m_statusReason).c_str());
+      ImGui::TextWrapped(str::format(upscalerModeLabel(), " inactive: ", m_statusReason).c_str());
     }
   }
 

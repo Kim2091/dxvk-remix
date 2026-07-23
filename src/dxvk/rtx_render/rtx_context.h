@@ -105,7 +105,10 @@ namespace dxvk {
                                     const VkRect2D& sourceSubrect,
                                     std::vector<NgxVelocityDraw>&& velocityDraws,
                                     const NgxVelocityCaptureStats& velocityStats,
-                                    float jitterX, float jitterY);
+                                    float jitterX, float jitterY,
+                                    bool cameraMatricesValid,
+                                    const Matrix4& worldToView,
+                                    const Matrix4& viewToProjection);
 
     // NGX passthrough mode: copies the pre-UI backbuffer into the HUD-less frame generation
     // input slot. Emitted by the D3D9 layer at the first UI-classified backbuffer draw

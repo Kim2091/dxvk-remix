@@ -129,6 +129,20 @@ namespace dxvk {
     m_initialized = false;
   }
 
+  void DxvkXeSS::beginPassthroughFrame(Rc<DxvkContext>& ctx,
+                                       const VkExtent3D& renderExtent,
+                                       const VkExtent3D& displayExtent,
+                                       bool resetHistory,
+                                       bool isCameraCut) {
+    FrameBeginContext frameBeginCtx;
+    frameBeginCtx.downscaledExtent = renderExtent;
+    frameBeginCtx.targetExtent = displayExtent;
+    frameBeginCtx.frameTimeMilliseconds = 0.0f;
+    frameBeginCtx.resetHistory = resetHistory;
+    frameBeginCtx.isCameraCut = isCameraCut;
+    onFrameBegin(ctx, frameBeginCtx);
+  }
+
   bool DxvkXeSS::isXeSSLibraryAvailable() {
     // Try to get XeSS version to test if library is available
     xess_version_t version;
@@ -388,10 +402,27 @@ namespace dxvk {
   float DxvkXeSS::calcUpscaleFactor() const {
     if (XessOptions::preset() == XeSSPreset::Custom) {
       return 1.0f / RtxOptions::resolutionScale();
-    } else {
-      xess_quality_settings_t quality = presetToQuality(XessOptions::preset());
-      return getUpscaleFactor(quality);
     }
+    return getUpscaleFactor(presetToQuality(XessOptions::preset()));
+  }
+
+  float DxvkXeSS::calcScreenPercentageForPreset(XeSSPreset preset) {
+    float upscaleFactor = 2.0f;
+    if (preset == XeSSPreset::Custom) {
+      upscaleFactor = 1.0f / std::max(RtxOptions::resolutionScale(), 0.01f);
+    } else {
+      switch (preset) {
+      case XeSSPreset::UltraPerf:        upscaleFactor = 3.0f; break;
+      case XeSSPreset::Performance:      upscaleFactor = 2.3f; break;
+      case XeSSPreset::Balanced:         upscaleFactor = 2.0f; break;
+      case XeSSPreset::Quality:          upscaleFactor = 1.7f; break;
+      case XeSSPreset::UltraQuality:     upscaleFactor = 1.5f; break;
+      case XeSSPreset::UltraQualityPlus: upscaleFactor = 1.3f; break;
+      case XeSSPreset::NativeAA:         upscaleFactor = 1.0f; break;
+      default:                           upscaleFactor = 2.0f; break;
+      }
+    }
+    return 100.0f / upscaleFactor;
   }
 
   float DxvkXeSS::calcRecommendedMipBias() const {
@@ -417,17 +448,34 @@ namespace dxvk {
     DxvkBarrierSet& barriers,
     const Resources::RaytracingOutput& rtOutput,
     bool resetHistory) {
+    dispatch(renderContext,
+             barriers,
+             rtOutput.m_compositeOutput.resource(Resources::AccessType::Read),
+             rtOutput.m_primaryScreenSpaceMotionVector,
+             rtOutput.m_primaryDepth,
+             rtOutput.m_finalOutput.resource(Resources::AccessType::Write),
+             resetHistory);
+  }
+
+  void DxvkXeSS::dispatch(
+    Rc<DxvkContext> renderContext,
+    DxvkBarrierSet& barriers,
+    const Resources::Resource& colorInput,
+    const Resources::Resource& motionVectors,
+    const Resources::Resource& depth,
+    const Resources::Resource& output,
+    bool resetHistory) {
     
     if (!isActive()) {
       // Fallback: just copy input to output
       renderContext->copyImage(
-        rtOutput.m_finalOutput.resource(Resources::AccessType::Write).image,
+        output.image,
         { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
         { 0, 0, 0 },
-        rtOutput.m_compositeOutput.image(Resources::AccessType::Read),
+        colorInput.image,
         { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
         { 0, 0, 0 },
-        rtOutput.m_compositeOutputExtent);
+        colorInput.image->info().extent);
       return;
     }
 
@@ -446,8 +494,8 @@ namespace dxvk {
       } else {
         // Fallback to actual output texture resolution
         targetExtent = { 
-          rtOutput.m_finalOutput.resource(Resources::AccessType::Write).image->info().extent.width,
-          rtOutput.m_finalOutput.resource(Resources::AccessType::Write).image->info().extent.height,
+          output.image->info().extent.width,
+          output.image->info().extent.height,
           1
         };
       }
@@ -458,31 +506,40 @@ namespace dxvk {
     if (!m_initialized || !m_xessContext) {
       // Fallback: just copy input to output
       renderContext->copyImage(
-        rtOutput.m_finalOutput.resource(Resources::AccessType::Write).image,
+        output.image,
         { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
         { 0, 0, 0 },
-        rtOutput.m_compositeOutput.image(Resources::AccessType::Read),
+        colorInput.image,
         { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
         { 0, 0, 0 },
-        rtOutput.m_compositeOutputExtent);
+        colorInput.image->info().extent);
       return;
     }
     
     // Set up image barriers for XeSS inputs and outputs
-    std::array<Rc<DxvkImageView>, 4> inputs = {
-      rtOutput.m_compositeOutput.view(Resources::AccessType::Read),
-      rtOutput.m_primaryScreenSpaceMotionVector.view,
-      rtOutput.m_primaryDepth.view,
+    std::array<const Resources::Resource*, 4> inputResources = {
+      &colorInput,
+      &motionVectors,
+      &depth,
       nullptr // Placeholder for auto-exposure texture
     };
 
     auto& autoExposure = device()->getCommon()->metaAutoExposure();
+    Resources::Resource exposureResource = {};
     if (autoExposure.enabled() && autoExposure.getExposureTexture().image != nullptr) {
-      inputs[3] = autoExposure.getExposureTexture().view;
+      exposureResource = autoExposure.getExposureTexture();
+      inputResources[3] = &exposureResource;
     }
 
+    std::array<Rc<DxvkImageView>, 4> inputs = {
+      colorInput.view,
+      motionVectors.view,
+      depth.view,
+      exposureResource.view
+    };
+
     std::array<Rc<DxvkImageView>, 1> outputs = {
-      rtOutput.m_finalOutput.view(Resources::AccessType::Write)
+      output.view
     };
 
     // Set up barriers for input textures
@@ -575,7 +632,7 @@ namespace dxvk {
     xess_vk_execute_params_t execParams = {};
     
     // Input color texture
-    auto colorView = rtOutput.m_compositeOutput.view(Resources::AccessType::Read);
+    auto colorView = inputs[0];
     execParams.colorTexture.imageView = colorView->handle();
     execParams.colorTexture.image = colorView->image()->handle();
     execParams.colorTexture.subresourceRange = colorView->subresources();
@@ -584,8 +641,8 @@ namespace dxvk {
     execParams.colorTexture.height = colorView->imageInfo().extent.height;
 
     // Optional Exposure texture
-    if (autoExposure.enabled() && autoExposure.getExposureTexture().image != nullptr) {
-      auto exposureView = autoExposure.getExposureTexture().view;
+    if (inputs[3] != nullptr) {
+      auto exposureView = inputs[3];
       execParams.exposureScaleTexture.imageView = exposureView->handle();
       execParams.exposureScaleTexture.image = exposureView->image()->handle();
       execParams.exposureScaleTexture.subresourceRange = exposureView->subresources();
@@ -598,7 +655,7 @@ namespace dxvk {
     }
 
     // Motion vector texture
-    auto motionView = rtOutput.m_primaryScreenSpaceMotionVector.view;
+    auto motionView = inputs[1];
     execParams.velocityTexture.imageView = motionView->handle();
     execParams.velocityTexture.image = motionView->image()->handle();
     execParams.velocityTexture.subresourceRange = motionView->subresources();
@@ -607,7 +664,7 @@ namespace dxvk {
     execParams.velocityTexture.height = motionView->imageInfo().extent.height;
 
     // Depth texture
-    auto depthView = rtOutput.m_primaryDepth.view;
+    auto depthView = inputs[2];
     execParams.depthTexture.imageView = depthView->handle();
     execParams.depthTexture.image = depthView->image()->handle();
     execParams.depthTexture.subresourceRange = depthView->subresources();
@@ -616,7 +673,7 @@ namespace dxvk {
     execParams.depthTexture.height = depthView->imageInfo().extent.height;
 
     // Output texture
-    auto outputView = rtOutput.m_finalOutput.view(Resources::AccessType::Write);
+    auto outputView = outputs[0];
     execParams.outputTexture.imageView = outputView->handle();
     execParams.outputTexture.image = outputView->image()->handle();
     execParams.outputTexture.subresourceRange = outputView->subresources();
@@ -650,13 +707,13 @@ namespace dxvk {
       
       // Fallback to simple copy on failure
       renderContext->copyImage(
-        rtOutput.m_finalOutput.resource(Resources::AccessType::Write).image,
+        output.image,
         { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
         { 0, 0, 0 },
-        rtOutput.m_compositeOutput.image(Resources::AccessType::Read),
+        colorInput.image,
         { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
         { 0, 0, 0 },
-        rtOutput.m_compositeOutputExtent);
+        colorInput.image->info().extent);
     } else {
       // XeSS execution successful - removed debug logging to avoid spam
     }

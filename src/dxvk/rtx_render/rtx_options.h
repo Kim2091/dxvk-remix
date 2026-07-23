@@ -333,9 +333,13 @@ namespace dxvk {
     
   public:
     RTX_OPTION("rtx", bool, showRaytracingOption, true, "Enables or disables the option to toggle ray tracing in the UI. When set to false the ray tracing checkbox will not appear in the Remix UI.");
-    RTX_OPTION_ENV("rtx", bool, enableRaytracing, true, "DXVK_ENABLE_RAYTRACING",
+    public: static void enableRaytracingOnChange(DxvkDevice* device);
+    RTX_OPTION_ARGS("rtx", bool, enableRaytracing, true,
                    "Globally enables or disables ray tracing. When set to false the original game should render mostly as it would in DXVK typically.\n"
-                   "Some artifacts may still appear however compared to the original game either due to issues with the underlying DXVK translation or issues in Remix itself.");
+                   "Some artifacts may still appear however compared to the original game either due to issues with the underlying DXVK translation or issues in Remix itself.\n"
+                   "Ignored while rtx.ngxPassthroughMode is active (path tracing is disabled in that mode).",
+                   args.environment = "DXVK_ENABLE_RAYTRACING",
+                   args.onChangeCallback = &enableRaytracingOnChange);
 
     RTX_OPTION("rtx", float, sceneScale, 1, "Defines the ratio of rendering unit (1cm) to game unit, i.e. sceneScale = 1cm / GameUnit.");
     RTX_OPTION("rtx", bool, zUp, false, "Indicates that the Z axis is the \"upward\" axis in the world when true, otherwise the Y axis when false.");

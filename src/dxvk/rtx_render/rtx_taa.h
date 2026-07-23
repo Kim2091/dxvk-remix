@@ -50,6 +50,8 @@ namespace dxvk {
       const Resources::Resource& colorTextureOutput,
       const bool isUpscale);
 
+    void ensureResources(Rc<DxvkContext>& ctx, const VkExtent3D& targetExtent);
+
     void prewarmShaders(DxvkPipelineManager& pipelineManager) const;
 
     void showImguiSettings();

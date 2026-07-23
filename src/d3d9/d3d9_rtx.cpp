@@ -16,6 +16,7 @@
 #include "../dxso/dxso_tables.h"
 #include "../dxvk/rtx_render/rtx_terrain_baker.h"
 #include "../dxvk/rtx_render/rtx_ngx_passthrough.h"
+#include "../dxvk/rtx_render/rtx_options.h"
 #include "../dxvk/rtx_render/rtx_dlfg.h"
 #include "../dxvk/rtx_render/rtx_camera.h"
 #include "../dxvk/imgui/dxvk_imgui.h"
@@ -8411,9 +8412,15 @@ namespace dxvk {
     // Flush any pending game and RTX work
     m_parent->Flush();
 
-    // Send command to inject RTX
-    m_parent->EmitCs([cReflexFrameId = GetReflexFrameId()](DxvkContext* ctx) {
-      static_cast<RtxContext*>(ctx)->injectRTX(cReflexFrameId);
+    // Send command to inject RTX. Pass the backbuffer when known: the CS thread's bound render
+    // target is often the scene color surface at the injection trigger, and falling back to
+    // that would upscale the wrong image while the presented backbuffer stays native.
+    m_parent->EmitCs([cReflexFrameId = GetReflexFrameId(), cTargetImage = m_ngxFrameBackbufferImage](DxvkContext* ctx) {
+      if (cTargetImage != nullptr) {
+        static_cast<RtxContext*>(ctx)->injectRTX(cReflexFrameId, cTargetImage);
+      } else {
+        static_cast<RtxContext*>(ctx)->injectRTX(cReflexFrameId);
+      }
     });
   }
 
@@ -10898,9 +10905,21 @@ namespace dxvk {
           const int32_t expectedW = int32_t(float(bbW) * sp / 100.0f);
           const int32_t expectedH = int32_t(float(bbH) * sp / 100.0f);
           const int32_t sizeTolerance = 16;
-          if (int32_t(vp.Width)  < expectedW - sizeTolerance || int32_t(vp.Width)  > expectedW + sizeTolerance ||
-              int32_t(vp.Height) < expectedH - sizeTolerance || int32_t(vp.Height) > expectedH + sizeTolerance)
-            return;
+          const bool viewportMatchesExpected =
+            int32_t(vp.Width)  >= expectedW - sizeTolerance && int32_t(vp.Width)  <= expectedW + sizeTolerance &&
+            int32_t(vp.Height) >= expectedH - sizeTolerance && int32_t(vp.Height) <= expectedH + sizeTolerance;
+          if (!viewportMatchesExpected) {
+            // The D3D9 layer may have written a reduced ScreenPercentage before the game has
+            // applied it (typically one frame). Accept the main view at full backbuffer size
+            // during that window so scene targets and the camera stay valid; once the viewport
+            // shrinks the gate enforces the reduced size and Super Resolution engages.
+            const bool viewportNearFullSize =
+              int32_t(vp.Width) >= int32_t(bbW) - sizeTolerance &&
+              int32_t(vp.Height) >= int32_t(bbH) - sizeTolerance;
+            const bool expectingReducedResolution = sp < 99.5f;
+            if (!(expectingReducedResolution && viewportNearFullSize))
+              return;
+          }
         } else if (vp.Width * 2 < bbW || vp.Height * 2 < bbH) {
           // ScreenPercentage not resolved yet (first frame): fall back to the near-backbuffer
           // heuristic, safe for >= 50% and self-correcting once it resolves.
@@ -10977,6 +10996,10 @@ namespace dxvk {
 
     ONCE(Logger::info(str::format("[RTX NGX Passthrough] UE3 camera captured from shader constants (viewProjReg=c",
                                   viewProjReg, "..c", viewProjReg + 3, ", viewOriginReg=c", viewOriginReg, ").")));
+
+    m_ngxFrameWorldToView = worldToView;
+    m_ngxFrameViewToProjection = viewToProjection;
+    m_ngxFrameCameraMatricesValid = true;
 
     m_parent->EmitCs([cWorldToView = worldToView, cViewToProjection = viewToProjection](DxvkContext* ctx) {
       static_cast<RtxContext*>(ctx)->getSceneManager().getCameraManager().processExternalCamera(
@@ -11835,47 +11858,42 @@ namespace dxvk {
       return 0;
     }
 
-    // Maps the Remix DLSS mode (rtx.qualityDLSS) to a UE3 ScreenPercentage: the linear
-    // dimension ratio DLSS renders at, times 100. Full Resolution is native (DLAA, no
-    // upscale); the Super Resolution tiers use DLSS's standard scaling factors so the
-    // resulting render ratio round-trips back to the same NGX quality value
-    // (see perfQualityFromResolutionRatio). Auto mirrors DxvkDLSS::getAutoProfile's
-    // display-height buckets.
-    float ue3ScreenPercentageForDlssProfile(DLSSProfile profile, uint32_t displayHeight) {
-      DLSSProfile resolved = profile;
-      if (resolved == DLSSProfile::Auto) {
-        if (displayHeight == 0 || displayHeight <= 1080) {
-          resolved = DLSSProfile::MaxQuality;
-        } else if (displayHeight < 2160) {
-          resolved = DLSSProfile::Balanced;
-        } else if (displayHeight < 4320) {
-          resolved = DLSSProfile::MaxPerf;
-        } else {
-          resolved = DLSSProfile::UltraPerf;
-        }
-      }
+  }
 
-      switch (resolved) {
-      case DLSSProfile::UltraPerf:      return 100.0f / 3.0f;   // 0.333x
-      case DLSSProfile::MaxPerf:        return 50.0f;           // 0.5x
-      case DLSSProfile::Balanced:       return 58.0f;           // 0.58x
-      case DLSSProfile::MaxQuality:     return 200.0f / 3.0f;   // 0.667x
-      case DLSSProfile::FullResolution: return 100.0f;          // DLAA
-      default:                          return 100.0f;
-      }
+  void D3D9Rtx::bootstrapNgxPassthroughUpscaler(uint32_t displayWidth, uint32_t displayHeight) {
+    if (m_ngxPassthroughBootstrapped) {
+      return;
     }
+
+    if (!m_frameOptions.valid) {
+      refreshFrameOptionCache();
+    }
+
+    if (!m_frameOptions.ngxPassthroughMode) {
+      return;
+    }
+
+    // Preset sync already runs in RtxInitializer; here we only prime XeSS input resolution
+    // (what the Remix UI does via getXeSSInputResolution) once the display size is known.
+    if (displayWidth > 0 && displayHeight > 0) {
+      m_parent->GetDXVKDevice()->getCommon()->metaNgxPassthrough()
+        .syncXeSSInputResolution(displayWidth, displayHeight);
+    }
+
+    m_ngxPassthroughBootstrapped = true;
   }
 
   void D3D9Rtx::applyNgxPassthroughScreenPercentage() {
     const bool driving = m_frameOptions.ngxPassthroughMode &&
                          RtxNgxPassthrough::driveGameScreenPercentage();
 
-    // Locate the field once whenever the mode is on (even when not driving: the scene-camera
-    // gate still needs the game's ScreenPercentage). The game is either this process
-    // (single-process DXVK) or the parent that launched NvRemixBridge.exe (the bridge); scan
-    // the current process first, then the parent, and keep whichever module has the signature.
-    if (!m_ngxScreenPercentageScanDone && m_frameOptions.ngxPassthroughMode) {
-      m_ngxScreenPercentageScanDone = true;
+    // Locate the field whenever the mode is on and it has not been found yet (even when not
+    // driving: the scene-camera gate still needs the game's ScreenPercentage). The game is
+    // either this process (single-process DXVK) or the parent that launched NvRemixBridge.exe
+    // (the bridge); scan the current process first, then the parent, and keep whichever module
+    // has the signature. Retries until found so an early swap-chain reset before the game
+    // module is mapped does not permanently disable driving.
+    if (m_ngxScreenPercentageRemoteAddr == 0 && m_frameOptions.ngxPassthroughMode) {
 
       struct Candidate { HANDLE handle; DWORD pid; bool ownsHandle; };
       std::vector<Candidate> candidates;
@@ -11914,6 +11932,7 @@ namespace dxvk {
                                  (candidate.ownsHandle ? "the parent game process (RTX Remix bridge)" : "the current process"),
                                  " (current ", m_ngxScreenPercentageOriginal,
                                  "); the DLSS mode selector now drives it."));
+        m_ngxScreenPercentageScanDone = true;
         break;
       }
 
@@ -11924,9 +11943,9 @@ namespace dxvk {
       }
 
       if (m_ngxScreenPercentageRemoteAddr == 0) {
-        Logger::warn("[RTX NGX Passthrough] Could not locate the game's ScreenPercentage field; "
-                     "the DLSS mode selector will not drive the render resolution. Use the in-game "
-                     "'scale set ScreenPercentage <value>' console command instead.");
+        ONCE(Logger::warn("[RTX NGX Passthrough] Could not locate the game's ScreenPercentage field; "
+                          "the DLSS mode selector will not drive the render resolution. Use the in-game "
+                          "'scale set ScreenPercentage <value>' console command instead."));
       }
     }
 
@@ -11960,10 +11979,16 @@ namespace dxvk {
     }
 
     uint32_t displayHeight = 0;
-    if (m_activePresentParams.has_value())
+    uint32_t displayWidth = 0;
+    if (m_activePresentParams.has_value()) {
       displayHeight = m_activePresentParams->BackBufferHeight;
+      displayWidth = m_activePresentParams->BackBufferWidth;
+    }
 
-    const float screenPercentage = ue3ScreenPercentageForDlssProfile(RtxOptions::qualityDLSS(), displayHeight);
+    bootstrapNgxPassthroughUpscaler(displayWidth, displayHeight);
+
+    const float screenPercentage = m_parent->GetDXVKDevice()->getCommon()->metaNgxPassthrough()
+      .screenPercentageForDisplay(displayWidth, displayHeight);
 
     // Force UpscaleScreenPercentage on (the adjacent field at +4) so Super Resolution engages:
     // UE3 renders into a reduced subrect and stretches to the primary target, which the D3D9
@@ -11980,10 +12005,9 @@ namespace dxvk {
 
     if (screenPercentage != m_ngxScreenPercentageLastLogged) {
       m_ngxScreenPercentageLastLogged = screenPercentage;
-      Logger::info(str::format("[RTX NGX Passthrough] DLSS mode '",
-                               dlssProfileToString(RtxOptions::qualityDLSS()),
-                               "' -> game ScreenPercentage ", screenPercentage,
-                               (screenPercentage >= 99.5f ? " (DLAA)." : " (DLSS Super Resolution).")));
+      Logger::info(str::format("[RTX NGX Passthrough] ", RtxNgxPassthrough::upscalerModeLabel(),
+                               " mode -> game ScreenPercentage ", screenPercentage,
+                               (screenPercentage >= 99.5f ? " (native)." : " (Super Resolution).")));
     }
   }
 
@@ -12025,9 +12049,13 @@ namespace dxvk {
                       cVelocityDraws = std::move(m_ngxVelocityDraws),
                       cVelocityStats = m_ngxVelocityStats,
                       cJitterX = m_ngxFrameJitter[0],
-                      cJitterY = m_ngxFrameJitter[1]](DxvkContext* ctx) mutable {
+                      cJitterY = m_ngxFrameJitter[1],
+                      cCameraMatricesValid = m_ngxFrameCameraMatricesValid,
+                      cWorldToView = m_ngxFrameWorldToView,
+                      cViewToProjection = m_ngxFrameViewToProjection](DxvkContext* ctx) mutable {
       static_cast<RtxContext*>(ctx)->setNgxPassthroughFrameData(cSceneDepth, cColorTarget, cColorMirror, cUpscaleSource, cSubrect,
-                                                                std::move(cVelocityDraws), cVelocityStats, cJitterX, cJitterY);
+                                                                std::move(cVelocityDraws), cVelocityStats, cJitterX, cJitterY,
+                                                                cCameraMatricesValid, cWorldToView, cViewToProjection);
     });
 
     m_ngxVelocityDraws.clear();
@@ -12415,18 +12443,25 @@ namespace dxvk {
 
     // Decide this frame's sub-pixel jitter before the first draw that may consume it
     if (!m_ngxFrameJitterValid) {
+      if (unlikely(!m_frameOptions.valid)) {
+        refreshFrameOptionCache();
+      }
+
+      // Drive ScreenPercentage before scene draws so the game can apply the reduced render
+      // resolution this frame (EndFrame alone is one frame late for the first scene pass).
+      applyNgxPassthroughScreenPercentage();
+
       m_ngxFrameJitterValid = true;
       m_ngxFrameJitter[0] = 0.0f;
       m_ngxFrameJitter[1] = 0.0f;
 
-      // DLSS upscaler selected (ray reconstruction cannot exist without the path tracer, so
-      // no need to exclude it here) and actually supported on this system
-      const bool dlssUsable = RtxOptions::isDLSSOrRayReconstructionEnabled() &&
-                              m_parent->GetDXVKDevice()->getCommon()->metaNGXContext().supportsDLSS();
+      // Temporal upscaler selected and usable on this system
+      const bool temporalUpscalerUsable = RtxNgxPassthrough::needsViewportJitter(m_parent->GetDXVKDevice().ptr());
 
-      if (m_frameOptions.ngxPassthroughJitter && dlssUsable) {
+      if (m_frameOptions.ngxPassthroughJitter && temporalUpscalerUsable) {
+        const uint32_t jitterSequenceLength = RtxNgxPassthrough::viewportJitterSequenceLength(m_parent->GetDXVKDevice().ptr());
         const Vector2 jitter = calculateHaltonJitter(m_parent->GetDXVKDevice()->getCurrentFrameId(),
-                                                     RtxOptions::cameraJitterSequenceLength());
+                                                     jitterSequenceLength);
         m_ngxFrameJitter[0] = jitter.x;
         m_ngxFrameJitter[1] = jitter.y;
       }
@@ -12915,6 +12950,15 @@ namespace dxvk {
     // Cache the present parameters
     m_activePresentParams = presentationParameters;
 
+    // Prime ScreenPercentage as soon as the display size is known so the first scene pass
+    // can render at the upscaler's target resolution instead of waiting for EndFrame.
+    if (RtxNgxPassthrough::ngxPassthroughMode()) {
+      if (!m_frameOptions.valid) {
+        refreshFrameOptionCache();
+      }
+      applyNgxPassthroughScreenPercentage();
+    }
+
     // Inform the backend about potential presenter update
     m_parent->EmitCs([cWidth = m_activePresentParams->BackBufferWidth,
                       cHeight = m_activePresentParams->BackBufferHeight](DxvkContext* ctx) {
@@ -12994,9 +13038,9 @@ namespace dxvk {
     // replay) read fresh values and the next frame's draws see this frame's resolution.
     refreshFrameOptionCache();
 
-    // Drive the game's ScreenPercentage from the Remix DLSS mode selector. Done here (at
-    // present time) so the value is in place before the next frame's scene viewport setup
-    // reads it; also restores the game's own value when the feature is turned off.
+    // Drive the game's ScreenPercentage from the Remix upscaler quality preset. Done here
+    // (at present time) so the value is in place before the next frame's scene viewport
+    // setup reads it; also restores the game's own value when the feature is turned off.
     applyNgxPassthroughScreenPercentage();
 
     // Flush this frame's replacement-material-hash tracking as one CS command. Must be
@@ -13052,6 +13096,12 @@ namespace dxvk {
       static_cast<RtxContext*>(ctx)->endFrame(currentReflexFrameId, targetImage, callInjectRtx); 
     });
 
+    // Wait for injectRTX to finish upscaling the backbuffer before the external presenter
+    // (or deferred UI replay) touches it on the same thread.
+    if (callInjectRtx) {
+      m_parent->Flush();
+    }
+
     // Replay any deferred overlays that no mid-frame injection flushed. Typically this means
     // no trigger draw fired this frame and the endFrame call above performs the fallback
     // injection onto the backbuffer; the overlays then composite on top of that blit.
@@ -13100,6 +13150,7 @@ namespace dxvk {
     m_ngxPrevCameraValid = m_ngxFrameCameraValid;
     m_ngxPrevCameraUsedTranspose = m_ngxFrameCameraUsedTranspose;
     m_ngxFrameCameraValid = false;
+    m_ngxFrameCameraMatricesValid = false;
     m_ngxVelocityStats = NgxVelocityCaptureStats();
     m_ngxVelocitySkinnedDraws = 0;
     m_ngxVelocityDynamicDraws = 0;

@@ -73,6 +73,15 @@ namespace dxvk {
     RemixGui::DragFloat("Color Clamping Factor", &colorClampingFactorObject(), 0.001f, 0.005f, FLT_MAX, "%.2f", ImGuiSliderFlags_AlwaysClamp);
   }
 
+  void DxvkTemporalAA::ensureResources(Rc<DxvkContext>& ctx, const VkExtent3D& targetExtent) {
+    if (m_taaFeedbackTexture[0].image == nullptr ||
+        m_taaFeedbackTexture[0].image->info().extent.width != targetExtent.width ||
+        m_taaFeedbackTexture[0].image->info().extent.height != targetExtent.height) {
+      releaseTargetResource();
+      createTargetResource(ctx, targetExtent);
+    }
+  }
+
   void DxvkTemporalAA::dispatch(
     Rc<DxvkContext> ctx,
     Rc<DxvkSampler> linearSampler,

@@ -78,6 +78,15 @@ namespace dxvk {
       const Resources::RaytracingOutput& rtOutput,
       bool resetHistory);
 
+    void dispatch(
+      Rc<DxvkContext> renderContext,
+      DxvkBarrierSet& barriers,
+      const Resources::Resource& colorInput,
+      const Resources::Resource& motionVectors,
+      const Resources::Resource& depth,
+      const Resources::Resource& output,
+      bool resetHistory);
+
     // Public methods needed by RTX context
     void setSetting(const uint32_t displaySize[2], const XeSSPreset preset, uint32_t outRenderSize[2]);
     void getInputSize(uint32_t& width, uint32_t& height) const;
@@ -85,6 +94,17 @@ namespace dxvk {
     // XeSS 2.1 public helper methods
     uint32_t calcRecommendedJitterSequenceLength() const;
     float calcRecommendedMipBias() const;
+
+    // ScreenPercentage mapping for NGX passthrough (hardcoded factors; matches calcUpscaleFactor fallback).
+    static float calcScreenPercentageForPreset(XeSSPreset preset);
+
+    // Activates the RtxPass without running the full path-traced Resources::onFrameBegin()
+    // (which assumes raytracing output resources exist and will crash in NGX passthrough).
+    void beginPassthroughFrame(Rc<DxvkContext>& ctx,
+                               const VkExtent3D& renderExtent,
+                               const VkExtent3D& displayExtent,
+                               bool resetHistory,
+                               bool isCameraCut);
 
   protected:
 

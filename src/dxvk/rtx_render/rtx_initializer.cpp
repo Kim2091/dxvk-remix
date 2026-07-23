@@ -38,6 +38,7 @@
 #include "rtx_tone_mapping.h"
 #include "rtx_neural_radiance_cache.h"
 #include "rtx_ray_reconstruction.h"
+#include "rtx_ngx_passthrough.h"
 
 namespace dxvk {
   RtxInitializer::RtxInitializer(DxvkDevice* device)
@@ -69,7 +70,9 @@ namespace dxvk {
         env::getEnvVar("DXVK_GRAPHICS_PRESET_TYPE") != "0") {
       const DxvkDeviceInfo& deviceInfo = m_device->adapter()->devicePropertiesExt();
 
-      RtxOptions::updateUpscalerFromDlssPreset();
+      if (!RtxNgxPassthrough::ngxPassthroughMode()) {
+        RtxOptions::updateUpscalerFromDlssPreset();
+      }
       RtxOptions::updateGraphicsPresets(m_device);
       RtxOptions::updateRaytraceModePresets(deviceInfo.core.properties.vendorID, deviceInfo.khrDeviceDriverProperties.driverID);
     } else {
@@ -92,6 +95,20 @@ namespace dxvk {
 
     // Need to promote all of the hardware support Options before prewarming shaders.
     RtxOptionManager::applyPendingValues(m_device, /* forceOnChange */ true);
+
+    // Sync upscaler presets from rtx.upscalerType at launch (otherwise preset-dependent
+    // options are not applied until the Remix UI first opens).
+    if (RtxNgxPassthrough::ngxPassthroughMode()) {
+      RtxNgxPassthrough::enforceRaytracingDisabledForPassthrough();
+      // RR is path-traced only; leaving it on blocks DLSS-SR via isDLSSEnabled() in other
+      // code paths even though passthrough dispatch ignores it.
+      if (RtxOptions::upscalerType() == UpscalerType::DLSS && RtxOptions::enableRayReconstruction()) {
+        RtxOptions::enableRayReconstruction.setImmediately(false);
+      }
+      RtxOptions::dlssPreset.setImmediately(DlssPreset::Custom);
+      RtxOptions::updatePresetFromUpscaler();
+      RtxOptionManager::applyPendingValues(m_device, /* forceOnChange */ false);
+    }
 
     // Kick off shader prewarming
     startPrewarmShaders();

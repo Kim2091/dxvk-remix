@@ -243,13 +243,18 @@ namespace dxvk {
   }
 
   void DxvkNIS::dispatch(Rc<RtxContext> ctx, const Resources::RaytracingOutput& rtOutput) {
+    dispatch(ctx,
+             getInput(ctx, rtOutput),
+             rtOutput.m_finalOutput.resource(Resources::AccessType::Write));
+  }
+
+  void DxvkNIS::dispatch(Rc<RtxContext> ctx,
+                         const Resources::Resource& input,
+                         const Resources::Resource& output) {
     setConfig(ctx);
 
-    auto& input = getInput(ctx, rtOutput);
-    auto& output = rtOutput.m_finalOutput;
-
     VkExtent3D inputExtent = input.image->info().extent;
-    VkExtent3D outputExtent = output.resource(Resources::AccessType::Write).image->info().extent;
+    VkExtent3D outputExtent = output.image->info().extent;
 
     NISConfig nisConfig;
     NVScalerUpdateConfig(nisConfig,
@@ -266,7 +271,7 @@ namespace dxvk {
 
     ctx->bindResourceSampler(NIS_BINDING_SAMPLER_LINEAR_CLAMP, m_sampler);
     ctx->bindResourceView(NIS_BINDING_INPUT, input.view, nullptr);
-    ctx->bindResourceView(NIS_BINDING_OUTPUT, output.view(Resources::AccessType::Write), nullptr);
+    ctx->bindResourceView(NIS_BINDING_OUTPUT, output.view, nullptr);
     ctx->bindResourceView(NIS_BINDING_COEF_SCALER, scalerTex.view, nullptr);
     ctx->bindResourceView(NIS_BINDING_COEF_USM, usmTex.view, nullptr);
 

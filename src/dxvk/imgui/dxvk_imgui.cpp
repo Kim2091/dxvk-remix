@@ -50,6 +50,7 @@
 #include "rtx_render/rtx_neural_radiance_cache.h"
 #include "rtx_render/rtx_ray_reconstruction.h"
 #include "rtx_render/rtx_xess.h"
+#include "rtx_render/rtx_ngx_passthrough.h"
 #include "rtx_render/rtx_rtxdi_rayquery.h"
 #include "rtx_render/rtx_restir_gi_rayquery.h"
 #include "rtx_render/rtx_debug_view.h"
@@ -976,13 +977,17 @@ namespace dxvk {
         RtxOptions::enableReplacementMeshes.setDeferred(false);
         break;
       case RtxQuickAction::kRtxOnEnhanced:
-        RtxOptions::enableRaytracing.setDeferred(true);
+        if (!RtxNgxPassthrough::ngxPassthroughMode()) {
+          RtxOptions::enableRaytracing.setDeferred(true);
+        }
         RtxOptions::enableReplacementLights.setDeferred(true);
         RtxOptions::enableReplacementMaterials.setDeferred(true);
         RtxOptions::enableReplacementMeshes.setDeferred(true);
         break;
       case RtxQuickAction::kRtxOn:
-        RtxOptions::enableRaytracing.setDeferred(true);
+        if (!RtxNgxPassthrough::ngxPassthroughMode()) {
+          RtxOptions::enableRaytracing.setDeferred(true);
+        }
         RtxOptions::enableReplacementLights.setDeferred(false);
         RtxOptions::enableReplacementMaterials.setDeferred(false);
         RtxOptions::enableReplacementMeshes.setDeferred(false);
@@ -3633,7 +3638,7 @@ namespace dxvk {
       auto& rayReconstruction = common->metaRayReconstruction();
       ImGui::Indent();
 
-      if (RtxOptions::showRaytracingOption()) {
+      if (RtxOptions::showRaytracingOption() && !RtxNgxPassthrough::ngxPassthroughMode()) {
         RemixGui::Checkbox("Raytracing Enabled", &RtxOptions::enableRaytracingObject());
 
         renderPassGBufferRaytraceModeCombo.getKey(&RtxOptions::renderPassGBufferRaytraceModeObject());
@@ -3641,12 +3646,15 @@ namespace dxvk {
         renderPassIntegrateIndirectRaytraceModeCombo.getKey(&RtxOptions::renderPassIntegrateIndirectRaytraceModeObject());
 
         RemixGui::Separator();
+      } else if (RtxOptions::showRaytracingOption() && RtxNgxPassthrough::ngxPassthroughMode()) {
+        ImGui::TextDisabled("Raytracing is disabled in NGX passthrough mode.");
+        RemixGui::Separator();
       }
 
       {
         IMGUI_ADD_TOOLTIP(
           RemixGui::Checkbox("NGX Passthrough Mode", &RtxNgxPassthrough::ngxPassthroughModeObject()),
-          "Presents the game's own rasterized rendering (no path tracing) with DLSS/DLAA, Frame Generation and Reflex on top.\nMust be enabled at launch for the game's depth buffer to be shader-readable.");
+          "Presents the game's own rasterized rendering (no path tracing) with the selected upscaler, Frame Generation and Reflex on top.\nMust be enabled at launch for the game's depth buffer to be shader-readable.");
 
         if (RtxNgxPassthrough::ngxPassthroughMode()) {
           ImGui::Indent();
@@ -3666,11 +3674,13 @@ namespace dxvk {
       RemixGui::Separator();
 
       if (ctx->getCommonObjects()->metaDLSS().supportsDLSS()) {
-        // Show upscaler and DLSS-RR option.
+        // Show upscaler and DLSS-RR option (RR is path-traced only; hidden in NGX passthrough mode).
         auto oldUpscalerType = RtxOptions::upscalerType();
         bool oldDLSSRREnabled = RtxOptions::enableRayReconstruction();
         getUpscalerCombo(dlss, rayReconstruction).getKey(&RtxOptions::upscalerTypeObject());
-        showRayReconstructionEnable(rayReconstruction.supportsRayReconstruction());
+        if (!RtxNgxPassthrough::ngxPassthroughMode()) {
+          showRayReconstructionEnable(rayReconstruction.supportsRayReconstruction());
+        }
 
         // Update path tracer settings when upscaler is changed or DLSS-RR is toggled.
         if (oldUpscalerType != RtxOptions::upscalerType() || oldDLSSRREnabled != RtxOptions::enableRayReconstruction()) {
@@ -3686,7 +3696,7 @@ namespace dxvk {
         RtxOptions::upscalerType.setDeferred(UpscalerType::TAAU);
       }
 
-      if (RtxOptions::isRayReconstructionEnabled()) {
+      if (RtxOptions::isRayReconstructionEnabled() && !RtxNgxPassthrough::ngxPassthroughMode()) {
         dlssProfileCombo.getKey(&RtxOptions::qualityDLSSObject());
         rayReconstruction.showRayReconstructionImguiSettings(false);
       } else if (RtxOptions::upscalerType() == UpscalerType::DLSS) {
@@ -3705,11 +3715,12 @@ namespace dxvk {
           }
 
           // Display XeSS internal resolution
-          auto& xess = ctx->getCommonObjects()->metaXeSS();
-
           uint32_t inputWidth;
           uint32_t inputHeight;
-          xess.getInputSize(inputWidth, inputHeight);
+          ctx->getCommonObjects()->metaNgxPassthrough().getXeSSInputResolution(
+            uint32_t(ImGui::GetIO().DisplaySize.x),
+            uint32_t(ImGui::GetIO().DisplaySize.y),
+            inputWidth, inputHeight);
           ImGui::TextWrapped(str::format("Render Resolution: ", inputWidth, "x", inputHeight).c_str());
         } else if (RtxOptions::upscalerType() == UpscalerType::TAAU) {
         RemixGui::SliderFloat("Resolution scale", &RtxOptions::resolutionScaleObject(), 0.5f, 1.0f);

@@ -578,14 +578,17 @@ namespace dxvk {
 
     bool raytracedThisFrame = false;
 
-    // NGX passthrough mode: the game's rasterized output is presented as-is while DLSS /
-    // DLSS Frame Generation / Reflex run on top of it. Takes precedence over path tracing.
+    // NGX passthrough mode: the game's rasterized output is presented as-is while the
+    // selected upscaler, Frame Generation and Reflex run on top. Takes precedence over
+    // path tracing.
     // Note: deliberately not gated on asyncShaderCompilationActive - that flag tracks the
     // background prewarming of the path tracer's shader set (which runs for minutes after
     // launch and oscillates), while this path only needs its own small compute shader.
     const bool ngxPassthroughActive = RtxNgxPassthrough::ngxPassthroughMode();
+    const bool ngxPassthroughCanDispatch = ngxPassthroughActive &&
+                                           (isCameraValid || m_ngxPassthroughSceneDepth != nullptr);
 
-    if (ngxPassthroughActive && isCameraValid) {
+    if (ngxPassthroughCanDispatch) {
       if (targetImage == nullptr) {
         targetImage = m_state.om.renderTargets.color[0].view->image();
       }
@@ -2291,7 +2294,15 @@ namespace dxvk {
                                               const VkRect2D& sourceSubrect,
                                               std::vector<NgxVelocityDraw>&& velocityDraws,
                                               const NgxVelocityCaptureStats& velocityStats,
-                                              float jitterX, float jitterY) {
+                                              float jitterX, float jitterY,
+                                              bool cameraMatricesValid,
+                                              const Matrix4& worldToView,
+                                              const Matrix4& viewToProjection) {
+    if (cameraMatricesValid) {
+      getSceneManager().getCameraManager().processExternalCamera(
+        CameraType::Main, worldToView, viewToProjection);
+    }
+
     m_ngxPassthroughSceneDepth = sceneDepthImage;
     m_ngxPassthroughColorTarget = colorTargetImage;
     m_ngxPassthroughColorMirror = colorMirrorImage;

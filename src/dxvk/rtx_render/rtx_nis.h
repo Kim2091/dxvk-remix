@@ -42,6 +42,10 @@ namespace dxvk {
 
         void dispatch(Rc<RtxContext> ctx, const Resources::RaytracingOutput& rtOutput);
 
+        void dispatch(Rc<RtxContext> ctx,
+                      const Resources::Resource& input,
+                      const Resources::Resource& output);
+
         float m_sharpness = 0.5f;
         bool m_useFp16 = false;
 

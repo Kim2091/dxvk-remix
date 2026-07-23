@@ -208,18 +208,37 @@ namespace dxvk {
 
     void showImguiSettings();
 
+    static float screenPercentageForUpscaler(uint32_t displayWidth, uint32_t displayHeight);
+    static const char* upscalerModeLabel();
+
+    // Whether the selected passthrough upscaler needs sub-pixel viewport jitter (temporal upscalers only).
+    static bool needsViewportJitter(DxvkDevice* device);
+    static uint32_t viewportJitterSequenceLength(DxvkDevice* device);
+
+    // Like screenPercentageForUpscaler(), but uses cached XeSS optimal input size when available
+    // so the game's ScreenPercentage tracks the SDK rather than hardcoded fallback factors.
+    float screenPercentageForDisplay(uint32_t displayWidth, uint32_t displayHeight);
+
+    // Keeps DxvkXeSS::m_inputSize in sync for the UI when the path-traced frame path is not
+    // running (NGX passthrough). Falls back to cached passthrough extents when display size is 0.
+    void syncXeSSInputResolution(uint32_t displayWidth, uint32_t displayHeight);
+
+    // syncXeSSInputResolution + getInputSize, for ImGui panels.
+    void getXeSSInputResolution(uint32_t displayWidth, uint32_t displayHeight,
+                                uint32_t& inputWidth, uint32_t& inputHeight);
+
     // Per-frame capture diagnostics from the D3D9 layer, stored for the developer menu
     void setVelocityCaptureStats(const NgxVelocityCaptureStats& stats) {
       m_lastCaptureStats = stats;
     }
 
-    // Single status line (DLSS state + resolutions), shared between the developer panel and
+    // Single status line (upscaler state + resolutions), shared between the developer panel and
     // the user menu (the stock DLSS object's state is meaningless while this mode is active)
     void showImguiStatusLine(bool includeInjectionPoint = true);
 
-    // True when DLSS evaluated successfully last frame (for UI/status display)
-    bool isDlssActive() const {
-      return m_dlssActive;
+    // True when the selected upscaler evaluated successfully last frame (for UI/status display)
+    bool isUpscalerActive() const {
+      return m_upscalerActive;
     }
 
     // Copies the game's depth buffer into a runtime-owned snapshot. Called (via RtxContext)
@@ -249,24 +268,29 @@ namespace dxvk {
       ObjectVelocityCoverage = 3,
     };
 
-    RTX_OPTION("rtx", bool, ngxPassthroughMode, false,
+    // Path tracing is incompatible with NGX passthrough; keep rtx.enableRaytracing off.
+    static void enforceRaytracingDisabledForPassthrough();
+    static void ngxPassthroughModeOnChange(DxvkDevice* device);
+
+    RTX_OPTION_ARGS("rtx", bool, ngxPassthroughMode, false,
                "Master toggle for the NGX passthrough mode: the game's original rasterized rendering is presented (no path tracing,\n"
-               "no scene capture) while DLSS Super Resolution / DLAA, DLSS Frame Generation and Reflex run on top of it.\n"
+               "no scene capture) while the selected upscaler (DLSS, NIS, TAA-U or XeSS), DLSS Frame Generation and Reflex run on top.\n"
                "Screen space motion vectors are synthesized from the game's depth buffer via camera reprojection, and sub-pixel\n"
-               "camera jitter is injected through the game's viewport so DLSS can temporally accumulate detail.\n"
-               "Takes precedence over rtx.enableRaytracing. Requires rtx.upscalerType to be DLSS for upscaling to run, and should\n"
-               "be set at launch (game depth buffers are created with a shader-readable layout only when this mode is active).");
+               "camera jitter is injected through the game's viewport so temporal upscalers can accumulate detail.\n"
+               "Takes precedence over rtx.enableRaytracing (which is forced off while this mode is active). Should be set at launch (game depth\n"
+               "buffers are created with a shader-readable layout only when this mode is active).",
+               args.onChangeCallback = &RtxNgxPassthrough::ngxPassthroughModeOnChange);
     RTX_OPTION("rtx.ngxPassthrough", bool, enableJitter, true,
                "Applies a sub-pixel Halton jitter offset to the game's viewport for all draws targeting the detected scene render\n"
-               "target. Required for DLSS/DLAA to anti-alias; only disable for debugging.");
+               "target. Required for temporal upscalers (DLSS, TAA-U, XeSS) to anti-alias; only disable for debugging.");
     RTX_OPTION("rtx.ngxPassthrough", bool, prePostProcess, true,
-               "Runs DLSS on the game's linear scene color before the game's post-process chain instead of on the final\n"
+               "Runs the upscaler on the game's linear scene color before the game's post-process chain instead of on the final\n"
                "post-processed output, matching a native engine integration: bloom, tonemapping and color grading then operate\n"
-               "on the anti-aliased, unjittered image rather than baking into the DLSS input (post effects sampling a jittered\n"
-               "scene wobble sub-pixel per frame, which DLSS otherwise has to soften out). Also enables DLSS's HDR input mode\n"
-               "when the scene color is a floating point target. The injection triggers on the first post-process pass sampling\n"
-               "the identified scene color; frames where that never happens (e.g. the game's post chain is disabled) fall back\n"
-               "to the late injection point automatically.");
+               "on the anti-aliased, unjittered image rather than baking into the upscaler input (post effects sampling a jittered\n"
+               "scene wobble sub-pixel per frame, which temporal upscalers otherwise have to soften out). Also enables DLSS's HDR\n"
+               "input mode when the scene color is a floating point target and DLSS is selected. The injection triggers on the\n"
+               "first post-process pass sampling the identified scene color; frames where that never happens (e.g. the game's post\n"
+               "chain is disabled) fall back to the late injection point automatically.");
     RTX_OPTION("rtx.ngxPassthrough", bool, objectVelocities, true,
                "Rasterizes true motion vectors for dynamic objects into the synthesized motion vector inputs, replacing the\n"
                "static-world camera reprojection where they land. Covers rigid movers (doors, elevators - draws whose transform\n"
@@ -286,13 +310,12 @@ namespace dxvk {
                "which pixels are UI instead of detecting them heuristically, which strongly reduces UI warping over busy\n"
                "moving backgrounds.");
     RTX_OPTION("rtx.ngxPassthrough", bool, driveGameScreenPercentage, true,
-               "Lets the Remix DLSS mode selector (rtx.qualityDLSS - Full Resolution, Quality, Balanced, Performance, Ultra\n"
-               "Performance, Auto) drive the game's ScreenPercentage directly, so the render resolution is chosen from the menu\n"
-               "instead of the in-game 'scale set ScreenPercentage' console command. Full Resolution renders natively (DLAA);\n"
-               "the other tiers render at DLSS's standard scaling factors and are upscaled by DLSS Super Resolution. The D3D9\n"
-               "layer writes the value into the game each frame while this mode is active and restores the game's own value\n"
-               "when disabled. Only meaningful with rtx.ngxPassthroughMode; harmless if the game's ScreenPercentage field\n"
-               "cannot be located (the feature simply stays inactive).");
+               "Lets the Remix upscaler quality preset drive the game's ScreenPercentage directly, so the render\n"
+               "resolution is chosen from the menu instead of the in-game 'scale set ScreenPercentage' console command.\n"
+               "Full Resolution renders natively (DLAA for DLSS, 100% for NIS/TAA-U/XeSS); the other tiers render at the\n"
+               "upscaler's standard scaling factors and are upscaled on output. The D3D9 layer writes the value into the\n"
+               "game each frame while this mode is active and restores the game's own value when disabled. Only meaningful\n"
+               "with rtx.ngxPassthroughMode; harmless if the game's ScreenPercentage field cannot be located.");
     RTX_OPTION("rtx.ngxPassthrough", int, dlssRenderPreset, 10,
                "DLSS render preset (model selection) hint for the NGX feature. 0: Default (snippet/driver decides, typically an\n"
                "older CNN model), 1-6: presets A-F (CNN models), 10: preset J (transformer model - noticeably better detail\n"
@@ -359,12 +382,66 @@ namespace dxvk {
                       const float jitter[2],
                       bool resetHistory);
 
+    bool evaluateNis(RtxContext* ctx,
+                     DxvkBarrierSet& barriers,
+                     const Rc<DxvkImage>& colorSourceImage,
+                     const VkOffset2D& colorSourceOffset,
+                     const Rc<DxvkImage>& targetImage,
+                     const VkOffset2D& targetOffset,
+                     bool preserveTargetAlpha,
+                     bool resetHistory);
+
+    bool evaluateTaau(RtxContext* ctx,
+                      DxvkBarrierSet& barriers,
+                      const Rc<DxvkImage>& colorSourceImage,
+                      const VkOffset2D& colorSourceOffset,
+                      const Rc<DxvkImage>& targetImage,
+                      const VkOffset2D& targetOffset,
+                      bool preserveTargetAlpha,
+                      const float jitter[2],
+                      bool resetHistory);
+
+#ifndef _M_ARM64
+    bool evaluateXess(RtxContext* ctx,
+                      DxvkBarrierSet& barriers,
+                      const Rc<DxvkImage>& colorSourceImage,
+                      const VkOffset2D& colorSourceOffset,
+                      const Rc<DxvkImage>& targetImage,
+                      const VkOffset2D& targetOffset,
+                      bool preserveTargetAlpha,
+                      bool resetHistory);
+#endif
+
+    void snapshotColorInput(RtxContext* ctx,
+                            const Rc<DxvkImage>& colorSourceImage,
+                            const VkOffset2D& colorSourceOffset);
+
+    bool applyPostFxAndWriteback(RtxContext* ctx,
+                                 DxvkBarrierSet& barriers,
+                                 const Rc<DxvkImage>& targetImage,
+                                 const VkOffset2D& targetOffset,
+                                 bool preserveTargetAlpha,
+                                 bool resetHistory);
+
+    // Runs Remix postfx on the scene color when no upscaler is selected or available.
+    bool evaluatePostFxOnly(RtxContext* ctx,
+                            DxvkBarrierSet& barriers,
+                            const Rc<DxvkImage>& colorSourceImage,
+                            const VkOffset2D& colorSourceOffset,
+                            const Rc<DxvkImage>& targetImage,
+                            const VkOffset2D& targetOffset,
+                            bool preserveTargetAlpha,
+                            bool resetHistory);
+
+    void copyColorInputToOutput(RtxContext* ctx);
+
     // Combines m_dlssOutput RGB with m_colorInput alpha into m_mergedOutput
     void dispatchAlphaMerge(RtxContext* ctx, DxvkBarrierSet& barriers);
 
     std::unique_ptr<NGXDLSSContext> m_dlssContext;
     bool m_dlssNeedsInitialize = true;
-    bool m_dlssActive = false;
+    bool m_upscalerActive = false;
+    bool m_postFxActive = false;
     int m_dlssInitializedRenderPreset = -1;
     bool m_dlssInitializedHDR = false;
 
@@ -377,7 +454,7 @@ namespace dxvk {
 
     // Rolling counters for the periodic diagnostic summary log
     uint32_t m_statDispatchCount = 0;
-    uint32_t m_statDlssActiveCount = 0;
+    uint32_t m_statUpscalerActiveCount = 0;
     uint32_t m_statCameraInvalidCount = 0;
     uint32_t m_statUpscalerOffCount = 0;
     uint32_t m_statNoInputsCount = 0;

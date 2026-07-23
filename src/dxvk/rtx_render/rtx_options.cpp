@@ -25,6 +25,7 @@
 #include <nvapi.h>
 #include "../imgui/imgui.h"
 #include "rtx_bridge_message_channel.h"
+#include "rtx_ngx_passthrough.h"
 #include "rtx_terrain_baker.h"
 #include "rtx_nee_cache.h"
 #include "rtx_rtxdi_rayquery.h"
@@ -43,6 +44,10 @@ namespace dxvk {
   RtxOptions* RtxOptions::s_instance = nullptr;
   HashRule RtxOptions::s_geometryHashGenerationRule = 0;
   HashRule RtxOptions::s_geometryAssetHashRule = 0;
+
+  void RtxOptions::enableRaytracingOnChange(DxvkDevice* device) {
+    RtxNgxPassthrough::enforceRaytracingDisabledForPassthrough();
+  }
 
   void RtxOptions::graphicsPresetOnChange(DxvkDevice* device) {
     // device will be nullptr during initial config loading.
@@ -160,6 +165,12 @@ namespace dxvk {
         reflexMode.setImmediately(ReflexMode::None);
         break;
       case DlssPreset::On:
+        // NGX passthrough selects the upscaler via rtx.upscalerType (NIS/TAA-U/XeSS/DLSS).
+        // The bundled DLSS preset must not stomp a user-configured non-DLSS upscaler at launch.
+        if (RtxNgxPassthrough::ngxPassthroughMode() && RtxOptions::upscalerType() != UpscalerType::DLSS) {
+          dlssPreset.setImmediately(DlssPreset::Custom);
+          break;
+        }
         upscalerType.setImmediately(UpscalerType::DLSS);
         qualityDLSS.setImmediately(DLSSProfile::Auto);
         reflexMode.setImmediately(ReflexMode::LowLatency); // Reflex uses ON under G (not Boost)

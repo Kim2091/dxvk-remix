@@ -378,11 +378,12 @@ namespace dxvk {
           }
 
           // Display XeSS internal resolution
-          auto& xess = ctx->getCommonObjects()->metaXeSS();
-
           uint32_t inputWidth;
           uint32_t inputHeight;
-          xess.getInputSize(inputWidth, inputHeight);
+          ctx->getCommonObjects()->metaNgxPassthrough().getXeSSInputResolution(
+            uint32_t(ImGui::GetIO().DisplaySize.x),
+            uint32_t(ImGui::GetIO().DisplaySize.y),
+            inputWidth, inputHeight);
           ImGui::TextWrapped(str::format("Render Resolution: ", inputWidth, "x", inputHeight).c_str());
 
           break;

@@ -124,6 +124,7 @@ namespace dxvk {
     { R"(\\MirrorsEdge\.exe$)", {{
       { "rtx.d3d9.ue3EngineMode",                                    "True" },
       { "rtx.ngxPassthroughMode",                                    "True" },
+      { "rtx.enableRaytracing",                                      "False" },
       { "rtx.zUp",                                                   "True" },
       { "rtx.sceneScale",                                            "1.0" },
       { "rtx.d3d9.autoRaytracedRenderTargetFromFullscreenComposite", "True" },
