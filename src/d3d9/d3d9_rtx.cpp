@@ -3914,34 +3914,165 @@ namespace dxvk {
       return result;
     }
 
-    bool tryExtractUe3WorldToViewAndProjectionFromShaderConstants(
-      const D3D9ShaderConstantsVSSoftware& vsConsts,
-      const uint32_t viewProjRegisterBase,
-      const uint32_t viewOriginRegister,
+    // Accepts a matrix as a usable perspective view->projection: it must decompose to finite,
+    // forward-facing frustum parameters with no meaningful shear. Shared by the combined
+    // world->projection extraction and the separate View/Projection provider, which uses it
+    // to pick the engine's packing convention (the wrong transpose does not decompose).
+    bool validateProjectionMatrix(const Matrix4& viewToProjection, DecomposeProjectionParams& outParams) {
+      decomposeProjection(viewToProjection, outParams);
+
+      const bool finite =
+        std::isfinite(outParams.fov) &&
+        std::isfinite(outParams.aspectRatio) &&
+        std::isfinite(outParams.nearPlane) &&
+        std::isfinite(outParams.farPlane) &&
+        std::isfinite(outParams.shearX) &&
+        std::isfinite(outParams.shearY);
+      if (!finite)
+        return false;
+
+      if (outParams.fov < 0.001f)
+        return false;
+      if (std::abs(outParams.shearX) > 0.01f)
+        return false;
+      if (outParams.nearPlane <= 0.0f)
+        return false;
+      if (outParams.farPlane <= outParams.nearPlane)
+        return false;
+
+      return true;
+    }
+
+    // Packing discriminators for separately uploaded View/Projection matrices.
+    //
+    // Validation alone cannot tell a matrix from its transpose - the transpose of a rotation
+    // is another perfectly good rotation, and a transposed perspective still decomposes to
+    // sane frustum parameters - so the convention has to be read off the structure instead.
+    // In the runtime's convention (data[i] is column i, clip = M * world) an affine
+    // world->view has a zero bottom row and a homogeneous 1, while a perspective projection
+    // carries the +-z pick-up in its w row and a zero w-w term. The transposed packing puts
+    // both somewhere else, so exactly one orientation passes.
+    bool isViewMatrixPackedForRuntime(const Matrix4& m) {
+      constexpr float kEps = 1e-3f;
+      return std::abs(m[0].w) < kEps && std::abs(m[1].w) < kEps && std::abs(m[2].w) < kEps &&
+             std::abs(m[3].w - 1.0f) < kEps;
+    }
+
+    bool isProjectionMatrixPackedForRuntime(const Matrix4& m) {
+      constexpr float kEps = 1e-3f;
+      // w row picks up view z (|.| == 1 for the standard D3D perspective) and contributes
+      // nothing constant; an orthographic or transposed matrix fails one of the two
+      return std::abs(m[3].w) < kEps && std::abs(std::abs(m[2].w) - 1.0f) < kEps;
+    }
+
+    // Accepts a matrix as a usable world->view: a rigid transform, i.e. an orthonormal 3x3
+    // basis (engines never scale the view matrix) with a finite translation. Used together
+    // with the packing discriminator above, and to reject the mirrored views that
+    // reflection/portal captures upload under main-view constant names.
+    bool validateWorldToViewMatrix(const Matrix4& worldToView) {
+      const Vector3 axisX(worldToView[0].x, worldToView[1].x, worldToView[2].x);
+      const Vector3 axisY(worldToView[0].y, worldToView[1].y, worldToView[2].y);
+      const Vector3 axisZ(worldToView[0].z, worldToView[1].z, worldToView[2].z);
+
+      for (const Vector3& axis : { axisX, axisY, axisZ }) {
+        const float lengthSquared = lengthSqr(axis);
+        if (!std::isfinite(lengthSquared) || std::abs(lengthSquared - 1.0f) > 0.01f)
+          return false;
+      }
+
+      if (std::abs(dot(axisX, axisY)) > 0.01f ||
+          std::abs(dot(axisX, axisZ)) > 0.01f ||
+          std::abs(dot(axisY, axisZ)) > 0.01f)
+        return false;
+
+      // Right handed basis only: a negative determinant is a mirrored view
+      if (dot(cross(axisX, axisY), axisZ) < 0.0f)
+        return false;
+
+      return std::isfinite(worldToView[3].x) && std::isfinite(worldToView[3].y) &&
+             std::isfinite(worldToView[3].z);
+    }
+
+    // Recovers the world space eye position from a world to projection matrix alone, for
+    // engines that never hand the camera position to the vertex shader as its own constant
+    // (the UE3 path has ViewOrigin; most others do not). Every view ray converges at the
+    // perspective frustum's apex, so unprojecting two NDC columns at two depths gives two
+    // world space lines whose closest approach is the eye. Orthographic projections have
+    // parallel rays and no apex, and are rejected here rather than yielding a garbage point.
+    bool tryDeriveEyeFromInverseWorldToProjection(const Matrix4& invWorldToProjection, Vector3& outEye) {
+      constexpr float kEps = 1e-6f;
+
+      auto unproject = [&](float ndcX, float ndcY, float ndcZ, Vector3& outWorldPos) -> bool {
+        const Vector4 worldH = invWorldToProjection * Vector4(ndcX, ndcY, ndcZ, 1.0f);
+        if (!std::isfinite(worldH.w) || std::abs(worldH.w) < kEps)
+          return false;
+        outWorldPos = worldH.xyz() * (1.0f / worldH.w);
+        return std::isfinite(outWorldPos.x) && std::isfinite(outWorldPos.y) && std::isfinite(outWorldPos.z);
+      };
+
+      // Two well separated screen positions, each sampled at two depths inside the usable
+      // range of the D3D depth convention (the extremes are the least well conditioned)
+      Vector3 nearA, farA, nearB, farB;
+      if (!unproject(-0.5f, -0.5f, 0.2f, nearA) || !unproject(-0.5f, -0.5f, 0.8f, farA))
+        return false;
+      if (!unproject(0.5f, 0.5f, 0.2f, nearB) || !unproject(0.5f, 0.5f, 0.8f, farB))
+        return false;
+
+      Vector3 dirA = farA - nearA;
+      Vector3 dirB = farB - nearB;
+      if (lengthSqr(dirA) < kEps || lengthSqr(dirB) < kEps)
+        return false;
+      dirA = normalize(dirA);
+      dirB = normalize(dirB);
+
+      // Closest approach of the two rays; the unit directions collapse the usual
+      // denominator to 1 - dot^2, which vanishes exactly when the rays are parallel
+      const Vector3 between = nearA - nearB;
+      const float dirDot = dot(dirA, dirB);
+      const float denom = 1.0f - dirDot * dirDot;
+      if (!std::isfinite(denom) || std::abs(denom) < 1e-5f)
+        return false;  // parallel rays: orthographic projection, no apex to find
+
+      const float projA = dot(dirA, between);
+      const float projB = dot(dirB, between);
+      const float tA = (dirDot * projB - projA) / denom;
+      const float tB = (projB - dirDot * projA) / denom;
+
+      const Vector3 pointA = nearA + dirA * tA;
+      const Vector3 pointB = nearB + dirB * tB;
+
+      if (!std::isfinite(pointA.x) || !std::isfinite(pointA.y) || !std::isfinite(pointA.z) ||
+          !std::isfinite(pointB.x) || !std::isfinite(pointB.y) || !std::isfinite(pointB.z))
+        return false;
+
+      // A true perspective apex has the two rays meeting; anything else is not a camera.
+      // The tolerance is relative to the eye-to-near-plane distance so the test holds at
+      // any world scale.
+      const float missDistanceSq = lengthSqr(pointA - pointB);
+      const float referenceDistanceSq = std::max(lengthSqr(nearA - pointA), kEps);
+      if (missDistanceSq > referenceDistanceSq * 1e-4f)
+        return false;
+
+      outEye = (pointA + pointB) * 0.5f;
+      return true;
+    }
+
+    // Derives a stable (world to view, view to projection) pair from a combined world to
+    // projection transform by
+    // 1 unprojecting a few NDC points to recover view orientation (using the camera position)
+    // 2 deriving a pure projection matrix and validating it via projection decomposition
+    //
+    // explicitEye: the engine's own camera position constant when it has one, otherwise null
+    // to recover the eye from the frustum apex (see tryDeriveEyeFromInverseWorldToProjection).
+    // Both the raw matrix and its transpose are tried, so the caller need not know the
+    // engine's packing convention.
+    bool tryExtractCameraFromWorldToProjection(
+      const Matrix4& worldToProjection,
+      const Vector3* explicitEye,
       Matrix4& outWorldToView,
       Matrix4& outViewToProjection,
       bool* outUsedTranspose = nullptr,
       float* outReconstructionError = nullptr) {
-
-      // UE3 uploads ViewProjectionMatrix via SetVertexShaderConstantF as 4 consecutive float4 registers
-      // These values are the raw shader constants and in UE3/HLSL this matrix is typically treated as column-major
-      // We derive a stable (world to view, view to projection) pair by
-      // 1 treating the provided matrix as a world to projection transform
-      // 2 unprojecting a few NDC points to recover view orientation (using camera position)
-      // 3 deriving a pure projection matrix and validating it via projection decomposition
-
-      if (viewProjRegisterBase + 3 >= caps::MaxFloatConstantsSoftware)
-        return false;
-      if (viewOriginRegister >= caps::MaxFloatConstantsSoftware)
-        return false;
-
-      Matrix4 worldToProjection;
-      worldToProjection[0] = vsConsts.fConsts[viewProjRegisterBase + 0];
-      worldToProjection[1] = vsConsts.fConsts[viewProjRegisterBase + 1];
-      worldToProjection[2] = vsConsts.fConsts[viewProjRegisterBase + 2];
-      worldToProjection[3] = vsConsts.fConsts[viewProjRegisterBase + 3];
-
-      const Vector3 camPos = vsConsts.fConsts[viewOriginRegister].xyz();
 
       // Quick reject: all-zero matrices show up during some initialization paths
       constexpr float kEps = 1e-6f;
@@ -3953,28 +4084,7 @@ namespace dxvk {
       }
 
       auto validateProjection = [](const Matrix4& viewToProjection, DecomposeProjectionParams& outParams) {
-        decomposeProjection(viewToProjection, outParams);
-
-        const bool finite =
-          std::isfinite(outParams.fov) &&
-          std::isfinite(outParams.aspectRatio) &&
-          std::isfinite(outParams.nearPlane) &&
-          std::isfinite(outParams.farPlane) &&
-          std::isfinite(outParams.shearX) &&
-          std::isfinite(outParams.shearY);
-        if (!finite)
-          return false;
-
-        if (outParams.fov < 0.001f)
-          return false;
-        if (std::abs(outParams.shearX) > 0.01f)
-          return false;
-        if (outParams.nearPlane <= 0.0f)
-          return false;
-        if (outParams.farPlane <= outParams.nearPlane)
-          return false;
-
-        return true;
+        return validateProjectionMatrix(viewToProjection, outParams);
       };
 
       auto matrixL1Error = [](const Matrix4& a, const Matrix4& b) {
@@ -3999,6 +4109,16 @@ namespace dxvk {
         // invert world to projection to unproject a few NDC points
         Matrix4 invWorldToProjection;
         invWorldToProjection = inverse(candidateWorldToProjection);
+
+        // Resolved per candidate: a derived eye belongs to the transpose interpretation it
+        // was recovered from, and the wrong interpretation fails to produce an apex at all
+        // (which is itself a useful rejection signal)
+        Vector3 camPos;
+        if (explicitEye != nullptr) {
+          camPos = *explicitEye;
+        } else if (!tryDeriveEyeFromInverseWorldToProjection(invWorldToProjection, camPos)) {
+          return false;
+        }
 
         auto unprojectNdc = [&](float ndcX, float ndcY, float ndcZ, Vector3& outWorldPos) -> bool {
           const Vector4 clip(ndcX, ndcY, ndcZ, 1.0f);
@@ -4146,6 +4266,35 @@ namespace dxvk {
       if (outReconstructionError != nullptr)
         *outReconstructionError = best->error;
       return true;
+    }
+
+    // UE3 uploads ViewProjectionMatrix via SetVertexShaderConstantF as 4 consecutive float4
+    // registers, with the camera position in its own ViewOrigin register.
+    bool tryExtractUe3WorldToViewAndProjectionFromShaderConstants(
+      const D3D9ShaderConstantsVSSoftware& vsConsts,
+      const uint32_t viewProjRegisterBase,
+      const uint32_t viewOriginRegister,
+      Matrix4& outWorldToView,
+      Matrix4& outViewToProjection,
+      bool* outUsedTranspose = nullptr,
+      float* outReconstructionError = nullptr) {
+
+      if (viewProjRegisterBase + 3 >= caps::MaxFloatConstantsSoftware)
+        return false;
+      if (viewOriginRegister >= caps::MaxFloatConstantsSoftware)
+        return false;
+
+      Matrix4 worldToProjection;
+      worldToProjection[0] = vsConsts.fConsts[viewProjRegisterBase + 0];
+      worldToProjection[1] = vsConsts.fConsts[viewProjRegisterBase + 1];
+      worldToProjection[2] = vsConsts.fConsts[viewProjRegisterBase + 2];
+      worldToProjection[3] = vsConsts.fConsts[viewProjRegisterBase + 3];
+
+      const Vector3 camPos = vsConsts.fConsts[viewOriginRegister].xyz();
+
+      return tryExtractCameraFromWorldToProjection(worldToProjection, &camPos,
+                                                   outWorldToView, outViewToProjection,
+                                                   outUsedTranspose, outReconstructionError);
     }
   }
 
@@ -4795,6 +4944,8 @@ namespace dxvk {
     o.ngxDlfgHudless = RtxNgxPassthrough::dlfgHudlessInput() && DxvkDLFG::enable() &&
                        m_parent->GetDXVKDevice()->getCommon()->metaNGXContext().supportsDLFG();
     o.ngxObjectVelocities = RtxNgxPassthrough::objectVelocities();
+    o.ngxObjectVelocitiesGeneric = RtxNgxPassthrough::objectVelocitiesGeneric();
+    o.ngxClipTransformProbe = RtxNgxPassthrough::clipTransformProbe();
     o.ngxDebugVisualization = RtxNgxPassthrough::debugVisualization();
 
     // On-demand post-chain dump (one-shot: consumed here, option resets itself)
@@ -4802,6 +4953,25 @@ namespace dxvk {
       m_ngxPostChainDumpFramesLeft = uint32_t(RtxNgxPassthrough::dumpPostChainFrames());
       RtxNgxPassthrough::dumpPostChainFramesObject().setDeferred(0);
       Logger::info(str::format("[RTX NGX Passthrough][dump] On-demand dump armed for ", m_ngxPostChainDumpFramesLeft, " frames."));
+    }
+
+    // One-shot manual trigger: reports the next frame whatever it contains, bypassing the
+    // frame-selection heuristics entirely (the user pressing the button has already chosen
+    // the moment far more reliably than a draw-count threshold can)
+    if (o.ngxPassthroughMode && RtxNgxPassthrough::dumpCameraCandidatesNow()) {
+      RtxNgxPassthrough::dumpCameraCandidatesNowObject().setDeferred(false);
+      m_ngxCameraDumpFramesLeft = 1;
+      m_ngxCameraDumpForced = true;
+      m_ngxCameraDumpSeenShaders.clear();
+      Logger::info("[RTX NGX Passthrough][cameraDump] Manual sweep armed for the next frame (all shaders, no filtering).");
+    }
+
+    if (o.ngxPassthroughMode && RtxNgxPassthrough::dumpCameraCandidateFrames() > 0 && m_ngxCameraDumpFramesLeft == 0) {
+      m_ngxCameraDumpFramesLeft = uint32_t(RtxNgxPassthrough::dumpCameraCandidateFrames());
+      RtxNgxPassthrough::dumpCameraCandidateFramesObject().setDeferred(0);
+      m_ngxCameraDumpSeenShaders.clear();
+      Logger::info(str::format("[RTX NGX Passthrough][cameraDump] Constant register sweep armed for ",
+                               m_ngxCameraDumpFramesLeft, " frames."));
     }
     o.enableIndexBufferMemoization = enableIndexBufferMemoizationObject().get();
 
@@ -10749,7 +10919,11 @@ namespace dxvk {
       }
 
       const DxsoCtab& ctab = decoder.getCtabInfo();
-      if (ctab.m_size == 0 || ctab.m_constantData.empty())
+      // Recorded before the name matching so the failure summary can separate "this game ships
+      // no shader symbols" from "this game names its camera something we do not recognise"
+      result.hasCtab = ctab.m_size != 0 && !ctab.m_constantData.empty();
+      result.ctabConstantCount = uint32_t(ctab.m_constantData.size());
+      if (!result.hasCtab)
         return result;
 
       auto lower = [](const std::string& s) {
@@ -10769,44 +10943,95 @@ namespace dxvk {
       uint32_t viewProjRegister = 0;
       uint32_t viewOriginRegister = 0;
 
+      // Shared disqualifiers for every camera symbol below. A matrix that is any of these is
+      // either not the main view (light/shadow/sky/reflection passes upload their own
+      // view-projections under equally view-like names) or not in the direction we need
+      // (inverses, previous-frame copies). Rejecting them by name is what keeps the widened
+      // dictionary from steering the camera off a shadow cascade.
+      auto isDisqualifiedCameraName = [&](const std::string& n) {
+        return
+          contains(n, "prev") || contains(n, "previous") || contains(n, "last") ||
+          contains(n, "inv") || contains(n, "transpose") ||
+          contains(n, "light") || contains(n, "shadow") || contains(n, "cascade") ||
+          contains(n, "sky") || contains(n, "cloud") ||
+          contains(n, "reflect") || contains(n, "mirror") || contains(n, "portal") ||
+          contains(n, "capture") || contains(n, "probe") || contains(n, "cubemap") ||
+          contains(n, "decal") || contains(n, "local") || contains(n, "bone");
+      };
+
       for (const DxsoCtab::Constant& c : ctab.m_constantData) {
         const std::string name = lower(c.name);
+        const bool disqualified = isDisqualifiedCameraName(name);
 
-        if (!hasViewProjectionMatrix && c.registerCount >= 4) {
+        if (!hasViewProjectionMatrix && c.registerCount >= 4 && !disqualified) {
+          // Combined world->clip, under the spellings engines actually ship. "world" forms
+          // are included because an engine that folds an identity world into the upload
+          // (common for static geometry) still names the constant WorldViewProjection.
           const bool looksLikeViewProj =
-            contains(name, "viewprojectionmatrix") ||
-            contains(name, "viewprojmatrix") ||
-            contains(name, "view_projection_matrix") ||
-            contains(name, "view_proj_matrix");
-          const bool isPreviousViewProj =
-            contains(name, "prevviewprojectionmatrix") ||
-            contains(name, "prevviewprojmatrix") ||
-            contains(name, "previousviewprojectionmatrix") ||
-            contains(name, "previousviewprojmatrix") ||
-            contains(name, "prev_view_projection_matrix") ||
-            contains(name, "prev_view_proj_matrix");
-          if (looksLikeViewProj && !isPreviousViewProj) {
+            contains(name, "viewprojection") ||
+            contains(name, "viewproj") ||
+            contains(name, "view_projection") ||
+            contains(name, "view_proj") ||
+            contains(name, "worldviewproj") ||
+            contains(name, "wvp") ||
+            contains(name, "viewtoclip") ||
+            contains(name, "worldtoclip") ||
+            contains(name, "worldtoprojection");
+          if (looksLikeViewProj) {
             hasViewProjectionMatrix = true;
             viewProjRegister = c.registerIndex;
           }
         }
 
-        if (!hasCameraPosition && c.registerCount >= 1) {
+        // Separate View and Projection uploads. Each half must exclude the other's token so
+        // a combined "ViewProjectionMatrix" cannot register as either, and the world matrix
+        // ("WorldView") is excluded from the view half for the same reason.
+        if (!result.hasSeparateView && c.registerCount >= 4 && !disqualified &&
+            !contains(name, "proj") && !contains(name, "world") && !contains(name, "clip")) {
+          const bool looksLikeView =
+            contains(name, "viewmatrix") ||
+            contains(name, "view_matrix") ||
+            contains(name, "matview") ||
+            contains(name, "worldtoview") ||
+            contains(name, "mview") ||
+            name == "view" || name == "g_view" || name == "_view";
+          if (looksLikeView) {
+            result.hasSeparateView = true;
+            result.separateViewRegister = c.registerIndex;
+          }
+        }
+
+        if (!result.hasSeparateProjection && c.registerCount >= 4 && !disqualified &&
+            !contains(name, "view") && !contains(name, "world")) {
+          const bool looksLikeProjection =
+            contains(name, "projectionmatrix") ||
+            contains(name, "projection_matrix") ||
+            contains(name, "projmatrix") ||
+            contains(name, "matproj") ||
+            contains(name, "mproj") ||
+            name == "projection" || name == "proj" ||
+            name == "g_projection" || name == "g_proj" || name == "_projection";
+          if (looksLikeProjection) {
+            result.hasSeparateProjection = true;
+            result.separateProjectionRegister = c.registerIndex;
+          }
+        }
+
+        if (!hasCameraPosition && c.registerCount >= 1 && !disqualified) {
           const bool looksLikeCameraPosition =
             contains(name, "cameraposition") ||
             contains(name, "vieworigin") ||
             contains(name, "cameraworldpos") ||
             contains(name, "cameraworldposition") ||
             contains(name, "camerapos") ||
-            contains(name, "eyeposition");
-          const bool isPreviousCameraPosition =
-            contains(name, "prevcameraposition") ||
-            contains(name, "prevvieworigin") ||
-            contains(name, "previouscameraposition") ||
-            contains(name, "previousvieworigin") ||
-            contains(name, "prevcameraworldposition") ||
-            contains(name, "previouseyeposition");
-          if (looksLikeCameraPosition && !isPreviousCameraPosition) {
+            contains(name, "eyeposition") ||
+            contains(name, "eyepos") ||
+            contains(name, "eyepoint") ||
+            contains(name, "viewposition") ||
+            contains(name, "viewpos") ||
+            contains(name, "campos") ||
+            contains(name, "worldcamerapos");
+          if (looksLikeCameraPosition) {
             hasCameraPosition = true;
             viewOriginRegister = c.registerIndex;
           }
@@ -10851,43 +11076,880 @@ namespace dxvk {
     return result;
   }
 
-  void D3D9Rtx::tryNgxPassthroughCameraCapture() {
+  const char* D3D9Rtx::ngxCameraSourceLabel(NgxCameraSource source) {
+    switch (source) {
+      case NgxCameraSource::CtabViewProjWithOrigin: return "ViewProjection + camera position (shader constants)";
+      case NgxCameraSource::CtabViewProjDerivedEye: return "ViewProjection, eye from frustum apex (shader constants)";
+      case NgxCameraSource::CtabSeparateViewProj:   return "separate View + Projection (shader constants)";
+      case NgxCameraSource::FixedFunction:          return "fixed function D3DTS_VIEW / D3DTS_PROJECTION";
+      case NgxCameraSource::ClipTransformProbe:     return "vertex shader clip transform (measured, name-independent)";
+      default:                                      return "none";
+    }
+  }
+
+  bool D3D9Rtx::resolveNgxPassthroughCamera(const NgxCameraCtabRegs& ctabRegs,
+                                            bool hasProgrammableVs,
+                                            Matrix4& outWorldToView,
+                                            Matrix4& outViewToProjection,
+                                            bool& outUsedTranspose,
+                                            XXH64_hash_t& outConstantsHash,
+                                            NgxCameraSource& outSource) {
+    outSource = NgxCameraSource::None;
+    outUsedTranspose = false;
+    outConstantsHash = 0;
+
+    NgxCameraResolveStats& stats = m_ngxCameraResolveStats;
+    stats.drawsExamined++;
+    if (hasProgrammableVs) {
+      stats.drawsProgrammableVs++;
+      if (ctabRegs.hasCtab) {
+        stats.drawsWithCtabPresent++;
+      } else {
+        stats.drawsWithCtabStripped++;
+      }
+      if (ctabRegs.hasViewProjection || ctabRegs.hasSeparateView || ctabRegs.hasSeparateProjection ||
+          ctabRegs.ctabVerified) {
+        stats.shadersWithCtab++;
+      }
+      if (ctabRegs.hasViewProjection) {
+        stats.withViewProjection++;
+      }
+      if (ctabRegs.ctabVerified) {
+        stats.withCameraPosition++;
+      }
+      if (ctabRegs.hasSeparateView && ctabRegs.hasSeparateProjection) {
+        stats.withSeparateViewProjection++;
+      }
+    } else {
+      stats.drawsFixedFunction++;
+    }
+
+    const auto& vsConsts = d3d9State().vsConsts;
+
+    // Mirrored view rejection for the combined world->projection providers: reflection and
+    // portal captures premultiply a mirror matrix into the view, which flips the sign of the
+    // 3x3 determinant relative to the main view. Checked on the raw registers because the
+    // basis reconstruction downstream re-orthonormalizes and would destroy the signal; the
+    // sign itself is transpose-invariant.
+    //
+    // Which sign the MAIN view carries is a per-engine convention, not a constant: it falls
+    // out of the world handedness and the projection's handedness together. Assuming positive
+    // (as the UE3 path did) rejects every draw in an engine that composes them the other way,
+    // so the reference sign is learned from the game instead - the main view massively
+    // outnumbers reflection captures, so the dominant sign across a frame is the main view's.
+    // Until a frame has established it, both signs are accepted.
+    auto registersAreMirrored = [&](uint32_t baseRegister) {
+      const Vector4& row0 = vsConsts.fConsts[baseRegister + 0];
+      const Vector4& row1 = vsConsts.fConsts[baseRegister + 1];
+      const Vector4& row2 = vsConsts.fConsts[baseRegister + 2];
+      const float det3 =
+        row0.x * (row1.y * row2.z - row1.z * row2.y) -
+        row0.y * (row1.x * row2.z - row1.z * row2.x) +
+        row0.z * (row1.x * row2.y - row1.y * row2.x);
+
+      if (!std::isfinite(det3) || det3 == 0.0f)
+        return true;
+
+      const int32_t sign = det3 > 0.0f ? 1 : -1;
+      if (sign > 0) {
+        m_ngxCameraDetPositiveCount++;
+      } else {
+        m_ngxCameraDetNegativeCount++;
+      }
+
+      return m_ngxCameraDetSign != 0 && sign != m_ngxCameraDetSign;
+    };
+
+    auto registersInRange = [](uint32_t baseRegister, uint32_t count) {
+      return baseRegister + count <= caps::MaxFloatConstantsSoftware;
+    };
+
+    // --- Provider 1/2: a combined ViewProjection, with the engine's camera position when it
+    // publishes one and the frustum apex when it does not. Identical extraction either way,
+    // so they share a path and differ only in the reported source.
+    if (hasProgrammableVs && ctabRegs.hasViewProjection) {
+      const uint32_t viewProjReg = ctabRegs.viewProjRegister;
+      const bool haveOrigin = ctabRegs.ctabVerified;
+      const uint32_t viewOriginReg = ctabRegs.viewOriginRegister;
+
+      const bool rangeOk = registersInRange(viewProjReg, 4) &&
+                           (!haveOrigin || registersInRange(viewOriginReg, 1));
+      if (!rangeOk) {
+        stats.declinedRegisterRange++;
+      } else if (registersAreMirrored(viewProjReg)) {
+        stats.declinedMirroredView++;
+      } else {
+        float reconstructionError = 0.0f;
+        bool extracted = false;
+
+        if (haveOrigin) {
+          // The cached path, shared with the ray traced pipeline
+          extracted = tryGetUe3CameraFromConstantsCached(viewProjReg, viewOriginReg,
+                                                         outWorldToView, outViewToProjection,
+                                                         outUsedTranspose, reconstructionError,
+                                                         &outConstantsHash);
+          if (extracted)
+            outSource = NgxCameraSource::CtabViewProjWithOrigin;
+        } else {
+          Matrix4 worldToProjection;
+          worldToProjection[0] = vsConsts.fConsts[viewProjReg + 0];
+          worldToProjection[1] = vsConsts.fConsts[viewProjReg + 1];
+          worldToProjection[2] = vsConsts.fConsts[viewProjReg + 2];
+          worldToProjection[3] = vsConsts.fConsts[viewProjReg + 3];
+
+          extracted = tryExtractCameraFromWorldToProjection(worldToProjection, nullptr,
+                                                            outWorldToView, outViewToProjection,
+                                                            &outUsedTranspose, &reconstructionError);
+          if (extracted) {
+            outSource = NgxCameraSource::CtabViewProjDerivedEye;
+            outConstantsHash = XXH3_64bits(&worldToProjection, sizeof(worldToProjection));
+          }
+        }
+
+        if (extracted)
+          return true;
+
+        stats.declinedExtractionFailed++;
+      }
+    }
+
+    // --- Provider 3: separately uploaded View and Projection matrices, taken as-is. No
+    // decomposition and no apex derivation, so this is exact where it applies; the only
+    // unknown is the packing convention, which the validators resolve by trying both.
+    if (hasProgrammableVs && ctabRegs.hasSeparateView && ctabRegs.hasSeparateProjection) {
+      const uint32_t viewReg = ctabRegs.separateViewRegister;
+      const uint32_t projReg = ctabRegs.separateProjectionRegister;
+
+      if (registersInRange(viewReg, 4) && registersInRange(projReg, 4)) {
+        auto loadRegisters = [&](uint32_t baseRegister) {
+          Matrix4 m;
+          m[0] = vsConsts.fConsts[baseRegister + 0];
+          m[1] = vsConsts.fConsts[baseRegister + 1];
+          m[2] = vsConsts.fConsts[baseRegister + 2];
+          m[3] = vsConsts.fConsts[baseRegister + 3];
+          return m;
+        };
+
+        const Matrix4 rawView = loadRegisters(viewReg);
+        const Matrix4 rawProjection = loadRegisters(projReg);
+
+        // Exactly one orientation may satisfy the packing discriminator. Ambiguous matrices
+        // (both or neither) are refused outright rather than guessed: a silently transposed
+        // camera looks plausible and produces motion vectors that are wrong everywhere,
+        // which is far harder to diagnose than simply having no camera.
+        auto resolvePacking = [](const Matrix4& raw, bool (*isPacked)(const Matrix4&),
+                                 Matrix4& out, bool& outWasTransposed) {
+          const Matrix4 flipped = transpose(raw);
+          const bool rawPacked = isPacked(raw);
+          const bool flippedPacked = isPacked(flipped);
+          if (rawPacked == flippedPacked)
+            return false;
+          out = rawPacked ? raw : flipped;
+          outWasTransposed = !rawPacked;
+          return true;
+        };
+
+        Matrix4 worldToView;
+        bool viewWasTransposed = false;
+        const bool viewResolved =
+          resolvePacking(rawView, &isViewMatrixPackedForRuntime, worldToView, viewWasTransposed) &&
+          validateWorldToViewMatrix(worldToView);
+
+        Matrix4 viewToProjection;
+        bool projectionWasTransposed = false;
+        bool projectionResolved = false;
+        if (viewResolved) {
+          DecomposeProjectionParams projParams {};
+          projectionResolved =
+            resolvePacking(rawProjection, &isProjectionMatrixPackedForRuntime,
+                           viewToProjection, projectionWasTransposed) &&
+            validateProjectionMatrix(viewToProjection, projParams);
+        }
+
+        if (viewResolved && projectionResolved) {
+          outUsedTranspose = viewWasTransposed;
+          outWorldToView = worldToView;
+          outViewToProjection = viewToProjection;
+          outSource = NgxCameraSource::CtabSeparateViewProj;
+
+          const Vector4 hashInput[8] = {
+            rawView[0], rawView[1], rawView[2], rawView[3],
+            rawProjection[0], rawProjection[1], rawProjection[2], rawProjection[3],
+          };
+          outConstantsHash = XXH3_64bits(hashInput, sizeof(hashInput));
+          return true;
+        }
+
+        stats.declinedPackingAmbiguous++;
+      } else {
+        stats.declinedRegisterRange++;
+      }
+    }
+
+    // --- Provider 4: fixed function transform state. The only provider that fires for draws
+    // without a vertex shader, and the reason pre-shader D3D9 titles work at all. The device
+    // already stores these in the convention the runtime uses (the ray traced path consumes
+    // them directly), so they need no interpretation.
+    //
+    // Strictly gated on the draw actually being fixed function: when a vertex shader is
+    // transforming the geometry, D3DTS_VIEW is whatever the game last happened to set (very
+    // often identity) and has nothing to do with what is on screen. Without this gate a
+    // shader-driven game would let stale transform state overwrite a good camera.
+    if (!hasProgrammableVs) {
+      const Matrix4& worldToView = d3d9State().transforms[GetTransformIndex(D3DTS_VIEW)];
+      const Matrix4& viewToProjection = d3d9State().transforms[GetTransformIndex(D3DTS_PROJECTION)];
+
+      // Cheap structural gate first: this runs on every fixed function draw, and a UI-heavy
+      // frame issues hundreds of them against an orthographic or identity projection. Two
+      // float compares reject those before the full frustum decomposition is worth paying for.
+      DecomposeProjectionParams projParams {};
+      if (isProjectionMatrixPackedForRuntime(viewToProjection) &&
+          validateWorldToViewMatrix(worldToView) &&
+          validateProjectionMatrix(viewToProjection, projParams)) {
+        outWorldToView = worldToView;
+        outViewToProjection = viewToProjection;
+        outSource = NgxCameraSource::FixedFunction;
+
+        const Vector4 hashInput[8] = {
+          worldToView[0], worldToView[1], worldToView[2], worldToView[3],
+          viewToProjection[0], viewToProjection[1], viewToProjection[2], viewToProjection[3],
+        };
+        outConstantsHash = XXH3_64bits(hashInput, sizeof(hashInput));
+        return true;
+      }
+
+      stats.declinedFfpProjection++;
+    } else {
+      stats.declinedFfpShaderBound++;
+    }
+
+    // --- Provider 5: the transform the bound vertex shader's own arithmetic applies to the
+    // input position, recovered from its bytecode plus the live constants and confirmed by
+    // cross-draw agreement (see the commentary on the probe members in d3d9_rtx.h).
+    //
+    // Deliberately last, and strictly a fallback: it only engages while NO named provider has
+    // ever carried the camera - neither this frame nor in any earlier one. A game the named
+    // providers handle therefore never reaches it at all, not even on the draws where they
+    // decline (UI and utility passes, which the probe would otherwise be free to reconstruct a
+    // camera from and steer the scene target off).
+    const bool namedProviderInUse =
+      (m_ngxLastCameraSource != NgxCameraSource::None &&
+       m_ngxLastCameraSource != NgxCameraSource::ClipTransformProbe) ||
+      (m_ngxFrameCameraSource != NgxCameraSource::None &&
+       m_ngxFrameCameraSource != NgxCameraSource::ClipTransformProbe);
+
+    if (hasProgrammableVs && m_frameOptions.ngxClipTransformProbe && !namedProviderInUse) {
+      if (tryNgxClipTransformProbe(outWorldToView, outViewToProjection, outConstantsHash)) {
+        outUsedTranspose = false;
+        outSource = NgxCameraSource::ClipTransformProbe;
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  // A frame's probe budget. Both bound the cost of a game the named providers cannot handle:
+  // the evaluation budget caps how many draws per frame have their vertex transform computed,
+  // the sweep budget how many of those additionally have their constant footprint searched for
+  // an un-folded view-projection (much more expensive, and only useful while learning).
+  static constexpr uint32_t kNgxClipProbeMaxEvalsPerFrame = 192;
+  static constexpr uint32_t kNgxClipProbeMaxSweepsPerFrame = 8;
+  static constexpr uint32_t kNgxClipProbeMaxSamplesPerFrame = 96;
+  // A consensus needs this many agreeing draws and this share of the frame's candidates before
+  // it is believed at all, and this many consecutive frames before it may steer the camera.
+  // The frame count is not just noise rejection: a game the NAMED providers handle still has
+  // camera-less frames at startup (splash screens, loading), and the probe must not claim the
+  // camera during them and leave a menu-frame scene target behind. Several consecutive frames
+  // of agreement with no named provider anywhere in sight is a much stronger statement.
+  static constexpr uint32_t kNgxClipProbeMinAgreeingSamples = 3;
+  static constexpr uint32_t kNgxClipProbeConfirmFrames = 8;
+
+  const VsClipTransformProgram* D3D9Rtx::getNgxClipProbeProgram(XXH64_hash_t shaderHash,
+                                                                const std::vector<uint8_t>& bytecode) {
+    auto it = m_ngxClipProbePrograms.find(shaderHash);
+    if (it == m_ngxClipProbePrograms.end()) {
+      it = m_ngxClipProbePrograms.emplace(
+        shaderHash, analyzeVsClipTransform(bytecode.data(), bytecode.size())).first;
+    }
+    return &it->second;
+  }
+
+  bool D3D9Rtx::reconstructNgxClipProbeCandidate(const Matrix4& objectToClip,
+                                                 NgxClipProbeCandidate& outCandidate) const {
+    // Same reconstruction the named providers use, with the eye taken from the frustum apex:
+    // the probe never has an engine-published camera position to lean on.
+    Matrix4 worldToView;
+    Matrix4 viewToProjection;
+    if (!tryExtractCameraFromWorldToProjection(objectToClip, nullptr, worldToView, viewToProjection))
+      return false;
+
+    DecomposeProjectionParams projParams {};
+    if (!validateProjectionMatrix(viewToProjection, projParams))
+      return false;
+
+    const Matrix4 viewToWorld = inverseAffine(worldToView);
+    outCandidate.worldToView = worldToView;
+    outCandidate.viewToProjection = viewToProjection;
+    outCandidate.eye = viewToWorld[3].xyz();
+    outCandidate.forward = viewToWorld[2].xyz();
+    outCandidate.fov = projParams.fov;
+    outCandidate.aspectRatio = projParams.aspectRatio;
+    outCandidate.nearPlane = projParams.nearPlane;
+    outCandidate.farPlane = projParams.farPlane;
+
+    return std::isfinite(outCandidate.eye.x) && std::isfinite(outCandidate.eye.y) &&
+           std::isfinite(outCandidate.eye.z);
+  }
+
+  // Do two reconstructions describe the same camera? Used twice with different tolerances:
+  // tightly, to cluster candidates taken from the SAME frame (draws sharing a world->clip
+  // reconstruct to numerically near-identical cameras, so the bar can be high), and loosely,
+  // to accept a draw against the previous frame's consensus (the camera legitimately moved
+  // and turned in between).
+  bool D3D9Rtx::ngxProbeCamerasMatch(const NgxClipProbeCandidate& a,
+                                     const NgxClipProbeCandidate& b,
+                                     float eyeTolerance,
+                                     float forwardDotMin,
+                                     float projectionTolerance) {
+    if (std::abs(a.fov - b.fov) > projectionTolerance * std::max(b.fov, 0.01f))
+      return false;
+    if (std::abs(std::abs(a.aspectRatio) - std::abs(b.aspectRatio)) >
+        projectionTolerance * std::max(std::abs(b.aspectRatio), 0.01f))
+      return false;
+    if (dot(a.forward, b.forward) < forwardDotMin)
+      return false;
+    return length(a.eye - b.eye) <= eyeTolerance;
+  }
+
+  bool D3D9Rtx::tryNgxClipTransformProbe(Matrix4& outWorldToView,
+                                         Matrix4& outViewToProjection,
+                                         XXH64_hash_t& outConstantsHash) {
+    NgxCameraResolveStats& stats = m_ngxCameraResolveStats;
+
+    if (d3d9State().vertexShader.ptr() == nullptr)
+      return false;
+
     const D3D9CommonShader* vertexShaderCommon = d3d9State().vertexShader->GetCommonShader();
     if (vertexShaderCommon == nullptr)
-      return;
+      return false;
 
     const XXH64_hash_t shaderHash = vertexShaderCommon->GetBytecodeHash();
     if (shaderHash == 0)
-      return;
+      return false;
 
-    auto it = m_ngxCameraCtabCache.find(shaderHash);
-    if (it == m_ngxCameraCtabCache.end()) {
-      it = m_ngxCameraCtabCache.emplace(shaderHash, scanNgxCameraCtabRegs(vertexShaderCommon->GetBytecode())).first;
+    const VsClipTransformProgram* program = getNgxClipProbeProgram(shaderHash, vertexShaderCommon->GetBytecode());
+    if (!program->ok()) {
+      // Skinned meshes, shaders that branch before transforming, position built from more than
+      // the position attribute: legitimate and common. Other shaders in the frame carry the
+      // same camera, so this is a per-draw decline and not a failure.
+      stats.probeShadersNotAffine++;
+      return false;
+    }
+    stats.probeShadersAnalyzed++;
+
+    if (m_ngxClipProbeEvalsThisFrame >= kNgxClipProbeMaxEvalsPerFrame)
+      return false;
+    m_ngxClipProbeEvalsThisFrame++;
+
+    const auto& vsConsts = d3d9State().vsConsts;
+
+    // Which readings of this draw to try. Once a shader has been seen to agree with the
+    // consensus, only that reading is recomputed; until then the shader's own transform plus
+    // any four-register window inside its constant footprint are all offered - the window
+    // sweep is what finds the view-projection of an engine that folds the world matrix into
+    // the transform (the fused result is then object->clip and can never agree with itself
+    // across draws, while the un-folded view-projection it was built from does).
+    int32_t learnedSource = INT32_MIN;
+    {
+      auto it = m_ngxClipProbeShaderSource.find(shaderHash);
+      if (it != m_ngxClipProbeShaderSource.end())
+        learnedSource = it->second;
     }
 
-    const NgxCameraCtabRegs& ctabRegs = it->second;
-    if (!ctabRegs.ctabVerified)
-      return;
+    // The shader's transform itself only needs evaluating while it is still a candidate: a
+    // shader whose view-projection was found at a constant window reads it straight out
+    Matrix4 objectToClip;
+    if (learnedSource < 0 &&
+        !evaluateVsClipTransform(*program, vsConsts.fConsts, caps::MaxFloatConstantsSoftware, objectToClip))
+      return false;
 
-    const uint32_t viewProjReg = ctabRegs.viewProjRegister;
-    const uint32_t viewOriginReg = ctabRegs.viewOriginRegister;
+    // The shader's own transform plus, while learning, a bounded number of constant windows
+    struct ProbeReading {
+      int32_t source;
+      Matrix4 matrix;
+    };
+    constexpr uint32_t kMaxReadings = 7;
+    std::array<ProbeReading, kMaxReadings> readings;
+    uint32_t readingCount = 0;
 
-    if (viewProjReg + 3 >= caps::MaxFloatConstantsSoftware || viewOriginReg >= caps::MaxFloatConstantsSoftware)
-      return;
-
-    // Mirrored view rejection (SceneCapture reflection/portal probes premultiply a mirror
-    // matrix into the view, flipping the 3x3 determinant sign; the main view is always
-    // positive). Checked on the raw registers - the sign is transpose-invariant.
-    {
-      const Vector4& vpRow0 = d3d9State().vsConsts.fConsts[viewProjReg + 0];
-      const Vector4& vpRow1 = d3d9State().vsConsts.fConsts[viewProjReg + 1];
-      const Vector4& vpRow2 = d3d9State().vsConsts.fConsts[viewProjReg + 2];
-      const float vpDet3 =
-        vpRow0.x * (vpRow1.y * vpRow2.z - vpRow1.z * vpRow2.y) -
-        vpRow0.y * (vpRow1.x * vpRow2.z - vpRow1.z * vpRow2.x) +
-        vpRow0.z * (vpRow1.x * vpRow2.y - vpRow1.y * vpRow2.x);
-      if (!std::isfinite(vpDet3) || vpDet3 < 0.0f)
+    auto addWindow = [&](uint32_t base) {
+      if (readingCount >= readings.size())
         return;
+      if (base + 4 > caps::MaxFloatConstantsSoftware)
+        return;
+      Matrix4 window;
+      window[0] = vsConsts.fConsts[base + 0];
+      window[1] = vsConsts.fConsts[base + 1];
+      window[2] = vsConsts.fConsts[base + 2];
+      window[3] = vsConsts.fConsts[base + 3];
+      readings[readingCount].source = int32_t(base);
+      readings[readingCount].matrix = window;
+      readingCount++;
+    };
+
+    if (learnedSource == INT32_MIN) {
+      readings[readingCount].source = -1;
+      readings[readingCount].matrix = objectToClip;
+      readingCount++;
+
+      if (m_ngxClipProbeSweepsThisFrame < kNgxClipProbeMaxSweepsPerFrame) {
+        m_ngxClipProbeSweepsThisFrame++;
+        const std::vector<uint16_t>& footprint = program->constRegisters;
+        for (size_t i = 0; i + 3 < footprint.size(); i++) {
+          // Only genuinely contiguous windows: a matrix is uploaded as consecutive registers,
+          // and a "window" straddling a gap is four unrelated constants
+          if (footprint[i + 1] != footprint[i] + 1 ||
+              footprint[i + 2] != footprint[i] + 2 ||
+              footprint[i + 3] != footprint[i] + 3)
+            continue;
+          addWindow(footprint[i]);
+        }
+      }
+    } else if (learnedSource < 0) {
+      readings[readingCount].source = -1;
+      readings[readingCount].matrix = objectToClip;
+      readingCount++;
+    } else {
+      addWindow(uint32_t(learnedSource));
+    }
+
+    // The previous frame's consensus, and how far a real camera is allowed to have moved and
+    // turned since. Scaled by the scene's own far plane so no world-unit constant is assumed.
+    const bool consensusUsable = m_ngxClipProbeConsensus.valid &&
+                                 m_ngxClipProbeConsensus.streak >= kNgxClipProbeConfirmFrames;
+    const float acceptEyeTolerance = std::max(m_ngxClipProbeConsensus.farPlane * 0.02f,
+                                              m_ngxClipProbeConsensus.nearPlane * 4.0f);
+
+    bool accepted = false;
+
+    for (uint32_t i = 0; i < readingCount; i++) {
+      NgxClipProbeSample sample;
+      if (!reconstructNgxClipProbeCandidate(readings[i].matrix, sample))
+        continue;
+
+      sample.shaderHash = shaderHash;
+      sample.source = readings[i].source;
+      sample.drawIndex = m_ngxClipProbeEvalsThisFrame;  // unique per probed draw this frame
+      stats.probeCandidates++;
+
+      if (m_ngxClipProbeSamples.size() < kNgxClipProbeMaxSamplesPerFrame)
+        m_ngxClipProbeSamples.push_back(sample);
+
+      if (accepted || !consensusUsable)
+        continue;
+
+      if (!ngxProbeCamerasMatch(sample, m_ngxClipProbeConsensus, acceptEyeTolerance, 0.98f, 0.02f)) {
+        stats.probeDeclinedDisagreed++;
+        continue;
+      }
+
+      outWorldToView = sample.worldToView;
+      outViewToProjection = sample.viewToProjection;
+      outConstantsHash = XXH3_64bits(&readings[i].matrix, sizeof(readings[i].matrix));
+      accepted = true;
+    }
+
+    if (!accepted && !consensusUsable)
+      stats.probeDeclinedNoConsensus++;
+
+    return accepted;
+  }
+
+  void D3D9Rtx::updateNgxClipProbeConsensus() {
+    const uint32_t sampleCount = uint32_t(m_ngxClipProbeSamples.size());
+    if (sampleCount == 0) {
+      // Nothing to learn from this frame; keep whatever was established rather than dropping it
+      // (menus, loading screens and cutscenes routinely submit no probe-eligible draws)
+      m_ngxClipProbeEvalsThisFrame = 0;
+      m_ngxClipProbeSweepsThisFrame = 0;
+      return;
+    }
+
+    // How many distinct draws contributed a candidate at all: the denominator agreement is
+    // measured against (see NgxClipProbeSample::drawIndex)
+    uint32_t probedDraws = 0;
+    {
+      uint32_t lastDrawIndex = UINT32_MAX;
+      for (const NgxClipProbeSample& sample : m_ngxClipProbeSamples) {
+        if (sample.drawIndex != lastDrawIndex) {
+          probedDraws++;
+          lastDrawIndex = sample.drawIndex;
+        }
+      }
+    }
+
+    // Largest set of candidates from this frame that describe one and the same camera, scored
+    // by how many DIFFERENT draws it spans. The tolerance is tight on purpose: within a single
+    // frame, every draw sharing a world->clip reconstructs to the same eye and the same
+    // frustum, so anything that only roughly agrees is a different transform (an object's own
+    // space) rather than numerical noise.
+    uint32_t bestIndex = 0;
+    uint32_t bestCount = 0;
+    for (uint32_t i = 0; i < sampleCount; i++) {
+      const NgxClipProbeSample& reference = m_ngxClipProbeSamples[i];
+      const float tolerance = 1e-3f * (1.0f + length(reference.eye));
+      uint32_t count = 0;
+      uint32_t lastDrawIndex = UINT32_MAX;
+      for (uint32_t j = 0; j < sampleCount; j++) {
+        const NgxClipProbeSample& sample = m_ngxClipProbeSamples[j];
+        if (sample.drawIndex == lastDrawIndex)
+          continue;  // this draw already agreed through another of its readings
+        if (ngxProbeCamerasMatch(sample, reference, tolerance, 0.9999f, 1e-3f)) {
+          count++;
+          lastDrawIndex = sample.drawIndex;
+        }
+      }
+      if (count > bestCount) {
+        bestCount = count;
+        bestIndex = i;
+      }
+    }
+
+    const bool clearMajority = bestCount >= kNgxClipProbeMinAgreeingSamples &&
+                               bestCount * 2 >= probedDraws;
+
+    if (clearMajority) {
+      const NgxClipProbeSample& winner = m_ngxClipProbeSamples[bestIndex];
+
+      // A consensus only counts as continuous with the previous frame's when it describes the
+      // same camera moved a plausible amount. That is what stops a single anomalous frame
+      // (one object dominating the draw list) from becoming the camera: it would reset the
+      // streak and have to prove itself over several frames before steering anything.
+      const float continuityTolerance = std::max(winner.farPlane * 0.05f, winner.nearPlane * 8.0f);
+      const bool continuous = m_ngxClipProbeConsensus.valid &&
+                              ngxProbeCamerasMatch(winner, m_ngxClipProbeConsensus, continuityTolerance, 0.9f, 0.05f);
+
+      const uint32_t previousStreak = m_ngxClipProbeConsensus.streak;
+      static_cast<NgxClipProbeCandidate&>(m_ngxClipProbeConsensus) = winner;
+      m_ngxClipProbeConsensus.valid = true;
+      m_ngxClipProbeConsensus.agreeingSamples = bestCount;
+      m_ngxClipProbeConsensus.totalSamples = probedDraws;
+      m_ngxClipProbeConsensus.streak = continuous ? previousStreak + 1 : 1;
+      m_ngxClipProbeConsensus.frame = m_ue3FrameCounter;
+
+      // Remember which reading of each shader landed in the winning cluster, so later frames
+      // recompute one candidate per draw instead of sweeping its whole footprint - and forget a
+      // reading that has stopped agreeing, so a shader learned from a draw that happened to sit
+      // at the world origin goes back to being swept instead of quietly polluting the vote.
+      const float tolerance = 1e-3f * (1.0f + length(winner.eye));
+      for (const NgxClipProbeSample& sample : m_ngxClipProbeSamples) {
+        if (ngxProbeCamerasMatch(sample, winner, tolerance, 0.9999f, 1e-3f)) {
+          m_ngxClipProbeShaderSource[sample.shaderHash] = sample.source;
+        } else {
+          auto it = m_ngxClipProbeShaderSource.find(sample.shaderHash);
+          if (it != m_ngxClipProbeShaderSource.end() && it->second == sample.source)
+            m_ngxClipProbeShaderSource.erase(it);
+        }
+      }
+
+      if (m_ngxClipProbeConsensus.streak == kNgxClipProbeConfirmFrames && !m_ngxClipProbeReportedConsensus) {
+        m_ngxClipProbeReportedConsensus = true;
+        Logger::info(str::format(
+          "[RTX NGX Passthrough] Clip-transform probe locked on: the camera was recovered from what the game's "
+          "vertex shaders compute, without matching any constant name.\n"
+          "    agreement ", bestCount, "/", probedDraws, " draws over ", kNgxClipProbeConfirmFrames, " frames"
+          " | eye=(", winner.eye.x, ", ", winner.eye.y, ", ", winner.eye.z, ")",
+          " fovY=", winner.fov, " aspect=", winner.aspectRatio,
+          " near=", winner.nearPlane, " far=", winner.farPlane, "\n"
+          "    shader readings learned: ", m_ngxClipProbeShaderSource.size(),
+          " (source -1 = the shader's own transform is already world->clip; a register number = "
+          "the view-projection was found at that constant window)"));
+      }
+    } else if (m_ngxClipProbeConsensus.valid) {
+      // The frame produced candidates but no majority (a frame dominated by one object's draws
+      // looks exactly like this). An established camera is kept rather than dropped: every draw
+      // is re-validated against it anyway, so a stale consensus stops accepting draws by itself
+      // once the real camera has moved away from it, and the next majority frame replaces it.
+      // Dropping it here would instead make the camera flicker in and out.
+      m_ngxClipProbeConsensus.agreeingSamples = bestCount;
+      m_ngxClipProbeConsensus.totalSamples = probedDraws;
+    }
+
+    m_ngxClipProbeSamples.clear();
+    m_ngxClipProbeEvalsThisFrame = 0;
+    m_ngxClipProbeSweepsThisFrame = 0;
+  }
+
+  // A frame must submit at least this many camera-candidate draws before it is treated as
+  // gameplay for the register sweep (see dumpNgxCameraCandidates)
+  static constexpr uint32_t kNgxCameraDumpMinDrawsPerFrame = 32;
+
+  void D3D9Rtx::dumpNgxCameraCandidates() {
+    // Sweeps the bound vertex shader's float constants for any four-register block that
+    // reconstructs as a camera, and reports what the shader's constant table (if any) calls
+    // its constants. Deliberately assumes nothing about the engine: the point is to find out
+    // what a game actually uploads when none of the named providers recognise it.
+    if (!m_parent->UseProgrammableVS() || d3d9State().vertexShader.ptr() == nullptr) {
+      return;
+    }
+
+    const D3D9CommonShader* vertexShaderCommon = d3d9State().vertexShader->GetCommonShader();
+    if (vertexShaderCommon == nullptr) {
+      return;
+    }
+
+    const XXH64_hash_t shaderHash = vertexShaderCommon->GetBytecodeHash();
+    if (shaderHash == 0) {
+      return;
+    }
+
+    // A manual sweep reports everything: the point of the button is to remove the filtering
+    // that keeps sampling the wrong thing, so a forced frame skips both gates below.
+    if (!m_ngxCameraDumpForced) {
+      // Draws that look like they could be scene geometry. Deliberately permissive: requiring
+      // BOTH depth writes AND a bound depth-stencil silently discarded entire games (a title
+      // that renders its world straight into the backbuffer with no depth buffer reported one
+      // post-process shader out of 1500 draws, which said nothing about how it draws its
+      // world). The draw state is logged per shader instead, so scene and UI stay separable by
+      // reading rather than by guessing here.
+      if (d3d9State().renderStates[D3DRS_ZWRITEENABLE] == FALSE && d3d9State().depthStencil == nullptr) {
+        return;
+      }
+
+      // ...and the frame has to be busy enough to plausibly BE the scene. Logo, intro and
+      // loading screens do submit a qualifying draw or two, which was enough to consume the
+      // whole budget before any gameplay geometry existed - the sampled shader then describes
+      // a splash screen and says nothing about how the game draws its world.
+      if (m_ngxCameraResolveStats.drawsExamined < kNgxCameraDumpMinDrawsPerFrame) {
+        return;
+      }
+    }
+
+    // The permissive gate above lets a whole frame's shaders through, so the per-shader cost
+    // (a full 256-register reconstruction sweep) and the log volume need their own bound
+    constexpr size_t kNgxCameraDumpMaxShadersPerFrame = 48;
+    if (m_ngxCameraDumpSeenShaders.size() >= kNgxCameraDumpMaxShadersPerFrame) {
+      ONCE(Logger::info(str::format("[RTX NGX Passthrough][cameraDump] Shader report cap (",
+                                    kNgxCameraDumpMaxShadersPerFrame,
+                                    ") reached; remaining shaders in this frame are not reported.")));
+      return;
+    }
+
+    if (!m_ngxCameraDumpSeenShaders.insert(shaderHash).second) {
+      return;  // one report per shader per frame
+    }
+
+    std::string ctabReport = "none";
+    {
+      const std::vector<uint8_t>& bytecode = vertexShaderCommon->GetBytecode();
+      try {
+        if (bytecode.size() >= sizeof(uint32_t) && (bytecode.size() % sizeof(uint32_t)) == 0) {
+          const uint32_t* tokens = reinterpret_cast<const uint32_t*>(bytecode.data());
+          const uint32_t headerToken = tokens[0];
+          if ((headerToken & 0xffff0000u) == 0xfffe0000u) {
+            DxsoProgramInfo programInfo { DxsoProgramTypes::VertexShader,
+                                          headerToken & 0xffu, (headerToken >> 8) & 0xffu };
+            DxsoDecodeContext decoder(programInfo);
+            DxsoCodeIter iter(tokens + 1);
+            while (decoder.decodeInstruction(iter)) { }
+
+            const DxsoCtab& ctab = decoder.getCtabInfo();
+            if (ctab.m_size != 0 && !ctab.m_constantData.empty()) {
+              ctabReport.clear();
+              uint32_t reported = 0;
+              for (const DxsoCtab::Constant& c : ctab.m_constantData) {
+                if (reported >= 24) {
+                  ctabReport += ", ...";
+                  break;
+                }
+                if (reported > 0) {
+                  ctabReport += ", ";
+                }
+                ctabReport += str::format("\"", c.name, "\" c", c.registerIndex);
+                if (c.registerCount > 1) {
+                  ctabReport += str::format("..c", c.registerIndex + c.registerCount - 1);
+                }
+                reported++;
+              }
+            }
+          }
+        }
+      } catch (...) {
+        ctabReport = "unreadable";
+      }
+    }
+
+    // Draw state, so scene geometry and UI/utility passes stay separable when reading the log
+    // rather than being guessed at (and thrown away) by the gate above
+    const D3DVIEWPORT9& dumpViewport = d3d9State().viewport;
+    D3D9CommonTexture* dumpRenderTarget = d3d9State().renderTargets[kRenderTargetIndex] != nullptr
+      ? d3d9State().renderTargets[kRenderTargetIndex]->GetCommonTexture() : nullptr;
+
+    Logger::info(str::format("[RTX NGX Passthrough][cameraDump] frame ", m_ue3FrameCounter,
+                             " vs 0x", std::hex, shaderHash, std::dec,
+                             " vp=", dumpViewport.Width, "x", dumpViewport.Height,
+                             " rt=", (dumpRenderTarget != nullptr && dumpRenderTarget->GetImage() != nullptr)
+                                       ? str::format(dumpRenderTarget->GetImage()->info().extent.width, "x",
+                                                     dumpRenderTarget->GetImage()->info().extent.height)
+                                       : std::string("none"),
+                             " depth=", d3d9State().depthStencil != nullptr ? "bound" : "none",
+                             " z=", int(d3d9State().renderStates[D3DRS_ZENABLE]),
+                             " zw=", int(d3d9State().renderStates[D3DRS_ZWRITEENABLE]),
+                             "\n    constant table: ", ctabReport));
+
+    // What the shader's own arithmetic does with its input position. This is the part that does
+    // not depend on the game naming anything, and it is the first thing to read: it says whether
+    // a transform exists at all, which constants it is built from, and - via the eye - whether
+    // that transform is the world camera or an object's own.
+    const VsClipTransformProgram* clipProgram =
+      getNgxClipProbeProgram(shaderHash, vertexShaderCommon->GetBytecode());
+
+    if (!clipProgram->ok()) {
+      std::string relInfo;
+      if (clipProgram->usesRelativeAddressing) {
+        // The decisive line for indexed-addressing engines (JSR and the like): a0 loaded from a
+        // constant means the transform is a matrix per draw, recoverable by resolving the index
+        // at evaluation time; a0 from vertex data means it genuinely varies per vertex.
+        relInfo = clipProgram->relativeAddressConstantDerived
+          ? str::format(" [indexed constant addressing, a0 is CONSTANT-derived (from c",
+                        clipProgram->relativeAddressSourceReg, ", base c", clipProgram->relativeReadBaseReg,
+                        ") -> RECOVERABLE by resolving the index at eval time]")
+          : str::format(" [indexed constant addressing, a0 is NOT constant-derived (base c",
+                        clipProgram->relativeReadBaseReg, ") -> genuinely per-vertex]");
+      }
+      Logger::info(str::format("    clip transform: NOT RECOVERABLE - ",
+                               vsClipTransformStatusLabel(clipProgram->status),
+                               " (", clipProgram->instructionCount, " instructions)", relInfo));
+    } else {
+      std::string footprint;
+      for (size_t i = 0; i < clipProgram->constRegisters.size(); i++) {
+        if (i >= 24) {
+          footprint += ", ...";
+          break;
+        }
+        footprint += str::format(i > 0 ? ", c" : "c", clipProgram->constRegisters[i]);
+      }
+      if (footprint.empty()) {
+        footprint = "(none - position is transformed by shader literals only)";
+      }
+
+      Matrix4 objectToClip;
+      std::string reconstruction = "does not reconstruct as a perspective camera";
+      if (evaluateVsClipTransform(*clipProgram, d3d9State().vsConsts.fConsts,
+                                  caps::MaxFloatConstantsSoftware, objectToClip)) {
+        NgxClipProbeCandidate candidate;
+        if (reconstructNgxClipProbeCandidate(objectToClip, candidate)) {
+          reconstruction = str::format("eye=(", candidate.eye.x, ", ", candidate.eye.y, ", ", candidate.eye.z,
+                                       ") fovY=", candidate.fov, " aspect=", candidate.aspectRatio,
+                                       " near=", candidate.nearPlane, " far=", candidate.farPlane);
+        }
+      } else {
+        reconstruction = "could not be evaluated against the live constants";
+      }
+
+      Logger::info(str::format("    clip transform: recovered from ", clipProgram->sliceInstructionCount,
+                               " of ", clipProgram->instructionCount, " instructions",
+                               "\n      constants it is built from: ", footprint,
+                               "\n      as a camera: ", reconstruction));
+    }
+
+    // Structural sweep. Every four-register window is offered to the same reconstruction the
+    // providers use, with the eye derived from the frustum apex (no camera position assumed).
+    // Windows of zeroed registers are skipped so untouched constant space is not reported.
+    const auto& vsConsts = d3d9State().vsConsts;
+    constexpr uint32_t kSweepRegisterLimit = 256;
+    uint32_t candidatesFound = 0;
+
+    auto windowFeedsPosition = [&](uint32_t base) {
+      // Windows the clip transform actually reads are the only ones that can BE the camera;
+      // the rest are shadow/light/bone matrices that happen to reconstruct
+      if (!clipProgram->ok())
+        return false;
+      uint32_t found = 0;
+      for (const uint16_t reg : clipProgram->constRegisters) {
+        if (reg >= base && reg < base + 4)
+          found++;
+      }
+      return found == 4;
+    };
+
+    for (uint32_t base = 0; base + 4 <= kSweepRegisterLimit; base++) {
+      Matrix4 candidate;
+      bool allZero = true;
+      for (uint32_t row = 0; row < 4; row++) {
+        candidate[row] = vsConsts.fConsts[base + row];
+        if (lengthSqr(candidate[row].xyz()) > 1e-12f || std::abs(candidate[row].w) > 1e-6f) {
+          allZero = false;
+        }
+      }
+      if (allZero) {
+        continue;
+      }
+
+      Matrix4 worldToView;
+      Matrix4 viewToProjection;
+      bool usedTranspose = false;
+      float reconstructionError = 0.0f;
+      if (!tryExtractCameraFromWorldToProjection(candidate, nullptr, worldToView, viewToProjection,
+                                                 &usedTranspose, &reconstructionError)) {
+        continue;
+      }
+
+      DecomposeProjectionParams projParams {};
+      decomposeProjection(viewToProjection, projParams);
+
+      // The eye is the discriminator the dump exists to expose: identical across shaders and
+      // draws means a view-projection (usable); moving per draw means a world-view-projection,
+      // whose apex is in that object's space
+      const Matrix4 viewToWorld = inverseAffine(worldToView);
+      const Vector4& eye = viewToWorld[3];
+
+      Logger::info(str::format("      c", base, "..c", base + 3,
+                               " -> camera OK",
+                               (usedTranspose ? " [transposed]" : ""),
+                               (windowFeedsPosition(base) ? " [feeds oPos]" : ""),
+                               " eye=(", eye.x, ", ", eye.y, ", ", eye.z, ")",
+                               " fovY=", projParams.fov,
+                               " aspect=", projParams.aspectRatio,
+                               " near=", projParams.nearPlane,
+                               " far=", projParams.farPlane,
+                               " err=", reconstructionError));
+      candidatesFound++;
+
+      if (candidatesFound >= 12) {
+        Logger::info("      (further candidates suppressed)");
+        break;
+      }
+    }
+
+    if (candidatesFound == 0) {
+      Logger::info("      no register window reconstructs as a camera "
+                   "(the camera never reaches this shader as a whole matrix; if the clip transform above "
+                   "did reconstruct, the camera exists only as the arithmetic the shader performs)");
+    }
+  }
+
+  void D3D9Rtx::tryNgxPassthroughCameraCapture() {
+    // Shader-constant providers need the bound vertex shader's CTAB; the fixed function
+    // provider does not, so draws without a programmable VS still reach the chain.
+    // Reflects the device state, not whether a CTAB was found: a shader-driven draw whose
+    // bytecode has no usable camera symbols must still lock the fixed function provider out
+    // (see resolveNgxPassthroughCamera), otherwise stale transform state wins by default.
+    NgxCameraCtabRegs ctabRegs;
+    const bool hasProgrammableVs = m_parent->UseProgrammableVS();
+
+    if (hasProgrammableVs && d3d9State().vertexShader.ptr() != nullptr) {
+      if (const D3D9CommonShader* vertexShaderCommon = d3d9State().vertexShader->GetCommonShader()) {
+        const XXH64_hash_t shaderHash = vertexShaderCommon->GetBytecodeHash();
+        if (shaderHash != 0) {
+          auto it = m_ngxCameraCtabCache.find(shaderHash);
+          if (it == m_ngxCameraCtabCache.end()) {
+            it = m_ngxCameraCtabCache.emplace(shaderHash, scanNgxCameraCtabRegs(vertexShaderCommon->GetBytecode())).first;
+          }
+          ctabRegs = it->second;
+        }
+      }
     }
 
     // Only the main scene view may steer the main camera and scene targets. It renders at
@@ -10933,11 +11995,11 @@ namespace dxvk {
     Matrix4 worldToView;
     Matrix4 viewToProjection;
     bool usedTranspose = false;
-    float reconstructionError = 0.0f;
     XXH64_hash_t constantsHash = 0;
+    NgxCameraSource cameraSource = NgxCameraSource::None;
 
-    if (!tryGetUe3CameraFromConstantsCached(viewProjReg, viewOriginReg, worldToView, viewToProjection,
-                                            usedTranspose, reconstructionError, &constantsHash))
+    if (!resolveNgxPassthroughCamera(ctabRegs, hasProgrammableVs, worldToView, viewToProjection,
+                                     usedTranspose, constantsHash, cameraSource))
       return;
 
     // Record the scene color/depth targets from depth-writing scene draws: the depth image
@@ -10962,33 +12024,80 @@ namespace dxvk {
           m_ngxFrameCameraUsedTranspose = usedTranspose;
         }
 
-        const bool sceneTargetsChanged = m_ngxSceneColorImage != renderTargetTexture->GetImage();
+        // Scene target stickiness. A game may draw depth-writing geometry into more than one
+        // full-size target - Mass Effect 2 renders the world at a reduced ScreenPercentage
+        // while other passes target the full backbuffer - and taking whichever draw came last
+        // makes the scene target, the scene viewport, the injection point and therefore the
+        // upscaler's input format all alternate frame to frame. Each alternation recreates the
+        // DLSS feature and throws away its temporal history, which reads as heavy flicker.
+        //
+        // So an established scene target is only displaced once it has gone quiet for a while;
+        // whichever target is picked, the result is stable, and a genuine target change (level
+        // transition, resolution change) still comes through after the grace period.
+        constexpr uint32_t kNgxSceneTargetStickyFrames = 30;
 
-        m_ngxSceneColorImage = renderTargetTexture->GetImage();
-        m_ngxSceneDepthImage = depthStencilTexture->GetImage();
-        m_ngxSceneTargetsLastSeenFrame = m_ue3FrameCounter;
+        const Rc<DxvkImage>& candidateColor = renderTargetTexture->GetImage();
+        const bool isEstablishedTarget =
+          m_ngxSceneColorImage != nullptr && candidateColor.ptr() == m_ngxSceneColorImage.ptr();
 
-        // The viewport of the scene draws is the subrect the game renders into; when the
-        // game runs with a reduced ScreenPercentage this is smaller than the backbuffer
-        m_ngxSceneViewport = d3d9State().viewport;
-        m_ngxSceneViewportValid = true;
+        if (isEstablishedTarget) {
+          m_ngxSceneColorSeenThisFrame = true;
+        }
 
-        if (sceneTargetsChanged) {
-          ONCE(Logger::info(str::format("[RTX NGX Passthrough] Scene color/depth targets identified. color=0x",
-                                        std::hex, uintptr_t(m_ngxSceneColorImage.ptr()),
-                                        " depth=0x", uintptr_t(m_ngxSceneDepthImage.ptr()), std::dec,
-                                        " extent=", m_ngxSceneColorImage->info().extent.width, "x",
-                                        m_ngxSceneColorImage->info().extent.height,
-                                        " format=", int(m_ngxSceneColorImage->info().format))));
-          // Automatic dump on target changes (level transitions): validates the pre-post
-          // injection point against the game's compositing without user action
-          if (m_frameOptions.ngxPrePostProcess) {
-            m_ngxPostChainDumpFramesLeft = 2;
+        const bool mayAdoptTarget =
+          m_ngxSceneColorImage == nullptr ||
+          (!m_ngxSceneColorSeenThisFrame &&
+           m_ue3FrameCounter - m_ngxSceneTargetsLastSeenFrame >= kNgxSceneTargetStickyFrames);
+
+        // Skipping adoption only skips the TARGET: this draw's camera is still valid and is
+        // fed below, so a competing depth pass can never cost the frame its camera.
+        if (!isEstablishedTarget && !mayAdoptTarget) {
+          m_ngxSceneTargetRejectedStickyDraws++;
+        } else {
+          const bool sceneTargetsChanged = m_ngxSceneColorImage != candidateColor;
+
+          m_ngxSceneColorImage = candidateColor;
+          m_ngxSceneDepthImage = depthStencilTexture->GetImage();
+          m_ngxSceneTargetsLastSeenFrame = m_ue3FrameCounter;
+          m_ngxSceneColorSeenThisFrame = true;
+
+          // The viewport of the scene draws is the subrect the game renders into; when the
+          // game runs with a reduced ScreenPercentage this is smaller than the backbuffer
+          m_ngxSceneViewport = d3d9State().viewport;
+          m_ngxSceneViewportValid = true;
+
+          if (sceneTargetsChanged) {
+            // Not ONCE(): a target change after the grace period is a real event worth seeing
+            // every time, and it is exactly what a flip-flopping game would reveal
+            Logger::info(str::format("[RTX NGX Passthrough] Scene color/depth targets identified. color=0x",
+                                     std::hex, uintptr_t(m_ngxSceneColorImage.ptr()),
+                                     " depth=0x", uintptr_t(m_ngxSceneDepthImage.ptr()), std::dec,
+                                     " extent=", m_ngxSceneColorImage->info().extent.width, "x",
+                                     m_ngxSceneColorImage->info().extent.height,
+                                     " format=", int(m_ngxSceneColorImage->info().format),
+                                     " viewport=", m_ngxSceneViewport.Width, "x", m_ngxSceneViewport.Height));
+            // Automatic dump on target changes (level transitions): validates the pre-post
+            // injection point against the game's compositing without user action
+            if (m_frameOptions.ngxPrePostProcess) {
+              m_ngxPostChainDumpFramesLeft = 2;
+            }
+            // Rebind the viewport so this draw already gets the sub-pixel jitter
+            m_parent->m_flags.set(D3D9DeviceFlag::DirtyViewportScissor);
           }
-          // Rebind the viewport so this draw already gets the sub-pixel jitter
-          m_parent->m_flags.set(D3D9DeviceFlag::DirtyViewportScissor);
         }
       }
+    }
+
+    // The frame's camera source is the FIRST provider to succeed, because that is the draw
+    // whose matrices actually reach RtCamera (it keeps the first update per frame). Recording
+    // the last one instead would report a provider whose result was discarded.
+    //
+    // Per draw is also the wrong granularity to log at: a game whose shader families differ
+    // in what they declare (some publishing a camera position, some not) legitimately
+    // alternates providers draw to draw, which as a transition log is tens of thousands of
+    // lines a session. The frame-to-frame transition is reported at frame end instead.
+    if (m_ngxFrameCameraSource == NgxCameraSource::None) {
+      m_ngxFrameCameraSource = cameraSource;
     }
 
     // Feed the main camera once per unique constants; RtCamera keeps the first update per frame
@@ -10996,11 +12105,12 @@ namespace dxvk {
       return;
     m_ngxLastCameraConstantsHash = constantsHash;
 
-    ONCE(Logger::info(str::format("[RTX NGX Passthrough] UE3 camera captured from shader constants (viewProjReg=c",
-                                  viewProjReg, "..c", viewProjReg + 3, ", viewOriginReg=c", viewOriginReg, ").")));
-
     m_ngxFrameWorldToView = worldToView;
     m_ngxFrameViewToProjection = viewToProjection;
+    // Kept in step with the matrices above for the generic rigid velocity path (see the members):
+    // the composed world->projection this frame, paired at frame end with the previous frame's to
+    // form the clip-space camera delta.
+    m_ngxFrameWorldToProjection = viewToProjection * worldToView;
     m_ngxFrameCameraMatricesValid = true;
 
     m_parent->EmitCs([cWorldToView = worldToView, cViewToProjection = viewToProjection](DxvkContext* ctx) {
@@ -11106,56 +12216,112 @@ namespace dxvk {
     const bool dynamicMeshShape = vbDynamic && !ibDynamic && !ctabRegs.hasBoneMatrices &&
                                   d3d9State().vertexBuffers[0].offset == 0;
 
-    if (!ctabRegs.hasLocalToWorld) {
-      return;
-    }
-
-    // The full camera verification (ViewProjection + CameraPosition) guards camera
-    // steering; the velocity capture itself only needs the per-draw ViewProjection and
-    // LocalToWorld. CPU-modified-mesh-shaped draws are accepted on that weaker contract
-    // (their motion-blur shader variants may lack the camera position symbol).
-    if (!ctabRegs.ctabVerified && !(dynamicMeshShape && ctabRegs.hasViewProjection)) {
-      return;
-    }
-
-    if (ctabRegs.viewProjRegister + 3 >= caps::MaxFloatConstantsSoftware) {
-      return;
-    }
-
     // Skinned draws (UE3 GPU skin): motion is bone palette + rigid transform combined.
     // The velocity raster replays the skinning with both frames' palettes.
     const bool skinned = ctabRegs.hasBoneMatrices;
 
-    if (skinned) {
-      if (ctabRegs.boneMatricesRegisterCount == 0 ||
-          ctabRegs.boneMatricesRegisterCount > kNgxVelocityBonePaletteRegisters ||
-          ctabRegs.boneMatricesRegister + ctabRegs.boneMatricesRegisterCount > caps::MaxFloatConstantsSoftware) {
+    // Rigid-transform acquisition. The UE3-shaped route reads a named LocalToWorld constant.
+    // Where the shaders publish no such name - Gamebryo and others fold the world matrix into a
+    // single world-view-projection handed to the vertex shader - the clip-transform probe
+    // recovers the object->clip transform the shader actually applies from its bytecode,
+    // name-independently, and the frame's own camera factors it back into an object->world
+    // (the exact quantity the named route extracts). Skinned draws stay on the named route: the
+    // probe correctly declines blend-indexed position as non-affine, so there is no generic
+    // skinned path here.
+    bool useGenericRigid = false;
+    if (!ctabRegs.hasLocalToWorld) {
+      // Off entirely once this game has been seen to name its rigid transform (UE3): that is
+      // exactly the route the probe would duplicate, and staying off keeps Mirror's Edge /
+      // Mass Effect 2 on their proven path with zero behaviour change.
+      if (!m_frameOptions.ngxObjectVelocitiesGeneric || m_ngxVelocityNamedRigidSeen ||
+          skinned || !m_ngxFrameCameraMatricesValid) {
         return;
       }
-      if (m_ngxVelocitySkinnedDraws >= kNgxVelocityMaxSkinnedDraws) {
+      useGenericRigid = true;
+    }
+
+    // Filled by the named route; the generic route needs neither (its transform is read whole).
+    uint32_t l2wReg = 0;
+    bool hasWorldToLocal = false;
+
+    // The world->projection this velocity draw composes with. Named draws read the packed
+    // ViewProjection at the draw (oriented): scene phases render with their own projections
+    // (the foreground DPG uses a first-person FOV), so every draw composes with its draw-time
+    // matrix - the game's exact vertex transform. The generic route has no per-draw
+    // ViewProjection symbol to read and composes with the frame's accepted main camera.
+    Matrix4 drawWorldToProjection;
+
+    // Recovered by the generic route only: the exact object->clip transform this shader applies.
+    // The motion vectors come straight from it and static objects are culled from it in clip
+    // space (see the generic block after the shared draw builder). Only meaningful when
+    // useGenericRigid; no ill-conditioned camera inverse ever touches the motion path.
+    Matrix4 genericObjectToClip;
+
+    if (!useGenericRigid) {
+      // The full camera verification (ViewProjection + CameraPosition) guards camera
+      // steering; the velocity capture itself only needs the per-draw ViewProjection and
+      // LocalToWorld. CPU-modified-mesh-shaped draws are accepted on that weaker contract
+      // (their motion-blur shader variants may lack the camera position symbol).
+      if (!ctabRegs.ctabVerified && !(dynamicMeshShape && ctabRegs.hasViewProjection)) {
+        return;
+      }
+
+      if (ctabRegs.viewProjRegister + 3 >= caps::MaxFloatConstantsSoftware) {
+        return;
+      }
+
+      if (skinned) {
+        if (ctabRegs.boneMatricesRegisterCount == 0 ||
+            ctabRegs.boneMatricesRegisterCount > kNgxVelocityBonePaletteRegisters ||
+            ctabRegs.boneMatricesRegister + ctabRegs.boneMatricesRegisterCount > caps::MaxFloatConstantsSoftware) {
+          return;
+        }
+        if (m_ngxVelocitySkinnedDraws >= kNgxVelocityMaxSkinnedDraws) {
+          m_ngxVelocityStats.skippedBudget++;
+          return;
+        }
+      }
+
+      l2wReg = ctabRegs.localToWorldRegister;
+      if (l2wReg + 3 >= caps::MaxFloatConstantsSoftware) {
+        return;
+      }
+
+      hasWorldToLocal = ctabRegs.hasWorldToLocal &&
+                        ctabRegs.worldToLocalRegister + 2 < caps::MaxFloatConstantsSoftware;
+
+      drawWorldToProjection[0] = d3d9State().vsConsts.fConsts[ctabRegs.viewProjRegister + 0];
+      drawWorldToProjection[1] = d3d9State().vsConsts.fConsts[ctabRegs.viewProjRegister + 1];
+      drawWorldToProjection[2] = d3d9State().vsConsts.fConsts[ctabRegs.viewProjRegister + 2];
+      drawWorldToProjection[3] = d3d9State().vsConsts.fConsts[ctabRegs.viewProjRegister + 3];
+      if (m_ngxFrameCameraUsedTranspose) {
+        drawWorldToProjection = transpose(drawWorldToProjection);
+      }
+
+      // This game names its rigid transform: keep the generic probe route off for it.
+      m_ngxVelocityNamedRigidSeen = true;
+    } else {
+      drawWorldToProjection = m_ngxFrameWorldToProjection;
+
+      constexpr uint32_t kNgxVelocityMaxGenericProbeEvals = 4096;
+      if (m_ngxVelocityGenericProbeEvals >= kNgxVelocityMaxGenericProbeEvals) {
         m_ngxVelocityStats.skippedBudget++;
         return;
       }
-    }
+      m_ngxVelocityGenericProbeEvals++;
 
-    const uint32_t l2wReg = ctabRegs.localToWorldRegister;
-    if (l2wReg + 3 >= caps::MaxFloatConstantsSoftware) {
-      return;
-    }
-
-    const bool hasWorldToLocal = ctabRegs.hasWorldToLocal &&
-                                 ctabRegs.worldToLocalRegister + 2 < caps::MaxFloatConstantsSoftware;
-
-    // The packed ViewProjection at THIS draw (oriented): scene phases render with their
-    // own projections (the foreground DPG uses a first-person FOV), so every velocity
-    // draw composes with its draw-time matrix - the game's exact vertex transform.
-    Matrix4 drawWorldToProjection;
-    drawWorldToProjection[0] = d3d9State().vsConsts.fConsts[ctabRegs.viewProjRegister + 0];
-    drawWorldToProjection[1] = d3d9State().vsConsts.fConsts[ctabRegs.viewProjRegister + 1];
-    drawWorldToProjection[2] = d3d9State().vsConsts.fConsts[ctabRegs.viewProjRegister + 2];
-    drawWorldToProjection[3] = d3d9State().vsConsts.fConsts[ctabRegs.viewProjRegister + 3];
-    if (m_ngxFrameCameraUsedTranspose) {
-      drawWorldToProjection = transpose(drawWorldToProjection);
+      // Recover the exact transform this shader applies to input position (object->clip) from
+      // its bytecode and the live constants. Skinned shaders decline here (position is not
+      // affine in the input), which is the intended behaviour. This is fed to the raster as the
+      // clip transform directly and matched across frames in clip space (the generic block after
+      // the shared draw builder), so no ill-conditioned camera inverse touches the motion.
+      const VsClipTransformProgram* program =
+        getNgxClipProbeProgram(shaderHash, vertexShaderCommon->GetBytecode());
+      if (!program->ok() ||
+          !evaluateVsClipTransform(*program, d3d9State().vsConsts.fConsts,
+                                   caps::MaxFloatConstantsSoftware, genericObjectToClip)) {
+        return;
+      }
     }
 
     // Vertex layout on stream 0: position always; skinned draws additionally need the
@@ -11167,6 +12333,10 @@ namespace dxvk {
     uint32_t blendWeightsOffset = 0;
     bool hasBlendIndices = false;
     bool hasBlendWeights = false;
+    // Any blend attribute, of any type: the marker for "this is a skeletal mesh", used to keep
+    // the generic rigid route off skinned geometry (see below). hasBlendIndices/hasBlendWeights
+    // stay narrow (the UE3 GPU-skin UBYTE4 layout the named skinned raster replays).
+    bool hasSkinningAttributes = false;
 
     for (const D3DVERTEXELEMENT9& element : vertexElements) {
       if (element.Stream != 0 || element.UsageIndex != 0) {
@@ -11180,12 +12350,18 @@ namespace dxvk {
           positionFormat = VK_FORMAT_R32G32B32A32_SFLOAT;
         }
         positionOffset = element.Offset;
-      } else if (element.Usage == D3DDECLUSAGE_BLENDINDICES && element.Type == D3DDECLTYPE_UBYTE4) {
-        hasBlendIndices = true;
-        blendIndicesOffset = element.Offset;
-      } else if (element.Usage == D3DDECLUSAGE_BLENDWEIGHT && element.Type == D3DDECLTYPE_UBYTE4N) {
-        hasBlendWeights = true;
-        blendWeightsOffset = element.Offset;
+      } else if (element.Usage == D3DDECLUSAGE_BLENDINDICES) {
+        hasSkinningAttributes = true;
+        if (element.Type == D3DDECLTYPE_UBYTE4) {
+          hasBlendIndices = true;
+          blendIndicesOffset = element.Offset;
+        }
+      } else if (element.Usage == D3DDECLUSAGE_BLENDWEIGHT) {
+        hasSkinningAttributes = true;
+        if (element.Type == D3DDECLTYPE_UBYTE4N) {
+          hasBlendWeights = true;
+          blendWeightsOffset = element.Offset;
+        }
       }
     }
 
@@ -11198,6 +12374,18 @@ namespace dxvk {
       return;
     }
 
+    // The generic rigid route is for meshes with no per-vertex skinning. A draw that declares
+    // blend indices/weights is a skeletal mesh, and the clip-transform probe will still recover a
+    // single rigid transform for it whenever the drawn sub-mesh binds mostly to one bone - a
+    // character's head is the classic case. Capturing that tracks only the head while the body
+    // (many bones, non-affine, correctly declined) ghosts, which reads worse than uniform camera
+    // reprojection. Skinned geometry belongs to the skinned path (named GPU skin today; a generic
+    // skinned tier later), so the generic rigid route declines it by construction.
+    if (useGenericRigid && hasSkinningAttributes) {
+      m_ngxVelocityStats.skippedBudget++;
+      return;
+    }
+
     // Dynamic-buffer draws split into two kinds. CPU-modified meshes (UE3 CPU-skins
     // morph/cloth-augmented skeletal meshes into DEDICATED dynamic buffers, e.g. the
     // first person arms) carry their motion in the vertex positions and are captured
@@ -11205,7 +12393,9 @@ namespace dxvk {
     // whole-buffer stream (offset 0) and a static index buffer. Everything else on
     // dynamic buffers is ring-pool geometry (particles, trails, canvas) whose
     // allocation offsets shift every frame - untrackable, and skipped.
-    const bool dynamicMesh = dynamicMeshShape && !skinned;
+    // The generic rigid route captures static-buffer draws only; a game's CPU-modified/morph
+    // meshes on dynamic buffers stay on the named path (they need a named transform anyway).
+    const bool dynamicMesh = dynamicMeshShape && !skinned && !useGenericRigid;
 
     if ((vbDynamic || ibDynamic) && !dynamicMesh) {
       return;
@@ -11260,20 +12450,36 @@ namespace dxvk {
     };
     const XXH64_hash_t identity = XXH3_64bits(identityData, sizeof(identityData));
 
+    // Named route reads the live LocalToWorld registers; the generic route returns from its own
+    // block below before this is used (l2wReg is 0 there, so this stays a valid unused pointer).
     const Vector4* localToWorldRows = &d3d9State().vsConsts.fConsts[l2wReg];
     const Vector4* boneRegisters = skinned ? &d3d9State().vsConsts.fConsts[ctabRegs.boneMatricesRegister] : nullptr;
     const uint32_t boneRegisterCount = skinned ? ctabRegs.boneMatricesRegisterCount : 0;
+
+    // The object's transform this draw, in the runtime convention the camera reconstruction and
+    // the motion vector pass compose with. Named route only - it disambiguates the packed
+    // LocalToWorld registers; the generic route matches in clip space and never needs this.
+    const Matrix4 objectToWorld = useGenericRigid
+      ? Matrix4()
+      : extractUe3ObjectToWorld(l2wReg, hasWorldToLocal, ctabRegs.worldToLocalRegister,
+                                m_ngxFrameCameraUsedTranspose);
 
     NgxVelocityObjectState& objectState = m_ngxVelocityObjectCache[identity];
 
     // Shared draw construction for the emission sites below. previousBones is the
     // instance's cached palette; when unusable (first skinned sighting of the identity),
     // the current palette stands in for both sides - transform-only motion that frame.
+    // explicitClipFromLocal / explicitPrevClipFromLocal (generic route): the exact object->clip
+    // transforms this and last frame, used verbatim instead of composing camera x object->world
+    // - the generic route recovers clip transforms directly and must not round-trip them through
+    // the (ill-conditioned) camera, which would corrupt the motion vectors.
     const auto appendVelocityDraw = [&](const Matrix4& objectToWorldCurrent,
                                         const Matrix4& worldToProjectionPrevious,
                                         const Matrix4& objectToWorldPrevious,
                                         const std::vector<Vector4>& previousBones,
-                                        const std::vector<Vector3>& previousPositions) {
+                                        const std::vector<Vector3>& previousPositions,
+                                        const Matrix4* explicitClipFromLocal = nullptr,
+                                        const Matrix4* explicitPrevClipFromLocal = nullptr) {
       NgxVelocityDraw velocityDraw;
       velocityDraw.vertexBuffer = vertexBufferCommon->GetBufferSlice<D3D9_COMMON_BUFFER_TYPE_REAL>(d3d9State().vertexBuffers[0].offset);
       velocityDraw.vertexStride = d3d9State().vertexBuffers[0].stride;
@@ -11285,8 +12491,10 @@ namespace dxvk {
       velocityDraw.firstIndex = drawContext.StartIndex;
       velocityDraw.vertexOffset = drawContext.BaseVertexIndex;
 
-      velocityDraw.clipFromLocal = drawWorldToProjection * objectToWorldCurrent;
-      velocityDraw.prevClipFromLocal = worldToProjectionPrevious * objectToWorldPrevious;
+      velocityDraw.clipFromLocal = explicitClipFromLocal ? *explicitClipFromLocal
+                                                         : (drawWorldToProjection * objectToWorldCurrent);
+      velocityDraw.prevClipFromLocal = explicitPrevClipFromLocal ? *explicitPrevClipFromLocal
+                                                                 : (worldToProjectionPrevious * objectToWorldPrevious);
       velocityDraw.foregroundPhase = foregroundPhase;
       velocityDraw.viewportMinZ = d3d9State().viewport.MinZ;
       velocityDraw.viewportMaxZ = d3d9State().viewport.MaxZ;
@@ -11325,6 +12533,10 @@ namespace dxvk {
         m_ngxVelocityStats.capturedDynamic++;
       }
 
+      if (useGenericRigid) {
+        m_ngxVelocityStats.capturedGenericRigid++;
+      }
+
       if (foregroundPhase) {
         m_ngxVelocityStats.capturedForeground++;
       }
@@ -11361,6 +12573,100 @@ namespace dxvk {
       return false;
     };
 
+    // Generic (name-independent) rigid velocity: clip-space matching. Kept entirely separate
+    // from the named world-space path below, which it returns before reaching.
+    //
+    // The motion vectors are the exact probed clip transforms - clipFromLocal = object->clip this
+    // frame, prevClipFromLocal = the same object's object->clip last frame - so nothing in the
+    // motion path passes through the (float-ill-conditioned) camera inverse. To tell a static
+    // object (already served by camera reprojection) from a mover, note that a static object's
+    // object->clip between two frames differs only by the camera's own motion, so
+    // object->clip(now) ~ C * object->clip(prev) with C = worldToProjection(now) *
+    // inverse(worldToProjection(prev)). C maps clip->clip (norm ~1 for normal per-frame camera
+    // motion) and so does not amplify error; only the transient inverse is taken, in double
+    // precision, once per frame.
+    if (useGenericRigid) {
+      if (m_ngxGenericCameraDeltaFrame != m_ue3FrameCounter) {
+        m_ngxGenericCameraDeltaFrame = m_ue3FrameCounter;
+        m_ngxGenericCameraDeltaValid = m_ngxPrevFrameWorldToProjectionValid;
+        if (m_ngxGenericCameraDeltaValid) {
+          const Matrix4Base<double> worldToProjectionNow(m_ngxFrameWorldToProjection);
+          const Matrix4Base<double> worldToProjectionPrev(m_ngxPrevFrameWorldToProjection);
+          m_ngxGenericCameraDelta = Matrix4(worldToProjectionNow * inverse(worldToProjectionPrev));
+        }
+      }
+
+      // Pair with the nearest last-frame instance of this identity, comparing this frame's clip
+      // position against each instance's camera-only prediction: a mover's clip position barely
+      // shifts once the shared camera delta is removed, so the right instance is the closest even
+      // among several placements of the same asset.
+      const uint32_t previousFrame = m_ue3FrameCounter - 1;
+      NgxVelocityObjectInstance* matched = nullptr;
+      float matchedDistance = 0.0f;
+      for (NgxVelocityObjectInstance& instance : objectState.instances) {
+        if (instance.lastSeenFrame != previousFrame) {
+          continue;
+        }
+        const Vector4 predicted = m_ngxGenericCameraDeltaValid
+          ? (m_ngxGenericCameraDelta * instance.objectToClip)[3]
+          : instance.objectToClip[3];
+        const float distance = length(genericObjectToClip[3].xyz() - predicted.xyz());
+        if (matched == nullptr || distance < matchedDistance) {
+          matched = &instance;
+          matchedDistance = distance;
+        }
+      }
+
+      if (matched != nullptr && m_ngxGenericCameraDeltaValid) {
+        // Static test: how far this frame's clip transform is from the camera-only prediction,
+        // relative to its own magnitude. Below tolerance the object did not move in the world
+        // (camera reprojection covers it); above it, emit its true clip-space motion.
+        const Matrix4 predicted = m_ngxGenericCameraDelta * matched->objectToClip;
+        float residual = 0.0f;
+        float magnitude = 0.0f;
+        for (uint32_t row = 0; row < 4; row++) {
+          const Vector4 delta = genericObjectToClip[row] - predicted[row];
+          const Vector4 cur = genericObjectToClip[row];
+          residual += std::abs(delta.x) + std::abs(delta.y) + std::abs(delta.z) + std::abs(delta.w);
+          magnitude += std::abs(cur.x) + std::abs(cur.y) + std::abs(cur.z) + std::abs(cur.w);
+        }
+
+        constexpr float kGenericStaticRelTol = 1e-3f;
+        if (residual > kGenericStaticRelTol * std::max(magnitude, 1e-3f)) {
+          appendVelocityDraw(Matrix4(), Matrix4(), Matrix4(),
+                             std::vector<Vector4>(), std::vector<Vector3>(),
+                             &genericObjectToClip, &matched->objectToClip);
+        } else {
+          m_ngxVelocityStats.exactMatches++;
+        }
+
+        matched->objectToClip = genericObjectToClip;
+        matched->lastSeenFrame = m_ue3FrameCounter;
+        return;
+      }
+
+      // No usable pairing (new placement, or the camera delta is not established yet): record the
+      // sighting without velocity. Refresh a last-frame instance in place, otherwise take a free
+      // slot or recycle the stalest when the identity is heavily instanced.
+      constexpr size_t kMaxGenericInstancesPerIdentity = 64;
+      NgxVelocityObjectInstance* target = matched;
+      if (target == nullptr) {
+        if (objectState.instances.size() >= kMaxGenericInstancesPerIdentity) {
+          for (NgxVelocityObjectInstance& instance : objectState.instances) {
+            if (target == nullptr || instance.lastSeenFrame < target->lastSeenFrame) {
+              target = &instance;
+            }
+          }
+        } else {
+          target = &objectState.instances.emplace_back();
+        }
+      }
+      target->objectToClip = genericObjectToClip;
+      target->lastSeenFrame = m_ue3FrameCounter;
+      m_ngxVelocityStats.newRegistrations++;
+      return;
+    }
+
     // Exact register match: a static placement re-uploading the same matrix every frame,
     // or a repeat draw of an instance already handled this frame (depth prepass + base
     // pass, multi-pass lighting). Static placements get no velocity draw - the camera
@@ -11382,8 +12688,6 @@ namespace dxvk {
                                      (dynamicMesh && dynamicPositionsChangedFrom(instance.dynamicPositions));
 
         if (contentAnimated) {
-          const Matrix4 objectToWorld = extractUe3ObjectToWorld(l2wReg, hasWorldToLocal, ctabRegs.worldToLocalRegister,
-                                                                m_ngxFrameCameraUsedTranspose);
           appendVelocityDraw(objectToWorld, instance.worldToProjection, instance.objectToWorld,
                              instance.bones, instance.dynamicPositions);
           instance.lastEmitFrame = m_ue3FrameCounter;
@@ -11455,11 +12759,6 @@ namespace dxvk {
         return;
       }
     }
-
-    // Disambiguated transform in the same convention the camera reconstruction uses;
-    // composed exactly like the motion vector pass composes its reprojection chain
-    const Matrix4 objectToWorld = extractUe3ObjectToWorld(l2wReg, hasWorldToLocal, ctabRegs.worldToLocalRegister,
-                                                          m_ngxFrameCameraUsedTranspose);
 
     // Near match against instances seen exactly one frame ago: the same object having
     // moved. Static placements are consumed by the exact match above, so the bounds only
@@ -13234,6 +14533,8 @@ namespace dxvk {
     m_ngxVelocityStats.frameCameraValid = m_ngxFrameCameraValid;
     m_ngxVelocityStats.depthClears = m_ngxDepthClearsThisFrame;
     m_ngxVelocityStats.cameraTransposeFlips = m_ngxCameraTransposeFlips;
+    // Static string literal, so it survives the hop to the CS thread by value
+    m_ngxVelocityStats.cameraSource = ngxCameraSourceLabel(m_ngxFrameCameraSource);
 
     m_parent->EmitCs([cSceneDepth = sceneDepth,
                       cColorTarget = m_ngxColorTargetImage,
@@ -13765,9 +15066,13 @@ namespace dxvk {
       }
     }
 
-    // Camera extraction from UE3 reserved shader constants (CTAB-verified draws only)
-    if (m_parent->UseProgrammableVS() && d3d9State().vertexShader.ptr() != nullptr) {
-      tryNgxPassthroughCameraCapture();
+    // Camera acquisition (see resolveNgxPassthroughCamera): shader-constant providers for
+    // programmable draws, fixed function transform state otherwise - so pre-shader D3D9
+    // titles reach the chain too
+    tryNgxPassthroughCameraCapture();
+
+    if (unlikely(m_ngxCameraDumpFramesLeft > 0)) {
+      dumpNgxCameraCandidates();
     }
 
     // Dynamic object capture for the velocity raster pass
@@ -14352,11 +15657,20 @@ namespace dxvk {
     }
     m_ngxPrevCameraValid = m_ngxFrameCameraValid;
     m_ngxPrevCameraUsedTranspose = m_ngxFrameCameraUsedTranspose;
+    // Roll this frame's composed camera into the previous slot for the generic velocity path's
+    // clip-space camera delta (valid only when this frame actually established a camera). Must
+    // run before the matrices-valid flag is cleared below.
+    m_ngxPrevFrameWorldToProjection = m_ngxFrameWorldToProjection;
+    m_ngxPrevFrameWorldToProjectionValid = m_ngxFrameCameraMatricesValid;
     m_ngxFrameCameraValid = false;
     m_ngxFrameCameraMatricesValid = false;
+    // m_ngxLastCameraSource is deliberately not reset: it is the sticky "what worked last"
+    // used to log provider transitions, while this is the per-frame value
+    m_ngxFrameCameraSource = NgxCameraSource::None;
     m_ngxVelocityStats = NgxVelocityCaptureStats();
     m_ngxVelocitySkinnedDraws = 0;
     m_ngxVelocityDynamicDraws = 0;
+    m_ngxVelocityGenericProbeEvals = 0;
     m_ngxVelocityDraws.clear();
     // Periodically drop instances not sighted for a while (left behind by level streaming
     // and visibility changes), then empty identities; emergency-clear pathological growth
@@ -14389,6 +15703,158 @@ namespace dxvk {
       Logger::info(str::format("[RTX NGX Passthrough][dump] ---- end of frame ", m_ue3FrameCounter, " ----"));
     }
     m_ngxPostChainDumpLinesThisFrame = 0;
+
+    // A frame that acquired no camera produces no motion vectors, no scene targets and no
+    // injection - every later stage is gated on it - so report why, naming the gate each draw
+    // died at. Rate limited: the condition holds for every draw of every affected frame, and
+    // the failure is usually permanent for a given game rather than transient.
+    // Establish the main view's determinant sign from this frame's histogram (see the mirror
+    // rejection). Only once: it is a fixed property of the engine, and letting it flip later
+    // would let a frame dominated by reflection passes redefine which draws count as mirrored.
+    if (m_ngxCameraDetSign == 0 &&
+        (m_ngxCameraDetPositiveCount + m_ngxCameraDetNegativeCount) > 0) {
+      m_ngxCameraDetSign = m_ngxCameraDetPositiveCount >= m_ngxCameraDetNegativeCount ? 1 : -1;
+      Logger::info(str::format(
+        "[RTX NGX Passthrough] Main view determinant sign established: ",
+        m_ngxCameraDetSign > 0 ? "positive" : "negative",
+        " (", m_ngxCameraDetPositiveCount, " positive / ", m_ngxCameraDetNegativeCount,
+        " negative draws this frame); views of the opposite sign are treated as mirrored "
+        "reflection or portal captures."));
+    }
+    m_ngxCameraDetPositiveCount = 0;
+    m_ngxCameraDetNegativeCount = 0;
+
+    // Fold this frame's clip-transform candidates into the running consensus. Must happen after
+    // every draw has been seen and before the failure summary below reports on it.
+    updateNgxClipProbeConsensus();
+
+    // Report a game that genuinely has competing scene-like targets once, so the stickiness
+    // is visible rather than silently papering over an oscillation
+    if (m_ngxSceneTargetRejectedStickyDraws > 0) {
+      ONCE(Logger::info(str::format(
+        "[RTX NGX Passthrough] Competing full-size depth-writing target(s) detected (",
+        m_ngxSceneTargetRejectedStickyDraws, " draws this frame); keeping the established scene target. "
+        "Without this the injection point and the upscaler's input format would alternate per frame.")));
+    }
+    m_ngxSceneTargetRejectedStickyDraws = 0;
+    m_ngxSceneColorSeenThisFrame = false;
+
+    // Only spend a dump frame on a frame busy enough to have been the scene (see
+    // kNgxCameraDumpMinDrawsPerFrame); otherwise the whole budget burns down during startup,
+    // logo and loading screens, long before any world geometry is submitted.
+    //
+    // The manual (forced) sweep additionally WAITS for a frame that actually contained
+    // vertex-shader draws rather than firing on the literal next frame: the frame right after
+    // the developer-menu click is frequently a menu or transition frame with no scene geometry
+    // (this really happened - "frame 1296 contained no vertex-shader draws at all"), and
+    // reporting that tells the user nothing. It stays armed across empty frames up to a bound,
+    // so a game that genuinely never draws geometry still gives up with a clear message rather
+    // than hanging armed forever.
+    if (m_ngxCameraDumpFramesLeft > 0) {
+      const bool frameHadShaders = !m_ngxCameraDumpSeenShaders.empty();
+
+      if (m_ngxCameraDumpForced && !frameHadShaders) {
+        constexpr uint32_t kNgxForcedDumpMaxWaitFrames = 240;  // ~2-4s: skip past a menu/transition
+        if (++m_ngxCameraDumpForcedWaited < kNgxForcedDumpMaxWaitFrames) {
+          // Stay armed; do not consume. Report occasionally so a truly geometry-less state is visible.
+          if (m_ngxCameraDumpForcedWaited % 60 == 0) {
+            Logger::info(str::format("[RTX NGX Passthrough][cameraDump] Manual sweep still waiting for a frame with "
+                                     "scene draws (", m_ngxCameraDumpForcedWaited, " frames so far - is the world on screen?)."));
+          }
+        } else {
+          Logger::info(str::format("[RTX NGX Passthrough][cameraDump] Manual sweep gave up after ",
+                                   kNgxForcedDumpMaxWaitFrames, " frames with no vertex-shader scene draws."));
+          m_ngxCameraDumpFramesLeft = 0;
+          m_ngxCameraDumpForced = false;
+          m_ngxCameraDumpForcedWaited = 0;
+        }
+      } else if (m_ngxCameraDumpForced || frameHadShaders) {
+        m_ngxCameraDumpFramesLeft--;
+        if (m_ngxCameraDumpFramesLeft == 0) {
+          m_ngxCameraDumpForced = false;
+          m_ngxCameraDumpForcedWaited = 0;
+        }
+      }
+
+      m_ngxCameraDumpSeenShaders.clear();
+    }
+
+    if (m_ngxFrameCameraSource == NgxCameraSource::None && m_ngxCameraResolveStats.drawsExamined > 0) {
+      const bool firstFailure = !m_ngxCameraFailureLogged;
+      if (firstFailure || m_ue3FrameCounter >= m_ngxCameraFailureLogNextFrame) {
+        const NgxCameraResolveStats& s = m_ngxCameraResolveStats;
+        const NgxClipProbeConsensus& probe = m_ngxClipProbeConsensus;
+
+        // What to do next depends entirely on which stage ran out of information, so the summary
+        // says so outright instead of leaving it to be inferred from the counters
+        const char* advice =
+          !m_frameOptions.ngxClipTransformProbe
+            ? "The clip-transform probe is disabled; re-enable rtx.ngxPassthrough.clipTransformProbe to let the "
+              "name-independent provider try."
+          : s.probeShadersAnalyzed == 0 && s.probeShadersNotAffine > 0
+            ? "No vertex shader's clip position reduced to a matrix transform of its input position - every scene "
+              "draw is skinned, branches before transforming, or builds position from more than the position "
+              "attribute. Dump the candidates (rtx.ngxPassthrough.dumpCameraCandidatesNow) and read the "
+              "'clip transform' lines to see which shape each shader has."
+          : s.probeCandidates == 0
+            ? "Vertex transforms were recovered but none of them reconstructs as a perspective camera at all, which "
+              "means the game's scene draws are not being reached (a UI/menu frame) or use an orthographic view."
+          : !probe.valid
+            ? "Vertex transforms were recovered and reconstruct as cameras, but no two draws agree on one - every "
+              "draw carries its own object transform folded in, and the un-folded view-projection is not among the "
+              "constants those shaders read. This is the case the current design cannot resolve."
+            : "A camera was agreed on but this frame's draws did not match it; it is still gathering confirmation "
+              "or the view changed abruptly.";
+
+        Logger::warn(str::format(
+          "[RTX NGX Passthrough] Camera source: none - no provider recognised this frame's draws, so motion vectors, "
+          "scene target identification and the upscaler injection are all skipped.\n"
+          "    draws examined ", s.drawsExamined,
+          " (programmable VS ", s.drawsProgrammableVs, ", fixed function ", s.drawsFixedFunction, ")\n"
+          "    shader bytecode: constant table present ", s.drawsWithCtabPresent,
+          ", stripped ", s.drawsWithCtabStripped, "\n"
+          "    named symbols: usable constant table ", s.shadersWithCtab,
+          ", ViewProjection ", s.withViewProjection,
+          ", camera position ", s.withCameraPosition,
+          ", separate View+Projection ", s.withSeparateViewProjection, "\n"
+          "    declined: mirrored view ", s.declinedMirroredView,
+          ", reconstruction failed ", s.declinedExtractionFailed,
+          ", packing ambiguous ", s.declinedPackingAmbiguous,
+          ", register range ", s.declinedRegisterRange,
+          ", fixed function locked out by bound shader ", s.declinedFfpShaderBound,
+          ", fixed function projection rejected ", s.declinedFfpProjection, "\n"
+          "    clip-transform probe: transforms recovered ", s.probeShadersAnalyzed,
+          ", not a matrix transform ", s.probeShadersNotAffine,
+          ", camera candidates ", s.probeCandidates,
+          ", declined (no consensus yet) ", s.probeDeclinedNoConsensus,
+          ", declined (disagreed with the agreed camera) ", s.probeDeclinedDisagreed, "\n"
+          "    probe consensus: ", probe.valid ? "yes" : "no",
+          " agreement ", probe.agreeingSamples, "/", probe.totalSamples, " draws",
+          " streak ", probe.streak, "/", kNgxClipProbeConfirmFrames,
+          (probe.valid
+             ? str::format(" eye=(", probe.eye.x, ", ", probe.eye.y, ", ", probe.eye.z,
+                           ") fovY=", probe.fov, " near=", probe.nearPlane, " far=", probe.farPlane)
+             : std::string()), "\n"
+          "    ", advice));
+        m_ngxCameraFailureLogged = true;
+        m_ngxCameraFailureLogNextFrame = m_ue3FrameCounter + 600;
+      }
+    } else if (m_ngxFrameCameraSource != NgxCameraSource::None) {
+      m_ngxCameraFailureLogged = false;
+
+      // One line per change of provider, evaluated once per frame (see the note in
+      // tryNgxPassthroughCameraCapture on why this cannot be logged per draw)
+      if (m_ngxFrameCameraSource != m_ngxLastCameraSource) {
+        Logger::info(str::format("[RTX NGX Passthrough] Camera source: ",
+                                 ngxCameraSourceLabel(m_ngxFrameCameraSource),
+                                 (m_ngxLastCameraSource != NgxCameraSource::None
+                                    ? str::format(" (was: ", ngxCameraSourceLabel(m_ngxLastCameraSource), ")")
+                                    : std::string())));
+        m_ngxLastCameraSource = m_ngxFrameCameraSource;
+      }
+    }
+
+    m_ngxCameraResolveStats = NgxCameraResolveStats();
     // Drop scene target references when unseen for a while (level transitions recreate them)
     if (m_ngxSceneColorImage != nullptr && m_ue3FrameCounter - m_ngxSceneTargetsLastSeenFrame > 60) {
       m_ngxSceneColorImage = nullptr;

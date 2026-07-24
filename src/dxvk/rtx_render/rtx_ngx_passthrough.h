@@ -119,6 +119,12 @@ namespace dxvk {
     uint32_t captured = 0;
     uint32_t capturedSkinned = 0;
     uint32_t capturedDynamic = 0;
+    // Rigid movers captured through the name-independent clip-transform probe rather than a
+    // named LocalToWorld constant (see RtxNgxPassthrough::objectVelocitiesGeneric): the count
+    // of otherwise-ghosting movers recovered on engines that fold the world matrix into a
+    // single world-view-projection. Zero on UE3 (the named path handles it and the generic
+    // route is left off there).
+    uint32_t capturedGenericRigid = 0;
     uint32_t capturedForeground = 0;
     uint32_t exactMatches = 0;
     uint32_t newRegistrations = 0;
@@ -135,6 +141,10 @@ namespace dxvk {
     // (the engine issues an extra mid-scene clear ahead of the foreground DPG).
     uint32_t depthClears = 0;
     uint32_t cameraTransposeFlips = 0;
+    // Which camera provider carried the main view this frame (a static label - see
+    // D3D9Rtx::NgxCameraSource). "none" is the first thing to check when bringing up a game
+    // that has no motion vectors: no provider recognised its camera.
+    const char* cameraSource = "none";
   };
 
   /**
@@ -305,6 +315,17 @@ namespace dxvk {
                "position snapshots). DLSS, Frame Generation and Remix motion blur then see real screen space motion instead\n"
                "of treating everything as static world. First person meshes are handled in both their world/intermediate and\n"
                "foreground render phases.");
+    RTX_OPTION("rtx.ngxPassthrough", bool, objectVelocitiesGeneric, true,
+               "Name-independent rigid object velocity for engines that do not publish a LocalToWorld constant the way UE3\n"
+               "does (Gamebryo and others fold the world matrix into a single world-view-projection handed to the vertex\n"
+               "shader). Instead of matching a constant name, the clip-transform probe reads each vertex shader's bytecode to\n"
+               "recover the object->clip transform it actually applies, then factors this frame's camera back out to get the\n"
+               "object's world transform - the same quantity the named path extracts, obtained from arithmetic rather than a\n"
+               "symbol. Feeds the existing per-object history matching and velocity raster unchanged, so rigid movers (doors,\n"
+               "vehicles, physics props) stop ghosting on those engines. Skinned meshes are not covered here: the probe\n"
+               "correctly declines blend-indexed position as non-affine, so characters still need the named GPU-skin path.\n"
+               "Automatically stays off for any game seen to name its rigid transform (UE3), leaving Mirror's Edge / Mass\n"
+               "Effect 2 on their proven path. Requires rtx.ngxPassthrough.objectVelocities.");
     RTX_OPTION("rtx.ngxPassthrough", bool, motionBlurFirstPerson, true,
                "Applies Remix motion blur (rtx.postfx) to the camera-locked first person meshes like the rest of the scene:\n"
                "during sprints and camera motion the hands smear with their true motion, matching the vanilla game's camera\n"
@@ -344,6 +365,34 @@ namespace dxvk {
                "magnitude: 0 = per-object velocity override (dynamic object coverage), 0.25 = foreground object velocity\n"
                "(first person meshes with true skinned motion), 0.5 = world camera reprojection, 1 = camera-locked\n"
                "foreground without object velocity.");
+    RTX_OPTION("rtx.ngxPassthrough", bool, clipTransformProbe, true,
+               "Last-resort camera acquisition for games none of the named providers recognise. Instead of matching\n"
+               "constant names, it reads each vertex shader's bytecode to work out the transform the shader actually\n"
+               "applies to its input position, then evaluates that against the live constants - so it works on shaders\n"
+               "shipped without a constant table, on unknown naming conventions, and on engines that never upload the\n"
+               "camera as a single 4x4 (an affine world->view plus packed projection scalars is recovered just as well).\n"
+               "What that yields is an object->clip transform; whether it is also the world->clip is decided by\n"
+               "agreement across a frame's draws - a world->clip puts the frustum apex at the camera for every draw,\n"
+               "an object->clip does not - and only a camera that a clear majority agrees on over several consecutive\n"
+               "frames is ever used. Disable to confirm whether a suspicious camera comes from this path.");
+    RTX_OPTION("rtx.ngxPassthrough", bool, dumpCameraCandidatesNow, false,
+               "One-shot trigger for the camera candidate sweep: reports the NEXT frame, whatever it contains, and\n"
+               "resets itself. Unlike dumpCameraCandidateFrames this ignores the heuristics that try to guess which\n"
+               "frames are gameplay (they pick badly on games whose menus and splash screens also submit depth-writing\n"
+               "draws), and it reports every shader in the frame rather than sampling. Drive it from the button in\n"
+               "Rendering -> General while standing in the world.");
+    RTX_OPTION("rtx.ngxPassthrough", int, dumpCameraCandidateFrames, 0,
+               "Diagnostic for bringing up a game whose camera none of the providers recognise (the log reports\n"
+               "'Camera source: none'). For the next N frames, every distinct vertex shader that draws into the scene is\n"
+               "reported once: whether its bytecode carries a constant table and what that table names, plus a structural\n"
+               "sweep of the float constant registers for any four-register block that reconstructs as a usable camera -\n"
+               "each candidate listed with the world-space eye, field of view and clip planes it decomposes to.\n"
+               "Encodes no engine knowledge; it reports what the game actually uploads.\n"
+               "Reading it: a block whose eye is the SAME across every shader and draw is a view-projection, and the\n"
+               "camera can be recovered from it. A block whose eye moves per draw is a world-view-projection - the eye is\n"
+               "in that object's space, not the world's, and is not usable on its own. No candidates at all means the\n"
+               "camera never reaches the vertex shader as a whole matrix.\n"
+               "Expensive while running (every register window is tested per shader); resets to 0 automatically.");
     RTX_OPTION("rtx.ngxPassthrough", int, dumpPostChainFrames, 0,
                "Diagnostic: when set to a value N > 0, the non-scene draw flow (post-process passes, composites, UI, resolve\n"
                "copies, render state) of the next N frames is written to the log, then the value resets to 0 automatically.\n"

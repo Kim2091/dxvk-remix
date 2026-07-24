@@ -1,6 +1,7 @@
 #pragma once
 
 #include "d3d9_state.h"
+#include "d3d9_vs_clip_transform.h"
 #include "../dxvk/dxvk_buffer.h"
 #include "../util/util_threadpool.h"
 
@@ -709,13 +710,76 @@ namespace dxvk {
     fast_unordered_cache<Ue3VsShaderCtabInfo> m_ue3VsShaderCtabCache;
     std::optional<Ue3VsShaderCtabInfo> m_currentUe3CtabInfo;
 
+    // NGX passthrough camera acquisition: which provider recovered the main view this frame.
+    // Providers are tried in descending order of confidence (see resolveNgxPassthroughCamera);
+    // the winner is recorded so a new game's failure mode is legible in the developer panel
+    // ("which provider fired, or none at all") without attaching a debugger.
+    enum class NgxCameraSource : uint32_t {
+      None = 0,
+      CtabViewProjWithOrigin,   // combined ViewProjection + an explicit camera position (UE3)
+      CtabViewProjDerivedEye,   // combined ViewProjection alone; eye from the frustum apex
+      CtabSeparateViewProj,     // distinct View and Projection matrices, usable as-is
+      FixedFunction,            // D3DTS_VIEW / D3DTS_PROJECTION
+      ClipTransformProbe,       // the transform the vertex shader's own arithmetic applies
+    };
+    static const char* ngxCameraSourceLabel(NgxCameraSource source);
+
+    // Why camera acquisition came up empty, accumulated over a frame's draws. Exists because
+    // the interesting case for a new game is the FAILING one, and a source label alone cannot
+    // say which provider was close: these counters name the gate each draw died at, so
+    // "no shader declares a camera" is distinguishable from "the camera is there but its
+    // packing is ambiguous" without attaching a debugger.
+    struct NgxCameraResolveStats {
+      uint32_t drawsExamined = 0;
+      uint32_t drawsProgrammableVs = 0;
+      uint32_t drawsFixedFunction = 0;
+      // Whether the bytecode carries a constant table at all. Separates "the game strips its
+      // shader symbols" (nothing can ever be matched by name) from "the game names its camera
+      // something this code does not know" - two failures with the same symptom and completely
+      // different answers, which is why they are counted apart.
+      uint32_t drawsWithCtabPresent = 0;
+      uint32_t drawsWithCtabStripped = 0;
+      // How far the shader-constant providers got
+      uint32_t shadersWithCtab = 0;
+      uint32_t withViewProjection = 0;
+      uint32_t withCameraPosition = 0;
+      uint32_t withSeparateViewProjection = 0;
+      // Declines, by gate
+      uint32_t declinedMirroredView = 0;
+      uint32_t declinedExtractionFailed = 0;
+      uint32_t declinedPackingAmbiguous = 0;
+      uint32_t declinedFfpShaderBound = 0;
+      uint32_t declinedFfpProjection = 0;
+      uint32_t declinedRegisterRange = 0;
+      // Clip-transform probe (see tryNgxClipTransformProbe)
+      uint32_t probeShadersAnalyzed = 0;      // draws whose vertex transform was recovered
+      uint32_t probeShadersNotAffine = 0;     // draws whose position is not a matrix transform
+      uint32_t probeCandidates = 0;           // reconstructions offered to the consensus
+      uint32_t probeDeclinedNoConsensus = 0;  // no world-space transform agreed on yet
+      uint32_t probeDeclinedDisagreed = 0;    // candidate did not match the established camera
+    };
+
     // NGX passthrough mode: minimal CTAB scan for the camera symbols plus what the object
     // velocity capture needs. Kept as a separate cache from m_ue3VsShaderCtabCache so the
     // passthrough path never populates partial entries into the full ray tracing parse cache.
     struct NgxCameraCtabRegs {
+      // Whether the bytecode carries a constant table at all, and how many symbols it names.
+      // Purely diagnostic, but decisive when a game brings up nothing: no table means no name
+      // based provider can ever work on it and the structural providers are the only route.
+      bool hasCtab = false;
+      uint32_t ctabConstantCount = 0;
+
       bool ctabVerified = false;   // shader declares both ViewProjectionMatrix and CameraPosition
       uint32_t viewProjRegister = 0;
       uint32_t viewOriginRegister = 0;
+
+      // Engines that upload View and Projection separately rather than pre-composed. Taken
+      // as-is (no decomposition, no apex derivation), so this is the most reliable source
+      // when present - but it is only trusted when both halves are found in one shader.
+      bool hasSeparateView = false;
+      uint32_t separateViewRegister = 0;
+      bool hasSeparateProjection = false;
+      uint32_t separateProjectionRegister = 0;
 
       // ViewProjection presence independent of the full verification (ctabVerified
       // additionally requires the camera position symbol; the velocity capture accepts
@@ -757,6 +821,11 @@ namespace dxvk {
       // both sides of a velocity delta must compose with the projection their draw
       // actually used
       Matrix4 worldToProjection;
+      // Generic (name-independent) route only: the exact object->clip transform recovered from
+      // the vertex shader at the last sighting. The clip-space matcher predicts, compares and
+      // emits from this directly, so the ill-conditioned camera inverse never touches the motion
+      // vectors (see the generic block in tryCaptureNgxVelocityDraw). Unused on the named route.
+      Matrix4 objectToClip;
       uint32_t lastSeenFrame = 0;
       // Movement history gating velocity emission: wasMoving latches once the instance
       // is a confirmed mover (decaying after a period at rest - see the exact-match
@@ -896,11 +965,149 @@ namespace dxvk {
     float m_ngxGameScreenPercentage = 0.0f;
     bool m_ngxPassthroughBootstrapped = false;
 
-    // Latest UE3 camera matrices accepted this frame; replayed into the CS camera at injection
+    // Latest camera matrices accepted this frame; replayed into the CS camera at injection
     // time so dispatch does not depend on earlier async processExternalCamera ordering.
     Matrix4 m_ngxFrameWorldToView;
     Matrix4 m_ngxFrameViewToProjection;
     bool m_ngxFrameCameraMatricesValid = false;
+    // The accepted camera as a composed world->projection this frame, and the previous frame's
+    // (rolled at frame end). The generic (name-independent) rigid velocity path uses the two to
+    // build a clip-space camera delta - it never inverts the camera in the motion path. Only
+    // meaningful while the matching validity flags are set.
+    Matrix4 m_ngxFrameWorldToProjection;
+    Matrix4 m_ngxPrevFrameWorldToProjection;
+    bool m_ngxPrevFrameWorldToProjectionValid = false;
+    // Clip-space camera delta C = worldToProjection(now) * inverse(worldToProjection(prev)),
+    // computed once per frame in double precision (the only place the ill-conditioned inverse is
+    // taken; the result maps clip->clip with norm ~1 and is safe in float). A generic rigid draw
+    // is static when object->clip(now) ~ C * object->clip(prev). Frame-stamped so it is built
+    // lazily on the frame's first generic draw.
+    Matrix4 m_ngxGenericCameraDelta;
+    bool m_ngxGenericCameraDeltaValid = false;
+    uint32_t m_ngxGenericCameraDeltaFrame = UINT32_MAX;
+    // Sticky per-run latch: set once any draw is captured through a named LocalToWorld
+    // constant (a UE3-shaped engine). The generic clip-transform-probe rigid path is held off
+    // while this is set, so Mirror's Edge / Mass Effect 2 keep their exact named path with no
+    // behaviour change; games that never name a rigid transform (Gamebryo and others) leave it
+    // clear and get the generic route.
+    bool m_ngxVelocityNamedRigidSeen = false;
+    // Per-frame budget on generic clip-transform-probe evaluations (reset each frame): a safety
+    // backstop so a scene with thousands of qualifying static draws cannot spend unbounded time
+    // probing them (each still resolves to a static, non-emitting match).
+    uint32_t m_ngxVelocityGenericProbeEvals = 0;
+
+    // Which provider produced this frame's camera, and the one that last succeeded (sticky
+    // across frames for the developer panel, which is read between frames)
+    NgxCameraSource m_ngxFrameCameraSource = NgxCameraSource::None;
+    NgxCameraSource m_ngxLastCameraSource = NgxCameraSource::None;
+
+    // Learned sign of the main view's 3x3 determinant (see the mirror rejection in
+    // resolveNgxPassthroughCamera): 0 until a frame establishes it, then +1 or -1. Which sign
+    // the main view carries is an engine convention - UE3 is positive, Gamebryo is not - so it
+    // is measured rather than assumed, and draws that disagree with it are the mirrored ones.
+    int32_t m_ngxCameraDetSign = 0;
+    uint32_t m_ngxCameraDetPositiveCount = 0;
+    uint32_t m_ngxCameraDetNegativeCount = 0;
+
+    // Failure diagnostics for frames that acquire no camera, plus the rate limiter for the
+    // summary log (a frame with no camera has that condition on every one of its draws, so
+    // this must not report per draw or even per frame)
+    NgxCameraResolveStats m_ngxCameraResolveStats;
+    uint32_t m_ngxCameraFailureLogNextFrame = 0;
+    bool m_ngxCameraFailureLogged = false;
+
+    // Diagnostic sweep of the vertex shader constant registers for camera candidates
+    // (rtx.ngxPassthrough.dumpCameraCandidateFrames); reports what the game actually uploads
+    // rather than assuming an engine convention
+    uint32_t m_ngxCameraDumpFramesLeft = 0;
+    // Armed by the developer-menu button rather than the frame heuristics: reports every
+    // shader in the chosen frame with no filtering (see dumpCameraCandidatesNow). Waits for a
+    // frame that actually has scene draws rather than firing on the frame right after the
+    // click (often a menu/transition frame); m_ngxCameraDumpForcedWaited bounds that wait.
+    bool m_ngxCameraDumpForced = false;
+    uint32_t m_ngxCameraDumpForcedWaited = 0;
+    fast_unordered_set m_ngxCameraDumpSeenShaders;
+    void dumpNgxCameraCandidates();
+
+    // --- Clip-transform probe: the camera provider of last resort ------------------------
+    //
+    // Every provider above this one identifies the camera by what the game CALLS its
+    // constants. That fails on two whole classes of game and always will: shaders shipped
+    // without a constant table (no symbol survives to be matched), and engines that never
+    // upload the camera as one 4x4 at all (a 3-register world->view plus a few packed
+    // projection scalars is a normal compact form). Both are answered by measuring instead:
+    // whatever constants the shader's arithmetic combines to produce clip-space position ARE
+    // its vertex transform, whatever they are named and however they are split up
+    // (see analyzeVsClipTransform).
+    //
+    // What that recovers is an OBJECT->clip transform. Whether it is also the world->clip -
+    // the thing the camera actually needs - depends on the draw's object transform being
+    // identity, which no amount of bytecode can tell us. It is resolved by measurement too:
+    // a world->clip puts the frustum apex at the camera for EVERY draw in the frame, while an
+    // object->clip puts it at the camera expressed in that object's space, which moves from
+    // draw to draw. So candidates are gathered across a frame's draws and the camera is
+    // whatever a clear majority of them agree on; a single draw is never trusted on its own.
+    // Additionally, when the shader folds a world matrix in, the un-folded view-projection is
+    // often still present among the constants the transform reads, so four-register windows
+    // inside that footprint are offered as candidates as well.
+    //
+    // Deliberately last in the provider chain: it is the most general and the least direct,
+    // and it costs a per-shader bytecode analysis plus bounded per-draw arithmetic. Games the
+    // named providers already handle never reach it.
+    struct NgxClipProbeCandidate {
+      Matrix4 worldToView;
+      Matrix4 viewToProjection;
+      Vector3 eye = Vector3(0.0f, 0.0f, 0.0f);
+      Vector3 forward = Vector3(0.0f, 0.0f, 1.0f);
+      float fov = 0.0f;
+      float aspectRatio = 0.0f;
+      float nearPlane = 0.0f;
+      float farPlane = 0.0f;
+    };
+
+    struct NgxClipProbeSample : public NgxClipProbeCandidate {
+      XXH64_hash_t shaderHash = 0;
+      // Which reading of the shader produced it: -1 = the transform the shader itself applies,
+      // >= 0 = the four-register constant window at that base
+      int32_t source = -1;
+      // Which probed draw it came from. Agreement is counted over DRAWS, not samples: one draw
+      // can offer several readings of itself (its own transform plus each constant window in
+      // its footprint) and at most one of those is the camera, so counting samples would let a
+      // handful of heavily-swept draws drown out the thing being measured.
+      uint32_t drawIndex = 0;
+    };
+
+    // The frame-to-frame camera the probe has agreed on, and how long it has held
+    struct NgxClipProbeConsensus : public NgxClipProbeCandidate {
+      bool valid = false;
+      uint32_t agreeingSamples = 0;
+      uint32_t totalSamples = 0;
+      uint32_t streak = 0;       // consecutive frames a consistent consensus was reached
+      uint32_t frame = 0;
+    };
+
+    fast_unordered_cache<VsClipTransformProgram> m_ngxClipProbePrograms;
+    // Per shader: which reading of it agreed with the consensus, so later frames evaluate one
+    // candidate instead of sweeping (INT32_MIN = not learned yet)
+    fast_unordered_cache<int32_t> m_ngxClipProbeShaderSource;
+    std::vector<NgxClipProbeSample> m_ngxClipProbeSamples;
+    NgxClipProbeConsensus m_ngxClipProbeConsensus;
+    uint32_t m_ngxClipProbeEvalsThisFrame = 0;
+    uint32_t m_ngxClipProbeSweepsThisFrame = 0;
+    bool m_ngxClipProbeReportedConsensus = false;
+
+    static bool ngxProbeCamerasMatch(const NgxClipProbeCandidate& a,
+                                     const NgxClipProbeCandidate& b,
+                                     float eyeTolerance,
+                                     float forwardDotMin,
+                                     float projectionTolerance);
+    const VsClipTransformProgram* getNgxClipProbeProgram(XXH64_hash_t shaderHash,
+                                                         const std::vector<uint8_t>& bytecode);
+    bool reconstructNgxClipProbeCandidate(const Matrix4& objectToClip, NgxClipProbeCandidate& outCandidate) const;
+    bool tryNgxClipTransformProbe(Matrix4& outWorldToView,
+                                  Matrix4& outViewToProjection,
+                                  XXH64_hash_t& outConstantsHash);
+    void updateNgxClipProbeConsensus();
 
     // Cache-backed UE3 camera extraction from the current vertex shader constants (shares
     // m_ue3CameraConstantsCache with the ray traced path; entries are keyed by the raw
@@ -1295,11 +1502,23 @@ namespace dxvk {
     bool checkBoundTextureCategory(const fast_unordered_set& textureCategory) const;
 
     // --- NGX passthrough mode (see RtxNgxPassthrough) ---
-    // All draws rasterize as-is; the per-draw work reduces to UE3 camera extraction, scene
+    // All draws rasterize as-is; the per-draw work reduces to camera acquisition, scene
     // color/depth target identification (for viewport jitter and DLSS inputs) and the thin
     // RTX injection trigger at scene end.
     PrepareDrawFlags prepareDrawForNgxPassthrough(const DrawContext& drawContext);
     void tryNgxPassthroughCameraCapture();
+
+    // Runs the camera providers in order and returns the first that yields a plausible main
+    // view. Shader-constant providers need ctabRegs from the bound vertex shader; the
+    // fixed-function provider ignores it and is the only one that fires for non-programmable
+    // draws. Reports which provider won so the caller can record it and log transitions.
+    bool resolveNgxPassthroughCamera(const NgxCameraCtabRegs& ctabRegs,
+                                     bool hasProgrammableVs,
+                                     Matrix4& outWorldToView,
+                                     Matrix4& outViewToProjection,
+                                     bool& outUsedTranspose,
+                                     XXH64_hash_t& outConstantsHash,
+                                     NgxCameraSource& outSource);
     void emitNgxPassthroughFrameData();
 
     void applyNgxPassthroughScreenPercentage();
@@ -1313,6 +1532,14 @@ namespace dxvk {
     Rc<DxvkImage> m_ngxSceneColorImage;
     Rc<DxvkImage> m_ngxSceneDepthImage;
     uint32_t m_ngxSceneTargetsLastSeenFrame = 0;
+
+    // Scene target stickiness (see tryNgxPassthroughCameraCapture): whether the established
+    // scene color was drawn into this frame, and how many draws into a competing full-size
+    // depth-writing target were refused because of it. A steadily nonzero refusal count means
+    // the game really does have two scene-like targets and the stickiness is what is keeping
+    // the injection point - and the upscaler's history - from oscillating between them.
+    bool m_ngxSceneColorSeenThisFrame = false;
+    uint32_t m_ngxSceneTargetRejectedStickyDraws = 0;
 
     // Per-frame sub-pixel jitter (pixels), decided on the app thread at the first draw of the
     // frame and forwarded to the CS side so DLSS/DLFG report exactly the rasterized value
@@ -1456,6 +1683,8 @@ namespace dxvk {
       bool ngxPrePostProcess = false;
       bool ngxDlfgHudless = false;
       bool ngxObjectVelocities = false;
+      bool ngxObjectVelocitiesGeneric = false;
+      bool ngxClipTransformProbe = false;
       int ngxDebugVisualization = 0;
 
       // upstream RtxOptions (raytracedRenderTargetEnable caches

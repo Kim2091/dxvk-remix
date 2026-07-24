@@ -1995,6 +1995,7 @@ namespace dxvk {
     ImGui::TextWrapped(str::format("Velocity capture: ", m_lastCaptureStats.captured, " captured (",
                                    m_lastCaptureStats.capturedSkinned, " skinned, ",
                                    m_lastCaptureStats.capturedDynamic, " cpu-mesh, ",
+                                   m_lastCaptureStats.capturedGenericRigid, " generic, ",
                                    m_lastCaptureStats.capturedForeground, " fg), ",
                                    m_lastCaptureStats.exactMatches, " static, ",
                                    m_lastCaptureStats.newRegistrations, " new, ",
@@ -2004,9 +2005,35 @@ namespace dxvk {
                                    m_lastCaptureStats.frameCameraValid ? "valid" : "missing",
                                    " | depth clears: ", m_lastCaptureStats.depthClears,
                                    " | transpose flips: ", m_lastCaptureStats.cameraTransposeFlips).c_str());
+    // The single most useful line when bringing up a new game: "none" means no provider
+    // recognised the camera, which explains a missing/static motion vector field outright
+    ImGui::TextWrapped(str::format("Camera source: ",
+                                   m_lastCaptureStats.cameraSource != nullptr
+                                     ? m_lastCaptureStats.cameraSource : "none").c_str());
 
     // rtx.ngxPassthrough.motionBlurFirstPerson and rtx.ngxPassthrough.objectVelocities
     // stay config-only: both default on and only serve as kill-switches
+    // Kill-switch for the measured (name-independent) camera provider: the fastest way to tell
+    // whether a suspicious camera came from the probe or from a named provider
+    RemixGui::Checkbox("Clip-Transform Camera Probe", &clipTransformProbeObject());
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip("Last-resort camera acquisition: recovers the transform each vertex shader applies to its\n"
+                        "input position from its bytecode, and confirms which of those is the world camera by\n"
+                        "cross-draw agreement. Only used when no named provider recognised the game.");
+    }
+
+    // Live A/B for the name-independent rigid velocity route (watch "generic" in the capture
+    // line above rise on Gamebryo and others). Auto-held-off on games that name their rigid
+    // transform, so toggling it has no effect on Mirror's Edge / Mass Effect 2.
+    RemixGui::Checkbox("Generic Rigid Object Velocity (name-independent)", &objectVelocitiesGenericObject());
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip("Recovers rigid movers' motion by reading the object->clip transform each vertex shader\n"
+                        "applies (from its bytecode) and factoring out the frame camera, for engines that never\n"
+                        "name a LocalToWorld constant. Held off automatically once a game is seen to name its\n"
+                        "rigid transform (UE3). Skinned meshes still need the named GPU-skin path. Requires\n"
+                        "Object Velocities.");
+    }
+
     RemixGui::Checkbox("Object Velocity Debug Freeze (zero motion)", &objectVelocityDebugFreezeObject());
     RemixGui::Checkbox("Frame Gen HUD-less UI Input", &dlfgHudlessInputObject());
 
@@ -2018,6 +2045,18 @@ namespace dxvk {
 
     if (ImGui::Button("Dump Post-Chain Draw Flow To Log (4 Frames)")) {
       dumpPostChainFramesObject().setDeferred(4);
+    }
+
+    // Manual trigger for the camera sweep: the automatic frame selection guesses which frames
+    // are gameplay and guesses badly on games whose menus also submit depth-writing draws.
+    // Pressing this while standing in the world removes the guess entirely.
+    if (ImGui::Button("Dump Camera Candidates For Next Frame")) {
+      dumpCameraCandidatesNowObject().setDeferred(true);
+    }
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip("Reports every scene vertex shader in the next frame: its constant table, and any four-register\n"
+                        "window that reconstructs as a camera (with the eye, FOV and clip planes it decomposes to).\n"
+                        "Use this while the world is on screen - the automatic sweep often samples a menu instead.");
     }
   }
 }
