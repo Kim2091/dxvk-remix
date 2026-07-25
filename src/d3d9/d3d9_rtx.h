@@ -426,7 +426,13 @@ namespace dxvk {
       * bracketed test draws are ignored. See rtx.d3d9.conservativeOcclusionQueries.
       */
     bool ConservativeOcclusionQueriesEnabled() const {
-      return m_frameOptions.enableRaytracing &&
+      // The original condition required ray tracing, because the unpopulated-depth failure this
+      // fixes only arises under path tracing. NGX passthrough hits the same *class* of flicker -
+      // the game's occlusion queries read back zero for meshes that are actually on screen - so
+      // enable it there too. The fix mechanism (answer readbacks with full-backbuffer coverage so
+      // the game never culls) is mode-independent; only this gate kept it out of passthrough.
+      // Still opt-in via conservativeOcclusionQueries (or UE3 engine mode).
+      return (m_frameOptions.enableRaytracing || m_frameOptions.ngxPassthroughMode) &&
              (m_frameOptions.conservativeOcclusionQueries || m_frameOptions.ue3EngineMode);
     }
 
