@@ -284,6 +284,17 @@ namespace dxvk {
       ObjectVelocityCoverage = 3,
     };
 
+    // Engine-specific compatibility fixes, selected as a group. Passthrough works from pure
+    // render-state heuristics for most games, but some engines need a targeted fix that would be
+    // wrong to apply elsewhere; picking the engine here enables that engine's fixes without
+    // hand-toggling each rtx.d3d9 knob. Extend as more engines are brought up.
+    enum class EngineProfile : int {
+      None = 0,           // no engine-specific fixes
+      UnrealEngine3 = 1,  // conservative occlusion queries: UE3's HW occlusion culling reads back
+                          // zero samples for meshes that are actually on screen under Remix,
+                          // hiding them and causing visibility flicker
+    };
+
     // Path tracing is incompatible with NGX passthrough; keep rtx.enableRaytracing off.
     static void enforceRaytracingDisabledForPassthrough();
     static void ngxPassthroughModeOnChange(DxvkDevice* device);
@@ -299,6 +310,12 @@ namespace dxvk {
     RTX_OPTION("rtx.ngxPassthrough", bool, enableJitter, true,
                "Applies a sub-pixel Halton jitter offset to the game's viewport for all draws targeting the detected scene render\n"
                "target. Required for temporal upscalers (DLSS, TAA-U, XeSS) to anti-alias; only disable for debugging.");
+    RTX_OPTION("rtx.ngxPassthrough", int, engineProfile, 0,
+               "Engine-specific compatibility fixes for the running game's engine, selected as a group (see\n"
+               "RtxNgxPassthrough::EngineProfile). 0: None. 1: Unreal Engine 3 - enables conservative occlusion queries,\n"
+               "because UE3's hardware occlusion culling reads back zero samples for meshes that are actually on screen\n"
+               "under Remix, hiding them and causing visibility flicker. Additive: the individual rtx.d3d9 fix toggles\n"
+               "(e.g. conservativeOcclusionQueries) still apply on top of whatever the profile enables.");
     RTX_OPTION("rtx.ngxPassthrough", bool, prePostProcess, true,
                "Runs the upscaler on the game's linear scene color before the game's post-process chain instead of on the final\n"
                "post-processed output, matching a native engine integration: bloom, tonemapping and color grading then operate\n"

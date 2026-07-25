@@ -4922,7 +4922,10 @@ namespace dxvk {
     o.ue3SkipShadowDepthPasses = ue3SkipShadowDepthPassesObject().get();
     o.ue3SkipDepthTestDisabledTranslucency = ue3SkipDepthTestDisabledTranslucencyObject().get();
     o.ue3SkipSceneCapturePasses = ue3SkipSceneCapturePassesObject().get();
-    o.conservativeOcclusionQueries = conservativeOcclusionQueriesObject().get();
+    // The UE3 engine profile enables conservative occlusion queries as a group; the individual
+    // rtx.d3d9 toggle still applies on top (see RtxNgxPassthrough::EngineProfile).
+    o.conservativeOcclusionQueries = conservativeOcclusionQueriesObject().get() ||
+        RtxNgxPassthrough::engineProfile() == int(RtxNgxPassthrough::EngineProfile::UnrealEngine3);
     o.ue3StaticLocalMeshVertexCaptureCache = ue3StaticLocalMeshVertexCaptureCacheObject().get();
     o.ue3StaticLocalMeshVertexCaptureCacheWarmupFrames = ue3StaticLocalMeshVertexCaptureCacheWarmupFramesObject().get();
     o.ue3StaticGeometryHashMemoization = ue3StaticGeometryHashMemoizationObject().get();

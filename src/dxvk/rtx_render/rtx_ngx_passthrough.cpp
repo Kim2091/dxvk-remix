@@ -1963,6 +1963,22 @@ namespace dxvk {
     RemixGui::Checkbox("Pre-Post-Process Injection (DLSS before the game's post chain)", &prePostProcessObject());
 
     {
+      // Engine-specific compatibility fixes, picked as a group (see EngineProfile). Each engine
+      // needs a fix that would be wrong to apply everywhere, so it is opt-in per engine rather
+      // than always on.
+      int engineProfileValue = engineProfile();
+      if (ImGui::Combo("Engine-Specific Fixes", &engineProfileValue, "None\0Unreal Engine 3\0")) {
+        engineProfileObject().setDeferred(engineProfileValue);
+      }
+      if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Applies the compatibility fixes a specific engine needs under passthrough.\n"
+                          "Unreal Engine 3: conservative occlusion queries - the game's hardware occlusion\n"
+                          "culling reads back zero samples for meshes that are actually on screen under Remix,\n"
+                          "hiding them and causing visibility flicker. The individual rtx.d3d9 toggles still apply.");
+      }
+    }
+
+    {
       static const int kPresetOptionValues[] = { 0, 1, 2, 3, 4, 5, 6, 10 };
       static const char* kPresetLabels = "Default\0Preset A (CNN)\0Preset B (CNN)\0Preset C (CNN)\0Preset D (CNN)\0Preset E (CNN)\0Preset F (CNN)\0Preset J (Transformer)\0";
 
