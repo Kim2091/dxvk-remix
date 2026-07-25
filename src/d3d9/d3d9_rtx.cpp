@@ -16216,6 +16216,12 @@ namespace dxvk {
       }
     }
 
+    // Fold this frame into the diffable fact log. Must run before the resolve stats are cleared
+    // and before the scene target references are dropped below, both of which it reads.
+    if (m_frameOptions.ngxPassthroughMode) {
+      recordNgxFacts();
+    }
+
     m_ngxCameraResolveStats = NgxCameraResolveStats();
     // Drop scene target references when unseen for a while (level transitions recreate them)
     if (m_ngxSceneColorImage != nullptr && m_ue3FrameCounter - m_ngxSceneTargetsLastSeenFrame > 60) {
@@ -16230,6 +16236,102 @@ namespace dxvk {
     m_prevDrawCullMode = 0;
 
     m_stagedBones.clear();
+  }
+
+  void D3D9Rtx::recordNgxFacts() {
+    const uint32_t frame = m_ue3FrameCounter;
+
+    // --- Camera acquisition -------------------------------------------------------------
+    // The sticky source rather than this frame's: games legitimately alternate providers draw
+    // to draw (FNV publishes a camera position from some shader families and not others), and
+    // the fact worth recording is which provider carries this game, not which won a given frame.
+    m_ngxFacts.set("camera.source", ngxCameraSourceLabel(m_ngxLastCameraSource), frame);
+
+    m_ngxFacts.set("camera.detSign",
+                   m_ngxCameraDetSign == 0 ? "unestablished"
+                                           : (m_ngxCameraDetSign > 0 ? "positive" : "negative"),
+                   frame);
+
+    // Which gate a camera-less game died at. Recorded only while there is no camera at all:
+    // once a provider carries the game the per-frame declines are just the mirrored reflection
+    // and portal draws being correctly refused, and logging those would make the file churn.
+    if (m_ngxLastCameraSource == NgxCameraSource::None && m_ngxCameraResolveStats.drawsExamined > 0) {
+      const NgxCameraResolveStats& s = m_ngxCameraResolveStats;
+      const char* blockedAt =
+        s.drawsWithCtabPresent == 0        ? "shader constant tables stripped"
+        : s.shadersWithCtab == 0           ? "no recognised camera symbol names"
+        : s.declinedMirroredView > 0       ? "mirrored view rejection"
+        : s.declinedPackingAmbiguous > 0   ? "matrix packing ambiguous"
+        : s.declinedExtractionFailed > 0   ? "reconstruction failed"
+        : s.probeShadersNotAffine > 0 && s.probeShadersAnalyzed == 0
+                                           ? "clip position not an affine transform"
+        : s.probeCandidates == 0           ? "no recovered transform reconstructs as a camera"
+                                           : "no two draws agree on one camera";
+      m_ngxFacts.set("camera.blockedAt", blockedAt, frame);
+    }
+
+    // --- Clip-transform probe (the name-independent provider of last resort) ---------------
+    // Whether it was even allowed to run matters as much as its verdict: it is deliberately
+    // locked out for good on any game a named provider has ever carried.
+    m_ngxFacts.set("probe.consensus",
+                   !m_frameOptions.ngxClipTransformProbe ? "disabled"
+                   : m_ngxLastCameraSource != NgxCameraSource::None &&
+                     m_ngxLastCameraSource != NgxCameraSource::ClipTransformProbe
+                                                         ? "not needed"
+                   : m_ngxClipProbeConsensus.valid       ? "established"
+                                                         : "none",
+                   frame);
+
+    // --- Scene targets ---------------------------------------------------------------------
+    if (m_ngxSceneColorImage != nullptr) {
+      const DxvkImageCreateInfo& colorInfo = m_ngxSceneColorImage->info();
+      m_ngxFacts.set("scene.targets", "identified", frame);
+      m_ngxFacts.set("scene.color.extent",
+                     str::format(colorInfo.extent.width, "x", colorInfo.extent.height), frame);
+      m_ngxFacts.setInt("scene.color.format", int64_t(colorInfo.format), frame);
+      m_ngxFacts.setBool("scene.depth.present", m_ngxSceneDepthImage != nullptr, frame);
+    } else {
+      m_ngxFacts.set("scene.targets", "none", frame);
+    }
+
+    // A steadily nonzero refusal count means the game really does have two scene-like targets
+    // and the stickiness is what keeps the injection point from oscillating between them (the
+    // Mass Effect 2 shape). Recorded as a latch, not a count: the count varies per frame.
+    if (m_ngxSceneTargetRejectedStickyDraws > 0) {
+      m_ngxFacts.set("scene.competingTargets", "yes", frame);
+    }
+
+    // --- Injection point --------------------------------------------------------------------
+    m_ngxFacts.set("inject.point",
+                   m_ngxInjectionPoint == RtxNgxPassthrough::InjectionPoint::PrePost ? "pre-post-process"
+                   : m_ngxInjectionPoint == RtxNgxPassthrough::InjectionPoint::Late  ? "late"
+                                                                                     : "undecided",
+                   frame);
+    // The option, because it changes how the point above should be read (a game configured with
+    // prePostProcess off can only ever reach "late", which is not the same finding)
+    m_ngxFacts.setBool("inject.prePostAllowed", m_frameOptions.ngxPrePostProcess, frame);
+
+    // --- Object velocity ---------------------------------------------------------------------
+    // Which route this game's rigid movers take. "named" is the UE3-shaped path (a LocalToWorld
+    // constant the shader declares by name); "generic" is the clip-transform probe standing in
+    // for it; "none" means movers reproject from the camera alone and therefore ghost.
+    m_ngxFacts.set("velocity.route",
+                   !m_frameOptions.ngxObjectVelocities        ? "disabled"
+                   : m_ngxVelocityNamedRigidSeen              ? "named"
+                   : m_frameOptions.ngxObjectVelocitiesGeneric ? "generic"
+                                                              : "none",
+                   frame);
+
+    // --- Resolution / MSAA driving (the in-memory game settings tier) -------------------------
+    m_ngxFacts.setBool("settings.screenPercentageDriven", m_ngxScreenPercentageDriven, frame);
+    m_ngxFacts.setBool("settings.msaaOverrideLatched", m_ngxMsaaOverrideLatched, frame);
+
+    // Rewrite the file on a cadence rather than on every change: a game that is still settling
+    // would otherwise rewrite it several times a frame.
+    if (m_ngxFacts.dirty() && frame >= m_ngxFactsNextFlushFrame) {
+      m_ngxFactsNextFlushFrame = frame + kNgxFactsFlushIntervalFrames;
+      m_ngxFacts.flush();
+    }
   }
 
   void D3D9Rtx::OnPresent(const Rc<DxvkImage>& targetImage) {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "d3d9_state.h"
+#include "d3d9_ngx_facts.h"
 #include "d3d9_vs_clip_transform.h"
 #include "../dxvk/dxvk_buffer.h"
 #include "../dxvk/rtx_render/rtx_ngx_passthrough.h"
@@ -1173,6 +1174,18 @@ namespace dxvk {
     NgxCameraResolveStats m_ngxCameraResolveStats;
     uint32_t m_ngxCameraFailureLogNextFrame = 0;
     bool m_ngxCameraFailureLogged = false;
+
+    // Diffable record of every decision this mode reached about the running game, written to
+    // rtx-remix/logs/ngx-facts.log (see NgxFactLog). Exists because the heuristics here are
+    // shared across every game rather than branched per engine: a change made for one game can
+    // silently move the answer for another that nobody re-tested - or that is not installed to
+    // be re-tested. Diffing this file between two runs turns that into a check.
+    NgxFactLog m_ngxFacts;
+    void recordNgxFacts();
+    // Flush cadence. The file is rewritten whole, so this only bounds how stale it can be after
+    // a crash or an alt-F4, which is how these sessions usually end.
+    uint32_t m_ngxFactsNextFlushFrame = 0;
+    static constexpr uint32_t kNgxFactsFlushIntervalFrames = 120;
 
     // Diagnostic sweep of the vertex shader constant registers for camera candidates
     // (rtx.ngxPassthrough.dumpCameraCandidateFrames); reports what the game actually uploads
