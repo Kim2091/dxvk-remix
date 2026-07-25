@@ -6134,11 +6134,14 @@ namespace dxvk {
     // pre-injection phase) lives in GetNgxPassthroughViewportJitter; the game's own screen
     // space lookups are kept aligned via PatchNgxScreenPositionScaleBias.
     {
-      float jitterX, jitterY;
+      // Zero-initialised because the getter leaves the outputs untouched when it declines; the
+      // applied value is recorded either way so the per-draw scope check can detect a stale bind
+      float jitterX = 0.0f, jitterY = 0.0f;
       if (m_rtx.GetNgxPassthroughViewportJitter(&jitterX, &jitterY)) {
         viewport.x += jitterX;
         viewport.y += jitterY;
       }
+      m_rtx.NoteAppliedViewportJitter(jitterX, jitterY);
     }
     // NV-DXVK end
 

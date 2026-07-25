@@ -110,6 +110,16 @@ namespace dxvk {
                                     const Matrix4& worldToView,
                                     const Matrix4& viewToProjection);
 
+    // NGX passthrough mode: skip this frame's upscaler dispatch entirely and present the game's
+    // rasterized output as-is. Emitted by the D3D9 layer while the injection point is still
+    // settling (see D3D9Rtx::allowNgxLateInjection): dispatching against whichever color source
+    // happened to appear would flip the DLSS content type and recreate the feature. Without this
+    // the endFrame fallback injection below would run on the backbuffer anyway, so suppressing
+    // the mid-frame trigger alone would not stop the flip.
+    void suppressNgxPassthroughDispatch() {
+      m_ngxPassthroughSuppressDispatch = true;
+    }
+
     // NGX passthrough mode: copies the pre-UI backbuffer into the HUD-less frame generation
     // input slot. Emitted by the D3D9 layer at the first UI-classified backbuffer draw
     // after a pre-post-process injection (or at frame end when no UI was drawn).
@@ -295,6 +305,7 @@ namespace dxvk {
     VkRect2D m_ngxPassthroughSubrect = { { 0, 0 }, { 0, 0 } };
     std::vector<NgxVelocityDraw> m_ngxPassthroughVelocityDraws;
     float m_ngxPassthroughJitter[2] = { 0.0f, 0.0f };
+    bool m_ngxPassthroughSuppressDispatch = false;
 
     std::chrono::time_point<std::chrono::steady_clock> m_prevRunningTime;
     uint64_t m_prevGpuIdleTicks = 0;

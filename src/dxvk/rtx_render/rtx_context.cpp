@@ -585,7 +585,10 @@ namespace dxvk {
     // background prewarming of the path tracer's shader set (which runs for minutes after
     // launch and oscillates), while this path only needs its own small compute shader.
     const bool ngxPassthroughActive = RtxNgxPassthrough::ngxPassthroughMode();
-    const bool ngxPassthroughCanDispatch = ngxPassthroughActive &&
+    // The D3D9 layer deliberately skipped this frame while the injection point settles, so the
+    // frame presents as the game rasterized it (see suppressNgxPassthroughDispatch)
+    const bool ngxPassthroughSuppressed = ngxPassthroughActive && m_ngxPassthroughSuppressDispatch;
+    const bool ngxPassthroughCanDispatch = ngxPassthroughActive && !ngxPassthroughSuppressed &&
                                            (isCameraValid || m_ngxPassthroughSceneDepth != nullptr);
 
     if (ngxPassthroughCanDispatch) {
@@ -601,6 +604,16 @@ namespace dxvk {
       m_cachedReflexFrameId = cachedReflexFrameId;
 
       dispatchNgxPassthrough(targetImage);
+
+      // This frame has now been injected, so the endFrame fallback must not dispatch again.
+      // The shared guard above only records the frame when the camera is valid - a path tracing
+      // assumption - but this path also dispatches on scene depth alone, so a frame whose camera
+      // was not accepted would inject twice. The second dispatch finds the pre-post color target
+      // already consumed (dispatchNgxPassthrough releases it) and therefore runs against the
+      // backbuffer instead: display-encoded LDR where the first was linear HDR. NGX bakes that
+      // distinction into the DLSS feature, so the pair recreates it twice per occurrence and
+      // discards the temporal history each time - the startup/gameplay flicker.
+      m_frameLastInjected = m_device->getCurrentFrameId();
 
       m_framesWithoutValidScene = 0;
     } else
@@ -826,7 +839,8 @@ namespace dxvk {
     } else {
       // NGX passthrough diagnostic: count frames where the injection ran without a valid
       // main camera (dispatch skipped entirely; reported in the periodic summary log)
-      if (ngxPassthroughActive && !isCameraValid) {
+      // A deliberately suppressed frame is not a camera failure and must not be counted as one
+      if (ngxPassthroughActive && !isCameraValid && !ngxPassthroughSuppressed) {
         m_common->metaNgxPassthrough().noteCameraInvalidFrame();
       }
 
@@ -866,6 +880,10 @@ namespace dxvk {
       // Fallback inject (is a no-op if already injected this frame, or no valid RT scene)
       injectRTX(cachedReflexFrameId, targetImage);
     }
+
+    // One-frame scoped: cleared here rather than in injectRTX, which has early returns that
+    // would leave a suppressed frame's flag latched forever
+    m_ngxPassthroughSuppressDispatch = false;
 
 #ifdef REMIX_DEVELOPMENT
     queryAvailableResourceAliasing();

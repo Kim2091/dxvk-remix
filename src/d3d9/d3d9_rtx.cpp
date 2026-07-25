@@ -4946,6 +4946,7 @@ namespace dxvk {
     o.ngxPassthroughMode = RtxNgxPassthrough::ngxPassthroughMode();
     o.ngxPassthroughJitter = RtxNgxPassthrough::enableJitter();
     o.ngxPrePostProcess = RtxNgxPassthrough::prePostProcess();
+    o.ngxStableInjectionPoint = RtxNgxPassthrough::stableInjectionPoint();
     o.ngxDlfgHudless = RtxNgxPassthrough::dlfgHudlessInput() && DxvkDLFG::enable() &&
                        m_parent->GetDXVKDevice()->getCommon()->metaNGXContext().supportsDLFG();
     o.ngxObjectVelocities = RtxNgxPassthrough::objectVelocities();
@@ -14932,6 +14933,82 @@ namespace dxvk {
     });
   }
 
+  // Scene frames given to the pre-post-process point to appear before concluding the game has
+  // none, and consecutive scene frames an established pre-post point may miss before the late
+  // point is allowed to take over. Both count only frames that actually rendered a scene, so a
+  // long menu or loading screen cannot spend the window the first gameplay frames need. The
+  // dropout tolerance matches kNgxSceneTargetStickyFrames: the same settling it covers.
+  static constexpr uint32_t kNgxInjectionDecisionFrames = 90;
+  static constexpr uint32_t kNgxPrePostDropoutFrames = 30;
+
+  bool D3D9Rtx::allowNgxLateInjection(bool structurallyDecisive) {
+    if (!m_frameOptions.ngxStableInjectionPoint) {
+      return true;
+    }
+
+    switch (m_ngxInjectionPoint) {
+    case RtxNgxPassthrough::InjectionPoint::Late:
+      return true;
+
+    case RtxNgxPassthrough::InjectionPoint::PrePost:
+      // An established pre-post point that misses a frame is a dropout, not a new injection
+      // point. Presenting a few frames unresolved costs a little aliasing; switching the
+      // upscaler's content type costs the whole temporal history and reads as a flash. Only a
+      // sustained absence (the game really did stop running its post chain) hands the frame over.
+      return m_ngxPrePostDropoutFrames >= kNgxPrePostDropoutFrames;
+
+    default:
+      // Undecided. A structurally decisive caller has positively identified the game's injection
+      // point rather than merely falling back to it, so there is nothing left to wait for: the
+      // ScreenPercentage stretch replacement only fires once the scene provably rendered into a
+      // subrect, and the pre-post point requires a full-size scene - it can never fire here.
+      if (!structurallyDecisive && m_ngxInjectionUndecidedFrames < kNgxInjectionDecisionFrames) {
+        return false;
+      }
+
+      m_ngxInjectionPoint = RtxNgxPassthrough::InjectionPoint::Late;
+      m_parent->GetDXVKDevice()->getCommon()->metaNgxPassthrough().setInjectionPoint(m_ngxInjectionPoint);
+
+      Logger::info(str::format(
+        "[RTX NGX Passthrough] Injection point established: late - the upscaler runs on the game's "
+        "post-processed output (",
+        structurallyDecisive
+          ? "the game renders its scene into a subrect and upscales it, so a full-size pre-post-process pass cannot exist"
+          : "no post-process pass sampling the scene color appeared while the injection point settled",
+        ")."));
+      return true;
+    }
+  }
+
+  void D3D9Rtx::updateNgxInjectionPoint() {
+    // Only frames that actually rendered a scene say anything about which injection point this
+    // game uses: the pre-post point cannot fire in a frame that drew no scene, so counting those
+    // would burn the decision window on menus and loading screens and conclude the wrong thing.
+    const bool sceneFrame = m_ngxFrameCameraValid && m_ngxSceneColorSeenThisFrame;
+
+    if (m_ngxPrePostEngagedThisFrame) {
+      if (m_ngxInjectionPoint != RtxNgxPassthrough::InjectionPoint::PrePost) {
+        m_ngxInjectionPoint = RtxNgxPassthrough::InjectionPoint::PrePost;
+        m_parent->GetDXVKDevice()->getCommon()->metaNgxPassthrough().setInjectionPoint(m_ngxInjectionPoint);
+
+        Logger::info("[RTX NGX Passthrough] Injection point established: pre-post-process - the upscaler "
+                     "runs on the game's linear scene color. Frames that miss it are presented unresolved "
+                     "rather than falling back, which would change the upscaler's content type.");
+      }
+      m_ngxPrePostDropoutFrames = 0;
+    } else if (sceneFrame) {
+      if (m_ngxInjectionPoint == RtxNgxPassthrough::InjectionPoint::PrePost) {
+        m_ngxPrePostDropoutFrames++;
+      } else if (m_ngxInjectionPoint == RtxNgxPassthrough::InjectionPoint::Undecided) {
+        m_ngxInjectionUndecidedFrames++;
+      }
+    }
+
+    m_ngxPrePostEngagedThisFrame = false;
+    m_ngxInjectionResolvedLastFrame = m_ngxInjectionResolvedThisFrame;
+    m_ngxInjectionResolvedThisFrame = false;
+  }
+
   PrepareDrawFlags D3D9Rtx::prepareDrawForNgxPassthrough(const DrawContext& drawContext) {
     ScopedCpuProfileZone();
 
@@ -14940,6 +15017,21 @@ namespace dxvk {
 
     if (unlikely(m_ngxPostChainDumpFramesLeft > 0)) {
       dumpNgxPostChainDraw(drawContext);
+    }
+
+    // Occlusion query test draws. Conservative occlusion queries answer the readback with a
+    // synthesized full-coverage result (see ConservativeOcclusionQueriesEnabled), so nothing
+    // consumes a real measurement and the game's bounding-box proxies must not rasterize at all.
+    // The ray traced path does exactly this in makeDrawCallType and again post-injection, but
+    // passthrough diverges in PrepareDrawGeometry before reaching either - so the fix was only
+    // half applied here: readbacks were synthesized while the proxies still drew into the scene.
+    // Ignoring them must happen before camera capture, velocity capture and the injection trigger
+    // as well: a proxy carries the scene camera's ViewProjection and would otherwise be offered
+    // to scene-target identification and object velocity matching as if it were world geometry.
+    if (ShouldApplyConservativeOcclusionQueryState()) {
+      ONCE(Logger::info("[RTX NGX Passthrough] Ignoring occlusion query test draws "
+                        "(conservative occlusion queries synthesize the result)."));
+      return PrepareDrawFlag::Ignore;
     }
 
     // Super Resolution texture LOD bias transitions: the bias is folded into the sampler
@@ -14952,6 +15044,24 @@ namespace dxvk {
       if (samplerLodBias != m_ngxAppliedSamplerLodBias) {
         m_ngxAppliedSamplerLodBias = samplerLodBias;
         m_parent->m_dirtySamplerStates = (1u << uint32_t(d3d9State().samplerStates.size())) - 1u;
+      }
+    }
+
+    // Sub-pixel jitter scope transitions, for exactly the same reason as the sampler bias above.
+    // GetNgxPassthroughViewportJitter is a per-draw predicate - it depends on this draw's render
+    // target and depth-stencil - but the only place it is consumed is BindViewportAndScissor,
+    // which the device runs solely when the D3D9 viewport/scissor RECTANGLE changes. Switching
+    // between render targets of equal size (this frame's scene color, its resolve copies, the
+    // post-chain targets and the backbuffer are all backbuffer-sized) leaves that rectangle
+    // identical, so without this the previous scope's jitter stays latched on the viewport:
+    // scene geometry can rasterize unjittered while the upscaler is told the frame carried a
+    // jitter, and full-size post passes can inherit a jitter they should never have had.
+    {
+      float jitterX = 0.0f, jitterY = 0.0f;
+      GetNgxPassthroughViewportJitter(&jitterX, &jitterY);
+
+      if (jitterX != m_ngxAppliedViewportJitter[0] || jitterY != m_ngxAppliedViewportJitter[1]) {
+        m_parent->m_flags.set(D3D9DeviceFlag::DirtyViewportScissor);
       }
     }
 
@@ -14981,7 +15091,16 @@ namespace dxvk {
       // Temporal upscaler selected and usable on this system
       const bool temporalUpscalerUsable = RtxNgxPassthrough::needsViewportJitter(m_parent->GetDXVKDevice().ptr());
 
-      if (m_frameOptions.ngxPassthroughJitter && temporalUpscalerUsable) {
+      // Jitter is only worth rasterizing into a frame something will resolve: the whole point of
+      // the offset is that the upscaler removes it again. While the injection point is settling
+      // (and during a pre-post dropout) frames are presented as the game drew them, so a jittered
+      // frame would just wobble sub-pixel. This frame's outcome is not known yet at the first
+      // draw, so it follows the previous frame's - which is stable exactly when it matters, and
+      // costs at most one soft frame either side of a transition.
+      const bool jitterWillBeResolved = !m_frameOptions.ngxStableInjectionPoint ||
+                                        m_ngxInjectionResolvedLastFrame;
+
+      if (m_frameOptions.ngxPassthroughJitter && temporalUpscalerUsable && jitterWillBeResolved) {
         const uint32_t jitterSequenceLength = RtxNgxPassthrough::viewportJitterSequenceLength(m_parent->GetDXVKDevice().ptr());
         const Vector2 jitter = calculateHaltonJitter(m_parent->GetDXVKDevice()->getCurrentFrameId(),
                                                      jitterSequenceLength);
@@ -15207,6 +15326,7 @@ namespace dxvk {
           m_ngxSubrect.extent = { m_ngxSceneViewport.Width, m_ngxSceneViewport.Height };
 
           triggerInjection = true;
+          m_ngxPrePostEngagedThisFrame = true;
 
           ONCE(Logger::info(str::format("[RTX NGX Passthrough] Pre-post-process injection engaged: DLSS runs on the ",
                                         (m_ngxColorMirrorImage != nullptr ? "resolved scene color" : "scene color"),
@@ -15278,7 +15398,9 @@ namespace dxvk {
               }
             }
 
-            if (sourceImage != nullptr) {
+            // A subrect scene rules the pre-post point out structurally (it requires a full-size
+            // scene), so this identifies the game's injection point rather than falling back to it
+            if (sourceImage != nullptr && allowNgxLateInjection(/* structurallyDecisive = */ true)) {
               m_ngxUpscaleSourceImage = sourceImage;
               m_ngxSubrect.offset = { int32_t(m_ngxSceneViewport.X), int32_t(m_ngxSceneViewport.Y) };
               m_ngxSubrect.extent = { m_ngxSceneViewport.Width, m_ngxSceneViewport.Height };
@@ -15297,13 +15419,16 @@ namespace dxvk {
         if (!triggerInjection) {
           m_currentUe3PassType = classifyUe3Pass(drawContext);
 
-          if (m_currentUe3PassType == Ue3PassType::UiComposite) {
-            triggerInjection = true;
-          } else if (isRenderingUI()) {
-            triggerInjection = true;
-          } else if (m_frameOptions.preTransformedVerticesIsUI &&
-                     d3d9State().vertexDecl != nullptr &&
-                     d3d9State().vertexDecl->TestFlag(D3D9VertexDeclFlag::HasPositionT)) {
+          const bool sceneEndedAtUi =
+            m_currentUe3PassType == Ue3PassType::UiComposite ||
+            isRenderingUI() ||
+            (m_frameOptions.preTransformedVerticesIsUI &&
+             d3d9State().vertexDecl != nullptr &&
+             d3d9State().vertexDecl->TestFlag(D3D9VertexDeclFlag::HasPositionT));
+
+          // This is the fallback point - it fires precisely on the frames the pre-post point
+          // missed, which is what makes the two alternate while the scene targets settle
+          if (sceneEndedAtUi && allowNgxLateInjection(/* structurallyDecisive = */ false)) {
             triggerInjection = true;
           }
         }
@@ -15311,6 +15436,9 @@ namespace dxvk {
     }
 
     if (triggerInjection) {
+      // The upscaler will run on this frame, so next frame's jitter is worth rasterizing
+      m_ngxInjectionResolvedThisFrame = true;
+
       // Everything from the trigger draw on samples the un-jittered DLSS output: stop the
       // ScreenPositionScaleBias patch and force fresh (unpatched) constant uploads
       m_ngxSpsbPatchActive = false;
@@ -15788,9 +15916,23 @@ namespace dxvk {
     }
 
     // NGX passthrough mode: no scene end trigger fired this frame (e.g. no UI drawn), so the
-    // fallback injection below runs on the backbuffer; hand over this frame's data first
+    // fallback injection below runs on the backbuffer; hand over this frame's data first.
+    // That fallback is the late injection point by another route, so it goes through the same
+    // gate - suppressing only the mid-frame trigger would leave it to flip the content type here.
     if (m_frameOptions.ngxPassthroughMode && !m_rtxInjectTriggered && callInjectRtx) {
+      // The frame data is handed over either way so the camera keeps advancing while the
+      // injection point settles: only the dispatch is suppressed, so the first frame that does
+      // dispatch already has a previous-frame camera to reproject motion vectors from rather
+      // than starting from a gap.
       emitNgxPassthroughFrameData();
+
+      if (allowNgxLateInjection(/* structurallyDecisive = */ false)) {
+        m_ngxInjectionResolvedThisFrame = true;
+      } else {
+        m_parent->EmitCs([](DxvkContext* ctx) {
+          static_cast<RtxContext*>(ctx)->suppressNgxPassthroughDispatch();
+        });
+      }
     }
 
     // HUD-less fallback: the injection ran (pre-post-process) but no UI-classified draw
@@ -15842,6 +15984,12 @@ namespace dxvk {
 
     DrawCallState::refreshCategoryLookupTable();
 
+    // Injection point stabilization. Runs before the resets below: it reads this frame's camera
+    // validity and scene-color sighting, both of which are cleared there.
+    if (m_frameOptions.ngxPassthroughMode) {
+      updateNgxInjectionPoint();
+    }
+
     // Reset for the next frame
     m_rtxInjectTriggered = false;
     m_drawCallID = 0;
@@ -15874,7 +16022,12 @@ namespace dxvk {
     m_ngxFrameCameraValid = false;
     m_ngxFrameCameraMatricesValid = false;
     // m_ngxLastCameraSource is deliberately not reset: it is the sticky "what worked last"
-    // used to log provider transitions, while this is the per-frame value
+    // used to log provider transitions, while this is the per-frame value.
+    // Snapshot it first: the reporting block further down describes the frame that just ended,
+    // but it runs after this reset - so reading the member there reported "none" for every frame
+    // that examined any draw, however well the camera actually resolved, and made the success
+    // branch unreachable. That warning is a primary debugging signal; it must not lie.
+    const NgxCameraSource frameCameraSource = m_ngxFrameCameraSource;
     m_ngxFrameCameraSource = NgxCameraSource::None;
     m_ngxVelocityStats = NgxVelocityCaptureStats();
     m_ngxVelocitySkinnedDraws = 0;
@@ -15988,7 +16141,7 @@ namespace dxvk {
       m_ngxCameraDumpSeenShaders.clear();
     }
 
-    if (m_ngxFrameCameraSource == NgxCameraSource::None && m_ngxCameraResolveStats.drawsExamined > 0) {
+    if (frameCameraSource == NgxCameraSource::None && m_ngxCameraResolveStats.drawsExamined > 0) {
       const bool firstFailure = !m_ngxCameraFailureLogged;
       if (firstFailure || m_ue3FrameCounter >= m_ngxCameraFailureLogNextFrame) {
         const NgxCameraResolveStats& s = m_ngxCameraResolveStats;
@@ -16048,18 +16201,18 @@ namespace dxvk {
         m_ngxCameraFailureLogged = true;
         m_ngxCameraFailureLogNextFrame = m_ue3FrameCounter + 600;
       }
-    } else if (m_ngxFrameCameraSource != NgxCameraSource::None) {
+    } else if (frameCameraSource != NgxCameraSource::None) {
       m_ngxCameraFailureLogged = false;
 
       // One line per change of provider, evaluated once per frame (see the note in
       // tryNgxPassthroughCameraCapture on why this cannot be logged per draw)
-      if (m_ngxFrameCameraSource != m_ngxLastCameraSource) {
+      if (frameCameraSource != m_ngxLastCameraSource) {
         Logger::info(str::format("[RTX NGX Passthrough] Camera source: ",
-                                 ngxCameraSourceLabel(m_ngxFrameCameraSource),
+                                 ngxCameraSourceLabel(frameCameraSource),
                                  (m_ngxLastCameraSource != NgxCameraSource::None
                                     ? str::format(" (was: ", ngxCameraSourceLabel(m_ngxLastCameraSource), ")")
                                     : std::string())));
-        m_ngxLastCameraSource = m_ngxFrameCameraSource;
+        m_ngxLastCameraSource = frameCameraSource;
       }
     }
 

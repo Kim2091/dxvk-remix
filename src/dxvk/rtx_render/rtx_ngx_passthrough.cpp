@@ -1338,6 +1338,11 @@ namespace dxvk {
     return true;
   }
 
+  // How long a color source may disagree with the DLSS feature's content type before the feature
+  // is rebuilt around it. Long enough to absorb a frame that reached the upscaler by the other
+  // injection route, short enough that a real change costs a fraction of a second of aliasing.
+  static constexpr uint32_t kNgxDlssContentMismatchFrames = 30;
+
   bool RtxNgxPassthrough::evaluateDlss(RtxContext* ctx,
                                        DxvkBarrierSet& barriers,
                                        const Rc<DxvkImage>& colorSourceImage,
@@ -1355,6 +1360,38 @@ namespace dxvk {
       return false;
     }
 
+    // HDR content flag follows the color source: the pre-post-process injection point feeds
+    // the game's linear scene color (float target), the late one display-encoded LDR output
+    const bool contentHDR = isHDRColorFormat(colorSourceImage->info().format);
+
+    // Content type hysteresis. NGX bakes HDR-vs-LDR into the feature, so a source of the other
+    // type cannot be consumed without recreating it, which discards the temporal history and
+    // reads as a flash. A brief mismatch means this frame reached the upscaler by a different
+    // route than the established one, so refuse it - the frame is presented as the game
+    // rasterized it - rather than rebuilding the feature around a transient. Only a mismatch
+    // that persists is the game genuinely changing what it hands us, and recreates as before.
+    // This is a safety net, not a diagnosis: it always says so in the log, because a source
+    // that keeps changing type is a bug upstream of here and should be found, not absorbed.
+    if (m_dlssContext != nullptr && !m_dlssNeedsInitialize && m_dlssInitializedHDR != contentHDR) {
+      m_dlssContentMismatchFrames++;
+
+      if (stableInjectionPoint() && m_dlssContentMismatchFrames <= kNgxDlssContentMismatchFrames) {
+        ONCE(Logger::warn(str::format(
+          "[RTX NGX Passthrough] Upscaler input changed content type (established ",
+          (m_dlssInitializedHDR ? "linear HDR" : "LDR"), ", this frame ",
+          (contentHDR ? "linear HDR" : "LDR"), ", ",
+          (m_lastDispatchPrePost ? "pre-post-process" : "late"), " injection). Presenting the frame "
+          "unresolved instead of recreating the DLSS feature; if this repeats, the injection point "
+          "is oscillating and that is the bug to fix.")));
+
+        m_statusReason = "input content type changed transiently; frame presented unresolved";
+        m_statContentMismatchCount++;
+        return false;
+      }
+    } else {
+      m_dlssContentMismatchFrames = 0;
+    }
+
     // Snapshot the scene color subrect as the DLSS input (the DLSS output may be written
     // back over the same target, so it cannot be read in place)
     snapshotColorInput(ctx, colorSourceImage, colorSourceOffset);
@@ -1363,10 +1400,6 @@ namespace dxvk {
       m_dlssContext = ngxContext.createDLSSContext();
       m_dlssNeedsInitialize = true;
     }
-
-    // HDR content flag follows the color source: the pre-post-process injection point feeds
-    // the game's linear scene color (float target), the late one display-encoded LDR output
-    const bool contentHDR = isHDRColorFormat(colorSourceImage->info().format);
 
     // Recreate the feature when the render preset option or the content type changes
     if (m_dlssInitializedRenderPreset != dlssRenderPreset() || m_dlssInitializedHDR != contentHDR) {
@@ -1377,6 +1410,7 @@ namespace dxvk {
       m_dlssNeedsInitialize = false;
       m_dlssInitializedRenderPreset = dlssRenderPreset();
       m_dlssInitializedHDR = contentHDR;
+      m_dlssContentMismatchFrames = 0;
 
       // The previous feature may still be in flight
       m_device->waitForIdle();
@@ -1405,7 +1439,10 @@ namespace dxvk {
                                " -> ", outputSize[0], "x", outputSize[1],
                                (perfQuality == NVSDK_NGX_PerfQuality_Value_DLAA ? " (DLAA)" : " (Super Resolution)"),
                                ", render preset ", renderPresetToString(renderPreset),
-                               (contentHDR ? ", linear HDR input" : ", LDR input")));
+                               (contentHDR ? ", linear HDR input" : ", LDR input"),
+                               // Which injection point fed this init: a run of these alternating
+                               // means the frame is reaching the upscaler by two different routes
+                               (m_lastDispatchPrePost ? " (pre-post-process injection)" : " (late injection)")));
     }
 
     // The DLSS indicator reads the exposure texture even with NGX auto exposure enabled, so
@@ -1961,6 +1998,15 @@ namespace dxvk {
   void RtxNgxPassthrough::showImguiSettings() {
     RemixGui::Checkbox("Sub-Pixel Camera Jitter", &enableJitterObject());
     RemixGui::Checkbox("Pre-Post-Process Injection (DLSS before the game's post chain)", &prePostProcessObject());
+    RemixGui::Checkbox("Stable Injection Point", &stableInjectionPointObject());
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip("Commits to one injection point per game rather than picking one per frame.\n"
+                        "The two points feed DLSS different content (linear HDR scene color vs the game's\n"
+                        "LDR output) and NGX bakes that into the feature, so alternating between them\n"
+                        "recreates it and discards the temporal history - the startup flicker. Frames are\n"
+                        "presented unresolved until a point is established. Watch DLSS initializations below:\n"
+                        "it should stay at 1.");
+    }
 
     {
       // Engine-specific compatibility fixes, picked as a group (see EngineProfile). Each engine
@@ -2003,6 +2049,18 @@ namespace dxvk {
     const uint32_t currentFrameId = m_device->getCurrentFrameId();
     ImGui::TextWrapped(str::format("Last dispatch: frame ", m_lastDispatchFrameId, " (current ", currentFrameId,
                                    "), DLSS initializations: ", m_dlssInitCount).c_str());
+
+    // Which injection point the game settled on. "settling" means frames are deliberately being
+    // presented unresolved; if it never leaves that state the game has neither a pre-post-process
+    // pass sampling the scene color nor a late trigger (usually no camera - check the status line)
+    if (stableInjectionPoint()) {
+      const InjectionPoint injectionPoint = injectionPointStatus();
+      ImGui::TextWrapped(str::format("Injection point: ",
+                                     injectionPoint == InjectionPoint::PrePost ? "pre-post-process (linear HDR scene color)" :
+                                     injectionPoint == InjectionPoint::Late ? "late (post-processed LDR output)" :
+                                     "settling - frames presented unresolved",
+                                     " | content type mismatches refused: ", m_statContentMismatchCount).c_str());
+    }
     ImGui::TextWrapped(str::format("Jitter: ", m_lastJitter[0], ", ", m_lastJitter[1],
                                    " | Dynamic object draws: ", m_lastVelocityDrawCount).c_str());
 

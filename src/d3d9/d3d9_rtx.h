@@ -3,6 +3,7 @@
 #include "d3d9_state.h"
 #include "d3d9_vs_clip_transform.h"
 #include "../dxvk/dxvk_buffer.h"
+#include "../dxvk/rtx_render/rtx_ngx_passthrough.h"
 #include "../util/util_threadpool.h"
 
 #include <array>
@@ -458,6 +459,15 @@ namespace dxvk {
         }
       }
       return 1u << 20;
+    }
+
+    /**
+      * \brief: Record the sub-pixel jitter that was actually bound into the viewport, so the
+      * per-draw scope check can tell when the bound value no longer matches this draw's.
+      */
+    void NoteAppliedViewportJitter(float jitterX, float jitterY) {
+      m_ngxAppliedViewportJitter[0] = jitterX;
+      m_ngxAppliedViewportJitter[1] = jitterY;
     }
 
     /**
@@ -1074,6 +1084,13 @@ namespace dxvk {
     // (see GetNgxPassthroughSamplerLodBias); samplers are only re-created when dirtied,
     // so every change forces a full sampler re-bind
     float m_ngxAppliedSamplerLodBias = 0.0f;
+
+    // The sub-pixel jitter actually bound into the Vulkan viewport by the last
+    // BindViewportAndScissor. GetNgxPassthroughViewportJitter is a per-DRAW predicate (it reads
+    // this draw's render target and depth-stencil), but the device only samples it when the D3D9
+    // viewport/scissor RECTANGLE changes - switching between render targets of equal size leaves
+    // that rectangle identical - so the applied value has to be tracked and compared explicitly.
+    float m_ngxAppliedViewportJitter[2] = { 0.0f, 0.0f };
 
     // Isolated renderer shadow (GSystemSettings untouched). Bridge path owns the parent handle.
     bool m_ngxScreenPercentageScanDone = false;
@@ -1721,6 +1738,33 @@ namespace dxvk {
     Rc<DxvkImage> m_ngxColorTargetImage;
     Rc<DxvkImage> m_ngxColorMirrorImage;
 
+    // Injection point stabilization (rtx.ngxPassthrough.stableInjectionPoint). The two
+    // injection points hand the upscaler different content - the pre-post-process point the
+    // game's linear HDR scene color, the late point its display-encoded LDR output - and NGX
+    // bakes that choice into the DLSS feature, so every switch recreates it and discards the
+    // temporal history (a visible flash). While a game starts up its scene targets are still
+    // settling and the late point, being a fallback for "the pre-post point did not fire",
+    // picks up exactly the frames the pre-post point missed, so the two alternate. Rather than
+    // dispatch against whichever source appeared, decide once which point this game uses and
+    // present the frames in between unresolved.
+    RtxNgxPassthrough::InjectionPoint m_ngxInjectionPoint = RtxNgxPassthrough::InjectionPoint::Undecided;
+    // Frames that actually rendered a scene (so the pre-post point had a real chance to fire)
+    // spent undecided, and consecutive scene frames an established pre-post point has missed
+    uint32_t m_ngxInjectionUndecidedFrames = 0;
+    uint32_t m_ngxPrePostDropoutFrames = 0;
+    bool m_ngxPrePostEngagedThisFrame = false;
+    // Whether the previous frame ended up resolved, used to predict this frame before the
+    // injection point is known: jitter is only worth rasterizing into a frame something will
+    // resolve, otherwise it is a sub-pixel wobble nothing removes
+    bool m_ngxInjectionResolvedThisFrame = false;
+    bool m_ngxInjectionResolvedLastFrame = false;
+
+    // Whether the late injection point (and the endFrame fallback, which is the same point) may
+    // run this frame; `structurallyDecisive` marks a caller that positively identified the
+    // game's injection point rather than falling back to it
+    bool allowNgxLateInjection(bool structurallyDecisive);
+    void updateNgxInjectionPoint();
+
     // Same-size StretchRect destinations copied from the scene color surface this frame
     // (UE3 D3D9 scene color resolves); sampled by the post chain in place of the surface
     std::array<Rc<DxvkImage>, 4> m_ngxSceneColorResolves;
@@ -1829,6 +1873,7 @@ namespace dxvk {
       bool ngxPassthroughMode = false;
       bool ngxPassthroughJitter = false;
       bool ngxPrePostProcess = false;
+      bool ngxStableInjectionPoint = false;
       bool ngxDlfgHudless = false;
       bool ngxObjectVelocities = false;
       bool ngxObjectVelocitiesGeneric = false;

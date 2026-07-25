@@ -21,6 +21,7 @@
 */
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <vector>
 
@@ -248,6 +249,23 @@ namespace dxvk {
       m_lastCaptureStats = stats;
     }
 
+    // Which injection point this game was found to use. The state machine itself lives in the
+    // D3D9 layer (see D3D9Rtx::allowNgxLateInjection); this is the display copy, written on the
+    // app thread only when the state changes and read by the developer menu on the CS thread.
+    enum class InjectionPoint : uint32_t {
+      Undecided = 0,  // still settling: frames are presented unresolved rather than dispatched
+      PrePost = 1,    // DLSS runs on the game's linear scene color, before its post chain
+      Late = 2,       // DLSS runs on the game's post-processed LDR output
+    };
+
+    void setInjectionPoint(InjectionPoint point) {
+      m_injectionPoint.store(point, std::memory_order_relaxed);
+    }
+
+    InjectionPoint injectionPointStatus() const {
+      return m_injectionPoint.load(std::memory_order_relaxed);
+    }
+
     // Single status line (upscaler state + resolutions), shared between the developer panel and
     // the user menu (the stock DLSS object's state is meaningless while this mode is active)
     void showImguiStatusLine(bool includeInjectionPoint = true);
@@ -324,6 +342,17 @@ namespace dxvk {
                "input mode when the scene color is a floating point target and DLSS is selected. The injection triggers on the\n"
                "first post-process pass sampling the identified scene color; frames where that never happens (e.g. the game's post\n"
                "chain is disabled) fall back to the late injection point automatically.");
+    RTX_OPTION("rtx.ngxPassthrough", bool, stableInjectionPoint, true,
+               "Commits to one injection point per game instead of picking one per frame. The two points feed the upscaler\n"
+               "different content - the pre-post-process point the game's linear HDR scene color, the late point its\n"
+               "display-encoded LDR output - and NGX bakes that choice into the DLSS feature, so every switch recreates the\n"
+               "feature and throws away the temporal history, which reads as a flash. While a game is starting up its scene\n"
+               "targets are still settling and the two points can alternate frame to frame; until one has been established\n"
+               "the frame is presented as the game rasterized it (upscaler and jitter both idle) rather than dispatching\n"
+               "against whichever source happened to appear. Once the pre-post-process point has engaged, occasional frames\n"
+               "that miss it are treated as dropouts and presented unresolved rather than switching back. Disable to restore\n"
+               "the per-frame fallback behaviour (rtx.ngxPassthrough.dlssInitializations in the developer menu counts the\n"
+               "resulting feature recreations - it should stay at 1).");
     RTX_OPTION("rtx.ngxPassthrough", bool, objectVelocities, true,
                "Rasterizes true motion vectors for dynamic objects into the synthesized motion vector inputs, replacing the\n"
                "static-world camera reprojection where they land. Covers rigid movers (doors, elevators - draws whose transform\n"
@@ -518,6 +547,9 @@ namespace dxvk {
     bool m_postFxActive = false;
     int m_dlssInitializedRenderPreset = -1;
     bool m_dlssInitializedHDR = false;
+    // Consecutive frames whose color source disagreed with the content type the DLSS feature was
+    // built for. Bounded so a genuine, lasting change still takes effect (see evaluateDlss).
+    uint32_t m_dlssContentMismatchFrames = 0;
 
     // Status/diagnostics for the developer menu (written on the CS thread, read for display)
     const char* m_statusReason = "not dispatched yet";
@@ -525,6 +557,7 @@ namespace dxvk {
     uint32_t m_dlssInitCount = 0;
     float m_lastJitter[2] = { 0.0f, 0.0f };
     bool m_lastDispatchPrePost = false;
+    std::atomic<InjectionPoint> m_injectionPoint = { InjectionPoint::Undecided };
 
     // Rolling counters for the periodic diagnostic summary log
     uint32_t m_statDispatchCount = 0;
@@ -532,6 +565,7 @@ namespace dxvk {
     uint32_t m_statCameraInvalidCount = 0;
     uint32_t m_statUpscalerOffCount = 0;
     uint32_t m_statNoInputsCount = 0;
+    uint32_t m_statContentMismatchCount = 0;
     uint32_t m_statEvaluateFailedCount = 0;
     uint32_t m_statDebugVisCount = 0;
     uint32_t m_statResetHistoryCount = 0;
