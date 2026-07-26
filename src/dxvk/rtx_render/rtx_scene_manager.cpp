@@ -1713,7 +1713,8 @@ namespace dxvk {
         subsurfaceMaterialIndex, isUsingRaytracedRenderTarget,
         samplerFeedbackStamp,
         secondaryTextureIndex,
-        albedoTextureIsSrgb, emissiveTextureIsSrgb
+        albedoTextureIsSrgb, emissiveTextureIsSrgb,
+        opaqueMaterialData.getSkyLitParticle()
       };
 
       accumulateOpaqueMaterialAggregates(opaqueSurfaceMaterial);
