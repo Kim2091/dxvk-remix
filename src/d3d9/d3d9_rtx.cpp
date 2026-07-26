@@ -16122,11 +16122,34 @@ namespace dxvk {
     // have no scene geometry and would otherwise consume it all reporting nothing.
     if (m_ngxGenericVelocityDumpFramesLeft > 0 && m_ngxGenericVelocityDrawSeenThisFrame) {
       m_ngxGenericVelocityDumpFramesLeft--;
+
+      // Where the camera actually is, both frames, derived from the accepted matrices. The static
+      // test assumes a static object's object->clip changes ONLY by the camera's ViewProjection
+      // delta. That is false if the engine renders camera-relative - the camera's translation then
+      // lives in each object's world matrix instead of in the ViewProjection, so a VP-only delta
+      // cannot predict it and every static object reads as having moved by the camera's own
+      // movement. These two lines separate that from a delta that simply drops the translation:
+      // an eye that stays put while the player walks means camera-relative.
+      std::string eyeReport = "eye: unavailable";
+      if (m_ngxFrameCameraMatricesValid && m_ngxPrevFrameWorldToProjectionValid) {
+        Vector3 eyeNow(0.0f);
+        Vector3 eyePrev(0.0f);
+        const bool haveNow =
+          tryDeriveEyeFromInverseWorldToProjection(inverse(m_ngxFrameWorldToProjection), eyeNow);
+        const bool havePrev =
+          tryDeriveEyeFromInverseWorldToProjection(inverse(m_ngxPrevFrameWorldToProjection), eyePrev);
+        if (haveNow && havePrev) {
+          eyeReport = str::format("eye=(", eyeNow.x, ", ", eyeNow.y, ", ", eyeNow.z,
+                                  ") moved=", length(eyeNow - eyePrev));
+        }
+      }
+
       Logger::info(str::format("[RTX NGX Passthrough][gvdump] ---- end of frame ", m_ue3FrameCounter,
                                ": ", m_ngxGenericVelocityDumpLinesThisFrame, " movers emitted, ",
                                m_ngxVelocityStats.skippedForeignView, " declined foreign-view, ",
                                m_ngxVelocityStats.exactMatches, " held static, ",
-                               m_ngxVelocityGenericProbeEvals, " draws probed ----"));
+                               m_ngxVelocityGenericProbeEvals, " draws probed | ",
+                               eyeReport, " ----"));
     }
     m_ngxGenericVelocityDumpLinesThisFrame = 0;
     m_ngxGenericVelocityDrawSeenThisFrame = false;
