@@ -4961,6 +4961,15 @@ namespace dxvk {
       Logger::info(str::format("[RTX NGX Passthrough][dump] On-demand dump armed for ", m_ngxPostChainDumpFramesLeft, " frames."));
     }
 
+    // On-demand generic velocity emit dump (same one-shot shape)
+    if (o.ngxPassthroughMode && RtxNgxPassthrough::dumpGenericVelocityFrames() > 0 &&
+        m_ngxGenericVelocityDumpFramesLeft == 0) {
+      m_ngxGenericVelocityDumpFramesLeft = uint32_t(RtxNgxPassthrough::dumpGenericVelocityFrames());
+      RtxNgxPassthrough::dumpGenericVelocityFramesObject().setDeferred(0);
+      Logger::info(str::format("[RTX NGX Passthrough][gvdump] Generic velocity dump armed for ",
+                               m_ngxGenericVelocityDumpFramesLeft, " frames."));
+    }
+
     // One-shot manual trigger: reports the next frame whatever it contains, bypassing the
     // frame-selection heuristics entirely (the user pressing the button has already chosen
     // the moment far more reliably than a draw-count threshold can)
@@ -12286,6 +12295,13 @@ namespace dxvk {
     // useGenericRigid; no ill-conditioned camera inverse ever touches the motion path.
     Matrix4 genericObjectToClip;
 
+    // Foreign-view gate outcome, carried to the emit-time diagnostic dump: whether the shader
+    // declared a ViewProjection at all (if not, the gate could not run on this draw and its
+    // ratio stays negative), and how far that matrix was from the frame camera relative to its
+    // own magnitude.
+    bool genericHadViewProjection = false;
+    float genericViewRatio = -1.0f;
+
     if (!useGenericRigid) {
       // The full camera verification (ViewProjection + CameraPosition) guards camera
       // steering; the velocity capture itself only needs the per-draw ViewProjection and
@@ -12348,8 +12364,9 @@ namespace dxvk {
       // probe consensus, so there is no per-draw matrix to compare); for those the structural
       // fallback - reconstruct the draw's implied frustum and compare fov/near/far, which survive
       // a rigid object transform while eye/forward do not - is still to be built.
-      if (ctabRegs.hasViewProjection &&
-          ctabRegs.viewProjRegister + 3 < caps::MaxFloatConstantsSoftware) {
+      genericHadViewProjection = ctabRegs.hasViewProjection &&
+                                 ctabRegs.viewProjRegister + 3 < caps::MaxFloatConstantsSoftware;
+      if (genericHadViewProjection) {
         Matrix4 drawViewProjection;
         for (uint32_t row = 0; row < 4; row++) {
           drawViewProjection[row] = d3d9State().vsConsts.fConsts[ctabRegs.viewProjRegister + row];
@@ -12370,7 +12387,8 @@ namespace dxvk {
         }
 
         constexpr float kGenericViewMatchRelTol = 1e-3f;
-        if (residual > kGenericViewMatchRelTol * std::max(magnitude, 1e-3f)) {
+        genericViewRatio = residual / std::max(magnitude, 1e-3f);
+        if (genericViewRatio > kGenericViewMatchRelTol) {
           m_ngxVelocityStats.skippedForeignView++;
           m_ngxFactsForeignViewSeen = true;
           return;
@@ -12706,7 +12724,25 @@ namespace dxvk {
         }
 
         constexpr float kGenericStaticRelTol = 1e-3f;
-        if (residual > kGenericStaticRelTol * std::max(magnitude, 1e-3f)) {
+        const float staticRatio = residual / std::max(magnitude, 1e-3f);
+        if (staticRatio > kGenericStaticRelTol) {
+          // Diagnostic: this draw is about to be treated as a mover. Report every input that
+          // decided it, so "why is this static object green" is answered from data rather than
+          // by elimination. The interesting columns are vp= (absent means the foreign-view gate
+          // never ran on this shader), static= against its tolerance, and placements/pairDist
+          // (several placements plus a large pairing distance is a mispairing, not motion).
+          if (m_ngxGenericVelocityDumpFramesLeft > 0 &&
+              m_ngxGenericVelocityDumpLinesThisFrame < kNgxGenericVelocityDumpMaxLines) {
+            m_ngxGenericVelocityDumpLinesThisFrame++;
+            Logger::info(str::format(
+              "[RTX NGX Passthrough][gvdump] vs=0x", std::hex, shaderHash, std::dec,
+              " prims=", drawContext.PrimitiveCount, " startIdx=", drawContext.StartIndex,
+              " vp=", genericHadViewProjection ? str::format(genericViewRatio) : std::string("none"),
+              " static=", staticRatio, " (tol ", kGenericStaticRelTol, ", ",
+              staticRatio / kGenericStaticRelTol, "x)",
+              " placements=", objectState.instances.size(),
+              " pairDist=", matchedDistance));
+          }
           appendVelocityDraw(Matrix4(), Matrix4(), Matrix4(),
                              std::vector<Vector4>(), std::vector<Vector3>(),
                              &genericObjectToClip, &matched->objectToClip);
@@ -16105,6 +16141,14 @@ namespace dxvk {
       m_ngxSceneColorResolves[i] = nullptr;
     }
     m_ngxSceneColorResolveCount = 0;
+    if (m_ngxGenericVelocityDumpFramesLeft > 0) {
+      m_ngxGenericVelocityDumpFramesLeft--;
+      Logger::info(str::format("[RTX NGX Passthrough][gvdump] ---- end of frame ", m_ue3FrameCounter,
+                               ": ", m_ngxGenericVelocityDumpLinesThisFrame, " movers emitted, ",
+                               m_ngxVelocityStats.skippedForeignView, " declined foreign-view ----"));
+    }
+    m_ngxGenericVelocityDumpLinesThisFrame = 0;
+
     if (m_ngxPostChainDumpFramesLeft > 0) {
       m_ngxPostChainDumpFramesLeft--;
       Logger::info(str::format("[RTX NGX Passthrough][dump] ---- end of frame ", m_ue3FrameCounter, " ----"));

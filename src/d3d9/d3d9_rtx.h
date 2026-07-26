@@ -1198,6 +1198,14 @@ namespace dxvk {
     // but whether the game does it AT ALL is a property of the game and belongs in the log:
     // it says the engine renders scene geometry through more than one view.
     bool m_ngxFactsForeignViewSeen = false;
+
+    // Diagnostic dump of the generic velocity route's emit decisions
+    // (rtx.ngxPassthrough.dumpGenericVelocityFrames). Reports, per draw treated as a mover, the
+    // inputs that decided it: whether the foreign-view gate could run at all, the static-test
+    // residual against the tolerance, and the identity's placement count plus pairing distance.
+    uint32_t m_ngxGenericVelocityDumpFramesLeft = 0;
+    uint32_t m_ngxGenericVelocityDumpLinesThisFrame = 0;
+    static constexpr uint32_t kNgxGenericVelocityDumpMaxLines = 64;
     // Flush cadence. The file is rewritten whole, so this only bounds how stale it can be after
     // a crash or an alt-F4, which is how these sessions usually end.
     uint32_t m_ngxFactsNextFlushFrame = 0;

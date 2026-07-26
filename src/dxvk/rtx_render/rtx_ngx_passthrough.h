@@ -455,6 +455,16 @@ namespace dxvk {
                "copies, render state) of the next N frames is written to the log, then the value resets to 0 automatically.\n"
                "The developer menu has a button for this. Used to validate the pre-post-process injection point against the\n"
                "game's real compositing chain.");
+    RTX_OPTION("rtx.ngxPassthrough", int, dumpGenericVelocityFrames, 0,
+               "Diagnostic: when set to a value N > 0, every draw the generic (name-independent) rigid velocity route\n"
+               "EMITS AS A MOVER over the next N frames is written to the log with the inputs that decided it, then the\n"
+               "value resets to 0 automatically. Answers 'why is this static object being treated as moving' with data\n"
+               "instead of a theory: each line reports whether the shader declared a ViewProjection at all (if not, the\n"
+               "foreign-view gate could not run on it), how far that ViewProjection was from the frame camera, how far\n"
+               "the draw's clip transform was from the camera-only prediction relative to the tolerance that decided it,\n"
+               "and how many tracked placements share the draw's identity together with the distance to the one it paired\n"
+               "with - a large distance with several placements is a mispairing rather than real motion. Requires\n"
+               "rtx.ngxPassthrough.objectVelocitiesGeneric.");
 
   private:
     void createResources(Rc<DxvkContext> ctx, const VkExtent2D& renderExtent, const VkExtent2D& displayExtent);
