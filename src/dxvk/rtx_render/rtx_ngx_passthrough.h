@@ -131,6 +131,13 @@ namespace dxvk {
     uint32_t newRegistrations = 0;
     uint32_t skippedNoCamera = 0;
     uint32_t skippedBudget = 0;
+    // Generic (probe) route only: draws declined because the ViewProjection they were rendered
+    // with is not the frame's accepted main camera - reflections, portal/mirror captures, and
+    // sub-views with their own FOV. The generic static test predicts a draw's motion with a
+    // camera delta built from the main view, which says nothing about a draw rendered under a
+    // different view, so a static object drawn that way reads as a mover. A steadily nonzero
+    // count means the game really does render scene geometry through more than one view.
+    uint32_t skippedForeignView = 0;
     // Scene draws with the CPU-modified-mesh buffer shape (dedicated dynamic VB, static
     // IB) rejected by the depth-test-enable gate: nonzero means such meshes render with
     // z-test disabled in some game state and are invisible to the capture

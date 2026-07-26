@@ -12332,6 +12332,51 @@ namespace dxvk {
     } else {
       drawWorldToProjection = m_ngxFrameWorldToProjection;
 
+      // View-consistency gate. The generic route decides "did this object move" by predicting its
+      // clip transform with a camera delta built from the frame's ACCEPTED MAIN camera (see the
+      // generic block below). That prediction is meaningless for a draw rendered through a
+      // different view - a reflection, a portal or mirror capture, a sub-view with its own FOV -
+      // because the delta describes the main view's motion and nothing else. A perfectly static
+      // object drawn that way fails the static test and is emitted as a false mover; that is what
+      // put NPC faces and one static building into the coverage view on Fallout New Vegas, and
+      // diagnosing it as a skinning problem cost a round of work (the faces were a coincidence -
+      // a static building has no bones).
+      //
+      // When the shader declares its own ViewProjection, the test is exact: compare the matrix the
+      // draw is actually using against the frame camera and decline on mismatch. Shaders that
+      // declare no ViewProjection are NOT covered here (the camera came from the clip-transform
+      // probe consensus, so there is no per-draw matrix to compare); for those the structural
+      // fallback - reconstruct the draw's implied frustum and compare fov/near/far, which survive
+      // a rigid object transform while eye/forward do not - is still to be built.
+      if (ctabRegs.hasViewProjection &&
+          ctabRegs.viewProjRegister + 3 < caps::MaxFloatConstantsSoftware) {
+        Matrix4 drawViewProjection;
+        for (uint32_t row = 0; row < 4; row++) {
+          drawViewProjection[row] = d3d9State().vsConsts.fConsts[ctabRegs.viewProjRegister + row];
+        }
+        if (m_ngxFrameCameraUsedTranspose) {
+          drawViewProjection = transpose(drawViewProjection);
+        }
+
+        // Relative compare, matching the static test's tolerance style: these matrices carry
+        // world-scale magnitudes, so an absolute epsilon would be meaningless across games.
+        float residual = 0.0f;
+        float magnitude = 0.0f;
+        for (uint32_t row = 0; row < 4; row++) {
+          const Vector4 delta = drawViewProjection[row] - m_ngxFrameWorldToProjection[row];
+          const Vector4 cur = m_ngxFrameWorldToProjection[row];
+          residual += std::abs(delta.x) + std::abs(delta.y) + std::abs(delta.z) + std::abs(delta.w);
+          magnitude += std::abs(cur.x) + std::abs(cur.y) + std::abs(cur.z) + std::abs(cur.w);
+        }
+
+        constexpr float kGenericViewMatchRelTol = 1e-3f;
+        if (residual > kGenericViewMatchRelTol * std::max(magnitude, 1e-3f)) {
+          m_ngxVelocityStats.skippedForeignView++;
+          m_ngxFactsForeignViewSeen = true;
+          return;
+        }
+      }
+
       constexpr uint32_t kNgxVelocityMaxGenericProbeEvals = 4096;
       if (m_ngxVelocityGenericProbeEvals >= kNgxVelocityMaxGenericProbeEvals) {
         m_ngxVelocityStats.skippedBudget++;
@@ -16352,6 +16397,13 @@ namespace dxvk {
                      : m_frameOptions.ngxObjectVelocitiesGeneric ? "generic"
                                                                 : "none",
                      frame);
+
+      // Only meaningful while the generic route is actually running; on the named route no draw
+      // is ever tested, so a "no" would say nothing about the game.
+      if (!m_ngxVelocityNamedRigidSeen && m_frameOptions.ngxObjectVelocities &&
+          m_frameOptions.ngxObjectVelocitiesGeneric) {
+        m_ngxFacts.setBool("velocity.foreignViewSeen", m_ngxFactsForeignViewSeen, frame);
+      }
     }
 
     // --- Resolution / MSAA driving (the in-memory game settings tier) -------------------------

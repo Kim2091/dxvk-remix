@@ -1193,6 +1193,11 @@ namespace dxvk {
     // startup are not recorded from the boot sequence (UINT32_MAX = not yet)
     uint32_t m_ngxFactsCameraEstablishedFrame = UINT32_MAX;
     static constexpr uint32_t kNgxFactsSettleFrames = 120;
+    // Latched when the generic velocity route has ever declined a draw for being rendered
+    // through a view other than the frame camera. A per-frame count would not be diff-stable,
+    // but whether the game does it AT ALL is a property of the game and belongs in the log:
+    // it says the engine renders scene geometry through more than one view.
+    bool m_ngxFactsForeignViewSeen = false;
     // Flush cadence. The file is rewritten whole, so this only bounds how stale it can be after
     // a crash or an alt-F4, which is how these sessions usually end.
     uint32_t m_ngxFactsNextFlushFrame = 0;

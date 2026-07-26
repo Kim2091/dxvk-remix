@@ -2075,6 +2075,7 @@ namespace dxvk {
                                    m_lastCaptureStats.newRegistrations, " new, ",
                                    m_lastCaptureStats.skippedNoCamera, " no-camera, ",
                                    m_lastCaptureStats.skippedBudget, " budget, ",
+                                   m_lastCaptureStats.skippedForeignView, " foreign-view, ",
                                    m_lastCaptureStats.skippedZDisabled, " z-off | frame camera: ",
                                    m_lastCaptureStats.frameCameraValid ? "valid" : "missing",
                                    " | depth clears: ", m_lastCaptureStats.depthClears,
