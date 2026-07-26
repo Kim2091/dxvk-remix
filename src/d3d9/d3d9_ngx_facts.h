@@ -67,6 +67,15 @@ namespace dxvk {
     void setBool(const char* key, bool value, uint32_t frameId);
 
     /**
+      * \brief Drop a fact that has been superseded rather than changed.
+      *
+      * For facts that only describe a transient condition: a startup diagnostic that a later
+      * success makes meaningless keeps reporting a scary value forever otherwise, which is worse
+      * than saying nothing. No-op when the key was never set.
+      */
+    void remove(const char* key, uint32_t frameId);
+
+    /**
       * \brief Write (overwrite) the summary file in the Remix log directory.
       *
       * Overwrite-in-place rather than append-on-exit so the file is always current even when

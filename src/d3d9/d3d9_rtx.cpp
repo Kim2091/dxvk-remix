@@ -16242,10 +16242,31 @@ namespace dxvk {
     const uint32_t frame = m_ue3FrameCounter;
 
     // --- Camera acquisition -------------------------------------------------------------
-    // The sticky source rather than this frame's: games legitimately alternate providers draw
-    // to draw (FNV publishes a camera position from some shader families and not others), and
-    // the fact worth recording is which provider carries this game, not which won a given frame.
-    m_ngxFacts.set("camera.source", ngxCameraSourceLabel(m_ngxLastCameraSource), frame);
+    // Accumulate the providers this game uses rather than reporting the latest winner. Games
+    // that alternate would otherwise report whichever provider happened to be live at the last
+    // write, which varies run to run with where the player stood - see m_ngxCameraSourcesSeen.
+    if (m_ngxLastCameraSource != NgxCameraSource::None) {
+      m_ngxCameraSourcesSeen |= 1u << uint32_t(m_ngxLastCameraSource);
+      if (m_ngxFactsCameraEstablishedFrame == UINT32_MAX) {
+        m_ngxFactsCameraEstablishedFrame = frame;
+      }
+    }
+
+    if (m_ngxCameraSourcesSeen == 0) {
+      m_ngxFacts.set("camera.source", ngxCameraSourceLabel(NgxCameraSource::None), frame);
+    } else {
+      std::string sources;
+      for (uint32_t bit = 0; bit < 32; bit++) {
+        if ((m_ngxCameraSourcesSeen & (1u << bit)) == 0) {
+          continue;
+        }
+        if (!sources.empty()) {
+          sources += " + ";
+        }
+        sources += ngxCameraSourceLabel(NgxCameraSource(bit));
+      }
+      m_ngxFacts.set("camera.source", sources, frame);
+    }
 
     m_ngxFacts.set("camera.detSign",
                    m_ngxCameraDetSign == 0 ? "unestablished"
@@ -16255,7 +16276,12 @@ namespace dxvk {
     // Which gate a camera-less game died at. Recorded only while there is no camera at all:
     // once a provider carries the game the per-frame declines are just the mirrored reflection
     // and portal draws being correctly refused, and logging those would make the file churn.
-    if (m_ngxLastCameraSource == NgxCameraSource::None && m_ngxCameraResolveStats.drawsExamined > 0) {
+    if (m_ngxCameraSourcesSeen != 0) {
+      // A provider has carried this game, so the startup diagnostic no longer describes
+      // anything. Left in place it would keep reporting "constant tables stripped" next to a
+      // working camera for the rest of the session.
+      m_ngxFacts.remove("camera.blockedAt", frame);
+    } else if (m_ngxCameraResolveStats.drawsExamined > 0) {
       const NgxCameraResolveStats& s = m_ngxCameraResolveStats;
       const char* blockedAt =
         s.drawsWithCtabPresent == 0        ? "shader constant tables stripped"
@@ -16315,12 +16341,18 @@ namespace dxvk {
     // Which route this game's rigid movers take. "named" is the UE3-shaped path (a LocalToWorld
     // constant the shader declares by name); "generic" is the clip-transform probe standing in
     // for it; "none" means movers reproject from the camera alone and therefore ghost.
-    m_ngxFacts.set("velocity.route",
-                   !m_frameOptions.ngxObjectVelocities        ? "disabled"
-                   : m_ngxVelocityNamedRigidSeen              ? "named"
-                   : m_frameOptions.ngxObjectVelocitiesGeneric ? "generic"
-                                                              : "none",
-                   frame);
+    // Held back until the camera has been up a while: the named-rigid latch is only set the
+    // first time a draw declares a LocalToWorld, so recording this from the boot sequence reports
+    // "generic" for the frame or two before a UE3-shaped game has drawn one.
+    if (m_ngxFactsCameraEstablishedFrame != UINT32_MAX &&
+        frame >= m_ngxFactsCameraEstablishedFrame + kNgxFactsSettleFrames) {
+      m_ngxFacts.set("velocity.route",
+                     !m_frameOptions.ngxObjectVelocities        ? "disabled"
+                     : m_ngxVelocityNamedRigidSeen              ? "named"
+                     : m_frameOptions.ngxObjectVelocitiesGeneric ? "generic"
+                                                                : "none",
+                     frame);
+    }
 
     // --- Resolution / MSAA driving (the in-memory game settings tier) -------------------------
     m_ngxFacts.setBool("settings.screenPercentageDriven", m_ngxScreenPercentageDriven, frame);

@@ -89,6 +89,24 @@ namespace dxvk {
     m_dirty = true;
   }
 
+  void NgxFactLog::remove(const char* key, uint32_t frameId) {
+    auto it = m_facts.find(key);
+    if (it == m_facts.end()) {
+      return;
+    }
+
+    // Recorded as a transition so the chronology still shows the condition existed and when it
+    // stopped applying - dropping it silently would hide a real startup phase
+    if (m_transitions.size() < kMaxTransitions) {
+      m_transitions.push_back(Transition { key, it->second.value, "(no longer applies)", frameId });
+    } else {
+      ++m_transitionsDropped;
+    }
+
+    m_facts.erase(it);
+    m_dirty = true;
+  }
+
   void NgxFactLog::setInt(const char* key, int64_t value, uint32_t frameId) {
     set(key, std::to_string(value), frameId);
   }

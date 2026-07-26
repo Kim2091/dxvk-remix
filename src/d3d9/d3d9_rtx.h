@@ -1182,6 +1182,17 @@ namespace dxvk {
     // be re-tested. Diffing this file between two runs turns that into a check.
     NgxFactLog m_ngxFacts;
     void recordNgxFacts();
+    // Every camera provider that has carried a frame this run, as a bit per NgxCameraSource.
+    // Recorded as a SET rather than as the latest winner because some games legitimately
+    // alternate providers frame to frame (Fallout New Vegas publishes a camera position from
+    // some shader families and not others, and flipped 14 times in one session), which would
+    // otherwise make the reported value depend on where the player happened to be standing at
+    // the last write - noise in exactly the field the log exists to make comparable.
+    uint32_t m_ngxCameraSourcesSeen = 0;
+    // Frame the camera first came up, so facts that are meaningless or still latching during
+    // startup are not recorded from the boot sequence (UINT32_MAX = not yet)
+    uint32_t m_ngxFactsCameraEstablishedFrame = UINT32_MAX;
+    static constexpr uint32_t kNgxFactsSettleFrames = 120;
     // Flush cadence. The file is rewritten whole, so this only bounds how stale it can be after
     // a crash or an alt-F4, which is how these sessions usually end.
     uint32_t m_ngxFactsNextFlushFrame = 0;
