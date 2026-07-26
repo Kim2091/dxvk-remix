@@ -1206,6 +1206,11 @@ namespace dxvk {
     uint32_t m_ngxGenericVelocityDumpFramesLeft = 0;
     uint32_t m_ngxGenericVelocityDumpLinesThisFrame = 0;
     static constexpr uint32_t kNgxGenericVelocityDumpMaxLines = 64;
+    // Whether the generic route evaluated any draw this frame. The dump only spends a frame that
+    // had some: armed from the menu or the config it would otherwise burn its whole budget on the
+    // startup and loading frames, which have no scene geometry, and report nothing at all. The
+    // camera candidate dump had exactly this bug and this is the same gate.
+    bool m_ngxGenericVelocityDrawSeenThisFrame = false;
     // Flush cadence. The file is rewritten whole, so this only bounds how stale it can be after
     // a crash or an alt-F4, which is how these sessions usually end.
     uint32_t m_ngxFactsNextFlushFrame = 0;

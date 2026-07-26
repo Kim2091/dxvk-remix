@@ -12401,6 +12401,8 @@ namespace dxvk {
         return;
       }
       m_ngxVelocityGenericProbeEvals++;
+      // This frame has real generic-route work, so it is worth spending a dump frame on
+      m_ngxGenericVelocityDrawSeenThisFrame = true;
 
       // Recover the exact transform this shader applies to input position (object->clip) from
       // its bytecode and the live constants. Skinned shaders decline here (position is not
@@ -16110,6 +16112,25 @@ namespace dxvk {
     // branch unreachable. That warning is a primary debugging signal; it must not lie.
     const NgxCameraSource frameCameraSource = m_ngxFrameCameraSource;
     m_ngxFrameCameraSource = NgxCameraSource::None;
+
+    // Generic velocity dump summary. Must run BEFORE the velocity counters are cleared below,
+    // for exactly the reason described for the camera source just above: reading them after the
+    // reset reported zero for every frame, which is worse than not reporting at all - the first
+    // run of this dump printed "0 declined foreign-view" for frames that had not run a single
+    // draw, and the zero looked like evidence. Only a frame the route actually worked on counts
+    // against the budget (see m_ngxGenericVelocityDrawSeenThisFrame): startup and loading frames
+    // have no scene geometry and would otherwise consume it all reporting nothing.
+    if (m_ngxGenericVelocityDumpFramesLeft > 0 && m_ngxGenericVelocityDrawSeenThisFrame) {
+      m_ngxGenericVelocityDumpFramesLeft--;
+      Logger::info(str::format("[RTX NGX Passthrough][gvdump] ---- end of frame ", m_ue3FrameCounter,
+                               ": ", m_ngxGenericVelocityDumpLinesThisFrame, " movers emitted, ",
+                               m_ngxVelocityStats.skippedForeignView, " declined foreign-view, ",
+                               m_ngxVelocityStats.exactMatches, " held static, ",
+                               m_ngxVelocityGenericProbeEvals, " draws probed ----"));
+    }
+    m_ngxGenericVelocityDumpLinesThisFrame = 0;
+    m_ngxGenericVelocityDrawSeenThisFrame = false;
+
     m_ngxVelocityStats = NgxVelocityCaptureStats();
     m_ngxVelocitySkinnedDraws = 0;
     m_ngxVelocityDynamicDraws = 0;
@@ -16141,14 +16162,6 @@ namespace dxvk {
       m_ngxSceneColorResolves[i] = nullptr;
     }
     m_ngxSceneColorResolveCount = 0;
-    if (m_ngxGenericVelocityDumpFramesLeft > 0) {
-      m_ngxGenericVelocityDumpFramesLeft--;
-      Logger::info(str::format("[RTX NGX Passthrough][gvdump] ---- end of frame ", m_ue3FrameCounter,
-                               ": ", m_ngxGenericVelocityDumpLinesThisFrame, " movers emitted, ",
-                               m_ngxVelocityStats.skippedForeignView, " declined foreign-view ----"));
-    }
-    m_ngxGenericVelocityDumpLinesThisFrame = 0;
-
     if (m_ngxPostChainDumpFramesLeft > 0) {
       m_ngxPostChainDumpFramesLeft--;
       Logger::info(str::format("[RTX NGX Passthrough][dump] ---- end of frame ", m_ue3FrameCounter, " ----"));
