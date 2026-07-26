@@ -12736,6 +12736,35 @@ namespace dxvk {
           if (m_ngxGenericVelocityDumpFramesLeft > 0 &&
               m_ngxGenericVelocityDumpLinesThisFrame < kNgxGenericVelocityDumpMaxLines) {
             m_ngxGenericVelocityDumpLinesThisFrame++;
+
+            // Composition probe. The static test composes the camera delta with the probed clip
+            // transform assuming both are packed the same way. If they are not, the product is
+            // meaningless and the residual lands near the transform's own magnitude - which is
+            // exactly what staticRatio reads here (~1, across every object, in every frame).
+            // Rather than reason about which side is packed which way, evaluate every candidate
+            // composition and report them all: for objects that are actually static, the correct
+            // one reads ~0 and the rest read ~1. If ALL of them read ~1, no composition can fix
+            // it, and the camera's translation is not in the ViewProjection at all (the engine
+            // renders camera-relative) - which this whole clip-space test cannot represent.
+            auto ratio = [](const Matrix4& target, const Matrix4& predicted) {
+              float r = 0.0f;
+              float m = 0.0f;
+              for (uint32_t row = 0; row < 4; row++) {
+                const Vector4 d = target[row] - predicted[row];
+                const Vector4 t = target[row];
+                r += std::abs(d.x) + std::abs(d.y) + std::abs(d.z) + std::abs(d.w);
+                m += std::abs(t.x) + std::abs(t.y) + std::abs(t.z) + std::abs(t.w);
+              }
+              return r / std::max(m, 1e-3f);
+            };
+
+            const Matrix4& prev = matched->objectToClip;
+            const Matrix4& deltaC = m_ngxGenericCameraDelta;
+            const Matrix4 deltaT = Matrix4(Matrix4Base<double>(transpose(m_ngxFrameWorldToProjection)) *
+                                           inverse(Matrix4Base<double>(transpose(m_ngxPrevFrameWorldToProjection))));
+            const Matrix4 nowT = transpose(genericObjectToClip);
+            const Matrix4 prevT = transpose(prev);
+
             Logger::info(str::format(
               "[RTX NGX Passthrough][gvdump] vs=0x", std::hex, shaderHash, std::dec,
               " prims=", drawContext.PrimitiveCount, " startIdx=", drawContext.StartIndex,
@@ -12743,7 +12772,13 @@ namespace dxvk {
               " static=", staticRatio, " (tol ", kGenericStaticRelTol, ", ",
               staticRatio / kGenericStaticRelTol, "x)",
               " placements=", objectState.instances.size(),
-              " pairDist=", matchedDistance));
+              " pairDist=", matchedDistance,
+              " | compositions C*prev=", ratio(genericObjectToClip, deltaC * prev),
+              " prev*C=", ratio(genericObjectToClip, prev * deltaC),
+              " Ct*prev=", ratio(genericObjectToClip, deltaT * prev),
+              " prev*Ct=", ratio(genericObjectToClip, prev * deltaT),
+              " T:C*prevT=", ratio(nowT, deltaC * prevT),
+              " T:prevT*C=", ratio(nowT, prevT * deltaC)));
           }
           appendVelocityDraw(Matrix4(), Matrix4(), Matrix4(),
                              std::vector<Vector4>(), std::vector<Vector3>(),
@@ -16097,6 +16132,24 @@ namespace dxvk {
     }
     m_ngxPrevCameraValid = m_ngxFrameCameraValid;
     m_ngxPrevCameraUsedTranspose = m_ngxFrameCameraUsedTranspose;
+    // Generic velocity dump: where the camera actually was, both frames. Must run HERE - before
+    // the previous-frame matrix is overwritten on the next line and before the validity flag is
+    // cleared two lines further down. Reading either after those points reports "unavailable" or,
+    // worse, compares the frame against itself and prints a confident moved=0.
+    if (m_ngxGenericVelocityDumpFramesLeft > 0 && m_ngxGenericVelocityDrawSeenThisFrame &&
+        m_ngxFrameCameraMatricesValid && m_ngxPrevFrameWorldToProjectionValid) {
+      Vector3 eyeNow(0.0f);
+      Vector3 eyePrev(0.0f);
+      if (tryDeriveEyeFromInverseWorldToProjection(inverse(m_ngxFrameWorldToProjection), eyeNow) &&
+          tryDeriveEyeFromInverseWorldToProjection(inverse(m_ngxPrevFrameWorldToProjection), eyePrev)) {
+        Logger::info(str::format("[RTX NGX Passthrough][gvdump] camera eye=(",
+                                 eyeNow.x, ", ", eyeNow.y, ", ", eyeNow.z,
+                                 ") moved=", length(eyeNow - eyePrev)));
+      } else {
+        Logger::info("[RTX NGX Passthrough][gvdump] camera eye: not derivable from the frame matrices");
+      }
+    }
+
     // Roll this frame's composed camera into the previous slot for the generic velocity path's
     // clip-space camera delta (valid only when this frame actually established a camera). Must
     // run before the matrices-valid flag is cleared below.
@@ -16123,33 +16176,11 @@ namespace dxvk {
     if (m_ngxGenericVelocityDumpFramesLeft > 0 && m_ngxGenericVelocityDrawSeenThisFrame) {
       m_ngxGenericVelocityDumpFramesLeft--;
 
-      // Where the camera actually is, both frames, derived from the accepted matrices. The static
-      // test assumes a static object's object->clip changes ONLY by the camera's ViewProjection
-      // delta. That is false if the engine renders camera-relative - the camera's translation then
-      // lives in each object's world matrix instead of in the ViewProjection, so a VP-only delta
-      // cannot predict it and every static object reads as having moved by the camera's own
-      // movement. These two lines separate that from a delta that simply drops the translation:
-      // an eye that stays put while the player walks means camera-relative.
-      std::string eyeReport = "eye: unavailable";
-      if (m_ngxFrameCameraMatricesValid && m_ngxPrevFrameWorldToProjectionValid) {
-        Vector3 eyeNow(0.0f);
-        Vector3 eyePrev(0.0f);
-        const bool haveNow =
-          tryDeriveEyeFromInverseWorldToProjection(inverse(m_ngxFrameWorldToProjection), eyeNow);
-        const bool havePrev =
-          tryDeriveEyeFromInverseWorldToProjection(inverse(m_ngxPrevFrameWorldToProjection), eyePrev);
-        if (haveNow && havePrev) {
-          eyeReport = str::format("eye=(", eyeNow.x, ", ", eyeNow.y, ", ", eyeNow.z,
-                                  ") moved=", length(eyeNow - eyePrev));
-        }
-      }
-
       Logger::info(str::format("[RTX NGX Passthrough][gvdump] ---- end of frame ", m_ue3FrameCounter,
                                ": ", m_ngxGenericVelocityDumpLinesThisFrame, " movers emitted, ",
                                m_ngxVelocityStats.skippedForeignView, " declined foreign-view, ",
                                m_ngxVelocityStats.exactMatches, " held static, ",
-                               m_ngxVelocityGenericProbeEvals, " draws probed | ",
-                               eyeReport, " ----"));
+                               m_ngxVelocityGenericProbeEvals, " draws probed ----"));
     }
     m_ngxGenericVelocityDumpLinesThisFrame = 0;
     m_ngxGenericVelocityDrawSeenThisFrame = false;
