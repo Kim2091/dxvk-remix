@@ -361,17 +361,21 @@ namespace dxvk {
                "position snapshots). DLSS, Frame Generation and Remix motion blur then see real screen space motion instead\n"
                "of treating everything as static world. First person meshes are handled in both their world/intermediate and\n"
                "foreground render phases.");
-    RTX_OPTION("rtx.ngxPassthrough", bool, objectVelocitiesGeneric, true,
+    RTX_OPTION("rtx.ngxPassthrough", bool, objectVelocitiesGeneric, false,
                "Name-independent rigid object velocity for engines that do not publish a LocalToWorld constant the way UE3\n"
                "does (Gamebryo and others fold the world matrix into a single world-view-projection handed to the vertex\n"
                "shader). Instead of matching a constant name, the clip-transform probe reads each vertex shader's bytecode to\n"
-               "recover the object->clip transform it actually applies, then factors this frame's camera back out to get the\n"
-               "object's world transform - the same quantity the named path extracts, obtained from arithmetic rather than a\n"
-               "symbol. Feeds the existing per-object history matching and velocity raster unchanged, so rigid movers (doors,\n"
-               "vehicles, physics props) stop ghosting on those engines. Skinned meshes are not covered here: the probe\n"
-               "correctly declines blend-indexed position as non-affine, so characters still need the named GPU-skin path.\n"
-               "Automatically stays off for any game seen to name its rigid transform (UE3), leaving Mirror's Edge / Mass\n"
-               "Effect 2 on their proven path. Requires rtx.ngxPassthrough.objectVelocities.");
+               "recover the object->clip transform it actually applies. Motion vectors are then emitted from this frame's and\n"
+               "the previous frame's probed clip transforms directly, and whether an object moved is decided in clip space\n"
+               "against a per-frame camera delta: the camera's world->clip matrix is ill-conditioned, so recovering a world\n"
+               "transform through its inverse would swamp both the motion vectors and the static test with float error.\n"
+               "Skinned meshes are not covered here: the probe correctly declines blend-indexed position as non-affine, so\n"
+               "characters still need the named GPU-skin path. Automatically stays off for any game seen to name its rigid\n"
+               "transform (UE3), leaving Mirror's Edge / Mass Effect 2 on their proven path.\n"
+               "Requires rtx.ngxPassthrough.objectVelocities. DEFAULT OFF pending validation: in testing the clip-space\n"
+               "static test false-positived on draws rendered with a different view-projection than the accepted main camera\n"
+               "(a camera delta built from the main view cannot predict a sub-view), which reads as static geometry moving.\n"
+               "Enable from the developer menu to experiment; leave off so it cannot confound unrelated compatibility work.");
     RTX_OPTION("rtx.ngxPassthrough", bool, motionBlurFirstPerson, true,
                "Applies Remix motion blur (rtx.postfx) to the camera-locked first person meshes like the rest of the scene:\n"
                "during sprints and camera motion the hands smear with their true motion, matching the vanilla game's camera\n"
