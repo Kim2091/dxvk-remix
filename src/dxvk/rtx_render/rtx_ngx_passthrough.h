@@ -341,8 +341,17 @@ namespace dxvk {
                "because UE3's hardware occlusion culling reads back zero samples for meshes that are actually on screen\n"
                "under Remix, hiding them and causing visibility flicker. Additive: the individual rtx.d3d9 fix toggles\n"
                "(e.g. conservativeOcclusionQueries) still apply on top of whatever the profile enables.");
-    RTX_OPTION("rtx.ngxPassthrough", bool, prePostProcess, true,
-               "Runs the upscaler on the game's linear scene color before the game's post-process chain instead of on the final\n"
+    RTX_OPTION("rtx.ngxPassthrough", bool, prePostProcess, false,
+               "DEFAULT OFF. The idea is right and the payoff is real, but the trigger is not reliable enough across engines to\n"
+               "be a default: it fires on the FIRST full-screen pass that samples the identified scene color, and on more than\n"
+               "one game that pass turns out to arrive while the scene is still being drawn. Mass Effect 2 loses its world\n"
+               "translucency that way (drawn into the scene color after the trigger, un-jittered against jittered depth, so it\n"
+               "fails the depth test and vanishes). Grand Theft Auto IV is worse: it is deferred, so the first pass sampling the\n"
+               "scene color is the LIGHTING pass, and the upscaler ran with the whole frame still ahead of it - jittered image,\n"
+               "no anti-aliasing at all. Both games are configured to turn it off, which is the evidence that it should not be\n"
+               "the default. Turn it on per game once the game is known to composite in a way the trigger reads correctly.\n"
+               "\n"
+               "When on, runs the upscaler on the game's linear scene color before the game's post-process chain instead of on the final\n"
                "post-processed output, matching a native engine integration: bloom, tonemapping and color grading then operate\n"
                "on the anti-aliased, unjittered image rather than baking into the upscaler input (post effects sampling a jittered\n"
                "scene wobble sub-pixel per frame, which temporal upscalers otherwise have to soften out). Also enables DLSS's HDR\n"
@@ -450,6 +459,22 @@ namespace dxvk {
                "in that object's space, not the world's, and is not usable on its own. No candidates at all means the\n"
                "camera never reaches the vertex shader as a whole matrix.\n"
                "Expensive while running (every register window is tested per shader); resets to 0 automatically.");
+    RTX_OPTION("rtx.ngxPassthrough", bool, sceneColorFollowsDownstream, false,
+               "Scene colour identification, second stage, for DEFERRED renderers. Off by default: it is unnecessary on a\n"
+               "forward renderer, where the first full-size depth-writing colour target genuinely is the scene.\n"
+               "\n"
+               "A deferred renderer fills several full-size, depth-writing G-buffer planes before it ever produces a lit\n"
+               "image, and those come first - so the plain 'first full-size depth-writing target' rule picks a G-buffer\n"
+               "plane. The upscaler then runs on it, at the deferred lighting pass, with the whole rest of the frame still\n"
+               "to be drawn: nothing is resolved, the applied jitter is never resolved either, and the result is a jittery\n"
+               "image with no anti-aliasing.\n"
+               "\n"
+               "With this on, a candidate that a full-size pass READS while writing a different, equally sized target that\n"
+               "depth-writing geometry ALSO renders into is treated as an input to that target, and the scene colour moves\n"
+               "downstream to it. All three conditions matter: equal size excludes bloom and depth-of-field, which read the\n"
+               "scene into smaller targets; a different image excludes ping-pong effects; and requiring the destination to\n"
+               "receive depth-writing geometry is what stops the chain walking on through the tone mapper, the HUD\n"
+               "composite and into the backbuffer, none of which the scene is ever drawn into.");
     RTX_OPTION("rtx.ngxPassthrough", int, dumpPostChainFrames, 0,
                "Diagnostic: when set to a value N > 0, the non-scene draw flow (post-process passes, composites, UI, resolve\n"
                "copies, render state) of the next N frames is written to the log, then the value resets to 0 automatically.\n"

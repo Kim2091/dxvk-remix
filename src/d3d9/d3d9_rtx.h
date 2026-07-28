@@ -870,6 +870,7 @@ namespace dxvk {
       None = 0,
       CtabViewProjWithOrigin,   // combined ViewProjection + an explicit camera position (UE3)
       CtabViewProjDerivedEye,   // combined ViewProjection alone; eye from the frustum apex
+      CtabViewProjApexVerified, // as above, but confirmed against a published inverse view
       CtabSeparateViewProj,     // distinct View and Projection matrices, usable as-is
       FixedFunction,            // D3DTS_VIEW / D3DTS_PROJECTION
       ClipTransformProbe,       // the transform the vertex shader's own arithmetic applies
@@ -903,6 +904,14 @@ namespace dxvk {
       uint32_t declinedFfpShaderBound = 0;
       uint32_t declinedFfpProjection = 0;
       uint32_t declinedRegisterRange = 0;
+      // The combined transform was recognised, but the engine separately publishes an inverse
+      // view whose translation says the camera is somewhere else, so this draw's matrix has an
+      // object's world folded into it (see the apex agreement test). Counted apart from the
+      // other declines because it is the one that means "close, and correctly rejected".
+      uint32_t declinedApexDisagreed = 0;
+      // Draws recognised only through a "world..." spelling next to a separately declared world
+      // matrix, dropped before any reconstruction was attempted
+      uint32_t declinedWorldFolded = 0;
       // Clip-transform probe (see tryNgxClipTransformProbe)
       uint32_t probeShadersAnalyzed = 0;      // draws whose vertex transform was recovered
       uint32_t probeShadersNotAffine = 0;     // draws whose position is not a matrix transform
@@ -937,6 +946,28 @@ namespace dxvk {
       // additionally requires the camera position symbol; the velocity capture accepts
       // CPU-modified-mesh draws on ViewProjection + LocalToWorld alone)
       bool hasViewProjection = false;
+
+      // A published inverse view (camera->world). Engines that light in world space hand the
+      // vertex and pixel shaders one of these to rebuild eye vectors from, and deferred
+      // renderers almost always do. Its TRANSLATION is the camera's world position stated by
+      // the engine itself - which is worth far more than it first appears: it is the ground
+      // truth that says whether a combined "world-view-projection" constant actually has an
+      // identity world folded into it. See the apex agreement test in
+      // resolveNgxPassthroughCamera. Only the translation is used, never the 3x3, because the
+      // translation is unambiguous under either packing while the rotation is not.
+      bool hasInverseView = false;
+      uint32_t inverseViewRegister = 0;
+      uint32_t inverseViewRegisterCount = 0;
+
+      // Set when the combined transform was only recognised through a "world..." spelling
+      // (WorldViewProjection and friends) AND the same shader separately declares its own
+      // object->world matrix. Taken together those say the world is NOT identity, so the
+      // constant is a genuine per-object transform whose frustum apex sits in that object's
+      // space rather than the world's. The dictionary accepts "world" spellings because an
+      // engine that folds an identity world into the upload still names the constant that
+      // way; this is the measurement that separates the two rather than assuming.
+      bool viewProjIsWorldFolded = false;
+      bool hasSeparateWorldMatrix = false;
       bool hasLocalToWorld = false;
       uint32_t localToWorldRegister = 0;
       bool hasWorldToLocal = false;
@@ -1165,6 +1196,45 @@ namespace dxvk {
     // the main view carries is an engine convention - UE3 is positive, Gamebryo is not - so it
     // is measured rather than assumed, and draws that disagree with it are the mirrored ones.
     int32_t m_ngxCameraDetSign = 0;
+
+    // Where the engine publishes its inverse view (camera->world), latched the first time any
+    // shader declares one and never revisited. Latching is what makes it usable at all: the
+    // matrix is a per-frame global living at a fixed register, so every draw can be checked
+    // against it, not just the draws whose own shader happens to name it.
+    //
+    // Only the translation is read - the camera's world position - and only to answer one
+    // question: does this draw's combined transform have an identity world folded into it, or
+    // its own object's? A world-view-projection reconstructs to a perfectly plausible camera
+    // whose eye sits in that object's space, and nothing about the matrix itself gives that
+    // away; the engine's own statement of where the camera is does.
+    //
+    // The confirmed flag is a REPORTED fact, not a gate. Gating rejection on it deadlocks: the
+    // draw that confirms the eye can only be found by rejecting the draws that come before it.
+    // Rejecting on a read that turns out not to be a camera position is safe anyway - no draw
+    // agrees, every named provider declines, and the structural probe is reached exactly as it
+    // would have been without any of this.
+    int32_t m_ngxInverseViewRegister = -1;
+    uint32_t m_ngxInverseViewRegisterCount = 0;
+    bool m_ngxInverseViewEyeConfirmed = false;
+
+    // Colour targets proven to sit UPSTREAM of the scene colour, and how many times the scene
+    // colour has been moved downstream because of it (see promoteNgxSceneColorIfUpstream).
+    //
+    // Why this exists: "the full-size target that depth-writing geometry renders into" IS the
+    // scene colour in a forward renderer, but a deferred renderer fills several full-size
+    // depth-writing G-buffer planes BEFORE it ever produces a lit image, and those come first,
+    // so first-past-the-post picks one of them. GTA IV picked an A2R10G10B10 G-buffer plane and
+    // the upscaler consequently ran on it - at the deferred lighting pass, with the entire rest
+    // of the frame still to be drawn - which resolved nothing and left the jitter unresolved.
+    //
+    // The demoted list is what keeps this one-way. Without it a promotion could be undone by
+    // the sticky-target grace period and the pair would swap back and forth forever.
+    std::vector<const DxvkImage*> m_ngxSceneColorUpstream;
+    uint32_t m_ngxSceneColorPromotions = 0;
+    // Full-size colour targets that depth-writing geometry has rendered into. Recorded
+    // independently of camera acquisition, because a promotion candidate has to be recognised
+    // as a scene target whether or not the draws filling it carry camera constants.
+    std::vector<const DxvkImage*> m_ngxSceneGeometryTargets;
     uint32_t m_ngxCameraDetPositiveCount = 0;
     uint32_t m_ngxCameraDetNegativeCount = 0;
 
@@ -1282,6 +1352,10 @@ namespace dxvk {
       bool valid = false;
       uint32_t agreeingSamples = 0;
       uint32_t totalSamples = 0;
+      // How many DISTINCT vertex shaders the agreeing draws used. The second way a consensus
+      // can be believed (see kNgxClipProbeMinAgreeingShaders): breadth across shaders where
+      // there is no majority of draws.
+      uint32_t agreeingShaders = 0;
       uint32_t streak = 0;       // consecutive frames a consistent consensus was reached
       uint32_t frame = 0;
     };
@@ -1724,6 +1798,17 @@ namespace dxvk {
                                      bool& outUsedTranspose,
                                      XXH64_hash_t& outConstantsHash,
                                      NgxCameraSource& outSource);
+    // The world space camera position stated by the engine's own inverse view constant, read
+    // from the live registers at the latched location. False when nothing has been latched or
+    // the registers do not currently hold a rigid camera->world transform.
+    bool tryReadNgxInverseViewEye(Vector3& outEye) const;
+    // Scene colour identification, second stage: a candidate that a full-size pass READS while
+    // writing a different full-size target is an input to that target, not the scene colour.
+    void promoteNgxSceneColorIfUpstream();
+    bool isNgxKnownUpstreamImage(const DxvkImage* image) const;
+    // "Is the scene actually drawn here" - the bound on how far a promotion may walk
+    bool isNgxSceneGeometryTarget(const DxvkImage* image) const;
+    void noteNgxSceneGeometryTarget(const DxvkImage* image);
     void emitNgxPassthroughFrameData();
 
     void applyNgxPassthroughScreenPercentage();
@@ -1915,6 +2000,7 @@ namespace dxvk {
       bool ngxPassthroughMode = false;
       bool ngxPassthroughJitter = false;
       bool ngxPrePostProcess = false;
+      bool ngxSceneColorFollowsDownstream = false;
       bool ngxStableInjectionPoint = false;
       bool ngxDlfgHudless = false;
       bool ngxObjectVelocities = false;
