@@ -130,6 +130,59 @@ int2 restirPtSelectSpatialNeighbor(uint2 pixel, float radiusPixels, inout RAB_Ra
 static const float kRestirPtSpatialNormalThreshold = 0.5f;
 static const float kRestirPtSpatialDepthThreshold = 0.1f;
 
+// ---------------------------------------------------------------------------
+// THE SELF-SHIFT PARITY METRIC (debug view 887)
+// ---------------------------------------------------------------------------
+//
+// This replaces a metric that could not be trusted, and the replacement is worth
+// reading before using the view as a gate.
+//
+// The first version computed  maxChannel(|shift - F|) / max(1e-4, luma(F))  and
+// then painted  max(0, error - threshold) * 100. Three faults, all of which
+// distorted a real measurement:
+//
+//   - CHROMA BIAS. It divided a per-CHANNEL difference by the LUMA of F. Rec.601
+//     weights blue at 0.114, so on the blue-dominant sky-lit paths that fill an
+//     FNV exterior every reading was inflated by up to 1/0.114 = 8.8x. A true 12%
+//     error read as "over 100%".
+//   - MANUFACTURED MAGNITUDE. The 1e-4 denominator floor turned any dim reservoir
+//     into an enormous relative error regardless of how small the absolute
+//     difference was.
+//   - SATURATION. The x100 ramp clipped at threshold + 1%, so sweeping the
+//     threshold could only bisect the population, never measure it. A 6% error and
+//     a 400% error painted identically.
+//
+// The replacement is a symmetric relative difference against the larger of the two
+// magnitudes, per channel, with no luma anywhere:
+//
+//     0.00  identical            0.50  they differ by 2x
+//     0.33  they differ by 1.5x  0.80  they differ by 5x
+//                                1.00  one of them is zero
+//
+// It is bounded in [0, 1] for non-negative radiance, so it cannot manufacture a
+// reading, and the full range is painted linearly above the threshold -- so
+// brightness now IS magnitude and the view can be read rather than bisected.
+//
+// Reservoirs too dim for either side to matter are not judged at all and are
+// painted BLUE rather than black, so "excluded" is never confused with "passing".
+static const float kRestirPtSelfShiftMinScale = 1e-3f;
+
+float restirPtSelfShiftRelativeError(vec3 a, vec3 b, out bool judged)
+{
+  const float scale = max(max(a.x, max(a.y, a.z)), max(b.x, max(b.y, b.z)));
+
+  judged = scale > kRestirPtSelfShiftMinScale;
+
+  if (!judged)
+  {
+    return 0.0f;
+  }
+
+  const vec3 difference = abs(a - b);
+
+  return max(difference.x, max(difference.y, difference.z)) / scale;
+}
+
 bool restirPtIsAcceptableNeighbor(RAB_Surface centralSurface, RAB_Surface neighborSurface)
 {
   if (!RAB_IsSurfaceValid(neighborSurface))
@@ -244,30 +297,25 @@ void main(uint2 threadId : SV_DispatchThreadID)
 
       if (shiftable)
       {
-        const vec3 integrandDelta = abs(selfIntegrand - centralReservoir.F);
-        const float relativeScale = max(1e-4f, RestirPtReservoir::toScalar(centralReservoir.F));
+        bool judged = false;
+        const float integrandError =
+          restirPtSelfShiftRelativeError(selfIntegrand, centralReservoir.F, judged);
 
-        const float integrandError = max(integrandDelta.x, max(integrandDelta.y, integrandDelta.z)) / relativeScale;
-        const float jacobianError = abs(selfJacobian - 1.0f);
+        // The same symmetric form for the Jacobian, so both channels read on one
+        // scale: 0.5 means the Jacobian is off by 2x, 1.0 means it is 0 or huge.
+        const float jacobianError = abs(selfJacobian - 1.0f) / max(1.0f, selfJacobian);
 
-        // THRESHOLD, then ramp. Raw relative error times 100 makes a 1% mismatch
-        // saturate, which is too sensitive for a pass/fail gate: the reconnection
-        // vertex is REBUILT from (surfaceIndex, primitiveIndex, barycentrics)
-        // rather than re-traced, and that rebuild has a small, bounded, known
-        // fidelity gap against what the trace loop resolved -- texture footprint
-        // and the shading-normal bend, both detailed in restirPtReconstructRcVertex.
-        // Anything under the threshold is that gap; anything over is a real
-        // transcription error, which in practice misses by tens to thousands of
-        // percent rather than by ones.
-        //
-        // Set the threshold to 0 to see the raw field, which is the right setting
-        // when hunting a residual rather than gating on one.
-        const float threshold = max(0.0f, restirPtArgs.debugParam);
+        // Threshold, then paint the REMAINING range linearly across [0, 1], so
+        // brightness is magnitude. Sub-threshold is exactly black.
+        const float threshold = saturate(restirPtArgs.debugParam);
+        const float inverseRange = 1.0f / max(1e-3f, 1.0f - threshold);
 
         error = vec3(
-          max(0.0f, integrandError - threshold) * 100.0f,
-          max(0.0f, jacobianError - threshold) * 100.0f,
-          0.0f);
+          judged ? saturate(max(0.0f, integrandError - threshold) * inverseRange) : 0.0f,
+          judged ? saturate(max(0.0f, jacobianError - threshold) * inverseRange) : 0.0f,
+          // Blue marks "too dim on both sides to be worth judging" -- visibly
+          // distinct from a passing black pixel.
+          judged ? 0.0f : 0.25f);
       }
     }
 

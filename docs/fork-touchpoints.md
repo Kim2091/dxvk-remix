@@ -3852,7 +3852,31 @@ and un-bitpacked.
 - **`src/dxvk/rtx_render/rtx_fork_restir_pt_rayquery.{h,cpp}`** - fork-owned changes.
   *Two-page reservoir allocation plus a `reservoirPageSlice` helper; a `dispatchSpatialReuse` that runs the rounds from inside `dispatchFinalShading` (so phase 3 adds no `rtx_context.cpp` touchpoint at all); the new `ManagedShader`; and seven live options with widgets - `enableSpatialReuse`, `spatialNeighborCount`, `spatialRadius`, `spatialRounds`, `jacobianRejectionThreshold`, `spatialSkyReconnection`, `shiftParityThreshold`.*
 
-**The reconnection vertex is REBUILT, not re-traced, and that has a bounded cost in fidelity.**
+**The reconnection vertex is REBUILT, not re-traced, and it must be rebuilt with the SCATTER
+ray's cone.** The trace resolves that vertex with a cone whose spread angle was widened by the
+primary scatter's own pdf - `2*asin(sqrt(1/(4*pi*pdf))) * rtx.indirectRaySpreadAngleFactor`, about
+0.064 rad for a diffuse bounce at the shipped factor of 0.05. The screen-space pixel spread is
+`fov/2/resY`, about 8.3e-4 rad. Handing the rebuild the latter, as the first cut did, understated
+the distance-dependent term by ~77x and read albedo and roughness **two to four mip levels too
+fine** - a texel against a 6x6-or-coarser average, which on contrasty terrain albedo, and far worse
+on a roughness texture where the GGX response squares it, is tens to hundreds of percent. It was
+the dominant term in the debug view 887 residual. The fix costs nothing: `kFootprintFromRayOrigin`
+already multiplies the spread by the segment length internally
+(`surface_interaction.slangh:620-622`), and the pdf it needs is already in the reservoir as
+`cachedJacobian.x`.
+
+**Debug view 887's metric was itself wrong, and distorted a full round of investigation.** It
+divided a per-CHANNEL difference by the LUMA of the stored integrand, floored the denominator at
+1e-4, and then saturated at threshold + 1%. Rec.601 weights blue at 0.114, so on the blue-dominant
+sky-lit paths that fill an FNV exterior it inflated every reading by up to 8.8x; the floor
+manufactured huge relative errors out of negligible absolute ones; and the saturation meant
+sweeping the threshold could only bisect a population, never measure it. It is now a symmetric
+relative difference against the larger of the two magnitudes, bounded in [0,1], with no luma
+anywhere, painted linearly above the threshold so brightness is magnitude - and pixels too dim to
+judge are painted blue rather than silently black. The lesson generalises past ReSTIR PT: a
+debug view used as a gate is an instrument, and an instrument that saturates cannot be swept.
+
+**The remaining rebuild gaps are bounded and documented.**
 `restirPtReconstructRcVertex` rebuilds the vertex from its `(surfaceIndex, primitiveIndex,
 barycentrics)` triple in one pass, which means the honest view direction is not available until
 after the vertex fetch. Three consequences, all documented at length on that function: the
@@ -3868,7 +3892,7 @@ knob because of this: at the raw scale a 1% mismatch saturates, and the rebuild'
 in that range on detailed or grazing-lit geometry while a real transcription error misses by tens
 to thousands of percent.
 - **`tests/rtx/unit/test_fork_restir_pt_reservoir.cpp`** - fork-owned changes.
-  *Three new groups on top of phase 2's: the reconnection geometry Jacobian (round trip, exact identity, degenerate rejection, one hand-computed value), the pairwise MIS **unbiasedness identity** - K+1 synthetic pixels over one shared discrete path domain, every reservoir build and every merge draw enumerated, asserting `E[F_c * W] == sum_j F_c(j)/p_j` - the partition-of-unity plus guard cases, and the **lobe-class self-shift identity**, which locks the convention the in-game 887 failure exposed: for each of three synthetic materials and each active lobe, the shift's class-restricted `dstF1/dstPDF1` must equal the trace kernel's sampled-lobe `f*cos/(pdf*P)`. Both new groups were verified load-bearing by sabotage - deleting `/(validNeighborCount + 1)` fails by exactly the predicted factor of (k+1), and re-deriving the lobe class from the roughness fold fails on exactly the specular lobe of the rough material and on nothing else, which is the stipple. A fourth group locks the **escape / sky-reconnection self-shift identity** - the branch with the least in-game exposure - including that the MIS weight degenerates to exactly 1 at `lightPdf = 0` and that the escape segment's attenuation is applied exactly once; its sabotage (folding the destination visibility attenuation in, as the finite-segment branch correctly does) fails as designed.*
+  *Three new groups on top of phase 2's: the reconnection geometry Jacobian (round trip, exact identity, degenerate rejection, one hand-computed value), the pairwise MIS **unbiasedness identity** - K+1 synthetic pixels over one shared discrete path domain, every reservoir build and every merge draw enumerated, asserting `E[F_c * W] == sum_j F_c(j)/p_j` - the partition-of-unity plus guard cases, and the **lobe-class self-shift identity**, which locks the convention the in-game 887 failure exposed: for each of three synthetic materials and each active lobe, the shift's class-restricted `dstF1/dstPDF1` must equal the trace kernel's sampled-lobe `f*cos/(pdf*P)`. Both new groups were verified load-bearing by sabotage - deleting `/(validNeighborCount + 1)` fails by exactly the predicted factor of (k+1), and re-deriving the lobe class from the roughness fold fails on exactly the specular lobe of the rough material and on nothing else, which is the stipple. A fourth group locks the **escape / sky-reconnection self-shift identity** - the branch with the least in-game exposure - including that the MIS weight degenerates to exactly 1 at `lightPdf = 0` and that the escape segment's attenuation is applied exactly once; its sabotage (folding the destination visibility attenuation in, as the finite-segment branch correctly does) fails as designed. Two further groups lock the **reconnection vertex's texture footprint** - asserting the rebuilt cone radius equals the trace's exactly, and quantifying the wrong derivation in MIP LEVELS so the magnitude claim is checkable rather than rhetorical - and the **debug view 887 metric** itself: symmetry, scale invariance, boundedness, absence of chroma bias, and that dim reservoirs are excluded rather than manufactured into huge readings. Both sabotage cleanly.*
 - **`src/dxvk/shaders/rtx/pass/raytrace_args.h`** - fork-touchpoint inline tweak.
   *ONE more complete 4-scalar (16-byte) group at the end - `restirPtSpatialNeighborCount`, `restirPtSpatialRounds`, `restirPtSpatialRadius`, `restirPtJacobianRejectionThreshold` - plus two more bits in the existing `restirPtFlags` word. Do not add a fifth scalar to that group; add the next complete group.*
 - **`src/dxvk/shaders/rtx/utility/debug_view_indices.h`** + **`src/dxvk/rtx_render/rtx_debug_view.cpp`** - index-only, fork.

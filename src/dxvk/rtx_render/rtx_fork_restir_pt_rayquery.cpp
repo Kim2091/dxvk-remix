@@ -555,7 +555,7 @@ namespace dxvk {
 
       ForkReSTIRPTArgs pushArgs = {};
       pushArgs.mode = round;  // dual use: the round index, see ForkReSTIRPTArgs.
-      pushArgs.debugParam = std::max(0.0f, shiftParityThreshold());
+      pushArgs.debugParam = std::clamp(shiftParityThreshold(), 0.0f, 1.0f);
       ctx->pushConstants(0, sizeof(pushArgs), &pushArgs);
 
       ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);

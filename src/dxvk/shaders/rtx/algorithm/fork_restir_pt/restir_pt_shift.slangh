@@ -115,6 +115,28 @@ static const int kRestirPtShiftRcVertexLength = 1;
 static const uint kRestirPtLobeClassAll =
   RESTIR_PT_LOBE_DIFFUSE_REFLECTION | RESTIR_PT_LOBE_SPECULAR_REFLECTION | RESTIR_PT_LOBE_DIFFUSE_TRANSMISSION;
 
+// Fork-local twin of calculateSpreadAngleFromSolidAnglePdfLocal
+// (restir_pt_trace_core.slangh, itself a twin of integrator.slangh:90-121).
+// KEEP THE THREE IN SYNC. Duplicated for the same include-graph reason as the
+// other leaf twins: the spatial pass must not pull in the trace core, which drags
+// the whole path state and the NEE-cache binding set with it. No translation unit
+// includes both, so the names are distinct only for future safety.
+//
+// This is load-bearing for texture LOD, not decoration -- see the footprint note
+// on restirPtReconstructRcVertex.
+float restirPtShiftSpreadAngleFromSolidAnglePdf(float incomingSpreadAngle, float solidAnglePdf)
+{
+  if (solidAnglePdf == 1.0f)
+  {
+    return incomingSpreadAngle;
+  }
+
+  const float newSpreadAngle =
+    2.0f * asin(sqrt(saturate(1.0f / (4.0f * pi * solidAnglePdf)))) * cb.indirectRaySpreadAngleFactor;
+
+  return max(incomingSpreadAngle, newSpreadAngle);
+}
+
 // ports getAllowedBSDFFlags, ReSTIRPTPass/PathTracer.slang:37-41 under
 // kSeparatePathBSDF.
 uint restirPtGetAllowedLobeClass(bool isSpecularBounce)
@@ -292,15 +314,26 @@ float restirPtEvalPdfBsdf(RAB_Surface surface, vec3 inputDirection, uint allowed
 // faithful rebuild means running surfaceInteractionCreate twice, and there are 2N
 // of these per pixel per round. What the single pass costs:
 //
-//   1. TEXTURE FOOTPRINT. The trace loop resolved this vertex with the scatter
-//      ray's cone: coneRadius + spreadAngle * hitDistance, where the spread angle
-//      was widened by the primary scatter's pdf (calculateSpreadAngleFromSolidAnglePdfLocal
-//      -- for a diffuse bounce that is tens of degrees). This rebuild uses the
-//      PRIMARY cone radius and the screen-space pixel spread, so it samples a
-//      finer mip. The two agree wherever the mip chain is locally flat and differ
-//      where it is not, which is why the residual reads as isolated speckle rather
-//      than a wash, and why it is worst on long first segments -- distant, open
-//      terrain -- where the trace's cone was widest.
+//   1. TEXTURE FOOTPRINT -- FIXED, and it was the big one. The trace loop resolves
+//      this vertex with the SCATTER ray's cone, whose spread angle was widened by
+//      the primary scatter's pdf: calculateSpreadAngleFromSolidAnglePdfLocal gives
+//      2*asin(sqrt(1/(4*pi*pdf))) * cb.indirectRaySpreadAngleFactor, which for a
+//      cosine-hemisphere bounce (pdf ~ 0.22) and the shipped factor of 0.05
+//      (rtx_options.h:844) is about 0.064 rad. The screen-space pixel spread is
+//      fov/2/resY, about 8.3e-4 rad -- so passing THAT here, as this function
+//      originally did, understated the cone by ~77x in its distance-dependent term
+//      and landed the material read two to four mip levels too fine. That is not
+//      an adjacent-mip rounding difference; it is a texel against a 6x6-or-coarser
+//      average, and on a contrasty terrain albedo -- or worse, a roughness texture,
+//      where the GGX response squares the error -- it is tens to hundreds of
+//      percent. It was the dominant term in the debug view 887 residual.
+//      The fix is free: kFootprintFromRayOrigin computes
+//      coneRadius + length(positionOffset) * ray.spreadAngle internally
+//      (surface_interaction.slangh:620-622), so handing it the widened spread
+//      reproduces rayInteractionCreate's coneRadius EXACTLY, with no extra work
+//      and no second vertex fetch. The pdf it needs is already in the reservoir:
+//      cachedJacobian.x is the primary scatter's solid-angle pdf, recorded at the
+//      first indirect hit.
 //   2. SHADING-NORMAL BEND. surfaceInteractionCreate applies getBentNormal against
 //      ray.direction (surface_interaction.slangh:423-425); at a zero direction that
 //      is the identity (math.slangh:504-519), so a rebuild never bends. The trace
@@ -328,8 +361,13 @@ float restirPtEvalPdfBsdf(RAB_Surface surface, vec3 inputDirection, uint allowed
 // The MATERIAL interaction does get the true view direction, so lobe probabilities,
 // the tangent frame and any parallax are evaluated honestly.
 //
-// If this gap ever needs closing, the fix is a two-pass rebuild, and it should be
-// costed against the Tracy measurement rather than assumed affordable.
+// Gaps 2 and 3 remain. Both are bounded and both need a two-pass rebuild to close
+// -- the honest view direction is not available until after the vertex fetch --
+// so they should be costed against the Tracy measurement rather than assumed
+// affordable. Their expected magnitude is single-digit percent: the bend only
+// fires at grazing incidence on curved low-poly geometry, and the flip fails
+// closed. If debug view 887 still shows a population well above that after the
+// footprint fix, look for a fourth mechanism rather than blaming these two.
 //
 // Returns false when the hit is invalid or its material is not opaque -- a
 // translucent or ray-portal rcVertex is a delta chain in this port and can never
@@ -638,9 +676,16 @@ vec3 restirPtComputeShiftedIntegrandReconnection(
   MinimalRayInteraction rcRayInteraction;
   OpaqueSurfaceMaterialInteraction rcMaterialInteraction;
 
+  // The cone the TRACE used for this vertex, not the screen-space pixel cone: the
+  // scatter that reached it widened the ray's spread by its own pdf, and that pdf
+  // is stored in cachedJacobian.x. Getting this wrong reads the material two to
+  // four mips too fine -- see gap 1 on restirPtReconstructRcVertex.
+  const float rcSpreadAngle = restirPtShiftSpreadAngleFromSolidAnglePdf(
+    cb.screenSpacePixelSpreadHalfAngle, srcReservoir.cachedJacobian.x);
+
   if (!restirPtReconstructRcVertex(
         rcVertexHit, dstPrimaryPosition,
-        dstPrimary.minimalRayInteraction.coneRadius, cb.screenSpacePixelSpreadHalfAngle,
+        dstPrimary.minimalRayInteraction.coneRadius, rcSpreadAngle,
         rcSurfaceInteraction, rcRayInteraction, rcMaterialInteraction))
   {
     return vec3(0.0f);

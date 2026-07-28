@@ -413,6 +413,75 @@ namespace mirror {
     return vec3(f.x / pdfSingle, f.y / pdfSingle, f.z / pdfSingle);
   }
 
+  // =========================================================================
+  // TEXTURE FOOTPRINT: the cone the trace resolves the reconnection vertex with,
+  // and the cone the shift's rebuild must reproduce.
+  //
+  // KEEP IN SYNC with restir_pt_shift.slangh (restirPtShiftSpreadAngleFromSolidAnglePdf
+  // and the rcSpreadAngle it hands restirPtReconstructRcVertex),
+  // restir_pt_trace_core.slangh (calculateSpreadAngleFromSolidAnglePdfLocal) and
+  // concept/surface/surface_interaction.slangh:620-622.
+  // =========================================================================
+
+  static constexpr float kPi = 3.14159265358979323846f;
+
+  // ports calculateSpreadAngleFromSolidAnglePdfLocal (integrator.slangh:90-121).
+  inline float spreadAngleFromSolidAnglePdf(
+    float incomingSpreadAngle, float solidAnglePdf, float indirectRaySpreadAngleFactor) {
+
+    if (solidAnglePdf == 1.0f) { return incomingSpreadAngle; }
+
+    const float clamped = std::min(1.0f, std::max(0.0f, 1.0f / (4.0f * kPi * solidAnglePdf)));
+    const float newSpreadAngle = 2.0f * std::asin(std::sqrt(clamped)) * indirectRaySpreadAngleFactor;
+
+    return std::max(incomingSpreadAngle, newSpreadAngle);
+  }
+
+  // What the TRACE ends up with: rayInteractionCreate (ray_interaction.slangh:49)
+  // gives coneRadius + spreadAngle * hitDistance, and surfaceInteractionCreate then
+  // uses that verbatim under kFootprintFromRayDirection.
+  inline float traceConeRadiusAtRcVertex(
+    float primaryConeRadius, float scatterSpreadAngle, float segmentLength) {
+    return primaryConeRadius + scatterSpreadAngle * segmentLength;
+  }
+
+  // What the REBUILD ends up with: kFootprintFromRayOrigin computes
+  // rayInteraction.coneRadius + length(positionOffset) * ray.spreadAngle
+  // (surface_interaction.slangh:622), where positionOffset is measured from the
+  // destination primary vertex -- i.e. it is the segment length. So the rebuild
+  // matches the trace exactly IF, and only if, it is handed the same spread angle.
+  inline float rebuildConeRadiusAtRcVertex(
+    float primaryConeRadius, float rebuildSpreadAngle, float segmentLength) {
+    return primaryConeRadius + rebuildSpreadAngle * segmentLength;
+  }
+
+  // =========================================================================
+  // The debug view 887 metric.
+  // KEEP IN SYNC with fork_restir_pt_spatial_reuse.comp.slang
+  // (restirPtSelfShiftRelativeError).
+  // =========================================================================
+
+  static constexpr float kSelfShiftMinScale = 1e-3f;
+
+  inline float maxComponent(const vec3& v) { return std::max(v.x, std::max(v.y, v.z)); }
+
+  inline float selfShiftRelativeError(const vec3& a, const vec3& b, bool& judged) {
+    const float scale = std::max(maxComponent(a), maxComponent(b));
+
+    judged = scale > kSelfShiftMinScale;
+    if (!judged) { return 0.0f; }
+
+    const vec3 difference(std::fabs(a.x - b.x), std::fabs(a.y - b.y), std::fabs(a.z - b.z));
+    return maxComponent(difference) / scale;
+  }
+
+  // The metric this replaced, kept only so the test can state what was wrong with
+  // it. maxChannel(|a-b|) / max(1e-4, luma(b)).
+  inline float retiredSelfShiftError(const vec3& a, const vec3& b) {
+    const vec3 difference(std::fabs(a.x - b.x), std::fabs(a.y - b.y), std::fabs(a.z - b.z));
+    return maxComponent(difference) / std::max(1e-4f, RestirPtReservoir::toScalar(b));
+  }
+
   inline float maxRelativeDifference(const vec3& a, const vec3& b) {
     float worst = 0.0f;
     const float ax[3] = { a.x, a.y, a.z };
@@ -1708,6 +1777,181 @@ namespace dxvk {
       }
     }
 
+    // -----------------------------------------------------------------------
+    // (l) PHASE 3: THE RECONNECTION VERTEX'S TEXTURE FOOTPRINT.
+    //
+    // The shift REBUILDS the reconnection vertex instead of re-tracing it, so it
+    // has to reproduce the cone the trace resolved that vertex with -- otherwise
+    // it reads albedo and roughness at a different mip and computes a different
+    // BSDF. The trace's cone is widened by the primary scatter's own pdf; the
+    // screen-space pixel cone is roughly two orders of magnitude narrower.
+    //
+    // The first cut of the rebuild passed the screen-space pixel spread, which
+    // measured as a two-to-four mip error and was the dominant term in the debug
+    // view 887 residual. This locks the derivation, and quantifies the miss so the
+    // magnitude claim is on record rather than in a commit message.
+    // -----------------------------------------------------------------------
+    void testReconnectionVertexFootprint() {
+      // rtx_options.h:844.
+      const float indirectRaySpreadAngleFactor = 0.05f;
+      // rtx_context.cpp:1319, fov / 2 / resolution.y. ~70 degrees at 1080p.
+      const float screenSpacePixelSpreadHalfAngle = 1.22f / 2.0f / 1080.0f;
+
+      struct Case {
+        const char* name;
+        float primaryScatterSolidAnglePdf;  // what cachedJacobian.x stores
+        float primaryConeRadius;            // grows with distance from the camera
+        float segmentLength;                // primary vertex -> reconnection vertex
+        float minimumMipLevelsMissed;       // what the WRONG spread angle costs
+      };
+
+      const std::vector<Case> cases = {
+        // A cosine-hemisphere diffuse bounce is the overwhelmingly common case.
+        { "distant terrain, diffuse bounce",  0.22f, 3.30f, 300.0f, 2.0f },
+        { "near geometry, diffuse bounce",    0.22f, 0.25f, 100.0f, 3.0f },
+        { "grazing diffuse bounce",           0.05f, 1.00f, 200.0f, 3.0f },
+        // A rough specular lobe is more peaked, so its cone is narrower -- but
+        // still far wider than a pixel.
+        { "rough specular bounce",            4.00f, 1.00f, 150.0f, 1.0f },
+      };
+
+      for (const Case& c : cases) {
+        const float scatterSpreadAngle = mirror::spreadAngleFromSolidAnglePdf(
+          screenSpacePixelSpreadHalfAngle, c.primaryScatterSolidAnglePdf, indirectRaySpreadAngleFactor);
+
+        // The scatter always widens the cone; if this ever stopped being true the
+        // whole concern would evaporate, so state it.
+        check(scatterSpreadAngle > screenSpacePixelSpreadHalfAngle,
+              str::format("l: [", c.name, "] the scatter widens the ray cone").c_str());
+
+        const float traceCone = mirror::traceConeRadiusAtRcVertex(
+          c.primaryConeRadius, scatterSpreadAngle, c.segmentLength);
+
+        // THE FIX: rebuild with the same spread angle, derived from the stored pdf.
+        const float rebuiltCone = mirror::rebuildConeRadiusAtRcVertex(
+          c.primaryConeRadius, scatterSpreadAngle, c.segmentLength);
+
+        check(rebuiltCone == traceCone,
+              str::format("l: [", c.name, "] the rebuilt footprint matches the trace exactly").c_str());
+
+        // THE BUG: rebuild with the screen-space pixel spread instead.
+        const float buggyCone = mirror::rebuildConeRadiusAtRcVertex(
+          c.primaryConeRadius, screenSpacePixelSpreadHalfAngle, c.segmentLength);
+
+        // Quantified as MIP LEVELS, because that is what a cone radius ratio means
+        // for a texture read and it is the number that makes the magnitude claim
+        // checkable: one mip is a 2x footprint.
+        const float mipLevelsMissed = std::log2(traceCone / buggyCone);
+
+        check(mipLevelsMissed >= c.minimumMipLevelsMissed,
+              str::format("l: [", c.name, "] the screen-space spread misses by at least ",
+                          c.minimumMipLevelsMissed, " mip levels").c_str());
+      }
+
+      // A dirac scatter has pdf exactly 1 by convention and must NOT be widened --
+      // the cone math breaks down there, and the reference guards it the same way.
+      {
+        const float dirac = mirror::spreadAngleFromSolidAnglePdf(
+          screenSpacePixelSpreadHalfAngle, 1.0f, indirectRaySpreadAngleFactor);
+        check(dirac == screenSpacePixelSpreadHalfAngle, "l: a dirac scatter leaves the cone alone");
+      }
+    }
+
+    // -----------------------------------------------------------------------
+    // (m) PHASE 3: THE SELF-SHIFT PARITY METRIC ITSELF.
+    //
+    // Debug view 887 is a measuring instrument, and the first one shipped was not
+    // trustworthy: it divided a per-CHANNEL difference by the LUMA of the stored
+    // integrand, floored that denominator at 1e-4, and then saturated. On the
+    // blue-dominant sky-lit paths that fill an FNV exterior it inflated readings by
+    // up to 1/0.114 = 8.8x, and it turned dim reservoirs into enormous relative
+    // errors out of nothing. A full round of investigation was spent on numbers it
+    // had distorted, so the replacement's properties are asserted here.
+    // -----------------------------------------------------------------------
+    void testSelfShiftMetric() {
+      bool judged = false;
+
+      // Identical inputs read exactly zero.
+      {
+        const mirror::vec3 a(0.4f, 0.7f, 1.2f);
+        check(mirror::selfShiftRelativeError(a, a, judged) == 0.0f, "m: identical inputs read 0");
+        check(judged, "m: a bright reservoir is judged");
+      }
+
+      // Symmetric and scale-invariant: only the RATIO matters, and swapping the
+      // arguments cannot change the answer.
+      {
+        const mirror::vec3 a(2.0f, 2.0f, 2.0f);
+        const mirror::vec3 b(1.0f, 1.0f, 1.0f);
+        checkClose(mirror::selfShiftRelativeError(a, b, judged), 0.5f, "m: a 2x difference reads 0.5");
+        checkClose(mirror::selfShiftRelativeError(b, a, judged), 0.5f, "m: the metric is symmetric");
+
+        const mirror::vec3 aScaled(200.0f, 200.0f, 200.0f);
+        const mirror::vec3 bScaled(100.0f, 100.0f, 100.0f);
+        checkClose(mirror::selfShiftRelativeError(aScaled, bScaled, judged), 0.5f,
+                   "m: the metric is scale invariant");
+
+        const mirror::vec3 fivefold(5.0f, 5.0f, 5.0f);
+        checkClose(mirror::selfShiftRelativeError(fivefold, b, judged), 0.8f, "m: a 5x difference reads 0.8");
+      }
+
+      // Bounded in [0,1] for non-negative radiance, so it cannot manufacture a
+      // reading no matter how extreme the inputs.
+      {
+        // Note: not named `small` -- rpcndr.h, reached through windows.h, #defines
+        // that to `char`.
+        const mirror::vec3 enormous(1e6f, 1e6f, 1e6f);
+        const mirror::vec3 faint(1e-2f, 1e-2f, 1e-2f);
+        const float e = mirror::selfShiftRelativeError(enormous, faint, judged);
+        check(e > 0.99f && e <= 1.0f, "m: an extreme mismatch saturates at 1, it does not run away");
+
+        const mirror::vec3 zero(0.0f, 0.0f, 0.0f);
+        checkClose(mirror::selfShiftRelativeError(faint, zero, judged), 1.0f, "m: against zero reads exactly 1");
+      }
+
+      // NO CHROMA BIAS. This is the fault that cost a round of investigation: a
+      // 10% error confined to the blue channel of a blue-dominant path.
+      {
+        const mirror::vec3 storedF(0.05f, 0.10f, 1.00f);   // sky-lit indirect, blue dominant
+        const mirror::vec3 shifted(0.05f, 0.10f, 1.10f);   // 10% high in blue only
+
+        const float honest = mirror::selfShiftRelativeError(shifted, storedF, judged);
+        checkClose(honest, 0.10f / 1.10f, "m: a 10% blue-channel error reads as ~10%", 1e-3f);
+
+        // What the retired metric said about the same pair.
+        const float retired = mirror::retiredSelfShiftError(shifted, storedF);
+        check(retired > 4.0f * honest,
+              "m: the retired metric inflated a blue-dominant error more than fourfold");
+        check(retired > 0.5f,
+              "m: the retired metric read a 10% error as over 50%, which is how a small residual looked large");
+      }
+
+      // NO MANUFACTURED MAGNITUDE on dim reservoirs. The retired metric's 1e-4
+      // denominator floor turned a negligible absolute difference into a huge
+      // relative one; the replacement excludes the pixel instead.
+      {
+        const mirror::vec3 dimA(2e-4f, 2e-4f, 2e-4f);
+        const mirror::vec3 dimB(0.0f, 0.0f, 0.0f);
+
+        const float honest = mirror::selfShiftRelativeError(dimA, dimB, judged);
+        check(!judged, "m: a reservoir below the minimum scale is excluded, not judged");
+        check(honest == 0.0f, "m: an excluded reservoir contributes no error");
+
+        const float retired = mirror::retiredSelfShiftError(dimA, dimB);
+        check(retired > 1.0f, "m: the retired metric read that same negligible pixel as over 100%");
+      }
+
+      // A dim STORED integrand against a bright shift is still judged -- exclusion
+      // must not become a way to hide a blow-up.
+      {
+        const mirror::vec3 bright(1.0f, 1.0f, 1.0f);
+        const mirror::vec3 dim(1e-5f, 1e-5f, 1e-5f);
+        const float e = mirror::selfShiftRelativeError(bright, dim, judged);
+        check(judged, "m: a bright shift against a dim reservoir is still judged");
+        check(e > 0.99f, "m: and it reads as a near-total mismatch");
+      }
+    }
+
     void run() {
       testAddBookkeeping();
       testFinalizeRIS();
@@ -1719,6 +1963,8 @@ namespace dxvk {
       testReconnectionGeometryJacobian();
       testLobeClassConventionSelfShift();
       testEscapeShiftIdentity();
+      testReconnectionVertexFootprint();
+      testSelfShiftMetric();
       testPairwiseResamplingMISIsUnbiased();
       testPairwiseWeightsPartitionAndGuards();
 

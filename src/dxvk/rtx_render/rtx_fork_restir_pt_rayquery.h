@@ -192,13 +192,15 @@ namespace dxvk {
                "Discards a shifted sample when max(J, 1/J) exceeds 1 + this, where J is the shift Jacobian. Zero or negative disables the test, "
                "which is how the reference ships it; the reference's value when enabled is 10. Discarding this way stays unbiased because the "
                "sample is removed from its own MIS weight as well as from the estimate.");
-    RTX_OPTION("rtx.restirPT", float, shiftParityThreshold, 0.05f,
-               "Relative-error threshold for the 'ReSTIR PT Shift Parity (Self)' debug view (887). Error below this reads BLACK; above it ramps from black at "
-               "100x the excess. Exists because the reconnection vertex is REBUILT from its (surface, primitive, barycentrics) triple rather than re-traced, and "
-               "that rebuild has a small bounded fidelity gap against the trace loop - texture footprint and the shading-normal bend - which at the raw scale "
-               "(threshold 0) paints sparse speckle on detailed or grazing-lit geometry.\n"
-               "A real transcription error misses by tens to thousands of percent, so it stays obvious at the default. Set this to 0 to see the raw field, which "
-               "is what you want when hunting a residual rather than gating on one.");
+    RTX_OPTION("rtx.restirPT", float, shiftParityThreshold, 0.02f,
+               "Error threshold for the 'ReSTIR PT Shift Parity (Self)' debug view (887). Below this reads BLACK; above it, the remaining range is painted "
+               "linearly across the full channel, so BRIGHTNESS IS MAGNITUDE.\n"
+               "The error is a SYMMETRIC relative difference against the larger of the two magnitudes, per channel: 0.33 means the shift and the stored "
+               "integrand differ by 1.5x, 0.5 by 2x, 0.8 by 5x, and 1.0 means one of them is zero. It is bounded in [0,1] and uses no luma anywhere, so - "
+               "unlike the metric this replaced - it can neither manufacture a huge reading out of a dim reservoir nor inflate blue-dominant sky-lit paths by "
+               "up to 8.8x.\n"
+               "Blue pixels are reservoirs too dim on both sides to be worth judging: excluded, not passing. Set the threshold to 0 to see the raw field when "
+               "hunting a residual rather than gating on one.");
     RTX_OPTION("rtx.restirPT", bool, spatialSkyReconnection, true,
                "Lets a path whose FIRST scatter left the scene be reused, by treating its escape direction as the reconnection vertex. "
                "The reference only does this under its hybrid shift, so turning this off reproduces strict reference behaviour - at the cost of "
