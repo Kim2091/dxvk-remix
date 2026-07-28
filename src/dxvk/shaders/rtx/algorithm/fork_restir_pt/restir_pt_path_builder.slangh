@@ -39,12 +39,24 @@
 // is the path the reservoir stores.
 //
 // The reference's own framing (:23) is worth keeping in mind: this "builds a
-// Path and a PathPrefix". In phase 2 there is no prefix, because there is no
-// reconnection vertex -- rcVertexLength is pinned at kRestirPtMaximumPathLength
-// so `is_rcVertex` is never true and the rcVertex bookkeeping is dead code. It
-// is ported anyway, with pins, so phase 3/5 can light it up by changing where
-// rcVertexLength is set rather than by writing new code against a stale memory
-// of the reference.
+// Path and a PathPrefix".
+//
+// PHASE 3 lit this up. rcVertexLength is no longer pinned: the trace core sets it
+// to 1 at the first indirect hit (restir_pt_trace_core.slangh, the reconnection
+// bookkeeping block), which is the port of the reference's
+// `!useHybridShift && path.length == 1` branch (PathTracer.slang:1171-1191). So
+// `is_rcVertex` below now fires -- on exactly the terminals that sit AT the
+// reconnection vertex -- and with it the two irradiance conversions and the
+// rcVertexWi overwrite. Nothing in this file changed to make that happen, which
+// was the point of porting it in phase 2.
+//
+// PATH LENGTH CONVENTION, restated because phase 2 got one site wrong and phase 3
+// reads it: `pathLength` is the index of the LAST SCATTERING VERTEX, primary
+// being 0. An NEE terminal at vertex k stores k (the light vertex is excluded); an
+// emissive hit at vertex k stores k-1 (the hit IS the light vertex); an escape
+// launched from vertex k stores k. The reference gets the last of those for free
+// because it only increments path.length on a hit; this kernel numbers segments
+// instead, so its escape site subtracts one explicitly.
 
 // The reference gates every add on `pathLength >= 1`
 // (PathBuilder.slang:63 and :123). FORK DEVIATION: the fork uses 0.
@@ -103,8 +115,9 @@ struct RestirPtPathBuilder
     rcVertexWi = vec3(0.0f);
     rcVertexHit = RestirPtHit::createInvalid();
 
-    // PHASE 2: pinned, so `is_rcVertex` below is never true. Phase 3/5 set this
-    // from the hybrid-shift heuristics instead.
+    // "No reconnection vertex chosen yet". The trace core lowers this to 1 at the
+    // first indirect hit; a path that never hits anything (a bounce-1 sky escape)
+    // leaves it here, which is what markEscapeVertexAsRcVertex tests against.
     rcVertexLength = kRestirPtMaximumPathLength;
     pathFlags.flags = 0;
     cachedJacobian = vec3(1.0f);
@@ -127,8 +140,9 @@ struct RestirPtPathBuilder
   //
   //   pathWeight     the candidate's full contribution (target function input)
   //   postfixWeight  the suffix contribution measured from the reconnection
-  //                  vertex; equal to pathWeight in phase 2 because the prefix
-  //                  throughput is identically 1 (RestirPtPathState::getCurrentThp)
+  //                  vertex outward, i.e. path.thp rather than getCurrentThp().
+  //                  This is what a shift re-attaches to a DIFFERENT prefix, so
+  //                  the prefix must not be baked into it.
   //   rrPdf          Russian roulette survival pdf -- the RIS source pdf
   [mutating] bool addEscapeVertex(
     int pathLength, vec3 wi, vec3 pathWeight, vec3 postfixWeight,
@@ -159,7 +173,7 @@ struct RestirPtPathBuilder
         pathReservoir.srcPixel = cachedSrcPixel;
         pathReservoir.srcFrameIdx = cachedSrcFrameIdx;
 
-        if (is_rcVertex)  // dead in phase 2, see the file header
+        if (is_rcVertex)  // live from phase 3, see the file header
         {
           pathReservoir.rcVertexWi = wi;
           // Exclude the last-vertex-dependent MIS weight.  ports :106
@@ -207,7 +221,7 @@ struct RestirPtPathBuilder
         pathReservoir.srcPixel = cachedSrcPixel;
         pathReservoir.srcFrameIdx = cachedSrcFrameIdx;
 
-        if (is_rcVertex)  // dead in phase 2, see the file header
+        if (is_rcVertex)  // live from phase 3, see the file header
         {
           // ports :170 -- convert to irradiance measured against the light pdf.
           pathReservoir.rcVertexIrradiance = pathReservoir.rcVertexIrradiance * lightPdf / misWeight;
@@ -223,9 +237,12 @@ struct RestirPtPathBuilder
   }
 
   // ports :182-197. Promotes the just-added escape vertex to the reconnection
-  // vertex. DEAD IN PHASE 2 -- rcVertexLength never moves off
-  // kRestirPtMaximumPathLength, so no caller reaches this. Ported now so phase 5's
-  // hybrid shift starts from a transcription rather than a rewrite.
+  // vertex. LIVE FROM PHASE 3, for one case only: a path whose FIRST scatter left
+  // the scene, where there is no hit to reconnect at and the escape direction
+  // itself becomes the reconnection "vertex" (the shift consumes it at
+  // Shift.slang:403-432). The reference reaches this only under the hybrid shift;
+  // dropping that gate is a deliberate fork deviation behind a live knob -- see
+  // the call site in restir_pt_trace_core.slangh.
   [mutating] void markEscapeVertexAsRcVertex(
     int pathLength, inout RestirPtReservoir pathReservoir, RestirPtHit hit,
     bool isDelta, bool isTransmission, bool isSpecularBounce,

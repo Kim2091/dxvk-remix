@@ -39,6 +39,7 @@
 #include "rtx_imgui.h"
 
 #include <rtx_shaders/fork_restir_pt_trace.h>
+#include <rtx_shaders/fork_restir_pt_spatial_reuse.h>
 #include <rtx_shaders/fork_restir_pt_final_shading.h>
 
 namespace dxvk {
@@ -74,6 +75,12 @@ namespace dxvk {
     // reservoir flags (ReSTIRPTPass/PathReservoir.slang:21-140) -- exceeding it
     // here would silently truncate on store.
     constexpr int kRestirPtMaxBouncesLimit = 15;
+
+    // Reservoir pages in the single reservoir allocation. Two, because spatial
+    // reuse round r reads page r % 2 and writes page (r + 1) % 2; reusing in place
+    // is a data race by construction. Phase 4 decides whether temporal history
+    // wants a third page or swap bookkeeping.
+    constexpr uint32_t kRestirPtReservoirPageCount = 2u;
 
     RemixGui::ComboWithKey<DxvkForkReSTIRPTRayQuery::EmissiveMisMode> emissiveMisModeCombo {
       "Emissive MIS Mode",
@@ -144,6 +151,46 @@ namespace dxvk {
       END_PARAMETER()
     };
 
+    // Spatial reuse cap. Each round is a full dispatch with 2 * neighbourCount
+    // reconnection shifts per pixel, so both of these are deliberately small.
+    constexpr int kRestirPtMaxSpatialNeighbors = 8;
+    constexpr int kRestirPtMaxSpatialRounds = 3;
+
+    class ForkReSTIRPTSpatialReuseShader : public ManagedShader
+    {
+      SHADER_SOURCE(ForkReSTIRPTSpatialReuseShader, VK_SHADER_STAGE_COMPUTE_BIT, fork_restir_pt_spatial_reuse)
+
+      BINDLESS_ENABLED()
+
+      // The round index rides in ForkReSTIRPTArgs::mode -- see the DUAL USE note
+      // where the struct is declared.
+      PUSH_CONSTANTS(ForkReSTIRPTArgs)
+
+      BEGIN_PARAMETER()
+        COMMON_RAYTRACING_BINDINGS
+
+        // Inputs -- primary G-buffer
+        TEXTURE2D(FORK_RESTIR_PT_SR_BINDING_WORLD_SHADING_NORMAL_INPUT)
+        TEXTURE2D(FORK_RESTIR_PT_SR_BINDING_PERCEPTUAL_ROUGHNESS_INPUT)
+        TEXTURE2D(FORK_RESTIR_PT_SR_BINDING_HIT_DISTANCE_INPUT)
+        TEXTURE2D(FORK_RESTIR_PT_SR_BINDING_ALBEDO_INPUT)
+        TEXTURE2D(FORK_RESTIR_PT_SR_BINDING_BASE_REFLECTIVITY_INPUT)
+        TEXTURE2D(FORK_RESTIR_PT_SR_BINDING_WORLD_POSITION_INPUT)
+        TEXTURE2D(FORK_RESTIR_PT_SR_BINDING_VIEW_DIRECTION_INPUT)
+        TEXTURE2D(FORK_RESTIR_PT_SR_BINDING_CONE_RADIUS_INPUT)
+        TEXTURE2D(FORK_RESTIR_PT_SR_BINDING_POSITION_ERROR_INPUT)
+        TEXTURE2D(FORK_RESTIR_PT_SR_BINDING_SHARED_FLAGS_INPUT)
+        TEXTURE2D(FORK_RESTIR_PT_SR_BINDING_SHARED_SURFACE_INDEX_INPUT)
+        TEXTURE2D(FORK_RESTIR_PT_SR_BINDING_SUBSURFACE_DATA_INPUT)
+        TEXTURE2D(FORK_RESTIR_PT_SR_BINDING_SUBSURFACE_DIFFUSION_PROFILE_DATA_INPUT)
+
+        // Reservoir ping-pong (two slices of one allocation)
+        STRUCTURED_BUFFER(FORK_RESTIR_PT_SR_BINDING_RESERVOIR_INPUT)
+        RW_STRUCTURED_BUFFER(FORK_RESTIR_PT_SR_BINDING_RESERVOIR_OUTPUT)
+
+      END_PARAMETER()
+    };
+
     class ForkReSTIRPTFinalShadingShader : public ManagedShader
     {
       SHADER_SOURCE(ForkReSTIRPTFinalShadingShader, VK_SHADER_STAGE_COMPUTE_BIT, fork_restir_pt_final_shading)
@@ -178,6 +225,7 @@ namespace dxvk {
 
     if (RtxOptions::useReSTIRPT()) {
       ForkReSTIRPTFinalShadingShader::getShader();
+      ForkReSTIRPTSpatialReuseShader::getShader();
     }
   }
 
@@ -204,6 +252,18 @@ namespace dxvk {
     RemixGui::DragFloat("Delta Roughness Threshold", &deltaRoughnessThresholdObject(), 0.0001f, 0.0f, 1.0f, "%.4f", ImGuiSliderFlags_AlwaysClamp);
     emissiveMisModeCombo.getKey(&emissiveMisModeObject());
     RemixGui::Checkbox("NEE Cache Task Feedback", &neeCacheTaskFeedbackObject());
+
+    // Phase 3. Every one of these has to be flippable live: the phase's whole
+    // verification story is stare-and-toggle A/Bs (reuse on/off must be
+    // energy-neutral, sky reconnection on/off must be energy-neutral, and the
+    // count/radius/rounds sweep is how the correlation artifact is tuned down).
+    ImGui::Separator();
+    RemixGui::Checkbox("Spatial Reuse", &enableSpatialReuseObject());
+    RemixGui::DragInt("Spatial Neighbor Count", &spatialNeighborCountObject(), 0.1f, 1, kRestirPtMaxSpatialNeighbors, "%d", ImGuiSliderFlags_AlwaysClamp);
+    RemixGui::DragFloat("Spatial Radius (px)", &spatialRadiusObject(), 0.5f, 1.0f, 100.0f, "%.1f", ImGuiSliderFlags_AlwaysClamp);
+    RemixGui::DragInt("Spatial Rounds", &spatialRoundsObject(), 0.05f, 1, kRestirPtMaxSpatialRounds, "%d", ImGuiSliderFlags_AlwaysClamp);
+    RemixGui::DragFloat("Jacobian Rejection Threshold", &jacobianRejectionThresholdObject(), 0.1f, 0.0f, 50.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+    RemixGui::Checkbox("Sky Reconnection", &spatialSkyReconnectionObject());
   }
 
   void DxvkForkReSTIRPTRayQuery::setRaytraceArgs(RaytraceArgs& constants) const {
@@ -230,7 +290,25 @@ namespace dxvk {
     const uint32_t misMode = std::min(static_cast<uint32_t>(emissiveMisMode()), RESTIR_PT_EMISSIVE_MIS_MODE_MASK);
     flags |= (misMode & RESTIR_PT_EMISSIVE_MIS_MODE_MASK) << RESTIR_PT_EMISSIVE_MIS_MODE_SHIFT;
 
+    // Note: the spatial reuse flag gates the reuse SHADER only. The trace kernel
+    // records reconnection data unconditionally, which is what makes "reuse off"
+    // reproduce the phase 2 image rather than a differently-built reservoir.
+    if (enableSpatialReuse()) {
+      flags |= RESTIR_PT_FLAG_SPATIAL_REUSE;
+    }
+
+    if (spatialSkyReconnection()) {
+      flags |= RESTIR_PT_FLAG_SPATIAL_SKY_RECONNECTION;
+    }
+
     constants.restirPtFlags = flags;
+
+    constants.restirPtSpatialNeighborCount =
+      static_cast<uint32_t>(std::clamp(spatialNeighborCount(), 1, kRestirPtMaxSpatialNeighbors));
+    constants.restirPtSpatialRounds =
+      static_cast<uint32_t>(std::clamp(spatialRounds(), 1, kRestirPtMaxSpatialRounds));
+    constants.restirPtSpatialRadius = std::max(1.0f, spatialRadius());
+    constants.restirPtJacobianRejectionThreshold = jacobianRejectionThreshold();
   }
 
   void DxvkForkReSTIRPTRayQuery::onFrameBegin(Rc<DxvkContext>& ctx, const FrameBeginContext& frameBeginCtx) {
@@ -274,7 +352,12 @@ namespace dxvk {
     m_allocatedForIndirectMode = RtxOptions::useReSTIRPT();
 
     if (m_allocatedForIndirectMode) {
-      bufferInfo.size = static_cast<VkDeviceSize>(paddedPixels) * RESTIR_PT_RESERVOIR_SIZE_BYTES;
+      // TWO pages, ping-ponged by the spatial reuse rounds. Page stride is
+      // paddedPixels * 96 B; paddedPixels is a multiple of 256 (16x16 blocks), so
+      // the stride is a multiple of 24576 B and clears any plausible
+      // minStorageBufferOffsetAlignment by orders of magnitude.
+      m_reservoirPageSize = static_cast<VkDeviceSize>(paddedPixels) * RESTIR_PT_RESERVOIR_SIZE_BYTES;
+      bufferInfo.size = m_reservoirPageSize * kRestirPtReservoirPageCount;
 
       m_reservoirBuffer = ctx->getDevice()->createBuffer(
         bufferInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXBuffer, "ReSTIR PT Reservoir Buffer");
@@ -290,6 +373,16 @@ namespace dxvk {
   void DxvkForkReSTIRPTRayQuery::releaseDownscaledResource() {
     m_reservoirBuffer = nullptr;
     m_parityBuffer = nullptr;
+    m_reservoirPageSize = 0;
+  }
+
+  DxvkBufferSlice DxvkForkReSTIRPTRayQuery::reservoirPageSlice(uint32_t page) const {
+    assert(m_reservoirBuffer != nullptr && m_reservoirPageSize != 0);
+
+    return DxvkBufferSlice(
+      m_reservoirBuffer,
+      static_cast<VkDeviceSize>(page % kRestirPtReservoirPageCount) * m_reservoirPageSize,
+      m_reservoirPageSize);
   }
 
   void DxvkForkReSTIRPTRayQuery::dispatchTrace(RtxContext* ctx, const Resources::RaytracingOutput& rtOutput) {
@@ -362,7 +455,9 @@ namespace dxvk {
 
     if (indirectModeActive) {
       ctx->bindResourceBuffer(FORK_RESTIR_PT_BINDING_PARITY_INPUT_OUTPUT, DxvkBufferSlice(nullptr, 0, 0));
-      ctx->bindResourceBuffer(FORK_RESTIR_PT_BINDING_RESERVOIR_OUTPUT, DxvkBufferSlice(m_reservoirBuffer, 0, m_reservoirBuffer->info().size));
+      // Page 0 is always the trace pass's output; spatial round r then reads
+      // page r % 2 and writes page (r + 1) % 2.
+      ctx->bindResourceBuffer(FORK_RESTIR_PT_BINDING_RESERVOIR_OUTPUT, reservoirPageSlice(0u));
       ctx->bindResourceView(FORK_RESTIR_PT_BINDING_INDIRECT_RADIANCE_HIT_DISTANCE_OUTPUT, rtOutput.m_indirectRadianceHitDistance.view(Resources::AccessType::Write), nullptr);
     } else {
       // Debug harness: this pass must not touch the frame's real outputs, so the
@@ -407,11 +502,74 @@ namespace dxvk {
     }
   }
 
+  uint32_t DxvkForkReSTIRPTRayQuery::activeSpatialRounds() const {
+    if (!enableSpatialReuse()) {
+      return 0u;
+    }
+
+    return static_cast<uint32_t>(std::clamp(spatialRounds(), 1, kRestirPtMaxSpatialRounds));
+  }
+
+  void DxvkForkReSTIRPTRayQuery::dispatchSpatialReuse(RtxContext* ctx, const Resources::RaytracingOutput& rtOutput) {
+
+    const uint32_t rounds = activeSpatialRounds();
+
+    if (rounds == 0u) {
+      return;
+    }
+
+    ScopedGpuProfileZone(ctx, "ReSTIR PT Spatial Reuse");
+
+    const auto& numRaysExtent = rtOutput.m_compositeOutputExtent;
+    const VkExtent3D workgroups = util::computeBlockCount(numRaysExtent, VkExtent3D { 16, 16, 1 });
+
+    ctx->bindCommonRayTracingResources(rtOutput);
+
+    // The same 13-entry primary G-buffer set the trace pass binds, in the spatial
+    // slots -- RAB_GetGBufferSurface reads these by name.
+    ctx->bindResourceView(FORK_RESTIR_PT_SR_BINDING_WORLD_SHADING_NORMAL_INPUT, rtOutput.m_primaryWorldShadingNormal.view, nullptr);
+    ctx->bindResourceView(FORK_RESTIR_PT_SR_BINDING_PERCEPTUAL_ROUGHNESS_INPUT, rtOutput.m_primaryPerceptualRoughness.view, nullptr);
+    ctx->bindResourceView(FORK_RESTIR_PT_SR_BINDING_HIT_DISTANCE_INPUT, rtOutput.m_primaryHitDistance.view, nullptr);
+    ctx->bindResourceView(FORK_RESTIR_PT_SR_BINDING_ALBEDO_INPUT, rtOutput.m_primaryAlbedo.view, nullptr);
+    ctx->bindResourceView(FORK_RESTIR_PT_SR_BINDING_BASE_REFLECTIVITY_INPUT, rtOutput.m_primaryBaseReflectivity.view(Resources::AccessType::Read), nullptr);
+    ctx->bindResourceView(FORK_RESTIR_PT_SR_BINDING_WORLD_POSITION_INPUT, rtOutput.getCurrentPrimaryWorldPositionWorldTriangleNormal().view(Resources::AccessType::Read), nullptr);
+    ctx->bindResourceView(FORK_RESTIR_PT_SR_BINDING_VIEW_DIRECTION_INPUT, rtOutput.m_primaryViewDirection.view, nullptr);
+    ctx->bindResourceView(FORK_RESTIR_PT_SR_BINDING_CONE_RADIUS_INPUT, rtOutput.m_primaryConeRadius.view, nullptr);
+    ctx->bindResourceView(FORK_RESTIR_PT_SR_BINDING_POSITION_ERROR_INPUT, rtOutput.m_primaryPositionError.view, nullptr);
+    ctx->bindResourceView(FORK_RESTIR_PT_SR_BINDING_SHARED_FLAGS_INPUT, rtOutput.m_sharedFlags.view, nullptr);
+    ctx->bindResourceView(FORK_RESTIR_PT_SR_BINDING_SHARED_SURFACE_INDEX_INPUT, rtOutput.m_sharedSurfaceIndex.view(Resources::AccessType::Read), nullptr);
+    ctx->bindResourceView(FORK_RESTIR_PT_SR_BINDING_SUBSURFACE_DATA_INPUT, rtOutput.m_sharedSubsurfaceData.view, nullptr);
+    ctx->bindResourceView(FORK_RESTIR_PT_SR_BINDING_SUBSURFACE_DIFFUSION_PROFILE_DATA_INPUT, rtOutput.m_sharedSubsurfaceDiffusionProfileData.view, nullptr);
+
+    for (uint32_t round = 0u; round < rounds; ++round) {
+      ctx->setFramePassStage(RtxFramePassStage::ReSTIR_PT_SpatialReuse);
+
+      // Ping-pong. Round 0 reads what the trace pass wrote (page 0). The read and
+      // write slices are always different pages, so the automatic compute barriers
+      // DxvkContext::dispatch emits are what serialises one round against the next.
+      ctx->bindResourceBuffer(FORK_RESTIR_PT_SR_BINDING_RESERVOIR_INPUT, reservoirPageSlice(round));
+      ctx->bindResourceBuffer(FORK_RESTIR_PT_SR_BINDING_RESERVOIR_OUTPUT, reservoirPageSlice(round + 1u));
+
+      ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, ForkReSTIRPTSpatialReuseShader::getShader());
+
+      ForkReSTIRPTArgs pushArgs = {};
+      pushArgs.mode = round;  // dual use: the round index, see ForkReSTIRPTArgs.
+      ctx->pushConstants(0, sizeof(pushArgs), &pushArgs);
+
+      ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
+    }
+  }
+
   void DxvkForkReSTIRPTRayQuery::dispatchFinalShading(RtxContext* ctx, const Resources::RaytracingOutput& rtOutput) {
 
     if (!isActive() || !RtxOptions::useReSTIRPT() || m_reservoirBuffer == nullptr) {
       return;
     }
+
+    // Spatial reuse runs here rather than from rtx_context.cpp: it sits between
+    // the trace pass and final shading, both of which this class already owns, so
+    // phase 3 adds no new dispatch site upstream.
+    dispatchSpatialReuse(ctx, rtOutput);
 
     ScopedGpuProfileZone(ctx, "ReSTIR PT Final Shading");
     ctx->setFramePassStage(RtxFramePassStage::ReSTIR_PT_FinalShading);
@@ -423,7 +581,8 @@ namespace dxvk {
 
     ctx->bindResourceView(FORK_RESTIR_PT_FS_BINDING_SHARED_FLAGS_INPUT, rtOutput.m_sharedFlags.view, nullptr);
     ctx->bindResourceView(FORK_RESTIR_PT_FS_BINDING_PRIMARY_CONE_RADIUS_INPUT, rtOutput.m_primaryConeRadius.view, nullptr);
-    ctx->bindResourceBuffer(FORK_RESTIR_PT_FS_BINDING_RESERVOIR_INPUT, DxvkBufferSlice(m_reservoirBuffer, 0, m_reservoirBuffer->info().size));
+    // Whichever page the last spatial round wrote -- page 0 when reuse is off.
+    ctx->bindResourceBuffer(FORK_RESTIR_PT_FS_BINDING_RESERVOIR_INPUT, reservoirPageSlice(activeSpatialRounds()));
 
     // ReadWrite: integrate_nee already wrote these and its contribution has to
     // survive. Same access pattern ReSTIR GI final shading uses

@@ -105,8 +105,40 @@
 #define FORK_RESTIR_PT_FS_BINDING_PRIMARY_INDIRECT_DIFFUSE_INPUT_OUTPUT  133
 #define FORK_RESTIR_PT_FS_BINDING_PRIMARY_INDIRECT_SPECULAR_INPUT_OUTPUT 134
 
+// --- Spatial reuse pass (phase 3; separate pipeline, own descriptor set) -----
+// The same 13-entry primary G-buffer set the trace pass binds at 100-112, in new
+// slots: RAB_GetGBufferSurface reads those globals BY NAME under
+// RAB_HAS_CURRENT_GBUFFER, so the names are fixed and only the numbers differ.
+// Deliberately absent: the NEE cache (the reconnection shift never evaluates it --
+// see the accepted-bias note in the spatial pass), the sky probe (the shift reads
+// stored irradiance, it never re-evaluates the sky) and the parity buffer.
+//
+// 135-152 was re-grepped against every src/dxvk/shaders/rtx/pass/**/
+// *_binding_indices.h before being claimed; bindings are per-pipeline, and within
+// this pipeline the only other occupants are COMMON_RAYTRACING_BINDINGS (0-19 and
+// the fork atmosphere range 200-215).
+#define FORK_RESTIR_PT_SR_BINDING_WORLD_SHADING_NORMAL_INPUT               135
+#define FORK_RESTIR_PT_SR_BINDING_PERCEPTUAL_ROUGHNESS_INPUT               136
+#define FORK_RESTIR_PT_SR_BINDING_HIT_DISTANCE_INPUT                       137
+#define FORK_RESTIR_PT_SR_BINDING_ALBEDO_INPUT                             138
+#define FORK_RESTIR_PT_SR_BINDING_BASE_REFLECTIVITY_INPUT                  139
+#define FORK_RESTIR_PT_SR_BINDING_WORLD_POSITION_INPUT                     140
+#define FORK_RESTIR_PT_SR_BINDING_VIEW_DIRECTION_INPUT                     141
+#define FORK_RESTIR_PT_SR_BINDING_CONE_RADIUS_INPUT                        142
+#define FORK_RESTIR_PT_SR_BINDING_POSITION_ERROR_INPUT                     143
+#define FORK_RESTIR_PT_SR_BINDING_SHARED_FLAGS_INPUT                       144
+#define FORK_RESTIR_PT_SR_BINDING_SHARED_SURFACE_INDEX_INPUT               145
+#define FORK_RESTIR_PT_SR_BINDING_SUBSURFACE_DATA_INPUT                    146
+#define FORK_RESTIR_PT_SR_BINDING_SUBSURFACE_DIFFUSION_PROFILE_DATA_INPUT  147
+
+// Reservoir ping-pong. Both are slices of the SAME two-page buffer; the host
+// swaps which page each one points at per round, so the shader keeps addressing
+// through restirPtReservoirIndex and never learns about paging.
+#define FORK_RESTIR_PT_SR_BINDING_RESERVOIR_INPUT                          148
+#define FORK_RESTIR_PT_SR_BINDING_RESERVOIR_OUTPUT                         149
+
 #define FORK_RESTIR_PT_MIN_BINDING   FORK_RESTIR_PT_BINDING_WORLD_SHADING_NORMAL_INPUT
-#define FORK_RESTIR_PT_MAX_BINDING   FORK_RESTIR_PT_FS_BINDING_PRIMARY_INDIRECT_SPECULAR_INPUT_OUTPUT
+#define FORK_RESTIR_PT_MAX_BINDING   FORK_RESTIR_PT_SR_BINDING_RESERVOIR_OUTPUT
 
 // Size of one RestirPtReservoir element, in bytes. Shared with the host so the
 // buffer allocation and the shader's structured-buffer stride can never drift.
@@ -133,11 +165,18 @@
 // state. Everything frame-constant (bounce cap, roughness thresholds, the
 // Russian roulette bit) stays in RaytraceArgs::restirPt*; only the mode rides
 // here.
+//
+// DUAL USE (phase 3): the spatial reuse pass dispatches the same struct with
+// `mode` carrying its ROUND INDEX instead, for the same reason -- 1..N rounds are
+// N dispatches inside one frame. The two passes are different pipelines and never
+// read each other's push constants, so the field is reused rather than widened;
+// widening it would mean growing a push-constant block that is otherwise exactly
+// the 16 bytes every backend guarantees.
 #define FORK_RESTIR_PT_MODE_TRACE         0u
 #define FORK_RESTIR_PT_MODE_REPLAY_VERIFY 1u
 
 struct ForkReSTIRPTArgs {
-  uint mode;   // FORK_RESTIR_PT_MODE_*
+  uint mode;   // trace pass: FORK_RESTIR_PT_MODE_*.  spatial pass: round index.
   uint pad0;
   uint pad1;
   uint pad2;

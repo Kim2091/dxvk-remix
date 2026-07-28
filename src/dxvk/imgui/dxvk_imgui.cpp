@@ -417,6 +417,7 @@ namespace dxvk {
       // aliasing-analyzer combo.
       { RtxFramePassStage::ReSTIR_PT_Trace, "ReSTIR_PT_Trace" },
       { RtxFramePassStage::ReSTIR_PT_ReplayVerify, "ReSTIR_PT_ReplayVerify" },
+      { RtxFramePassStage::ReSTIR_PT_SpatialReuse, "ReSTIR_PT_SpatialReuse" },
       { RtxFramePassStage::ReSTIR_PT_FinalShading, "ReSTIR_PT_FinalShading" },
       { RtxFramePassStage::Demodulate, "Demodulate" },
       { RtxFramePassStage::NRD, "NRD" },

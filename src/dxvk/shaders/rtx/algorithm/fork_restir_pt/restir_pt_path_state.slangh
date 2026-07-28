@@ -125,13 +125,28 @@ struct RestirPtPathState : IBasePayloadState
   float pdf;                  // Pdf that generated the in-flight scatter ray (pdfAll).  ports :77
   vec3 normal;                // Shading normal at the scatter ray origin (needed for MIS).  ports :78
   RestirPtHit hit;            // Hit info for the in-flight scatter ray.  ports :79
-  vec3 thp;                   // Path throughput.  ports :81
+  vec3 thp;                   // Path throughput, POSTFIX only from phase 3 on.  ports :81
+  // Throughput of the path PREFIX -- everything up to and including the scatter
+  // at the reconnection vertex. recordPrefixThp() moves thp into here and resets
+  // thp to 1, so `thp` afterwards measures the suffix alone. ports :82
+  vec3 prefixThp;
   vec3 L;                     // Accumulated path contribution.  ports :86
   vec3 LDeltaDirect;          // Direct lighting seen through delta/transmission chains.  ports :87
   float russianRoulettePdf;   // Product of survival probabilities.  ports :89
   float prevScatterPdf;       // Single-lobe pdf of the previous scatter.  ports :91
   float sceneLength;          // Path length in scene units, 0 at the primary hit.  ports :71
   float firstSegmentLength;   // Length of the first indirect segment (denoiser feed, phase 2).
+
+  // World position the in-flight scatter ray was LAUNCHED from, i.e. the previous
+  // path vertex. Stands in for the reference's `prevPathOrigin`
+  // (ReSTIRPTPass/PathTracer.slang:1130), which it can read straight off
+  // `path.origin` because Falcor has no resolve loop; here the resolve macro
+  // advances `path.origin` through every alpha / portal / decal continuation
+  // (resolve_expanded.slangh:176), so the launch point has to be kept separately
+  // or the reconnection geometry factor would measure from a foliage leaf rather
+  // than from the vertex that scattered. Written once per segment by
+  // restirPtTracePathInternal.
+  vec3 scatterRayOrigin;
 
   // --- dxvk-remix specific carry-over -------------------------------------
   float coneSpreadAngle;      // Ray-cone spread, fed into texture LOD by the resolver.
@@ -329,8 +344,23 @@ struct RestirPtPathState : IBasePayloadState
 
   // --- Throughput helpers -------------------------------------------------
 
-  // ports :114. The reference splits throughput into thp * prefixThp so the
-  // prefix up to the reconnection vertex can be factored out; phase 1 has no
-  // reconnection vertex, so the prefix is implicitly 1 and this is the identity.
-  vec3 getCurrentThp() { return thp; }
+  // ports :114. The full path throughput, prefix and suffix recombined. Every
+  // radiance ACCUMULATION site uses this, so path.L is unchanged by the split.
+  vec3 getCurrentThp() { return thp * prefixThp; }
+
+  // ports :115. Folds the throughput accumulated so far into the prefix and
+  // restarts `thp` at 1. Called after every scatter whose vertex index is at or
+  // before the reconnection vertex (PathTracer.slang:419-420), so that once the
+  // path passes the reconnection vertex, `thp` measures the SUFFIX alone -- which
+  // is exactly what the reservoir stores as rcVertexIrradiance and what the shift
+  // re-attaches to a different prefix.
+  //
+  // Phase 2 shipped this as the identity (prefix pinned to 1) because
+  // rcVertexLength was pinned at kRestirPtMaximumPathLength; phase 3 sets
+  // rcVertexLength = 1 at the first indirect hit, which makes the split real.
+  [mutating] void recordPrefixThp()
+  {
+    prefixThp *= thp;
+    thp = vec3(1.0f);
+  }
 };

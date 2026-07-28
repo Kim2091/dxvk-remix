@@ -1,0 +1,88 @@
+/*
+* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+#pragma once
+
+#include "rtx/pass/fork_restir_pt/fork_restir_pt_binding_indices.h"
+
+// ReSTIR PT (fork) -- spatial reuse pass bindings.
+//
+// Note: The global names below are not free choices -- RAB_GetGBufferSurface
+// (RtxdiApplicationBridge.slangh:286-324) reads them by name under
+// RAB_HAS_CURRENT_GBUFFER, so they must match restir_gi_reuse_bindings.slangh and
+// fork_restir_pt_bindings.slangh exactly. Only the slot numbers differ.
+
+// Inputs -- the primary G-buffer set.
+
+layout(r32ui, binding = FORK_RESTIR_PT_SR_BINDING_WORLD_SHADING_NORMAL_INPUT)
+Texture2D<uint> PrimaryWorldShadingNormal;
+
+layout(r8, binding = FORK_RESTIR_PT_SR_BINDING_PERCEPTUAL_ROUGHNESS_INPUT)
+Texture2D<float> PrimaryPerceptualRoughness;
+
+layout(r32f, binding = FORK_RESTIR_PT_SR_BINDING_HIT_DISTANCE_INPUT)
+Texture2D<float> PrimaryHitDistance;
+
+layout(rgb10_a2, binding = FORK_RESTIR_PT_SR_BINDING_ALBEDO_INPUT)
+Texture2D<float4> PrimaryAlbedo;
+
+layout(rgb10_a2, binding = FORK_RESTIR_PT_SR_BINDING_BASE_REFLECTIVITY_INPUT)
+Texture2D<float4> PrimaryBaseReflectivity;
+
+layout(rgba32f, binding = FORK_RESTIR_PT_SR_BINDING_WORLD_POSITION_INPUT)
+Texture2D<float4> PrimaryWorldPositionWorldTriangleNormal;
+
+layout(rg16_snorm, binding = FORK_RESTIR_PT_SR_BINDING_VIEW_DIRECTION_INPUT)
+Texture2D<float2> PrimaryViewDirection;
+
+layout(r16f, binding = FORK_RESTIR_PT_SR_BINDING_CONE_RADIUS_INPUT)
+Texture2D<float> PrimaryConeRadius;
+
+layout(r32f, binding = FORK_RESTIR_PT_SR_BINDING_POSITION_ERROR_INPUT)
+Texture2D<float> PrimaryPositionError;
+
+layout(r16ui, binding = FORK_RESTIR_PT_SR_BINDING_SHARED_FLAGS_INPUT)
+Texture2D<uint16_t> SharedFlags;
+
+layout(r32ui, binding = FORK_RESTIR_PT_SR_BINDING_SHARED_SURFACE_INDEX_INPUT)
+Texture2D<uint> SharedSurfaceIndex;
+
+layout(rg16ui, binding = FORK_RESTIR_PT_SR_BINDING_SUBSURFACE_DATA_INPUT)
+Texture2D<uint2> SharedSubsurfaceData;
+
+layout(rg32ui, binding = FORK_RESTIR_PT_SR_BINDING_SUBSURFACE_DIFFUSION_PROFILE_DATA_INPUT)
+Texture2D<uint2> SharedSubsurfaceDiffusionProfileData;
+
+// Note: included HERE, after the G-buffer globals above, for the same include
+// ordering reason the trace pass documents -- RestirPtReservoir lives behind
+// rtx/algorithm/rtxdi/rtxdi.slangh, whose bridge reads those globals by name.
+#include "rtx/algorithm/fork_restir_pt/restir_pt_reservoir.slangh"
+
+// Reservoir ping-pong. Read-only input page, write-only output page: two slices
+// of one allocation, never the same page in the same dispatch. In-place reuse
+// would be a data race by construction (pixel A reads neighbour B while B's own
+// thread overwrites it), which is why the reference swaps buffers per round too
+// (ReSTIRPTPass.cpp:1665-1675).
+layout(binding = FORK_RESTIR_PT_SR_BINDING_RESERVOIR_INPUT)
+StructuredBuffer<RestirPtReservoir> RestirPtReservoirInput;
+
+layout(binding = FORK_RESTIR_PT_SR_BINDING_RESERVOIR_OUTPUT)
+RWStructuredBuffer<RestirPtReservoir> RestirPtReservoirOutput;

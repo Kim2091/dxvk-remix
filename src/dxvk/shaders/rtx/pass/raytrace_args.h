@@ -437,6 +437,15 @@ struct RaytraceArgs {
   float restirPtSpecularRoughnessThreshold;  // Perceptual roughness at or below which a non-diffuse lobe counts as a specular bounce.
   float restirPtDeltaRoughnessThreshold;     // Perceptual roughness below which opaque specular is classified as a delta event (reconnection forbidden).
 
+  // Fork (2026-07-28): ReSTIR PT phase 3, spatial reuse. ONE MORE COMPLETE
+  // 4-SCALAR (16-byte) GROUP, appended for the same reason and with the same
+  // constraint as the group above -- do not add a fifth scalar here, add the next
+  // complete group.
+  uint restirPtSpatialNeighborCount;         // Neighbours considered per spatial round.
+  uint restirPtSpatialRounds;                // Spatial reuse rounds per frame (each is one dispatch).
+  float restirPtSpatialRadius;               // Neighbour gather radius, in pixels.
+  float restirPtJacobianRejectionThreshold;  // Discard a shift when max(J, 1/J) > 1 + this. <= 0 disables (reference default).
+
   // NOTE: Add structs to the top section of RaytraceArgs, not the bottom.
   // NOTE: bool does not work in debug builds, use uint instead.
 };
@@ -471,3 +480,11 @@ struct RaytraceArgs {
 #define RESTIR_PT_EMISSIVE_MIS_SUPPRESS         0u  // Reference behaviour: drop length-1 emissive as "direct".
 #define RESTIR_PT_EMISSIVE_MIS_NONE             1u  // Weight 1 everywhere: double-counts against integrate_nee.
 #define RESTIR_PT_EMISSIVE_MIS_NEE_CACHE        2u  // Default: BSDF-side MIS against the NEE cache at length 1.
+
+// Phase 3. Bit 6 gates the spatial reuse pass; the trace kernel is unaffected by
+// it (it always records reconnection data, which is what keeps reuse-off equal to
+// phase 2). Bit 7 gates the sky-reconnection deviation -- promoting a bounce-1 sky
+// escape to a reconnection vertex, which the reference only does under the hybrid
+// shift; off reproduces strict reference behaviour outdoors.
+#define RESTIR_PT_FLAG_SPATIAL_REUSE            (1u << 6)
+#define RESTIR_PT_FLAG_SPATIAL_SKY_RECONNECTION (1u << 7)

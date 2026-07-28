@@ -1,0 +1,815 @@
+/*
+* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+/*
+* Portions of this file are a port of the ReSTIR PT reference implementation:
+*   Copyright (c) 2022, Daqi Lin.  All rights reserved.
+*   ReSTIR_PT/Source/RenderPasses/ReSTIRPTPass/Shift.slang
+* Licensed under BSD-3-Clause (see ThirdPartyLicenses.txt, "ReSTIR PT" entry).
+*/
+#pragma once
+
+#include "rtx/algorithm/fork_restir_pt/restir_pt_reservoir.slangh"
+
+// ReSTIR PT (fork) -- the RECONNECTION shift and its BSDF evaluation helpers.
+//
+// ports ReSTIRPTPass/Shift.slang:224-227 (isJacobianInvalid), :383-572
+// (computeShiftedIntegrandReconnection) and :575-630 (the merge wrappers), with
+// `useHybridShift` and `useCachedJacobian` compiled in as FALSE. Both parameters
+// are kept as named constants below rather than deleted, so phase 5's hybrid
+// shift extends this file instead of rewriting it.
+//
+// WHAT A SHIFT IS, in one paragraph, because everything else here is arithmetic.
+// A reservoir at pixel S stores a path that starts at S's primary surface,
+// scatters once, and reaches a *reconnection vertex* (rcVertex) -- in pure
+// reconnection mode always the first indirect hit, or, for a path whose first
+// scatter left the scene, the escape direction itself. Everything beyond that
+// vertex is frozen into a single number, `rcVertexIrradiance`. Shifting that path
+// onto pixel D means: throw away S's first segment, draw a new first segment from
+// D's primary surface to the SAME rcVertex, and re-evaluate only the two BSDF
+// factors that changed -- D's primary BSDF along the new connection direction, and
+// the rcVertex's BSDF for the new incident direction. The Jacobian is the density
+// ratio of that reparametrisation: a solid-angle-to-area geometry term ratio times
+// a BSDF-sampling pdf ratio.
+//
+// PDF / EVAL CONVENTION, the classic place a GRIS port goes silently wrong.
+// Every ratio below is formed with ONE helper pair (restirPtEvalPdfBsdf /
+// restirPtEvalBsdfCosine) applied identically on the src and dst sides, and both
+// mirror the reference's kSeparatePathBSDF semantics: `pdfSingle` is the sum of
+// the ALLOWED lobe class's selection-weighted solid-angle pdfs (BxDF.slang:1022-1051)
+// and `pdfAll` is the same sum over every lobe. The trace kernel folds
+// f*cos / (lobeSolidAnglePdf * lobeSelectionPdf) per sampled lobe
+// (restir_pt_trace_core.slangh restirPtSampleScatterDirection), which is exactly
+// f*cos / pdfSingle for a one-lobe class. For the two-lobe diffuse class
+// (diffuseReflection + diffuseTransmission) they differ, and only on
+// thin-translucent materials -- debug view 887 is the designed detector.
+//
+// ENHANCED SEAMS kept deliberately:
+//   - restirPtReconstructRcVertex is a standalone function; Enhanced 4
+//     (scene-independent reconnection criteria) and 6.2.3 (forced-NEE light
+//     reconnection) both want to reuse it.
+//   - restirPtReconnectionGeometryJacobian is a pure function of positions and one
+//     normal, so the unit test can mirror it on the CPU.
+
+// The two reference parameters this phase pins. Named rather than inlined so the
+// phase 5 diff is a parameter change, not a rewrite.
+//   ports Shift.slang:385 -- `useHybridShift`, false here, so the shift's
+//   reconnection vertex is ALWAYS at path length 1 (:390) regardless of what the
+//   reservoir stored, and no random replay is ever needed.
+static const bool kRestirPtShiftUseHybridShift = false;
+//   ports Shift.slang:385 -- `useCachedJacobian`, false here, so both src-side
+//   pdfs are re-evaluated fresh at the source surface (:480, :500) instead of
+//   being read back from cachedJacobian.x/.y. That is what keeps trace-time pdf
+//   conventions out of phase 3's Jacobians entirely.
+static const bool kRestirPtShiftUseCachedJacobian = false;
+//   ports Shift.slang:390 -- the reconnection vertex index in pure reconnection.
+static const int kRestirPtShiftRcVertexLength = 1;
+
+// Lobe class mask. The reference's SampledBSDFFlags are a 4-bit set over Falcor's
+// {DiffuseReflection, DiffuseTransmission, SpecularReflection,
+// SpecularReflectionTransmission}; getAllowedBSDFFlags returns 0xc for a specular
+// bounce and 0x3 for a diffuse one (PathTracer.slang:37-41). dxvk-remix's opaque
+// material has three non-delta lobes and no specular transmission (that lives on
+// the translucent material, which is a pure delta chain here and can never host a
+// reconnection), so the mapping is:
+//
+//   reference DiffuseReflection            -> opaqueLobeTypeDiffuseReflection
+//   reference DiffuseTransmission          -> opaqueLobeTypeDiffuseTransmission
+//   reference SpecularReflection           -> opaqueLobeTypeSpecularReflection
+//   reference SpecularReflectionTransmission -> (no twin)
+//
+// opacityTransmission is excluded on purpose: it is a dirac with no solid-angle
+// pdf, and the codebase's own all-lobe marginal leaves it out too
+// (opaque_surface_material_interaction.slangh:1822-1824).
+#define RESTIR_PT_LOBE_DIFFUSE_REFLECTION    (1u << 0)
+#define RESTIR_PT_LOBE_SPECULAR_REFLECTION   (1u << 1)
+#define RESTIR_PT_LOBE_DIFFUSE_TRANSMISSION  (1u << 2)
+
+static const uint kRestirPtLobeClassAll =
+  RESTIR_PT_LOBE_DIFFUSE_REFLECTION | RESTIR_PT_LOBE_SPECULAR_REFLECTION | RESTIR_PT_LOBE_DIFFUSE_TRANSMISSION;
+
+// ports getAllowedBSDFFlags, ReSTIRPTPass/PathTracer.slang:37-41 under
+// kSeparatePathBSDF.
+uint restirPtGetAllowedLobeClass(bool isSpecularBounce)
+{
+  return isSpecularBounce
+    ? RESTIR_PT_LOBE_SPECULAR_REFLECTION
+    : (RESTIR_PT_LOBE_DIFFUSE_REFLECTION | RESTIR_PT_LOBE_DIFFUSE_TRANSMISSION);
+}
+
+// ports ReSTIRPTPass/Shift.slang:224-227. Every Jacobian in this file is passed
+// through this before it is used or returned; a non-positive, NaN or infinite
+// Jacobian means the reparametrisation is degenerate and the shift contributes
+// nothing. Missing this is the classic firefly source in a resampling loop.
+bool restirPtIsJacobianInvalid(float jacobian)
+{
+  return jacobian <= 0.0f || isnan(jacobian) || isinf(jacobian);
+}
+
+// ports PathTracer::evalMIS, ReSTIRPTPass/PathTracer.slang:550-560, balance
+// heuristic branch (kMISHeuristic default).
+//
+// FORK ADDITION: the zero-sum guard. The reference divides unconditionally and
+// relies on its callers' downstream NaN checks; returning 0 here reaches the same
+// outcome (a zero integrand is rejected by the merge) without putting a NaN into
+// a product first.
+float restirPtEvalMIS(float n0, float p0, float n1, float p1)
+{
+  const float q0 = n0 * p0;
+  const float q1 = n1 * p1;
+  const float sum = q0 + q1;
+
+  return (sum > 0.0f) ? (q0 / sum) : 0.0f;
+}
+
+// ---------------------------------------------------------------------------
+// BSDF evaluation helpers
+// ---------------------------------------------------------------------------
+
+// ports evalBSDFCosine, Falcor Rendering/Materials/MaterialShading.slang:124.
+// The reference returns (f_d + f_r) * saturate(dot(N,L)) restricted to the allowed
+// lobe class; dxvk-remix's twin is the projected weight, already f*cos, split per
+// lobe (opaque_surface_material_interaction.slangh:1895).
+vec3 restirPtEvalBsdfCosine(
+  OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteraction,
+  MinimalRayInteraction minimalRayInteraction,
+  vec3 inputDirection,
+  uint allowedLobes)
+{
+  const SurfaceMaterialInteractionSplitWeight splitWeight =
+    opaqueSurfaceMaterialInteractionCalcProjectedWeight(
+      opaqueSurfaceMaterialInteraction, minimalRayInteraction, inputDirection);
+
+  vec3 weight = vec3(0.0f);
+
+  if ((allowedLobes & RESTIR_PT_LOBE_DIFFUSE_REFLECTION) != 0u)
+  {
+    weight += splitWeight.diffuseReflectionWeight;
+  }
+
+  if ((allowedLobes & RESTIR_PT_LOBE_SPECULAR_REFLECTION) != 0u)
+  {
+    weight += splitWeight.specularReflectionWeight;
+  }
+
+  if ((allowedLobes & RESTIR_PT_LOBE_DIFFUSE_TRANSMISSION) != 0u)
+  {
+    weight += splitWeight.diffuseTransmissionWeight;
+  }
+
+  return weight;
+}
+
+// ports evalPdfBSDF / evalPdfBSDFWithV, MaterialShading.slang:200-224, whose
+// bodies are FalcorBSDF::evalPdfAll (BxDF.slang:1022-1051). Returns the
+// class-restricted pdf and, through `pdfAll`, the full marginal the MIS weights
+// need.
+//
+// The "WithV" variant of the reference is reached here by handing in a
+// MinimalRayInteraction whose viewDirection has been replaced -- every consumer
+// below reads the view direction only through that struct, so there is nothing
+// else to substitute.
+float restirPtEvalPdfBsdf(
+  OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteraction,
+  MinimalRayInteraction minimalRayInteraction,
+  vec3 inputDirection,
+  uint allowedLobes,
+  out float pdfAll)
+{
+  pdfAll = 0.0f;
+
+  float diffuseReflectionProbability = 0.0f;
+  float specularReflectionProbability = 0.0f;
+  float opacityTransmissionProbability = 0.0f;
+  float diffuseTransmissionProbability = 0.0f;
+
+  const bool isValid = opaqueSurfaceMaterialInteractionCalcLobeProbability(
+    opaqueSurfaceMaterialInteraction, minimalRayInteraction.viewDirection,
+    diffuseReflectionProbability, specularReflectionProbability,
+    opacityTransmissionProbability, diffuseTransmissionProbability);
+
+  if (!isValid)
+  {
+    return 0.0f;
+  }
+
+  float pdfSingle = 0.0f;
+
+  if (diffuseReflectionProbability > 0.0f)
+  {
+    const float pdf = diffuseReflectionProbability *
+      opaqueSurfaceMaterialInteractionCalcDiffuseReflectionSolidAnglePdf(
+        opaqueSurfaceMaterialInteraction, minimalRayInteraction, inputDirection);
+
+    if ((allowedLobes & RESTIR_PT_LOBE_DIFFUSE_REFLECTION) != 0u) { pdfSingle += pdf; }
+    pdfAll += pdf;
+  }
+
+  if (specularReflectionProbability > 0.0f)
+  {
+    const float pdf = specularReflectionProbability *
+      opaqueSurfaceMaterialInteractionCalcSpecularReflectionSolidAnglePdf(
+        opaqueSurfaceMaterialInteraction, minimalRayInteraction, inputDirection);
+
+    if ((allowedLobes & RESTIR_PT_LOBE_SPECULAR_REFLECTION) != 0u) { pdfSingle += pdf; }
+    pdfAll += pdf;
+  }
+
+  if (diffuseTransmissionProbability > 0.0f)
+  {
+    const float pdf = diffuseTransmissionProbability *
+      opaqueSurfaceMaterialInteractionCalcDiffuseTransmissionSolidAnglePdf(
+        opaqueSurfaceMaterialInteraction, minimalRayInteraction, inputDirection);
+
+    if ((allowedLobes & RESTIR_PT_LOBE_DIFFUSE_TRANSMISSION) != 0u) { pdfSingle += pdf; }
+    pdfAll += pdf;
+  }
+
+  return pdfSingle;
+}
+
+// Thin wrappers for the primary surfaces, which arrive as an RAB_Surface.
+
+vec3 restirPtEvalBsdfCosine(RAB_Surface surface, vec3 inputDirection, uint allowedLobes)
+{
+  return restirPtEvalBsdfCosine(
+    surface.opaqueSurfaceMaterialInteraction, surface.minimalRayInteraction, inputDirection, allowedLobes);
+}
+
+float restirPtEvalPdfBsdf(RAB_Surface surface, vec3 inputDirection, uint allowedLobes, out float pdfAll)
+{
+  return restirPtEvalPdfBsdf(
+    surface.opaqueSurfaceMaterialInteraction, surface.minimalRayInteraction, inputDirection, allowedLobes, pdfAll);
+}
+
+// ---------------------------------------------------------------------------
+// Reconnection-vertex reconstruction
+// ---------------------------------------------------------------------------
+
+// ports loadShadingDataWithPrevVertexPosition (ReSTIRPTPass/LoadShadingData.slang:142-151),
+// used by the shift at Shift.slang:444. Rebuilds the full surface + material
+// interaction of a stored hit WITHOUT tracing a ray, from the (surfaceIndex,
+// primitiveIndex, barycentrics) triple the reservoir carries, and orients it
+// toward `prevVertexPosition` -- which for a shift is the DESTINATION pixel's
+// primary vertex, not the one the path originally came from. That substitution is
+// the entire shift.
+//
+// Shaped after nee_cache_light.slangh:126-148 but deliberately WITHOUT its
+// USE_SIMPLIFIED_MODEL shortcuts: that path forces isStatic/isMatte and drops the
+// normal buffer because it only needs emitted radiance, whereas the shift needs
+// honest roughness, albedo and shading normals to re-evaluate a BSDF.
+//
+// Known approximation, matching the NEE cache's: the surface interaction is built
+// with a zero view direction, so the triangle normal is NOT flipped toward the
+// viewer and the shading normals are not bent. Both are no-ops for the hits this
+// can see -- the trace loop culls back faces (restir_pt_trace_core.slangh sets
+// RAY_FLAG_CULL_BACK_FACING_TRIANGLES outside a medium), so a stored rcVertex is
+// front-facing by construction, and getBentNormal is the identity at a zero view
+// direction (math.slangh:504-519). The MATERIAL interaction, which is the one that
+// decides shading-normal orientation and the tangent frame, does get the true view
+// direction. Doing it otherwise would need two full vertex reconstructions per
+// shift, and there are 2N of them per pixel per round.
+//
+// Returns false when the hit is invalid or its material is not opaque -- a
+// translucent or ray-portal rcVertex is a delta chain in this port and can never
+// host a reconnection. The delta flags already reject those; this is the belt to
+// those braces.
+bool restirPtReconstructRcVertex(
+  RestirPtHit hit,
+  vec3 prevVertexPosition,
+  float coneRadius,
+  float spreadAngle,
+  inout SurfaceInteraction surfaceInteraction,
+  inout MinimalRayInteraction minimalRayInteraction,
+  inout OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteraction)
+{
+  // Note: the three interactions are `inout`, not `out`, and are left untouched on
+  // the failure paths below. SurfaceInteraction and RayInteraction both inherit
+  // from their Minimal counterparts, which Slang refuses to build an initializer
+  // list for ("cannot use initializer list for type"), so there is no cheap empty
+  // value to write; every caller reads them only when this returns true. Same
+  // pattern the trace core uses for its OpaqueSurfaceMaterialInteraction.
+  if (!hit.isValid())
+  {
+    return false;
+  }
+
+  const MemoryPolymorphicSurfaceMaterial memoryPolymorphicSurfaceMaterial = surfaceMaterials[hit.surfaceIndex];
+
+  if (!memoryPolymorphicSurfaceMaterial.isOpaque())
+  {
+    return false;
+  }
+
+  const Surface surface = surfaces[hit.surfaceIndex];
+
+  RayInteraction rayInteraction;
+  rayInteraction.hitDistance = 0.0f;
+  rayInteraction.materialType = uint8_t(surfaceMaterialTypeOpaque);
+  rayInteraction.isViewModel = false;
+  rayInteraction.frontHit = true;
+  rayInteraction.viewDirection = vec3(0.0f);
+  rayInteraction.surfaceIndex = hit.surfaceIndex;
+  rayInteraction.primitiveIndex = hit.primitiveIndex;
+  rayInteraction.barycentricCoordinates = barycentricsToUint(hit.barycentrics);
+  rayInteraction.coneRadius = coneRadius;
+
+  Ray ray = (Ray) 0;
+  ray.origin = prevVertexPosition;
+  ray.spreadAngle = spreadAngle;
+
+  // kFootprintFromRayOrigin: the texture footprint is derived from
+  // (position - ray.origin), so it needs no ray direction -- which is exactly the
+  // chicken-and-egg this single-pass reconstruction has to avoid
+  // (surface_interaction.slangh:620-622).
+  surfaceInteraction = surfaceInteractionCreate<SurfaceGenerateTangents>(
+    surface, rayInteraction, ray, /*usePreviousPositions=*/ false, kFootprintFromRayOrigin);
+
+  // Now that the position is known, the honest view direction is too: from the
+  // reconnection vertex back toward the destination pixel's primary vertex. Twin
+  // of the reference's `viewDir = normalize(prevVertexPosition - v.posW)`
+  // (LoadShadingData.slang:147).
+  rayInteraction.viewDirection = safeNormalize(prevVertexPosition - surfaceInteraction.position, vec3(0.0f, 0.0f, 1.0f));
+
+  const OpaqueSurfaceMaterial opaqueSurfaceMaterial = opaqueSurfaceMaterialCreate(memoryPolymorphicSurfaceMaterial);
+
+  opaqueSurfaceMaterialInteraction = opaqueSurfaceMaterialInteractionCreate(
+    opaqueSurfaceMaterial, surface, surfaceInteraction, rayInteraction);
+
+  minimalRayInteraction = rayInteraction;
+
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// The reconnection Jacobian's geometry term
+// ---------------------------------------------------------------------------
+
+// ports ReSTIRPTPass/Shift.slang:450-469. The solid-angle-to-area change of
+// variables for moving the connection segment from srcPrimaryPos to dstPrimaryPos
+// while keeping the reconnection vertex fixed:
+//
+//   J_geom = [cos(theta_dst) / d_dst^2] / [cos(theta_src) / d_src^2]
+//
+// with theta measured against the reconnection vertex's TRIANGLE normal on both
+// sides (the reference uses sd.faceN twice; dxvk-remix's twin is
+// SurfaceInteraction::geometryNormal, not the shading normal).
+//
+// Pure function of five vectors so tests/rtx/unit/test_fork_restir_pt_reservoir.cpp
+// can mirror it and assert J(a->b) * J(b->a) == 1 and J(a->a) == 1.
+float restirPtReconnectionGeometryJacobian(
+  vec3 dstPrimaryPosition, vec3 srcPrimaryPosition, vec3 rcPosition, vec3 rcFaceNormal)
+{
+  const vec3 shiftedDisplacement = rcPosition - dstPrimaryPosition;
+  const float shiftedDistanceSquared = dot(shiftedDisplacement, shiftedDisplacement);
+  const vec3 shiftedDirection = safeNormalize(shiftedDisplacement, vec3(0.0f, 0.0f, 1.0f));
+  const float shiftedCosine = abs(dot(rcFaceNormal, shiftedDirection));
+
+  const vec3 originalDisplacement = rcPosition - srcPrimaryPosition;
+  const float originalDistanceSquared = dot(originalDisplacement, originalDisplacement);
+  const vec3 originalDirection = safeNormalize(originalDisplacement, vec3(0.0f, 0.0f, 1.0f));
+  const float originalCosine = abs(dot(rcFaceNormal, originalDirection));
+
+  if (shiftedDistanceSquared <= 0.0f || originalCosine <= 0.0f)
+  {
+    return 0.0f;
+  }
+
+  return (shiftedCosine / shiftedDistanceSquared) * originalDistanceSquared / originalCosine;
+}
+
+// ---------------------------------------------------------------------------
+// Visibility
+// ---------------------------------------------------------------------------
+
+// Replaces the reference's evalSegmentVisibility (ReSTIRPTPass/Shift.slang:633-654),
+// which is a binary occlusion test.
+//
+// FORK DEVIATION, and a deliberate improvement: dxvk-remix's traceVisibilityRay
+// folds volumetric attenuation and translucent / alpha-blend attenuation into
+// `attenuation` unconditionally (visibility.slangh:512-515). The caller multiplies
+// that into the shifted integrand rather than thresholding it, which keeps the
+// destination's connection segment consistent with what a natively traced dst path
+// would have seen -- there, the same attenuation lands in the prefix throughput.
+// (Phase 2 deviation D7 is what makes the two comparable in the first place.)
+VisibilityResult restirPtTraceShiftVisibility(
+  RAB_Surface dstPrimary, vec3 targetPosition, float tMaxFactor)
+{
+  uint8_t rayMask = uint8_t(OBJECT_MASK_OPAQUE | (dstPrimary.objectMask & OBJECT_MASK_ALL_DYNAMIC));
+  rayMask |= cb.enableIndirectTranslucentShadows ? uint8_t(OBJECT_MASK_TRANSLUCENT) : uint8_t(0);
+  rayMask |= cb.enableIndirectAlphaBlendShadows ? uint8_t(OBJECT_MASK_ALPHA_BLEND) : uint8_t(0);
+
+  return traceVisibilityRay<visibilityModeEnableTranslucentMaterials>(
+    dstPrimary.minimalSurfaceInteraction, targetPosition, rayMask,
+    invalidRayPortalIndex, dstPrimary.portalSpace, /*pomOpaqueSurfaceEncountered=*/ false,
+    dstPrimary.minimalRayInteraction.coneRadius, cb.screenSpacePixelSpreadHalfAngle, tMaxFactor);
+}
+
+// The direction-only form, for a reconnection vertex that is the environment
+// (ports the `isDirection` branch of evalSegmentVisibility, :639-641).
+VisibilityResult restirPtTraceShiftVisibilityDirectional(RAB_Surface dstPrimary, vec3 direction)
+{
+  uint8_t rayMask = uint8_t(OBJECT_MASK_OPAQUE | (dstPrimary.objectMask & OBJECT_MASK_ALL_DYNAMIC));
+  rayMask |= cb.enableIndirectTranslucentShadows ? uint8_t(OBJECT_MASK_TRANSLUCENT) : uint8_t(0);
+  rayMask |= cb.enableIndirectAlphaBlendShadows ? uint8_t(OBJECT_MASK_ALPHA_BLEND) : uint8_t(0);
+
+  Ray viewRay = (Ray) 0;
+  viewRay.spreadAngle = cb.screenSpacePixelSpreadHalfAngle;
+
+  MinimalRayInteraction minimalRayInteraction = (MinimalRayInteraction) 0;
+  minimalRayInteraction.coneRadius = dstPrimary.minimalRayInteraction.coneRadius;
+
+  // rayCreateDirection produces the correctly offset origin and an infinite tMax
+  // (ray.slangh:151-156), which is what "test along a direction" means.
+  const Ray visibilityRay = rayCreateDirection(
+    minimalRayInteraction, dstPrimary.minimalSurfaceInteraction, viewRay, direction, /*penetrateSurface=*/ false);
+
+  return traceVisibilityRay<visibilityModeEnableTranslucentMaterials>(
+    visibilityRay, rayMask, invalidRayPortalIndex, dstPrimary.portalSpace);
+}
+
+// ---------------------------------------------------------------------------
+// The reconnection shift
+// ---------------------------------------------------------------------------
+
+// ports ReSTIRPTPass/Shift.slang:383-572, verbatim in structure, with
+// useHybridShift == useCachedJacobian == false.
+//
+// Returns the shifted integrand (the destination pixel's contribution for the
+// source pixel's path) and writes the shift Jacobian to `dstJacobian`. Both are 0
+// when the shift is invalid, which every caller treats as "this neighbour offers
+// nothing" -- never as an error.
+//
+// `evalVisibility` is false only for the self-shift parity debug view, where the
+// connection segment is degenerate by construction.
+vec3 restirPtComputeShiftedIntegrandReconnection(
+  out float dstJacobian,
+  RAB_Surface dstPrimary,
+  RAB_Surface srcPrimary,
+  RestirPtReservoir srcReservoir,
+  bool evalVisibility)
+{
+  dstJacobian = 0.0f;
+
+  // ports :55 -- an empty reservoir has nothing to shift.
+  if (srcReservoir.weight == 0.0f)
+  {
+    return vec3(0.0f);
+  }
+
+  const RestirPtHit rcVertexHit = srcReservoir.rcVertexHit;
+  const vec3 rcVertexIrradiance = srcReservoir.rcVertexIrradiance;
+  const vec3 rcVertexWi = srcReservoir.rcVertexWi;
+  const bool rcVertexHitExists = rcVertexHit.isValid();
+
+  // ports :398 -- the lobe class of the scatter BEFORE the reconnection vertex,
+  // i.e. the primary scatter's class. Recorded unconditionally at the primary
+  // scatter (phase 2 deviation D6), which is what makes the sky-escape case below
+  // well defined.
+  const uint allowedSampledTypes1 =
+    restirPtGetAllowedLobeClass(srcReservoir.pathFlags.decodeIsSpecularBounce(true));
+
+  const vec3 dstPrimaryPosition = dstPrimary.minimalSurfaceInteraction.position;
+  const vec3 srcPrimaryPosition = srcPrimary.minimalSurfaceInteraction.position;
+
+  // ports :400-401 (computeNewRayOrigin) is deliberately NOT transcribed: it only
+  // matters for the BPR variant, because the non-BPR path below rejects every
+  // delta chain outright at :442, and dxvk-remix applies its own ray offset inside
+  // traceVisibilityRay / rayCreatePosition.
+
+  // --- The reconnection "vertex" is the environment -------------------------
+  // ports :403-432. Reached by a path whose FIRST scatter left the scene, which
+  // this fork marks as a reconnection (markEscapeVertexAsRcVertex, see the sky
+  // reconnection deviation in restir_pt_trace_core.slangh). The reference only
+  // produces this class under the hybrid shift.
+  if (!rcVertexHitExists)
+  {
+    vec3 dstIntegrand = vec3(0.0f);
+
+    if (srcReservoir.pathFlags.lightType() == kRestirPtLightTypeEnvMap &&
+        srcReservoir.pathFlags.pathLength() + 1 == kRestirPtShiftRcVertexLength &&
+        !srcReservoir.pathFlags.lastVertexNEE())
+    {
+      const vec3 wi = rcVertexWi;
+      const VisibilityResult visibility = restirPtTraceShiftVisibilityDirectional(dstPrimary, wi);
+
+      if (!visibility.hasOpaqueHit)
+      {
+        // ports :413-420.
+        //
+        // FORK CORRECTION: the reference evaluates srcPDF1 here with its DEFAULT
+        // lobe mask (all lobes, :413) while evaluating dstPDF1 with
+        // allowedSampledTypes1 (:415) -- an asymmetry it does not have at the
+        // corresponding hit-case site (:478/:480, both class-restricted). Left
+        // as-is, J(a -> a) would not be 1 on any multi-lobe material and debug
+        // view 887 could never be black. Both sides use the class here.
+        float srcPDF1All = 0.0f;
+        const float srcPDF1 = restirPtEvalPdfBsdf(srcPrimary, wi, allowedSampledTypes1, srcPDF1All);
+
+        float dstPDF1All = 0.0f;
+        const float dstPDF1 = restirPtEvalPdfBsdf(dstPrimary, wi, allowedSampledTypes1, dstPDF1All);
+
+        const vec3 dstF1 = restirPtEvalBsdfCosine(dstPrimary, wi, allowedSampledTypes1);
+
+        // lightPdf is 0 for every escape this kernel produces (it never NEE-samples
+        // the sky), so this degenerates to 1 -- which is exactly
+        // kRestirPtNeeMisWeight / kRestirPtEnvMisWeight's claim at trace time. If
+        // sky NEE is ever added, both have to move together.
+        const float misWeight = restirPtEvalMIS(1.0f, dstPDF1All, 1.0f, srcReservoir.lightPdf);
+
+        // Note: BINARY visibility here, unlike the finite-segment case below --
+        // visibility.attenuation is deliberately NOT multiplied in. Two reasons,
+        // both specific to an infinite ray: (1) the stored rcVertexIrradiance
+        // already carries the SOURCE segment's escape attenuation, because the
+        // resolver computes it on the miss and markEscapeVertexAsRcVertex hands it
+        // over as part of the suffix -- multiplying again would double-count fog;
+        // (2) calcVolumetricAttenuation over an unbounded ray is ill-conditioned
+        // anyway (visibility.slangh:512-515 feeds it the ray's tMax). The residual
+        // is the same accepted-bias class as the baked NEE-cache MIS weight: the
+        // source pixel's escape attenuation rides along, and accepted neighbours
+        // sit within ~20 px of it.
+        dstIntegrand = dstF1 / dstPDF1 * misWeight * rcVertexIrradiance;
+        dstJacobian = dstPDF1 / srcPDF1;
+      }
+    }
+
+    // ports :428-429.
+    if (restirPtIsJacobianInvalid(dstJacobian))
+    {
+      dstJacobian = 0.0f;
+    }
+
+    if (any(isnan(dstIntegrand)) || any(isinf(dstIntegrand)))
+    {
+      return vec3(0.0f);
+    }
+
+    return dstIntegrand;
+  }
+
+  // --- The reconnection vertex is a real hit --------------------------------
+
+  // ports :434-436.
+  const int pathLength = srcReservoir.pathFlags.pathLength();
+  const bool isRcVertexFinal = pathLength == kRestirPtShiftRcVertexLength;
+  const bool isRcVertexEscapedVertex =
+    (pathLength + 1 == kRestirPtShiftRcVertexLength) && !srcReservoir.pathFlags.lastVertexNEE();
+  const bool isRcVertexNEE = isRcVertexFinal && srcReservoir.pathFlags.lastVertexNEE();
+
+  // ports :438-442 -- a delta bounce on either side of the reconnection vertex
+  // makes the connection impossible: the shift would need to hit a direction of
+  // measure zero. This is the single most important rejection in the whole file.
+  if (srcReservoir.pathFlags.decodeIsDeltaEvent(true) ||
+      srcReservoir.pathFlags.decodeIsDeltaEvent(false))
+  {
+    return vec3(0.0f);
+  }
+
+  // ports :444.
+  SurfaceInteraction rcSurfaceInteraction;
+  MinimalRayInteraction rcRayInteraction;
+  OpaqueSurfaceMaterialInteraction rcMaterialInteraction;
+
+  if (!restirPtReconstructRcVertex(
+        rcVertexHit, dstPrimaryPosition,
+        dstPrimary.minimalRayInteraction.coneRadius, cb.screenSpacePixelSpreadHalfAngle,
+        rcSurfaceInteraction, rcRayInteraction, rcMaterialInteraction))
+  {
+    return vec3(0.0f);
+  }
+
+  const vec3 rcPosition = rcSurfaceInteraction.position;
+  const vec3 rcFaceNormal = rcSurfaceInteraction.geometryNormal;
+
+  // ports :447-448. dstConnectionV points FROM the destination primary vertex TO
+  // the reconnection vertex (the reference writes it as -rcVertexSd.V).
+  const vec3 dstConnectionV = -rcRayInteraction.viewDirection;
+  const vec3 srcConnectionV = safeNormalize(rcPosition - srcPrimaryPosition, vec3(0.0f, 0.0f, 1.0f));
+
+  // ports :450-469. The DistanceCondition local strategy at :454-458 is
+  // hybrid-only and arrives in phase 5.
+  float jacobian = restirPtReconnectionGeometryJacobian(
+    dstPrimaryPosition, srcPrimaryPosition, rcPosition, rcFaceNormal);
+
+  // ports :471.
+  if (restirPtIsJacobianInvalid(jacobian))
+  {
+    return vec3(0.0f);
+  }
+
+  // ports :477-483.
+  float dstPDF1All = 0.0f;
+  const float dstPDF1 = restirPtEvalPdfBsdf(dstPrimary, dstConnectionV, allowedSampledTypes1, dstPDF1All);
+
+  float srcPDF1All = 0.0f;
+  const float srcPDF1 = restirPtEvalPdfBsdf(srcPrimary, srcConnectionV, allowedSampledTypes1, srcPDF1All);
+
+  jacobian *= dstPDF1 / srcPDF1;
+
+  // ports :484.
+  if (restirPtIsJacobianInvalid(jacobian))
+  {
+    return vec3(0.0f);
+  }
+
+  // ports :486.
+  const vec3 dstF1 = restirPtEvalBsdfCosine(dstPrimary, dstConnectionV, allowedSampledTypes1);
+
+  // ports :488-493. An NEE terminal AT the reconnection vertex is evaluated
+  // against every lobe (the reference's allowedSampledTypes2 = -1), because the
+  // light connection was not produced by BSDF lobe sampling at all.
+  float dstRcVertexScatterPdfAll = 0.0f;
+  float dstPDF2 = 1.0f;
+  float dstRcVertexScatterPdf = 1.0f;
+  float srcRcVertexScatterPdf = 1.0f;
+
+  const uint allowedSampledTypes2 = isRcVertexNEE
+    ? kRestirPtLobeClassAll
+    : restirPtGetAllowedLobeClass(srcReservoir.pathFlags.decodeIsSpecularBounce(false));
+
+  if (!isRcVertexEscapedVertex)
+  {
+    // ports :498-503.
+    dstRcVertexScatterPdf = restirPtEvalPdfBsdf(
+      rcMaterialInteraction, rcRayInteraction, rcVertexWi, allowedSampledTypes2, dstRcVertexScatterPdfAll);
+
+    // ports :500 (evalPdfBSDFWithV) -- the SAME reconnection vertex, seen from the
+    // SOURCE pixel's primary vertex instead of the destination's.
+    MinimalRayInteraction srcRcRayInteraction = rcRayInteraction;
+    srcRcRayInteraction.viewDirection = -srcConnectionV;
+
+    float srcRcVertexScatterPdfAll = 0.0f;
+    srcRcVertexScatterPdf = restirPtEvalPdfBsdf(
+      rcMaterialInteraction, srcRcRayInteraction, rcVertexWi, allowedSampledTypes2, srcRcVertexScatterPdfAll);
+
+    dstPDF2 = isRcVertexNEE ? srcReservoir.lightPdf : dstRcVertexScatterPdf;
+  }
+
+  // ports :506-509.
+  vec3 dstF2 = vec3(1.0f);
+
+  if (!isRcVertexEscapedVertex)
+  {
+    dstF2 = restirPtEvalBsdfCosine(
+      rcMaterialInteraction, rcRayInteraction, rcVertexWi, allowedSampledTypes2);
+  }
+
+  // ports :512 -- the connection point is behind one of the two surfaces.
+  if (all(dstF1 == vec3(0.0f)) || all(dstF2 == vec3(0.0f)))
+  {
+    return vec3(0.0f);
+  }
+
+  // ports :515-516.
+  vec3 dstIntegrand = dstF1 / dstPDF1 * (dstF2 / dstPDF2 * rcVertexIrradiance);
+
+  // ports :518-522.
+  if (isRcVertexEscapedVertex)
+  {
+    dstIntegrand *= restirPtEvalMIS(1.0f, dstPDF1All, 1.0f, srcReservoir.lightPdf);
+  }
+
+  // ports :525-536. The analytic exemption is what makes fork NEE terminals pass
+  // through with MIS weight 1, matching kRestirPtNeeMisWeight at trace time (phase
+  // 2 deviation D3): every light sampleLightBasicRIS can draw is analytic.
+  if (isRcVertexFinal && srcReservoir.pathFlags.lightType() != kRestirPtLightTypeAnalytic)
+  {
+    const float lightPdf = srcReservoir.lightPdf;
+    const float misWeight = restirPtEvalMIS(
+      1.0f, isRcVertexNEE ? lightPdf : dstRcVertexScatterPdfAll,
+      1.0f, isRcVertexNEE ? dstRcVertexScatterPdfAll : lightPdf);
+
+    dstIntegrand *= misWeight;
+
+    if (!isRcVertexNEE)
+    {
+      jacobian *= dstRcVertexScatterPdf / srcRcVertexScatterPdf;
+    }
+  }
+
+  // ports :539-542 -- the reconnection vertex is an interior vertex, so its own
+  // BSDF sampling density also changed.
+  if (!isRcVertexFinal && !isRcVertexEscapedVertex)
+  {
+    jacobian *= dstRcVertexScatterPdf / srcRcVertexScatterPdf;
+  }
+
+  // ports :544.
+  if (restirPtIsJacobianInvalid(jacobian))
+  {
+    return vec3(0.0f);
+  }
+
+  // ports :546-552, plus the fork's attenuation fold (see
+  // restirPtTraceShiftVisibility).
+  if (evalVisibility)
+  {
+    // Shorten slightly so the ray cannot self-intersect the reconnection vertex's
+    // own triangle -- the reference's 0.999 at :647.
+    const VisibilityResult visibility = restirPtTraceShiftVisibility(dstPrimary, rcPosition, 0.999f);
+
+    if (visibility.hasOpaqueHit)
+    {
+      return vec3(0.0f);
+    }
+
+    dstIntegrand *= vec3(visibility.attenuation);
+  }
+
+  // ports :554.
+  if (any(isnan(dstIntegrand)) || any(isinf(dstIntegrand)))
+  {
+    return vec3(0.0f);
+  }
+
+  // ports :556-564. Off by default (threshold <= 0), exactly as the reference
+  // ships it (Params.slang:146-147 -- rejectShiftBasedOnJacobian false, threshold
+  // 10). Discarding on a large Jacobian is unbiased: it removes the sample from
+  // BOTH the estimate and its own MIS weight.
+  if (cb.restirPtJacobianRejectionThreshold > 0.0f)
+  {
+    if (jacobian > 0.0f &&
+        max(jacobian, 1.0f / jacobian) > 1.0f + cb.restirPtJacobianRejectionThreshold)
+    {
+      jacobian = 0.0f;
+      dstIntegrand = vec3(0.0f);
+    }
+  }
+
+  // ports :566.
+  dstJacobian = jacobian;
+
+  return dstIntegrand;
+}
+
+// ---------------------------------------------------------------------------
+// Merge wrappers
+// ---------------------------------------------------------------------------
+
+// ports ReSTIRPTPass/Shift.slang:575-612, the non-PathReuse branch.
+//
+// The forceMerge fixup at :603-608 is subtle and load-bearing for pairwise MIS:
+// with forceMerge the caller does not want a resampling decision at all, it wants
+// `dstReservoir` left holding the SHIFTED integrand together with the SOURCE's M
+// and weight, so the pairwise weight of that neighbour can be computed from it.
+// `dstReservoir` is a scratch copy at every such call site.
+bool restirPtShiftAndMergeReservoir(
+  out float dstJacobian,
+  RAB_Surface dstPrimary,
+  inout RestirPtReservoir dstReservoir,
+  RAB_Surface srcPrimary,
+  RestirPtReservoir srcReservoir,
+  bool evalVisibility,
+  inout RAB_RandomSamplerState rng,
+  float misWeight,
+  bool forceMerge)
+{
+  const vec3 dstIntegrand = restirPtComputeShiftedIntegrandReconnection(
+    dstJacobian, dstPrimary, srcPrimary, srcReservoir, evalVisibility);
+
+  const bool selected = dstReservoir.merge(dstIntegrand, dstJacobian, srcReservoir, rng, misWeight, forceMerge);
+
+  if (forceMerge)
+  {
+    if (!selected)
+    {
+      dstReservoir.F = vec3(0.0f);
+    }
+
+    dstReservoir.M = srcReservoir.M;
+    dstReservoir.weight = srcReservoir.weight;
+  }
+
+  return selected;
+}
+
+// ports ReSTIRPTPass/Shift.slang:620-624. Thin by design -- kept as a named
+// function so the reuse loop reads like the reference's.
+bool restirPtMergeReservoirWithResamplingMIS(
+  vec3 dstIntegrand, float dstJacobian,
+  inout RestirPtReservoir dstReservoir,
+  RestirPtReservoir tempDstReservoir,
+  inout RAB_RandomSamplerState rng,
+  float misWeight)
+{
+  return dstReservoir.mergeWithResamplingMIS(
+    dstIntegrand, dstJacobian, tempDstReservoir, rng, misWeight, /*forceAdd=*/ false);
+}

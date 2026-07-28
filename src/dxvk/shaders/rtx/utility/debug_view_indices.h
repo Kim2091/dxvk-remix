@@ -364,6 +364,21 @@
 #define DEBUG_VIEW_RESTIR_PT_RESERVOIR_VALID  883
 #define DEBUG_VIEW_RESTIR_PT_RESERVOIR_F      884
 #define DEBUG_VIEW_RESTIR_PT_FINAL_SHADING    885
+// Phase 3 spatial reuse diagnostics, both written by the spatial reuse pass.
+//
+// 886 -- F * weight of the reservoir the last spatial round produced. Compare
+//        against 885 (final shading) with reuse off: same average brightness,
+//        visibly lower variance. A uniform brightness change is an energy bug, and
+//        the symptom table in plan-phase3 resolved-question 3 names which one.
+// 887 -- SELF-SHIFT PARITY, phase 3's equivalent of 881. Every pixel's reservoir
+//        is shifted onto its OWN primary surface, which a correct reconnection
+//        shift must reproduce exactly: R = |integrand - F| / phat(F) * 100,
+//        G = |Jacobian - 1| * 100. Must be BLACK on ordinary opaque surfaces
+//        before any neighbour result is judged. Red channel lit = the BSDF eval
+//        or pdf convention diverges from the trace kernel's; green lit = the
+//        geometry term or the pdf-ratio transcription.
+#define DEBUG_VIEW_RESTIR_PT_SPATIAL_REUSE    886
+#define DEBUG_VIEW_RESTIR_PT_SHIFT_PARITY     887
 
 enum class CompositeDebugView : uint32_t {
   Disabled = 0,

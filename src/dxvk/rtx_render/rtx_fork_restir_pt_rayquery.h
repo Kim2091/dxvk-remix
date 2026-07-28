@@ -70,6 +70,9 @@ namespace dxvk {
     // Dispatched from RtxContext beside ReSTIR GI's own dispatch: after the NRC
     // resolve and RTXDI confidence, before demodulate. No-op unless the ReSTIR PT
     // indirect mode is selected.
+    //
+    // Runs the spatial reuse rounds first, inside the same mode gate, so phase 3
+    // needs no new rtx_context.cpp touchpoint.
     void dispatchFinalShading(RtxContext* ctx, const Resources::RaytracingOutput& rtOutput);
 
     void prewarmShaders(DxvkPipelineManager& pipelineManager) const;
@@ -100,9 +103,35 @@ namespace dxvk {
     virtual void createDownscaledResource(Rc<DxvkContext>& ctx, const VkExtent3D& downscaledExtent) override;
     virtual void releaseDownscaledResource() override;
 
-    // One RestirPtReservoir per padded pixel. Allocated only in the ReSTIR PT
-    // indirect mode.
+    // One page of the two-page reservoir allocation, as a bindable slice. `page`
+    // is taken modulo the page count so callers can pass a raw round index.
+    DxvkBufferSlice reservoirPageSlice(uint32_t page) const;
+
+    // Spatial reuse rounds actually dispatched this frame (0 when reuse is off).
+    uint32_t activeSpatialRounds() const;
+
+    // 1..N spatial reuse rounds, ping-ponging the two reservoir pages. Called from
+    // dispatchFinalShading, before the final shading dispatch and inside the same
+    // mode gate.
+    void dispatchSpatialReuse(RtxContext* ctx, const Resources::RaytracingOutput& rtOutput);
+
+    // TWO pages of one RestirPtReservoir per padded pixel. Allocated only in the
+    // ReSTIR PT indirect mode.
+    //
+    // Spatial reuse cannot run in place -- pixel A reads neighbour B's reservoir
+    // while B's own thread overwrites it -- so round r reads page r % 2 and writes
+    // page (r + 1) % 2. The two pages are bound as buffer SLICES of this one
+    // allocation, which is why no shader needs page arithmetic: the reference
+    // swaps whole buffers per round (ReSTIRPTPass.cpp:1665-1675) and ReSTIR GI
+    // uses pages with shader-side indexing (rtx_restir_gi_rayquery.cpp:321-331);
+    // slices are the cheap middle.
+    //
+    // Phase 4 (temporal reuse) will want history storage; exactly two pages are
+    // allocated now so that decision stays open.
     Rc<DxvkBuffer> m_reservoirBuffer;
+
+    // Size in bytes of ONE reservoir page, i.e. the slice stride.
+    VkDeviceSize m_reservoirPageSize = 0;
 
     // Debug-only scratch: float4 per padded pixel, {radiance.xyz, packed terminal
     // descriptor}. Written by the trace dispatch, read back by the replay-verify
@@ -141,6 +170,33 @@ namespace dxvk {
                "None (1): accumulate with weight 1 everywhere. Too BRIGHT, because integrate_nee's first-bounce NEE cache counts the same light.\n"
                "NEE Cache (2, default): BSDF-side MIS against the NEE cache selection pdf at the first indirect vertex, weight 1 beyond. "
                "Should sit between the other two on emissive-mesh-lit surfaces; if it does not, the selection pdf is wrong.");
+    RTX_OPTION("rtx.restirPT", bool, enableSpatialReuse, true,
+               "Enables the ReSTIR PT spatial reuse pass: each pixel resamples a few screen-space neighbours' paths onto its own surface "
+               "through the reconnection shift, with pairwise resampling MIS. Reduces indirect noise at the cost of one extra pass "
+               "(2 x neighbourCount visibility rays and surface reconstructions per pixel per round) and one extra reservoir page of VRAM.\n"
+               "Turning it OFF must reproduce the phase 2 image exactly - the trace kernel is unaffected by this toggle.\n"
+               "The expected artifact when it is ON is radius-scale correlated splotches re-rolled every frame; judge it THROUGH the denoiser, "
+               "not on the raw debug views.");
+    RTX_OPTION("rtx.restirPT", int, spatialNeighborCount, 1,
+               "Number of screen-space neighbours each pixel considers per spatial reuse round. The reference's default is 3; this ships at 1 "
+               "because each neighbour costs two reconnection shifts (two visibility rays and two surface reconstructions) and the PT mode's "
+               "performance headroom over ReSTIR GI is only about 10%. Raise it and watch a Tracy capture of the 'ReSTIR PT Spatial Reuse' zone.");
+    RTX_OPTION("rtx.restirPT", float, spatialRadius, 20.0f,
+               "Screen-space radius, in pixels, of the disk each spatial neighbour is drawn from. The reference's default. "
+               "A larger radius spreads the correlation artifact thinner but pulls in less similar surfaces (which the feature-based rejection "
+               "then discards, wasting the sample).");
+    RTX_OPTION("rtx.restirPT", int, spatialRounds, 1,
+               "Number of spatial reuse rounds per frame, each a separate dispatch that ping-pongs the reservoir pages. "
+               "More rounds widen the effective reuse footprint at linear cost.");
+    RTX_OPTION("rtx.restirPT", float, jacobianRejectionThreshold, 0.0f,
+               "Discards a shifted sample when max(J, 1/J) exceeds 1 + this, where J is the shift Jacobian. Zero or negative disables the test, "
+               "which is how the reference ships it; the reference's value when enabled is 10. Discarding this way stays unbiased because the "
+               "sample is removed from its own MIS weight as well as from the estimate.");
+    RTX_OPTION("rtx.restirPT", bool, spatialSkyReconnection, true,
+               "Lets a path whose FIRST scatter left the scene be reused, by treating its escape direction as the reconnection vertex. "
+               "The reference only does this under its hybrid shift, so turning this off reproduces strict reference behaviour - at the cost of "
+               "nearly all outdoor reuse, since a sky escape one bounce off the primary surface is the dominant path class outdoors. "
+               "No brightness change either way; if there is one, the escape MIS convention is wrong.");
     RTX_OPTION("rtx.restirPT", bool, neeCacheTaskFeedback, true,
                "Inserts NEE cache tasks at emissive hits inside the ReSTIR PT kernel, as the indirect integrator does. "
                "This is how the cache DISCOVERS emissive triangles; integrate_nee's own feedback only reinforces existing candidates. "

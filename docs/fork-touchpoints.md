@@ -3776,3 +3776,75 @@ than argued about.
 
 ---
 
+## Workstream - ReSTIR PT phase 3: spatial reuse, pure reconnection shift (fork - 2026-07-28)
+
+Phase 3 turns the phase 2 reservoir into a *resampled* one. The trace kernel now selects a
+**reconnection vertex at the first indirect hit** (`rcVertexLength = 1`, the vertex-2
+reconnection of the reference's `ShiftMapping::Reconnection`), and a new fork-owned pass runs
+1..N rounds of **spatial reuse with pairwise resampling MIS** between the trace pass and final
+shading: each pixel shifts a few screen-space neighbours' paths onto its own surface through a
+port of `computeShiftedIntegrandReconnection` and merges them through the merge family phase 2
+ported and left dormant. Nothing in `restir_pt_reservoir.slangh` changed to make that happen,
+which was the point of porting it early.
+
+**No hybrid shift, no random replay in the reuse path, no temporal reuse.** Those are phases 4-5.
+Spatial reuse OFF must reproduce the phase 2 image exactly - the trace kernel is unaffected by
+the toggle, because it records reconnection data unconditionally and final shading reads only
+`weight`, `F` and two flag bits.
+
+Three things in it are worth knowing about even if you never touch ReSTIR PT:
+
+*The prefix/postfix throughput split is the load-bearing bookkeeping.* `RestirPtPathState` gains
+`prefixThp` and `recordPrefixThp()`; after every scatter at or before the reconnection vertex the
+throughput accumulated so far moves into the prefix and `thp` restarts at 1, so past that vertex
+`thp` measures the SUFFIX alone. That suffix is what the reservoir stores as `rcVertexIrradiance`
+and what a shift re-attaches to a *different* prefix. Phase 2 shipped `getCurrentThp()` as the
+identity; without the split the shift would double-count the primary (and reconnection-vertex)
+BSDF it re-evaluates, and the tell would be strong brightening plus glossy blowups.
+
+*A phase 2 off-by-one surfaced and is fixed here.* Falcor increments `path.length` inside
+`nextVertex` and only on a HIT, so on a MISS its `path.length` names the vertex the ray was
+launched from; this kernel numbers segments instead. Phase 2 transcribed the escape site's
+`path.length` literally and was therefore one too high on that site alone. It was invisible then
+(nothing read `pathFlags.pathLength()`), and load-bearing now: the shift compares against a
+hardcoded `rcVertexLength` of 1, so a bounce-1 sky escape has to store `pathLength = 0` or the
+whole sky-reconnection case silently shifts to zero. The invariant, now stated in
+`restir_pt_path_builder.slangh`, is that `pathLength` is the index of the LAST SCATTERING VERTEX.
+
+*Reuse needs two reservoir pages, and that is +191 MiB.* Spatial reuse in place is a data race by
+construction, so round r reads page `r % 2` and writes page `(r + 1) % 2`. The two pages are
+slices of ONE `DxvkBuffer`, bound per round, so no shader learns about paging - the reference
+swaps whole buffers (`ReSTIRPTPass.cpp:1665-1675`) and ReSTIR GI uses shader-side page indexing
+(`rtx_restir_gi_rayquery.cpp:321-331`); slices are the cheap middle. At 1080p render resolution
+the allocation goes from ~191 MiB to ~382 MiB. The designed refund is the Enhanced paper's
+96 -> 64 B reservoir compression, which is why every field here stays f16/octahedral-compressible
+and un-bitpacked.
+
+- **`src/dxvk/shaders/rtx/algorithm/fork_restir_pt/restir_pt_shift.slangh`** - NEW fork-owned file.
+  *The reconnection shift. Ports `ReSTIRPTPass/Shift.slang:224-227` (`isJacobianInvalid`), `:383-572` (`computeShiftedIntegrandReconnection`) and `:575-630` (the merge wrappers), with `useHybridShift` and `useCachedJacobian` compiled in as false and kept as named constants so phase 5 extends rather than rewrites. Also the BSDF eval/pdf helper pair that maps the reference's `kSeparatePathBSDF` semantics onto dxvk-remix's opaque lobes (`pdfSingle` = the allowed lobe class's selection-weighted solid-angle pdfs, `pdfAll` = the full marginal), a standalone reconnection-vertex reconstruction from `(surfaceIndex, primitiveIndex, barycentrics)` with no ray trace, and the geometry Jacobian as a pure function so the unit test can mirror it. Every NaN/inf guard the reference has is ported, per site.*
+- **`src/dxvk/shaders/rtx/pass/fork_restir_pt/fork_restir_pt_spatial_reuse.comp.slang`** + **`..._spatial_bindings.slangh`** - NEW fork-owned files.
+  *One dispatch per reuse round. Ports `SpatialReuse.cs.slang:64-78` (feature-based rejection), `:151-183` (setup, including the pairwise `init()` that is easy to forget and doubles the canonical sample if you do), `:340-411` (the pairwise loop) and `:534-538` (output guards + store). Neighbour selection and acceptance are deliberately factored into two named functions rather than inlined the way the reference writes them: Enhanced section 3's paired/reciprocal reuse replaces exactly that pair with a pairing texture, and keeping the seam makes it a drop-in. The reference's precomputed 8192-entry R2 disk texture is replaced by a uniform disk sample from the murmur3 stream (a variance nicety, not a correctness feature, and Enhanced 3 deletes the component). Also carries the self-shift parity harness behind debug view 887.*
+- **`src/dxvk/shaders/rtx/algorithm/fork_restir_pt/restir_pt_path_state.slangh`** - fork-owned changes.
+  *`prefixThp` + `recordPrefixThp()` + a real `getCurrentThp()` (ports `PathState.slang:82,114-115`), and `scatterRayOrigin` - the reference reads its `prevPathOrigin` straight off `path.origin` because Falcor has no resolve loop, whereas here the resolve macro advances `path.origin` through every alpha/portal continuation, so the launch point has to be kept separately or the reconnection geometry factor measures from a foliage leaf.*
+- **`src/dxvk/shaders/rtx/algorithm/fork_restir_pt/restir_pt_trace_core.slangh`** - fork-owned changes.
+  *`rcVertexLength = 1` at the first indirect hit plus the geometry factor (ports `PathTracer.slang:1171-1191`); the at-reconnection-vertex captures at the scatter - event-bit pair, `cachedJacobian.y`, `rcVertexWi` (ports `:384-390`, `:334-337`, `:1435-1437`); `recordPrefixThp()` at both scatter sites (ports `:419-420`); postfix arguments at all four add-sites, including the NEE site's `weight = 1` exclusion of the reconnection vertex's own BSDF (ports `:1332-1346`); the escape-site path-length fix; and `markEscapeVertexAsRcVertex` for bounce-1 sky escapes, behind `RESTIR_PT_FLAG_SPATIAL_SKY_RECONNECTION`.*
+- **`src/dxvk/shaders/rtx/algorithm/fork_restir_pt/restir_pt_path_builder.slangh`** - fork-owned comment changes only.
+  *`is_rcVertex` and `markEscapeVertexAsRcVertex` are no longer dead; the path-length convention is written down where the add sites are.*
+- **`src/dxvk/shaders/rtx/pass/fork_restir_pt/fork_restir_pt_binding_indices.h`** - fork-owned changes.
+  *Band extended to 100-149: the spatial pass's own 13-entry G-buffer clone at 135-147 and the reservoir ping-pong at 148-149. Both `#error` guards kept; 135-149 was re-grepped against every `*_binding_indices.h` first. `ForkReSTIRPTArgs::mode` gains a documented dual use - the spatial pass puts its round index there, for the same reason the trace pass puts its mode there (N dispatches inside one frame, one constant-buffer upload).*
+- **`src/dxvk/rtx_render/rtx_fork_restir_pt_rayquery.{h,cpp}`** - fork-owned changes.
+  *Two-page reservoir allocation plus a `reservoirPageSlice` helper; a `dispatchSpatialReuse` that runs the rounds from inside `dispatchFinalShading` (so phase 3 adds no `rtx_context.cpp` touchpoint at all); the new `ManagedShader`; and six live options with widgets - `enableSpatialReuse`, `spatialNeighborCount`, `spatialRadius`, `spatialRounds`, `jacobianRejectionThreshold`, `spatialSkyReconnection`.*
+- **`tests/rtx/unit/test_fork_restir_pt_reservoir.cpp`** - fork-owned changes.
+  *Three new groups on top of phase 2's: the reconnection geometry Jacobian (round trip, exact identity, degenerate rejection, one hand-computed value), the pairwise MIS **unbiasedness identity** - K+1 synthetic pixels over one shared discrete path domain, every reservoir build and every merge draw enumerated, asserting `E[F_c * W] == sum_j F_c(j)/p_j` - and the partition-of-unity plus guard cases. The unbiasedness test was verified to be load-bearing by deleting the `/(validNeighborCount + 1)` normalisation, which makes it fail by exactly the predicted factor of (k+1).*
+- **`src/dxvk/shaders/rtx/pass/raytrace_args.h`** - fork-touchpoint inline tweak.
+  *ONE more complete 4-scalar (16-byte) group at the end - `restirPtSpatialNeighborCount`, `restirPtSpatialRounds`, `restirPtSpatialRadius`, `restirPtJacobianRejectionThreshold` - plus two more bits in the existing `restirPtFlags` word. Do not add a fifth scalar to that group; add the next complete group.*
+- **`src/dxvk/shaders/rtx/utility/debug_view_indices.h`** + **`src/dxvk/rtx_render/rtx_debug_view.cpp`** - index-only, fork.
+  *886 (spatial reuse output) and 887 (self-shift parity) from the fork's 880-900 block. 887 is phase 3's equivalent of 881: shifting a pixel's reservoir onto its OWN surface must reproduce `F` with Jacobian 1, so the view is black iff the shift math and the pdf/eval conventions are right, before any neighbour is involved.*
+- **`src/dxvk/rtx_render/rtx_types.h`** - fork-touchpoint inline tweak.
+  *One more `RtxFramePassStage`, `ReSTIR_PT_SpatialReuse`, inserted before `ReSTIR_PT_FinalShading`. As with phase 2 this shifts the numeric value of every later stage, which only matters to a saved `rtx.aliasing.beginPass`/`endPass` (debug-only).*
+- **`src/dxvk/imgui/dxvk_imgui.cpp`** - fork-touchpoint inline tweak.
+  *The matching `aliasingPassComboEntries` row. The table mirrors `RtxFramePassStage` 1:1 and a missing row silently gaps the aliasing analyzer.*
+- **Not touched:** `rtx_context.cpp` (the spatial rounds dispatch from inside the existing final-shading entry point), `rtx_options.h`, `meson.build` (shaders auto-discover; no new host files).
+- **`RtxOptions.md`** - REGEN STILL PENDING, now ~14 `rtx.restirPT.*` rows.
+
+---

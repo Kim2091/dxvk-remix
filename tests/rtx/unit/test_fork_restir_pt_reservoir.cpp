@@ -290,6 +290,50 @@ namespace mirror {
   inline void pathBuilderFinalize(RestirPtReservoir& r) {
     r.M = 1.0f;
   }
+
+  // =========================================================================
+  // Phase 3 mirror -- the shift's Jacobian core and the pairwise MIS arithmetic.
+  //
+  // KEEP IN SYNC with
+  //   src/dxvk/shaders/rtx/algorithm/fork_restir_pt/restir_pt_shift.slangh
+  //   src/dxvk/shaders/rtx/pass/fork_restir_pt/fork_restir_pt_spatial_reuse.comp.slang
+  // by the same rule as the reservoir mirror above: two independent statements of
+  // the same arithmetic, never a shared header.
+  // =========================================================================
+
+  inline vec3 sub(const vec3& a, const vec3& b) { return vec3(a.x - b.x, a.y - b.y, a.z - b.z); }
+  inline float dot3(const vec3& a, const vec3& b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+
+  inline vec3 normalizeOrZ(const vec3& v) {
+    const float len = std::sqrt(dot3(v, v));
+    if (!(len > 0.0f)) { return vec3(0.0f, 0.0f, 1.0f); }
+    return vec3(v.x / len, v.y / len, v.z / len);
+  }
+
+  // ports restir_pt_shift.slangh restirPtIsJacobianInvalid
+  // (ReSTIRPTPass/Shift.slang:224-227).
+  inline bool isJacobianInvalid(float jacobian) {
+    return jacobian <= 0.0f || std::isnan(jacobian) || std::isinf(jacobian);
+  }
+
+  // ports restir_pt_shift.slangh restirPtReconnectionGeometryJacobian
+  // (ReSTIRPTPass/Shift.slang:450-469).
+  inline float reconnectionGeometryJacobian(
+    const vec3& dstPrimaryPosition, const vec3& srcPrimaryPosition,
+    const vec3& rcPosition, const vec3& rcFaceNormal) {
+
+    const vec3 shiftedDisplacement = sub(rcPosition, dstPrimaryPosition);
+    const float shiftedDistanceSquared = dot3(shiftedDisplacement, shiftedDisplacement);
+    const float shiftedCosine = std::fabs(dot3(rcFaceNormal, normalizeOrZ(shiftedDisplacement)));
+
+    const vec3 originalDisplacement = sub(rcPosition, srcPrimaryPosition);
+    const float originalDistanceSquared = dot3(originalDisplacement, originalDisplacement);
+    const float originalCosine = std::fabs(dot3(rcFaceNormal, normalizeOrZ(originalDisplacement)));
+
+    if (shiftedDistanceSquared <= 0.0f || originalCosine <= 0.0f) { return 0.0f; }
+
+    return (shiftedCosine / shiftedDistanceSquared) * originalDistanceSquared / originalCosine;
+  }
 }
 
 namespace dxvk {
@@ -712,6 +756,504 @@ namespace dxvk {
       checkClose(mirror::RestirPtReservoir::computeWeight(mirror::vec3(0.0f), true), 0.0f, "f: computeWeight leaves zero alone");
     }
 
+    // -----------------------------------------------------------------------
+    // (g) PHASE 3: the reconnection Jacobian's geometry core.
+    //
+    // Three properties, all of which a transcription slip breaks: the shift onto
+    // your own surface is the identity, shifting there and back is the identity,
+    // and degenerate placements are rejected rather than returning garbage.
+    // -----------------------------------------------------------------------
+    void testReconnectionGeometryJacobian() {
+      const mirror::vec3 rc(0.0f, 0.0f, 0.0f);
+      const mirror::vec3 faceN(0.0f, 0.0f, 1.0f);
+
+      const mirror::vec3 a(1.0f, 0.0f, 2.0f);
+      const mirror::vec3 b(-3.0f, 1.5f, 5.0f);
+
+      // J(a -> a) is exactly 1: identical numerator and denominator, bit for bit.
+      check(mirror::reconnectionGeometryJacobian(a, a, rc, faceN) == 1.0f,
+            "g: J(a -> a) is exactly 1");
+      check(mirror::reconnectionGeometryJacobian(b, b, rc, faceN) == 1.0f,
+            "g: J(b -> b) is exactly 1");
+
+      // Round trip. If the src/dst roles were swapped anywhere, this lands on
+      // (cos_a d_b^2 / cos_b d_a^2)^2 instead of 1 -- the "energy warp correlated
+      // with geometry" symptom.
+      const float forward = mirror::reconnectionGeometryJacobian(a, b, rc, faceN);
+      const float backward = mirror::reconnectionGeometryJacobian(b, a, rc, faceN);
+
+      check(!mirror::isJacobianInvalid(forward), "g: forward Jacobian is valid");
+      check(!mirror::isJacobianInvalid(backward), "g: backward Jacobian is valid");
+      checkClose(forward * backward, 1.0f, "g: J(a -> b) * J(b -> a) == 1");
+
+      // Hand-computed value, so a sign or an inversion cannot hide behind the
+      // round trip alone. cos = |z| / d, so J = (|z_a|/d_a^3) / (|z_b|/d_b^3).
+      {
+        const mirror::vec3 p(0.0f, 0.0f, 1.0f);   // straight on, distance 1
+        const mirror::vec3 q(0.0f, 3.0f, 4.0f);   // distance 5, cos = 4/5
+        const float expected = (1.0f / 1.0f) / ((4.0f / 5.0f) / 25.0f);
+        checkClose(mirror::reconnectionGeometryJacobian(p, q, rc, faceN), expected,
+                   "g: hand-computed geometry Jacobian");
+      }
+
+      // Degenerate placements. A source vertex coplanar with the reconnection
+      // vertex's triangle has zero cosine on the source side -- an infinite
+      // Jacobian if the guard is missing.
+      {
+        const mirror::vec3 coplanar(4.0f, 0.0f, 0.0f);
+        const float j = mirror::reconnectionGeometryJacobian(a, coplanar, rc, faceN);
+        check(mirror::isJacobianInvalid(j), "g: coplanar source is rejected");
+      }
+
+      {
+        // Destination sitting exactly on the reconnection vertex: zero distance.
+        const float j = mirror::reconnectionGeometryJacobian(rc, a, rc, faceN);
+        check(mirror::isJacobianInvalid(j), "g: zero-length connection is rejected");
+      }
+
+      // The guard itself, on the values the reference names.
+      const float nan = std::numeric_limits<float>::quiet_NaN();
+      const float inf = std::numeric_limits<float>::infinity();
+
+      check(mirror::isJacobianInvalid(nan), "g: NaN Jacobian is invalid");
+      check(mirror::isJacobianInvalid(inf), "g: infinite Jacobian is invalid");
+      check(mirror::isJacobianInvalid(0.0f), "g: zero Jacobian is invalid");
+      check(mirror::isJacobianInvalid(-1.0f), "g: negative Jacobian is invalid");
+      check(!mirror::isJacobianInvalid(1e-8f), "g: a tiny positive Jacobian is valid");
+
+      // The full shift Jacobian is the geometry term times two pdf ratios; each
+      // ratio inverts under a src/dst swap, so the whole product round-trips.
+      {
+        const float dstPdf1 = 0.37f, srcPdf1 = 1.91f;
+        const float dstPdf2 = 4.25f, srcPdf2 = 0.62f;
+
+        const float full = forward * (dstPdf1 / srcPdf1) * (dstPdf2 / srcPdf2);
+        const float fullBack = backward * (srcPdf1 / dstPdf1) * (srcPdf2 / dstPdf2);
+
+        checkClose(full * fullBack, 1.0f, "g: full shift Jacobian round-trips");
+      }
+    }
+
+    // -----------------------------------------------------------------------
+    // (h) PHASE 3: PAIRWISE RESAMPLING MIS IS UNBIASED.
+    //
+    // The strongest assertion available for this phase, and the direct extension
+    // of (c). Build K+1 synthetic pixels over ONE shared discrete path domain, so
+    // that shifting is the identity with Jacobian 1 and "pixel px's integrand at
+    // path j" is simply F[px][j]. Every pixel builds a phase-2 reservoir over that
+    // domain; the central pixel then runs the pairwise combine exactly as
+    // fork_restir_pt_spatial_reuse.comp.slang does, with the merge draws
+    // enumerated rather than sampled.
+    //
+    //   assert  E[F_c(Y) * W_out]  ==  SUM_j F_c(j) / p_j
+    //
+    // which is what the central pixel's own estimator was already unbiased for.
+    // Reuse is allowed to change the variance and nothing else.
+    //
+    // What this catches, from plan-phase3's symptom table: a missing
+    // /(validNeighborCount + 1) (~x(k+1) too bright), a forgotten dstReservoir
+    // .init() or a canonical-weight slip, and `merge` used where
+    // `mergeWithResamplingMIS` belongs -- the last of which is nearly invisible
+    // in-game at M == 1 and unmissable here.
+    // -----------------------------------------------------------------------
+    void testPairwiseResamplingMISIsUnbiased() {
+      // One reservoir outcome of a phase-2 streaming build: which path index was
+      // selected, with what probability and what contribution weight.
+      struct Outcome {
+        int index = 0;
+        double probability = 0.0;
+        mirror::RestirPtReservoir reservoir;
+      };
+
+      // Enumerate a pixel's streaming RIS build exhaustively. Each candidate is
+      // offered in order; the selected index is the only thing that survives, and
+      // its probability is w_j / w_sum.
+      auto buildPixel = [](const std::vector<mirror::vec3>& F, const std::vector<float>& p) {
+        std::vector<Outcome> outcomes;
+
+        mirror::RestirPtReservoir reference;
+        reference.init();
+        for (size_t j = 0; j < F.size(); ++j) {
+          reference.add(F[j], p[j], 1.0f);
+        }
+
+        const float wSum = reference.weight;
+
+        for (size_t j = 0; j < F.size(); ++j) {
+          const float w = mirror::RestirPtReservoir::toScalar(F[j]) / p[j];
+          if (!(w > 0.0f)) { continue; }
+
+          Outcome o;
+          o.index = int(j);
+          o.probability = double(w) / double(wSum);
+
+          o.reservoir.init();
+          o.reservoir.F = F[j];
+          o.reservoir.weight = wSum;
+          o.reservoir.M = 1.0f;
+          // Stash the path index so the shift can be modelled as the identity.
+          o.reservoir.srcPixel = uint32_t(j);
+          mirror::pathBuilderFinalize(o.reservoir);
+          o.reservoir.finalizeRIS();
+
+          outcomes.push_back(o);
+        }
+
+        return outcomes;
+      };
+
+      // One (K + 1) x J integrand table plus one shared source-pdf vector is a
+      // whole test case. Deliberately asymmetric: differing scales per pixel, and
+      // at least one path a neighbour cannot see at all (F == 0), which is the
+      // shift-to-zero case the canonical weight has to compensate for.
+      struct Case {
+        const char* name;
+        std::vector<std::vector<mirror::vec3>> F;  // [pixel][path], pixel 0 is central
+        std::vector<float> p;
+      };
+
+      std::vector<Case> cases;
+
+      cases.push_back({
+        "k=1, mild asymmetry",
+        {
+          { mirror::vec3(1.0f, 0.5f, 0.25f), mirror::vec3(0.2f, 2.0f, 0.1f), mirror::vec3(0.7f, 0.7f, 3.0f) },
+          { mirror::vec3(0.8f, 0.6f, 0.30f), mirror::vec3(0.3f, 1.4f, 0.2f), mirror::vec3(0.5f, 0.9f, 2.1f) },
+        },
+        { 1.0f, 0.8f, 0.5f }
+      });
+
+      cases.push_back({
+        "k=2, one neighbour blind to a path",
+        {
+          { mirror::vec3(2.0f, 1.0f, 0.5f),  mirror::vec3(0.4f, 0.4f, 4.0f), mirror::vec3(1.1f, 0.2f, 0.9f) },
+          { mirror::vec3(0.1f, 0.1f, 0.1f),  mirror::vec3(0.0f, 0.0f, 0.0f), mirror::vec3(3.0f, 1.0f, 0.5f) },
+          { mirror::vec3(5.0f, 0.25f, 1.0f), mirror::vec3(0.9f, 0.9f, 0.9f), mirror::vec3(0.0f, 0.0f, 0.0f) },
+        },
+        { 1.0f, 0.64f, 0.32f }
+      });
+
+      cases.push_back({
+        "k=3, wide dynamic range",
+        {
+          { mirror::vec3(0.05f, 0.05f, 0.05f), mirror::vec3(9.0f, 0.1f, 0.1f) },
+          { mirror::vec3(0.02f, 0.90f, 0.03f), mirror::vec3(0.3f, 0.3f, 6.0f) },
+          { mirror::vec3(1.50f, 0.02f, 0.20f), mirror::vec3(0.0f, 0.0f, 0.0f) },
+          { mirror::vec3(0.40f, 0.40f, 0.40f), mirror::vec3(2.2f, 0.5f, 0.1f) },
+        },
+        { 0.9f, 0.45f }
+      });
+
+      for (const Case& c : cases) {
+        const int pixelCount = int(c.F.size());
+        const int neighborCount = pixelCount - 1;
+        const int pathCount = int(c.F[0].size());
+
+        // The target: what the central pixel's own estimator estimates.
+        double refX = 0.0, refY = 0.0, refZ = 0.0;
+        for (int j = 0; j < pathCount; ++j) {
+          refX += double(c.F[0][j].x) / double(c.p[j]);
+          refY += double(c.F[0][j].y) / double(c.p[j]);
+          refZ += double(c.F[0][j].z) / double(c.p[j]);
+        }
+
+        std::vector<std::vector<Outcome>> perPixel;
+        for (int px = 0; px < pixelCount; ++px) {
+          perPixel.push_back(buildPixel(c.F[px], c.p));
+        }
+
+        // Enumerate the joint selection of every pixel's reservoir.
+        std::vector<int> pick(pixelCount, 0);
+        double totalProbability = 0.0;
+        double eX = 0.0, eY = 0.0, eZ = 0.0;
+
+        // Odometer over perPixel[px].size().
+        bool done = false;
+        while (!done) {
+          double jointProbability = 1.0;
+          for (int px = 0; px < pixelCount; ++px) {
+            jointProbability *= perPixel[px][pick[px]].probability;
+          }
+
+          const mirror::RestirPtReservoir centralReservoir = perPixel[0][pick[0]].reservoir;
+          const int centralPath = perPixel[0][pick[0]].index;
+
+          // --- the pairwise combine, mirroring the shader ---------------------
+          //
+          // Shifts are the identity on this domain, so the shifted integrand of a
+          // path j onto pixel P is simply F[P][j], and every Jacobian is 1.
+          int validNeighborCount = 0;
+          float canonicalWeight = 1.0f;
+
+          struct MergeState { mirror::RestirPtReservoir dst; double probability; };
+
+          std::vector<MergeState> states;
+          {
+            MergeState s;
+            s.dst.init();
+            s.probability = 1.0;
+            states.push_back(s);
+          }
+
+          for (int i = 1; i < pixelCount; ++i) {
+            const mirror::RestirPtReservoir neighborReservoir = perPixel[i][pick[i]].reservoir;
+            const int neighborPath = perPixel[i][pick[i]].index;
+
+            ++validNeighborCount;
+
+            // (a) central -> neighbour, for the canonical weight. ports
+            // SpatialReuse.cs.slang:372-379.
+            const mirror::vec3 prefixIntegrand = c.F[i][centralPath];
+            const float prefixApproxPdf =
+              mirror::RestirPtReservoir::computeWeight(prefixIntegrand, false) * 1.0f;
+
+            canonicalWeight += 1.0f;
+
+            if (prefixApproxPdf > 0.0f) {
+              canonicalWeight -= prefixApproxPdf * neighborReservoir.M /
+                (prefixApproxPdf * neighborReservoir.M +
+                 centralReservoir.M * mirror::RestirPtReservoir::computeWeight(centralReservoir.F, false) /
+                   float(neighborCount));
+            }
+
+            // (b) neighbour -> central. ports :381-400.
+            const mirror::vec3 shiftedIntegrand = c.F[0][neighborPath];
+            const float dstJacobian = 1.0f;
+
+            std::vector<MergeState> next;
+
+            for (const MergeState& s : states) {
+              // shiftAndMergeReservoir with forceMerge: the temp reservoir ends up
+              // holding the shifted integrand plus the SOURCE's M and weight.
+              mirror::RestirPtReservoir temp = s.dst;
+              const bool selected = temp.merge(shiftedIntegrand, dstJacobian, neighborReservoir,
+                                               /*acceptRnd=*/ 0.0f, /*misWeight=*/ 1.0f, /*forceAdd=*/ true);
+              if (!selected) { temp.F = mirror::vec3(); }
+              temp.M = neighborReservoir.M;
+              temp.weight = neighborReservoir.weight;
+
+              float neighborWeight = 0.0f;
+
+              if (selected) {
+                const float neighborPHat =
+                  mirror::RestirPtReservoir::computeWeight(neighborReservoir.F, false) / dstJacobian;
+
+                neighborWeight = neighborPHat * neighborReservoir.M /
+                  (neighborPHat * neighborReservoir.M +
+                   mirror::RestirPtReservoir::computeWeight(temp.F, false) * centralReservoir.M /
+                     float(neighborCount));
+
+                if (std::isnan(neighborWeight) || std::isinf(neighborWeight)) { neighborWeight = 0.0f; }
+              }
+
+              // mergeWithResamplingMIS, both branches of the accept draw.
+              const float w = mirror::RestirPtReservoir::toScalar(temp.F) * dstJacobian *
+                              temp.weight * neighborWeight;
+              const float wSumAfter = s.dst.weight + w;
+              const double pAccept = (!(w > 0.0f) || std::isnan(w))
+                ? 0.0 : std::min(1.0, double(w) / double(wSumAfter));
+
+              if (pAccept > 0.0) {
+                MergeState accepted = s;
+                accepted.dst.mergeWithResamplingMIS(temp.F, dstJacobian, temp, 0.0f, neighborWeight, false);
+                accepted.probability = s.probability * pAccept;
+                next.push_back(accepted);
+              }
+
+              if (pAccept < 1.0) {
+                MergeState rejected = s;
+                rejected.dst.mergeWithResamplingMIS(temp.F, dstJacobian, temp, 1.0f, neighborWeight, false);
+                rejected.probability = s.probability * (1.0 - pAccept);
+                next.push_back(rejected);
+              }
+            }
+
+            states = next;
+          }
+
+          // The canonical merge. ports :403 -- shifted onto itself, Jacobian 1.
+          {
+            std::vector<MergeState> next;
+
+            for (const MergeState& s : states) {
+              const float w = mirror::RestirPtReservoir::toScalar(centralReservoir.F) * 1.0f *
+                              centralReservoir.weight * canonicalWeight;
+              const float wSumAfter = s.dst.weight + w;
+              const double pAccept = (!(w > 0.0f) || std::isnan(w))
+                ? 0.0 : std::min(1.0, double(w) / double(wSumAfter));
+
+              if (pAccept > 0.0) {
+                MergeState accepted = s;
+                accepted.dst.mergeWithResamplingMIS(centralReservoir.F, 1.0f, centralReservoir, 0.0f, canonicalWeight, false);
+                accepted.probability = s.probability * pAccept;
+                next.push_back(accepted);
+              }
+
+              if (pAccept < 1.0) {
+                MergeState rejected = s;
+                rejected.dst.mergeWithResamplingMIS(centralReservoir.F, 1.0f, centralReservoir, 1.0f, canonicalWeight, false);
+                rejected.probability = s.probability * (1.0 - pAccept);
+                next.push_back(rejected);
+              }
+            }
+
+            states = next;
+          }
+
+          // ports :405-409 plus the output guards at :534-535.
+          for (MergeState& s : states) {
+            if (s.dst.weight > 0.0f) {
+              s.dst.finalizeGRIS();
+              s.dst.weight /= float(validNeighborCount + 1);
+            }
+
+            if (s.dst.weight < 0.0f) { s.dst.weight = 0.0f; }
+            if (std::isnan(s.dst.weight) || std::isinf(s.dst.weight)) { s.dst.weight = 0.0f; }
+
+            const double probability = jointProbability * s.probability;
+
+            totalProbability += probability;
+            eX += probability * double(s.dst.F.x) * double(s.dst.weight);
+            eY += probability * double(s.dst.F.y) * double(s.dst.weight);
+            eZ += probability * double(s.dst.F.z) * double(s.dst.weight);
+          }
+
+          // Advance the odometer.
+          int px = 0;
+          for (; px < pixelCount; ++px) {
+            if (++pick[px] < int(perPixel[px].size())) { break; }
+            pick[px] = 0;
+          }
+          done = (px == pixelCount);
+        }
+
+        checkClose(float(totalProbability), 1.0f,
+                   str::format("h: [", c.name, "] outcome probabilities sum to 1").c_str(), 1e-4f);
+        checkClose(float(eX), float(refX),
+                   str::format("h: [", c.name, "] E[F.x * W] == sum F_c.x / p").c_str(), 1e-3f);
+        checkClose(float(eY), float(refY),
+                   str::format("h: [", c.name, "] E[F.y * W] == sum F_c.y / p").c_str(), 1e-3f);
+        checkClose(float(eZ), float(refZ),
+                   str::format("h: [", c.name, "] E[F.z * W] == sum F_c.z / p").c_str(), 1e-3f);
+      }
+    }
+
+    // -----------------------------------------------------------------------
+    // (i) PHASE 3: the pairwise MIS weights are a partition of unity, and the
+    // guards on the way out of the reuse pass.
+    //
+    // The partition check is the algebraic half of (h): it holds pointwise, for
+    // any number of VALID neighbours, whatever is inside the individual ratios --
+    // which is exactly why the deferred /(k' + 1) is the whole normalisation and
+    // why dropping it brightens the image by that factor.
+    // -----------------------------------------------------------------------
+    void testPairwiseWeightsPartitionAndGuards() {
+      const int configuredCount = 4;   // the divisor the reference uses inside the ratios
+
+      // Arbitrary per-neighbour target-function values at the canonical path.
+      const std::vector<float> neighborPHatAtCanonical = { 0.7f, 0.0f, 3.25f, 0.02f };
+      const float centralPHat = 1.3f;
+
+      for (int validCount = 1; validCount <= 4; ++validCount) {
+        float canonicalWeight = 1.0f;
+        float neighborWeightSum = 0.0f;
+
+        for (int i = 0; i < validCount; ++i) {
+          const float prefixApproxPdf = neighborPHatAtCanonical[i];
+
+          canonicalWeight += 1.0f;
+
+          if (prefixApproxPdf > 0.0f) {
+            const float a = prefixApproxPdf /
+              (prefixApproxPdf + centralPHat / float(configuredCount));
+            canonicalWeight -= a;
+            neighborWeightSum += a;
+          }
+        }
+
+        // Every m_i is a_i, m_c is canonicalWeight; the deferred division by
+        // (validCount + 1) is what turns the sum into 1.
+        checkClose((canonicalWeight + neighborWeightSum) / float(validCount + 1), 1.0f,
+                   "i: pairwise MIS weights sum to 1 after the deferred division");
+      }
+
+      // A zero-integrand shift (the neighbour cannot see the canonical path at
+      // all) must leave the canonical weight at its full +1 for that neighbour --
+      // that is how the canonical sample compensates for a lost shift.
+      {
+        float canonicalWeight = 1.0f;
+        const float prefixApproxPdf = 0.0f;
+        canonicalWeight += 1.0f;
+        if (prefixApproxPdf > 0.0f) { canonicalWeight -= 0.5f; }
+        checkClose(canonicalWeight, 2.0f, "i: a shift-to-zero neighbour leaves the canonical weight whole");
+      }
+
+      // ports SpatialReuse.cs.slang:397 -- the neighbour weight guard. A zero
+      // Jacobian that slipped past isJacobianInvalid would make this infinite.
+      {
+        const float inf = std::numeric_limits<float>::infinity();
+        const float nan = std::numeric_limits<float>::quiet_NaN();
+
+        float neighborWeight = inf;
+        if (std::isnan(neighborWeight) || std::isinf(neighborWeight)) { neighborWeight = 0.0f; }
+        check(neighborWeight == 0.0f, "i: infinite neighbour weight is zeroed");
+
+        neighborWeight = nan;
+        if (std::isnan(neighborWeight) || std::isinf(neighborWeight)) { neighborWeight = 0.0f; }
+        check(neighborWeight == 0.0f, "i: NaN neighbour weight is zeroed");
+      }
+
+      // ports :534-535 -- the output guards, mirrored so the reuse pass's last
+      // line of defence is locked the same way final shading's already is.
+      {
+        const float inf = std::numeric_limits<float>::infinity();
+        const float nan = std::numeric_limits<float>::quiet_NaN();
+
+        mirror::RestirPtReservoir r;
+        r.init();
+        r.F = mirror::vec3(1.0f);
+
+        r.weight = -3.0f;
+        if (r.weight < 0.0f) { r.weight = 0.0f; }
+        if (std::isnan(r.weight) || std::isinf(r.weight)) { r.weight = 0.0f; }
+        check(r.weight == 0.0f, "i: negative output weight is clamped to 0");
+
+        r.weight = inf;
+        if (r.weight < 0.0f) { r.weight = 0.0f; }
+        if (std::isnan(r.weight) || std::isinf(r.weight)) { r.weight = 0.0f; }
+        check(r.weight == 0.0f, "i: infinite output weight is zeroed");
+
+        r.weight = nan;
+        if (r.weight < 0.0f) { r.weight = 0.0f; }
+        if (std::isnan(r.weight) || std::isinf(r.weight)) { r.weight = 0.0f; }
+        check(r.weight == 0.0f, "i: NaN output weight is zeroed");
+      }
+
+      // The inherited `0 * inf` quirk documented in (d) reaches the reuse pass
+      // through mergeWithResamplingMIS too: an infinite resampling weight offered
+      // with a zero draw is REJECTED, with any positive draw ACCEPTED. Locked here
+      // so a later change to it is deliberate; it stays harmless only because the
+      // output guards above and final shading's own guards both exist.
+      {
+        mirror::RestirPtReservoir in;
+        in.init();
+        in.M = 1.0f;
+        in.weight = std::numeric_limits<float>::infinity();
+        in.F = mirror::vec3(1.0f);
+
+        mirror::RestirPtReservoir zeroDraw;
+        zeroDraw.init();
+        check(!zeroDraw.mergeWithResamplingMIS(mirror::vec3(1.0f), 1.0f, in, 0.0f, 1.0f, false),
+              "i: 0 * inf is NaN, so a zero draw rejects an infinite resampling weight");
+
+        mirror::RestirPtReservoir positiveDraw;
+        positiveDraw.init();
+        check(positiveDraw.mergeWithResamplingMIS(mirror::vec3(1.0f), 1.0f, in, 0.5f, 1.0f, false),
+              "i: the same infinite weight is accepted with a positive draw");
+        check(std::isinf(positiveDraw.weight), "i: the infinity propagates to w_sum, for the guards to catch");
+      }
+    }
+
     void run() {
       testAddBookkeeping();
       testFinalizeRIS();
@@ -720,6 +1262,9 @@ namespace dxvk {
       testNanRejection();
       testPathFlagsRoundTrip();
       testTargetFunction();
+      testReconnectionGeometryJacobian();
+      testPairwiseResamplingMISIsUnbiased();
+      testPairwiseWeightsPartitionAndGuards();
 
       std::cout << "All passed (" << m_checks << " checks)\n";
     }

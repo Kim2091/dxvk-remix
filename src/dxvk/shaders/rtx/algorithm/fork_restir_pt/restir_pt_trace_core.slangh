@@ -442,6 +442,7 @@ void restirPtGeneratePath(
   path.continueResolving = true;
 
   path.thp = vec3(1.0f);
+  path.prefixThp = vec3(1.0f);
   path.L = vec3(0.0f);
   path.LDeltaDirect = vec3(0.0f);
   path.russianRoulettePdf = 1.0f;
@@ -451,6 +452,7 @@ void restirPtGeneratePath(
   path.bounceCounters = 0u;
   path.sceneLength = 0.0f;
   path.firstSegmentLength = 0.0f;
+  path.scatterRayOrigin = vec3(0.0f);
   path.hit = RestirPtHit::createInvalid();
 
   path.pixelCoordinate = dstPixel;
@@ -573,6 +575,17 @@ bool restirPtScatterAtPrimarySurface(inout RestirPtPathState path, RAB_Surface p
   path.pdf = solidAnglePdf;
   path.prevScatterPdf = solidAnglePdf;
   path.thp *= continuationThroughput;
+
+  // ports :419-420. The primary vertex is always at or before the reconnection
+  // vertex (rcVertexLength is >= 1 by construction), so this always fires; it is
+  // written with the reference's condition anyway so the two stay diffable.
+  // After it, `path.thp` is 1 and the primary scatter's f*cos/pdf lives in
+  // prefixThp -- which is precisely the factor the reconnection shift replaces
+  // with dstF1 / dstPDF1 at the destination pixel.
+  if (int(path.length) <= path.pathBuilder.rcVertexLength)
+  {
+    path.recordPrefixThp();
+  }
 
   // Lobe classification. ports :313-317 and :353-381: the primary-hit
   // diffuse/specular flags feed denoiser routing in phase 2, and the
@@ -698,16 +711,74 @@ void restirPtHandleVertex(
       path.LDeltaDirect += skyLr;
     }
 
-    // ports :1541-1543 -- offer the escaped path as an RIS candidate. The
-    // reference's `path.length` indexing transcribes as-is: for an escape the
-    // stored length is the number of scattering vertices, with no light vertex
-    // to exclude.
+    // ports :1541-1543 -- offer the escaped path as an RIS candidate.
+    //
+    // PHASE 3 CORRECTION to the phase 2 transcription. The reference's
+    // `path.length` is NOT the fork's here: Falcor increments path.length inside
+    // nextVertex and only on a HIT (PathTracer.slang:835), so on a miss its
+    // path.length still names the vertex the ray was launched FROM, whereas this
+    // kernel sets path.length = bounce at the top of the segment loop regardless
+    // of the outcome. Phase 2 transcribed `path.length` literally and was
+    // therefore one too high on this site alone (the hit sites already agree, and
+    // the emissive site's max(0, length-1) already agrees).
+    //
+    // The invariant the reference maintains across all of its add sites, and that
+    // this now restores, is: pathLength == the index of the LAST SCATTERING
+    // VERTEX, primary being 0. Phase 2 could not see the error because
+    // pathFlags.pathLength() feeds nothing that phase reads; phase 3's shift reads
+    // it in three places (isRcVertexFinal, isRcVertexNEE, isRcVertexEscapedVertex),
+    // and in pure reconnection mode the shift compares against a HARDCODED
+    // rcVertexLength of 1 (Shift.slang:390), so a bounce-1 sky escape has to store
+    // pathLength 0 or the escaped-vertex branch at :407 never fires.
+    const int escapePathLength = int(path.length) - 1;
+
     if (path.buildReservoir)
     {
-      path.pathBuilder.addEscapeVertex(
-        int(path.length), path.direction, skyLr, skyLr,
+      // Postfix: the suffix measured from the reconnection vertex outward, i.e.
+      // path.thp rather than getCurrentThp(). ports :1543.
+      const vec3 skyPostfix = path.thp * skyRadiance * radianceAttenuation * kRestirPtEnvMisWeight;
+
+      const bool selected = path.pathBuilder.addEscapeVertex(
+        escapePathLength, path.direction, skyLr, skyPostfix,
         path.russianRoulettePdf, kRestirPtEnvMisWeight, /*lightPdf=*/ 0.0f,
         kRestirPtLightTypeEnvMap, path.pathReservoir, path.enableRandomReplay);
+
+      // ports :1546-1562 -- promote the escape direction itself to the
+      // reconnection vertex, so a path whose FIRST scatter left the scene is
+      // still shiftable (the shift's env-map branch, Shift.slang:403-432).
+      //
+      // TWO DELIBERATE FORK DEVIATIONS, both recorded in plan-phase3 Q2.5:
+      //
+      //   1. The reference gates the whole thing on `path.useHybridShift`, which
+      //      means its pure-reconnection mode simply cannot reuse a bounce-1 sky
+      //      escape -- rcVertexLength stays 15, the shift's escaped-vertex test
+      //      fails and the integrand is 0. Outdoors in FNV that class dominates,
+      //      so the gate is dropped and replaced by a live knob.
+      //   2. The reference's remaining conditions are `path.length >= 1 &&
+      //      path.length + 1 < rcVertexLength` in ITS length convention, which in
+      //      fork terms is `escapePathLength >= 1` -- and that would exclude the
+      //      bounce-1 escape this deviation exists for. The fork condition below
+      //      is the same statement written against the fork's convention: fire
+      //      when a reconnection vertex has not already been chosen (any escape at
+      //      bounce 2 or later already has rcVertexLength 1 from the first hit, so
+      //      the second half self-excludes it).
+      //
+      // rcVertexLength is set to escapePathLength + 1, exactly as the reference
+      // does, which keeps `pathLength + 1 == rcVertexLength` true for this
+      // candidate. lightPdf is 0 because this kernel never NEE-samples the sky, so
+      // the shift's evalMIS degenerates to 1 -- matching kRestirPtEnvMisWeight.
+      if (selected &&
+          (cb.restirPtFlags & RESTIR_PT_FLAG_SPATIAL_SKY_RECONNECTION) != 0u &&
+          escapePathLength >= 0 &&
+          escapePathLength + 1 < path.pathBuilder.rcVertexLength)
+      {
+        path.pathBuilder.markEscapeVertexAsRcVertex(
+          escapePathLength + 1, path.pathReservoir, RestirPtHit::createInvalid(),
+          path.isDelta(), path.isTransmission(), path.isSpecularBounce(),
+          /*lightPdf=*/ 0.0f, kRestirPtLightTypeEnvMap,
+          skyRadiance * radianceAttenuation, path.direction,
+          path.prevScatterPdf, /*geometryFactor=*/ 1.0f);
+      }
     }
   }
 
@@ -731,8 +802,12 @@ void restirPtHandleVertex(
 
     if (path.buildReservoir)
     {
+      // Postfix measured from the reconnection vertex outward (path.thp), the
+      // same split the reference applies at its own emissive site (:1089).
+      const vec3 resolvePostfix = path.thp * emissiveRadiance;
+
       path.pathBuilder.addEscapeVertex(
-        max(0, int(path.length) - 1), path.direction, resolveLr, resolveLr,
+        max(0, int(path.length) - 1), path.direction, resolveLr, resolvePostfix,
         path.russianRoulettePdf, /*misWeight=*/ 1.0f, /*lightPdf=*/ 0.0f,
         kRestirPtLightTypeEmissive, path.pathReservoir, path.enableRandomReplay);
     }
@@ -771,18 +846,39 @@ void restirPtHandleVertex(
   path.setHit(restirPtMakeHit(rayInteraction));
 
   // --- Reconnection-vertex bookkeeping at the first secondary vertex --------
-  // ports :1174-1176 (the `!useHybridShift && path.length == 1` branch), minus
+  // ports :1171-1191 (the `!useHybridShift && path.length == 1` branch), minus
   // the three event-bit inserts, which moved to the primary scatter -- see the
   // note in restirPtScatterAtPrimarySurface for why.
   //
-  // rcVertexLength itself stays pinned at kRestirPtMaximumPathLength in phase 2
-  // (see restir_pt_path_builder.slangh), so `is_rcVertex` inside the builder is
-  // still never true; recording the hit and the scatter pdf here costs nothing
-  // and is exactly what phase 3's reconnection shift will read.
+  // PHASE 3 lights this up: `rcVertexLength = path.length` is the one assignment
+  // that turns the whole dormant reconnection machinery on. It is UNCONDITIONAL
+  // in this kernel -- every candidate carries reconnection data whether or not
+  // spatial reuse is enabled, because the reuse *toggle* gates the reuse pass and
+  // not the trace. That is what keeps reuse-off byte-comparable with phase 2:
+  // rcVertexLength changes nothing final shading reads (it reads weight, F and
+  // two flag bits), it only changes what the reservoir CARRIES.
   if (path.length == uint16_t(1))
   {
     path.pathBuilder.rcVertexHit = path.hit;
     path.pathBuilder.cachedJacobian.x = path.prevScatterPdf;
+    path.pathBuilder.rcVertexLength = int(path.length);
+
+    // ports :1182-1185 -- the geometry term of the reconnection Jacobian,
+    // cos(theta_rc) / d^2, measured from the vertex the segment was launched
+    // from. NOT consumed in phase 3 (the shift recomputes both halves fresh
+    // because useCachedJacobian is false there, Shift.slang:463-469); phase 5's
+    // hybrid shift is the consumer, so it is recorded correctly now while the
+    // reference is in front of us.
+    //
+    // The normal source has to agree with the shift's: the reference uses
+    // sd.faceN on both sides, and dxvk-remix's twin of faceN is
+    // SurfaceInteraction::geometryNormal (shadingNormal is the shaded one).
+    const vec3 disp = path.scatterRayOrigin - surfaceInteraction.position;
+    const float dispSquared = dot(disp, disp);
+
+    path.pathBuilder.cachedJacobian.z = (dispSquared > 0.0f)
+      ? abs(dot(surfaceInteraction.geometryNormal, rayInteraction.viewDirection)) / dispSquared
+      : 0.0f;
   }
 
   // --- Emitted radiance at the hit -----------------------------------------
@@ -881,8 +977,14 @@ void restirPtHandleVertex(
       // deviation note in restir_pt_path_builder.slangh.
       if (path.buildReservoir)
       {
+        // ports :1089 -- the postfix is the SUFFIX throughput (path.thp), not the
+        // whole-path throughput. Identical to Lr in phase 2 because prefixThp was
+        // pinned to 1; from phase 3 on they genuinely differ, and handing Lr here
+        // would make the shift double-count the primary BSDF it re-evaluates.
+        const vec3 emissivePostfix = path.thp * emissiveLight * misWeight;
+
         path.pathBuilder.addEscapeVertex(
-          max(0, int(path.length) - 1), path.direction, Lr, Lr,
+          max(0, int(path.length) - 1), path.direction, Lr, emissivePostfix,
           path.russianRoulettePdf, misWeight, /*lightPdf=*/ 0.0f,
           kRestirPtLightTypeEmissive, path.pathReservoir, path.enableRandomReplay);
       }
@@ -1004,16 +1106,35 @@ void restirPtHandleVertex(
 
           if (path.buildReservoir)
           {
-            // pathWeight and postfixWeight coincide in phase 2: the reference
-            // splits them so the prefix throughput up to the reconnection vertex
-            // can be factored out (:1348), and this port's prefix is identically
-            // 1 (RestirPtPathState::getCurrentThp).
+            // ports :1332-1346. Two things happen to the postfix here that do NOT
+            // happen to Lr:
             //
+            //   1. It uses the SUFFIX throughput path.thp, not getCurrentThp() --
+            //      the prefix (primary BSDF, and the reconnection vertex's own
+            //      BSDF once we are past it) is what the shift re-evaluates at the
+            //      destination pixel and must not be baked in here.
+            //   2. When this NEE connection IS the reconnection vertex, the
+            //      reference sets `weight = 1` (:1333), excluding the reconnection
+            //      vertex's own BSDF factor from the stored irradiance. The
+            //      builder then multiplies by lightPdf / misWeight (:170), so what
+            //      lands in rcVertexIrradiance is RAW incident light times the
+            //      shadow-ray attenuation -- exactly what the shift's isRcVertexNEE
+            //      case re-weights with dstF2 / srcReservoir.lightPdf
+            //      (Shift.slang:498-515).
+            //
+            // In fork terms `neeLight` is the reference's `weight * ls.Li` and
+            // `lightSample.radiance * lightThroughput` is its bare `ls.Li`.
+            const bool isRcVertexNeeConnection =
+              (int(path.length) == path.pathBuilder.rcVertexLength);
+
+            const vec3 neePostfix = path.thp * kRestirPtNeeMisWeight *
+              (isRcVertexNeeConnection ? (lightSample.radiance * lightThroughput) : neeLight);
+
             // lightPdf is the EFFECTIVE pdf -- solidAnglePdf already divided by
-            // the RIS inverse selection pdf above -- which is what phase 3's
-            // NEE-final shift case needs.
+            // the RIS inverse selection pdf above -- which is what the NEE-final
+            // shift case consumes as dstPDF2.
             path.pathBuilder.addNeeVertex(
-              int(path.length), inputDirection, Lr, Lr,
+              int(path.length), inputDirection, Lr, neePostfix,
               path.russianRoulettePdf, kRestirPtNeeMisWeight, lightSample.solidAnglePdf,
               kRestirPtLightTypeAnalytic, path.pathReservoir, path.enableRandomReplay);
           }
@@ -1114,6 +1235,40 @@ void restirPtHandleVertex(
     restirPtClassifyScatterEvent(path, sampledLobe, perceptualRoughness, materialType);
 
     path.thp *= continuationThroughput;
+
+    // --- At-reconnection-vertex captures -----------------------------------
+    // All three fire only on the vertex the reconnection was placed at, which in
+    // pure reconnection mode is always the first indirect hit.
+    if (int(path.length) == path.pathBuilder.rcVertexLength)
+    {
+      // ports :384-390 -- the event class of the scatter AT the reconnection
+      // vertex. The shift reads decodeIsDeltaEvent(false) to reject a shift onto
+      // a delta chain (Shift.slang:439,442) and decodeIsSpecularBounce(false) to
+      // pick the lobe class its rc-vertex evaluations are restricted to (:493).
+      path.pathBuilder.pathFlags.insertIsDeltaEvent(path.isDelta(), false);
+      path.pathBuilder.pathFlags.insertIsTransmissionEvent(path.isTransmission(), false);
+      path.pathBuilder.pathFlags.insertIsSpecularBounce(path.isSpecularBounce(), false);
+
+      // ports :334-337. Note the fork's `solidAnglePdf` is the sampled lobe's own
+      // solid-angle pdf and is NOT multiplied by the lobe selection probability,
+      // which is the convention path.prevScatterPdf and cachedJacobian.x already
+      // use here. Unconsumed in phase 3 (useCachedJacobian is false); phase 5 must
+      // reconcile it with the pdfSingle convention of the shift's helpers before
+      // switching useCachedJacobian on.
+      path.pathBuilder.cachedJacobian.y = solidAnglePdf;
+
+      // ports :1435-1437 -- the outgoing direction at the reconnection vertex, the
+      // one the shift re-evaluates the rc BSDF along.
+      path.pathBuilder.rcVertexWi = path.direction;
+    }
+
+    // ports :419-420 -- close the prefix at the reconnection vertex. Beyond it
+    // this is false and path.thp accumulates the suffix alone.
+    if (int(path.length) <= path.pathBuilder.rcVertexLength)
+    {
+      path.recordPrefixThp();
+    }
+
     path.continuePath = true;
   }
 }
@@ -1148,6 +1303,11 @@ vec3 restirPtTracePathInternal(
 
     path.length = uint16_t(bounce);
     path.continuePath = false;
+
+    // The vertex this segment is launched from. The resolve loop is free to move
+    // path.origin through alpha / portal continuations, so the reconnection
+    // geometry factor reads this instead (see RestirPtPathState::scatterRayOrigin).
+    path.scatterRayOrigin = path.origin;
 
     Ray segmentRay;
     segmentRay.origin = path.origin;
@@ -1263,6 +1423,9 @@ vec3 restirPtTraceContinuationPath(
   path.continueResolving = true;
 
   path.thp = throughput;
+  // No reservoir on this route, so nothing ever consults the prefix/suffix split;
+  // the whole throughput stays in `thp` and getCurrentThp() is the identity again.
+  path.prefixThp = vec3(1.0f);
   path.L = vec3(0.0f);
   path.LDeltaDirect = vec3(0.0f);
   path.russianRoulettePdf = 1.0f;
@@ -1272,6 +1435,7 @@ vec3 restirPtTraceContinuationPath(
   path.bounceCounters = 0u;
   path.sceneLength = 0.0f;
   path.firstSegmentLength = 0.0f;
+  path.scatterRayOrigin = rayOrigin;
   path.hit = RestirPtHit::createInvalid();
 
   path.pixelCoordinate = pixel;

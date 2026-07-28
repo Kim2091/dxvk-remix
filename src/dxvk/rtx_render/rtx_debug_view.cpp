@@ -261,6 +261,8 @@ namespace dxvk {
         {DEBUG_VIEW_RESTIR_PT_RESERVOIR_VALID, "ReSTIR PT Reservoir Valid", "R = reservoir M (1 where a candidate was streamed in), G = weight > 0. Black on a lit surface means the path builder rejected everything."},
         {DEBUG_VIEW_RESTIR_PT_RESERVOIR_F, "ReSTIR PT Reservoir Integrand", "Cached integrand F of the selected path, before the contribution weight is applied."},
         {DEBUG_VIEW_RESTIR_PT_FINAL_SHADING, "ReSTIR PT Final Shading", "F * weight, the radiance the fork final shading pass adds into the primary indirect channels. Compare against 'ReSTIR PT Trace' - the two must agree in expectation."},
+        {DEBUG_VIEW_RESTIR_PT_SPATIAL_REUSE, "ReSTIR PT Spatial Reuse", "F * weight of the reservoir the last spatial reuse round produced. Same average brightness as 'ReSTIR PT Final Shading' with reuse off, but visibly lower variance; a uniform brightness change is an energy bug."},
+        {DEBUG_VIEW_RESTIR_PT_SHIFT_PARITY, "ReSTIR PT Shift Parity (Self)", "Shifts every pixel's reservoir onto its OWN surface, which must reproduce F with Jacobian 1. R = relative integrand error x100, G = |Jacobian - 1| x100. Must be black on ordinary opaque surfaces before any neighbour reuse is judged."},
 
         {DEBUG_VIEW_NEE_CACHE_LIGHT_HISTOGRAM, "NEE Cache Light Histogram"},
         {DEBUG_VIEW_NEE_CACHE_HISTOGRAM, "NEE Cache Triangle Histogram"},
