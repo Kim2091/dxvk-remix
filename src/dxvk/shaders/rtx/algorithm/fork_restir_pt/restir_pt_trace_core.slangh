@@ -884,6 +884,33 @@ void restirPtHandleVertex(
     path.pathBuilder.cachedJacobian.x = path.prevScatterPdf;
     path.pathBuilder.rcVertexLength = int(path.length);
 
+    // CLOSE THE PREFIX ON *ARRIVAL* AT THE RECONNECTION VERTEX, not just after
+    // scattering from it. Without this line the connection segment's attenuation
+    // is double-counted by every shift whose terminal sits AT the reconnection
+    // vertex, and that was a real energy error in spatial reuse, not merely a
+    // failing harness.
+    //
+    // The chain: `path.thp *= radianceAttenuation` above folds segment 1's alpha
+    // cutout (resolve.slangh:540) and volumetric attenuation (:413) into `thp` --
+    // the SUFFIX accumulator -- because until now the only fold happened after the
+    // scatter, further down. Any terminal offered before that scatter (NEE at this
+    // vertex, emissive at this vertex) therefore built its postfix, and so its
+    // stored rcVertexIrradiance, with that attenuation baked in. The shift then
+    // multiplies the destination's own connection-segment attenuation in again
+    // (restir_pt_shift.slangh, the evalVisibility block), so the same term appears
+    // twice. For a self-shift the error is exactly (1 - A): negligible for the
+    // volumetric part at shipped densities, but 2%-99% for a cutout texel, which
+    // is why it read as isolated salt rather than a wash -- it needs a terminal at
+    // the reconnection vertex AND a segment that crossed non-opaque geometry, two
+    // independent per-pixel conditions.
+    //
+    // getCurrentThp() is INVARIANT under this fold -- it returns thp * prefixThp,
+    // and the fold moves a factor from one to the other -- so F, path.L, the
+    // Russian roulette test and the NEE-cache task feedback are all unchanged, and
+    // the replay parity view stays black. The fold further down still composes:
+    // it now sees thp = 1 rather than thp = A, and folds the scatter weight on top.
+    path.recordPrefixThp();
+
     // ports :1182-1185 -- the geometry term of the reconnection Jacobian,
     // cos(theta_rc) / d^2, measured from the vertex the segment was launched
     // from. NOT consumed in phase 3 (the shift recomputes both halves fresh

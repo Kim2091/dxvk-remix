@@ -491,8 +491,16 @@ float restirPtReconnectionGeometryJacobian(
 // destination's connection segment consistent with what a natively traced dst path
 // would have seen -- there, the same attenuation lands in the prefix throughput.
 // (Phase 2 deviation D7 is what makes the two comparable in the first place.)
+//
+// `spreadAngle` must be the SCATTER ray's widened spread, not the screen-space
+// pixel spread. This ray re-reads the alpha of every cutout surface it crosses, and
+// those reads have to land on the same mip the trace's resolve loop used or the
+// attenuation it returns is not the attenuation the trace applied. On a cutout
+// edge a fine-mip alpha is ~0 or ~1 where the coarse-mip alpha is ~0.4, so the
+// disagreement is not a rounding difference: it can push cumulative opacity across
+// the commit threshold and drive the shifted integrand to zero outright.
 VisibilityResult restirPtTraceShiftVisibility(
-  RAB_Surface dstPrimary, vec3 targetPosition, float tMaxFactor)
+  RAB_Surface dstPrimary, vec3 targetPosition, float spreadAngle, float tMaxFactor)
 {
   uint8_t rayMask = uint8_t(OBJECT_MASK_OPAQUE | (dstPrimary.objectMask & OBJECT_MASK_ALL_DYNAMIC));
   rayMask |= cb.enableIndirectTranslucentShadows ? uint8_t(OBJECT_MASK_TRANSLUCENT) : uint8_t(0);
@@ -501,19 +509,23 @@ VisibilityResult restirPtTraceShiftVisibility(
   return traceVisibilityRay<visibilityModeEnableTranslucentMaterials>(
     dstPrimary.minimalSurfaceInteraction, targetPosition, rayMask,
     invalidRayPortalIndex, dstPrimary.portalSpace, /*pomOpaqueSurfaceEncountered=*/ false,
-    dstPrimary.minimalRayInteraction.coneRadius, cb.screenSpacePixelSpreadHalfAngle, tMaxFactor);
+    dstPrimary.minimalRayInteraction.coneRadius, spreadAngle, tMaxFactor);
 }
 
 // The direction-only form, for a reconnection vertex that is the environment
 // (ports the `isDirection` branch of evalSegmentVisibility, :639-641).
-VisibilityResult restirPtTraceShiftVisibilityDirectional(RAB_Surface dstPrimary, vec3 direction)
+VisibilityResult restirPtTraceShiftVisibilityDirectional(
+  RAB_Surface dstPrimary, vec3 direction, float spreadAngle)
 {
   uint8_t rayMask = uint8_t(OBJECT_MASK_OPAQUE | (dstPrimary.objectMask & OBJECT_MASK_ALL_DYNAMIC));
   rayMask |= cb.enableIndirectTranslucentShadows ? uint8_t(OBJECT_MASK_TRANSLUCENT) : uint8_t(0);
   rayMask |= cb.enableIndirectAlphaBlendShadows ? uint8_t(OBJECT_MASK_ALPHA_BLEND) : uint8_t(0);
 
   Ray viewRay = (Ray) 0;
-  viewRay.spreadAngle = cb.screenSpacePixelSpreadHalfAngle;
+  // Same requirement as the finite-segment form above: the escape ray crosses the
+  // same cutout geometry the trace's resolve loop walked, and must read its alpha
+  // at the same mip.
+  viewRay.spreadAngle = spreadAngle;
 
   MinimalRayInteraction minimalRayInteraction = (MinimalRayInteraction) 0;
   minimalRayInteraction.coneRadius = dstPrimary.minimalRayInteraction.coneRadius;
@@ -578,6 +590,15 @@ vec3 restirPtComputeShiftedIntegrandReconnection(
   const vec3 dstPrimaryPosition = dstPrimary.minimalSurfaceInteraction.position;
   const vec3 srcPrimaryPosition = srcPrimary.minimalSurfaceInteraction.position;
 
+  // The cone the TRACE used along this connection, widened by the scatter that
+  // created it. cachedJacobian.x holds that scatter's solid-angle pdf, recorded at
+  // the first indirect hit and also by markEscapeVertexAsRcVertex, so it is
+  // available in BOTH branches below. Every texture read on the destination side --
+  // the reconnection vertex rebuild AND the visibility ray's alpha reads -- has to
+  // use it, or they land two to four mip levels finer than the trace's.
+  const float rcSpreadAngle = restirPtShiftSpreadAngleFromSolidAnglePdf(
+    cb.screenSpacePixelSpreadHalfAngle, srcReservoir.cachedJacobian.x);
+
   // ports :400-401 (computeNewRayOrigin) is deliberately NOT transcribed: it only
   // matters for the BPR variant, because the non-BPR path below rejects every
   // delta chain outright at :442, and dxvk-remix applies its own ray offset inside
@@ -597,7 +618,8 @@ vec3 restirPtComputeShiftedIntegrandReconnection(
         !srcReservoir.pathFlags.lastVertexNEE())
     {
       const vec3 wi = rcVertexWi;
-      const VisibilityResult visibility = restirPtTraceShiftVisibilityDirectional(dstPrimary, wi);
+      const VisibilityResult visibility =
+        restirPtTraceShiftVisibilityDirectional(dstPrimary, wi, rcSpreadAngle);
 
       if (!visibility.hasOpaqueHit)
       {
@@ -675,13 +697,6 @@ vec3 restirPtComputeShiftedIntegrandReconnection(
   SurfaceInteraction rcSurfaceInteraction;
   MinimalRayInteraction rcRayInteraction;
   OpaqueSurfaceMaterialInteraction rcMaterialInteraction;
-
-  // The cone the TRACE used for this vertex, not the screen-space pixel cone: the
-  // scatter that reached it widened the ray's spread by its own pdf, and that pdf
-  // is stored in cachedJacobian.x. Getting this wrong reads the material two to
-  // four mips too fine -- see gap 1 on restirPtReconstructRcVertex.
-  const float rcSpreadAngle = restirPtShiftSpreadAngleFromSolidAnglePdf(
-    cb.screenSpacePixelSpreadHalfAngle, srcReservoir.cachedJacobian.x);
 
   if (!restirPtReconstructRcVertex(
         rcVertexHit, dstPrimaryPosition,
@@ -819,7 +834,8 @@ vec3 restirPtComputeShiftedIntegrandReconnection(
   {
     // Shorten slightly so the ray cannot self-intersect the reconnection vertex's
     // own triangle -- the reference's 0.999 at :647.
-    const VisibilityResult visibility = restirPtTraceShiftVisibility(dstPrimary, rcPosition, 0.999f);
+    const VisibilityResult visibility =
+      restirPtTraceShiftVisibility(dstPrimary, rcPosition, rcSpreadAngle, 0.999f);
 
     if (visibility.hasOpaqueHit)
     {

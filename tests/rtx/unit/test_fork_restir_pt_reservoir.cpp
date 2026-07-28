@@ -456,6 +456,39 @@ namespace mirror {
   }
 
   // =========================================================================
+  // PREFIX / SUFFIX THROUGHPUT, and where the connection segment's attenuation
+  // is allowed to live.
+  //
+  // KEEP IN SYNC with restir_pt_path_state.slangh (recordPrefixThp,
+  // getCurrentThp) and the two fold sites in restir_pt_trace_core.slangh -- one
+  // on ARRIVAL at the reconnection vertex, one after the scatter FROM it.
+  // =========================================================================
+
+  struct PathThroughput {
+    vec3 prefix = vec3(1.0f);
+    vec3 suffix = vec3(1.0f);
+
+    // ports RestirPtPathState::getCurrentThp.
+    vec3 current() const {
+      return vec3(suffix.x * prefix.x, suffix.y * prefix.y, suffix.z * prefix.z);
+    }
+
+    // ports RestirPtPathState::recordPrefixThp.
+    void recordPrefix() {
+      prefix = vec3(prefix.x * suffix.x, prefix.y * suffix.y, prefix.z * suffix.z);
+      suffix = vec3(1.0f);
+    }
+
+    void multiplySuffix(const vec3& v) {
+      suffix = vec3(suffix.x * v.x, suffix.y * v.y, suffix.z * v.z);
+    }
+  };
+
+  inline vec3 mul3(const vec3& a, const vec3& b) {
+    return vec3(a.x * b.x, a.y * b.y, a.z * b.z);
+  }
+
+  // =========================================================================
   // The debug view 887 metric.
   // KEEP IN SYNC with fork_restir_pt_spatial_reuse.comp.slang
   // (restirPtSelfShiftRelativeError).
@@ -1848,6 +1881,26 @@ namespace dxvk {
                           c.minimumMipLevelsMissed, " mip levels").c_str());
       }
 
+      // BOTH destination-side texture consumers must use that cone, not just the
+      // rebuild. The visibility ray re-reads the alpha of every cutout surface it
+      // crosses; reading it at a different mip returns a different attenuation than
+      // the trace applied, and on a cutout edge that is the difference between
+      // alpha ~0.4 and alpha ~0 or ~1. Fixing only the rebuild leaves half the bug.
+      {
+        const Case& c = cases[0];
+        const float scatterSpreadAngle = mirror::spreadAngleFromSolidAnglePdf(
+          screenSpacePixelSpreadHalfAngle, c.primaryScatterSolidAnglePdf, indirectRaySpreadAngleFactor);
+
+        // One value feeds the rebuild and the visibility ray alike.
+        const float rebuildSpread = scatterSpreadAngle;
+        const float visibilitySpread = scatterSpreadAngle;
+
+        check(visibilitySpread == rebuildSpread,
+              "l: the visibility ray uses the same cone spread as the vertex rebuild");
+        check(visibilitySpread != screenSpacePixelSpreadHalfAngle,
+              "l: and it is not the screen-space pixel spread");
+      }
+
       // A dirac scatter has pdf exactly 1 by convention and must NOT be widened --
       // the cone math breaks down there, and the reference guards it the same way.
       {
@@ -1952,6 +2005,193 @@ namespace dxvk {
       }
     }
 
+    // -----------------------------------------------------------------------
+    // (n) PHASE 3: THE CONNECTION SEGMENT'S ATTENUATION BELONGS TO THE PREFIX.
+    //
+    // This one was a real energy error in spatial reuse, not just a failing
+    // harness, and it is the subtlest thing in the phase.
+    //
+    // The trace folds segment 1's attenuation -- alpha cutout plus volumetric --
+    // into `thp`, the SUFFIX accumulator, on arrival at the reconnection vertex.
+    // Any terminal offered AT that vertex (NEE there, emissive there) then builds
+    // its postfix, and so the stored rcVertexIrradiance, from that suffix -- so
+    // the attenuation is baked into the irradiance. The shift afterwards multiplies
+    // the DESTINATION's own connection-segment attenuation into the integrand,
+    // because for a shifted path that segment is new. Result: the same term twice.
+    //
+    // The fix is to close the prefix on ARRIVAL at the reconnection vertex, so the
+    // attenuation sits in the prefix -- exactly the part the shift replaces.
+    //
+    // Two things are asserted: that getCurrentThp is INVARIANT under the extra
+    // fold (so F, path.L and Russian roulette cannot move), and that the stored
+    // irradiance is then free of the attenuation.
+    // -----------------------------------------------------------------------
+    void testConnectionAttenuationBelongsToPrefix() {
+      // Primary scatter weight, segment-1 attenuation (a cutout leaf edge at
+      // alpha 0.5 plus a little fog), and the terminal's own quantities.
+      const mirror::vec3 primaryScatterWeight(0.42f, 0.38f, 0.31f);
+      const mirror::vec3 segmentAttenuation(0.50f, 0.52f, 0.55f);
+      const mirror::vec3 incidentRadiance(3.0f, 3.6f, 5.0f);
+      const mirror::vec3 rcVertexBsdfWeight(0.20f, 0.18f, 0.15f);
+
+      // --- the trace, up to the terminal AT the reconnection vertex ---------
+      auto walkToReconnectionVertex = [&](bool foldOnArrival) {
+        mirror::PathThroughput t;
+
+        // Primary scatter: fold its weight, then close the prefix (this fold has
+        // always been there).
+        t.multiplySuffix(primaryScatterWeight);
+        t.recordPrefix();
+
+        // Segment 1 travelled: its attenuation lands in the SUFFIX.
+        t.multiplySuffix(segmentAttenuation);
+
+        // Arrival at the reconnection vertex. THE FIX.
+        if (foldOnArrival) { t.recordPrefix(); }
+
+        return t;
+      };
+
+      const mirror::PathThroughput fixed = walkToReconnectionVertex(true);
+      const mirror::PathThroughput unfixed = walkToReconnectionVertex(false);
+
+      // (1) INVARIANCE. getCurrentThp is what every radiance accumulation site and
+      // the Russian roulette test read, so if the fold moved it, the shaded image
+      // and the replay parity view would both move. Asserted BIT-EXACT, not close:
+      // the fold only moves a factor from one operand of a product to the other,
+      // and IEEE multiplication is commutative.
+      const mirror::vec3 currentFixed = fixed.current();
+      const mirror::vec3 currentUnfixed = unfixed.current();
+
+      check(currentFixed.x == currentUnfixed.x &&
+            currentFixed.y == currentUnfixed.y &&
+            currentFixed.z == currentUnfixed.z,
+            "n: getCurrentThp is BIT-IDENTICAL under the arrival fold");
+
+      const mirror::vec3 expectedCurrent = mirror::mul3(primaryScatterWeight, segmentAttenuation);
+      check(mirror::maxRelativeDifference(currentFixed, expectedCurrent) < 1e-6f,
+            "n: and it is still the full prefix-times-suffix product");
+
+      // (2) The suffix -- which is what a terminal at this vertex hands the builder
+      // as its postfix, and hence what lands in rcVertexIrradiance -- must be free
+      // of the segment attenuation after the fix, and carry it before.
+      check(fixed.suffix.x == 1.0f && fixed.suffix.y == 1.0f && fixed.suffix.z == 1.0f,
+            "n: after the arrival fold the suffix is exactly 1 at the reconnection vertex");
+      check(mirror::maxRelativeDifference(unfixed.suffix, segmentAttenuation) < 1e-6f,
+            "n: without it the suffix still carries the connection segment's attenuation");
+
+      // (3) THE DOUBLE COUNT, end to end. Build the stored irradiance the way
+      // addNeeVertex does for a terminal AT the reconnection vertex (the reference's
+      // `weight = 1` exclusion, then x lightPdf / misWeight), shift it back onto the
+      // same pixel, and compare against the traced F.
+      const float lightPdf = 2.5f;
+      const float misWeight = 1.0f;
+
+      auto storedIrradiance = [&](const mirror::PathThroughput& t) {
+        // postfix = suffix * (radiance / lightPdf) * mis, with the rc vertex's own
+        // BSDF excluded; the builder then multiplies by lightPdf / mis.
+        const mirror::vec3 postfix(
+          t.suffix.x * incidentRadiance.x / lightPdf * misWeight,
+          t.suffix.y * incidentRadiance.y / lightPdf * misWeight,
+          t.suffix.z * incidentRadiance.z / lightPdf * misWeight);
+        const float toIrradiance = lightPdf / misWeight;
+        return mirror::vec3(postfix.x * toIrradiance, postfix.y * toIrradiance, postfix.z * toIrradiance);
+      };
+
+      // The traced F for this candidate: full throughput x the rc BSDF x radiance.
+      const mirror::vec3 tracedF(
+        currentFixed.x * rcVertexBsdfWeight.x * incidentRadiance.x / lightPdf,
+        currentFixed.y * rcVertexBsdfWeight.y * incidentRadiance.y / lightPdf,
+        currentFixed.z * rcVertexBsdfWeight.z * incidentRadiance.z / lightPdf);
+
+      // The self-shift: the destination's primary factor (which for a self-shift is
+      // the primary scatter weight), the rc BSDF over the light pdf, the stored
+      // irradiance, and the connection segment's attenuation supplied by the
+      // visibility ray.
+      auto selfShift = [&](const mirror::vec3& irradiance) {
+        return mirror::vec3(
+          primaryScatterWeight.x * rcVertexBsdfWeight.x / lightPdf * irradiance.x * segmentAttenuation.x,
+          primaryScatterWeight.y * rcVertexBsdfWeight.y / lightPdf * irradiance.y * segmentAttenuation.y,
+          primaryScatterWeight.z * rcVertexBsdfWeight.z / lightPdf * irradiance.z * segmentAttenuation.z);
+      };
+
+      const mirror::vec3 shiftedFixed = selfShift(storedIrradiance(fixed));
+      check(mirror::maxRelativeDifference(shiftedFixed, tracedF) < 1e-5f,
+            "n: with the arrival fold, the self-shift of a terminal-at-rc reproduces F");
+
+      const mirror::vec3 shiftedUnfixed = selfShift(storedIrradiance(unfixed));
+      const float relative = mirror::maxRelativeDifference(shiftedUnfixed, tracedF);
+
+      // Error is exactly (1 - A) on each channel; for a 0.5 cutout texel that is 50%.
+      checkClose(relative, 1.0f - segmentAttenuation.x,
+                 "n: without it the error is exactly one minus the segment attenuation", 1e-3f);
+      check(relative > 0.4f,
+            "n: which for a half-transparent cutout texel is a ~50% error, not a rounding one");
+
+      // (4) The fold must not disturb candidates BEYOND the reconnection vertex:
+      // the scatter fold further down still composes, and the total prefix is the
+      // same product either way.
+      {
+        const mirror::vec3 rcScatterWeight(0.31f, 0.29f, 0.27f);
+
+        mirror::PathThroughput afterFixed = fixed;
+        afterFixed.multiplySuffix(rcScatterWeight);
+        afterFixed.recordPrefix();
+
+        mirror::PathThroughput afterUnfixed = unfixed;
+        afterUnfixed.multiplySuffix(rcScatterWeight);
+        afterUnfixed.recordPrefix();
+
+        check(mirror::maxRelativeDifference(afterFixed.prefix, afterUnfixed.prefix) < 1e-5f,
+              "n: past the reconnection vertex the prefix is the same product either way");
+        check(afterFixed.suffix.x == 1.0f, "n: and the suffix restarts at 1 for the bounce-2 terminals");
+      }
+    }
+
+    // -----------------------------------------------------------------------
+    // (o) PHASE 3: a zero view direction must not become a NaN.
+    //
+    // The reconnection-vertex rebuild has no view direction to give until the
+    // position is known, so it passes zero. `normalize(0)` is NaN, and every
+    // comparison against a NaN is false -- which in the baked-terrain cascade
+    // selection (surface_interaction.slangh:581) silently pins the cascade to
+    // level 0 for a point that may be hundreds of metres out. Latent rather than
+    // live in the scenes measured so far, but real wherever baked terrain hosts a
+    // reconnection vertex.
+    // -----------------------------------------------------------------------
+    void testZeroViewDirectionIsSafe() {
+      const mirror::vec3 zero(0.0f, 0.0f, 0.0f);
+      const mirror::vec3 fallback(0.0f, 0.0f, 1.0f);
+
+      // What plain normalize does.
+      {
+        const float length = std::sqrt(mirror::dot3(zero, zero));
+        check(length == 0.0f, "o: a zero view direction has zero length");
+        const float naive = zero.x / length;
+        check(std::isnan(naive), "o: plain normalize of it is NaN");
+        // The specific consequence: the threshold test silently takes the false
+        // branch, so cascade 0 is chosen without anything looking wrong.
+        check(!(naive >= 0.5f), "o: and every comparison against that NaN is false");
+      }
+
+      // What safeNormalize does.
+      {
+        const mirror::vec3 safe = mirror::normalizeOrZ(zero);
+        check(safe.x == fallback.x && safe.y == fallback.y && safe.z == fallback.z,
+              "o: safeNormalize returns the fallback instead");
+        check(!std::isnan(safe.x) && !std::isnan(safe.y) && !std::isnan(safe.z),
+              "o: and the result is finite, so the comparison below it is meaningful");
+      }
+
+      // A real direction is untouched by the guard.
+      {
+        const mirror::vec3 real(0.0f, 3.0f, 4.0f);
+        const mirror::vec3 safe = mirror::normalizeOrZ(real);
+        checkClose(safe.y, 0.6f, "o: a real direction normalizes normally");
+        checkClose(safe.z, 0.8f, "o: a real direction normalizes normally (z)");
+      }
+    }
+
     void run() {
       testAddBookkeeping();
       testFinalizeRIS();
@@ -1965,6 +2205,8 @@ namespace dxvk {
       testEscapeShiftIdentity();
       testReconnectionVertexFootprint();
       testSelfShiftMetric();
+      testConnectionAttenuationBelongsToPrefix();
+      testZeroViewDirectionIsSafe();
       testPairwiseResamplingMISIsUnbiased();
       testPairwiseWeightsPartitionAndGuards();
 

@@ -578,7 +578,15 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
         // For surfaces with displacement, we need to ensure the final hit point is within a cascade level.
         // To do this, calculate the furthest texcoord that displacement could return, and use a cascade level that includes that point.
         const mat3 worldToTangent = mat3(surfaceInteraction.geometryTangent, surfaceInteraction.geometryBitangent, surfaceInteraction.geometryNormal);
-        const vec3 viewDirTangentSpace = normalize(mul(worldToTangent, rayInteraction.viewDirection));
+        // Note: safeNormalize rather than normalize. A caller that rebuilds a surface
+        // interaction from a stored hit rather than from a live ray has no view
+        // direction to give until the position is known, and passes zero; normalize(0)
+        // is NaN, every comparison against it is false, and the cascade selection below
+        // then silently pins to level 0 for a point that may be hundreds of metres out.
+        // The fallback keeps that case on the first cascade deliberately rather than by
+        // accident. (Fork: the ReSTIR PT reconnection shift is such a caller --
+        // rtx/algorithm/fork_restir_pt/restir_pt_shift.slangh.)
+        const vec3 viewDirTangentSpace = safeNormalize(mul(worldToTangent, rayInteraction.viewDirection), vec3(0.0f, 0.0f, 1.0f));
         // viewDirection is hitPos to camera, so invert it before converting to a texcoord offset.
         const vec2 maxPossiblePomOffset = viewDirTangentSpace.xy * (-1.f * cb.terrainArgs.displaceIn / viewDirTangentSpace.z);
 

@@ -165,6 +165,16 @@ static const float kRestirPtSpatialDepthThreshold = 0.1f;
 //
 // Reservoirs too dim for either side to matter are not judged at all and are
 // painted BLUE rather than black, so "excluded" is never confused with "passing".
+// Blue is an absolute 1e-3 radiance floor and is expected to appear as a small
+// dim tail at dusk; it is not a signal.
+//
+// WHAT A BLACK PIXEL DOES *NOT* CERTIFY, stated so this view is not over-trusted.
+// Several shift paths FAIL CLOSED: a back-facing rebuilt reconnection vertex
+// zeroes the reflection weights and returns before the Jacobian is ever written,
+// so `shiftable` is false and the pixel reads black. Black therefore certifies
+// "the shift is correct OR the shift silently contributed nothing" -- and the
+// second case is a loss of reuse, invisible here. Measuring that would need a
+// separate view painting shiftability itself, which is not built.
 static const float kRestirPtSelfShiftMinScale = 1e-3f;
 
 float restirPtSelfShiftRelativeError(vec3 a, vec3 b, out bool judged)
