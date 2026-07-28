@@ -285,6 +285,26 @@ namespace dxvk {
     RTX_OPTION("rtx.restirPT", float, lightingValidationThreshold, 0.05f,
                "Gradient magnitude above which a temporal sample is treated as stale. Lower discards more history (more responsive, noisier); "
                "higher discards less (quieter, more ghosting).");
+    RTX_OPTION("rtx.restirPT", bool, enableBoilingFilter, true,
+               "Clears a reservoir whose radiance towers over the local average of its 16x8 workgroup. Ported from the RTXDI SDK by way of "
+               "rtx.restirGI.useBoilingFilter.\n"
+               "A resampling loop does the OPPOSITE of averaging a firefly away: a huge contribution weight is very likely to be selected, so "
+               "spatial reuse copies it to neighbours and temporal reuse re-selects it for about temporalHistoryLength frames. The two together "
+               "retain and spread it, which reads in-game as a bright spot that GROWS over seconds while the image mean stays perfectly stable. "
+               "This clears the offending reservoir in the page that becomes next frame's history, which is what breaks that loop.\n"
+               "Deliberately biased - it removes energy. It must not be used to hide an energy bug; if the overall brightness is wrong, that is a "
+               "different problem and this will only disguise it.");
+    RTX_OPTION("rtx.restirPT", float, boilingFilterThreshold, 30.0f,
+               "How far above its workgroup's average radiance a reservoir must sit before the boiling filter clears it. Lower catches more "
+               "outliers and costs more real light; the reference point is rtx.restirGI.boilingFilterRemoveReservoirThreshold, which is 62.\n"
+               "Too low and legitimately bright small features - a lamp filament, a specular glint, a sunlit gap - get erased.");
+    RTX_OPTION("rtx.restirPT", float, fireflyThreshold, 0.0f,
+               "Absolute luminance clamp on a reservoir's radiance, applied per pixel and written back into the reservoir so the clamped value is "
+               "what later frames reuse. Zero disables it, which is the default: the neighbourhood-relative boiling filter should be tried first "
+               "because it adapts to local brightness, while this does not.\n"
+               "Twin of the clamp ReSTIR GI applies to its initial sample. Note its comment's warning applies here too - a resampling loop tolerates "
+               "a far higher threshold than a plain integrator, because it produces a stable result rather than a one-frame spike, so setting this "
+               "low DARKENS the image rather than cleaning it.");
     RTX_OPTION("rtx.restirPT", bool, neeCacheTaskFeedback, true,
                "Inserts NEE cache tasks at emissive hits inside the ReSTIR PT kernel, as the indirect integrator does. "
                "This is how the cache DISCOVERS emissive triangles; integrate_nee's own feedback only reinforces existing candidates. "

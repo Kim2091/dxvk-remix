@@ -63,10 +63,121 @@
 #include "rtx/utility/gbuffer_helpers.slangh"
 #include "rtx/algorithm/integrator_helpers.slangh"
 
+// ---------------------------------------------------------------------------
+// OUTLIER SUPPRESSION
+// ---------------------------------------------------------------------------
+//
+// ReSTIR PT shipped phases 1-4 with NONE of this, which is a gap rather than a
+// deliberate omission: ReSTIR GI beside it has three separate mechanisms
+// (rtx.restirGI.useBoilingFilter, fireflyThreshold, and a firefly clamp on the
+// initial sample before it ever enters a reservoir).
+//
+// WHY A RESAMPLING LOOP NEEDS THIS AND A PLAIN PATH TRACER DOES NOT. A path
+// tracer's firefly is one sample in one pixel in one frame, and the denoiser
+// averages it away. A reservoir does the opposite of averaging: a sample with a
+// huge contribution weight is very likely to be SELECTED, so spatial reuse copies
+// it to neighbours and temporal reuse re-selects it for ~temporalHistoryLength
+// frames. The two together retain and spread it. That is visible as a bright spot
+// that grows over seconds while the image mean stays perfectly stable -- unbiased
+// and unusable at the same time, which is why no amount of MIS auditing finds it.
+//
+// Both mechanisms WRITE BACK to the reservoir buffer. That is the load-bearing
+// part: final shading reads the page that becomes next frame's history page
+// (finalPage() in rtx_fork_restir_pt_rayquery.cpp), so clearing an outlier here is
+// what stops it being inherited. Suppressing only the shaded output would leave the
+// firefly sitting in the reservoir, still spreading, still immortal.
+//
+// This is deliberately BIASED -- it removes energy. It is a variance/bias trade
+// every ReSTIR implementation makes, and it must never be used to paper over an
+// unbiasedness bug: if the image mean is wrong, fix the mean. These knobs exist for
+// what remains after the mean is right.
+//
+// The boiling filter is borrowed from the RTXDI SDK by way of ReSTIR GI's
+// (restir_gi_final_shading.comp.slang:62-120): take the local average of nonzero
+// reservoir radiance across the workgroup and clear whatever towers over it.
+#define RESTIR_PT_BOILING_GROUP_WIDTH  16
+#define RESTIR_PT_BOILING_GROUP_HEIGHT 8
+#define RESTIR_PT_BOILING_GROUP_THREADS (RESTIR_PT_BOILING_GROUP_WIDTH * RESTIR_PT_BOILING_GROUP_HEIGHT)
+
+// One entry per wavefront in the group. Sized for the smallest plausible wave
+// width (8) so it is correct on any hardware; the surplus is a few hundred bytes.
+groupshared float s_boilingWeights[RESTIR_PT_BOILING_GROUP_THREADS / 8];
+groupshared uint s_boilingCounts[RESTIR_PT_BOILING_GROUP_THREADS / 8];
+
 [shader("compute")]
 [numthreads(16, 8, 1)]
-void main(uint2 threadIndex : SV_DispatchThreadID)
+void main(uint2 threadIndex : SV_DispatchThreadID, uint2 localIndex : SV_GroupThreadID, uint2 groupIndex : SV_GroupID)
 {
+  // --- The boiling filter, BEFORE any early-out ----------------------------
+  //
+  // Placement is a correctness requirement, not a preference. The filter needs
+  // GroupMemoryBarrierWithGroupSync, which is undefined unless every thread in the
+  // group reaches it, and the three early returns below are all per-pixel. So it
+  // runs first, under a GROUP-UNIFORM gate: only for groups lying entirely inside
+  // the image. That is the same guard ReSTIR GI uses
+  // (restir_gi_final_shading.comp.slang:317) and it also keeps partial groups from
+  // skewing the average with pixels that do not exist.
+  const uint2 groupCorner = groupIndex * uint2(RESTIR_PT_BOILING_GROUP_WIDTH, RESTIR_PT_BOILING_GROUP_HEIGHT);
+  const bool groupFullyInside =
+    all(groupCorner + uint2(RESTIR_PT_BOILING_GROUP_WIDTH, RESTIR_PT_BOILING_GROUP_HEIGHT) - 1 < uint2(cb.camera.resolution));
+
+  if ((cb.restirPtFlags & RESTIR_PT_FLAG_BOILING_FILTER) != 0u && groupFullyInside)
+  {
+    const uint filterReservoirIndex = restirPtReservoirIndex(threadIndex, uint2(cb.camera.resolution));
+    RestirPtReservoir filterReservoir = RestirPtReservoirBuffer[filterReservoirIndex];
+
+    const vec3 filterRadiance = filterReservoir.F * filterReservoir.weight;
+    const bool filterValid =
+      filterReservoir.weight > 0.0f && isValidValue(filterRadiance) && all(filterRadiance >= vec3(0.0f));
+    const float filterLuminance = filterValid ? calcBt709Luminance(filterRadiance) : 0.0f;
+
+    // Average of the NONZERO reservoirs only -- counting the empty ones would drag
+    // the average down and make the filter progressively more aggressive the
+    // darker the neighbourhood is.
+    float waveWeight = WaveActiveSum(filterLuminance);
+    uint waveCount = WaveActiveCountBits(filterValid && filterLuminance > 0.0f);
+
+    const uint linearThreadIndex = localIndex.x + localIndex.y * RESTIR_PT_BOILING_GROUP_WIDTH;
+    const uint waveIndex = linearThreadIndex / WaveGetLaneCount();
+
+    if (WaveIsFirstLane())
+    {
+      s_boilingWeights[waveIndex] = waveWeight;
+      s_boilingCounts[waveIndex] = waveCount;
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    // Reduce the per-wavefront partials into one group average, in one wavefront.
+    const uint waveTotal = (RESTIR_PT_BOILING_GROUP_THREADS + WaveGetLaneCount() - 1) / WaveGetLaneCount();
+
+    if (linearThreadIndex < waveTotal)
+    {
+      waveWeight = WaveActiveSum(s_boilingWeights[linearThreadIndex]);
+      waveCount = WaveActiveSum(s_boilingCounts[linearThreadIndex]);
+
+      if (linearThreadIndex == 0)
+      {
+        s_boilingWeights[0] = (waveCount > 0u) ? (waveWeight / float(waveCount)) : 0.0f;
+      }
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    const float averageLuminance = s_boilingWeights[0];
+
+    // Clear the reservoir outright rather than rescaling its radiance. Rescaling
+    // would leave the offending PATH in the reservoir with a merely smaller weight,
+    // and reuse would keep selecting and re-spreading it; the point is to break the
+    // loop, not to dim one frame of it.
+    if (averageLuminance > 0.0f &&
+        filterLuminance > averageLuminance * cb.restirPtBoilingFilterThreshold)
+    {
+      filterReservoir.init();
+      RestirPtReservoirBuffer[filterReservoirIndex] = filterReservoir;
+    }
+  }
+
   if (any(threadIndex >= cb.camera.resolution))
   {
     return;
@@ -120,6 +231,34 @@ void main(uint2 threadIndex : SV_DispatchThreadID)
   if (any(isnan(radiance)) || any(isinf(radiance)) || any(radiance < vec3(0.0f)))
   {
     radiance = vec3(0.0f);
+  }
+
+  // The absolute firefly clamp, the per-pixel companion to the neighbourhood-
+  // relative boiling filter above. Twin of the clamp ReSTIR GI applies to its
+  // initial sample (restir_gi_temporal_reuse.comp.slang:138-140), including the
+  // reasoning in its comment: a resampling loop tolerates a much higher threshold
+  // than a plain integrator does, because it produces a stable result rather than
+  // a one-frame spike -- so setting this too low DARKENS the image instead of
+  // cleaning it. Uses the same fireflyFiltering helper (common.slangh:37), which
+  // scales the colour by the clamped/original luminance ratio and so preserves hue.
+  if (cb.restirPtFireflyThreshold > 0.0f)
+  {
+    const vec3 clampedRadiance = fireflyFiltering(radiance, cb.restirPtFireflyThreshold);
+
+    // WRITE THE CLAMP BACK INTO THE RESERVOIR, not just into the shaded output.
+    // This page becomes next frame's history; clamping only the output would leave
+    // the unclamped path in the reservoir, still selectable, still spreading
+    // through spatial reuse. Scaling F rather than weight keeps F's dual role as
+    // both radiance and RIS target function self-consistent.
+    if (any(clampedRadiance != radiance) && any(radiance > vec3(0.0f)))
+    {
+      const float clampScale = calcBt709Luminance(clampedRadiance) / max(calcBt709Luminance(radiance), 1e-9f);
+
+      reservoir.F *= clampScale;
+      RestirPtReservoirBuffer[reservoirIndex] = reservoir;
+
+      radiance = clampedRadiance;
+    }
   }
 
   // ports :572-573. The lobe class of the bounce BEFORE the reconnection vertex

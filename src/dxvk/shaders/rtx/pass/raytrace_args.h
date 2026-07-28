@@ -453,8 +453,13 @@ struct RaytraceArgs {
   // fifth scalar later would cost a re-audit of the whole struct's alignment.
   float restirPtTemporalHistoryLength;       // M-cap: history M is clamped to this x the current reservoir's M.
   float restirPtLightingValidationThreshold; // RTXDI gradient magnitude above which a temporal sample is discarded as stale.
-  uint restirPtReserved0;                    // Reserved for phase 5 (hybrid shift retrace).
-  uint restirPtReserved1;                    // Reserved for phase 5 (hybrid shift retrace).
+  // The two scalars this group reserved, spent. Outlier suppression: ReSTIR PT had
+  // none at all, while ReSTIR GI beside it ships three separate mechanisms for it
+  // (rtx.restirGI.useBoilingFilter, fireflyThreshold, and a firefly clamp on the
+  // initial sample). A resampling loop RETAINS and SPREADS a firefly rather than
+  // averaging it away, so this is not optional polish.
+  float restirPtBoilingFilterThreshold;      // Clear a reservoir whose radiance exceeds this x the workgroup average.
+  float restirPtFireflyThreshold;            // Absolute luminance clamp on a reservoir's radiance. <= 0 disables.
 
   // NOTE: Add structs to the top section of RaytraceArgs, not the bottom.
   // NOTE: bool does not work in debug builds, use uint instead.
@@ -508,3 +513,9 @@ struct RaytraceArgs {
 #define RESTIR_PT_FLAG_TEMPORAL_REUSE           (1u << 8)
 #define RESTIR_PT_FLAG_TEMPORAL_JITTER          (1u << 9)
 #define RESTIR_PT_FLAG_LIGHTING_VALIDATION      (1u << 10)
+
+// Bit 11 gates the boiling filter in final shading. Deliberately a separate bit
+// from the firefly clamp (which is keyed off its threshold being positive): the
+// two suppress different things and want to be A/B'd independently -- the clamp is
+// per-pixel and absolute, the filter is neighbourhood-relative.
+#define RESTIR_PT_FLAG_BOILING_FILTER           (1u << 11)

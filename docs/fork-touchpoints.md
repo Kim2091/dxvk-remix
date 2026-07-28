@@ -4070,4 +4070,28 @@ targets disagree about the path being possible. Pre-fix those were the runaway r
 they are pixels where the temporal candidate declines, so a yellow-heavy view now means the surface
 reconstruction is starving reuse, not that energy is wrong.
 
+**OUTLIER SUPPRESSION (fork - 2026-07-28), a gap rather than a bug.** ReSTIR PT shipped phases 1-4
+with no firefly or boiling suppression at all, while ReSTIR GI beside it has three separate
+mechanisms. That is not optional polish for a resampling loop, and the reason generalises: a plain
+path tracer's firefly is one sample in one pixel in one frame and the denoiser averages it away,
+whereas a reservoir does the OPPOSITE of averaging - a huge contribution weight is very likely to
+be SELECTED, so spatial reuse copies it to neighbours and temporal reuse re-selects it for about
+`temporalHistoryLength` frames. The two together retain and spread it, which reads in-game as a
+bright spot that GROWS over seconds while the image mean stays perfectly stable: unbiased and
+unusable at once, and therefore invisible to any amount of MIS auditing.
+
+Added in `fork_restir_pt_final_shading.comp.slang`: a workgroup boiling filter borrowed from the
+RTXDI SDK by way of `restir_gi_final_shading.comp.slang:62-120`, plus an absolute per-pixel firefly
+clamp (default OFF - the neighbourhood-relative filter adapts to local brightness and should be
+tried first). Two placement details are load-bearing. **Both WRITE BACK into the reservoir buffer**,
+because final shading reads the page that becomes next frame's history (`finalPage()`), so
+suppressing only the shaded output would leave the firefly in the reservoir, still selectable and
+still spreading. And **the filter runs before every early-out**, under a GROUP-UNIFORM gate, because
+`GroupMemoryBarrierWithGroupSync` is undefined unless every thread in the group reaches it and all
+three of that shader's early returns are per-pixel.
+
+Both are deliberately BIASED - they remove energy - and neither may be used to paper over an
+unbiasedness bug. Two spare scalars reserved in the phase 4 `RaytraceArgs` group are spent on their
+thresholds, so the struct did not grow.
+
 ---

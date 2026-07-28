@@ -328,6 +328,14 @@ namespace dxvk {
     RemixGui::Checkbox("Validate Lighting Change", &validateLightingChangeObject());
     RemixGui::DragFloat("Lighting Validation Threshold", &lightingValidationThresholdObject(), 0.005f, 0.0f, 1.0f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
 
+    // Outlier suppression. Both must be live: the whole point of the boiling filter
+    // is a stare-and-toggle A/B against a growing bright spot, and the thresholds
+    // are the difference between erasing a firefly and erasing a lamp filament.
+    ImGui::Separator();
+    RemixGui::Checkbox("Boiling Filter", &enableBoilingFilterObject());
+    RemixGui::DragFloat("Boiling Filter Threshold", &boilingFilterThresholdObject(), 0.5f, 2.0f, 200.0f, "%.1f", ImGuiSliderFlags_AlwaysClamp);
+    RemixGui::DragFloat("Firefly Threshold (0 = off)", &fireflyThresholdObject(), 1.0f, 0.0f, 5000.0f, "%.0f", ImGuiSliderFlags_AlwaysClamp);
+
     if (indirectModeActive && enableTemporalReuse() && !usesDenoiserGradient()) {
       ImGui::TextWrapped("Note: lighting validation is off, so a light change will ghost for about Temporal History Length frames.");
     }
@@ -376,6 +384,10 @@ namespace dxvk {
       flags |= RESTIR_PT_FLAG_TEMPORAL_JITTER;
     }
 
+    if (enableBoilingFilter()) {
+      flags |= RESTIR_PT_FLAG_BOILING_FILTER;
+    }
+
     // Note: gated on the gradient pass ACTUALLY RUNNING this frame, not just on the
     // option -- the shader reads RtxdiGradients under this bit, and an unwritten or
     // stale gradient texture would invalidate history at random. Mirrors how
@@ -390,8 +402,12 @@ namespace dxvk {
 
     constants.restirPtTemporalHistoryLength = std::max(1.0f, temporalHistoryLength());
     constants.restirPtLightingValidationThreshold = std::max(0.0f, lightingValidationThreshold());
-    constants.restirPtReserved0 = 0u;
-    constants.restirPtReserved1 = 0u;
+
+    // Note: a threshold at or below 1 would clear every reservoir at or above its
+    // own neighbourhood average, i.e. roughly half of them, so it is clamped well
+    // clear of that rather than left to a stray drag of the slider.
+    constants.restirPtBoilingFilterThreshold = std::max(2.0f, boilingFilterThreshold());
+    constants.restirPtFireflyThreshold = std::max(0.0f, fireflyThreshold());
 
     constants.restirPtSpatialNeighborCount =
       static_cast<uint32_t>(std::clamp(spatialNeighborCount(), 1, kRestirPtMaxSpatialNeighbors));
