@@ -247,9 +247,26 @@ void main(uint2 threadId : SV_DispatchThreadID)
         const vec3 integrandDelta = abs(selfIntegrand - centralReservoir.F);
         const float relativeScale = max(1e-4f, RestirPtReservoir::toScalar(centralReservoir.F));
 
+        const float integrandError = max(integrandDelta.x, max(integrandDelta.y, integrandDelta.z)) / relativeScale;
+        const float jacobianError = abs(selfJacobian - 1.0f);
+
+        // THRESHOLD, then ramp. Raw relative error times 100 makes a 1% mismatch
+        // saturate, which is too sensitive for a pass/fail gate: the reconnection
+        // vertex is REBUILT from (surfaceIndex, primitiveIndex, barycentrics)
+        // rather than re-traced, and that rebuild has a small, bounded, known
+        // fidelity gap against what the trace loop resolved -- texture footprint
+        // and the shading-normal bend, both detailed in restirPtReconstructRcVertex.
+        // Anything under the threshold is that gap; anything over is a real
+        // transcription error, which in practice misses by tens to thousands of
+        // percent rather than by ones.
+        //
+        // Set the threshold to 0 to see the raw field, which is the right setting
+        // when hunting a residual rather than gating on one.
+        const float threshold = max(0.0f, restirPtArgs.debugParam);
+
         error = vec3(
-          max(integrandDelta.x, max(integrandDelta.y, integrandDelta.z)) / relativeScale * 100.0f,
-          abs(selfJacobian - 1.0f) * 100.0f,
+          max(0.0f, integrandError - threshold) * 100.0f,
+          max(0.0f, jacobianError - threshold) * 100.0f,
           0.0f);
       }
     }

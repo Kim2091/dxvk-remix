@@ -177,7 +177,11 @@
 
 struct ForkReSTIRPTArgs {
   uint mode;   // trace pass: FORK_RESTIR_PT_MODE_*.  spatial pass: round index.
-  uint pad0;
+  // Debug-view-only. Spatial pass: the self-shift parity threshold for debug view
+  // 887 (see restirPtShiftParityThreshold). Rides here rather than in RaytraceArgs
+  // because that struct may only grow in complete 4-scalar groups and this is one
+  // debug scalar; the trace pass zero-fills the struct, so it reads 0 there.
+  float debugParam;
   uint pad1;
   uint pad2;
 };

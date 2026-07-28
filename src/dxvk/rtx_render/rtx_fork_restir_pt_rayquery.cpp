@@ -264,6 +264,7 @@ namespace dxvk {
     RemixGui::DragInt("Spatial Rounds", &spatialRoundsObject(), 0.05f, 1, kRestirPtMaxSpatialRounds, "%d", ImGuiSliderFlags_AlwaysClamp);
     RemixGui::DragFloat("Jacobian Rejection Threshold", &jacobianRejectionThresholdObject(), 0.1f, 0.0f, 50.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
     RemixGui::Checkbox("Sky Reconnection", &spatialSkyReconnectionObject());
+    RemixGui::DragFloat("Shift Parity Threshold (view 887)", &shiftParityThresholdObject(), 0.005f, 0.0f, 1.0f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
   }
 
   void DxvkForkReSTIRPTRayQuery::setRaytraceArgs(RaytraceArgs& constants) const {
@@ -554,6 +555,7 @@ namespace dxvk {
 
       ForkReSTIRPTArgs pushArgs = {};
       pushArgs.mode = round;  // dual use: the round index, see ForkReSTIRPTArgs.
+      pushArgs.debugParam = std::max(0.0f, shiftParityThreshold());
       ctx->pushConstants(0, sizeof(pushArgs), &pushArgs);
 
       ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);

@@ -1576,6 +1576,138 @@ namespace dxvk {
       }
     }
 
+    // -----------------------------------------------------------------------
+    // (k) PHASE 3: THE ESCAPE / SKY-RECONNECTION SELF-SHIFT IDENTITY.
+    //
+    // The env-map branch of the shift (Shift.slang:403-432) is the one piece with
+    // the least in-game exposure, and the residual hunt after Gate 1 needed it
+    // ruled in or out. Structurally it is the SIMPLE branch: it never reconstructs
+    // a reconnection vertex -- there is no hit to reconstruct -- so none of the
+    // rebuild fidelity gaps can reach it. What it does have is a chain of
+    // conventions that must line up exactly:
+    //
+    //   trace:  F                 = prefixThp * sky * segmentAttenuation
+    //           rcVertexIrradiance = sky * segmentAttenuation   (markEscapeVertexAsRcVertex)
+    //           lightPdf           = 0                          (this kernel never NEE-samples the sky)
+    //   shift:  integrand          = dstF1/dstPDF1 * evalMIS(1, dstPDF1All, 1, lightPdf) * rcVertexIrradiance
+    //
+    // so the identity holds iff (a) dstF1/dstPDF1 reproduces prefixThp -- the lobe
+    // class again, already locked by (j) -- (b) the MIS weight degenerates to
+    // exactly 1 at lightPdf 0, and (c) the segment attenuation is applied EXACTLY
+    // ONCE. (c) is the live hazard: the finite-segment branch multiplies the
+    // destination's visibility attenuation into the integrand, and doing the same
+    // here would double-count, because for an escape the source's attenuation is
+    // already baked into the stored irradiance.
+    // -----------------------------------------------------------------------
+    void testEscapeShiftIdentity() {
+      // A rough dielectric primary that scattered diffusely into the sky.
+      mirror::LobeState primary;
+      primary.selectionProbability[mirror::kLobeIndexDiffuseReflection] = 0.6f;
+      primary.selectionProbability[mirror::kLobeIndexSpecularReflection] = 0.4f;
+      primary.solidAnglePdf[mirror::kLobeIndexDiffuseReflection] = 0.26f;
+      primary.solidAnglePdf[mirror::kLobeIndexSpecularReflection] = 1.40f;
+      primary.projectedWeight[mirror::kLobeIndexDiffuseReflection] = mirror::vec3(0.11f, 0.10f, 0.08f);
+      primary.projectedWeight[mirror::kLobeIndexSpecularReflection] = mirror::vec3(0.02f, 0.02f, 0.02f);
+
+      const mirror::vec3 skyRadiance(3.0f, 3.6f, 5.0f);
+      const mirror::vec3 segmentAttenuation(0.82f, 0.86f, 0.93f);  // fog over the escape segment
+
+      // ports restir_pt_shift.slangh restirPtEvalMIS (PathTracer.slang:550-560,
+      // balance heuristic), including the fork's zero-sum guard.
+      auto evalMIS = [](float n0, float p0, float n1, float p1) {
+        const float q0 = n0 * p0;
+        const float q1 = n1 * p1;
+        const float sum = q0 + q1;
+        return (sum > 0.0f) ? (q0 / sum) : 0.0f;
+      };
+
+      for (int lobe = 0; lobe < 2; ++lobe) {
+        const bool isSpecularLobeClass = (lobe == mirror::kLobeIndexSpecularReflection);
+        const unsigned allowed = mirror::allowedLobeClass(isSpecularLobeClass);
+
+        // --- trace side ---------------------------------------------------
+        const mirror::vec3 prefixThp = mirror::traceThroughputForSampledLobe(primary, lobe);
+        const mirror::vec3 tracedF(
+          prefixThp.x * skyRadiance.x * segmentAttenuation.x,
+          prefixThp.y * skyRadiance.y * segmentAttenuation.y,
+          prefixThp.z * skyRadiance.z * segmentAttenuation.z);
+
+        // What markEscapeVertexAsRcVertex stores: sky times the SOURCE segment's
+        // attenuation, and lightPdf 0.
+        const mirror::vec3 rcVertexIrradiance(
+          skyRadiance.x * segmentAttenuation.x,
+          skyRadiance.y * segmentAttenuation.y,
+          skyRadiance.z * segmentAttenuation.z);
+        const float lightPdf = 0.0f;
+
+        // --- shift side ---------------------------------------------------
+        float pdfAll = 0.0f;
+        const float dstPDF1 = mirror::shiftEvalPdfBsdf(primary, allowed, pdfAll);
+        const mirror::vec3 dstF1 = mirror::shiftEvalBsdfCosine(primary, allowed);
+
+        const float misWeight = evalMIS(1.0f, pdfAll, 1.0f, lightPdf);
+        checkClose(misWeight, 1.0f, "k: the escape MIS weight degenerates to exactly 1 at lightPdf 0");
+
+        const mirror::vec3 shifted(
+          dstF1.x / dstPDF1 * misWeight * rcVertexIrradiance.x,
+          dstF1.y / dstPDF1 * misWeight * rcVertexIrradiance.y,
+          dstF1.z / dstPDF1 * misWeight * rcVertexIrradiance.z);
+
+        check(mirror::maxRelativeDifference(shifted, tracedF) < 1e-5f,
+              str::format("k: [lobe ", lobe, "] the escape self-shift reproduces F exactly").c_str());
+      }
+
+      // --- The double-count hazard, stated as a test -----------------------
+      // Folding the destination's visibility attenuation in here -- which is what
+      // the FINITE-segment branch correctly does -- squares the fog term, because
+      // the stored irradiance already carries the source's. Asserted to be wrong by
+      // a margin the 887 view would show, so nobody "unifies" the two branches.
+      {
+        const int lobe = mirror::kLobeIndexDiffuseReflection;
+        const unsigned allowed = mirror::allowedLobeClass(false);
+
+        const mirror::vec3 prefixThp = mirror::traceThroughputForSampledLobe(primary, lobe);
+        const mirror::vec3 tracedF(
+          prefixThp.x * skyRadiance.x * segmentAttenuation.x,
+          prefixThp.y * skyRadiance.y * segmentAttenuation.y,
+          prefixThp.z * skyRadiance.z * segmentAttenuation.z);
+
+        float pdfAll = 0.0f;
+        const float dstPDF1 = mirror::shiftEvalPdfBsdf(primary, allowed, pdfAll);
+        const mirror::vec3 dstF1 = mirror::shiftEvalBsdfCosine(primary, allowed);
+
+        // The bug: attenuation applied a second time.
+        const mirror::vec3 doubleCounted(
+          dstF1.x / dstPDF1 * skyRadiance.x * segmentAttenuation.x * segmentAttenuation.x,
+          dstF1.y / dstPDF1 * skyRadiance.y * segmentAttenuation.y * segmentAttenuation.y,
+          dstF1.z / dstPDF1 * skyRadiance.z * segmentAttenuation.z * segmentAttenuation.z);
+
+        const float relative = mirror::maxRelativeDifference(doubleCounted, tracedF);
+        check(relative > 0.05f,
+              "k: double-counting the escape segment attenuation is a visible error, not a rounding one");
+      }
+
+      // The env branch is only entered for a path whose FIRST scatter escaped, i.e.
+      // stored pathLength 0 against the hardcoded rcVertexLength of 1. The phase 2
+      // off-by-one made this 1 and the branch never fired; lock the arithmetic so
+      // the length convention cannot drift back.
+      {
+        mirror::RestirPtPathFlags f;
+        f.insertPathLength(0);
+        f.insertLightType(0u);  // kRestirPtLightTypeEnvMap
+        f.insertLastVertexNEE(false);
+
+        const int shiftRcVertexLength = 1;  // kRestirPtShiftRcVertexLength
+        check(f.pathLength() + 1 == shiftRcVertexLength,
+              "k: a bounce-1 escape satisfies the env branch's escaped-vertex test");
+
+        mirror::RestirPtPathFlags offByOne;
+        offByOne.insertPathLength(1);
+        check(offByOne.pathLength() + 1 != shiftRcVertexLength,
+              "k: the phase 2 off-by-one would have missed the env branch entirely");
+      }
+    }
+
     void run() {
       testAddBookkeeping();
       testFinalizeRIS();
@@ -1586,6 +1718,7 @@ namespace dxvk {
       testTargetFunction();
       testReconnectionGeometryJacobian();
       testLobeClassConventionSelfShift();
+      testEscapeShiftIdentity();
       testPairwiseResamplingMISIsUnbiased();
       testPairwiseWeightsPartitionAndGuards();
 

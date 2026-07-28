@@ -286,16 +286,50 @@ float restirPtEvalPdfBsdf(RAB_Surface surface, vec3 inputDirection, uint allowed
 // normal buffer because it only needs emitted radiance, whereas the shift needs
 // honest roughness, albedo and shading normals to re-evaluate a BSDF.
 //
-// Known approximation, matching the NEE cache's: the surface interaction is built
-// with a zero view direction, so the triangle normal is NOT flipped toward the
-// viewer and the shading normals are not bent. Both are no-ops for the hits this
-// can see -- the trace loop culls back faces (restir_pt_trace_core.slangh sets
-// RAY_FLAG_CULL_BACK_FACING_TRIANGLES outside a medium), so a stored rcVertex is
-// front-facing by construction, and getBentNormal is the identity at a zero view
-// direction (math.slangh:504-519). The MATERIAL interaction, which is the one that
-// decides shading-normal orientation and the tangent frame, does get the true view
-// direction. Doing it otherwise would need two full vertex reconstructions per
-// shift, and there are 2N of them per pixel per round.
+// KNOWN FIDELITY GAP, three parts, all consequences of doing this in ONE pass.
+// The chicken-and-egg is that the honest view direction needs the reconnection
+// vertex's world position, and the position needs the vertex fetch -- so a fully
+// faithful rebuild means running surfaceInteractionCreate twice, and there are 2N
+// of these per pixel per round. What the single pass costs:
+//
+//   1. TEXTURE FOOTPRINT. The trace loop resolved this vertex with the scatter
+//      ray's cone: coneRadius + spreadAngle * hitDistance, where the spread angle
+//      was widened by the primary scatter's pdf (calculateSpreadAngleFromSolidAnglePdfLocal
+//      -- for a diffuse bounce that is tens of degrees). This rebuild uses the
+//      PRIMARY cone radius and the screen-space pixel spread, so it samples a
+//      finer mip. The two agree wherever the mip chain is locally flat and differ
+//      where it is not, which is why the residual reads as isolated speckle rather
+//      than a wash, and why it is worst on long first segments -- distant, open
+//      terrain -- where the trace's cone was widest.
+//   2. SHADING-NORMAL BEND. surfaceInteractionCreate applies getBentNormal against
+//      ray.direction (surface_interaction.slangh:423-425); at a zero direction that
+//      is the identity (math.slangh:504-519), so a rebuild never bends. The trace
+//      does, at grazing incidence on normal-mapped geometry.
+//   3. TRIANGLE-NORMAL FLIP. flippedTriangleNormal is chosen by
+//      dot(triangleNormal, rayInteraction.viewDirection) >= 0 (:361-362), which at a
+//      zero view direction is always true, so a rebuild never flips.
+//
+// On (3), note the earlier claim here -- "back faces are culled, so a stored
+// rcVertex is front-facing by construction" -- is WRONG and has been removed.
+// RAY_FLAG_CULL_BACK_FACING_TRIANGLES is overridden per instance by
+// VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR, which
+// rtx_instance_manager.cpp sets for alpha-blended geometry (:86-87), for any draw
+// call with VK_CULL_MODE_NONE (:96-98), and optionally for baked terrain (:91-94).
+// A back-facing reconnection vertex is therefore reachable. Its consequence is
+// benign but worth knowing: the material interaction is built on an unflipped
+// frame, CalcProjectedWeight sees normalDotOutputDirection < 0 and returns zero
+// reflection weights, the shift returns 0, and the neighbour is simply not reused.
+// That reads BLACK in debug view 887, not red -- a silent loss of reuse, never a
+// wrong contribution. (The one exception is a thin-opaque subsurface material,
+// whose transmission weight survives the early-out; those need authored SSS
+// materials to exist at all, since diffuseTransmissionProbability is hard-zeroed
+// without them, opaque_surface_material_interaction.slangh:1054.)
+//
+// The MATERIAL interaction does get the true view direction, so lobe probabilities,
+// the tangent frame and any parallax are evaluated honestly.
+//
+// If this gap ever needs closing, the fix is a two-pass rebuild, and it should be
+// costed against the Tracy measurement rather than assumed affordable.
 //
 // Returns false when the hit is invalid or its material is not opaque -- a
 // translucent or ray-portal rcVertex is a delta chain in this port and can never

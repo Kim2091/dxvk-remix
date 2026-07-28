@@ -192,6 +192,13 @@ namespace dxvk {
                "Discards a shifted sample when max(J, 1/J) exceeds 1 + this, where J is the shift Jacobian. Zero or negative disables the test, "
                "which is how the reference ships it; the reference's value when enabled is 10. Discarding this way stays unbiased because the "
                "sample is removed from its own MIS weight as well as from the estimate.");
+    RTX_OPTION("rtx.restirPT", float, shiftParityThreshold, 0.05f,
+               "Relative-error threshold for the 'ReSTIR PT Shift Parity (Self)' debug view (887). Error below this reads BLACK; above it ramps from black at "
+               "100x the excess. Exists because the reconnection vertex is REBUILT from its (surface, primitive, barycentrics) triple rather than re-traced, and "
+               "that rebuild has a small bounded fidelity gap against the trace loop - texture footprint and the shading-normal bend - which at the raw scale "
+               "(threshold 0) paints sparse speckle on detailed or grazing-lit geometry.\n"
+               "A real transcription error misses by tens to thousands of percent, so it stays obvious at the default. Set this to 0 to see the raw field, which "
+               "is what you want when hunting a residual rather than gating on one.");
     RTX_OPTION("rtx.restirPT", bool, spatialSkyReconnection, true,
                "Lets a path whose FIRST scatter left the scene be reused, by treating its escape direction as the reconnection vertex. "
                "The reference only does this under its hybrid shift, so turning this off reproduces strict reference behaviour - at the cost of "
