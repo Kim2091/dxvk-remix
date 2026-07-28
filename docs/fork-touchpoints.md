@@ -3802,6 +3802,21 @@ and what a shift re-attaches to a *different* prefix. Phase 2 shipped `getCurren
 identity; without the split the shift would double-count the primary (and reconnection-vertex)
 BSDF it re-evaluates, and the tell would be strong brightening plus glossy blowups.
 
+*The lobe class and the denoiser-routing flag are NOT the same bit, and conflating them cost a
+whole in-game gate.* The reference stores one `specularBounce` flag and uses it for both jobs,
+which it can because there the flag is a pure lobe-type test (`result.isLobe(LobeType::SpecularOrDelta)`,
+`PathTracer.slang:378-381`) while the roughness threshold only drives `setSpecular()` and the
+bounce counters (`:360`). Phase 2 deliberately redefined the fork's flag as a routing decision
+that folds in `specularRoughnessThreshold`, so a rough specular bounce lands in the diffuse
+denoiser channel like dxvk-remix's own integrator does. Phase 3's first cut then read that flag as
+the shift's lobe class, and on every surface rougher than the threshold -- effectively all terrain
+and rock -- a path that sampled the SPECULAR lobe was handed the DIFFUSE class and the shift
+re-evaluated the wrong lobe. Because `minOpaqueSpecularLobeSamplingProbability` is 0.25, the
+specular lobe is drawn on a large minority of pixels everywhere, so the failure was a dithered
+red wash over an entire FNV exterior in debug view 887 -- with the Jacobian channel clean, since
+the same wrong class appears on both sides of every pdf ratio and cancels. Fixed with fork-owned
+`pathFlags` bits 20/21 carrying the honest lobe class; 26/27 keep the routing meaning untouched.
+
 *A phase 2 off-by-one surfaced and is fixed here.* Falcor increments `path.length` inside
 `nextVertex` and only on a HIT, so on a MISS its `path.length` names the vertex the ray was
 launched from; this kernel numbers segments instead. Phase 2 transcribed the escape site's
@@ -3827,7 +3842,9 @@ and un-bitpacked.
 - **`src/dxvk/shaders/rtx/algorithm/fork_restir_pt/restir_pt_path_state.slangh`** - fork-owned changes.
   *`prefixThp` + `recordPrefixThp()` + a real `getCurrentThp()` (ports `PathState.slang:82,114-115`), and `scatterRayOrigin` - the reference reads its `prevPathOrigin` straight off `path.origin` because Falcor has no resolve loop, whereas here the resolve macro advances `path.origin` through every alpha/portal continuation, so the launch point has to be kept separately or the reconnection geometry factor measures from a foliage leaf.*
 - **`src/dxvk/shaders/rtx/algorithm/fork_restir_pt/restir_pt_trace_core.slangh`** - fork-owned changes.
-  *`rcVertexLength = 1` at the first indirect hit plus the geometry factor (ports `PathTracer.slang:1171-1191`); the at-reconnection-vertex captures at the scatter - event-bit pair, `cachedJacobian.y`, `rcVertexWi` (ports `:384-390`, `:334-337`, `:1435-1437`); `recordPrefixThp()` at both scatter sites (ports `:419-420`); postfix arguments at all four add-sites, including the NEE site's `weight = 1` exclusion of the reconnection vertex's own BSDF (ports `:1332-1346`); the escape-site path-length fix; and `markEscapeVertexAsRcVertex` for bounce-1 sky escapes, behind `RESTIR_PT_FLAG_SPATIAL_SKY_RECONNECTION`.*
+  *`rcVertexLength = 1` at the first indirect hit plus the geometry factor (ports `PathTracer.slang:1171-1191`); the at-reconnection-vertex captures at the scatter - event-bit pair, `cachedJacobian.y`, `rcVertexWi` (ports `:384-390`, `:334-337`, `:1435-1437`); `recordPrefixThp()` at both scatter sites (ports `:419-420`); postfix arguments at all four add-sites, including the NEE site's `weight = 1` exclusion of the reconnection vertex's own BSDF (ports `:1332-1346`); the escape-site path-length fix; `markEscapeVertexAsRcVertex` for bounce-1 sky escapes, behind `RESTIR_PT_FLAG_SPATIAL_SKY_RECONNECTION`; and the `isSpecularLobeClass` derivation in `restirPtClassifyScatterEvent` plus a new `kRestirPtFlagSpecularLobeClass` path-state bit, which is what the shift's lobe class is actually built from.*
+- **`src/dxvk/shaders/rtx/algorithm/fork_restir_pt/restir_pt_reservoir.slangh`** - fork-owned addition.
+  *`insertIsSpecularLobeClass` / `decodeIsSpecularLobeClass` on `RestirPtPathFlags`, bits 20/21, taken from the reference's unused range so nothing already stored shifts. No layout change - the reservoir is still 96 B. The long comment there is the one to read before anyone reuses those bits or "simplifies" them back onto 26/27.*
 - **`src/dxvk/shaders/rtx/algorithm/fork_restir_pt/restir_pt_path_builder.slangh`** - fork-owned comment changes only.
   *`is_rcVertex` and `markEscapeVertexAsRcVertex` are no longer dead; the path-length convention is written down where the add sites are.*
 - **`src/dxvk/shaders/rtx/pass/fork_restir_pt/fork_restir_pt_binding_indices.h`** - fork-owned changes.
@@ -3835,7 +3852,7 @@ and un-bitpacked.
 - **`src/dxvk/rtx_render/rtx_fork_restir_pt_rayquery.{h,cpp}`** - fork-owned changes.
   *Two-page reservoir allocation plus a `reservoirPageSlice` helper; a `dispatchSpatialReuse` that runs the rounds from inside `dispatchFinalShading` (so phase 3 adds no `rtx_context.cpp` touchpoint at all); the new `ManagedShader`; and six live options with widgets - `enableSpatialReuse`, `spatialNeighborCount`, `spatialRadius`, `spatialRounds`, `jacobianRejectionThreshold`, `spatialSkyReconnection`.*
 - **`tests/rtx/unit/test_fork_restir_pt_reservoir.cpp`** - fork-owned changes.
-  *Three new groups on top of phase 2's: the reconnection geometry Jacobian (round trip, exact identity, degenerate rejection, one hand-computed value), the pairwise MIS **unbiasedness identity** - K+1 synthetic pixels over one shared discrete path domain, every reservoir build and every merge draw enumerated, asserting `E[F_c * W] == sum_j F_c(j)/p_j` - and the partition-of-unity plus guard cases. The unbiasedness test was verified to be load-bearing by deleting the `/(validNeighborCount + 1)` normalisation, which makes it fail by exactly the predicted factor of (k+1).*
+  *Three new groups on top of phase 2's: the reconnection geometry Jacobian (round trip, exact identity, degenerate rejection, one hand-computed value), the pairwise MIS **unbiasedness identity** - K+1 synthetic pixels over one shared discrete path domain, every reservoir build and every merge draw enumerated, asserting `E[F_c * W] == sum_j F_c(j)/p_j` - the partition-of-unity plus guard cases, and the **lobe-class self-shift identity**, which locks the convention the in-game 887 failure exposed: for each of three synthetic materials and each active lobe, the shift's class-restricted `dstF1/dstPDF1` must equal the trace kernel's sampled-lobe `f*cos/(pdf*P)`. Both new groups were verified load-bearing by sabotage - deleting `/(validNeighborCount + 1)` fails by exactly the predicted factor of (k+1), and re-deriving the lobe class from the roughness fold fails on exactly the specular lobe of the rough material and on nothing else, which is the stipple.*
 - **`src/dxvk/shaders/rtx/pass/raytrace_args.h`** - fork-touchpoint inline tweak.
   *ONE more complete 4-scalar (16-byte) group at the end - `restirPtSpatialNeighborCount`, `restirPtSpatialRounds`, `restirPtSpatialRadius`, `restirPtJacobianRejectionThreshold` - plus two more bits in the existing `restirPtFlags` word. Do not add a fifth scalar to that group; add the next complete group.*
 - **`src/dxvk/shaders/rtx/utility/debug_view_indices.h`** + **`src/dxvk/rtx_render/rtx_debug_view.cpp`** - index-only, fork.

@@ -118,6 +118,17 @@ namespace mirror {
       return (beforeRcVertex ? ((flags >> 26) & 1) : ((flags >> 27) & 1)) != 0;
     }
 
+    // Fork-owned bits 20/21. NOT a synonym for the specularBounce pair above --
+    // see the long note on RestirPtPathFlags::insertIsSpecularLobeClass.
+    void insertIsSpecularLobeClass(bool isSpecularLobeClass, bool beforeRcVertex) {
+      flags &= (beforeRcVertex ? ~(0x100000) : ~(0x200000));
+      if (isSpecularLobeClass) { flags |= 1 << (beforeRcVertex ? 20 : 21); }
+    }
+
+    bool decodeIsSpecularLobeClass(bool beforeRcVertex) const {
+      return (beforeRcVertex ? ((flags >> 20) & 1) : ((flags >> 21) & 1)) != 0;
+    }
+
     void insertPathLength(int pathLength) {
       flags &= ~0xF;
       flags |= pathLength & 0xF;
@@ -314,6 +325,103 @@ namespace mirror {
   // (ReSTIRPTPass/Shift.slang:224-227).
   inline bool isJacobianInvalid(float jacobian) {
     return jacobian <= 0.0f || std::isnan(jacobian) || std::isinf(jacobian);
+  }
+
+  // =========================================================================
+  // The BSDF LOBE-CLASS CONVENTION, which the self-shift identity rests on.
+  //
+  // KEEP IN SYNC with restir_pt_shift.slangh (restirPtGetAllowedLobeClass,
+  // restirPtEvalBsdfCosine, restirPtEvalPdfBsdf) and with
+  // restir_pt_trace_core.slangh (restirPtSampleScatterDirection, and the
+  // isSpecularLobeClass derivation in restirPtClassifyScatterEvent).
+  //
+  // dxvk-remix opaque lobes, in the order used below:
+  //   0 diffuseReflection   1 specularReflection   2 diffuseTransmission
+  // (opacityTransmission is a dirac; the shift rejects deltas outright and the
+  // codebase's own all-lobe pdf marginal leaves it out too.)
+  // =========================================================================
+
+  static const unsigned kLobeDiffuseReflection   = 1u << 0;
+  static const unsigned kLobeSpecularReflection  = 1u << 1;
+  static const unsigned kLobeDiffuseTransmission = 1u << 2;
+  static const unsigned kLobeClassAll =
+    kLobeDiffuseReflection | kLobeSpecularReflection | kLobeDiffuseTransmission;
+
+  static constexpr int kLobeIndexDiffuseReflection = 0;
+  static constexpr int kLobeIndexSpecularReflection = 1;
+  static constexpr int kLobeIndexDiffuseTransmission = 2;
+
+  // ports restir_pt_shift.slangh restirPtGetAllowedLobeClass
+  // (ReSTIRPTPass/PathTracer.slang:37-41).
+  inline unsigned allowedLobeClass(bool isSpecularLobeClass) {
+    return isSpecularLobeClass
+      ? kLobeSpecularReflection
+      : (kLobeDiffuseReflection | kLobeDiffuseTransmission);
+  }
+
+  // One opaque material evaluated at one (view, scatter) direction pair. All
+  // three arrays are indexed by the lobe indices above.
+  struct LobeState {
+    float selectionProbability[3] = { 0.0f, 0.0f, 0.0f };  // normalized P_lobe
+    float solidAnglePdf[3] = { 0.0f, 0.0f, 0.0f };         // per-lobe solid angle pdf
+    vec3 projectedWeight[3];                               // f * cos, per lobe
+  };
+
+  // ports restir_pt_trace_core.slangh restirPtSampleScatterDirection: the trace
+  // kernel folds the SAMPLED lobe's projected weight over that lobe's own pdf and
+  // over the probability of having selected it. This is the quantity the shift has
+  // to reproduce at the destination pixel.
+  inline vec3 traceThroughputForSampledLobe(const LobeState& m, int lobe) {
+    const float denom = m.solidAnglePdf[lobe] * m.selectionProbability[lobe];
+    const vec3& f = m.projectedWeight[lobe];
+    return vec3(f.x / denom, f.y / denom, f.z / denom);
+  }
+
+  // ports restir_pt_shift.slangh restirPtEvalBsdfCosine.
+  inline vec3 shiftEvalBsdfCosine(const LobeState& m, unsigned allowed) {
+    vec3 sum;
+    for (int i = 0; i < 3; ++i) {
+      const unsigned bit = 1u << i;
+      if ((allowed & bit) == 0u) { continue; }
+      sum.x += m.projectedWeight[i].x;
+      sum.y += m.projectedWeight[i].y;
+      sum.z += m.projectedWeight[i].z;
+    }
+    return sum;
+  }
+
+  // ports restir_pt_shift.slangh restirPtEvalPdfBsdf -- `pdfSingle` is the
+  // class-restricted sum of selection-weighted per-lobe pdfs (BxDF.slang:1022-1051),
+  // NOT a renormalisation over the class.
+  inline float shiftEvalPdfBsdf(const LobeState& m, unsigned allowed, float& pdfAll) {
+    pdfAll = 0.0f;
+    float pdfSingle = 0.0f;
+    for (int i = 0; i < 3; ++i) {
+      if (m.selectionProbability[i] <= 0.0f) { continue; }
+      const float pdf = m.selectionProbability[i] * m.solidAnglePdf[i];
+      if ((allowed & (1u << i)) != 0u) { pdfSingle += pdf; }
+      pdfAll += pdf;
+    }
+    return pdfSingle;
+  }
+
+  // The shift's primary-vertex factor, dstF1 / dstPDF1.
+  inline vec3 shiftPrimaryFactor(const LobeState& m, unsigned allowed) {
+    float pdfAll = 0.0f;
+    const float pdfSingle = shiftEvalPdfBsdf(m, allowed, pdfAll);
+    const vec3 f = shiftEvalBsdfCosine(m, allowed);
+    return vec3(f.x / pdfSingle, f.y / pdfSingle, f.z / pdfSingle);
+  }
+
+  inline float maxRelativeDifference(const vec3& a, const vec3& b) {
+    float worst = 0.0f;
+    const float ax[3] = { a.x, a.y, a.z };
+    const float bx[3] = { b.x, b.y, b.z };
+    for (int i = 0; i < 3; ++i) {
+      const float scale = std::max(1e-8f, std::fabs(bx[i]));
+      worst = std::max(worst, std::fabs(ax[i] - bx[i]) / scale);
+    }
+    return worst;
   }
 
   // ports restir_pt_shift.slangh restirPtReconnectionGeometryJacobian
@@ -1254,6 +1362,220 @@ namespace dxvk {
       }
     }
 
+    // -----------------------------------------------------------------------
+    // (j) PHASE 3: THE SELF-SHIFT IDENTITY, at the level the GPU got wrong.
+    //
+    // For dst == src the reconnection shift must return the path's own integrand.
+    // Its primary-vertex factor is dstF1 / dstPDF1, evaluated over a LOBE CLASS;
+    // the trace kernel's corresponding factor is the SAMPLED lobe's
+    // f*cos / (pdf_lobe * P_lobe). Those agree only when
+    //
+    //   (1) the class contains exactly one lobe with non-zero selection
+    //       probability, and
+    //   (2) that lobe is the one the path actually sampled.
+    //
+    // (2) is what broke in-game: the shift was reading the fork's
+    // `specularBounce` flag, which folds in a roughness threshold because this
+    // fork repurposed it for denoiser routing. On any surface rougher than the
+    // threshold a specular sample was labelled "not specular", so the shift
+    // evaluated the diffuse lobe instead. `minOpaqueSpecularLobeSamplingProbability`
+    // is 0.25 (rtx_options.h:831), which forces the specular lobe to be picked on
+    // a large minority of pixels everywhere -- hence a dithered failure over an
+    // entire exterior rather than a localised one. Debug view 887 showed it as
+    // red (integrand) with green (Jacobian) clean, because the same wrong class is
+    // used on both sides of every pdf ratio and cancels there.
+    //
+    // This test locks (1) and (2) directly, and re-enacts the bug so the
+    // diagnosis itself cannot be quietly undone.
+    // -----------------------------------------------------------------------
+    void testLobeClassConventionSelfShift() {
+      // The fork's specularRoughnessThreshold default (rtx_fork_restir_pt_rayquery.h).
+      const float specularRoughnessThreshold = 0.2f;
+
+      struct Material {
+        const char* name;
+        float perceptualRoughness;
+        mirror::LobeState lobes;
+        bool diffuseClassHasTwoActiveLobes;
+      };
+
+      std::vector<Material> materials;
+
+      {
+        // Rough dielectric terrain -- an FNV cliff or ground. Specular probability
+        // is floored at 0.25 by minOpaqueSpecularLobeSamplingProbability even
+        // though the material barely reflects, so roughly half of all pixels here
+        // sample the specular lobe. This is the case that failed in-game.
+        Material m;
+        m.name = "rough dielectric terrain";
+        m.perceptualRoughness = 0.70f;
+        m.lobes.selectionProbability[mirror::kLobeIndexDiffuseReflection] = 0.55f;
+        m.lobes.selectionProbability[mirror::kLobeIndexSpecularReflection] = 0.45f;
+        m.lobes.selectionProbability[mirror::kLobeIndexDiffuseTransmission] = 0.0f;
+        m.lobes.solidAnglePdf[mirror::kLobeIndexDiffuseReflection] = 0.28f;
+        m.lobes.solidAnglePdf[mirror::kLobeIndexSpecularReflection] = 1.90f;
+        m.lobes.solidAnglePdf[mirror::kLobeIndexDiffuseTransmission] = 0.0f;
+        m.lobes.projectedWeight[mirror::kLobeIndexDiffuseReflection] = mirror::vec3(0.090f, 0.080f, 0.070f);
+        m.lobes.projectedWeight[mirror::kLobeIndexSpecularReflection] = mirror::vec3(0.012f, 0.012f, 0.012f);
+        m.lobes.projectedWeight[mirror::kLobeIndexDiffuseTransmission] = mirror::vec3();
+        m.diffuseClassHasTwoActiveLobes = false;
+        materials.push_back(m);
+      }
+
+      {
+        // Smooth metal -- roughness BELOW the threshold, so the roughness-folded
+        // flag happens to agree with the lobe class. This is why the bug hid on
+        // shiny surfaces and showed up on terrain.
+        Material m;
+        m.name = "smooth metal";
+        m.perceptualRoughness = 0.05f;
+        m.lobes.selectionProbability[mirror::kLobeIndexDiffuseReflection] = 0.25f;
+        m.lobes.selectionProbability[mirror::kLobeIndexSpecularReflection] = 0.75f;
+        m.lobes.selectionProbability[mirror::kLobeIndexDiffuseTransmission] = 0.0f;
+        m.lobes.solidAnglePdf[mirror::kLobeIndexDiffuseReflection] = 0.31f;
+        m.lobes.solidAnglePdf[mirror::kLobeIndexSpecularReflection] = 44.0f;
+        m.lobes.solidAnglePdf[mirror::kLobeIndexDiffuseTransmission] = 0.0f;
+        m.lobes.projectedWeight[mirror::kLobeIndexDiffuseReflection] = mirror::vec3(0.004f, 0.004f, 0.004f);
+        m.lobes.projectedWeight[mirror::kLobeIndexSpecularReflection] = mirror::vec3(0.900f, 0.750f, 0.400f);
+        m.lobes.projectedWeight[mirror::kLobeIndexDiffuseTransmission] = mirror::vec3();
+        m.diffuseClassHasTwoActiveLobes = false;
+        materials.push_back(m);
+      }
+
+      {
+        // Thin-opaque subsurface (foliage). diffuseTransmission is ACTIVE, so the
+        // diffuse class genuinely holds two lobes and condition (1) fails. This is
+        // the residual the plan predicted; it is asserted as a bounded
+        // approximation rather than as an identity, so it stays documented.
+        Material m;
+        m.name = "thin-opaque foliage";
+        m.perceptualRoughness = 0.60f;
+        m.lobes.selectionProbability[mirror::kLobeIndexDiffuseReflection] = 0.40f;
+        m.lobes.selectionProbability[mirror::kLobeIndexSpecularReflection] = 0.20f;
+        m.lobes.selectionProbability[mirror::kLobeIndexDiffuseTransmission] = 0.40f;
+        m.lobes.solidAnglePdf[mirror::kLobeIndexDiffuseReflection] = 0.30f;
+        m.lobes.solidAnglePdf[mirror::kLobeIndexSpecularReflection] = 2.00f;
+        m.lobes.solidAnglePdf[mirror::kLobeIndexDiffuseTransmission] = 0.25f;
+        m.lobes.projectedWeight[mirror::kLobeIndexDiffuseReflection] = mirror::vec3(0.100f, 0.120f, 0.060f);
+        m.lobes.projectedWeight[mirror::kLobeIndexSpecularReflection] = mirror::vec3(0.020f, 0.020f, 0.020f);
+        m.lobes.projectedWeight[mirror::kLobeIndexDiffuseTransmission] = mirror::vec3(0.050f, 0.070f, 0.030f);
+        m.diffuseClassHasTwoActiveLobes = true;
+        materials.push_back(m);
+      }
+
+      for (const Material& m : materials) {
+        for (int lobe = 0; lobe < 3; ++lobe) {
+          if (m.lobes.selectionProbability[lobe] <= 0.0f) { continue; }
+
+          // The fork's honest lobe class: a pure lobe-type test, no roughness.
+          // ports restirPtClassifyScatterEvent's isSpecularLobeClass.
+          const bool isSpecularLobeClass = (lobe == mirror::kLobeIndexSpecularReflection);
+
+          const mirror::vec3 traced = mirror::traceThroughputForSampledLobe(m.lobes, lobe);
+          const mirror::vec3 shifted =
+            mirror::shiftPrimaryFactor(m.lobes, mirror::allowedLobeClass(isSpecularLobeClass));
+
+          const float relative = mirror::maxRelativeDifference(shifted, traced);
+
+          const bool classIsSingleLobe =
+            !(m.diffuseClassHasTwoActiveLobes && lobe != mirror::kLobeIndexSpecularReflection);
+
+          if (classIsSingleLobe) {
+            // THE SELF-SHIFT IDENTITY. Debug view 887 paints this quantity x100,
+            // so anything above 1e-2 here is a visibly non-black pixel in-game.
+            check(relative < 1e-5f,
+                  str::format("j: [", m.name, ", lobe ", lobe,
+                              "] self-shift reproduces the traced throughput").c_str());
+          } else {
+            // Known, bounded approximation: two active lobes in one class. Asserted
+            // in BOTH directions so it can neither silently grow nor be silently
+            // fixed without updating this comment.
+            check(relative > 1e-3f && relative < 0.5f,
+                  str::format("j: [", m.name, ", lobe ", lobe,
+                              "] two-active-lobe class is a bounded approximation").c_str());
+          }
+        }
+      }
+
+      // --- Re-enactment of the shipped bug ---------------------------------
+      // The class the shift WOULD get if it read the roughness-folded
+      // `specularBounce` flag instead of the lobe class.
+      auto buggyRoughnessFoldedClass = [&](const Material& m, int lobe) {
+        const bool isSpecularBounce =
+          (lobe != mirror::kLobeIndexDiffuseReflection) &&
+          (m.perceptualRoughness <= specularRoughnessThreshold);
+        return mirror::allowedLobeClass(isSpecularBounce);
+      };
+
+      {
+        const Material& terrain = materials[0];
+        const int lobe = mirror::kLobeIndexSpecularReflection;
+
+        const mirror::vec3 traced = mirror::traceThroughputForSampledLobe(terrain.lobes, lobe);
+        const mirror::vec3 buggy =
+          mirror::shiftPrimaryFactor(terrain.lobes, buggyRoughnessFoldedClass(terrain, lobe));
+
+        // Not a subtle drift: on this material the wrong class is off by a factor
+        // of ~40, which is why the failure read as saturated red rather than as a
+        // faint tint.
+        const float relative = mirror::maxRelativeDifference(buggy, traced);
+        check(relative > 10.0f,
+              "j: the roughness-folded class is grossly wrong for a specular sample on a rough surface");
+
+        // ...and it is CORRECT for a diffuse sample on the same material, which is
+        // exactly what made the in-game failure stippled instead of uniform: only
+        // the pixels that happened to draw the specular lobe were wrong.
+        const int diffuseLobe = mirror::kLobeIndexDiffuseReflection;
+        const mirror::vec3 tracedDiffuse = mirror::traceThroughputForSampledLobe(terrain.lobes, diffuseLobe);
+        const mirror::vec3 buggyDiffuse =
+          mirror::shiftPrimaryFactor(terrain.lobes, buggyRoughnessFoldedClass(terrain, diffuseLobe));
+        check(mirror::maxRelativeDifference(buggyDiffuse, tracedDiffuse) < 1e-5f,
+              "j: the roughness-folded class is correct for a diffuse sample -- hence a STIPPLED failure");
+      }
+
+      {
+        // On a surface smoother than the threshold the two agree for every lobe,
+        // which is why the bug never showed on shiny geometry.
+        const Material& metal = materials[1];
+        for (int lobe = 0; lobe < 2; ++lobe) {
+          const mirror::vec3 traced = mirror::traceThroughputForSampledLobe(metal.lobes, lobe);
+          const mirror::vec3 buggy =
+            mirror::shiftPrimaryFactor(metal.lobes, buggyRoughnessFoldedClass(metal, lobe));
+          check(mirror::maxRelativeDifference(buggy, traced) < 1e-5f,
+                "j: below the roughness threshold the two conventions coincide");
+        }
+      }
+
+      // --- The two flag pairs must stay independent ------------------------
+      // If a later change aliases the lobe class back onto the specularBounce bits
+      // (or reuses 20/21 for something else), this fails.
+      for (int mask = 0; mask < 16; ++mask) {
+        const bool routingBefore = (mask & 1) != 0;
+        const bool routingAt = (mask & 2) != 0;
+        const bool classBefore = (mask & 4) != 0;
+        const bool classAt = (mask & 8) != 0;
+
+        mirror::RestirPtPathFlags f;
+        f.insertPathLength(9);
+        f.insertRcVertexLength(1);
+        f.insertLightType(2);
+        f.insertIsDeltaEvent(true, true);
+        f.insertIsSpecularBounce(routingBefore, true);
+        f.insertIsSpecularBounce(routingAt, false);
+        f.insertIsSpecularLobeClass(classBefore, true);
+        f.insertIsSpecularLobeClass(classAt, false);
+
+        check(f.decodeIsSpecularBounce(true) == routingBefore, "j: routing-before survives the lobe class");
+        check(f.decodeIsSpecularBounce(false) == routingAt, "j: routing-at survives the lobe class");
+        check(f.decodeIsSpecularLobeClass(true) == classBefore, "j: lobe-class-before round-trips");
+        check(f.decodeIsSpecularLobeClass(false) == classAt, "j: lobe-class-at round-trips");
+        check(f.pathLength() == 9, "j: lobe class does not disturb pathLength");
+        check(f.rcVertexLength() == 1, "j: lobe class does not disturb rcVertexLength");
+        check(f.lightType() == 2u, "j: lobe class does not disturb lightType");
+        check(f.decodeIsDeltaEvent(true), "j: lobe class does not disturb the delta bit");
+      }
+    }
+
     void run() {
       testAddBookkeeping();
       testFinalizeRIS();
@@ -1263,6 +1585,7 @@ namespace dxvk {
       testPathFlagsRoundTrip();
       testTargetFunction();
       testReconnectionGeometryJacobian();
+      testLobeClassConventionSelfShift();
       testPairwiseResamplingMISIsUnbiased();
       testPairwiseWeightsPartitionAndGuards();
 

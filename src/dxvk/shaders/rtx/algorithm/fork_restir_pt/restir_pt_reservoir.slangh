@@ -116,6 +116,11 @@ static const uint kRestirPtLightTypeAnalytic = 2u;
 //   16    last vertex was an NEE connection
 //   18-19 terminal light type
 //   26/27 specular bounce, before / at the reconnection vertex
+//
+// FORK-OWNED ADDITION, bits 20/21 -- see insertIsSpecularLobeClass below. The
+// reference has no twin because it does not need one: there, `specularBounce`
+// IS the sampled lobe's class. Chosen from the reference's unused range
+// (12-15, 17, 20-25, 28-31) so nothing already stored shifts.
 struct RestirPtPathFlags
 {
   int flags;
@@ -173,6 +178,47 @@ struct RestirPtPathFlags
   bool decodeIsSpecularBounce(bool beforeRcVertex)
   {
     return (beforeRcVertex ? ((flags >> 26) & 1) : ((flags >> 27) & 1)) != 0;
+  }
+
+  // ---------------------------------------------------------------------
+  // FORK-OWNED, bits 20/21: "the sampled lobe belongs to the SPECULAR class".
+  //
+  // WHY THIS EXISTS, and why reusing bits 26/27 for it is a bug (it was, in
+  // phase 3's first cut -- debug view 887 came up red across an entire FNV
+  // exterior).
+  //
+  // The reference stores ONE flag, `specularBounce`, and uses it for two jobs:
+  // routing radiance into the specular denoiser channel, and telling the shift
+  // which BSDF lobe class to restrict its evaluations to (getAllowedBSDFFlags,
+  // ReSTIRPTPass/PathTracer.slang:37-41). It can, because there the flag is set
+  // purely from the sampled lobe TYPE -- `if (result.isLobe(LobeType::
+  // SpecularOrDelta)) path.setSpecularBounce();` (:378-381) -- while the
+  // roughness threshold only feeds `setSpecular()` and the bounce counters
+  // (:360). Lobe class and denoiser routing coincide there.
+  //
+  // This fork deliberately split them (phase 2 deviation D6): its
+  // `isSpecularBounce` is `sampledLobe != diffuseReflection && perceptualRoughness
+  // <= specularRoughnessThreshold`, so a rough specular bounce routes into the
+  // DIFFUSE denoiser channel, matching dxvk-remix's own integrator
+  // (integrator_direct.slangh:326-332). That is right for routing and wrong for
+  // the shift: on any surface rougher than the threshold -- which is nearly all
+  // terrain and rock -- a path that sampled the SPECULAR lobe is labelled "not a
+  // specular bounce", and the shift then re-evaluates the diffuse lobe instead of
+  // the one the path actually took.
+  //
+  // So the two meanings need two bits. 26/27 keep the routing meaning (final
+  // shading reads them, unchanged); 20/21 carry the honest lobe class and are
+  // what the shift reads. Nothing else may consume 20/21 -- if a later phase
+  // wants "was this a shiny bounce", it wants 26/27.
+  [mutating] void insertIsSpecularLobeClass(bool isSpecularLobeClass, bool beforeRcVertex)
+  {
+    flags &= (beforeRcVertex ? ~(0x100000) : ~(0x200000));
+    if (isSpecularLobeClass) { flags |= 1 << (beforeRcVertex ? 20 : 21); }
+  }
+
+  bool decodeIsSpecularLobeClass(bool beforeRcVertex)
+  {
+    return (beforeRcVertex ? ((flags >> 20) & 1) : ((flags >> 21) & 1)) != 0;
   }
 
   // Maximum length: 15 (kRestirPtMaximumPathLength).

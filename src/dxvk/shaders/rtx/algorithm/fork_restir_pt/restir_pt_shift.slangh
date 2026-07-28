@@ -58,9 +58,18 @@
 // and `pdfAll` is the same sum over every lobe. The trace kernel folds
 // f*cos / (lobeSolidAnglePdf * lobeSelectionPdf) per sampled lobe
 // (restir_pt_trace_core.slangh restirPtSampleScatterDirection), which is exactly
-// f*cos / pdfSingle for a one-lobe class. For the two-lobe diffuse class
-// (diffuseReflection + diffuseTransmission) they differ, and only on
-// thin-translucent materials -- debug view 887 is the designed detector.
+// f*cos / pdfSingle WHEN the class contains exactly one ACTIVE lobe and that lobe
+// is the one the path sampled. Two conditions, and the second one is the trap:
+//
+//   - One active lobe. On dxvk-remix opaque materials this holds: the diffuse
+//     class {diffuseReflection, diffuseTransmission} has diffuseTransmission
+//     probability 0 unless the material is thin-opaque subsurface, and the
+//     specular class is a single lobe (dxvk has no opaque specular transmission).
+//     Thin-opaque foliage is the one residual, and it is small.
+//   - The class names the sampled lobe. This is what
+//     decodeIsSpecularLobeClass exists to guarantee; reading the fork's
+//     roughness-folded specularBounce instead put ~half of every FNV exterior
+//     pixel on the wrong lobe. Debug view 887 is the detector, and it caught it.
 //
 // ENHANCED SEAMS kept deliberately:
 //   - restirPtReconstructRcVertex is a standalone function; Enhanced 4
@@ -484,8 +493,15 @@ vec3 restirPtComputeShiftedIntegrandReconnection(
   // i.e. the primary scatter's class. Recorded unconditionally at the primary
   // scatter (phase 2 deviation D6), which is what makes the sky-escape case below
   // well defined.
+  //
+  // decodeIsSpecularLobeClass, NOT decodeIsSpecularBounce. The reference reads its
+  // specularBounce here because there that flag IS the sampled lobe's class; in
+  // this fork specularBounce was redefined as a denoiser-routing decision that
+  // folds in a roughness threshold, so reading it would hand the shift the DIFFUSE
+  // class for every specular sample on a surface rougher than that threshold.
+  // Full account on RestirPtPathFlags::insertIsSpecularLobeClass.
   const uint allowedSampledTypes1 =
-    restirPtGetAllowedLobeClass(srcReservoir.pathFlags.decodeIsSpecularBounce(true));
+    restirPtGetAllowedLobeClass(srcReservoir.pathFlags.decodeIsSpecularLobeClass(true));
 
   const vec3 dstPrimaryPosition = dstPrimary.minimalSurfaceInteraction.position;
   const vec3 srcPrimaryPosition = srcPrimary.minimalSurfaceInteraction.position;
@@ -643,7 +659,7 @@ vec3 restirPtComputeShiftedIntegrandReconnection(
 
   const uint allowedSampledTypes2 = isRcVertexNEE
     ? kRestirPtLobeClassAll
-    : restirPtGetAllowedLobeClass(srcReservoir.pathFlags.decodeIsSpecularBounce(false));
+    : restirPtGetAllowedLobeClass(srcReservoir.pathFlags.decodeIsSpecularLobeClass(false));
 
   if (!isRcVertexEscapedVertex)
   {

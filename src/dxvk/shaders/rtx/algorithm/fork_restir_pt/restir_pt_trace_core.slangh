@@ -348,12 +348,29 @@ void restirPtClassifyScatterEvent(
     (sampledLobe == opaqueLobeTypeOpacityTransmission) ||
     (sampledLobe == opaqueLobeTypeSpecularReflection && perceptualRoughness < cb.restirPtDeltaRoughnessThreshold);
 
-  // "Specular bounce" counts everything that is not a rough diffuse gather; it
-  // is the reference's specularBounce flag (:378-381) and the fork's
-  // firstSampledLobeIsSpecular convention rolled into one.
+  // "Specular bounce" counts everything that is not a rough diffuse gather. This
+  // is DENOISER ROUTING, matching integrator_direct.slangh:326-332 and the fork's
+  // firstSampledLobeIsSpecular convention -- NOT the reference's specularBounce,
+  // which carries no roughness test. See the next block.
   const bool isSpecularBounce =
     (sampledLobe != opaqueLobeTypeDiffuseReflection) &&
     (perceptualRoughness <= cb.restirPtSpecularRoughnessThreshold);
+
+  // The LOBE CLASS: which of the shift's two BSDF classes the sampled lobe
+  // belongs to. This is the reference's actual specularBounce semantic
+  // (ReSTIRPTPass/PathTracer.slang:378-381, `result.isLobe(LobeType::
+  // SpecularOrDelta)`) -- a pure lobe-type test with the roughness threshold
+  // deliberately absent, because the reconnection shift has to re-evaluate the
+  // lobe the path ACTUALLY sampled, not the one a denoiser would like it in.
+  //
+  // dxvk-remix's opaque lobe -> reference class map (see restir_pt_shift.slangh):
+  //   diffuseReflection, diffuseTransmission -> diffuse class (0x3)
+  //   specularReflection                     -> specular class (0xc)
+  //   opacityTransmission                    -> delta; the shift rejects it
+  // Non-opaque materials are pure delta chains here and are rejected too, so
+  // false is the honest answer for them.
+  const bool isSpecularLobeClass =
+    isOpaque && (sampledLobe == opaqueLobeTypeSpecularReflection);
 
   if (!isTransmission)
   {
@@ -375,6 +392,7 @@ void restirPtClassifyScatterEvent(
 
   path.setDelta(isDelta);
   path.setSpecularBounce(isSpecularBounce);
+  path.setSpecularLobeClass(isSpecularLobeClass);
 }
 
 // Packs a resolved hit into the identity triple a later phase reconstructs the
@@ -615,6 +633,9 @@ bool restirPtScatterAtPrimarySurface(inout RestirPtPathState path, RAB_Surface p
   path.pathBuilder.pathFlags.insertIsDeltaEvent(path.isDelta(), true);
   path.pathBuilder.pathFlags.insertIsTransmissionEvent(path.isTransmission(), true);
   path.pathBuilder.pathFlags.insertIsSpecularBounce(path.isSpecularBounce(), true);
+  // The lobe class the shift restricts its primary-vertex evaluations to. NOT the
+  // same bit as the line above -- see RestirPtPathFlags::insertIsSpecularLobeClass.
+  path.pathBuilder.pathFlags.insertIsSpecularLobeClass(path.isSpecularLobeClass(), true);
 
   path.normal = primarySurface.opaqueSurfaceMaterialInteraction.shadingNormal;
 
@@ -1248,6 +1269,8 @@ void restirPtHandleVertex(
       path.pathBuilder.pathFlags.insertIsDeltaEvent(path.isDelta(), false);
       path.pathBuilder.pathFlags.insertIsTransmissionEvent(path.isTransmission(), false);
       path.pathBuilder.pathFlags.insertIsSpecularBounce(path.isSpecularBounce(), false);
+      // ...and the lobe class, which is what allowedSampledTypes2 actually reads.
+      path.pathBuilder.pathFlags.insertIsSpecularLobeClass(path.isSpecularLobeClass(), false);
 
       // ports :334-337. Note the fork's `solidAnglePdf` is the sampled lobe's own
       // solid-angle pdf and is NOT multiplied by the lobe selection probability,

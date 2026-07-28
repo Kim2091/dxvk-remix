@@ -73,6 +73,13 @@ static const uint16_t kRestirPtFlagDiffusePrimaryHit      = uint16_t(0x0200);  /
 static const uint16_t kRestirPtFlagFreePath               = uint16_t(0x0400);  // Unused in this port.
 static const uint16_t kRestirPtFlagSpecularBounce         = uint16_t(0x0800);  // Everything that is not diffuse.
 static const uint16_t kRestirPtFlagSpecularPrimaryHit     = uint16_t(0x1000);  // Primary hit sampled from a specular lobe (denoiser routing).
+// FORK-OWNED, no reference twin. "The lobe just sampled belongs to the SPECULAR
+// class", with NO roughness test -- which is what the reference's specularBounce
+// means and what the reconnection shift needs to pick the lobe class it restricts
+// its evaluations to. Distinct from kRestirPtFlagSpecularBounce, which this fork
+// redefined as a denoiser-routing decision. See the long note on
+// RestirPtPathFlags::insertIsSpecularLobeClass.
+static const uint16_t kRestirPtFlagSpecularLobeClass      = uint16_t(0x2000);
 
 // Bounce type counters, one byte each inside bounceCounters.
 // ports ReSTIRPTPass/PathState.slang:43-49.
@@ -291,6 +298,8 @@ struct RestirPtPathState : IBasePayloadState
   bool isSpecular() { return hasFlag(kRestirPtFlagSpecular); }
   bool isDelta() { return hasFlag(kRestirPtFlagDelta); }
   bool isSpecularBounce() { return hasFlag(kRestirPtFlagSpecularBounce); }
+  // Fork-owned. NOT a synonym for isSpecularBounce -- see kRestirPtFlagSpecularLobeClass.
+  bool isSpecularLobeClass() { return hasFlag(kRestirPtFlagSpecularLobeClass); }
   bool isLightSampled() { return (flags & (kRestirPtFlagLightSampledUpper | kRestirPtFlagLightSampledLower)) != uint16_t(0); }
   bool isLightSampledUpper() { return hasFlag(kRestirPtFlagLightSampledUpper); }
   bool isLightSampledLower() { return hasFlag(kRestirPtFlagLightSampledLower); }
@@ -311,13 +320,14 @@ struct RestirPtPathState : IBasePayloadState
   [mutating] void clearEventFlags()
   {
     flags &= ~(kRestirPtFlagTransmission | kRestirPtFlagSpecular | kRestirPtFlagDelta |
-               kRestirPtFlagVolume | kRestirPtFlagSpecularBounce);
+               kRestirPtFlagVolume | kRestirPtFlagSpecularBounce | kRestirPtFlagSpecularLobeClass);
   }
 
   [mutating] void setTransmission(bool value) { setFlag(kRestirPtFlagTransmission, value); }
   [mutating] void setSpecular(bool value) { setFlag(kRestirPtFlagSpecular, value); }
   [mutating] void setDelta(bool value) { setFlag(kRestirPtFlagDelta, value); }
   [mutating] void setSpecularBounce(bool value) { setFlag(kRestirPtFlagSpecularBounce, value); }
+  [mutating] void setSpecularLobeClass(bool value) { setFlag(kRestirPtFlagSpecularLobeClass, value); }
   [mutating] void setLightSampled(bool upper, bool lower)
   {
     setFlag(kRestirPtFlagLightSampledUpper, upper);
