@@ -137,8 +137,45 @@
 #define FORK_RESTIR_PT_SR_BINDING_RESERVOIR_INPUT                          148
 #define FORK_RESTIR_PT_SR_BINDING_RESERVOIR_OUTPUT                         149
 
+// --- Temporal reuse pass (phase 4; separate pipeline, own descriptor set) ----
+// The same 13-entry primary G-buffer set again, for the same by-name reason, plus
+// three history / reprojection inputs the spatial pass does not need.
+//
+// Note what is NOT here: the surface mapping buffer that remaps a history
+// reservoir's reconnection-vertex surface index into this frame's surface list.
+// It needs no slot -- it is already bound at BINDING_SURFACE_MAPPING_BUFFER (5) by
+// COMMON_RAYTRACING_BINDINGS, which this pipeline binds.
+#define FORK_RESTIR_PT_TR_BINDING_WORLD_SHADING_NORMAL_INPUT               150
+#define FORK_RESTIR_PT_TR_BINDING_PERCEPTUAL_ROUGHNESS_INPUT               151
+#define FORK_RESTIR_PT_TR_BINDING_HIT_DISTANCE_INPUT                       152
+#define FORK_RESTIR_PT_TR_BINDING_ALBEDO_INPUT                             153
+#define FORK_RESTIR_PT_TR_BINDING_BASE_REFLECTIVITY_INPUT                  154
+#define FORK_RESTIR_PT_TR_BINDING_WORLD_POSITION_INPUT                     155
+#define FORK_RESTIR_PT_TR_BINDING_VIEW_DIRECTION_INPUT                     156
+#define FORK_RESTIR_PT_TR_BINDING_CONE_RADIUS_INPUT                        157
+#define FORK_RESTIR_PT_TR_BINDING_POSITION_ERROR_INPUT                     158
+#define FORK_RESTIR_PT_TR_BINDING_SHARED_FLAGS_INPUT                       159
+#define FORK_RESTIR_PT_TR_BINDING_SHARED_SURFACE_INDEX_INPUT               160
+#define FORK_RESTIR_PT_TR_BINDING_SUBSURFACE_DATA_INPUT                    161
+#define FORK_RESTIR_PT_TR_BINDING_SUBSURFACE_DIFFUSION_PROFILE_DATA_INPUT  162
+
+// History / reprojection. The previous world position texture is the ONLY exact
+// previous-frame surface datum this port relies on -- see THE TEMPORAL SOURCE
+// SURFACE block in fork_restir_pt_temporal_reuse.comp.slang for why GBufferLast is
+// deliberately not used despite carrying a previous shading normal.
+#define FORK_RESTIR_PT_TR_BINDING_PREV_WORLD_POSITION_INPUT                163
+#define FORK_RESTIR_PT_TR_BINDING_MVEC_INPUT                               164
+#define FORK_RESTIR_PT_TR_BINDING_GRADIENTS_INPUT                          165
+
+// Reservoirs. The current page is read AND written in place (each lane touches
+// only its own index, so there is no race); the history page is last frame's final
+// page and is read at the reprojected pixel. They are always different pages of
+// the three-page allocation -- see the rotation comment on m_historyPage.
+#define FORK_RESTIR_PT_TR_BINDING_RESERVOIR_HISTORY_INPUT                  166
+#define FORK_RESTIR_PT_TR_BINDING_RESERVOIR_INPUT_OUTPUT                   167
+
 #define FORK_RESTIR_PT_MIN_BINDING   FORK_RESTIR_PT_BINDING_WORLD_SHADING_NORMAL_INPUT
-#define FORK_RESTIR_PT_MAX_BINDING   FORK_RESTIR_PT_SR_BINDING_RESERVOIR_OUTPUT
+#define FORK_RESTIR_PT_MAX_BINDING   FORK_RESTIR_PT_TR_BINDING_RESERVOIR_INPUT_OUTPUT
 
 // Size of one RestirPtReservoir element, in bytes. Shared with the host so the
 // buffer allocation and the shader's structured-buffer stride can never drift.

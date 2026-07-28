@@ -71,8 +71,8 @@ namespace dxvk {
     // resolve and RTXDI confidence, before demodulate. No-op unless the ReSTIR PT
     // indirect mode is selected.
     //
-    // Runs the spatial reuse rounds first, inside the same mode gate, so phase 3
-    // needs no new rtx_context.cpp touchpoint.
+    // Runs the temporal pass and then the spatial reuse rounds first, inside the
+    // same mode gate, so phases 3 and 4 need no new rtx_context.cpp touchpoint.
     void dispatchFinalShading(RtxContext* ctx, const Resources::RaytracingOutput& rtOutput);
 
     void prewarmShaders(DxvkPipelineManager& pipelineManager) const;
@@ -82,7 +82,19 @@ namespace dxvk {
     // Fills the ReSTIR PT block of RaytraceArgs. Called once per frame from
     // RtxContext::updateRaytraceArgsConstantBuffer; the per-dispatch trace/replay
     // mode selector is a push constant instead (see ForkReSTIRPTArgs).
-    void setRaytraceArgs(RaytraceArgs& constants) const;
+    //
+    // Takes the context because one of its flags -- gradient-based history
+    // validation -- is only meaningful when the RTXDI gradient pass actually ran
+    // this frame, which is a cross-pass question (see usesDenoiserGradient).
+    void setRaytraceArgs(RtxContext& ctx, RaytraceArgs& constants) const;
+
+    // True when this pass needs RTXDI's lighting-change gradients this frame.
+    // Read by DxvkRtxdiRayQuery::getEnableDenoiserGradient, which is what decides
+    // whether the gradient passes run at all; without this the gradient texture is
+    // never produced in ReSTIR PT mode under DLSS-RR and temporal validation would
+    // silently do nothing. Exists as a predicate rather than as three public option
+    // accessors so the enablement rule lives in one place.
+    bool usesDenoiserGradient() const;
 
     // Emissive accounting policy. The A/B for the one phase 2 change that moves
     // energy: the removal of the reference's `suppressAsDirect`. Values match
@@ -103,35 +115,75 @@ namespace dxvk {
     virtual void createDownscaledResource(Rc<DxvkContext>& ctx, const VkExtent3D& downscaledExtent) override;
     virtual void releaseDownscaledResource() override;
 
-    // One page of the two-page reservoir allocation, as a bindable slice. `page`
-    // is taken modulo the page count so callers can pass a raw round index.
+    // One page of the reservoir allocation, as a bindable slice. `page` is NOT
+    // taken modulo anything -- with temporal reuse the page roles rotate across
+    // frames and a silent wrap would alias the history page onto a working one.
+    // Callers pass an index the schedule below produced.
     DxvkBufferSlice reservoirPageSlice(uint32_t page) const;
+
+    // Reservoir pages this configuration needs: 3 with temporal reuse (two working
+    // pages plus a history page that must survive the frame boundary), 2 without.
+    uint32_t requiredPageCount() const;
 
     // Spatial reuse rounds actually dispatched this frame (0 when reuse is off).
     uint32_t activeSpatialRounds() const;
 
-    // 1..N spatial reuse rounds, ping-ponging the two reservoir pages. Called from
-    // dispatchFinalShading, before the final shading dispatch and inside the same
-    // mode gate.
+    // True when the temporal pass will be dispatched this frame.
+    bool temporalReuseActiveThisFrame() const;
+
+    // THE PAGE SCHEDULE. With H = m_historyPage, the two pages that are NOT the
+    // history page are this frame's working pair, in index order. The trace pass
+    // writes the first of them; the spatial rounds ping-pong between them; final
+    // shading reads whichever was written last, and that page becomes the next
+    // frame's history. Returns the working pair.
+    void workingPages(uint32_t& firstPage, uint32_t& secondPage) const;
+
+    // The page final shading reads this frame, i.e. the last one written.
+    uint32_t finalPage() const;
+
+    // One temporal reuse dispatch, in place on the trace pass's page, reading the
+    // history page. Called from dispatchFinalShading before the spatial rounds.
+    void dispatchTemporalReuse(RtxContext* ctx, const Resources::RaytracingOutput& rtOutput);
+
+    // 1..N spatial reuse rounds, ping-ponging the two working reservoir pages.
+    // Called from dispatchFinalShading, before the final shading dispatch and
+    // inside the same mode gate.
     void dispatchSpatialReuse(RtxContext* ctx, const Resources::RaytracingOutput& rtOutput);
 
-    // TWO pages of one RestirPtReservoir per padded pixel. Allocated only in the
-    // ReSTIR PT indirect mode.
+    // TWO or THREE pages of one RestirPtReservoir per padded pixel. Allocated only
+    // in the ReSTIR PT indirect mode.
     //
     // Spatial reuse cannot run in place -- pixel A reads neighbour B's reservoir
-    // while B's own thread overwrites it -- so round r reads page r % 2 and writes
-    // page (r + 1) % 2. The two pages are bound as buffer SLICES of this one
+    // while B's own thread overwrites it -- so round r reads one working page and
+    // writes the other. The pages are bound as buffer SLICES of this one
     // allocation, which is why no shader needs page arithmetic: the reference
     // swaps whole buffers per round (ReSTIRPTPass.cpp:1665-1675) and ReSTIR GI
     // uses pages with shader-side indexing (rtx_restir_gi_rayquery.cpp:321-331);
     // slices are the cheap middle.
     //
-    // Phase 4 (temporal reuse) will want history storage; exactly two pages are
-    // allocated now so that decision stays open.
+    // Phase 4 adds the third page, and with it the ROTATION: last frame's final
+    // page is this frame's history page and is untouched until the temporal pass
+    // has read it, which is what lets this port skip the reference's per-frame
+    // copyResource (ReSTIRPTPass.cpp:770-771). One page is ~191 MiB at 1080p
+    // render resolution, so the third one is not free and the option's description
+    // says so.
     Rc<DxvkBuffer> m_reservoirBuffer;
 
     // Size in bytes of ONE reservoir page, i.e. the slice stride.
     VkDeviceSize m_reservoirPageSize = 0;
+
+    // Pages actually allocated. Tracked because the needed count changes with an
+    // option, not only with an activation transition -- see onFrameBegin.
+    uint32_t m_allocatedPageCount = 0;
+
+    // The page holding last frame's final reservoirs. Advanced at the end of every
+    // frame the pass runs in indirect mode.
+    uint32_t m_historyPage = 0;
+
+    // False for the first frame after any (re)allocation: there is no history to
+    // reuse yet, and the pages hold undefined memory. The reference's
+    // `skipTemporalReuse = mReservoirFrameCount == 0` (ReSTIRPTPass.cpp:681).
+    bool m_historyValid = false;
 
     // Debug-only scratch: float4 per padded pixel, {radiance.xyz, packed terminal
     // descriptor}. Written by the trace dispatch, read back by the replay-verify
@@ -206,6 +258,33 @@ namespace dxvk {
                "The reference only does this under its hybrid shift, so turning this off reproduces strict reference behaviour - at the cost of "
                "nearly all outdoor reuse, since a sky escape one bounce off the primary surface is the dominant path class outdoors. "
                "No brightness change either way; if there is one, the escape MIS convention is wrong.");
+    RTX_OPTION("rtx.restirPT", bool, enableTemporalReuse, true,
+               "Enables the ReSTIR PT temporal reuse pass: each pixel resamples the previous frame's reservoir at the reprojected pixel "
+               "through the same reconnection shift the spatial pass uses, with Talbot resampling MIS over the two candidates.\n"
+               "This is what makes indirect light STABLE rather than merely less noisy - it is also the first part of this port that can "
+               "boil, because it is the first with cross-frame feedback. If low-frequency luminance pulsing appears on large flat surfaces, "
+               "lower Temporal History Length first.\n"
+               "Costs two reconnection shifts and two visibility rays per pixel (about one spatial neighbour's worth) AND A THIRD RESERVOIR "
+               "PAGE OF VRAM - roughly +191 MiB at 1080p render resolution, since last frame's reservoirs have to survive the frame boundary. "
+               "Turning it off gives that page back.");
+    RTX_OPTION("rtx.restirPT", float, temporalHistoryLength, 20.0f,
+               "M-cap: the previous frame's confidence weight is clamped to this multiple of the current reservoir's before resampling. "
+               "The reference's default (ReSTIRPTPass.h). This is THE stability-versus-lag knob - raise it for a quieter image that responds "
+               "more slowly to change, lower it for the opposite.\n"
+               "Raising it must not change the average brightness of anything. If it does, the M-cap or a Talbot MIS denominator is wrong.");
+    RTX_OPTION("rtx.restirPT", bool, temporalReprojectionJitter, true,
+               "Stochastically rounds the reprojected pixel to one of the pixels the exact reprojected position touches, instead of always "
+               "taking the containing one. Decorrelates a slowly panning camera from repeatedly resampling the same history lane, which is "
+               "one of the cheaper defences against temporal correlation artifacts.");
+    RTX_OPTION("rtx.restirPT", bool, validateLightingChange, true,
+               "Discards a temporal sample when RTXDI's lighting-change gradients say the light reaching its reconnection vertex has changed. "
+               "Twin of rtx.restirGI.validateLightingChange. With this off, switching an emitter off or moving it makes the indirect response "
+               "GHOST for roughly Temporal History Length frames - that A/B is how you check the validation is actually firing (watch the blue "
+               "channel of the 'ReSTIR PT Temporal Reprojection' debug view).\n"
+               "Only effective where the reconnection vertex is on screen; gradients do not exist for anything else.");
+    RTX_OPTION("rtx.restirPT", float, lightingValidationThreshold, 0.05f,
+               "Gradient magnitude above which a temporal sample is treated as stale. Lower discards more history (more responsive, noisier); "
+               "higher discards less (quieter, more ghosting).");
     RTX_OPTION("rtx.restirPT", bool, neeCacheTaskFeedback, true,
                "Inserts NEE cache tasks at emissive hits inside the ReSTIR PT kernel, as the indirect integrator does. "
                "This is how the cache DISCOVERS emissive triangles; integrate_nee's own feedback only reinforces existing candidates. "

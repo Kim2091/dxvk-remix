@@ -23,6 +23,7 @@
 #include "dxvk_device.h"
 #include "rtx_shader_manager.h"
 #include "rtx_restir_gi_rayquery.h"
+#include "rtx_fork_restir_pt_rayquery.h"
 
 #include "rtx/pass/common_binding_indices.h"
 #include "rtx/pass/raytrace_args.h"
@@ -368,13 +369,20 @@ namespace dxvk {
 
     DxvkRayReconstruction& rayReconstruction = ctx.getCommonObjects()->metaRayReconstruction();
     DxvkReSTIRGIRayQuery& restirGI = ctx.getCommonObjects()->metaReSTIRGIRayQuery();
+    // Fork: ReSTIR PT's temporal reuse consumes the same gradients for the same
+    // purpose ReSTIR GI does - discarding a history sample whose suffix now points
+    // at light that has changed. Without this clause the gradient pass is skipped in
+    // ReSTIR PT mode under DLSS-RR, and the validation silently never fires.
+    DxvkForkReSTIRPTRayQuery& restirPT = ctx.getCommonObjects()->metaForkReSTIRPT();
 
     const bool isNrdAPrimaryDenoiser = RtxOptions::useDenoiser()
       && !rayReconstruction.useRayReconstruction()
       && !RtxOptions::useDenoiserReferenceMode();
 
-    // Gradients are only used when NRD is a primary denoiser and/or ReSTIR GI is using it
-    if (!isNrdAPrimaryDenoiser && !(restirGI.isActive() && restirGI.validateLightingChange())) {
+    // Gradients are only used when NRD is a primary denoiser and/or ReSTIR GI / ReSTIR PT is using it
+    if (!isNrdAPrimaryDenoiser
+        && !(restirGI.isActive() && restirGI.validateLightingChange())
+        && !restirPT.usesDenoiserGradient()) {
       return false;
     }
 

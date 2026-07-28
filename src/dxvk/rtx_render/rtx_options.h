@@ -664,7 +664,15 @@ namespace dxvk {
     }
 
     static bool enablePreviousTLAS() {
-      return !isRayReconstructionEnabled() || useReSTIRGI();
+      // Fork: ReSTIR PT joins ReSTIR GI here. Its temporal reuse pass carries a
+      // reconnection vertex across the frame boundary as a (surfaceIndex,
+      // primitiveIndex, barycentrics) triple, and surfaceIndex names LAST frame's
+      // surface list -- so it needs the surface mapping buffer, which is what this
+      // flag ultimately gates through SceneManager::isPreviousFrameSceneAvailable.
+      // Keyed on the mode rather than on rtx.restirPT.enableTemporalReuse for the
+      // same reason the ReSTIRGI clause is keyed on the mode: this header cannot
+      // see the pass's options without an include cycle.
+      return !isRayReconstructionEnabled() || useReSTIRGI() || useReSTIRPT();
     }
 
     struct AntiCulling {

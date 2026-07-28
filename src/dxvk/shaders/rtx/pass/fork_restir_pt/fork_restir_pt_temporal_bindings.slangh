@@ -1,0 +1,112 @@
+/*
+* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+#pragma once
+
+#include "rtx/pass/fork_restir_pt/fork_restir_pt_binding_indices.h"
+#include "rtxdi/RtxdiParameters.h"
+
+// ReSTIR PT (fork) -- temporal reuse pass bindings.
+//
+// Note: the G-buffer global names below are not free choices -- RAB_GetGBufferSurface
+// (RtxdiApplicationBridge.slangh:286-324) reads them by name under
+// RAB_HAS_CURRENT_GBUFFER, so they must match restir_gi_reuse_bindings.slangh and
+// the other two fork binding headers exactly. Only the slot numbers differ.
+//
+// RAB_HAS_PREVIOUS_GBUFFER is deliberately NOT defined by the pass that includes
+// this: it would bind GBufferLast, which is written by the RTXDI and ReSTIR GI
+// SPATIAL passes (rtxdi_spatial_reuse.comp.slang:91,107 and
+// restir_gi_spatial_reuse.comp.slang:54) and therefore carries no guarantee of
+// being this-frame-fresh in ReSTIR PT mode. The previous world position texture
+// below is part of the G-buffer ping-pong and has no such coupling.
+
+// Inputs -- the primary G-buffer set.
+
+layout(r32ui, binding = FORK_RESTIR_PT_TR_BINDING_WORLD_SHADING_NORMAL_INPUT)
+Texture2D<uint> PrimaryWorldShadingNormal;
+
+layout(r8, binding = FORK_RESTIR_PT_TR_BINDING_PERCEPTUAL_ROUGHNESS_INPUT)
+Texture2D<float> PrimaryPerceptualRoughness;
+
+layout(r32f, binding = FORK_RESTIR_PT_TR_BINDING_HIT_DISTANCE_INPUT)
+Texture2D<float> PrimaryHitDistance;
+
+layout(rgb10_a2, binding = FORK_RESTIR_PT_TR_BINDING_ALBEDO_INPUT)
+Texture2D<float4> PrimaryAlbedo;
+
+layout(rgb10_a2, binding = FORK_RESTIR_PT_TR_BINDING_BASE_REFLECTIVITY_INPUT)
+Texture2D<float4> PrimaryBaseReflectivity;
+
+layout(rgba32f, binding = FORK_RESTIR_PT_TR_BINDING_WORLD_POSITION_INPUT)
+Texture2D<float4> PrimaryWorldPositionWorldTriangleNormal;
+
+layout(rg16_snorm, binding = FORK_RESTIR_PT_TR_BINDING_VIEW_DIRECTION_INPUT)
+Texture2D<float2> PrimaryViewDirection;
+
+layout(r16f, binding = FORK_RESTIR_PT_TR_BINDING_CONE_RADIUS_INPUT)
+Texture2D<float> PrimaryConeRadius;
+
+layout(r32f, binding = FORK_RESTIR_PT_TR_BINDING_POSITION_ERROR_INPUT)
+Texture2D<float> PrimaryPositionError;
+
+layout(r16ui, binding = FORK_RESTIR_PT_TR_BINDING_SHARED_FLAGS_INPUT)
+Texture2D<uint16_t> SharedFlags;
+
+layout(r32ui, binding = FORK_RESTIR_PT_TR_BINDING_SHARED_SURFACE_INDEX_INPUT)
+Texture2D<uint> SharedSurfaceIndex;
+
+layout(rg16ui, binding = FORK_RESTIR_PT_TR_BINDING_SUBSURFACE_DATA_INPUT)
+Texture2D<uint2> SharedSubsurfaceData;
+
+layout(rg32ui, binding = FORK_RESTIR_PT_TR_BINDING_SUBSURFACE_DIFFUSION_PROFILE_DATA_INPUT)
+Texture2D<uint2> SharedSubsurfaceDiffusionProfileData;
+
+// History / reprojection inputs.
+
+layout(rgba32f, binding = FORK_RESTIR_PT_TR_BINDING_PREV_WORLD_POSITION_INPUT)
+Texture2D<float4> PreviousWorldPosition_WorldTriangleNormal;
+
+layout(rgba16f, binding = FORK_RESTIR_PT_TR_BINDING_MVEC_INPUT)
+Texture2D<float4> PrimaryVirtualMotionVector;
+
+// RTXDI's per-tile lighting-change gradients: .x is the gradient magnitude, .y the
+// linear depth of the surface it was measured on. Bound whether or not validation
+// is enabled -- Vulkan wants every declared binding filled -- but read only under
+// RESTIR_PT_FLAG_LIGHTING_VALIDATION, which the host sets only when the gradient
+// pass actually ran this frame.
+layout(rg16f, binding = FORK_RESTIR_PT_TR_BINDING_GRADIENTS_INPUT)
+Texture2DArray<float2> RtxdiGradients;
+
+// Note: included HERE, after the G-buffer globals above, for the same include
+// ordering reason the other two fork passes document -- RestirPtReservoir lives
+// behind rtx/algorithm/rtxdi/rtxdi.slangh, whose bridge reads those globals by name.
+#include "rtx/algorithm/fork_restir_pt/restir_pt_reservoir.slangh"
+
+// Last frame's FINAL reservoir page, read at the reprojected pixel.
+layout(binding = FORK_RESTIR_PT_TR_BINDING_RESERVOIR_HISTORY_INPUT)
+StructuredBuffer<RestirPtReservoir> RestirPtReservoirHistory;
+
+// This frame's current page, read and written IN PLACE. Safe because every lane
+// touches only its own index here -- the reference does the same
+// (TemporalReuse.cs.slang:91,299 load and store outputReservoirs[centralOffset]),
+// and it is why temporal reuse needs no ping-pong of its own.
+layout(binding = FORK_RESTIR_PT_TR_BINDING_RESERVOIR_INPUT_OUTPUT)
+RWStructuredBuffer<RestirPtReservoir> RestirPtReservoirCurrent;

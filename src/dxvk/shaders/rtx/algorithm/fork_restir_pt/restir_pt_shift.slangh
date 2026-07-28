@@ -373,21 +373,36 @@ float restirPtEvalPdfBsdf(RAB_Surface surface, vec3 inputDirection, uint allowed
 // translucent or ray-portal rcVertex is a delta chain in this port and can never
 // host a reconnection. The delta flags already reject those; this is the belt to
 // those braces.
-bool restirPtReconstructRcVertex(
+// The GEOMETRY half of restirPtReconstructRcVertex, split out so a caller that
+// needs only where the reconnection vertex IS can skip the material interaction --
+// which is the half that does texture reads. Phase 4's gradient-based history
+// validation is that caller: it projects the reconnection vertex to screen space
+// and reads one gradient texel, and evaluates no BSDF at all.
+//
+// The full reconstruction below CALLS this rather than repeating it, so the two can
+// never drift apart on the footprint convention -- which is the one thing here that
+// has already been wrong once (see the KNOWN FIDELITY GAP note above). The cost of
+// that sharing is that surfaces[] and surfaceMaterials[] are indexed in both halves;
+// both are read-only structured buffers indexed identically inside one inlined
+// function, so the loads fold.
+//
+// `rayInteraction` comes back with viewDirection ZERO -- the honest direction is not
+// knowable until the position is, which is the whole chicken-and-egg this split
+// documents. The full version fills it in.
+bool restirPtReconstructRcVertexGeometry(
   RestirPtHit hit,
   vec3 prevVertexPosition,
   float coneRadius,
   float spreadAngle,
   inout SurfaceInteraction surfaceInteraction,
-  inout MinimalRayInteraction minimalRayInteraction,
-  inout OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteraction)
+  inout RayInteraction rayInteraction)
 {
-  // Note: the three interactions are `inout`, not `out`, and are left untouched on
-  // the failure paths below. SurfaceInteraction and RayInteraction both inherit
-  // from their Minimal counterparts, which Slang refuses to build an initializer
-  // list for ("cannot use initializer list for type"), so there is no cheap empty
-  // value to write; every caller reads them only when this returns true. Same
-  // pattern the trace core uses for its OpaqueSurfaceMaterialInteraction.
+  // Note: the interactions are `inout`, not `out`, and are left untouched on the
+  // failure paths below. SurfaceInteraction and RayInteraction both inherit from
+  // their Minimal counterparts, which Slang refuses to build an initializer list
+  // for ("cannot use initializer list for type"), so there is no cheap empty value
+  // to write; every caller reads them only when this returns true. Same pattern the
+  // trace core uses for its OpaqueSurfaceMaterialInteraction.
   if (!hit.isValid())
   {
     return false;
@@ -402,7 +417,6 @@ bool restirPtReconstructRcVertex(
 
   const Surface surface = surfaces[hit.surfaceIndex];
 
-  RayInteraction rayInteraction;
   rayInteraction.hitDistance = 0.0f;
   rayInteraction.materialType = uint8_t(surfaceMaterialTypeOpaque);
   rayInteraction.isViewModel = false;
@@ -423,6 +437,29 @@ bool restirPtReconstructRcVertex(
   // (surface_interaction.slangh:620-622).
   surfaceInteraction = surfaceInteractionCreate<SurfaceGenerateTangents>(
     surface, rayInteraction, ray, /*usePreviousPositions=*/ false, kFootprintFromRayOrigin);
+
+  return true;
+}
+
+bool restirPtReconstructRcVertex(
+  RestirPtHit hit,
+  vec3 prevVertexPosition,
+  float coneRadius,
+  float spreadAngle,
+  inout SurfaceInteraction surfaceInteraction,
+  inout MinimalRayInteraction minimalRayInteraction,
+  inout OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteraction)
+{
+  RayInteraction rayInteraction;
+
+  if (!restirPtReconstructRcVertexGeometry(
+        hit, prevVertexPosition, coneRadius, spreadAngle, surfaceInteraction, rayInteraction))
+  {
+    return false;
+  }
+
+  const MemoryPolymorphicSurfaceMaterial memoryPolymorphicSurfaceMaterial = surfaceMaterials[hit.surfaceIndex];
+  const Surface surface = surfaces[hit.surfaceIndex];
 
   // Now that the position is known, the honest view direction is too: from the
   // reconnection vertex back toward the destination pixel's primary vertex. Twin

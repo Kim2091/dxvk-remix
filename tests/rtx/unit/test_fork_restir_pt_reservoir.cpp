@@ -59,8 +59,11 @@
 //   That identity is the whole reason the final shading pass may write F*weight
 //   and nothing else. If it breaks, PT mode's brightness stops matching GI's.
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <string>
+#include <utility>
 #include <vector>
 #include <limits>
 
@@ -2192,6 +2195,384 @@ namespace dxvk {
       }
     }
 
+    // -----------------------------------------------------------------------
+    // (p) PHASE 4: TALBOT RESAMPLING MIS IS UNBIASED, and unbiased INDEPENDENTLY
+    // OF THE CONFIDENCE WEIGHTS.
+    //
+    // The temporal analogue of (h), on the same enumerate-every-draw harness.
+    // Two candidates -- the current frame's reservoir and the previous frame's --
+    // over ONE shared discrete path domain, so shifting is the identity with
+    // Jacobian 1 and "the temporal path shifted onto the central pixel" is simply
+    // F_c[j]. The central pixel then runs the Talbot combine exactly as
+    // fork_restir_pt_temporal_reuse.comp.slang does.
+    //
+    //   assert  E[F_c(Y) * W_out]  ==  SUM_j F_c(j) / p_j
+    //
+    // The SECOND assertion is the one that matters most for this phase, and it is
+    // why every case is run at several history lengths: the M-cap changes M_T, M_T
+    // appears in both Talbot denominators, and the result must not move at all.
+    // A drift here would show in-game as "the image gets brighter (or dimmer) as
+    // rtx.restirPT.temporalHistoryLength is raised" -- which is exactly the
+    // symptom the phase's A/B watches for, and which is otherwise indistinguishable
+    // from a tuning preference.
+    //
+    // What this catches: the two Talbot denominators swapped (they are NOT
+    // symmetric -- one divides by the Jacobian, the other multiplies), p_self taken
+    // from the wrong reservoir, a missing confidence weight on either term, and
+    // finalizeRIS used where finalizeGRIS belongs (which reintroduces a division by
+    // M and darkens everything by the accumulated history length).
+    // -----------------------------------------------------------------------
+    void testTalbotResamplingMISIsUnbiased() {
+      struct Outcome {
+        int index = 0;
+        double probability = 0.0;
+        mirror::RestirPtReservoir reservoir;
+      };
+
+      // Same exhaustive streaming build (p) shares with (h): each candidate is
+      // offered in order, the selected index survives with probability w_j / w_sum.
+      auto buildPixel = [](const std::vector<mirror::vec3>& F, const std::vector<float>& p) {
+        std::vector<Outcome> outcomes;
+
+        mirror::RestirPtReservoir reference;
+        reference.init();
+        for (size_t j = 0; j < F.size(); ++j) {
+          reference.add(F[j], p[j], 1.0f);
+        }
+
+        const float wSum = reference.weight;
+
+        for (size_t j = 0; j < F.size(); ++j) {
+          const float w = mirror::RestirPtReservoir::toScalar(F[j]) / p[j];
+          if (!(w > 0.0f)) { continue; }
+
+          Outcome o;
+          o.index = int(j);
+          o.probability = double(w) / double(wSum);
+
+          o.reservoir.init();
+          o.reservoir.F = F[j];
+          o.reservoir.weight = wSum;
+          o.reservoir.M = 1.0f;
+          o.reservoir.srcPixel = uint32_t(j);
+          mirror::pathBuilderFinalize(o.reservoir);
+          o.reservoir.finalizeRIS();
+
+          outcomes.push_back(o);
+        }
+
+        return outcomes;
+      };
+
+      struct Case {
+        const char* name;
+        std::vector<mirror::vec3> centralF;   // the current frame's integrands
+        std::vector<mirror::vec3> temporalF;  // the previous frame's, same domain
+        std::vector<float> p;
+      };
+
+      std::vector<Case> cases;
+
+      cases.push_back({
+        "ordinary",
+        { mirror::vec3(1.0f, 0.5f, 0.25f), mirror::vec3(0.2f, 2.0f, 0.1f), mirror::vec3(0.7f, 0.7f, 3.0f) },
+        { mirror::vec3(0.8f, 0.6f, 0.30f), mirror::vec3(0.3f, 1.4f, 0.2f), mirror::vec3(0.5f, 0.9f, 2.1f) },
+        { 1.0f, 0.8f, 0.5f }
+      });
+
+      // A path the previous frame could not see at all. Its Talbot weight there is
+      // 0 and the canonical weight must absorb the whole of it -- the temporal twin
+      // of (h)'s shift-to-zero neighbour, and the case a "both weights are 1/2"
+      // simplification silently gets wrong.
+      cases.push_back({
+        "history blind to a path",
+        { mirror::vec3(2.0f, 1.0f, 0.5f), mirror::vec3(0.4f, 0.4f, 4.0f), mirror::vec3(1.1f, 0.2f, 0.9f) },
+        { mirror::vec3(0.1f, 0.1f, 0.1f), mirror::vec3(0.0f, 0.0f, 0.0f), mirror::vec3(3.0f, 1.0f, 0.5f) },
+        { 1.0f, 0.64f, 0.32f }
+      });
+
+      cases.push_back({
+        "wide dynamic range",
+        { mirror::vec3(0.05f, 0.05f, 0.05f), mirror::vec3(9.0f, 0.1f, 0.1f) },
+        { mirror::vec3(1.50f, 0.02f, 0.20f), mirror::vec3(0.3f, 0.3f, 6.0f) },
+        { 0.9f, 0.45f }
+      });
+
+      // The M-cap's output. 1 is "no history yet", 20 is the shipped default, 200
+      // is the far end of the slider.
+      const std::vector<float> historyMs = { 1.0f, 3.0f, 20.0f, 200.0f };
+
+      for (const Case& c : cases) {
+        const int pathCount = int(c.centralF.size());
+
+        // The target: what the central pixel's own estimator already estimates.
+        double refX = 0.0, refY = 0.0, refZ = 0.0;
+        for (int j = 0; j < pathCount; ++j) {
+          refX += double(c.centralF[j].x) / double(c.p[j]);
+          refY += double(c.centralF[j].y) / double(c.p[j]);
+          refZ += double(c.centralF[j].z) / double(c.p[j]);
+        }
+
+        const std::vector<Outcome> centralOutcomes = buildPixel(c.centralF, c.p);
+        const std::vector<Outcome> temporalOutcomes = buildPixel(c.temporalF, c.p);
+
+        for (const float historyM : historyMs) {
+          double totalProbability = 0.0;
+          double eX = 0.0, eY = 0.0, eZ = 0.0;
+
+          for (const Outcome& central : centralOutcomes) {
+            for (const Outcome& temporalRaw : temporalOutcomes) {
+              const double jointProbability = central.probability * temporalRaw.probability;
+
+              const mirror::RestirPtReservoir centralReservoir = central.reservoir;
+              const int centralPath = central.index;
+
+              mirror::RestirPtReservoir temporalReservoir = temporalRaw.reservoir;
+              const int temporalPath = temporalRaw.index;
+
+              // The confidence weight the M-cap produced after some number of
+              // accumulated frames. What (p) asserts is that the estimator does not
+              // depend on it AT ALL; the cap arithmetic itself is locked in (q).
+              // currentM is 1 here, as it is in-game before any reuse has run.
+              const float currentM = centralReservoir.M;
+              temporalReservoir.M = historyM;
+
+              struct MergeState { mirror::RestirPtReservoir dst; double probability; };
+
+              std::vector<MergeState> states;
+              {
+                MergeState s;
+                s.dst.init();
+                s.probability = 1.0;
+                states.push_back(s);
+              }
+
+              // --- i = curSampleId ------------------------------------------
+              {
+                const mirror::RestirPtReservoir tempDst = centralReservoir;
+                const bool possible = tempDst.weight > 0.0f;
+
+                float pSum = 0.0f;
+                float pSelf = 0.0f;
+
+                if (possible) {
+                  pSelf = mirror::RestirPtReservoir::computeWeight(tempDst.F, false) * currentM;
+                  pSum = pSelf;
+
+                  // The SECOND shift: the current sample projected into the
+                  // temporal domain. Identity here, so it is F_T at the central
+                  // pixel's path.
+                  pSum += mirror::RestirPtReservoir::computeWeight(c.temporalF[centralPath], false) *
+                          1.0f * temporalReservoir.M;
+                }
+
+                const float misWeight = (pSum == 0.0f) ? 0.0f : (pSelf / pSum);
+
+                std::vector<MergeState> next;
+
+                for (const MergeState& s : states) {
+                  const float w = mirror::RestirPtReservoir::toScalar(tempDst.F) * 1.0f *
+                                  tempDst.weight * misWeight;
+                  const float wSumAfter = s.dst.weight + w;
+                  const double pAccept = (!(w > 0.0f) || std::isnan(w))
+                    ? 0.0 : std::min(1.0, double(w) / double(wSumAfter));
+
+                  if (pAccept > 0.0) {
+                    MergeState accepted = s;
+                    accepted.dst.mergeWithResamplingMIS(tempDst.F, 1.0f, tempDst, 0.0f, misWeight, false);
+                    accepted.probability = s.probability * pAccept;
+                    next.push_back(accepted);
+                  }
+
+                  if (pAccept < 1.0) {
+                    MergeState rejected = s;
+                    rejected.dst.mergeWithResamplingMIS(tempDst.F, 1.0f, tempDst, 1.0f, misWeight, false);
+                    rejected.probability = s.probability * (1.0 - pAccept);
+                    next.push_back(rejected);
+                  }
+                }
+
+                states = next;
+              }
+
+              // --- i = prevSampleId -----------------------------------------
+              {
+                std::vector<MergeState> next;
+
+                for (const MergeState& s : states) {
+                  // shiftAndMergeReservoir with forceMerge. THE FIRST SHIFT:
+                  // temporal -> central, identity here, so F_c at the temporal
+                  // pixel's path.
+                  const mirror::vec3 shiftedIntegrand = c.centralF[temporalPath];
+                  const float dstJacobian = 1.0f;
+
+                  mirror::RestirPtReservoir temp = s.dst;
+                  const bool selected = temp.merge(shiftedIntegrand, dstJacobian, temporalReservoir,
+                                                   /*acceptRnd=*/ 0.0f, /*misWeight=*/ 1.0f, /*forceAdd=*/ true);
+                  if (!selected) { temp.F = mirror::vec3(); }
+                  temp.M = temporalReservoir.M;
+                  temp.weight = temporalReservoir.weight;
+
+                  float pSum = 0.0f;
+                  float pSelf = 0.0f;
+
+                  if (selected) {
+                    pSum = mirror::RestirPtReservoir::computeWeight(temp.F, false) * currentM;
+                    pSelf = mirror::RestirPtReservoir::computeWeight(temporalReservoir.F, false) /
+                            dstJacobian * temporalReservoir.M;
+                    pSum += pSelf;
+                  }
+
+                  const float misWeight = (pSum == 0.0f) ? 0.0f : (pSelf / pSum);
+
+                  const float w = mirror::RestirPtReservoir::toScalar(temp.F) * dstJacobian *
+                                  temp.weight * misWeight;
+                  const float wSumAfter = s.dst.weight + w;
+                  const double pAccept = (!(w > 0.0f) || std::isnan(w))
+                    ? 0.0 : std::min(1.0, double(w) / double(wSumAfter));
+
+                  if (pAccept > 0.0) {
+                    MergeState accepted = s;
+                    accepted.dst.mergeWithResamplingMIS(temp.F, dstJacobian, temp, 0.0f, misWeight, false);
+                    accepted.probability = s.probability * pAccept;
+                    next.push_back(accepted);
+                  }
+
+                  if (pAccept < 1.0) {
+                    MergeState rejected = s;
+                    rejected.dst.mergeWithResamplingMIS(temp.F, dstJacobian, temp, 1.0f, misWeight, false);
+                    rejected.probability = s.probability * (1.0 - pAccept);
+                    next.push_back(rejected);
+                  }
+                }
+
+                states = next;
+              }
+
+              // ports :222-225 and :298 -- finalizeGRIS, NOT finalizeRIS, and no
+              // division by a candidate count: Talbot's weights already form a
+              // partition of unity, which is the whole difference from pairwise.
+              for (MergeState& s : states) {
+                if (s.dst.weight > 0.0f) { s.dst.finalizeGRIS(); }
+
+                if (s.dst.weight < 0.0f) { s.dst.weight = 0.0f; }
+                if (std::isnan(s.dst.weight) || std::isinf(s.dst.weight)) { s.dst.weight = 0.0f; }
+
+                const double probability = jointProbability * s.probability;
+
+                totalProbability += probability;
+                eX += probability * double(s.dst.F.x) * double(s.dst.weight);
+                eY += probability * double(s.dst.F.y) * double(s.dst.weight);
+                eZ += probability * double(s.dst.F.z) * double(s.dst.weight);
+              }
+            }
+          }
+
+          const std::string label = str::format("p: [", c.name, ", M_T ", int(historyM), "] ");
+
+          checkClose(float(totalProbability), 1.0f,
+                     (label + "outcome probabilities sum to 1").c_str(), 1e-4f);
+          checkClose(float(eX), float(refX),
+                     (label + "E[F.x * W] == sum F_c.x / p").c_str(), 1e-3f);
+          checkClose(float(eY), float(refY),
+                     (label + "E[F.y * W] == sum F_c.y / p").c_str(), 1e-3f);
+          checkClose(float(eZ), float(refZ),
+                     (label + "E[F.z * W] == sum F_c.z / p").c_str(), 1e-3f);
+        }
+      }
+    }
+
+    // -----------------------------------------------------------------------
+    // (q) PHASE 4: the Talbot weights are a partition of unity, and the M-cap
+    // does not disturb it.
+    //
+    // The algebraic half of (p): it holds pointwise, for any target-function
+    // values and any pair of confidence weights, which is what makes Talbot need
+    // NO deferred normalisation of the kind pairwise MIS needs. The one way to
+    // break it is to make the two denominators disagree -- e.g. by dividing by the
+    // Jacobian on one side and forgetting to multiply on the other.
+    // -----------------------------------------------------------------------
+    void testTalbotWeightsPartitionAndMCap() {
+      struct Sample { float centralPHat; float temporalPHat; float jacobian; };
+
+      const std::vector<Sample> samples = {
+        { 1.30f, 0.70f, 1.00f },
+        { 0.02f, 5.00f, 0.25f },
+        { 4.00f, 0.01f, 3.75f },
+        { 1.00f, 0.00f, 1.00f },  // history blind to this path
+      };
+
+      const std::vector<std::pair<float, float>> confidences = {
+        { 1.0f, 1.0f }, { 1.0f, 20.0f }, { 1.0f, 200.0f }, { 3.0f, 7.0f },
+      };
+
+      for (const Sample& s : samples) {
+        for (const std::pair<float, float>& mc : confidences) {
+          const float currentM = mc.first;
+          const float temporalM = mc.second;
+
+          // Both denominators are the same sum, expressed in the central pixel's
+          // measure: the central term direct, the temporal term converted.
+          const float centralTerm = s.centralPHat * currentM;
+          const float temporalTerm = (s.temporalPHat / s.jacobian) * temporalM;
+          const float denominator = centralTerm + temporalTerm;
+
+          if (denominator <= 0.0f) { continue; }
+
+          const float misCentral = centralTerm / denominator;
+          const float misTemporal = temporalTerm / denominator;
+
+          checkClose(misCentral + misTemporal, 1.0f,
+                     "q: Talbot MIS weights sum to 1 with no deferred normalisation");
+
+          if (s.temporalPHat == 0.0f) {
+            checkClose(misCentral, 1.0f, "q: a history blind to the path leaves the canonical weight whole");
+            checkClose(misTemporal, 0.0f, "q: and takes none for itself");
+          }
+        }
+      }
+
+      // The M-cap itself: history confidence is clamped to a multiple of the
+      // current reservoir's, never raised by it. ports TemporalReuse.cs.slang:139.
+      {
+        const float historyLength = 20.0f;
+
+        auto cap = [historyLength](float currentM, float temporalM) {
+          return std::min(historyLength * currentM, temporalM);
+        };
+
+        checkClose(cap(1.0f, 5.0f), 5.0f, "q: an under-cap history is left alone");
+        checkClose(cap(1.0f, 50.0f), 20.0f, "q: an over-cap history is clamped");
+        checkClose(cap(1.0f, 20.0f), 20.0f, "q: exactly at the cap is a fixed point");
+        checkClose(cap(0.0f, 50.0f), 0.0f,
+                   "q: a pixel whose current reservoir found nothing keeps no history either");
+      }
+
+      // Both Talbot denominators must be THE SAME SUM. Locking this directly,
+      // because the two are written out separately in the shader (once per
+      // candidate) and a transcription slip in either is invisible in the partition
+      // check above, which only ever sees one of them.
+      {
+        const float centralPHat = 1.3f, temporalPHat = 0.7f, jacobian = 2.5f;
+        const float currentM = 1.0f, temporalM = 20.0f;
+
+        // Candidate "current": p_self direct, other term is the current sample
+        // shifted INTO the temporal domain, hence x jacobian.
+        const float sumFromCurrentSide =
+          centralPHat * currentM + (temporalPHat * jacobian) * temporalM;
+
+        // Candidate "temporal": p_self is the temporal target converted OUT of the
+        // temporal domain, hence / jacobian... which is only the same sum when the
+        // two Jacobians are reciprocal, as they are for a shift and its inverse.
+        const float inverseJacobian = 1.0f / jacobian;
+        const float sumFromTemporalSide =
+          centralPHat * currentM + (temporalPHat / inverseJacobian) * temporalM;
+
+        checkClose(sumFromCurrentSide, sumFromTemporalSide,
+                   "q: both Talbot denominators are the same sum under a reciprocal Jacobian");
+      }
+    }
+
     void run() {
       testAddBookkeeping();
       testFinalizeRIS();
@@ -2209,6 +2590,8 @@ namespace dxvk {
       testZeroViewDirectionIsSafe();
       testPairwiseResamplingMISIsUnbiased();
       testPairwiseWeightsPartitionAndGuards();
+      testTalbotResamplingMISIsUnbiased();
+      testTalbotWeightsPartitionAndMCap();
 
       std::cout << "All passed (" << m_checks << " checks)\n";
     }

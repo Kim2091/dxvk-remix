@@ -3932,3 +3932,102 @@ to thousands of percent.
 - **`RtxOptions.md`** - REGEN STILL PENDING, now ~14 `rtx.restirPT.*` rows.
 
 ---
+
+## Workstream - ReSTIR PT phase 4: temporal reuse, Talbot MIS, gradient validation (fork - 2026-07-28)
+
+Phase 4 gives the phase 3 reservoir a memory. A new fork-owned pass runs between the trace pass
+and the spatial rounds and resamples **the previous frame's reservoir at the reprojected pixel**
+through the same reconnection shift phase 3 built, with **Talbot resampling MIS** over the
+two-candidate set {current, temporal}, an M-cap, a `surfaceMapping` remap of the stored
+reconnection vertex, and gradient-based history invalidation. Nothing in `restir_pt_shift.slangh`
+changed to make that happen beyond one refactor - the shift is domain-agnostic, and a previous
+frame is just another domain.
+
+**Phase 4 is the first part of this port that can BOIL.** Phase 3 could not: it had no cross-frame
+feedback, so every frame's reuse was independent. Everything about lag, ghosting, creeping
+brightness and low-frequency luminance pulsing is new surface area here.
+
+**No hybrid shift, no random replay, no retrace passes.** Those are phase 5; the reference's
+`reconnectionDataBuffer` reads at `TemporalReuse.cs.slang:168-172,200-204` are `dummyRcData` under
+the pure reconnection shift and are simply absent here.
+
+Four things in it are worth knowing about even if you never touch ReSTIR PT:
+
+*dxvk-remix keeps no previous-frame MATERIAL, and that forced the one real deviation in the
+phase.* A shift needs the source pixel's full primary surface - position for the geometry
+Jacobian, material plus view direction for `srcPDF1`. The reference has one: it keeps a temporal
+V-buffer and re-runs `loadShadingData` on it (`TemporalReuse.cs.slang:67-78`). Here,
+`RAB_GetGBufferSurface(pixel, true)` (`RtxdiApplicationBridge.slangh:272-284`) returns exactly
+THREE fields out of the `rg32f` `GBufferLast` texture - `hitDistance`, an octahedral shading
+normal and `portalSpace`. No position, no albedo, no roughness, no view direction. A BSDF cannot
+be evaluated on it. What the frame does carry is the previous primary world position and triangle
+normal, plus the previous camera matrices. So the temporal source surface is built by taking the
+CURRENT pixel's surface and replacing its position and view direction with their previous-frame
+values, keeping the material. That is sound because of what the acceptance test asserts: temporal
+reuse runs only where the previous frame's surface at `prevPixel` and this frame's at `pixel` pass
+a depth AND triangle-normal test, which is the statement "these are the same surface point" - and
+under a passing test the two materials are the same material at the same UV, one frame apart. The
+residual is texture-LOD drift from one frame of camera motion, parallax UV drift, and animated
+material parameters: all small, all continuous in camera motion (so none can produce a
+discontinuity), and all partially cancelling, because `srcPDF1` enters the Jacobian as a ratio
+against a `dstPDF1` built from the same material. Position and view direction are NOT
+approximated. The alternatives were rejected deliberately: adding a previous-material G-buffer is
+~5 more render targets to correct a bounded term, and skipping the source-side BSDF entirely
+pins `J = 1`, which is a BIAS rather than an approximation on every specular surface.
+
+*`GBufferLast` is deliberately unused, despite carrying an exact previous shading normal.* It is
+written by the RTXDI and ReSTIR GI **spatial** passes (`rtxdi_spatial_reuse.comp.slang:91,107`,
+`restir_gi_spatial_reuse.comp.slang:54`), neither of which is guaranteed to run in ReSTIR PT mode.
+Reading it would silently mix in a stale frame's normals whenever RTXDI direct is off. The
+previous world position texture is part of the G-buffer ping-pong and has no such coupling. Worth
+remembering for any future pass that wants "last frame's normal" cheaply.
+
+*A stored reconnection vertex MUST be remapped through `surfaceMapping`, and this is a correctness
+gate rather than a nicety.* `RestirPtReservoir::rcVertexHit.surfaceIndex` indexes `surfaces[]`,
+which is rebuilt every frame, so a history reservoir's index names LAST frame's surface list.
+Unremapped, it reconstructs a reconnection vertex on whatever object happens to occupy that slot
+this frame - a silent, arbitrarily wrong contribution with no NaN and no visible tell beyond
+"temporal reuse produces garbage after a cell load". The renderer already owns the remap
+(`surfaceMapping[lastFrameSurfaceID]`, returning `int32_t(-1)` when the surface is gone), it needs
+no new binding because `COMMON_RAYTRACING_BINDINGS` already binds it at slot 5, and
+`visibility.slangh:45-60` uses it in precisely this role. The remap happens once, when the history
+reservoir is loaded, so a reservoir that survives N frames is remapped N times and the stored
+indices are never more than one frame old. Gated on `cb.enablePreviousTLAS`, which is exactly
+"the surface mapping buffer exists and the previous frame was raytraced".
+
+*Temporal history costs a THIRD reservoir page, and the roles rotate rather than copy.* Last
+frame's final reservoirs have to survive untouched until this frame's temporal pass has read them.
+The reference copies (`ReSTIRPTPass.cpp:770-771`); here the page final shading read last frame
+becomes this frame's history page and the other two are the working pair, so the copy disappears.
+Temporal reuse itself runs IN PLACE on the trace pass's page - safe because every lane touches
+only its own index there, which is what the reference does too (`TemporalReuse.cs.slang:91,299`).
+At 1080p render resolution the allocation goes from ~382 MiB to ~573 MiB, and the option's
+description says so, because that is large enough that a user should be told. The designed refund
+is still the Enhanced paper's 96 -> 64 B reservoir compression.
+
+- **`src/dxvk/shaders/rtx/pass/fork_restir_pt/fork_restir_pt_temporal_reuse.comp.slang`** + **`..._temporal_bindings.slangh`** - NEW fork-owned files.
+  *One dispatch. Ports `TemporalReuse.cs.slang:85-143` (setup, reprojection, M-cap), `:146-226` (the Talbot loop, unrolled over the reference's two-candidate loop because with exactly two candidates the inner `j` loop has one term per branch and unrolling makes each MIS denominator readable) and `:298-299` (output guards + store). NOT ported: the Constant / ConstantBiased / ConstantBinary MIS branches, `mergeReservoirNoResampling`, `gNoResamplingForTemporalReuse`, and the NRD block. Reprojection is ported from ReSTIR GI's temporal pass (`restir_gi_temporal_reuse.comp.slang:194-206`) rather than from the reference, because this renderer's VIRTUAL motion vector already accounts for ray portals and PSR and is what every other temporal pass here consumes; GI's reflection reprojection is out of scope (this port has no virtual samples). One deviation from `:126`: the reference adds a raw `[0,1)` sample to the reprojected coordinate, which biases the chosen pixel half a pixel toward +x/+y; centring the jitter makes it a stochastic round instead. A lane that declines to reuse WRITES NOTHING - the opposite of the spatial pass's "every lane writes, always" discipline, and correct for the opposite reason: this pass reads and writes the same page.*
+- **`src/dxvk/shaders/rtx/algorithm/fork_restir_pt/restir_pt_shift.slangh`** - fork-owned refactor, no behaviour change.
+  *`restirPtReconstructRcVertexGeometry` split out of `restirPtReconstructRcVertex` - the same `surfaceInteractionCreate` call without the material interaction, which is the half that does texture reads. Gradient validation needs only where the reconnection vertex IS. The full version now CALLS the split half rather than repeating it, so the two cannot drift on the footprint convention - the one thing here that has already been wrong once.*
+- **`src/dxvk/shaders/rtx/pass/fork_restir_pt/fork_restir_pt_binding_indices.h`** - fork-owned changes.
+  *Band extended to 100-167: the temporal pass's own 13-entry G-buffer clone at 150-162 (names fixed by `RAB_GetGBufferSurface`), previous world position / virtual motion vector / RTXDI gradients at 163-165, and the two reservoir slots at 166-167. Both `#error` guards kept.*
+- **`src/dxvk/rtx_render/rtx_fork_restir_pt_rayquery.{h,cpp}`** - fork-owned changes.
+  *Two-or-three-page allocation driven by `requiredPageCount()`, the `workingPages` / `finalPage` schedule and the `m_historyPage` / `m_historyValid` rotation; `dispatchTemporalReuse`, run from inside `dispatchFinalShading` before the spatial rounds (so phase 4 adds no `rtx_context.cpp` DISPATCH touchpoint either); the new `ManagedShader`; `usesDenoiserGradient()` as the single public predicate the RTXDI gradient enablement reads; and five live options with widgets - `enableTemporalReuse`, `temporalHistoryLength`, `temporalReprojectionJitter`, `validateLightingChange`, `lightingValidationThreshold`. `reservoirPageSlice` no longer takes its argument modulo anything: with the rotation, a silent wrap would alias the history page onto a working one.*
+- **`tests/rtx/unit/test_fork_restir_pt_reservoir.cpp`** - fork-owned changes.
+  *Two new groups. **(p) Talbot resampling MIS is unbiased, and unbiased INDEPENDENTLY OF THE CONFIDENCE WEIGHTS** - the temporal analogue of (h) on the same enumerate-every-draw harness: two candidates over one shared discrete path domain, asserting `E[F_c * W] == sum_j F_c(j)/p_j`, run at M_T in {1, 3, 20, 200}. The M-sweep is the point: `M_T` appears in both Talbot denominators and the result must not move, because a drift there shows in-game as "the image gets brighter as `temporalHistoryLength` is raised", which is otherwise indistinguishable from a tuning preference. **(q)** the partition-of-unity half plus the M-cap arithmetic, including that both denominators are the same sum under a reciprocal Jacobian - locked directly because the two are written out separately in the shader, once per candidate, and a slip in either is invisible to a partition check that only ever sees one of them. Both verified load-bearing by sabotage: `finalizeGRIS` -> `finalizeRIS` fails by exactly `M_C + M_T`, and dropping the history confidence weight from the current-side denominator PASSES at M_T = 1 and fails first at M_T = 3 - which is the demonstration that the sweep, not the single-M case, is what catches that class.*
+- **`src/dxvk/shaders/rtx/pass/raytrace_args.h`** - fork-touchpoint inline tweak.
+  *ONE more complete 4-scalar (16-byte) group - `restirPtTemporalHistoryLength`, `restirPtLightingValidationThreshold`, and two scalars reserved for phase 5's retrace. The two spares are deliberate: reserving them costs nothing now, whereas adding a fifth scalar later would cost a re-audit of the whole struct's alignment. Plus three more bits in the existing `restirPtFlags` word.*
+- **`src/dxvk/rtx_render/rtx_options.h`** - fork-touchpoint inline tweak.
+  *`enablePreviousTLAS()` gains `|| useReSTIRPT()`. ReSTIR PT joins ReSTIR GI here for the same underlying reason - it carries a surface index across the frame boundary and needs the surface mapping buffer. Keyed on the mode rather than on the pass's own option because this header cannot see that option without an include cycle, which is exactly how the existing `useReSTIRGI()` clause is keyed.*
+- **`src/dxvk/rtx_render/rtx_rtxdi_rayquery.cpp`** - fork-touchpoint inline tweak.
+  *`getEnableDenoiserGradient` gains a `!restirPT.usesDenoiserGradient()` clause beside the existing ReSTIR GI one. Without it the gradient passes are skipped in ReSTIR PT mode under DLSS-RR and temporal validation silently never fires. Expressed as one predicate on the pass rather than three public option accessors so the enablement rule lives in one place.*
+- **`src/dxvk/rtx_render/rtx_context.cpp`** - fork-touchpoint inline tweak, one token.
+  *`setRaytraceArgs(constants)` becomes `setRaytraceArgs(*this, constants)`. The pass needs the context because one of its flags - gradient-based validation - is only meaningful when the gradient pass actually ran this frame, mirroring how `enableReSTIRGILightingValidation` is computed at `:1298`.*
+- **`src/dxvk/shaders/rtx/utility/debug_view_indices.h`** + **`src/dxvk/rtx_render/rtx_debug_view.cpp`** - index-only, fork.
+  *888 (temporal reuse output) and 889 (the reprojection acceptance mask) from the fork's 880-900 block. 889 is the view to read FIRST when anything about temporal reuse looks wrong: green accepted, red rejected by the depth/normal/portal test, blue history could not be brought forward (surface gone, or gradient validation), black no reprojection possible. It tells a disocclusion artifact apart from a shift bug in one glance.*
+- **`src/dxvk/rtx_render/rtx_types.h`** + **`src/dxvk/imgui/dxvk_imgui.cpp`** - fork-touchpoint inline tweaks.
+  *One more `RtxFramePassStage`, `ReSTIR_PT_TemporalReuse`, before `ReSTIR_PT_SpatialReuse`, and the matching `aliasingPassComboEntries` row. The table mirrors the enum 1:1 and a missing row silently gaps the aliasing analyzer.*
+- **Not touched:** `meson.build` (shaders auto-discover; no new host files).
+- **`RtxOptions.md`** - REGEN STILL PENDING, now ~19 `rtx.restirPT.*` rows.
+
+---

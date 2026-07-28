@@ -379,6 +379,24 @@
 //        geometry term or the pdf-ratio transcription.
 #define DEBUG_VIEW_RESTIR_PT_SPATIAL_REUSE    886
 #define DEBUG_VIEW_RESTIR_PT_SHIFT_PARITY     887
+// Phase 4 temporal reuse diagnostics, both written by the temporal reuse pass.
+//
+// 888 -- F * weight of the reservoir the temporal pass produced. Same AVERAGE
+//        brightness as 885/886, visibly lower variance once history has built up.
+//        A mean that climbs as rtx.restirPT.temporalHistoryLength is raised is an
+//        energy bug in the M-cap or a Talbot denominator, not a tuning matter.
+// 889 -- the reprojection acceptance mask, and the view to read FIRST when
+//        anything about temporal reuse looks wrong:
+//          GREEN  accepted -- history was resampled here
+//          RED    rejected by the depth / normal / portal test (a disocclusion, or
+//                 a threshold that is too tight if it persists on a static camera)
+//          BLUE   rejected because the history could not be brought forward: the
+//                 reconnection vertex's surface no longer exists, or gradient
+//                 validation found the lighting there has changed
+//          BLACK  no reprojection was possible at all (off screen, behind the
+//                 previous camera, no previous frame, or the pixel does not reuse)
+#define DEBUG_VIEW_RESTIR_PT_TEMPORAL_REUSE         888
+#define DEBUG_VIEW_RESTIR_PT_TEMPORAL_REPROJECTION  889
 
 enum class CompositeDebugView : uint32_t {
   Disabled = 0,

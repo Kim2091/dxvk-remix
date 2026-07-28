@@ -446,6 +446,16 @@ struct RaytraceArgs {
   float restirPtSpatialRadius;               // Neighbour gather radius, in pixels.
   float restirPtJacobianRejectionThreshold;  // Discard a shift when max(J, 1/J) > 1 + this. <= 0 disables (reference default).
 
+  // Fork (2026-07-28): ReSTIR PT phase 4, temporal reuse. ONE MORE COMPLETE
+  // 4-SCALAR (16-byte) GROUP, same constraint again. The two spare scalars are
+  // deliberately left here rather than trimmed: phase 5's retrace passes want
+  // scalars in this block, and reserving them now costs nothing while adding a
+  // fifth scalar later would cost a re-audit of the whole struct's alignment.
+  float restirPtTemporalHistoryLength;       // M-cap: history M is clamped to this x the current reservoir's M.
+  float restirPtLightingValidationThreshold; // RTXDI gradient magnitude above which a temporal sample is discarded as stale.
+  uint restirPtReserved0;                    // Reserved for phase 5 (hybrid shift retrace).
+  uint restirPtReserved1;                    // Reserved for phase 5 (hybrid shift retrace).
+
   // NOTE: Add structs to the top section of RaytraceArgs, not the bottom.
   // NOTE: bool does not work in debug builds, use uint instead.
 };
@@ -488,3 +498,13 @@ struct RaytraceArgs {
 // shift; off reproduces strict reference behaviour outdoors.
 #define RESTIR_PT_FLAG_SPATIAL_REUSE            (1u << 6)
 #define RESTIR_PT_FLAG_SPATIAL_SKY_RECONNECTION (1u << 7)
+
+// Phase 4. Bit 8 gates the temporal reuse pass. Bit 9 jitters the reprojected
+// pixel within its footprint (the reference's sampleNext2D at
+// TemporalReuse.cs.slang:126), which decorrelates a slow camera pan from its own
+// history. Bit 10 gates gradient-based history invalidation; it is set only when
+// the RTXDI gradient pass is actually producing gradients this frame, so the
+// shader never reads a stale or unwritten gradient texture.
+#define RESTIR_PT_FLAG_TEMPORAL_REUSE           (1u << 8)
+#define RESTIR_PT_FLAG_TEMPORAL_JITTER          (1u << 9)
+#define RESTIR_PT_FLAG_LIGHTING_VALIDATION      (1u << 10)

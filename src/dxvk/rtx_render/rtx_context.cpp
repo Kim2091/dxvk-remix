@@ -1439,7 +1439,7 @@ namespace dxvk {
     constants.shadowTerminatorArgs.maxLength = std::max(0.f, RtxOptions::ShadowTerminator::maxLength() * RtxOptions::getMeterToWorldUnitScale());
 
     // Fork: ReSTIR PT (Lin et al. 2022) trace kernel parameters.
-    m_common->metaForkReSTIRPT().setRaytraceArgs(constants);
+    m_common->metaForkReSTIRPT().setRaytraceArgs(*this, constants);
 
     // Upload the constants to the GPU
     {
