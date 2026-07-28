@@ -1038,6 +1038,7 @@ enum class RtxFramePassStage {
   // and must be kept in the same order.
   ReSTIR_PT_Trace,
   ReSTIR_PT_ReplayVerify,
+  ReSTIR_PT_FinalShading,
   Demodulate,
   NRD,
   CompositionAlphaBlend,

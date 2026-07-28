@@ -347,6 +347,23 @@
 // divergence visible; a full-brightness pixel additionally means either a NaN or
 // a path-length/terminal-kind mismatch between the two runs.
 #define DEBUG_VIEW_RESTIR_PT_REPLAY_DELTA 881
+// Phase 2 reservoir diagnostics, all written by the trace pass except 885.
+//
+// 882 -- the resolved RIS contribution weight (1/p_hat * 1/M * w_sum). Should be
+//        smoothly varying; a speckled field of huge values means the RIS
+//        arithmetic or a source pdf is wrong.
+// 883 -- R = reservoir.M (1 where any candidate was streamed in, 0 where the
+//        path found no light at all), G = weight > 0. A large black region on a
+//        lit surface means the builder is rejecting everything.
+// 884 -- the cached integrand F of the selected path.
+// 885 -- the fork final shading pass's own output, F * weight, before it is
+//        added into the primary indirect channels. This is the differential
+//        diagnostic against 880 (raw traced radiance): with a single candidate
+//        the two must agree, and in general they must agree in expectation.
+#define DEBUG_VIEW_RESTIR_PT_RESERVOIR_WEIGHT 882
+#define DEBUG_VIEW_RESTIR_PT_RESERVOIR_VALID  883
+#define DEBUG_VIEW_RESTIR_PT_RESERVOIR_F      884
+#define DEBUG_VIEW_RESTIR_PT_FINAL_SHADING    885
 
 enum class CompositeDebugView : uint32_t {
   Disabled = 0,

@@ -51,14 +51,27 @@
 //      (integrator_indirect.slangh:213) -- but fork-owned, so the live
 //      integrator is untouched.
 //
-// PHASE 1 SCOPE. This is the replay-discipline harness, not the finished
-// integrator. Present: primary-surface scatter from the G-buffer, N-bounce
-// indirect tracing, emissive accumulation with a MIS stub, plain-RIS NEE with a
-// shadow ray, throughput-based Russian roulette, sky/dome/env on miss, and a
-// full replay entry point. Absent (later phases, per the plan): reservoirs and
-// the PathBuilder RIS stream (phase 2), reconnection-vertex bookkeeping and the
-// hybrid shift (phases 3/5), NEE-cache sampling and its MIS pdf (phase 2 open
-// question), NRC/PSR side products (phase 2).
+// PHASE 2 SCOPE. Present: primary-surface scatter from the G-buffer, N-bounce
+// indirect tracing, the PathBuilder streaming-RIS stream feeding one
+// RestirPtReservoir per pixel, emissive accounting with a three-way policy knob
+// (see the EMISSIVE ACCOUNTING POLICY block below), plain-RIS NEE with a shadow
+// ray, throughput-based Russian roulette, sky/dome/env on miss, NEE-cache task
+// feedback, a PSR/secondary continuation entry point, and the phase 1 full
+// replay entry point. Absent (later phases, per the plan): resampling of any
+// kind -- no spatial reuse, no temporal reuse, no shift mapping. A reservoir
+// holds exactly one initially-resampled path and is shaded directly. Also
+// absent: reconnection-vertex selection and the hybrid shift (phases 3/5), and
+// NEE-cache *sampling* inside the kernel (its consumption pattern is unbounded;
+// only MIS evaluation and task feedback land here).
+//
+// RUSSIAN ROULETTE ACCOUNTING. Unlike dxvk-remix's own integrator
+// (integrator_indirect.slangh:900-905), which divides the continuation
+// throughput by the survival probability on the spot, this kernel follows the
+// reference: throughput is left alone and the survival product is accumulated
+// into path.russianRoulettePdf, which the PathBuilder then hands to the
+// reservoir as the RIS *source pdf*. The RIS estimator F * weight therefore
+// carries the RR compensation. path.L, which the reference leaves biased, is
+// compensated here through restirPtAccumulateRadiance -- see that function.
 //
 // REPLAY-SAFETY NOTE on the resolver's out-of-band RNG. resolve.slangh:753
 // declares a *static* `resolveVertexUnorderedRng = createRNGAnywhere(cb.frameIdx, 555)`
@@ -88,7 +101,72 @@ static const float kRestirPtThroughputClampedDivisionMaximum = 65000.0f;
 // (ReSTIRPTPass/PathBuilder.slang addNeeVertex).
 static const uint kRestirPtTerminalNone    = 0u;  // Ended by Russian roulette or the bounce cap.
 static const uint kRestirPtTerminalEscaped = 1u;  // Ended on a miss (sky / env).
-static const uint kRestirPtTerminalNee     = 2u;  // Reserved for phase 2.
+static const uint kRestirPtTerminalNee     = 2u;  // Ended on an NEE connection (phase 5 gating).
+
+// ---------------------------------------------------------------------------
+// THE MIS-WEIGHT-1 ASSUMPTION -- read this before touching NEE or the sky path.
+// ---------------------------------------------------------------------------
+//
+// Both the NEE terminal and the escape (sky/env) terminal hand the PathBuilder a
+// MIS weight of exactly 1. That is not a stub and not a simplification; in this
+// codebase, today, it is exact -- and it is exact for a reason that lives in a
+// DIFFERENT file and could be invalidated there without anything here failing.
+//
+// The argument, by domain disjointness:
+//
+//   - The kernel's NEE pool is sampleLightBasicRIS (lighting.slangh:90-193),
+//     which iterates cb.lightRanges[lightType] over the `lights[]` array for
+//     lightType < lightTypeCount. Those five types are sphere, rect, disk,
+//     cylinder and distant (light_types.h:25-33) -- ANALYTIC lights, with no
+//     scene geometry behind them. A BSDF-sampled scatter ray can never hit one,
+//     so an NEE sample has no competing BSDF technique. Weight 1.
+//     (The reference makes exactly this exemption for its own analytic lights,
+//     PathTracer.slang:1301: `if (kUseMIS && ls.lightType != Analytic)`.)
+//
+//   - Conversely, a BSDF ray that hits an emissive MESH has no competing NEE
+//     technique inside the kernel, because emissive meshes are not in that pool.
+//     Weight 1 -- except against integrate_nee's first-bounce NEE-cache
+//     sampling, which is a real competitor and is handled explicitly by the
+//     EMISSIVE ACCOUNTING POLICY block below.
+//
+//   - The sky is not NEE-sampled by this kernel at all, so the escape terminal
+//     likewise has no competitor.
+//
+// WHAT BREAKS IT: if emissive meshes (or any geometry-backed emitter) ever enter
+// the analytic light pool upstream -- a new entry in light_types.h, a mesh-light
+// converter that ADDS a light without removing the emissive geometry, an RTXDI
+// change that samples triangle lights through cb.lightRanges -- then NEE and
+// BSDF sampling stop being disjoint and these weights become an energy
+// DOUBLE-COUNT. There is no test that would fail; the only tell is PT mode
+// reading brighter than GI mode on mesh-lit surfaces.
+//
+// TRIPWIRE: rtx_fork_restir_pt_rayquery.cpp carries a static_assert on
+// lightTypeCount == 5, which fires at compile time if a sixth light type is
+// added, forcing whoever adds it to read this block. Keep the two in sync.
+static const float kRestirPtNeeMisWeight = 1.0f;
+static const float kRestirPtEnvMisWeight = 1.0f;
+
+// Adds a radiance contribution to the path's running radiance estimate.
+//
+// FORK DEVIATION, deliberate: the division by russianRoulettePdf has no twin in
+// the reference. There, path.L is only consumed by the plain path-tracing mode
+// and is left uncompensated, because the RIS estimator (F * weight, whose source
+// pdf is russianRoulettePdf) carries the compensation instead. This port needs
+// path.L to be an unbiased estimate in its own right, for two consumers:
+//
+//   - PSR / secondary-selected pixels, whose radiance goes out through
+//     IndirectRadianceHitDistance and never touches a reservoir;
+//   - debug view 880 vs debug view 885, which the plan's verification compares
+//     against each other ("with 1 candidate they must agree in expectation").
+//
+// Without it, both would be darkened by exactly the Russian roulette survival
+// product. The reservoir path is unaffected: the PathBuilder still receives the
+// UNDIVIDED contribution together with russianRoulettePdf as its source pdf, so
+// the RIS arithmetic is reference-exact.
+void restirPtAccumulateRadiance(inout RestirPtPathState path, vec3 contribution)
+{
+  path.L += (path.russianRoulettePdf > 0.0f) ? (contribution / path.russianRoulettePdf) : vec3(0.0f);
+}
 
 // Extra-args bundle threaded through the resolve macro to the hit callback.
 // Empty for phase 1 -- everything the callback needs is either in the payload or
@@ -347,7 +425,7 @@ void restirPtEvalMediumChange(
 // ray trace and no resolve.
 void restirPtGeneratePath(
   u16vec2 dstPixel, u16vec2 srcPixel, uint srcFrameIdx,
-  RAB_Surface primarySurface,
+  RAB_Surface primarySurface, bool buildReservoir,
   out RestirPtPathState path)
 {
   // Note: no `path = (RestirPtPathState)0` -- Slang refuses an initializer list
@@ -395,6 +473,33 @@ void restirPtGeneratePath(
   path.randomReplayIsNEE = false;
   path.randomReplayIsEscaped = false;
   path.randomReplayLength = 0;
+
+  // Reservoir construction. ports the pathBuilder.init / pathReservoir.init pair
+  // ReSTIRPTPass/PathTracer.slang:222-224 performs in generatePath.
+  path.buildReservoir = buildReservoir;
+  path.pathBuilder.init(srcPixel, srcFrameIdx);
+  path.pathReservoir.init();
+
+  // NEE-cache cell of the PRIMARY surface. Twin of
+  // integrator_indirect.slangh:1358-1368: one jittered cell lookup per path,
+  // anchored on the primary surface, reused at every emissive hit for both the
+  // MIS weight and the task feedback. The jitter is dimension-addressed like
+  // everything else in this kernel, so it replays exactly; only the low 8 bits
+  // are consumed by the hash (nee_cache.h:757-762), hence the 0-255 scaling.
+  path.neeCacheCellOffset = 0;
+  path.neeCacheCellValid = false;
+
+  if (cb.neeCacheArgs.enable && primarySurface.minimalSurfaceInteraction.isValid)
+  {
+    RNG jitterRandomState = restirPtRngAt(srcPixel, srcFrameIdx, 0u, kRestirPtDimNeeCacheJitter);
+    const uint jitter = uint(saturate(getNextSampleBlueNoise(jitterRandomState)) * 255.0f + 0.5f);
+
+    path.neeCacheCellOffset = NEECache.pointToOffset(
+      primarySurface.minimalSurfaceInteraction.position,
+      primarySurface.minimalSurfaceInteraction.geometryNormal,
+      jitter);
+    path.neeCacheCellValid = true;
+  }
 }
 
 // ports ReSTIRPTPass/PathTracer.slang:233-257 (generateRandomReplayPath). Same
@@ -408,7 +513,10 @@ void restirPtGenerateReplayPath(
   int randomReplayLength, uint terminalKind,
   out RestirPtPathState path)
 {
-  restirPtGeneratePath(dstPixel, srcPixel, srcFrameIdx, primarySurface, path);
+  // buildReservoir = false: phase 2's replay is still only the parity harness,
+  // which compares radiances and never touches a reservoir. Phase 5's replay
+  // (which computes a shifted contribution) will flip this on.
+  restirPtGeneratePath(dstPixel, srcPixel, srcFrameIdx, primarySurface, /*buildReservoir=*/ false, path);
 
   path.enableRandomReplay = true;
   path.randomReplayLength = randomReplayLength;
@@ -479,6 +587,21 @@ bool restirPtScatterAtPrimarySurface(inout RestirPtPathState path, RAB_Surface p
 
   path.setDiffusePrimaryHit(sampledLobe == opaqueLobeTypeDiffuseReflection);
   path.setSpecularPrimaryHit(sampledLobe == opaqueLobeTypeSpecularReflection);
+
+  // Record the primary scatter's class into the builder's "before reconnection
+  // vertex" flag pair. ports :1177-1181, but moved here from the reference's
+  // reconnection-vertex selection site, deliberately:
+  //
+  // there the inserts sit inside `if (!useHybridShift && path.length == 1 || ...)`,
+  // which only runs when the first indirect segment HITS something. A primary
+  // scatter that escapes straight to the sky -- the common outdoor case, and the
+  // one where a mirror-like lobe matters most -- would leave the pair at zero and
+  // the final shading pass would route a specular reflection of the sky into the
+  // DIFFUSE channel, which NRD then smears. Setting them at the scatter itself is
+  // unconditional and describes exactly the same event.
+  path.pathBuilder.pathFlags.insertIsDeltaEvent(path.isDelta(), true);
+  path.pathBuilder.pathFlags.insertIsTransmissionEvent(path.isTransmission(), true);
+  path.pathBuilder.pathFlags.insertIsSpecularBounce(path.isSpecularBounce(), true);
 
   path.normal = primarySurface.opaqueSurfaceMaterialInteraction.shadingNormal;
 
@@ -556,29 +679,65 @@ void restirPtHandleVertex(
   }
   else if (!path.continueResolving)
   {
-    // handleMiss. ports :1493-1528: the escaped-vertex radiance, with the MIS
-    // weight stubbed to 1 (the reference's evalMIS against the env-map pdf at
-    // :1505-1509 needs the stored lightPdf that arrives with reservoirs in
-    // phase 2).
+    // handleMiss. ports :1490-1543: the escaped-vertex radiance. The MIS weight
+    // is 1 -- not a stub any more, but exact: this kernel never NEE-samples the
+    // sky, so the escape terminal has no competing technique. See THE
+    // MIS-WEIGHT-1 ASSUMPTION at the top of this file.
     const vec3 skyRadiance = restirPtEvalMissRadiance(path.direction, path.pixelCoordinate, !path.isSpecularBounce());
-
-    emissiveRadiance += skyRadiance * radianceAttenuation;
+    const vec3 skyLr = path.getCurrentThp() * skyRadiance * radianceAttenuation * kRestirPtEnvMisWeight;
 
     path.sceneLength = kRestirPtInvalidPathLength;
+
+    restirPtAccumulateRadiance(path, skyLr);
 
     // ports :1527 -- direct light reachable only through a delta or
     // transmission chain cannot be sampled by the direct-lighting estimator, so
     // it has to ride along in its own channel.
     if (!path.isLightSamplable() && path.length == uint16_t(1))
     {
-      path.LDeltaDirect += path.getCurrentThp() * skyRadiance * radianceAttenuation;
+      path.LDeltaDirect += skyLr;
+    }
+
+    // ports :1541-1543 -- offer the escaped path as an RIS candidate. The
+    // reference's `path.length` indexing transcribes as-is: for an escape the
+    // stored length is the number of scattering vertices, with no light vertex
+    // to exclude.
+    if (path.buildReservoir)
+    {
+      path.pathBuilder.addEscapeVertex(
+        int(path.length), path.direction, skyLr, skyLr,
+        path.russianRoulettePdf, kRestirPtEnvMisWeight, /*lightPdf=*/ 0.0f,
+        kRestirPtLightTypeEnvMap, path.pathReservoir, path.enableRandomReplay);
     }
   }
 
   // Accumulate resolve-loop products. Emissive takes priority over attenuation
   // so an emissive surface does not attenuate its own emission
   // (integrator_indirect.slangh:413-417).
-  path.L += path.getCurrentThp() * emissiveRadiance;
+  //
+  // This is emission picked up *along* the segment -- alpha-blended and
+  // opacity-transmission-approximated surfaces the resolver walked through, plus
+  // the transparency-layer ring emissive folded in above. The reference has no
+  // analogue (Falcor resolves nothing inside a trace call), but it must be
+  // offered to the builder all the same: in PT mode the reservoir is the ONLY
+  // thing that gets shaded for primary-selected pixels, so any radiance that
+  // reaches path.L without becoming an RIS candidate is silently lost. It is
+  // classified as an emissive-surface terminal because that is what it is.
+  if (any(emissiveRadiance > vec3(0.0f)))
+  {
+    const vec3 resolveLr = path.getCurrentThp() * emissiveRadiance;
+
+    restirPtAccumulateRadiance(path, resolveLr);
+
+    if (path.buildReservoir)
+    {
+      path.pathBuilder.addEscapeVertex(
+        max(0, int(path.length) - 1), path.direction, resolveLr, resolveLr,
+        path.russianRoulettePdf, /*misWeight=*/ 1.0f, /*lightPdf=*/ 0.0f,
+        kRestirPtLightTypeEmissive, path.pathReservoir, path.enableRandomReplay);
+    }
+  }
+
   path.thp *= radianceAttenuation;
 
   // Medium attenuation for the segment just travelled
@@ -611,33 +770,156 @@ void restirPtHandleVertex(
 
   path.setHit(restirPtMakeHit(rayInteraction));
 
+  // --- Reconnection-vertex bookkeeping at the first secondary vertex --------
+  // ports :1174-1176 (the `!useHybridShift && path.length == 1` branch), minus
+  // the three event-bit inserts, which moved to the primary scatter -- see the
+  // note in restirPtScatterAtPrimarySurface for why.
+  //
+  // rcVertexLength itself stays pinned at kRestirPtMaximumPathLength in phase 2
+  // (see restir_pt_path_builder.slangh), so `is_rcVertex` inside the builder is
+  // still never true; recording the hit and the scatter pdf here costs nothing
+  // and is exactly what phase 3's reconnection shift will read.
+  if (path.length == uint16_t(1))
+  {
+    path.pathBuilder.rcVertexHit = path.hit;
+    path.pathBuilder.cachedJacobian.x = path.prevScatterPdf;
+  }
+
   // --- Emitted radiance at the hit -----------------------------------------
-  // ports :1018-1075. The MIS weight against NEE is stubbed to 1 for phase 1;
-  // the reference computes it from the stored emissive-sampler pdf at
-  // :1041-1060, which needs the reservoir's lightPdf field (phase 2).
+  // ports :1018-1090.
   const uint materialType = polymorphicSurfaceMaterialInteractionGetTypeHelper(polymorphicSurfaceMaterialInteraction);
   const vec3 emissiveLight = polymorphicSurfaceMaterialInteractionEvalEmissiveRadiance(polymorphicSurfaceMaterialInteraction);
 
   if (any(emissiveLight > vec3(0.0f)))
   {
-    // ports :1025 -- an emissive surface reached by BSDF sampling straight off
-    // the primary vertex is the primary vertex's *direct* light, which RTXDI
-    // already estimates. Suppress it unless the chain went through a
-    // transmission or delta event, which RTXDI cannot express; in that case the
-    // contribution rides in LDeltaDirect instead (:1074).
-    const bool suppressAsDirect =
-      (path.length == uint16_t(1)) && !path.isTransmission() && !path.isDelta();
+    // ------------------------------------------------------------------------
+    // EMISSIVE ACCOUNTING POLICY -- the one edit in phase 2 that moves energy.
+    // ------------------------------------------------------------------------
+    //
+    // The reference suppresses emissive light seen one scatter off the primary
+    // vertex (`suppressAsDirect`, PathTracer.slang:1025) because there
+    // ScreenSpaceReSTIR DI owns it. In dxvk-remix that premise does not hold:
+    // RTXDI covers the ANALYTIC light pool only (see THE MIS-WEIGHT-1
+    // ASSUMPTION above), so an emissive MESH one bounce out is indirect light --
+    // exactly where GI mode puts it. It does, however, compete with
+    // integrate_nee's first-bounce NEE-cache sampling, which self-weights with
+    // lightPdf / (brdfPdf + lightPdf) (integrate_nee.comp.slang:216-218). The
+    // complementary BSDF-side weight is what the live integrator applies at
+    // every emissive hit (integrator_indirect.slangh:507-511, :537-541), and
+    // that is what mode 2 ports here.
+    //
+    // Three modes, live-switchable, because this is the phase's highest-risk
+    // change and it needs to be bracketed in-game rather than argued about:
+    //
+    //   SUPPRESS  (0) -- reference behaviour verbatim. Length-1 emissive is
+    //                    dropped unless the chain went through a transmission or
+    //                    delta event. Expect PT to read DIMMER than GI on
+    //                    mesh-lit surfaces; this is the "old behaviour" leg.
+    //   NONE      (1) -- accumulate with weight 1 everywhere. Expect PT to read
+    //                    BRIGHTER than GI on mesh-lit surfaces, because
+    //                    integrate_nee is counting the same light. This is the
+    //                    double-count leg.
+    //   NEE_CACHE (2) -- default. BSDF-side MIS against the NEE cache at
+    //                    length 1, weight 1 beyond (no cache NEE runs at kernel
+    //                    vertices, so there is no competitor there).
+    //
+    // Modes 0 and 1 bracket mode 2 from below and above: if mode 2 does not sit
+    // between them in a mesh-lit interior, the searchCandidate pdf is wrong.
+    const uint emissiveMisMode =
+      (cb.restirPtFlags >> RESTIR_PT_EMISSIVE_MIS_MODE_SHIFT) & RESTIR_PT_EMISSIVE_MIS_MODE_MASK;
 
-    const vec3 Lr = path.getCurrentThp() * emissiveLight;
+    const bool isFirstIndirectVertex = (path.length == uint16_t(1));
+
+    float misWeight = 1.0f;
+    bool suppressAsDirect = false;
+
+    if (emissiveMisMode == RESTIR_PT_EMISSIVE_MIS_SUPPRESS)
+    {
+      // ports :1025 verbatim.
+      suppressAsDirect = isFirstIndirectVertex && !path.isTransmission() && !path.isDelta();
+    }
+    else if (emissiveMisMode == RESTIR_PT_EMISSIVE_MIS_NEE_CACHE && isFirstIndirectVertex &&
+             cb.neeCacheArgs.enable && cb.neeCacheArgs.enableOnFirstBounce && path.neeCacheCellValid)
+    {
+      // ports integrator_indirect.slangh:507-511 (selection pdf lookup) and
+      // :537-541 (the MIS weight itself).
+      NEECell cell = NEECache.getCell(path.neeCacheCellOffset);
+
+      if (cell.isValid())
+      {
+        const bool shouldSampleObject = NEECacheUtils.shouldSampleObject(surface);
+        const int primitiveIndex = shouldSampleObject ? 0 : int(rayInteraction.primitiveIndex);
+        const int surfaceIndex = int(rayInteraction.surfaceIndex);
+
+        float lightSelectionPDF = cell.searchCandidate(surfaceIndex, primitiveIndex);
+
+        if (lightSelectionPDF > 0.0f && shouldSampleObject)
+        {
+          lightSelectionPDF /= NEECacheUtils.getSurfacePrimitiveCount(surfaceIndex, PrimitiveIDPrefixSum);
+        }
+
+        if (lightSelectionPDF > 0.0f)
+        {
+          misWeight = NEECacheUtils.calculateBRDFSampleMISWeight(
+            surfaceInteraction, path.direction, path.segmentHitDistance,
+            lightSelectionPDF, path.prevScatterPdf);
+        }
+      }
+    }
+
+    const vec3 Lr = path.getCurrentThp() * emissiveLight * misWeight;
 
     if (!suppressAsDirect)
     {
-      path.L += Lr;
+      restirPtAccumulateRadiance(path, Lr);
+
+      // ports :1077-1090 -- offer the emissive terminal as an RIS candidate.
+      // The `path.length - 1` indexing is the reference's, transcribed as-is:
+      // the emissive hit IS the light vertex, so the stored length counts one
+      // fewer scattering vertex than an escape at the same bounce. Note this is
+      // exactly why kRestirPtBuilderMinPathLength had to drop to 0 -- see the
+      // deviation note in restir_pt_path_builder.slangh.
+      if (path.buildReservoir)
+      {
+        path.pathBuilder.addEscapeVertex(
+          max(0, int(path.length) - 1), path.direction, Lr, Lr,
+          path.russianRoulettePdf, misWeight, /*lightPdf=*/ 0.0f,
+          kRestirPtLightTypeEmissive, path.pathReservoir, path.enableRandomReplay);
+      }
     }
 
-    if (!path.isLightSamplable() && path.length == uint16_t(1))
+    // ports :1074 -- light reachable only through a delta or transmission chain
+    // cannot be sampled by the direct-lighting estimator, so it rides in its own
+    // channel. LDeltaDirect is retired as a separate *output* in phase 2 (RTXDI
+    // covers analytic lights only, so this light belongs in the indirect signal
+    // and is already there); the field is kept, and kept correct, because phase
+    // 5's shift bookkeeping reads it.
+    if (!path.isLightSamplable() && isFirstIndirectVertex)
     {
       path.LDeltaDirect += Lr;
+    }
+
+    // --- NEE-cache task feedback -------------------------------------------
+    // ports integrator_indirect.slangh:496-505. Without this the cache stops
+    // DISCOVERING emissive triangles the moment integrate_indirect stops
+    // running: integrate_nee's own feedback only reinforces triangles that are
+    // already candidates (integrate_nee.comp.slang:241-254), so first-bounce
+    // emissive-mesh light would decay over minutes of play. That decay is the
+    // tell if this block is ever disabled.
+    //
+    // Trace dispatch only -- a replay-verify dispatch re-walking the same path
+    // must not insert the task twice.
+    if ((cb.restirPtFlags & RESTIR_PT_FLAG_NEE_CACHE_TASK_FEEDBACK) != 0u &&
+        cb.neeCacheArgs.enable && !path.enableRandomReplay && path.neeCacheCellValid)
+    {
+      NEECell taskCell = NEECache.getCell(path.neeCacheCellOffset);
+
+      const bool shouldSampleObject = NEECacheUtils.shouldSampleObject(surface);
+      const int primitiveIndex = shouldSampleObject ? 0 : int(rayInteraction.primitiveIndex);
+      const int prefixTask = NEECacheUtils.convertIDToPrefixSumID(
+        int(rayInteraction.surfaceIndex), primitiveIndex, PrimitiveIDPrefixSum);
+
+      taskCell.insertSlotTask(prefixTask, emissiveLight * path.getCurrentThp(), false);
     }
   }
 
@@ -713,7 +995,28 @@ void restirPtHandleVertex(
 
         if (isValidValue(neeLight))
         {
-          path.L += path.getCurrentThp() * neeLight;
+          // ports :1310-1348. kRestirPtNeeMisWeight is exactly 1 by domain
+          // disjointness, NOT as a placeholder -- see THE MIS-WEIGHT-1
+          // ASSUMPTION at the top of this file before changing it.
+          const vec3 Lr = path.getCurrentThp() * neeLight * kRestirPtNeeMisWeight;
+
+          restirPtAccumulateRadiance(path, Lr);
+
+          if (path.buildReservoir)
+          {
+            // pathWeight and postfixWeight coincide in phase 2: the reference
+            // splits them so the prefix throughput up to the reconnection vertex
+            // can be factored out (:1348), and this port's prefix is identically
+            // 1 (RestirPtPathState::getCurrentThp).
+            //
+            // lightPdf is the EFFECTIVE pdf -- solidAnglePdf already divided by
+            // the RIS inverse selection pdf above -- which is what phase 3's
+            // NEE-final shift case needs.
+            path.pathBuilder.addNeeVertex(
+              int(path.length), inputDirection, Lr, Lr,
+              path.russianRoulettePdf, kRestirPtNeeMisWeight, lightSample.solidAnglePdf,
+              kRestirPtLightTypeAnalytic, path.pathReservoir, path.enableRandomReplay);
+          }
         }
       }
 
@@ -882,24 +1185,146 @@ vec3 restirPtTracePathInternal(
 }
 
 // Trace entry point. Traces one indirect path from the primary G-buffer surface
-// at `pixel` in frame `frameIdx`, and reports the terminal descriptor a replay
-// needs to match it.
+// at `pixel` in frame `frameIdx`, resolves the streaming-RIS reservoir it built,
+// and reports the terminal descriptor a replay needs to match it.
+//
+// The returned radiance is the plain 1-spp path-traced estimate (debug view 880
+// and the parity harness); the reservoir is what actually gets shaded in PT mode.
 vec3 restirPtTracePath(
   u16vec2 pixel, uint frameIdx, RAB_Surface primarySurface, uint maxBounces,
+  out RestirPtReservoir outReservoir, out float outFirstSegmentLength,
   out uint outPathLength, out uint outTerminalKind)
 {
   RestirPtPathState path;
-  restirPtGeneratePath(pixel, pixel, frameIdx, primarySurface, path);
+  restirPtGeneratePath(pixel, pixel, frameIdx, primarySurface, /*buildReservoir=*/ true, path);
 
   outPathLength = 0u;
   outTerminalKind = kRestirPtTerminalNone;
+  outFirstSegmentLength = 0.0f;
+  outReservoir = path.pathReservoir;
 
   if (!restirPtScatterAtPrimarySurface(path, primarySurface))
   {
+    // An empty reservoir: M = 0 and F = 0, so finalizeRIS leaves weight at 0 and
+    // final shading contributes nothing for this pixel.
     return vec3(0.0f);
   }
 
-  return restirPtTracePathInternal(path, maxBounces, outPathLength, outTerminalKind);
+  const vec3 L = restirPtTracePathInternal(path, maxBounces, outPathLength, outTerminalKind);
+
+  // ports ReSTIRPTPass/PathTracer.slang:1845-1848 (finalize) and :1878-1891
+  // (the candidates == 1 branch of writeOutput). finalize pins M to 1 -- the
+  // reservoir is a SINGLE-sample estimator of the sum over all the terminals the
+  // builder streamed in, not an average over them -- and finalizeRIS turns the
+  // accumulated w_sum into the unbiased contribution weight, so that
+  // E[F * weight] == sum over terminals of (contribution / source pdf).
+  path.pathBuilder.finalize(path.pathReservoir);
+  path.pathReservoir.finalizeRIS();
+
+  outReservoir = path.pathReservoir;
+  outFirstSegmentLength = path.firstSegmentLength;
+
+  return L;
+}
+
+// Continuation entry point for pixels whose SELECTED integration surface is the
+// secondary one (PSR: mirrors, water, glass).
+//
+// These pixels never reach a reservoir. In GI mode ReSTIR GI contributes nothing
+// to them either (integrator_indirect.slangh:1111, :1289 gate candidate
+// generation on primarySelectedIntegrationSurface); their indirect light instead
+// travels as raw radiance through IndirectRadianceHitDistance and is folded into
+// SecondaryCombined* by the demodulate pass (demodulate.comp.slang:776-798). So
+// all PT mode owes them is that raw radiance -- which is what this produces.
+//
+// Crucially the surface interaction never has to be reconstructed: integrate_direct
+// already sampled the first indirect scatter at the selected surface and stashed
+// the resulting ray (integrator_direct.slangh:207-213), which integrate_indirect
+// merely continues (integrator_indirect.slangh:1316-1354). This does the same.
+vec3 restirPtTraceContinuationPath(
+  u16vec2 pixel, uint frameIdx,
+  vec3 rayOrigin, vec3 rayDirection, vec3 throughput, float rayConeRadius,
+  float firstSampledSolidAnglePdf, uint mediumMaterialIndex, bool insideMedium,
+  PortalSpace2BitsType portalSpace, uint objectMask, bool firstSampledLobeIsSpecular,
+  uint maxBounces, out float outFirstSegmentLength)
+{
+  RestirPtPathState path;
+
+  // Exhaustive init, for the same reason restirPtGeneratePath is exhaustive:
+  // Slang refuses an initializer list on a struct carrying property accessors,
+  // so an unwritten field is undefined register state.
+  path.flags = uint16_t(0);
+  path._stateFlags = uint8_t(0);
+  path._segmentHitDistance = 0.0f;
+  path.decalEncountered = false;
+
+  path.setActive();
+  path.continuePath = true;
+  path.continueResolving = true;
+
+  path.thp = throughput;
+  path.L = vec3(0.0f);
+  path.LDeltaDirect = vec3(0.0f);
+  path.russianRoulettePdf = 1.0f;
+  path.prevScatterPdf = firstSampledSolidAnglePdf;
+  path.pdf = firstSampledSolidAnglePdf;
+  path.length = uint16_t(0);
+  path.bounceCounters = 0u;
+  path.sceneLength = 0.0f;
+  path.firstSegmentLength = 0.0f;
+  path.hit = RestirPtHit::createInvalid();
+
+  path.pixelCoordinate = pixel;
+  path.srcPixel = pixel;
+  path.srcFrameIdx = frameIdx;
+
+  path.origin = rayOrigin;
+  path.direction = rayDirection;
+  path.normal = rayDirection;
+  path.coneRadius = rayConeRadius;
+  path.coneSpreadAngle = calculateSpreadAngleFromSolidAnglePdfLocal(
+    cb.screenSpacePixelSpreadHalfAngle, firstSampledSolidAnglePdf);
+  path.accumulatedHitDistance = 0.0f;
+  path.mediumMaterialIndex = mediumMaterialIndex;
+  path.insideMedium = insideMedium;
+
+  path.portalSpace = portalSpace;
+  path.rayMask = uint8_t(OBJECT_MASK_ALL | (objectMask & OBJECT_MASK_ALL_DYNAMIC));
+
+  // The sky-gather eligibility of the first continuation segment is inherited
+  // from the selected surface's first sampled lobe, exactly as
+  // integrator_indirect.slangh:1338-1341 does it -- restirPtEvalMissRadiance
+  // reads it back through path.isSpecularBounce().
+  path.setSpecularBounce(firstSampledLobeIsSpecular);
+
+  path.enableRandomReplay = false;
+  path.randomReplayIsNEE = false;
+  path.randomReplayIsEscaped = false;
+  path.randomReplayLength = 0;
+
+  // No reservoir on this route (see the header comment), but the members still
+  // have to be defined -- they ride along in the resolve-loop payload.
+  path.buildReservoir = false;
+  path.pathBuilder.init(pixel, frameIdx);
+  path.pathReservoir.init();
+
+  // No NEE-cache MIS or task feedback either: the cell is anchored on the
+  // primary surface, which is not where this path starts.
+  path.neeCacheCellOffset = 0;
+  path.neeCacheCellValid = false;
+
+  uint pathLength = 0u;
+  uint terminalKind = kRestirPtTerminalNone;
+
+  // Note: the primary scatter already happened in integrate_direct, so unlike
+  // restirPtTracePath this entry point goes straight into the loop. Dimension
+  // addressing still applies to every site inside it -- these pixels are never
+  // replayed, but keeping one discipline costs nothing.
+  const vec3 L = restirPtTracePathInternal(path, maxBounces, pathLength, terminalKind);
+
+  outFirstSegmentLength = path.firstSegmentLength;
+
+  return L;
 }
 
 // Replay entry point. ports ReSTIRPTPass/PathTracer.slang:1578-1619

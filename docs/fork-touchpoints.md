@@ -3698,3 +3698,81 @@ own buffer plus the debug-view texture - the rendered image is untouched either 
 - **`RtxOptions.md`** - REGEN PENDING (`rtx.restirPT.enableDebugTrace`, `replayParityTest`, `maxBounces`, `enableRussianRoulette`, `specularRoughnessThreshold`, `deltaRoughnessThreshold`).
 
 ---
+
+## Workstream - ReSTIR PT phase 2: reservoirs, initial RIS, final shading, mode integration (fork - 2026-07-28)
+
+Phase 2 turns the phase 1 kernel into a real indirect illumination mode. `IntegrateIndirectMode`
+gains a fourth value, **`ReSTIRPT`**; in that mode `integrate_indirect` early-outs and the fork
+trace kernel runs in its dispatch slot, producing one *initially resampled* path per pixel in a
+`RestirPtReservoir`. A new fork final shading pass then adds `F * weight` into
+`m_primaryIndirect{Diffuse,Specular}Radiance` at the exact point in the frame ReSTIR GI's final
+shading occupies, so demodulate / NRD / DLSS-RR / composite see a shape they already handle and
+RTXDI direct lighting composes unchanged.
+
+**No resampling.** A reservoir holds exactly one path and is shaded directly - no spatial reuse,
+no temporal reuse, no shift mapping. Those are phases 3-5. Phase 2 exists to prove the reservoir
+plumbing and the energy accounting before any of that is built on top.
+
+Three things in it are worth knowing about even if you never touch ReSTIR PT:
+
+*Step 0 came first, and had to.* `RESTIR_PT_DIMS_PER_BOUNCE` widened 16 -> 32 with a re-laid site
+table (RR moved *ahead* of the NEE window; NEE given all 26 remaining dims), which invalidates
+every phase 1 replay identity. That is precisely why it preceded the first reservoir: from this
+commit the dimension layout is **frozen reservoir ABI**, because a stored reservoir's identity
+`(srcPixel, srcFrameIdx)` only means anything relative to it. There is no version tag and no
+failing test for a later re-layout - only a wrong image.
+
+*The MIS-weight-1 assumption is now written down where it lives.* The kernel's NEE and escape
+terminals use a MIS weight of exactly 1, which is *exact* rather than a simplification: the NEE
+pool (`sampleLightBasicRIS`) draws only from the analytic light array, which has no geometry a
+BSDF ray can hit. That argument lives in another file and could be invalidated there silently, so
+`restir_pt_trace_core.slangh` carries the full statement of it and `rtx_fork_restir_pt_rayquery.cpp`
+carries a `static_assert(lightTypeCount == 5)` tripwire.
+
+*The one edit that moves energy is bracketed by a live A/B.* Removing the reference's
+`suppressAsDirect` is correct here (RTXDI covers analytic lights only, so emissive-mesh light one
+bounce out is indirect light) but it is the phase's highest-risk change. `rtx.restirPT.emissiveMisMode`
+is a genuine three-way switch - Suppress reproduces the reference exactly, None is the naive
+double-count, NEE Cache is the default - so the correct answer can be bracketed in-game rather
+than argued about.
+
+- **`src/dxvk/shaders/rtx/algorithm/fork_restir_pt/restir_pt_reservoir.slangh`** - NEW fork-owned file.
+  *`RestirPtHit` (moved here from the path state, so the reservoir does not depend on it), `RestirPtPathFlags` bit-for-bit from `ReSTIRPTPass/PathReservoir.slang:21-140`, and the `RestirPtReservoir` struct plus its whole method family - `init`, `toScalar`, `computeWeight`, `add`, `merge`, `mergeWithResamplingMIS`, `mergeInSamplePixel`, `prepareMerging`, `finalizeRIS`, `finalizeGRIS`. The merge family is unused until phase 3 but ported now and locked by a unit test. 96 B per element, not the reference's 88: a Vulkan structured buffer aligns every vec3 to 16 B, so the layout is written with an explicit scalar after every vec3 and the size is shared with the host as `RESTIR_PT_RESERVOIR_SIZE_BYTES`.*
+- **`src/dxvk/shaders/rtx/algorithm/fork_restir_pt/restir_pt_path_builder.slangh`** - NEW fork-owned file.
+  *`RestirPtPathBuilder`, a port of `ReSTIRPTPass/PathBuilder.slang:24-198` (non-BPR branches only). Streams each path terminal - NEE connection, sky escape, emissive hit - into the reservoir as an RIS candidate. One deliberate deviation, documented at length in the file: the reference's `pathLength >= 1` guard drops to 0, because the reference can afford to discard "direct" length-0 candidates (ScreenSpaceReSTIR owns them) and this fork cannot (RTXDI covers analytic lights only).*
+- **`src/dxvk/shaders/rtx/pass/fork_restir_pt/fork_restir_pt_final_shading.comp.slang`** + **`..._final_shading_bindings.slangh`** - NEW fork-owned files.
+  *Ports `ReSTIRPTPass/SpatialReuse.cs.slang:534-618` minus reuse and minus Falcor demodulation. Deliberately tiny: shading a phase-2 reservoir is `F * weight` routed by one stored flag bit, because the primary vertex's BSDF is already folded into F by the trace kernel - so unlike ReSTIR GI final shading there is no G-buffer set to bind. Adds IN PLACE so integrate_nee's first-bounce NEE-cache light and its hit-T survive.*
+- **`tests/rtx/unit/test_fork_restir_pt_reservoir.cpp`** - NEW fork-owned file.
+  *CPU mirror of the reservoir arithmetic with a keep-in-sync pin. Locks `add` bookkeeping and acceptance, both `finalizeRIS` guards, NaN rejection, exhaustive `pathFlags` round-trips, and - the important one - enumerates every selection outcome of a multi-candidate streaming build to check `E[F * weight] == sum_i F_i / p_i`. That identity is why the final shading pass may write `F * weight` and nothing else.*
+- **`src/dxvk/shaders/rtx/algorithm/fork_restir_pt/restir_pt_rng.slangh`** - fork-owned rewrite of the site table.
+  *Stride 16 -> 32; lobe 0-3 (with dim 3 a deliberate cushion for SSS/RTXCR overdraw), RR 4, NEE-cache jitter 5, NEE 6-31. Carries the headroom audit for `sampleLightBasicRIS` and the FROZEN RESERVOIR ABI notice.*
+- **`src/dxvk/shaders/rtx/algorithm/fork_restir_pt/restir_pt_path_state.slangh`** - fork-owned addition.
+  *Gains the builder and reservoir members (as the reference's `PathState` does), a `buildReservoir` flag for the PSR continuation route, and the primary surface's NEE-cache cell. `RestirPtHit` moved out to the reservoir header.*
+- **`src/dxvk/shaders/rtx/algorithm/fork_restir_pt/restir_pt_trace_core.slangh`** - fork-owned changes.
+  *The three add-sites (NEE / escape / emissive), the emissive accounting policy replacing `suppressAsDirect`, NEE-cache task feedback, `finalize` + `finalizeRIS`, and `restirPtTraceContinuationPath` for PSR pixels. Also `restirPtAccumulateRadiance`, which divides `path.L` by the Russian roulette survival product - the reference leaves `path.L` biased because only its RIS estimator is consumed, but this port feeds `path.L` straight out for PSR pixels.*
+- **`src/dxvk/shaders/rtx/pass/fork_restir_pt/fork_restir_pt_trace.comp.slang`** + **`..._binding_indices.h`** + **`..._bindings.slangh`** - fork-owned changes.
+  *Real-mode body alongside the debug harness; band extended to 100-134 (NEE cache 115-119, integrate_direct handoff 121-125, outputs 126-127, final shading 130-134), both `#error` guards kept. `RESOLVER_USE_VOLUMETRIC_ATTENUATION 1` is now defined, closing phase 1's deviation D7.*
+- **`src/dxvk/rtx_render/rtx_fork_restir_pt_rayquery.{h,cpp}`** - fork-owned changes.
+  *`dispatch` split into `dispatchTrace` + `dispatchFinalShading`; reservoir buffer lifecycle; an `onFrameBegin` override, because `RtxPass` only reallocates across an activation transition and this pass changes which buffer it needs while staying active; the `emissiveMisMode` / `neeCacheTaskFeedback` options and their live widgets; and the `lightTypeCount` tripwire.*
+- **`src/dxvk/rtx_render/rtx_options.h`** - fork-touchpoint inline tweak.
+  *`IntegrateIndirectMode::ReSTIRPT = 3` and a `useReSTIRPT()` twin of `useReSTIRGI()`.*
+- **`src/dxvk/imgui/dxvk_imgui.cpp`** - fork-touchpoint inline tweak.
+  *The mode combo entry and one more `aliasingPassComboEntries` row (`ReSTIR_PT_FinalShading`) - the table mirrors `RtxFramePassStage` 1:1 and a missing row silently gaps the aliasing analyzer.*
+- **`src/dxvk/rtx_render/rtx_types.h`** - fork-touchpoint inline tweak.
+  *One more `RtxFramePassStage`, `ReSTIR_PT_FinalShading`. Note this shifts the numeric value of every later stage, which only matters to a saved `rtx.aliasing.beginPass`/`endPass` (debug-only).*
+- **`src/dxvk/rtx_render/rtx_pathtracer_integrate_indirect.cpp`** - fork-touchpoint inline tweak.
+  *A log case for the new mode, and an early-out in `dispatch()` placed after the mode log and before any binding, so no aliased-resource access is recorded for a pass that never runs.*
+- **`src/dxvk/rtx_render/rtx_context.cpp`** - fork-touchpoint inline tweak.
+  *`dispatchTrace` moved to BEFORE `dispatchNEE` (integrate_nee consumes the `IndirectRadianceHitDistance` texel the kernel writes), and `dispatchFinalShading` added beside ReSTIR GI's dispatch.*
+- **`src/dxvk/rtx_render/rtx_demodulate.cpp`** - fork-touchpoint inline tweak.
+  *`isPrimaryIndirectRadianceResourceRead` gains `|| RtxOptions::useReSTIRPT()` - the same alias-ownership statement ReSTIR GI makes, for the same reason.*
+- **`src/dxvk/shaders/rtx/pass/raytrace_args.h`** - fork-touchpoint inline tweak.
+  *Bits only, NO new scalars - `RESTIR_PT_FLAG_MODE_ACTIVE`, `RESTIR_PT_FLAG_NEE_CACHE_TASK_FEEDBACK`, and a 2-bit `RESTIR_PT_EMISSIVE_MIS_MODE` field, all in the existing `restirPtFlags` word. The 4-scalar group is untouched.*
+- **`src/dxvk/shaders/rtx/utility/debug_view_indices.h`** + **`src/dxvk/rtx_render/rtx_debug_view.cpp`** - index-only, fork.
+  *882-885 from the fork's 880-900 block: reservoir weight, reservoir valid, reservoir integrand, final shading output.*
+- **`tests/rtx/unit/meson.build`** - index-only, fork.
+  *Registers `test_fork_restir_pt_reservoir`.*
+- **`RtxOptions.md`** - REGEN PENDING (phase 1's six `rtx.restirPT.*` rows plus `emissiveMisMode` and `neeCacheTaskFeedback`, and the new `IntegrateIndirectMode` value in the `rtx.integrateIndirectMode` description).
+
+---
+

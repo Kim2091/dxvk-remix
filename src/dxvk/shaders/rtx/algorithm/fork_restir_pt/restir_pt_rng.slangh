@@ -66,38 +66,88 @@
 // R2 shifts into the same blue-noise texel), which costs sampling quality but
 // never determinism. The light-sampling site is the one most likely to exceed
 // its window (the RIS loop scales with cb.risTotalSampleCount); it is given the
-// largest reservation for that reason, and the spare dimensions 13-15 exist so
-// the layout can grow without renumbering.
+// largest reservation for that reason, and it is placed LAST in the window so an
+// overrun spills into the next bounce's scatter site rather than into a
+// same-bounce neighbour.
 //
 // Resampling decisions in the (later-phase) reuse passes deliberately do NOT use
 // this stream -- they use the murmur3-backed RAB_RandomSamplerState
 // (RtxdiApplicationBridge.slangh:345-366), because the codebase itself warns at
 // :344 that table-based blue noise lacks the entropy resampling needs. Those
 // draws never need replaying.
+//
+//   *** FROZEN RESERVOIR ABI -- read before touching the layout below. ***
+//
+// From phase 2 on (the commit that introduced RestirPtReservoir) this dimension
+// layout is part of the reservoir's on-disk/in-buffer contract, not a private
+// implementation detail. A stored reservoir's replay identity is exactly
+// (srcPixel, srcFrameIdx); the *meaning* of that identity is "the path you get
+// by re-running every site at its addressed offset". Change RESTIR_PT_DIMS_PER_BOUNCE
+// or any kRestirPtDim* constant and every reservoir already in flight silently
+// decodes to a different path -- there is no version tag and no failing test,
+// only a wrong image (and, once temporal reuse lands in phase 4, wrong images
+// that persist across frames).
+//
+// So: the widening from 16 to 32 dims happened deliberately BEFORE the first
+// reservoir was ever written. Any future re-layout has to happen the same way --
+// as its own change, with the parity view (881) re-confirmed black across the
+// maxBounces sweep before anything downstream is judged. Prefer claiming the
+// spare dimensions inside the existing window.
 
 // Stride between consecutive bounces' dimension windows. Mirrors the existing
-// integrator's kApproxRNGSamplesPerBounce (path_state.slangh:39) so the two
-// disciplines are visually comparable, but unlike that constant this one is
-// exact rather than approximate: sites are independently addressed, so the
-// stride only has to be large enough to keep sites uncorrelated.
-#define RESTIR_PT_DIMS_PER_BOUNCE 16
+// integrator's kApproxRNGSamplesPerBounce (path_state.slangh:39) in spirit, but
+// unlike that constant this one is exact rather than approximate: sites are
+// independently addressed, so the stride only has to be large enough to keep
+// sites uncorrelated.
+//
+// Widened 16 -> 32 in phase 2. Phase 1 shipped a 6-dim NEE window at offset 4
+// that the RIS light loop could overrun straight into the Russian roulette site
+// at 12 (recorded in the phase 1 report); this layout moves RR *ahead* of the
+// NEE window and gives NEE all 26 remaining dims, so that specific collision is
+// structurally impossible.
+#define RESTIR_PT_DIMS_PER_BOUNCE 32
 
-// Lobe selection for the scatter event (1 dim consumed by the material's lobe
-// probability draw). Ports the sampleBSDF lobe draw of
+// Lobe selection for the scatter event. Ports the sampleBSDF lobe draw of
 // ReSTIRPTPass/PathTracer.slang:298-429.
+//
+// Budget: 3 dims (0 = lobe probability, 1-2 = the lobe's 2D direction sample),
+// plus dim 3 as a deliberate cushion. The cushion exists because the SSS/RTXCR
+// material paths draw extra samples from the same generator inside
+// polymorphicSurfaceMaterialInteractionCalcSample (rtxcr_material.slangh:148,162,329,436),
+// and that overdraw must not reach kRestirPtDimRR.
 static const uint kRestirPtDimLobe = 0u;
 // Direction sample for the scatter event (2 dims: the 2D uv of the lobe sample).
+// Consumed by the same RNG instance created at kRestirPtDimLobe; named for
+// documentation.
 static const uint kRestirPtDimDirection = 1u;
-// Next-event estimation. Reserves dims 4-9 (6 dims) for light selection + area
-// sampling. Ports the shape of generateLightSample,
-// ReSTIRPTPass/PathTracer.slang:752-794.
-static const uint kRestirPtDimNee = 4u;
 // Russian roulette continuation draw (1 dim). Ports
 // ReSTIRPTPass/PathTracer.slang:919-932, called at :1378-1388.
-static const uint kRestirPtDimRR = 12u;
-// Dimensions 13-15 are reserved spare. Claim them in later phases rather than
-// widening RESTIR_PT_DIMS_PER_BOUNCE, which would invalidate every reservoir
-// identity already in flight.
+// Moved AHEAD of the NEE window in phase 2 so a light-loop overrun can never
+// touch it again.
+static const uint kRestirPtDimRR = 4u;
+// Cell-offset jitter for the NEE-cache emissive-hit MIS weight and its task
+// feedback (1 dim). Twin of the integrator's own jitter draw,
+// integrator_indirect.slangh:1362-1366.
+static const uint kRestirPtDimNeeCacheJitter = 5u;
+// Next-event estimation. Reserves dims 6-31 (26 dims) for light selection + area
+// sampling. Ports the shape of generateLightSample,
+// ReSTIRPTPass/PathTracer.slang:752-794.
+//
+// HEADROOM AUDIT (sampleLightBasicRIS, lighting.slangh:109-174):
+//   worst case draws = SUM over non-empty light types of (1 start + risSampleCount)
+//                      + 2 area-sampling draws
+//                    = cb.risTotalSampleCount + A + 2,  A = active light types <= 5
+//                      (light_types.h:33 -- sphere/rect/disk/cylinder/distant).
+// The 26-dim window therefore covers risTotalSampleCount <= 19 with all five
+// ranges populated. The default rtx.risLightSampleCount is 7 (rtx_options.h:908)
+// and the per-type min-1 rounding in rtx_light_manager.cpp:797-826 lands the
+// realistic draw count around 9-16 -- comfortably inside.
+//
+// If it does overrun, the spill lands in the NEXT bounce's scatter site (upward,
+// away from RR and the jitter) and still cannot break determinism: every site
+// re-bases at a fixed offset regardless of how many samples its predecessor
+// consumed.
+static const uint kRestirPtDimNee = 6u;
 
 // Constructs the RNG for one addressed site of one bounce of the path identified
 // by (srcPixel, srcFrame). This is the only sanctioned way for the ReSTIR PT

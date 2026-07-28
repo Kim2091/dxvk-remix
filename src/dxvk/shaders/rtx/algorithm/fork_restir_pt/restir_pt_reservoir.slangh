@@ -1,0 +1,484 @@
+/*
+* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+/*
+* Portions of this file are a port of the ReSTIR PT reference implementation:
+*   Copyright (c) 2022, Daqi Lin.  All rights reserved.
+*   ReSTIR_PT/Source/RenderPasses/ReSTIRPTPass/PathReservoir.slang
+* Licensed under BSD-3-Clause (see ThirdPartyLicenses.txt, "ReSTIR PT" entry).
+*/
+#pragma once
+
+// RAB_RandomSamplerState / RAB_GetNextRandom. The murmur3 stream, deliberately
+// NOT the blue-noise stream: RIS acceptance decisions never need replaying and
+// the codebase itself warns that table-based blue noise lacks the entropy
+// resampling needs (RtxdiApplicationBridge.slangh:344). See the contract comment
+// in restir_pt_rng.slangh.
+#include "rtx/algorithm/rtxdi/rtxdi.slangh"
+#include "rtx/pass/fork_restir_pt/fork_restir_pt_binding_indices.h"
+
+// ReSTIR PT (fork) -- the path reservoir and its RIS arithmetic.
+//
+// ports ReSTIRPTPass/PathReservoir.slang:21-140 (ReSTIRPathFlags) and :224-451
+// (PathReservoir), with the BPR (bidirectional path reuse) branches dropped --
+// the reference compiles them behind `#if BPR` and the fork does not build that
+// configuration (see the plan's Out of scope).
+//
+// Two substitutions from the reference, both forced by the fork's RNG design:
+//
+//   - `rcRandomSeed` / `initRandomSeed` (the captured serial-LCG seeds the
+//     reference replays from, :229 and :233) are replaced by the replay identity
+//     pair `srcPixel` / `srcFrameIdx`. Same 8-byte footprint, same role: they are
+//     the *entire* description of "which random path is this". See
+//     restir_pt_rng.slangh for why dimension addressing makes that sufficient.
+//
+//   - `TriMeshHitInfo` becomes `RestirPtHit` (restir_pt_path_state.slangh), the
+//     surface/primitive/barycentric triple dxvk-remix rebuilds interactions from.
+//     Identical 16-byte shape.
+//
+// PHASE 2 SCOPE. A reservoir holds exactly one initially-resampled path and is
+// shaded directly; nothing merges yet. The merge family below is ported now
+// anyway (and locked by tests/rtx/unit/test_fork_restir_pt_reservoir.cpp) so the
+// arithmetic is transcribed while the reference is in front of us rather than
+// months later in the middle of phase 3.
+
+// Maximum path length representable in the 4-bit pathFlags field.
+// ports ReSTIRPTPass/StaticParams.slang kMaximumPathLength.
+static const int kRestirPtMaximumPathLength = 15;
+
+// Identity of a committed hit, sufficient to rebuild the surface interaction
+// with no ray trace in a later phase (the NEE cache does exactly this from the
+// same triple -- nee_cache_light.slangh:101-148). Stands in for the reference's
+// Falcor HitInfo / TriMeshHitInfo (ReSTIRPTPass/PathReservoir.slang:177-215),
+// with the identical 16-byte shape.
+//
+// Note: this type lives here rather than in restir_pt_path_state.slangh (where
+// phase 1 put it) purely for include ordering -- the reservoir must not depend
+// on the path state, because the path state carries a reservoir.
+struct RestirPtHit
+{
+  uint surfaceIndex;
+  uint primitiveIndex;
+  vec2 barycentrics;
+
+  static RestirPtHit createInvalid()
+  {
+    RestirPtHit hit;
+    hit.surfaceIndex = SURFACE_INDEX_INVALID;
+    hit.primitiveIndex = 0u;
+    hit.barycentrics = vec2(0.0f, 0.0f);
+    return hit;
+  }
+
+  bool isValid()
+  {
+    return surfaceIndex != SURFACE_INDEX_INVALID;
+  }
+};
+
+// Terminal light-vertex classes stored in pathFlags bits 18-19.
+// ports ReSTIRPTPass/PathTracer.slang:86-91 (LightSampleType), values kept
+// identical so the two can be diffed. `Emissive` here means an emissive *mesh*
+// reached by BSDF sampling; `Analytic` is the sphere/rect/disk/cylinder/distant
+// pool sampleLightBasicRIS draws from (light_types.h:33).
+static const uint kRestirPtLightTypeEnvMap   = 0u;
+static const uint kRestirPtLightTypeEmissive = 1u;
+static const uint kRestirPtLightTypeAnalytic = 2u;
+
+// ---------------------------------------------------------------------------
+// Path flags
+// ---------------------------------------------------------------------------
+
+// ports ReSTIRPTPass/PathReservoir.slang:21-140. Bit positions are kept
+// IDENTICAL to the reference:
+//   0-3   path length
+//   4-7   reconnection-vertex length
+//   8/9   delta event, before / at the reconnection vertex
+//   10/11 transmission event, before / at the reconnection vertex
+//   16    last vertex was an NEE connection
+//   18-19 terminal light type
+//   26/27 specular bounce, before / at the reconnection vertex
+struct RestirPtPathFlags
+{
+  int flags;
+
+  [mutating] void insertIsDeltaEvent(bool isDeltaEvent, bool beforeRcVertex)
+  {
+    flags &= (beforeRcVertex ? ~(0x100) : ~(0x200));
+    if (isDeltaEvent) { flags |= 1 << (beforeRcVertex ? 8 : 9); }
+  }
+
+  [mutating] void insertIsTransmissionEvent(bool isTransmissionEvent, bool beforeRcVertex)
+  {
+    flags &= (beforeRcVertex ? ~(0x400) : ~(0x800));
+    if (isTransmissionEvent) { flags |= 1 << (beforeRcVertex ? 10 : 11); }
+  }
+
+  // Note (reference comment kept): does not support a material carrying both
+  // SpecularReflectionMicrofacet and SpecularReflectionTransmissionMicrofacet.
+  [mutating] void insertIsSpecularBounce(bool isSpecularBounce, bool beforeRcVertex)
+  {
+    flags &= (beforeRcVertex ? ~(0x4000000) : ~(0x8000000));
+    if (isSpecularBounce) { flags |= 1 << (beforeRcVertex ? 26 : 27); }
+  }
+
+  // The three transfer* helpers move a *pair* of event bits wholesale. Unused
+  // until the half-vector reuse of phase 5; ported for diffability.
+  [mutating] void transferDeltaInformation(RestirPtPathFlags srcPathFlags)
+  {
+    flags &= ~(0x300);
+    flags |= ((srcPathFlags.flags >> 8) & 3) << 8;
+  }
+
+  [mutating] void transferTransmissionInformation(RestirPtPathFlags srcPathFlags)
+  {
+    flags &= ~(0xc00);
+    flags |= ((srcPathFlags.flags >> 10) & 3) << 10;
+  }
+
+  [mutating] void transferSpecularBounceInformation(RestirPtPathFlags srcPathFlags)
+  {
+    flags &= ~(0xc000000);
+    flags |= ((srcPathFlags.flags >> 26) & 3) << 26;
+  }
+
+  bool decodeIsDeltaEvent(bool beforeRcVertex)
+  {
+    return (beforeRcVertex ? ((flags >> 8) & 1) : ((flags >> 9) & 1)) != 0;
+  }
+
+  bool decodeIsTransmissionEvent(bool beforeRcVertex)
+  {
+    return (beforeRcVertex ? ((flags >> 10) & 1) : ((flags >> 11) & 1)) != 0;
+  }
+
+  bool decodeIsSpecularBounce(bool beforeRcVertex)
+  {
+    return (beforeRcVertex ? ((flags >> 26) & 1) : ((flags >> 27) & 1)) != 0;
+  }
+
+  // Maximum length: 15 (kRestirPtMaximumPathLength).
+  [mutating] void insertPathLength(int pathLength)
+  {
+    flags &= ~0xF;
+    flags |= pathLength & 0xF;
+  }
+
+  // Maximum length: 15 (kRestirPtMaximumPathLength).
+  [mutating] void insertRcVertexLength(int rcVertexLength)
+  {
+    flags &= ~0xF0;
+    flags |= (rcVertexLength & 0xF) << 4;
+  }
+
+  int pathLength() { return flags & 0xF; }
+
+  int rcVertexLength() { return (flags >> 4) & 0xF; }
+
+  [mutating] void insertLastVertexNEE(bool isNEE)
+  {
+    flags &= ~0x10000;
+    flags |= (int(isNEE) & 1) << 16;
+  }
+
+  bool lastVertexNEE() { return ((flags >> 16) & 1) != 0; }
+
+  [mutating] void insertLightType(uint lightType)
+  {
+    flags &= ~0xc0000;
+    flags |= ((int(lightType) & 3) << 18);
+  }
+
+  uint lightType() { return uint((flags >> 18) & 3); }
+};
+
+// ---------------------------------------------------------------------------
+// The reservoir
+// ---------------------------------------------------------------------------
+
+// ports ReSTIRPTPass/PathReservoir.slang:224-451.
+//
+// MEMORY LAYOUT. The reference advertises 88 B; this port is 96 B
+// (RESTIR_PT_RESERVOIR_SIZE_BYTES). The extra 8 B are not new payload -- the
+// reference's figure assumes D3D structured-buffer packing, while a Vulkan
+// structured buffer aligns every vec3 to 16 B and rounds the struct up to a
+// multiple of 16. Rather than let the compiler insert that padding implicitly
+// (which would silently disagree with the host-side allocation), every vec3 here
+// is FOLLOWED BY AN EXPLICIT SCALAR so the layout is unambiguous under std140,
+// std430 and D3D rules alike. Keep it that way when adding fields.
+//
+// Compression note (Enhanced 6.2.1, 88 -> 64 B): fields are grouped so the later
+// f16/octahedral pass is a drop-in -- M/weight/lightPdf are f16 candidates,
+// F/cachedJacobian/rcVertexIrradiance are f16x3 candidates and rcVertexWi is an
+// octahedral candidate. Nothing here is bitpacked beyond pathFlags, deliberately.
+struct RestirPtReservoir
+{
+  // --- 16 B ---------------------------------------------------------------
+  // Confidence weight. A float because temporal history length is allowed to be
+  // fractional from phase 4 on.  ports :226
+  float M;
+  // Dual meaning, exactly as in the reference (:227): during RIS and while used
+  // as a "RisState" this is w_sum; as an incoming reservoir, or after
+  // finalizeRIS/finalizeGRIS, it is 1/p(y) * 1/M * w_sum.
+  float weight;
+  // Path type indicator.  ports :228
+  RestirPtPathFlags pathFlags;
+  // Replay identity, low half. Packed u16x2 pixel coordinate; replaces the
+  // reference's rcRandomSeed (:229).
+  uint srcPixel;
+
+  // --- 16 B ---------------------------------------------------------------
+  // Cached integrand, refreshed whenever RIS selects a new path.  ports :230
+  vec3 F;
+  // NEE light pdf of the terminal vertex. Needed by phase 3's NEE-final shift
+  // case; may change after a shift because light sampling considers the
+  // previous bounce's upper hemisphere.  ports :231
+  float lightPdf;
+
+  // --- 16 B ---------------------------------------------------------------
+  // (previous vertex scatter pdf, scatter pdf, geometry term) at the
+  // reconnection vertex. Dead in phase 2 -- no reconnection vertex exists yet.
+  // ports :232
+  vec3 cachedJacobian;
+  // Replay identity, high half. Replaces the reference's initRandomSeed (:233).
+  uint srcFrameIdx;
+
+  // --- 16 B ---------------------------------------------------------------
+  // Hit info of the reconnection vertex.  ports :234
+  RestirPtHit rcVertexHit;
+
+  // --- 16 B ---------------------------------------------------------------
+  // Incident direction at the reconnection vertex.  ports :235
+  vec3 rcVertexWi;
+  // Reserved (see MEMORY LAYOUT). Phase 5's hybrid shift wants rcPrevWo here.
+  float reservedA;
+
+  // --- 16 B ---------------------------------------------------------------
+  // Sampled irradiance at the reconnection vertex.  ports :236
+  vec3 rcVertexIrradiance;
+  // Reserved (see MEMORY LAYOUT). Phase 3's Jacobian wants a geometry factor here.
+  float reservedB;
+
+  // ports :259-276
+  [mutating] void init()
+  {
+    M = 0.0f;
+    weight = 0.0f;
+    pathFlags.flags = 0;
+    pathFlags.insertRcVertexLength(kRestirPtMaximumPathLength);
+    F = vec3(0.0f);
+
+    // Fields the reference leaves untouched in init() but which must be written
+    // here regardless: this struct is written straight into a structured buffer
+    // and an unwritten lane is undefined memory, not zero.
+    srcPixel = 0u;
+    srcFrameIdx = 0u;
+    lightPdf = 0.0f;
+    cachedJacobian = vec3(1.0f);
+    rcVertexWi = vec3(0.0f);
+    rcVertexIrradiance = vec3(0.0f);
+    reservedA = 0.0f;
+    reservedB = 0.0f;
+
+    // Mark the reconnection vertex invalid.  ports :275
+    rcVertexHit = RestirPtHit::createInvalid();
+  }
+
+  // ports :278-281. Rec.601 luma -- kept rather than swapped for dxvk-remix's
+  // calcBt709Luminance because the RIS target function must match the reference's
+  // exactly for the arithmetic to be comparable.
+  static float toScalar(vec3 color)
+  {
+    return dot(color, vec3(0.299f, 0.587f, 0.114f));
+  }
+
+  // ports :283-288
+  static float computeWeight(vec3 color, bool binarize)
+  {
+    float w = toScalar(color);
+    if (binarize && w > 0.0f) { w = 1.0f; }
+    return w;
+  }
+
+  // Streaming RIS update. ports :290-310.
+  //
+  // `p` is the source pdf of the candidate -- for the PathBuilder's streaming
+  // adds that is the Russian roulette survival pdf, because every other factor
+  // is already folded into in_F. Returns true if the candidate was selected.
+  [mutating] bool add(vec3 in_F, float p, inout RAB_RandomSamplerState sg)
+  {
+    M += 1.0f;
+
+    const float w = toScalar(in_F) / p;
+
+    if (isnan(w) || w == 0.0f) { return false; }
+
+    weight += w;
+
+    // Accept?
+    if (RAB_GetNextRandom(sg) * weight <= w)
+    {
+      F = in_F;
+      return true;
+    }
+
+    return false;
+  }
+
+  // ports :320-353. Unused until phase 3 (spatial reuse).
+  [mutating] bool merge(vec3 in_F, float in_Jacobian, RestirPtReservoir inReservoir,
+                        inout RAB_RandomSamplerState sg, float misWeight, bool forceAdd)
+  {
+    const float w = toScalar(in_F) * in_Jacobian * inReservoir.M * inReservoir.weight * misWeight;
+
+    M += inReservoir.M;
+
+    if (isnan(w) || w == 0.0f) { return false; }
+
+    weight += w;
+
+    // Accept?
+    if (forceAdd || RAB_GetNextRandom(sg) * weight <= w)
+    {
+      copySampleFrom(inReservoir);
+      F = in_F;
+      return true;
+    }
+
+    return false;
+  }
+
+  // ports :355-388. Identical to merge() except the incoming reservoir's M is
+  // NOT folded into the resampling weight -- the caller is expected to supply a
+  // proper resampling MIS weight instead. Unused until phase 3.
+  [mutating] bool mergeWithResamplingMIS(vec3 in_F, float in_Jacobian, RestirPtReservoir inReservoir,
+                                         inout RAB_RandomSamplerState sg, float misWeight, bool forceAdd)
+  {
+    const float w = toScalar(in_F) * in_Jacobian * inReservoir.weight * misWeight;
+
+    M += inReservoir.M;
+
+    if (isnan(w) || w == 0.0f) { return false; }
+
+    weight += w;
+
+    // Accept?
+    if (forceAdd || RAB_GetNextRandom(sg) * weight <= w)
+    {
+      copySampleFrom(inReservoir);
+      F = in_F;
+      return true;
+    }
+
+    return false;
+  }
+
+  // ports :392-425. The same-pixel merge: the incoming reservoir's integrand is
+  // taken as-is (no shift, hence no Jacobian and no re-evaluated F).
+  [mutating] bool mergeInSamplePixel(RestirPtReservoir inReservoir, inout RAB_RandomSamplerState sg)
+  {
+    const float w = inReservoir.weight;
+
+    M += inReservoir.M;
+
+    if (isnan(w) || w == 0.0f) { return false; }
+
+    weight += w;
+
+    // Accept?
+    if (RAB_GetNextRandom(sg) * weight <= w)
+    {
+      copySampleFrom(inReservoir);
+      F = inReservoir.F;
+      return true;
+    }
+
+    return false;
+  }
+
+  // The three merge bodies above copy the identical field set on acceptance
+  // (:334-341, :369-376, :406-413); factored out so a field added to the
+  // reservoir cannot be forgotten in two of the three places. F is deliberately
+  // NOT copied here -- merge/mergeWithResamplingMIS assign the *shifted*
+  // integrand, mergeInSamplePixel assigns the source's.
+  [mutating] void copySampleFrom(RestirPtReservoir inReservoir)
+  {
+    pathFlags = inReservoir.pathFlags;
+    srcPixel = inReservoir.srcPixel;
+    srcFrameIdx = inReservoir.srcFrameIdx;
+    cachedJacobian = inReservoir.cachedJacobian;
+    lightPdf = inReservoir.lightPdf;
+    rcVertexWi = inReservoir.rcVertexWi;
+    rcVertexHit = inReservoir.rcVertexHit;
+    rcVertexIrradiance = inReservoir.rcVertexIrradiance;
+  }
+
+  // ports :429-433
+  [mutating] void prepareMerging()
+  {
+    weight *= toScalar(F) * M;
+  }
+
+  // ports :435-441
+  [mutating] void finalizeRIS()
+  {
+    const float pHat = toScalar(F);
+    if (pHat == 0.0f || M == 0.0f) { weight = 0.0f; }
+    else { weight = weight / (pHat * M); }
+  }
+
+  // ports :443-450. Assumes a proper resampling MIS weight was used, so there is
+  // no division by M.
+  [mutating] void finalizeGRIS()
+  {
+    const float pHat = toScalar(F);
+    if (pHat == 0.0f) { weight = 0.0f; }
+    else { weight = weight / pHat; }
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Buffer addressing + identity packing
+// ---------------------------------------------------------------------------
+
+// Row-major index into the reservoir buffer.
+//
+// The host allocates a 16x16-block padded pixel count (the ReSTIR GI reservoir
+// sizing pattern, rtx_restir_gi_rayquery.cpp:323-331), which is always
+// >= resolution.x * resolution.y, so a plain row-major stride with the UNPADDED
+// width is in range and the padding is pure slack. Both the trace pass and the
+// final shading pass address through here so the two can never disagree.
+uint restirPtReservoirIndex(uint2 pixel, uint2 resolution)
+{
+  return pixel.y * resolution.x + pixel.x;
+}
+
+// Replay identity packing. The pixel coordinate is a u16 pair, which is why the
+// reference's 4-byte rcRandomSeed slot is exactly the right size for it.
+uint restirPtPackSrcPixel(u16vec2 pixel)
+{
+  return (uint(pixel.x) & 0xFFFFu) | ((uint(pixel.y) & 0xFFFFu) << 16);
+}
+
+u16vec2 restirPtUnpackSrcPixel(uint packed)
+{
+  return u16vec2(uint16_t(packed & 0xFFFFu), uint16_t(packed >> 16));
+}

@@ -33,12 +33,14 @@
 #include "rtx/concept/ray/ray.slangh"
 #include "rtx/algorithm/resolve.h"
 #include "rtx/algorithm/resolve_expanded.slangh"
+// Brings in RestirPtHit, RestirPtReservoir and RestirPtPathBuilder. The
+// dependency runs one way only: reservoir -> builder -> path state.
+#include "rtx/algorithm/fork_restir_pt/restir_pt_path_builder.slangh"
 
 // ReSTIR PT (fork) -- live path state for the fork-owned trace kernel.
 //
 // ports ReSTIRPTPass/PathState.slang:17-39 (PathFlags) and :64-243 (PathState),
 // minus:
-//   - PathBuilder / PathReservoir members (phase 2 -- no reservoir exists yet)
 //   - the packed encode()/decode() pair (:193-241). Our kernel is one compute
 //     loop with an inline RayQuery resolve; nothing crosses a ray-payload
 //     boundary, so there is nothing to pack.
@@ -82,30 +84,8 @@ static const uint kRestirPtBounceTypeTransmission = 2u;
 // kNRDInvalidPathLength usage at ReSTIRPTPass/PathTracer.slang:841.
 static const float kRestirPtInvalidPathLength = 65504.0f;
 
-// Identity of a committed hit, sufficient to rebuild the surface interaction
-// with no ray trace in a later phase (the NEE cache does exactly this from the
-// same triple -- nee_cache_light.slangh:101-148). Stands in for the reference's
-// Falcor HitInfo / TriangleHit (ReSTIRPTPass/PathReservoir.slang:177-215).
-struct RestirPtHit
-{
-  uint surfaceIndex;
-  uint primitiveIndex;
-  vec2 barycentrics;
-
-  static RestirPtHit createInvalid()
-  {
-    RestirPtHit hit;
-    hit.surfaceIndex = SURFACE_INDEX_INVALID;
-    hit.primitiveIndex = 0u;
-    hit.barycentrics = vec2(0.0f, 0.0f);
-    return hit;
-  }
-
-  bool isValid()
-  {
-    return surfaceIndex != SURFACE_INDEX_INVALID;
-  }
-};
+// Note: RestirPtHit moved to restir_pt_reservoir.slangh in phase 2 (the
+// reservoir stores one, and the reservoir header must not depend on this file).
 
 // Live state for the ReSTIR PT trace kernel. Doubles as the resolve loop's
 // payload, so it must satisfy IBasePayloadState (resolve.h:66-83).
@@ -157,6 +137,27 @@ struct RestirPtPathState : IBasePayloadState
   float coneSpreadAngle;      // Ray-cone spread, fed into texture LOD by the resolver.
   uint mediumMaterialIndex;   // Translucent medium the path is currently inside, or SURFACE_INDEX_INVALID.
   float accumulatedHitDistance;
+
+  // --- Reservoir construction (phase 2) -----------------------------------
+  // ports the PathState members ReSTIRPTPass/PathState.slang carries for the
+  // same purpose (`pathBuilder`, `pathReservoir`). The reference keeps them in
+  // PathState too; here that costs nothing extra because this port has no ray
+  // payload to pack them into -- the state never leaves registers.
+  RestirPtPathBuilder pathBuilder;
+  RestirPtReservoir pathReservoir;
+
+  // False for the PSR / secondary-selected continuation entry, which produces a
+  // plain radiance estimate for IndirectRadianceHitDistance and must not offer
+  // its terminals to a reservoir (nothing shades one for those pixels -- see
+  // demodulate.comp.slang:776-798 for who consumes them instead).
+  bool buildReservoir;
+
+  // NEE-cache cell of the PRIMARY surface, jittered once at path generation.
+  // Twin of PathState::neeCacheCellOffset (path_state.slangh:65), set the same
+  // way the indirect integrator sets it (integrator_indirect.slangh:1360-1368).
+  // Used for the length-1 emissive MIS weight and the emissive task feedback.
+  int neeCacheCellOffset;
+  bool neeCacheCellValid;
 
   // --- Replay control -----------------------------------------------------
   // ports ReSTIRPTPass/PathState.slang:104-107. Phase 1 uses these purely for

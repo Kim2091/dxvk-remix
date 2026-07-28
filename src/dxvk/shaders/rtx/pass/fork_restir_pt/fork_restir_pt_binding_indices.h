@@ -59,15 +59,63 @@
 #define FORK_RESTIR_PT_BINDING_LINEAR_WRAP_SAMPLER                      113
 #define FORK_RESTIR_PT_BINDING_SKYPROBE                                 114
 
+// NEE cache. The global NAMES are fixed by nee_cache.h, which references them
+// unconditionally from its struct methods -- the same five
+// integrate_indirect_bindings.slangh:170-182 declares. Phase 2 pulls the header
+// in for two things only: the emissive-hit MIS weight and the emissive-hit task
+// feedback. NEE-cache *sampling* inside the kernel stays out of scope.
+#define FORK_RESTIR_PT_BINDING_NEE_CACHE                                115
+#define FORK_RESTIR_PT_BINDING_NEE_CACHE_SAMPLE                         116
+#define FORK_RESTIR_PT_BINDING_NEE_CACHE_TASK                           117
+#define FORK_RESTIR_PT_BINDING_NEE_CACHE_THREAD_TASK                    118
+#define FORK_RESTIR_PT_BINDING_PRIMITIVE_ID_PREFIX_SUM                  119
+
 // Inputs / Outputs
-// Phase-1-only parity buffer: one float4 per padded pixel holding the traced
+// Debug-only parity buffer: one float4 per padded pixel holding the traced
 // path's radiance in .xyz and its packed terminal descriptor in .w. The trace
 // dispatch writes it; the replay-verify dispatch reads it back and compares.
-// Retired once reservoirs land in phase 2 (the reservoir carries the identity).
+// Allocated only while rtx.restirPT.enableDebugTrace is on.
 #define FORK_RESTIR_PT_BINDING_PARITY_INPUT_OUTPUT                      120
 
+// The integrate_direct -> integrate_indirect handoff, read verbatim by the
+// PSR / secondary-selected continuation entry point
+// (integrator_indirect.slangh:147-160). SecondaryConeRadius is the miss test for
+// those pixels (integrate_indirect.slangh:118).
+#define FORK_RESTIR_PT_BINDING_RAY_ORIGIN_DIRECTION_INPUT               121
+#define FORK_RESTIR_PT_BINDING_THROUGHPUT_CONE_RADIUS_INPUT             122
+#define FORK_RESTIR_PT_BINDING_FIRST_SAMPLED_LOBE_DATA_INPUT            123
+#define FORK_RESTIR_PT_BINDING_SHARED_MEDIUM_MATERIAL_INDEX_INPUT       124
+#define FORK_RESTIR_PT_BINDING_SECONDARY_CONE_RADIUS_INPUT              125
+
+// The two real-mode outputs. IndirectRadianceHitDistance is the slot
+// integrate_indirect would have written; integrate_nee reads it immediately
+// after (integrate_nee.comp.slang:110-131) and demodulate folds it for
+// secondary-selected pixels (demodulate.comp.slang:776-798).
+#define FORK_RESTIR_PT_BINDING_INDIRECT_RADIANCE_HIT_DISTANCE_OUTPUT    126
+#define FORK_RESTIR_PT_BINDING_RESERVOIR_OUTPUT                         127
+
+// --- Final shading pass (separate pipeline, own descriptor set) -------------
+// Deliberately does NOT define RAB_HAS_CURRENT_GBUFFER: shading a phase-2
+// reservoir is `F * weight` routed by a stored flag bit, so no surface
+// interaction is needed. The primary vertex's BSDF is already folded into F by
+// the trace kernel's own primary scatter.
+#define FORK_RESTIR_PT_FS_BINDING_SHARED_FLAGS_INPUT                    130
+#define FORK_RESTIR_PT_FS_BINDING_PRIMARY_CONE_RADIUS_INPUT             131
+#define FORK_RESTIR_PT_FS_BINDING_RESERVOIR_INPUT                       132
+#define FORK_RESTIR_PT_FS_BINDING_PRIMARY_INDIRECT_DIFFUSE_INPUT_OUTPUT  133
+#define FORK_RESTIR_PT_FS_BINDING_PRIMARY_INDIRECT_SPECULAR_INPUT_OUTPUT 134
+
 #define FORK_RESTIR_PT_MIN_BINDING   FORK_RESTIR_PT_BINDING_WORLD_SHADING_NORMAL_INPUT
-#define FORK_RESTIR_PT_MAX_BINDING   FORK_RESTIR_PT_BINDING_PARITY_INPUT_OUTPUT
+#define FORK_RESTIR_PT_MAX_BINDING   FORK_RESTIR_PT_FS_BINDING_PRIMARY_INDIRECT_SPECULAR_INPUT_OUTPUT
+
+// Size of one RestirPtReservoir element, in bytes. Shared with the host so the
+// buffer allocation and the shader's structured-buffer stride can never drift.
+//
+// 96, not the reference's advertised 88: a Vulkan structured buffer aligns every
+// vec3 to 16 B and rounds the struct size up to a multiple of 16. The layout is
+// written so that padding is EXPLICIT (every vec3 is followed by a scalar) --
+// see the MEMORY LAYOUT note on RestirPtReservoir.
+#define RESTIR_PT_RESERVOIR_SIZE_BYTES 96
 
 #if FORK_RESTIR_PT_MIN_BINDING <= COMMON_MAX_BINDING
 #error "Increase the base index of ReSTIR PT bindings to avoid overlap with common bindings!"

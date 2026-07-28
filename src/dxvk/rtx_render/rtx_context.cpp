@@ -678,7 +678,15 @@ namespace dxvk {
 
         // ReSTIR GI
         m_common->metaReSTIRGIRayQuery().dispatch(this, rtOutput);
-        
+
+        // Fork: ReSTIR PT final shading. Deliberately the same structural slot
+        // ReSTIR GI final shading sits in -- after the NRC resolve and RTXDI
+        // confidence, before demodulate -- so demodulate/NRD/DLSS-RR/composite
+        // see a shape they already handle. The two are mutually exclusive: GI
+        // self-gates on isActive(), PT on the indirect mode.
+        m_common->metaForkReSTIRPT().dispatchFinalShading(this, rtOutput);
+
+
         if (captureScreenImage && captureDebugImage) {
           takeScreenshot("baseReflectivity", rtOutput.m_primaryBaseReflectivity.image(Resources::AccessType::Read));
           takeScreenshot("sharedSubsurfaceData", rtOutput.m_sharedSubsurfaceData.image);
@@ -1571,20 +1579,25 @@ namespace dxvk {
     {
       ScopedGpuProfileZone(this, "Integrate Indirect Raytracing");
       setFramePassStage(RtxFramePassStage::IndirectIntegration);
-      
+
       m_common->metaPathtracerIntegrateIndirect().dispatch(this, rtOutput);
     }
 
+    // Fork: ReSTIR PT (Lin et al. 2022).
+    //
+    // In ReSTIR PT mode this REPLACES integrate_indirect (which early-outs above)
+    // and must run BEFORE dispatchNEE, because integrate_nee consumes the
+    // IndirectRadianceHitDistance texel the trace kernel writes
+    // (integrate_nee.comp.slang:110-131).
+    //
+    // In every other mode the same call is the phase 1 debug trace + replay
+    // parity harness, which runs IN ADDITION to the normal frame and writes only
+    // its own scratch buffer plus (when selected) a debug view -- the rendered
+    // image is untouched. Self-gated on rtx.restirPT.enableDebugTrace via RtxPass.
+    m_common->metaForkReSTIRPT().dispatchTrace(this, rtOutput);
+
     // Integrate indirect - NEE Cache pass
     m_common->metaPathtracerIntegrateIndirect().dispatchNEE(this, rtOutput);
-
-    // Fork: ReSTIR PT (Lin et al. 2022) debug trace + replay-parity harness.
-    // Phase 1 runs IN ADDITION to the normal frame and writes only its own
-    // parity buffer plus (when selected) the debug view, so the rendered image
-    // is untouched. Self-gated on rtx.restirPT.enableDebugTrace via RtxPass, and
-    // sits at the slot the trace pass will eventually occupy in place of
-    // integrate_indirect.
-    m_common->metaForkReSTIRPT().dispatch(this, rtOutput);
   }
 
   void RtxContext::dispatchPathTracing(const Resources::RaytracingOutput& rtOutput) {

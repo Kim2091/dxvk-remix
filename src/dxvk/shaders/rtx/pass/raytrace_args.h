@@ -447,5 +447,27 @@ struct RaytraceArgs {
 // pass's push constants instead; see ForkReSTIRPTArgs in
 // rtx/pass/fork_restir_pt/fork_restir_pt_binding_indices.h.
 // Bit 0 is reserved so a later phase can reclaim it without renumbering.
-#define RESTIR_PT_FLAG_RESERVED0               (1u << 0)
-#define RESTIR_PT_FLAG_ENABLE_RUSSIAN_ROULETTE (1u << 1)
+//
+// Phase 2 adds bits only -- NO new scalars. Everything it needed (a mode-active
+// flag, a task-feedback toggle and a three-way emissive policy) fits in the
+// spare bits of this word, which is why the 4-scalar group above is untouched.
+#define RESTIR_PT_FLAG_RESERVED0                (1u << 0)
+#define RESTIR_PT_FLAG_ENABLE_RUSSIAN_ROULETTE  (1u << 1)
+// Set when IntegrateIndirectMode::ReSTIRPT is the live indirect mode, i.e. when
+// the fork trace kernel is running IN PLACE OF integrate_indirect rather than as
+// the debug-only harness alongside it.
+#define RESTIR_PT_FLAG_MODE_ACTIVE              (1u << 2)
+// Emissive-hit task insertions into the NEE cache. Keeps the cache DISCOVERING
+// emissive triangles once integrate_indirect stops running; see the task
+// feedback block in restir_pt_trace_core.slangh.
+#define RESTIR_PT_FLAG_NEE_CACHE_TASK_FEEDBACK  (1u << 3)
+
+// Emissive accounting policy, 2 bits at 4-5. The A/B knob for the one phase-2
+// change that moves energy (the removal of the reference's `suppressAsDirect`).
+// Modes 0 and 1 bracket the default from below and above -- see the EMISSIVE
+// ACCOUNTING POLICY block in restir_pt_trace_core.slangh.
+#define RESTIR_PT_EMISSIVE_MIS_MODE_SHIFT       4u
+#define RESTIR_PT_EMISSIVE_MIS_MODE_MASK        0x3u
+#define RESTIR_PT_EMISSIVE_MIS_SUPPRESS         0u  // Reference behaviour: drop length-1 emissive as "direct".
+#define RESTIR_PT_EMISSIVE_MIS_NONE             1u  // Weight 1 everywhere: double-counts against integrate_nee.
+#define RESTIR_PT_EMISSIVE_MIS_NEE_CACHE        2u  // Default: BSDF-side MIS against the NEE cache at length 1.

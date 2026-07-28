@@ -257,6 +257,10 @@ namespace dxvk {
         // Fork: ReSTIR PT (Lin et al. 2022). Requires rtx.restirPT.enableDebugTrace.
         {DEBUG_VIEW_RESTIR_PT_TRACE, "ReSTIR PT Trace"},
         {DEBUG_VIEW_RESTIR_PT_REPLAY_DELTA, "ReSTIR PT Replay Parity Delta", "Random-replay correctness check: max|traced - replayed| radiance x 1e6. Must be pure black; any lit pixel means the replay diverged from the base path."},
+        {DEBUG_VIEW_RESTIR_PT_RESERVOIR_WEIGHT, "ReSTIR PT Reservoir Weight", "Resolved RIS contribution weight of the stored path. Smoothly varying when healthy; speckled huge values mean the RIS arithmetic or a source pdf is wrong."},
+        {DEBUG_VIEW_RESTIR_PT_RESERVOIR_VALID, "ReSTIR PT Reservoir Valid", "R = reservoir M (1 where a candidate was streamed in), G = weight > 0. Black on a lit surface means the path builder rejected everything."},
+        {DEBUG_VIEW_RESTIR_PT_RESERVOIR_F, "ReSTIR PT Reservoir Integrand", "Cached integrand F of the selected path, before the contribution weight is applied."},
+        {DEBUG_VIEW_RESTIR_PT_FINAL_SHADING, "ReSTIR PT Final Shading", "F * weight, the radiance the fork final shading pass adds into the primary indirect channels. Compare against 'ReSTIR PT Trace' - the two must agree in expectation."},
 
         {DEBUG_VIEW_NEE_CACHE_LIGHT_HISTOGRAM, "NEE Cache Light Histogram"},
         {DEBUG_VIEW_NEE_CACHE_HISTOGRAM, "NEE Cache Triangle Histogram"},

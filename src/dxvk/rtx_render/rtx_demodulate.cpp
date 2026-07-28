@@ -123,7 +123,13 @@ namespace dxvk {
     // For secondary surfaces pixels m_indirectRadianceHitDistance is still valid
     // Therefore we suppress the alias check for m_indirectRadianceHitDistance 
     // since m_primaryIndirectDiffuseRadiance already took ownership of the shared resource
-    const bool isPrimaryIndirectRadianceResourceRead = ctx->getCommonObjects()->metaReSTIRGIRayQuery().isActive();
+    // Fork: ReSTIR PT makes exactly the same ownership statement as ReSTIR GI --
+    // its final shading pass took ownership of the aliased primary indirect
+    // channels for primary-selected pixels, while m_indirectRadianceHitDistance
+    // remains valid for secondary-selected ones. The comment above applies
+    // verbatim to both.
+    const bool isPrimaryIndirectRadianceResourceRead =
+      ctx->getCommonObjects()->metaReSTIRGIRayQuery().isActive() || RtxOptions::useReSTIRPT();
     const bool suppressIndirectRadianceAliasCheck = isPrimaryIndirectRadianceResourceRead;
 
     ctx->bindResourceView(DEMODULATE_BINDING_INDIRECT_RADIANCE_HIT_DISTANCE_INPUT, rtOutput.m_indirectRadianceHitDistance.view(Resources::AccessType::Read, !suppressIndirectRadianceAliasCheck), nullptr);

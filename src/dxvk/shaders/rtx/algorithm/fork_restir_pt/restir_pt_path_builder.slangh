@@ -1,0 +1,248 @@
+/*
+* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+/*
+* Portions of this file are a port of the ReSTIR PT reference implementation:
+*   Copyright (c) 2022, Daqi Lin.  All rights reserved.
+*   ReSTIR_PT/Source/RenderPasses/ReSTIRPTPass/PathBuilder.slang
+* Licensed under BSD-3-Clause (see ThirdPartyLicenses.txt, "ReSTIR PT" entry).
+*/
+#pragma once
+
+#include "rtx/algorithm/fork_restir_pt/restir_pt_reservoir.slangh"
+
+// ReSTIR PT (fork) -- the streaming RIS path builder.
+//
+// ports ReSTIRPTPass/PathBuilder.slang:24-198, non-BPR branches only
+// (kRcWiCount == 1). One builder instance rides along with a path; each time the
+// path reaches a *terminal* -- an NEE connection, an escape into the sky, or a
+// BSDF hit on an emissive surface -- the corresponding add* call offers that
+// complete path to the reservoir as an RIS candidate. Whichever candidate wins
+// is the path the reservoir stores.
+//
+// The reference's own framing (:23) is worth keeping in mind: this "builds a
+// Path and a PathPrefix". In phase 2 there is no prefix, because there is no
+// reconnection vertex -- rcVertexLength is pinned at kRestirPtMaximumPathLength
+// so `is_rcVertex` is never true and the rcVertex bookkeeping is dead code. It
+// is ported anyway, with pins, so phase 3/5 can light it up by changing where
+// rcVertexLength is set rather than by writing new code against a stale memory
+// of the reference.
+
+// The reference gates every add on `pathLength >= 1`
+// (PathBuilder.slang:63 and :123). FORK DEVIATION: the fork uses 0.
+//
+// Why the reference can afford 1: there, path length 0 means "the light vertex
+// is reached directly from the primary vertex", i.e. direct illumination, which
+// ScreenSpaceReSTIR owns -- and the reference explicitly suppresses that whole
+// class at the emissive-hit site (PathTracer.slang:1025, the `suppressAsDirect`
+// twin phase 2 removes).
+//
+// Why the fork cannot: dxvk-remix's direct-lighting estimator (RTXDI) covers the
+// *analytic* light pool only (lighting.slangh:110-130 iterates cb.lightRanges
+// over lights[]). An emissive MESH hit one scatter off the primary surface is
+// not direct light here -- it is indirect light that only the path tracer sees,
+// and it is exactly where GI mode puts it too. With the reference's gate that
+// contribution would be accumulated into path.L (which nothing reads for
+// primary-selected pixels in PT mode) and silently dropped from the reservoir,
+// which is the shaded signal. The tell would be emissive-mesh-lit interiors
+// reading dimmer in PT than in GI.
+//
+// Nothing else changes: the emissive site still passes the reference's
+// `max(0, path.length - 1)` length convention, so pathFlags.pathLength() keeps
+// the meaning phase 5's terminal-matching logic is written against.
+static const int kRestirPtBuilderMinPathLength = 0;
+
+// Pass index handed to RAB_InitRandomSampler for the RIS acceptance stream.
+// Chosen clear of the pass ids already in use on this RNG
+// (RtxdiApplicationBridge.slangh:345-366): RTXDI's 0-6, sampleLightAdvancedRIS's
+// 3, integrate_nee's 7, and the indirect integrator's bounceIteration.
+static const uint kRestirPtRisSamplerPass = 23u;
+
+struct RestirPtPathBuilder
+{
+  // ports :26-32
+  RestirPtHit rcVertexHit;
+  vec3 rcVertexWi;
+  // Replaces the reference's `cachedRandomSeed` (:28) -- the seed captured at the
+  // reconnection vertex. Under dimension addressing the whole path is described
+  // by its identity pair, so that is what gets cached and copied into the
+  // reservoir on acceptance.
+  uint cachedSrcPixel;
+  uint cachedSrcFrameIdx;
+  // RIS acceptance stream. The reference re-seeds a TinyUniformSampleGenerator
+  // from jenkinsHash(sg.next()) at :37; RAB_InitRandomSampler already applies a
+  // Jenkins hash to a Z-curve pixel index, so the re-seed is that call.
+  RAB_RandomSamplerState sg;
+  int rcVertexLength;
+  RestirPtPathFlags pathFlags;
+  vec3 cachedJacobian;
+
+  // ports :34-43
+  [mutating] void init(u16vec2 pixel, uint frameIdx)
+  {
+    sg = RAB_InitRandomSampler(uint2(pixel), frameIdx, kRestirPtRisSamplerPass);
+
+    rcVertexWi = vec3(0.0f);
+    rcVertexHit = RestirPtHit::createInvalid();
+
+    // PHASE 2: pinned, so `is_rcVertex` below is never true. Phase 3/5 set this
+    // from the hybrid-shift heuristics instead.
+    rcVertexLength = kRestirPtMaximumPathLength;
+    pathFlags.flags = 0;
+    cachedJacobian = vec3(1.0f);
+
+    cachedSrcPixel = restirPtPackSrcPixel(pixel);
+    cachedSrcFrameIdx = frameIdx;
+  }
+
+  // ports :45-55 (the non-BPR body, which is just the M assignment). The
+  // reservoir has been accumulating w_sum in `weight` across the streaming adds;
+  // with a single candidate stream M is 1 by construction.
+  void finalize(inout RestirPtReservoir pathReservoir)
+  {
+    pathReservoir.M = 1.0f;
+  }
+
+  // ports :57-115 (non-BPR branch). Offers a path that terminated by *escaping*
+  // -- either into the sky/env or onto an emissive surface reached by BSDF
+  // sampling -- as an RIS candidate.
+  //
+  //   pathWeight     the candidate's full contribution (target function input)
+  //   postfixWeight  the suffix contribution measured from the reconnection
+  //                  vertex; equal to pathWeight in phase 2 because the prefix
+  //                  throughput is identically 1 (RestirPtPathState::getCurrentThp)
+  //   rrPdf          Russian roulette survival pdf -- the RIS source pdf
+  [mutating] bool addEscapeVertex(
+    int pathLength, vec3 wi, vec3 pathWeight, vec3 postfixWeight,
+    float rrPdf, float misWeight, float lightPdf, uint lightType,
+    inout RestirPtReservoir pathReservoir, bool forceAdd)
+  {
+    bool selected = false;
+
+    if (pathLength >= kRestirPtBuilderMinPathLength)
+    {
+      const bool is_rcVertex = (pathLength == rcVertexLength);
+
+      if (forceAdd || pathReservoir.add(pathWeight, rrPdf, sg))
+      {
+        selected = true;
+        pathReservoir.pathFlags = pathFlags;
+        pathReservoir.pathFlags.insertPathLength(pathLength);
+        pathReservoir.pathFlags.insertRcVertexLength(rcVertexLength);
+        pathReservoir.pathFlags.insertLastVertexNEE(false);
+        pathReservoir.rcVertexIrradiance = postfixWeight;
+        pathReservoir.F = pathWeight;
+        pathReservoir.rcVertexWi = rcVertexWi;
+        pathReservoir.rcVertexHit = rcVertexHit;
+
+        pathReservoir.cachedJacobian = cachedJacobian;
+
+        // ports :101 (rcRandomSeed = cachedRandomSeed).
+        pathReservoir.srcPixel = cachedSrcPixel;
+        pathReservoir.srcFrameIdx = cachedSrcFrameIdx;
+
+        if (is_rcVertex)  // dead in phase 2, see the file header
+        {
+          pathReservoir.rcVertexWi = wi;
+          // Exclude the last-vertex-dependent MIS weight.  ports :106
+          pathReservoir.rcVertexIrradiance /= misWeight;
+        }
+
+        pathReservoir.lightPdf = lightPdf;
+        pathReservoir.pathFlags.insertLightType(lightType);
+      }
+    }
+
+    return selected;
+  }
+
+  // ports :117-180 (non-BPR branch). Offers a path that terminated on an NEE
+  // connection as an RIS candidate. Structurally identical to addEscapeVertex
+  // apart from the lastVertexNEE flag and the rcVertex irradiance conversion.
+  [mutating] bool addNeeVertex(
+    int pathLength, vec3 wi, vec3 pathWeight, vec3 postfixWeight,
+    float rrPdf, float misWeight, float lightPdf, uint lightType,
+    inout RestirPtReservoir pathReservoir, bool forceAdd)
+  {
+    bool selected = false;
+
+    if (pathLength >= kRestirPtBuilderMinPathLength)
+    {
+      const bool is_rcVertex = (pathLength == rcVertexLength);
+
+      if (forceAdd || pathReservoir.add(pathWeight, rrPdf, sg))
+      {
+        selected = true;
+        pathReservoir.pathFlags = pathFlags;
+        // Note (reference comment kept): the stored length EXCLUDES the NEE vertex.
+        pathReservoir.pathFlags.insertPathLength(pathLength);
+        pathReservoir.pathFlags.insertRcVertexLength(rcVertexLength);
+        pathReservoir.pathFlags.insertLastVertexNEE(true);
+        pathReservoir.rcVertexIrradiance = postfixWeight;
+        pathReservoir.F = pathWeight;
+        pathReservoir.rcVertexWi = rcVertexWi;
+        pathReservoir.rcVertexHit = rcVertexHit;
+
+        pathReservoir.cachedJacobian = cachedJacobian;
+
+        // ports :166 (rcRandomSeed = cachedRandomSeed).
+        pathReservoir.srcPixel = cachedSrcPixel;
+        pathReservoir.srcFrameIdx = cachedSrcFrameIdx;
+
+        if (is_rcVertex)  // dead in phase 2, see the file header
+        {
+          // ports :170 -- convert to irradiance measured against the light pdf.
+          pathReservoir.rcVertexIrradiance = pathReservoir.rcVertexIrradiance * lightPdf / misWeight;
+          pathReservoir.rcVertexWi = wi;
+        }
+
+        pathReservoir.lightPdf = lightPdf;
+        pathReservoir.pathFlags.insertLightType(lightType);
+      }
+    }
+
+    return selected;
+  }
+
+  // ports :182-197. Promotes the just-added escape vertex to the reconnection
+  // vertex. DEAD IN PHASE 2 -- rcVertexLength never moves off
+  // kRestirPtMaximumPathLength, so no caller reaches this. Ported now so phase 5's
+  // hybrid shift starts from a transcription rather than a rewrite.
+  [mutating] void markEscapeVertexAsRcVertex(
+    int pathLength, inout RestirPtReservoir pathReservoir, RestirPtHit hit,
+    bool isDelta, bool isTransmission, bool isSpecularBounce,
+    float lightPdf, uint lightType, vec3 rcVertexIrradianceIn, vec3 rcVertexWiIn,
+    float prevScatterPdf, float geometryFactor)
+  {
+    pathReservoir.pathFlags.insertRcVertexLength(pathLength);
+
+    pathReservoir.rcVertexHit = hit;
+    pathReservoir.pathFlags.insertIsDeltaEvent(isDelta, true);
+    pathReservoir.pathFlags.insertIsTransmissionEvent(isTransmission, true);
+    pathReservoir.pathFlags.insertIsSpecularBounce(isSpecularBounce, true);
+    pathReservoir.lightPdf = lightPdf;
+    pathReservoir.cachedJacobian.x = prevScatterPdf;
+    pathReservoir.pathFlags.insertLightType(lightType);
+    pathReservoir.rcVertexIrradiance = rcVertexIrradianceIn;
+    pathReservoir.rcVertexWi = rcVertexWiIn;
+    pathReservoir.cachedJacobian.z = geometryFactor;
+  }
+};

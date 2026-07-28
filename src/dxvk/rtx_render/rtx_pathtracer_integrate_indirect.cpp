@@ -390,6 +390,10 @@ namespace dxvk {
       case IntegrateIndirectMode::NeuralRadianceCache:
         Logger::info("[RTX] Integrate Indirect Mode: Neural Radiance Cache - activated");
         break;
+      // Fork: ReSTIR PT (Lin et al. 2022).
+      case IntegrateIndirectMode::ReSTIRPT:
+        Logger::info("[RTX] Integrate Indirect Mode: ReSTIR PT (Experimental) - activated; this pass does not dispatch");
+        break;
       }
     }
   }
@@ -401,6 +405,14 @@ namespace dxvk {
     const uint32_t frameIdx = ctx->getDevice()->getCurrentFrameId();
 
     logIntegrateIndirectMode();
+
+    // Fork: in ReSTIR PT mode the fork trace kernel occupies this dispatch slot
+    // instead (see RtxContext::dispatchIntegrate). Early out AFTER the mode log
+    // so the mode change is still reported, and before any binding so no
+    // aliased-resource access is recorded for a pass that never runs.
+    if (RtxOptions::useReSTIRPT()) {
+      return;
+    }
 
     // Bind resources
 

@@ -194,7 +194,12 @@ namespace dxvk {
     ImportanceSampled = 0,   // Importance sampled integration - provides the noisiest output and used primarily for reference comparisons
     ReSTIRGI = 1,            // Importance Sampled + ReSTIR GI integrations
     NeuralRadianceCache = 2, // Implements a live trained neural network to provide a world space radiance cache and allow the pathtracer to terminate paths earlier into the cache.
-  
+    // Fork: ReSTIR PT (Lin et al. 2022). The fork-owned path-tracing kernel runs
+    // in integrate_indirect's dispatch slot and produces one resampled path per
+    // pixel, shaded by a fork final shading pass into the same primary indirect
+    // channels ReSTIR GI feeds. Phase 2: no spatial or temporal reuse yet.
+    ReSTIRPT = 3,
+
     Count
   };
 
@@ -2450,6 +2455,14 @@ namespace dxvk {
 
     static bool useReSTIRGI() {
       return integrateIndirectMode() == IntegrateIndirectMode::ReSTIRGI;
+    }
+
+    // Fork: twin of useReSTIRGI for the ReSTIR PT indirect mode. Note that the
+    // two are mutually exclusive by construction, which is what lets PT reuse
+    // ReSTIR GI's structural slot (final shading before demodulate) and inherit
+    // its null-binding behaviour for the GI-only resources.
+    static bool useReSTIRPT() {
+      return integrateIndirectMode() == IntegrateIndirectMode::ReSTIRPT;
     }
 
     static bool shouldConvertToLight(const XXH64_hash_t& h) {

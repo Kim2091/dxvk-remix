@@ -349,7 +349,13 @@ namespace dxvk {
           "RTX Neural Radiance Cache (NRC). NRC is an AI based world space radiance cache. It is live trained by the path tracer\n"
           "and allows paths to terminate early by looking up the cached value and saving performance.\n"
           "NRC supports infinite bounces and often provides results closer to that of reference than ReSTIR GI\n"
-          "while increasing performance in scenarios where ray paths have 2 or more bounces on average."}
+          "while increasing performance in scenarios where ray paths have 2 or more bounces on average."},
+        // Fork: ReSTIR PT (Lin et al. 2022).
+        {IntegrateIndirectMode::ReSTIRPT, "ReSTIR PT (Experimental)",
+          "ReSTIR PT replaces the indirect integrator with a fork-owned path-tracing kernel whose paths are resampled\n"
+          "rather than averaged. Currently at phase 2 of the port: one resampled path per pixel, shaded directly,\n"
+          "with NO spatial or temporal reuse yet - so it is noisier than ReSTIR GI while costing about the same.\n"
+          "It exists to be A/B'd against ReSTIR GI for brightness parity; the reuse that makes it worthwhile lands later."}
     } }
   };
 
@@ -411,6 +417,7 @@ namespace dxvk {
       // aliasing-analyzer combo.
       { RtxFramePassStage::ReSTIR_PT_Trace, "ReSTIR_PT_Trace" },
       { RtxFramePassStage::ReSTIR_PT_ReplayVerify, "ReSTIR_PT_ReplayVerify" },
+      { RtxFramePassStage::ReSTIR_PT_FinalShading, "ReSTIR_PT_FinalShading" },
       { RtxFramePassStage::Demodulate, "Demodulate" },
       { RtxFramePassStage::NRD, "NRD" },
       { RtxFramePassStage::CompositionAlphaBlend, "CompositionAlphaBlend" },

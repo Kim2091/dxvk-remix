@@ -22,6 +22,8 @@
 #pragma once
 
 #include "rtx/pass/fork_restir_pt/fork_restir_pt_binding_indices.h"
+// NeeCache_PackedSample, needed by the NEE-cache sample buffer's element type.
+#include "rtx/algorithm/nee_cache_data.h"
 
 // Note: The global names below are not free choices -- RAB_GetGBufferSurface
 // (RtxdiApplicationBridge.slangh:286-324) reads them by name under
@@ -75,7 +77,60 @@ SamplerState LinearWrapSampler;
 layout(binding = FORK_RESTIR_PT_BINDING_SKYPROBE)
 SamplerCube<float3> SkyProbe;
 
+// The integrate_direct -> integrate_indirect handoff, consumed by the
+// PSR / secondary-selected continuation entry point. Formats and names copied
+// from integrate_indirect_bindings.slangh so the two read identically.
+
+layout(rgba32f, binding = FORK_RESTIR_PT_BINDING_RAY_ORIGIN_DIRECTION_INPUT)
+Texture2D<float4> RayOriginDirection;
+
+layout(rgba16f, binding = FORK_RESTIR_PT_BINDING_THROUGHPUT_CONE_RADIUS_INPUT)
+Texture2D<float4> ThroughputConeRadius;
+
+layout(r32ui, binding = FORK_RESTIR_PT_BINDING_FIRST_SAMPLED_LOBE_DATA_INPUT)
+Texture2D<uint> FirstSampledLobeData;
+
+layout(r32ui, binding = FORK_RESTIR_PT_BINDING_SHARED_MEDIUM_MATERIAL_INDEX_INPUT)
+Texture2D<uint> SharedMediumMaterialIndex;
+
+layout(r16f, binding = FORK_RESTIR_PT_BINDING_SECONDARY_CONE_RADIUS_INPUT)
+Texture2D<float> SecondaryConeRadius;
+
+// NEE cache. Note: these global NAMES are not free choices either -- nee_cache.h
+// references them by name from its struct methods, so they must match
+// integrate_indirect_bindings.slangh:170-182 exactly.
+
+layout(binding = FORK_RESTIR_PT_BINDING_NEE_CACHE)
+ByteAddressBuffer NeeCache;
+
+layout(binding = FORK_RESTIR_PT_BINDING_NEE_CACHE_SAMPLE)
+StructuredBuffer<NeeCache_PackedSample> NeeCacheSample;
+
+layout(binding = FORK_RESTIR_PT_BINDING_NEE_CACHE_TASK)
+RWByteAddressBuffer NeeCacheTask;
+
+layout(rg32ui, binding = FORK_RESTIR_PT_BINDING_NEE_CACHE_THREAD_TASK)
+RWTexture2D<uint2> NeeCacheThreadTask;
+
+layout(binding = FORK_RESTIR_PT_BINDING_PRIMITIVE_ID_PREFIX_SUM)
+StructuredBuffer<uint> PrimitiveIDPrefixSum;
+
 // Inputs / Outputs
 
 layout(binding = FORK_RESTIR_PT_BINDING_PARITY_INPUT_OUTPUT)
 RWStructuredBuffer<float4> RestirPtParityBuffer;
+
+// Outputs
+
+layout(rgba16f, binding = FORK_RESTIR_PT_BINDING_INDIRECT_RADIANCE_HIT_DISTANCE_OUTPUT)
+RWTexture2D<float4> IndirectRadianceHitDistance;
+
+// Note: included HERE, not at the top of the file. RestirPtReservoir lives
+// behind rtx/algorithm/rtxdi/rtxdi.slangh (for RAB_RandomSamplerState), and the
+// RTXDI bridge reads the primary G-buffer globals declared above by name under
+// RAB_HAS_CURRENT_GBUFFER -- so it has to be pulled in after them, exactly the
+// ordering the phase 1 shader already relied on for lighting.slangh.
+#include "rtx/algorithm/fork_restir_pt/restir_pt_reservoir.slangh"
+
+layout(binding = FORK_RESTIR_PT_BINDING_RESERVOIR_OUTPUT)
+RWStructuredBuffer<RestirPtReservoir> RestirPtReservoirBuffer;
