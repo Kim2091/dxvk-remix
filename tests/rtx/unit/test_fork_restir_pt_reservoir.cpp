@@ -3090,8 +3090,24 @@ namespace dxvk {
         mirror::vec3(0.0f), centralF[1], centralF[2]
       };
 
-      auto runLoop = [&](const std::vector<mirror::vec3>& reevalF, float historyLength,
-                         bool useStoredHistoryTarget, int frames, int chains, uint64_t seed,
+      // The CENTRAL target's two evaluators. `centralExact` is the shift agreeing
+      // with the trace -- everywhere debug view 887 is black. `centralUnderReports`
+      // is the 887 residual population: the shift returns 82% of what the trace
+      // stored on one path, a fraction rather than the ~2x the temporal split had.
+      // That single number is what turns a runaway you cannot miss into one that
+      // takes ~10 seconds to become visible.
+      const std::vector<mirror::vec3> centralExact = centralF;
+      const std::vector<mirror::vec3> centralUnderReports = {
+        centralF[0], mirror::vec3(0.164f, 1.64f, 0.082f), centralF[2]
+      };
+
+      // centralReevalF is what the SHIFT evaluator returns for the central target;
+      // centralF is what the TRACE stored. They coincide wherever debug view 887 is
+      // black, and the residual population is where they do not -- see (t).
+      auto runLoop = [&](const std::vector<mirror::vec3>& reevalF,
+                         const std::vector<mirror::vec3>& centralReevalF, float historyLength,
+                         bool useStoredHistoryTarget, bool useStoredCentralTarget,
+                         int frames, int chains, uint64_t seed,
                          std::vector<double>& frameMean) {
         frameMean.assign(size_t(frames), 0.0);
         FeedbackRng rng(seed);
@@ -3138,21 +3154,33 @@ namespace dxvk {
               float pSum = 0.0f;
               float pSelf = 0.0f;
 
+              // THE CENTRAL-SIDE SLOT. Pre-fix this read the stored trace integrand
+              // while the temporal candidate's denominator below read the shift's
+              // re-evaluation of the same target -- two evaluators, one target, and
+              // the surplus compounds exactly as the temporal-side split did, only
+              // slower because the disagreement is a fraction rather than ~2x.
+              const mirror::vec3 canonicalTarget = useStoredCentralTarget
+                ? canonical.F
+                : centralReevalF[canonicalPath];
+
               if (possible) {
-                pSelf = mirror::RestirPtReservoir::computeWeight(canonical.F, false) * currentM;
+                pSelf = mirror::RestirPtReservoir::computeWeight(canonicalTarget, false) * currentM;
                 pSum = pSelf;
                 pSum += mirror::RestirPtReservoir::computeWeight(reevalF[canonicalPath], false) *
                         temporal.M;
               }
 
               const float misWeight = (pSum == 0.0f) ? 0.0f : (pSelf / pSum);
-              dst.mergeWithResamplingMIS(canonical.F, 1.0f, canonical, rng.next(), misWeight, false);
+              // F serves double duty as radiance and target, and finalizeGRIS
+              // normalises by toScalar(F), so the merged integrand must be the same
+              // evaluator the weight used.
+              dst.mergeWithResamplingMIS(canonicalTarget, 1.0f, canonical, rng.next(), misWeight, false);
             }
 
             // --- i = prevSampleId -----------------------------------------
             {
               mirror::RestirPtReservoir temp = dst;
-              const mirror::vec3 shiftedIntegrand = centralF[temporalPath];
+              const mirror::vec3 shiftedIntegrand = centralReevalF[temporalPath];
               const float dstJacobian = 1.0f;
 
               const bool selected = temp.merge(shiftedIntegrand, dstJacobian, temporal,
@@ -3211,7 +3239,7 @@ namespace dxvk {
       // exactly unbiased, no growth.
       {
         std::vector<double> mean;
-        runLoop(reevalAllFail, 20.0f, false, frames, 120000, 0x51CA9E1Dull, mean);
+        runLoop(reevalAllFail, centralExact, 20.0f, false, false, frames, 120000, 0x51CA9E1Dull, mean);
 
         const double early = windowMean(mean, 0, 4);
         const double late = windowMean(mean, 40, 59);
@@ -3228,7 +3256,7 @@ namespace dxvk {
       // the healthy paths, the partition still holds, still no growth.
       {
         std::vector<double> mean;
-        runLoop(reevalPartialFail, 20.0f, false, frames, 120000, 0xB0BAFE77ull, mean);
+        runLoop(reevalPartialFail, centralExact, 20.0f, false, false, frames, 120000, 0xB0BAFE77ull, mean);
 
         const double early = windowMean(mean, 0, 4);
         const double late = windowMean(mean, 40, 59);
@@ -3247,7 +3275,7 @@ namespace dxvk {
       // at frame 59, limit 21x.
       {
         std::vector<double> mean;
-        runLoop(reevalAllFail, 20.0f, true, frames, 40000, 0xDEAD10CCull, mean);
+        runLoop(reevalAllFail, centralExact, 20.0f, true, false, frames, 40000, 0xDEAD10CCull, mean);
 
         const double first = mean[0];
         const double ramp = windowMean(mean, 17, 21);   // predicted ~10.5-11.5
@@ -3265,12 +3293,72 @@ namespace dxvk {
       // bisection's "history length 3 mitigates but does not remove".
       {
         std::vector<double> mean;
-        runLoop(reevalAllFail, 3.0f, true, frames, 40000, 0xF00DFACEull, mean);
+        runLoop(reevalAllFail, centralExact, 3.0f, true, false, frames, 40000, 0xF00DFACEull, mean);
 
         const double late = windowMean(mean, 40, 59);
 
         check(late > truthX * 3.4 && late < truthX * 4.4,
               "s: [stored, all-fail, H 3] the runaway saturates at ~4x, not ~21x");
+      }
+
+      // THE CENTRAL-SIDE SPLIT -- a REAL second inconsistency, MEASURED AND
+      // BOUNDED, and deliberately NOT fixed in the shader. This block exists so
+      // nobody spends another round chasing it.
+      //
+      // The central target has the identical two-evaluator structure the temporal
+      // one had: the canonical candidate's numerator reads the STORED trace
+      // integrand while the temporal candidate's MIS denominator reads the shift's
+      // re-evaluation of the same target. Debug view 887 is the measurement of how
+      // far those two are apart, and it is black on ordinary opaque surfaces, so
+      // the disagreement is confined to its documented residual -- foliage and
+      // thin-translucent, alpha-tested geometry, back-facing rebuilt vertices.
+      //
+      // The reason to model it and then walk away is the MAGNITUDE, which is the
+      // whole point. With an 18% disagreement on one path of three the loop grows
+      // about 1.5% per 60 frames. Extrapolated at 44 fps that is roughly 12% over
+      // ten seconds -- about twenty times too weak to be an in-game white-out, and
+      // the "fix" (routing the canonical numerator AND the merged contribution
+      // through a fourth self-shift, since F is both radiance and target here and
+      // finalizeGRIS normalises by it) costs a fourth visibility ray per pixel
+      // while trading that surplus for a deficit of comparable size.
+      //
+      // So: real, bounded, not worth a ray. If a future change makes the 887
+      // residual much larger, re-read this -- the bound below is what would move.
+      {
+        std::vector<double> storedMean;
+        runLoop(reevalPartialFail, centralUnderReports, 20.0f, false, true, frames, 40000,
+                0xC0FFEE11ull, storedMean);
+
+        std::vector<double> fixedMean;
+        runLoop(reevalPartialFail, centralUnderReports, 20.0f, false, false, frames, 40000,
+                0xC0FFEE11ull, fixedMean);
+
+        const double storedEarly = windowMean(storedMean, 0, 4);
+        const double storedLate = windowMean(storedMean, 50, 59);
+        const double fixedEarly = windowMean(fixedMean, 0, 4);
+        const double fixedLate = windowMean(fixedMean, 50, 59);
+
+        const double storedGrowth = storedLate / storedEarly;
+        const double fixedGrowth = fixedLate / fixedEarly;
+
+        // It IS an inflation, and it IS caused by the split: routing both slots
+        // through one evaluator grows strictly less.
+        check(storedGrowth > 1.0, "s: [central split] the stored-target loop does inflate");
+        check(storedGrowth > fixedGrowth,
+              "s: [central split] and inflates strictly more than the consistent-target form");
+
+        // AND IT IS SMALL. This is the assertion that retires the hypothesis: an
+        // 18% evaluator disagreement cannot compound fast enough to white out a
+        // frame in ten seconds. If this ever fires, the bound has moved and the
+        // trade-off above deserves re-costing.
+        check(storedGrowth < 1.05,
+              "s: [central split] growth over 60 frames stays under 5% - far too slow to be the in-game symptom");
+
+        // The discriminator against the temporal-side split, so the two mechanisms
+        // can never be confused: the temporal split is already ~1.5x on the FIRST
+        // reused frame; this one is indistinguishable from the truth there.
+        checkClose(float(storedEarly), float(truthX),
+                   "s: [central split] early frames are still at the truth - a SLOW ramp, not a jump", 0.03f);
       }
     }
 
