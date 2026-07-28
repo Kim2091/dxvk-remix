@@ -4030,4 +4030,44 @@ is still the Enhanced paper's 96 -> 64 B reservoir compression.
 - **Not touched:** `meson.build` (shaders auto-discover; no new host files).
 - **`RtxOptions.md`** - REGEN STILL PENDING, now ~19 `rtx.restirPT.*` rows.
 
+**AMENDMENT (fork - 2026-07-28): the phase 4 temporal pass shipped with an energy runaway, fixed
+in a follow-up commit. Read this before trusting the Talbot description above.**
+
+The Talbot loop transcribed `TemporalReuse.cs.slang:192` literally, feeding the temporal
+candidate's MIS numerator from the STORED history integrand while the canonical candidate's MIS
+denominator fed from a RE-EVALUATION of the same target through the central -> temporal shift.
+That is sound in the reference, whose temporal surface is the true previous-frame surface, so
+storage and re-evaluation are one function. It is not sound here, where the temporal surface is
+RECONSTRUCTED: the re-evaluation traces from a rebuilt origin and evaluates a borrowed material,
+and can report zero for a path the real previous surface held. The canonical weight then becomes 1
+while the temporal weight keeps ~M_T/(M_T+M_C), the pair sums to nearly 2, the surplus is written
+to the history page, and next frame it is multiplied again. **The fixed point is
+ times the truth** - 21x at the default, which is the in-game white-out,
+and 4x at history 3, which is why lowering that knob only ever mitigated it.
+
+The fix is **the consistent-target rule**: the stored history integrand is never used as a target
+value. It stays the temporal candidate's sample payload and rides its unbiased contribution
+weight, but every target evaluation of the temporal domain - numerator and denominator alike - goes
+through `restirPtComputeShiftedIntegrandReconnection` against the reconstructed temporal surface,
+the numerator via a self-shift of the history path. Both usages are then one function by
+construction and the weights partition unity for ANY reconstruction error, known or unknown. That
+insensitivity is the point: the reconstruction is an approximation by necessity, so any fix that
+depended on it being accurate would be one bug away from the same runaway. Costs a third shift and
+a third visibility ray per pixel. Residual is a bounded DEFICIT (never a surplus) on paths the
+re-evaluation claims that the true history could not hold.
+
+**The generalisable lesson, and it is not specific to ReSTIR PT:** a resampling MIS weight is a
+ratio of target functions, and *any* two evaluators for the same target - a cached value and a
+re-derivation, a stored G-buffer and a rebuild - will eventually disagree. When the result feeds
+back into its own input, a disagreement of a few percent does not stay a few percent. Unit test
+group (p) verified this exact arithmetic and could not see it, because it used identity shifts,
+where storage and re-evaluation are the same number by construction. Groups (r) and (s) close that:
+(r) gives them separate tables and enumerates both semantics against closed forms, (s) iterates the
+feedback loop 60 frames and asserts no growth.
+
+Debug view **889 gained a YELLOW state** - accepted pixels where the stored and re-evaluated
+targets disagree about the path being possible. Pre-fix those were the runaway regions; post-fix
+they are pixels where the temporal candidate declines, so a yellow-heavy view now means the surface
+reconstruction is starving reuse, not that energy is wrong.
+
 ---

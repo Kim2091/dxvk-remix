@@ -2418,7 +2418,14 @@ namespace dxvk {
 
                   if (selected) {
                     pSum = mirror::RestirPtReservoir::computeWeight(temp.F, false) * currentM;
-                    pSelf = mirror::RestirPtReservoir::computeWeight(temporalReservoir.F, false) /
+                    // Mirrors THE THIRD SHIFT (the consistent-target rule): the shader
+                    // re-evaluates the history path's target on the reconstructed
+                    // temporal surface instead of reading temporalReservoir.F. In this
+                    // test's identity world the re-evaluation IS the stored value
+                    // (c.temporalF[temporalPath] == temporalReservoir.F by
+                    // construction), which is exactly the blind spot group (r) covers
+                    // with an adversarial re-evaluation table.
+                    pSelf = mirror::RestirPtReservoir::computeWeight(c.temporalF[temporalPath], false) /
                             dstJacobian * temporalReservoir.M;
                     pSum += pSelf;
                   }
@@ -2573,6 +2580,700 @@ namespace dxvk {
       }
     }
 
+    // -----------------------------------------------------------------------
+    // (r) PHASE 4 FIX: TALBOT STAYS UNBIASED UNDER AN ASYMMETRIC SHIFT FAILURE.
+    //
+    // The blind spot of (p), closed. (p) verified the Talbot arithmetic with
+    // IDENTITY shifts, where the stored history integrand and its re-evaluation
+    // on the temporal surface are the same number by construction -- so it could
+    // not see the in-game energy runaway, whose mechanism is exactly their
+    // disagreement. Here the two are separate tables:
+    //
+    //   temporalTrueF[j]  what the REAL previous surface computed -- the stored
+    //                     history integrand, and the history pixel's true target.
+    //   reevalF[j]        what the RECONSTRUCTED temporal surface computes when
+    //                     the shift machinery re-evaluates path j against it
+    //                     (visibility ray from the rebuilt origin, borrowed
+    //                     material). q_T in the shader's terms.
+    //
+    // The PRE-FIX shader mixed them: the canonical candidate's MIS denominator
+    // used reevalF while the temporal candidate's numerator used temporalTrueF.
+    // Where reevalF spuriously reports zero (the visibility ray from the rebuilt
+    // origin fails) the canonical weight becomes 1 while the temporal weight
+    // stays ~M_T/(M_T+M_C): the weights sum to nearly 2 and the estimator
+    // inflates. The FIXED shader (THE CONSISTENT-TARGET RULE) computes both from
+    // reevalF, so the weights partition unity for ANY disagreement.
+    //
+    // Both semantics are enumerated here, each against its own closed-form
+    // prediction, so the test permanently locks BOTH that the fix is exact and
+    // that the pre-fix arithmetic inflates by the predicted amount -- the
+    // mechanism stays pinned even after the code that had it is gone.
+    //
+    //   assert  E[F_c(Y) * W_out]  ==  SUM_j (m_C(j) + m_T(j)) F_c(j) / p_j
+    //
+    // with, per path j (currentM == 1, J_j == |d central / d temporal|):
+    //   cM        = phat_c(j)                          [central target]
+    //   qTerm     = phat_reeval(j) / J_j * M_T         [re-evaluated, both slots, FIXED]
+    //   sTerm     = phat_stored(j) / J_j * M_T         [stored, numerator slot, PRE-FIX]
+    //   m_C(j)    = cM / (cM + qTerm)
+    //   m_T(j)    = num / (cM + num),  num = qTerm (fixed) or sTerm (pre-fix),
+    //               and 0 unless the history can hold j and the t->c shift lands.
+    //
+    // FIXED semantics therefore satisfies m_C + m_T == 1 wherever the temporal
+    // candidate is live, i.e. E == SUM_j F_c(j)/p_j exactly -- EXCEPT on
+    // "overclaim" paths (reevalF > 0 where temporalTrueF == 0): there the
+    // temporal candidate cannot exist, m_C < 1 discounts the canonical with no
+    // compensation, and the estimator shows the DECLARED residual deficit --
+    // asserted numerically below, never a surplus.
+    //
+    // The temporal candidates are built over p'_j = p_j * J_j, which is what "the
+    // same underlying paths, parametrised in the temporal domain's measure" means
+    // in a discrete mirror; it is exactly the condition under which the shifted
+    // UCW bookkeeping closes, and it makes the /dstJacobian in pSelf and the
+    // *1/J in the canonical's denominator load-bearing rather than decorative.
+    // -----------------------------------------------------------------------
+    void testTalbotAsymmetricShiftIsUnbiased() {
+      struct Outcome {
+        int index = 0;
+        double probability = 0.0;
+        mirror::RestirPtReservoir reservoir;
+      };
+
+      // The same exhaustive streaming build (p) uses.
+      auto buildPixel = [](const std::vector<mirror::vec3>& F, const std::vector<float>& p) {
+        std::vector<Outcome> outcomes;
+
+        mirror::RestirPtReservoir reference;
+        reference.init();
+        for (size_t j = 0; j < F.size(); ++j) {
+          reference.add(F[j], p[j], 1.0f);
+        }
+
+        const float wSum = reference.weight;
+
+        for (size_t j = 0; j < F.size(); ++j) {
+          const float w = mirror::RestirPtReservoir::toScalar(F[j]) / p[j];
+          if (!(w > 0.0f)) { continue; }
+
+          Outcome o;
+          o.index = int(j);
+          o.probability = double(w) / double(wSum);
+
+          o.reservoir.init();
+          o.reservoir.F = F[j];
+          o.reservoir.weight = wSum;
+          o.reservoir.M = 1.0f;
+          o.reservoir.srcPixel = uint32_t(j);
+          mirror::pathBuilderFinalize(o.reservoir);
+          o.reservoir.finalizeRIS();
+
+          outcomes.push_back(o);
+        }
+
+        return outcomes;
+      };
+
+      const std::vector<mirror::vec3> centralF = {
+        mirror::vec3(1.0f, 0.5f, 0.25f), mirror::vec3(0.2f, 2.0f, 0.1f), mirror::vec3(0.7f, 0.7f, 3.0f)
+      };
+      const std::vector<float> p = { 1.0f, 0.8f, 0.5f };
+
+      const std::vector<mirror::vec3> faithful = {
+        mirror::vec3(0.8f, 0.6f, 0.30f), mirror::vec3(0.3f, 1.4f, 0.2f), mirror::vec3(0.5f, 0.9f, 2.1f)
+      };
+
+      struct Case {
+        const char* name;
+        std::vector<mirror::vec3> temporalTrueF;
+        std::vector<mirror::vec3> reevalF;
+        std::vector<float> jacobian;
+      };
+
+      std::vector<Case> cases;
+
+      // The in-game mechanism: the re-evaluation spuriously reports one path
+      // impossible (a visibility ray from the rebuilt origin self-intersects).
+      cases.push_back({
+        "spurious re-evaluation failure",
+        faithful,
+        { mirror::vec3(0.0f), faithful[1], faithful[2] },
+        { 1.0f, 1.0f, 1.0f }
+      });
+
+      // The whole surface is broken: every re-evaluation returns zero. The fixed
+      // pass must degenerate to the canonical sample at weight 1 -- unbiased.
+      cases.push_back({
+        "surface-wide re-evaluation failure",
+        faithful,
+        { mirror::vec3(0.0f), mirror::vec3(0.0f), mirror::vec3(0.0f) },
+        { 1.0f, 1.0f, 1.0f }
+      });
+
+      // A continuous 2x underestimate (material drift, wrong mip): not a support
+      // change, still an asymmetry the pre-fix mixing turns into energy.
+      cases.push_back({
+        "re-evaluation underestimates 2x",
+        faithful,
+        { mirror::vec3(0.4f, 0.3f, 0.15f), mirror::vec3(0.15f, 0.7f, 0.1f), mirror::vec3(0.25f, 0.45f, 1.05f) },
+        { 1.0f, 1.0f, 1.0f }
+      });
+
+      // The converse disagreement: the re-evaluation CLAIMS a path the real
+      // history could never hold. This is the fix's declared residual -- a
+      // deficit, asserted exactly, never a surplus.
+      cases.push_back({
+        "re-evaluation overclaims a dead path",
+        { mirror::vec3(0.1f, 0.1f, 0.1f), mirror::vec3(0.0f), mirror::vec3(3.0f, 1.0f, 0.5f) },
+        { mirror::vec3(0.1f, 0.1f, 0.1f), mirror::vec3(0.3f, 1.4f, 0.2f), mirror::vec3(3.0f, 1.0f, 0.5f) },
+        { 1.0f, 1.0f, 1.0f }
+      });
+
+      // Non-unit Jacobians plus a spurious failure: catches a dropped
+      // /dstJacobian in pSelf or a dropped *1/J in the canonical's denominator.
+      cases.push_back({
+        "spurious failure under non-unit Jacobians",
+        faithful,
+        { faithful[0], faithful[1], mirror::vec3(0.0f) },
+        { 1.0f, 2.0f, 0.25f }
+      });
+
+      const std::vector<float> historyMs = { 1.0f, 3.0f, 20.0f, 200.0f };
+
+      // Closed-form prediction of the enumerated estimator, either semantics.
+      auto predict = [&](const Case& c, float historyM, bool useStoredHistoryTarget,
+                         double& outX, double& outY, double& outZ) {
+        outX = outY = outZ = 0.0;
+        for (size_t j = 0; j < centralF.size(); ++j) {
+          const double cM = double(mirror::RestirPtReservoir::toScalar(centralF[j])) * 1.0;
+          const double qTerm = double(mirror::RestirPtReservoir::toScalar(c.reevalF[j])) /
+                               double(c.jacobian[j]) * double(historyM);
+          const double sTerm = double(mirror::RestirPtReservoir::toScalar(c.temporalTrueF[j])) /
+                               double(c.jacobian[j]) * double(historyM);
+
+          const double mC = (cM > 0.0) ? cM / (cM + qTerm) : 0.0;
+
+          const bool historyCanHold = mirror::RestirPtReservoir::toScalar(c.temporalTrueF[j]) > 0.0f;
+          const bool shiftLands = mirror::RestirPtReservoir::toScalar(centralF[j]) > 0.0f && c.jacobian[j] > 0.0f;
+
+          double mT = 0.0;
+          if (historyCanHold && shiftLands) {
+            const double num = useStoredHistoryTarget ? sTerm : qTerm;
+            mT = (num > 0.0) ? num / (cM + num) : 0.0;
+          }
+
+          const double share = mC + mT;
+          outX += share * double(centralF[j].x) / double(p[j]);
+          outY += share * double(centralF[j].y) / double(p[j]);
+          outZ += share * double(centralF[j].z) / double(p[j]);
+        }
+      };
+
+      // The enumerated Talbot combine, (p)'s harness with the two-table split.
+      auto enumerate = [&](const Case& c, float historyM, bool useStoredHistoryTarget,
+                           double& totalProbability, double& eX, double& eY, double& eZ) {
+        std::vector<float> temporalP(p.size());
+        for (size_t j = 0; j < p.size(); ++j) { temporalP[j] = p[j] * c.jacobian[j]; }
+
+        const std::vector<Outcome> centralOutcomes = buildPixel(centralF, p);
+        const std::vector<Outcome> temporalOutcomes = buildPixel(c.temporalTrueF, temporalP);
+
+        totalProbability = 0.0;
+        eX = eY = eZ = 0.0;
+
+        for (const Outcome& central : centralOutcomes) {
+          for (const Outcome& temporalRaw : temporalOutcomes) {
+            const double jointProbability = central.probability * temporalRaw.probability;
+
+            const mirror::RestirPtReservoir centralReservoir = central.reservoir;
+            const int centralPath = central.index;
+
+            mirror::RestirPtReservoir temporalReservoir = temporalRaw.reservoir;
+            const int temporalPath = temporalRaw.index;
+
+            const float currentM = centralReservoir.M;
+            temporalReservoir.M = historyM;
+
+            struct MergeState { mirror::RestirPtReservoir dst; double probability; };
+
+            std::vector<MergeState> states;
+            {
+              MergeState s;
+              s.dst.init();
+              s.probability = 1.0;
+              states.push_back(s);
+            }
+
+            // --- i = curSampleId --------------------------------------------
+            {
+              const mirror::RestirPtReservoir tempDst = centralReservoir;
+              const bool possible = tempDst.weight > 0.0f;
+
+              float pSum = 0.0f;
+              float pSelf = 0.0f;
+
+              if (possible) {
+                pSelf = mirror::RestirPtReservoir::computeWeight(tempDst.F, false) * currentM;
+                pSum = pSelf;
+
+                // The central -> temporal re-evaluation: reevalF, times the
+                // c->t Jacobian 1/J_j. Both semantics use this term -- the
+                // pre-fix bug was never here.
+                pSum += mirror::RestirPtReservoir::computeWeight(c.reevalF[centralPath], false) *
+                        (1.0f / c.jacobian[centralPath]) * temporalReservoir.M;
+              }
+
+              const float misWeight = (pSum == 0.0f) ? 0.0f : (pSelf / pSum);
+
+              std::vector<MergeState> next;
+
+              for (const MergeState& s : states) {
+                const float w = mirror::RestirPtReservoir::toScalar(tempDst.F) * 1.0f *
+                                tempDst.weight * misWeight;
+                const float wSumAfter = s.dst.weight + w;
+                const double pAccept = (!(w > 0.0f) || std::isnan(w))
+                  ? 0.0 : std::min(1.0, double(w) / double(wSumAfter));
+
+                if (pAccept > 0.0) {
+                  MergeState accepted = s;
+                  accepted.dst.mergeWithResamplingMIS(tempDst.F, 1.0f, tempDst, 0.0f, misWeight, false);
+                  accepted.probability = s.probability * pAccept;
+                  next.push_back(accepted);
+                }
+
+                if (pAccept < 1.0) {
+                  MergeState rejected = s;
+                  rejected.dst.mergeWithResamplingMIS(tempDst.F, 1.0f, tempDst, 1.0f, misWeight, false);
+                  rejected.probability = s.probability * (1.0 - pAccept);
+                  next.push_back(rejected);
+                }
+              }
+
+              states = next;
+            }
+
+            // --- i = prevSampleId -------------------------------------------
+            {
+              std::vector<MergeState> next;
+
+              for (const MergeState& s : states) {
+                // THE FIRST SHIFT, temporal -> central: lands on the central
+                // pixel's integrand for that path, with the t->c Jacobian J_j.
+                // Evaluated at the REAL central surface, so it is faithful.
+                const mirror::vec3 shiftedIntegrand = centralF[temporalPath];
+                const float dstJacobian = c.jacobian[temporalPath];
+
+                mirror::RestirPtReservoir temp = s.dst;
+                const bool selected = temp.merge(shiftedIntegrand, dstJacobian, temporalReservoir,
+                                                 /*acceptRnd=*/ 0.0f, /*misWeight=*/ 1.0f, /*forceAdd=*/ true);
+                if (!selected) { temp.F = mirror::vec3(); }
+                temp.M = temporalReservoir.M;
+                temp.weight = temporalReservoir.weight;
+
+                float pSum = 0.0f;
+                float pSelf = 0.0f;
+
+                if (selected) {
+                  pSum = mirror::RestirPtReservoir::computeWeight(temp.F, false) * currentM;
+
+                  // THE CONTESTED SLOT. Fixed semantics: THE THIRD SHIFT's
+                  // re-evaluation (reevalF, self-Jacobian 1). Pre-fix semantics:
+                  // the stored history integrand. The entire energy-runaway bug
+                  // is this one line's choice of table.
+                  const float selfTarget = useStoredHistoryTarget
+                    ? mirror::RestirPtReservoir::computeWeight(temporalReservoir.F, false)
+                    : mirror::RestirPtReservoir::computeWeight(c.reevalF[temporalPath], false);
+
+                  pSelf = selfTarget / dstJacobian * temporalReservoir.M;
+                  pSum += pSelf;
+                }
+
+                const float misWeight = (pSum == 0.0f) ? 0.0f : (pSelf / pSum);
+
+                const float w = mirror::RestirPtReservoir::toScalar(temp.F) * dstJacobian *
+                                temp.weight * misWeight;
+                const float wSumAfter = s.dst.weight + w;
+                const double pAccept = (!(w > 0.0f) || std::isnan(w))
+                  ? 0.0 : std::min(1.0, double(w) / double(wSumAfter));
+
+                if (pAccept > 0.0) {
+                  MergeState accepted = s;
+                  accepted.dst.mergeWithResamplingMIS(temp.F, dstJacobian, temp, 0.0f, misWeight, false);
+                  accepted.probability = s.probability * pAccept;
+                  next.push_back(accepted);
+                }
+
+                if (pAccept < 1.0) {
+                  MergeState rejected = s;
+                  rejected.dst.mergeWithResamplingMIS(temp.F, dstJacobian, temp, 1.0f, misWeight, false);
+                  rejected.probability = s.probability * (1.0 - pAccept);
+                  next.push_back(rejected);
+                }
+              }
+
+              states = next;
+            }
+
+            for (MergeState& s : states) {
+              if (s.dst.weight > 0.0f) { s.dst.finalizeGRIS(); }
+
+              if (s.dst.weight < 0.0f) { s.dst.weight = 0.0f; }
+              if (std::isnan(s.dst.weight) || std::isinf(s.dst.weight)) { s.dst.weight = 0.0f; }
+
+              const double probability = jointProbability * s.probability;
+
+              totalProbability += probability;
+              eX += probability * double(s.dst.F.x) * double(s.dst.weight);
+              eY += probability * double(s.dst.F.y) * double(s.dst.weight);
+              eZ += probability * double(s.dst.F.z) * double(s.dst.weight);
+            }
+          }
+        }
+      };
+
+      // The unbiased target.
+      double truthX = 0.0, truthY = 0.0, truthZ = 0.0;
+      for (size_t j = 0; j < centralF.size(); ++j) {
+        truthX += double(centralF[j].x) / double(p[j]);
+        truthY += double(centralF[j].y) / double(p[j]);
+        truthZ += double(centralF[j].z) / double(p[j]);
+      }
+
+      for (const Case& c : cases) {
+        bool hasOverclaim = false;
+        bool hasUnderclaim = false;
+        for (size_t j = 0; j < centralF.size(); ++j) {
+          const float stored = mirror::RestirPtReservoir::toScalar(c.temporalTrueF[j]);
+          const float reeval = mirror::RestirPtReservoir::toScalar(c.reevalF[j]);
+          if (reeval > 0.0f && stored == 0.0f) { hasOverclaim = true; }
+          if (reeval < stored) { hasUnderclaim = true; }
+        }
+
+        for (const float historyM : historyMs) {
+          for (const bool useStored : { false, true }) {
+            double predX = 0.0, predY = 0.0, predZ = 0.0;
+            predict(c, historyM, useStored, predX, predY, predZ);
+
+            double totalProbability = 0.0, eX = 0.0, eY = 0.0, eZ = 0.0;
+            enumerate(c, historyM, useStored, totalProbability, eX, eY, eZ);
+
+            const std::string label = str::format(
+              "r: [", c.name, ", M_T ", int(historyM), ", ", useStored ? "stored" : "fixed", "] ");
+
+            checkClose(float(totalProbability), 1.0f,
+                       (label + "outcome probabilities sum to 1").c_str(), 1e-4f);
+            checkClose(float(eX), float(predX),
+                       (label + "E[F.x * W] matches the closed-form prediction").c_str(), 1e-3f);
+            checkClose(float(eY), float(predY),
+                       (label + "E[F.y * W] matches the closed-form prediction").c_str(), 1e-3f);
+            checkClose(float(eZ), float(predZ),
+                       (label + "E[F.z * W] matches the closed-form prediction").c_str(), 1e-3f);
+
+            if (!useStored) {
+              if (!hasOverclaim) {
+                // The fix's guarantee: exact unbiasedness under ANY underclaiming
+                // disagreement, including total failure.
+                checkClose(float(eX), float(truthX), (label + "E[F.x * W] == sum F_c.x / p").c_str(), 1e-3f);
+                checkClose(float(eY), float(truthY), (label + "E[F.y * W] == sum F_c.y / p").c_str(), 1e-3f);
+                checkClose(float(eZ), float(truthZ), (label + "E[F.z * W] == sum F_c.z / p").c_str(), 1e-3f);
+              } else {
+                // The declared residual: a deficit, exactly (1 - m_C) of each
+                // dead-but-claimed path's canonical share, and NEVER a surplus.
+                double deficitX = 0.0, deficitY = 0.0, deficitZ = 0.0;
+                for (size_t j = 0; j < centralF.size(); ++j) {
+                  const float stored = mirror::RestirPtReservoir::toScalar(c.temporalTrueF[j]);
+                  const float reeval = mirror::RestirPtReservoir::toScalar(c.reevalF[j]);
+                  if (!(reeval > 0.0f && stored == 0.0f)) { continue; }
+
+                  const double cM = double(mirror::RestirPtReservoir::toScalar(centralF[j]));
+                  const double qTerm = double(reeval) / double(c.jacobian[j]) * double(historyM);
+                  const double mC = cM / (cM + qTerm);
+
+                  deficitX += (1.0 - mC) * double(centralF[j].x) / double(p[j]);
+                  deficitY += (1.0 - mC) * double(centralF[j].y) / double(p[j]);
+                  deficitZ += (1.0 - mC) * double(centralF[j].z) / double(p[j]);
+                }
+
+                checkClose(float(eX), float(truthX - deficitX),
+                           (label + "the declared residual is exactly the dead-path deficit (x)").c_str(), 1e-3f);
+                checkClose(float(eY), float(truthY - deficitY),
+                           (label + "the declared residual is exactly the dead-path deficit (y)").c_str(), 1e-3f);
+                checkClose(float(eZ), float(truthZ - deficitZ),
+                           (label + "the declared residual is exactly the dead-path deficit (z)").c_str(), 1e-3f);
+                check(eX <= truthX + 1e-6 && eY <= truthY + 1e-6 && eZ <= truthZ + 1e-6,
+                      (label + "the residual is a deficit, never a surplus").c_str());
+              }
+            } else {
+              if (hasUnderclaim) {
+                // The pre-fix mechanism, permanently pinned: mixing the stored
+                // numerator with the re-evaluated denominator INFLATES.
+                check(eX > truthX + 1e-4 * std::max(1.0, truthX),
+                      (label + "stored-target semantics inflates E[F.x * W] above the truth").c_str());
+              }
+            }
+          }
+        }
+      }
+
+      // One hand-derived anchor, so the magnitude is pinned by arithmetic done
+      // OUTSIDE the code under test (the project's magnitude-discipline rule).
+      // Case "spurious re-evaluation failure", M_T = 20, stored semantics,
+      // channel x: only path 0 is poisoned, so
+      //   excess = m_T_old(0) * F_c(0).x / p_0
+      //   phat_c(0)      = 0.299*1.0 + 0.587*0.5 + 0.114*0.25 = 0.62100
+      //   phat_stored(0) = 0.299*0.8 + 0.587*0.6 + 0.114*0.30 = 0.62560
+      //   m_T_old(0)     = 0.6256*20 / (0.621 + 0.6256*20)    = 0.952726
+      //   E_old.x        = 2.65 + 0.952726 * 1.0/1.0          = 3.602726
+      {
+        const Case& c = cases[0];
+        double predX = 0.0, predY = 0.0, predZ = 0.0;
+        predict(c, 20.0f, true, predX, predY, predZ);
+        checkClose(float(predX), 3.602726f,
+                   "r: hand-derived pre-fix inflation anchor (spurious failure, M_T 20, x)", 1e-4f);
+      }
+    }
+
+    // -----------------------------------------------------------------------
+    // (s) PHASE 4 FIX: THE TEMPORAL FEEDBACK LOOP DOES NOT GROW.
+    //
+    // The test that would have caught the in-game runaway, and the one that
+    // proves it is gone. The output reservoir is fed back as the next frame's
+    // temporal candidate for 60 frames -- M-cap dynamics included -- under a
+    // re-evaluation table that spuriously reports paths impossible, and the
+    // estimator's per-frame mean is measured against the truth.
+    //
+    // FIXED semantics: flat at the truth, every frame, for any failure table --
+    // the partition of unity holds pointwise, so no per-frame factor exceeds 1.
+    //
+    // STORED (pre-fix) semantics, full failure table: the mean follows the
+    // deterministic ramp
+    //     r_f = 1.5 + 0.5 f                     while M_T ramps (f <= 19)
+    //     r_f = 21 - 10 * (20/21)^(f-19)        once M_T saturates at 20
+    // i.e. ~1.5x on the first reused frame, ~11x by frame 19, ~19.6x by frame
+    // 59, converging to 1 + historyLength = 21x. At historyLength 3 the fixed
+    // point is 4x -- the numeric shape of the in-game bisection result "history
+    // length 3 mitigates the symptom but does not remove it".
+    // -----------------------------------------------------------------------
+    struct FeedbackRng {
+      uint64_t state;
+      explicit FeedbackRng(uint64_t seed) : state(seed) { }
+
+      // splitmix64, folded to a 24-bit mantissa in [0, 1). Deterministic across
+      // platforms, unlike std::uniform_real_distribution.
+      float next() {
+        state += 0x9E3779B97F4A7C15ull;
+        uint64_t z = state;
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+        z ^= (z >> 31);
+        return float(uint32_t((z >> 40) & 0xFFFFFFu)) * (1.0f / 16777216.0f);
+      }
+    };
+
+    void testTemporalFeedbackLoopDoesNotGrow() {
+      const std::vector<mirror::vec3> centralF = {
+        mirror::vec3(1.0f, 0.5f, 0.25f), mirror::vec3(0.2f, 2.0f, 0.1f), mirror::vec3(0.7f, 0.7f, 3.0f)
+      };
+      const std::vector<float> p = { 1.0f, 0.8f, 0.5f };
+
+      double truthX = 0.0;
+      for (size_t j = 0; j < centralF.size(); ++j) {
+        truthX += double(centralF[j].x) / double(p[j]);
+      }
+
+      // Identity domain at steady state: a faithful re-evaluation returns the
+      // central integrand. The failure tables corrupt it the way the broken
+      // temporal surface did in-game.
+      const std::vector<mirror::vec3> reevalAllFail = {
+        mirror::vec3(0.0f), mirror::vec3(0.0f), mirror::vec3(0.0f)
+      };
+      const std::vector<mirror::vec3> reevalPartialFail = {
+        mirror::vec3(0.0f), centralF[1], centralF[2]
+      };
+
+      auto runLoop = [&](const std::vector<mirror::vec3>& reevalF, float historyLength,
+                         bool useStoredHistoryTarget, int frames, int chains, uint64_t seed,
+                         std::vector<double>& frameMean) {
+        frameMean.assign(size_t(frames), 0.0);
+        FeedbackRng rng(seed);
+
+        for (int chain = 0; chain < chains; ++chain) {
+          // Frame 0 has no history: the temporal dispatch is skipped in-game
+          // (m_historyValid false) and the trace output becomes the history.
+          mirror::RestirPtReservoir history;
+          int historyPath = -1;
+          {
+            history.init();
+            for (size_t j = 0; j < centralF.size(); ++j) {
+              if (history.add(centralF[j], p[j], rng.next())) { historyPath = int(j); }
+            }
+            history.srcPixel = uint32_t(historyPath);
+            mirror::pathBuilderFinalize(history);
+            history.finalizeRIS();
+          }
+
+          for (int frame = 0; frame < frames; ++frame) {
+            mirror::RestirPtReservoir canonical;
+            canonical.init();
+            int canonicalPath = -1;
+            for (size_t j = 0; j < centralF.size(); ++j) {
+              if (canonical.add(centralF[j], p[j], rng.next())) { canonicalPath = int(j); }
+            }
+            canonical.srcPixel = uint32_t(canonicalPath);
+            mirror::pathBuilderFinalize(canonical);
+            canonical.finalizeRIS();
+
+            const float currentM = canonical.M;
+
+            mirror::RestirPtReservoir temporal = history;
+            const int temporalPath = historyPath;
+            temporal.M = std::min(historyLength * currentM, temporal.M);
+
+            mirror::RestirPtReservoir dst;
+            dst.init();
+
+            // --- i = curSampleId ------------------------------------------
+            {
+              const bool possible = canonical.weight > 0.0f;
+
+              float pSum = 0.0f;
+              float pSelf = 0.0f;
+
+              if (possible) {
+                pSelf = mirror::RestirPtReservoir::computeWeight(canonical.F, false) * currentM;
+                pSum = pSelf;
+                pSum += mirror::RestirPtReservoir::computeWeight(reevalF[canonicalPath], false) *
+                        temporal.M;
+              }
+
+              const float misWeight = (pSum == 0.0f) ? 0.0f : (pSelf / pSum);
+              dst.mergeWithResamplingMIS(canonical.F, 1.0f, canonical, rng.next(), misWeight, false);
+            }
+
+            // --- i = prevSampleId -----------------------------------------
+            {
+              mirror::RestirPtReservoir temp = dst;
+              const mirror::vec3 shiftedIntegrand = centralF[temporalPath];
+              const float dstJacobian = 1.0f;
+
+              const bool selected = temp.merge(shiftedIntegrand, dstJacobian, temporal,
+                                               0.0f, 1.0f, /*forceAdd=*/ true);
+              if (!selected) { temp.F = mirror::vec3(); }
+              temp.M = temporal.M;
+              temp.weight = temporal.weight;
+
+              float pSum = 0.0f;
+              float pSelf = 0.0f;
+
+              if (selected) {
+                pSum = mirror::RestirPtReservoir::computeWeight(temp.F, false) * currentM;
+
+                // THE ONE LINE THE WHOLE FIX IS ABOUT. Pre-fix, this slot read the
+                // STORED history integrand while the canonical candidate's
+                // denominator above read the RE-EVALUATION; where the two disagree
+                // the weights stop summing to 1 and the surplus compounds through
+                // `history = dst` below. Post-fix, both read the re-evaluation.
+                const float selfTarget = useStoredHistoryTarget
+                  ? mirror::RestirPtReservoir::computeWeight(temporal.F, false)
+                  : mirror::RestirPtReservoir::computeWeight(reevalF[temporalPath], false);
+
+                pSelf = selfTarget / dstJacobian * temporal.M;
+                pSum += pSelf;
+              }
+
+              const float misWeight = (pSum == 0.0f) ? 0.0f : (pSelf / pSum);
+              dst.mergeWithResamplingMIS(temp.F, dstJacobian, temp, rng.next(), misWeight, false);
+            }
+
+            if (dst.weight > 0.0f) { dst.finalizeGRIS(); }
+            if (dst.weight < 0.0f || std::isnan(dst.weight) || std::isinf(dst.weight)) {
+              dst.weight = 0.0f;
+            }
+
+            frameMean[size_t(frame)] += double(dst.F.x) * double(dst.weight);
+
+            history = dst;
+            historyPath = int(dst.srcPixel);
+          }
+        }
+
+        for (double& v : frameMean) { v /= double(chains); }
+      };
+
+      auto windowMean = [](const std::vector<double>& v, int lo, int hi) {
+        double sum = 0.0;
+        for (int i = lo; i <= hi; ++i) { sum += v[size_t(i)]; }
+        return sum / double(hi - lo + 1);
+      };
+
+      const int frames = 60;
+
+      // FIXED semantics, total failure: degenerates to the canonical sample,
+      // exactly unbiased, no growth.
+      {
+        std::vector<double> mean;
+        runLoop(reevalAllFail, 20.0f, false, frames, 120000, 0x51CA9E1Dull, mean);
+
+        const double early = windowMean(mean, 0, 4);
+        const double late = windowMean(mean, 40, 59);
+
+        checkClose(float(early), float(truthX),
+                   "s: [fixed, all-fail, H 20] early frames sit at the truth", 0.02f);
+        checkClose(float(late), float(truthX),
+                   "s: [fixed, all-fail, H 20] late frames sit at the truth", 0.02f);
+        checkClose(float(late / early), 1.0f,
+                   "s: [fixed, all-fail, H 20] growth factor over 60 frames is 1", 0.02f);
+      }
+
+      // FIXED semantics, partial failure: the temporal candidate stays live on
+      // the healthy paths, the partition still holds, still no growth.
+      {
+        std::vector<double> mean;
+        runLoop(reevalPartialFail, 20.0f, false, frames, 120000, 0xB0BAFE77ull, mean);
+
+        const double early = windowMean(mean, 0, 4);
+        const double late = windowMean(mean, 40, 59);
+
+        checkClose(float(early), float(truthX),
+                   "s: [fixed, partial-fail, H 20] early frames sit at the truth", 0.02f);
+        checkClose(float(late), float(truthX),
+                   "s: [fixed, partial-fail, H 20] late frames sit at the truth", 0.02f);
+        checkClose(float(late / early), 1.0f,
+                   "s: [fixed, partial-fail, H 20] growth factor over 60 frames is 1", 0.02f);
+      }
+
+      // STORED (pre-fix) semantics, total failure, H 20: the runaway, with the
+      // deterministic ramp asserted at three depths. This is the in-game bug in
+      // four numbers: ~1.5x on the first reused frame, ~11x at frame 19, ~19.6x
+      // at frame 59, limit 21x.
+      {
+        std::vector<double> mean;
+        runLoop(reevalAllFail, 20.0f, true, frames, 40000, 0xDEAD10CCull, mean);
+
+        const double first = mean[0];
+        const double ramp = windowMean(mean, 17, 21);   // predicted ~10.5-11.5
+        const double late = windowMean(mean, 55, 59);   // predicted ~19.5
+
+        check(first > truthX * 1.35 && first < truthX * 1.65,
+              "s: [stored, all-fail, H 20] first reused frame inflates by ~1.5x");
+        check(ramp > truthX * 9.0 && ramp < truthX * 13.0,
+              "s: [stored, all-fail, H 20] frame ~19 inflates by ~11x (the ramp)");
+        check(late > truthX * 15.0 && late < truthX * 21.5,
+              "s: [stored, all-fail, H 20] frame ~59 inflates toward the 21x fixed point");
+      }
+
+      // STORED semantics, H 3: the fixed point drops to 1 + 3 = 4x -- the
+      // bisection's "history length 3 mitigates but does not remove".
+      {
+        std::vector<double> mean;
+        runLoop(reevalAllFail, 3.0f, true, frames, 40000, 0xF00DFACEull, mean);
+
+        const double late = windowMean(mean, 40, 59);
+
+        check(late > truthX * 3.4 && late < truthX * 4.4,
+              "s: [stored, all-fail, H 3] the runaway saturates at ~4x, not ~21x");
+      }
+    }
+
     void run() {
       testAddBookkeeping();
       testFinalizeRIS();
@@ -2592,6 +3293,8 @@ namespace dxvk {
       testPairwiseWeightsPartitionAndGuards();
       testTalbotResamplingMISIsUnbiased();
       testTalbotWeightsPartitionAndMCap();
+      testTalbotAsymmetricShiftIsUnbiased();
+      testTemporalFeedbackLoopDoesNotGrow();
 
       std::cout << "All passed (" << m_checks << " checks)\n";
     }

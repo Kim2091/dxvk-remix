@@ -29,7 +29,8 @@
 // ReSTIR PT (fork) -- temporal reuse, TALBOT resampling MIS, reconnection shift.
 //
 // ports ReSTIRPTPass/TemporalReuse.cs.slang:85-143 (setup, reprojection, M-cap),
-// :146-226 (the Talbot loop) and :298-299 (the output guards and store). NOT ported:
+// :146-226 (the Talbot loop -- with one deliberate deviation at :192, THE
+// CONSISTENT-TARGET RULE below) and :298-299 (the output guards and store). NOT ported:
 // the Constant / ConstantBiased / ConstantBinary MIS branches (:230-296),
 // mergeReservoirNoResampling, gNoResamplingForTemporalReuse, the hybrid shift's
 // reconnectionDataBuffer reads (:168-172, :200-204 -- under the pure reconnection
@@ -89,6 +90,55 @@
 // (rtxdi_spatial_reuse.comp.slang:91,107 and restir_gi_spatial_reuse.comp.slang:54),
 // neither of which is guaranteed to run in ReSTIR PT mode, so reading it would
 // silently mix in a stale frame's normals whenever RTXDI direct is off.
+//
+// ---------------------------------------------------------------------------
+// THE CONSISTENT-TARGET RULE -- the phase 4 energy-runaway fix
+// ---------------------------------------------------------------------------
+//
+// Talbot MIS is unbiased iff, for every path, the candidate weights sum to
+// exactly 1. Each weight is a ratio built from the same two target functions --
+// the central pixel's and the temporal pixel's -- so the partition holds if and
+// only if every appearance of a domain's target in the arithmetic is computed
+// by ONE function of the path.
+//
+// The temporal target appears in two places: the canonical candidate's MIS
+// denominator (the central -> temporal shift) and the temporal candidate's own
+// numerator. The reference feeds that numerator from the STORED history
+// integrand (TemporalReuse.cs.slang:192). That is sound there because its
+// temporal surface is the true previous-frame surface, so storage and
+// re-evaluation are the same function. Here the temporal surface is
+// RECONSTRUCTED (see above), and the two can disagree: the denominator's
+// re-evaluation traces its visibility ray from a rebuilt origin and evaluates a
+// borrowed material, and can report zero for a path the real previous surface
+// demonstrably held. When it does, the canonical weight becomes 1 while the
+// temporal weight keeps its stored-value ~M_T/(M_T+M_C): the weights sum to
+// nearly 2, the surplus is written into the history page, and next frame it is
+// multiplied again. The fixed point of that loop is ~(1 + temporalHistoryLength)
+// times the true value -- the in-game white-out this rule exists to prevent.
+// (A disagreement in the opposite slot -- the temporal -> central shift failing
+// -- merely zeroes the temporal candidate's weight, which loses reuse, never
+// gains energy. Only the numerator/denominator split above can inflate.)
+//
+// The rule: THE STORED HISTORY INTEGRAND IS NEVER USED AS A TARGET VALUE. It
+// remains the temporal candidate's sample payload and rides its unbiased
+// contribution weight, but every target evaluation of the temporal domain --
+// numerator and denominator alike -- goes through
+// restirPtComputeShiftedIntegrandReconnection against the reconstructed
+// temporal surface. The numerator's evaluation is the self-shift of the history
+// path (THE THIRD SHIFT, in the Talbot body below). Both usages are then one
+// function by construction, so the weights partition unity for ANY
+// reconstruction error -- known or unknown -- and resampling stays unbiased.
+//
+// What reconstruction imperfection costs under this rule: reuse efficiency
+// (a path the rebuilt origin cannot see gets temporal weight 0 and the pixel
+// falls back to its canonical sample at weight 1, which is unbiased), plus a
+// small declared DEFICIT -- never a surplus -- on paths the re-evaluation
+// claims for the temporal domain that the true history could not actually
+// hold (it then discounts the canonical weight with no temporal candidate to
+// compensate). That set is empty for a static camera -- position, TLAS and
+// material all coincide -- and is a one-pixel parallax sliver under motion,
+// where the acceptance test and its jitter already churn the history. Bounded
+// and convergent, unlike the surplus, which compounded without bound.
 
 #define RAB_HAS_CURRENT_GBUFFER 1
 // Matches the trace and spatial passes: visibility rays and the resolver fold
@@ -425,6 +475,14 @@ void main(uint2 threadId : SV_DispatchThreadID)
 
   uint verdict = kRestirPtTemporalRejectNoHistory;
 
+  // The stored history target vs its re-evaluation on the reconstructed temporal
+  // surface, for debug view 889's asymmetry overlay -- the one-look instrument
+  // for the energy-runaway mechanism (see THE CONSISTENT-TARGET RULE). Written
+  // only on accepted reprojections.
+  float debugHistoryTargetStored = 0.0f;
+  float debugHistoryTargetReevaluated = 0.0f;
+  bool debugHistoryTargetsValid = false;
+
   // Note: NOT written back on any early-out. This pass reads and writes the same
   // page, so declining to write is what leaves the trace pass's reservoir intact.
   const RestirPtReservoir centralReservoir = RestirPtReservoirCurrent[reservoirIndex];
@@ -527,6 +585,32 @@ void main(uint2 threadId : SV_DispatchThreadID)
             dstJacobian, centralSurface, tempDstReservoir, temporalSurface, temporalReservoir,
             /*evalVisibility=*/ true, rng, /*misWeight=*/ 1.0f, /*forceMerge=*/ true);
 
+          // FORK DEVIATION from :192, and the phase 4 energy-runaway fix. THE THIRD
+          // SHIFT: the temporal candidate's own target, RE-EVALUATED by shifting the
+          // history path onto the reconstructed temporal surface itself -- the same
+          // evaluator, the same visibility origin and the same borrowed material the
+          // canonical candidate's denominator term above uses. The reference reads
+          // toScalar(temporalReservoir.F) here instead; see THE CONSISTENT-TARGET
+          // RULE in the header for why that is a compounding energy inflation on a
+          // reconstructed surface and why this restores the partition of unity.
+          //
+          // The self-shift's Jacobian is exactly 1 whenever the integrand is
+          // non-zero (identical surfaces on both sides -- the debug view 887
+          // identity); it is folded in anyway so this term keeps precisely the
+          // q * J form of the denominator term it must match.
+          float selfJacobian = 0.0f;
+          const vec3 selfIntegrand = restirPtComputeShiftedIntegrandReconnection(
+            selfJacobian, temporalSurface, temporalSurface, temporalReservoir,
+            /*evalVisibility=*/ true);
+
+          const float reevaluatedHistoryTarget =
+            RestirPtReservoir::computeWeight(selfIntegrand, false) * selfJacobian;
+
+          // Debug view 889's asymmetry overlay reads these; no other consumer.
+          debugHistoryTargetStored = RestirPtReservoir::computeWeight(temporalReservoir.F, false);
+          debugHistoryTargetReevaluated = reevaluatedHistoryTarget;
+          debugHistoryTargetsValid = true;
+
           float pSum = 0.0f;
           float pSelf = 0.0f;
 
@@ -535,11 +619,11 @@ void main(uint2 threadId : SV_DispatchThreadID)
             // ports :184-185, j = curSampleId.
             pSum = RestirPtReservoir::computeWeight(tempDstReservoir.F, false) * currentM;
 
-            // ports :192-194, j == i. possibleToBeSelected implies the merge's weight
-            // was non-zero, which implies dstJacobian is non-zero -- so this division
-            // is safe by construction, not by luck.
-            pSelf = RestirPtReservoir::computeWeight(temporalReservoir.F, false) /
-              dstJacobian * temporalReservoir.M;
+            // ports :192-194, j == i, with the reference's stored target replaced by
+            // the re-evaluated one (see above). possibleToBeSelected implies the
+            // merge's weight was non-zero, which implies dstJacobian is non-zero --
+            // so this division is safe by construction, not by luck.
+            pSelf = reevaluatedHistoryTarget / dstJacobian * temporalReservoir.M;
             pSum += pSelf;
           }
 
@@ -593,6 +677,20 @@ void main(uint2 threadId : SV_DispatchThreadID)
     if (verdict == kRestirPtTemporalRejectNone)
     {
       color = vec3(0.0f, 1.0f, 0.0f);  // accepted
+
+      // The asymmetry overlay: YELLOW where the stored history target and its
+      // re-evaluation on the reconstructed temporal surface disagree about the
+      // path even being possible. Before the consistent-target fix, these were
+      // exactly the pixels whose canonical MIS weight was inflated to 1 with no
+      // compensating decrease -- i.e. the energy-runaway regions. After the fix
+      // they are the pixels where the temporal candidate declines (unbiased,
+      // just less reuse); a yellow-heavy view means the temporal surface
+      // reconstruction is starving reuse, not that energy is wrong.
+      if (debugHistoryTargetsValid &&
+          (debugHistoryTargetStored > 0.0f) != (debugHistoryTargetReevaluated > 0.0f))
+      {
+        color = vec3(1.0f, 1.0f, 0.0f);
+      }
     }
     else if (verdict == kRestirPtTemporalRejectGeometry)
     {
