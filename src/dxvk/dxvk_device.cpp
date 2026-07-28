@@ -28,6 +28,7 @@
 #include "rtx_render/rtx_neural_radiance_cache.h"
 #include "rtx_render/rtx_rtxdi_rayquery.h"
 #include "rtx_render/rtx_restir_gi_rayquery.h"
+#include "rtx_render/rtx_fork_restir_pt_rayquery.h"
 #include "rtx_render/rtx_composite.h"
 #include "rtx_render/rtx_debug_view.h"
 #include "rtx_render/rtx_xess.h"
@@ -546,6 +547,7 @@ namespace dxvk {
     m_pathtracerGbuffer(device),
     m_rtxdiRayQuery(device),
     m_restirgiRayQuery(device),
+    m_forkRestirPtRayQuery(device),
     m_pathtracerIntegrateDirect(device),
     m_pathtracerIntegrateIndirect(device),
     m_demodulate(device),

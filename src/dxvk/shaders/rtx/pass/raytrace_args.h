@@ -425,6 +425,27 @@ struct RaytraceArgs {
   // END of the struct so no existing field offsets move.
   float particleSkyAmbientScale;
 
+  // Fork (2026-07-27): ReSTIR PT (Lin et al. 2022) trace kernel parameters.
+  // Appended at the END of the struct as ONE COMPLETE 4-SCALAR (16-byte) GROUP
+  // so no existing field offsets move and the struct's 16-byte alignment is
+  // preserved -- this fork has GPU-hung twice on RaytraceArgs misalignment, so
+  // this group must stay exactly four scalars wide. Consumed by
+  // src/dxvk/shaders/rtx/pass/fork_restir_pt/ and
+  // src/dxvk/shaders/rtx/algorithm/fork_restir_pt/.
+  uint restirPtMaxBounces;                   // Path length cap; 0 disables tracing past the primary scatter.
+  uint restirPtFlags;                        // RESTIR_PT_FLAG_* bitfield below.
+  float restirPtSpecularRoughnessThreshold;  // Perceptual roughness at or below which a non-diffuse lobe counts as a specular bounce.
+  float restirPtDeltaRoughnessThreshold;     // Perceptual roughness below which opaque specular is classified as a delta event (reconnection forbidden).
+
   // NOTE: Add structs to the top section of RaytraceArgs, not the bottom.
   // NOTE: bool does not work in debug builds, use uint instead.
 };
+
+// Fork (2026-07-27): bit layout of RaytraceArgs::restirPtFlags. Frame-constant
+// bits only -- the trace/replay mode selector is per *dispatch* (the pass runs
+// twice inside one frame, and this buffer is uploaded once), so it lives in the
+// pass's push constants instead; see ForkReSTIRPTArgs in
+// rtx/pass/fork_restir_pt/fork_restir_pt_binding_indices.h.
+// Bit 0 is reserved so a later phase can reclaim it without renumbering.
+#define RESTIR_PT_FLAG_RESERVED0               (1u << 0)
+#define RESTIR_PT_FLAG_ENABLE_RUSSIAN_ROULETTE (1u << 1)

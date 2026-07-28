@@ -1032,6 +1032,12 @@ enum class RtxFramePassStage {
   ReSTIR_GI_TemporalReuse,
   ReSTIR_GI_SpatialReuse,
   ReSTIR_GI_FinalShading,
+  // Fork: ReSTIR PT (Lin et al. 2022). Debug-only in phase 1; both stages run
+  // in addition to the normal frame when rtx.restirPT.enableDebugTrace is set.
+  // Note: dxvk_imgui.cpp's aliasingPassComboEntries table mirrors this enum 1:1
+  // and must be kept in the same order.
+  ReSTIR_PT_Trace,
+  ReSTIR_PT_ReplayVerify,
   Demodulate,
   NRD,
   CompositionAlphaBlend,

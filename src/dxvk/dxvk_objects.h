@@ -71,6 +71,8 @@ namespace dxvk {
   class DxvkRayReconstruction;
   class DxvkRtxdiRayQuery;
   class DxvkReSTIRGIRayQuery;
+  // Fork: ReSTIR PT (Lin et al. 2022) debug trace pass.
+  class DxvkForkReSTIRPTRayQuery;
   class DxvkToneMapping;
   class DxvkBloom;
   class RtxGeometryUtils;
@@ -158,6 +160,11 @@ namespace dxvk {
 
     DxvkReSTIRGIRayQuery& metaReSTIRGIRayQuery() {
       return m_restirgiRayQuery.get();
+    }
+
+    // Fork: ReSTIR PT (Lin et al. 2022).
+    DxvkForkReSTIRPTRayQuery& metaForkReSTIRPT() {
+      return m_forkRestirPtRayQuery.get();
     }
 
     DxvkPathtracerIntegrateDirect& metaPathtracerIntegrateDirect() {
@@ -380,6 +387,7 @@ namespace dxvk {
     Active<DxvkPathtracerGbuffer>           m_pathtracerGbuffer;
     Active<DxvkRtxdiRayQuery>               m_rtxdiRayQuery;
     Active<DxvkReSTIRGIRayQuery>            m_restirgiRayQuery;
+    Active<DxvkForkReSTIRPTRayQuery>        m_forkRestirPtRayQuery;  // fork
     Active<DxvkPathtracerIntegrateDirect>   m_pathtracerIntegrateDirect;
     Active<DxvkPathtracerIntegrateIndirect> m_pathtracerIntegrateIndirect;
     Active<DemodulatePass>                  m_demodulate;

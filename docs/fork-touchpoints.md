@@ -227,6 +227,9 @@ check will enforce it if discipline slips.
 - **Inline tweak** at `ImGUI::showRenderingSettings` "Tonemapping" header — removed the `Tonemapping Mode` combo (Global / Local / Direct) and the standalone "User Brightness" / "User Brightness EV Range" sliders. The header body is now a single always-visible `metaToneMapping().showImguiSettings()` call between two separators. Tuning Mode (tone curve sliders) is also removed from the panel.
   *2026-05-13 tonemap refactor: mode selector removed; operator dropdown is now the primary control. 2026-05-15: local tonemap path removed entirely, so no per-path UI gate remains.*
 
+- **Inline tweak** at `aliasingPassComboEntries` (~line 407) and at the "Indirect Illumination" header — 2 enum rows + a "ReSTIR PT (Experimental)" collapsing header, plus `#include "rtx_render/rtx_fork_restir_pt_rayquery.h"`.
+  *The combo table mirrors `RtxFramePassStage` 1:1; the two new `ReSTIR_PT_Trace` / `ReSTIR_PT_ReplayVerify` rows keep the aliasing analyzer's stage list complete. The panel exposes the ReSTIR PT phase-1 harness toggles as live widgets (enable, replay parity test, max bounces, Russian roulette, roughness thresholds); it is shown unconditionally rather than under an `IntegrateIndirectMode` branch because phase 1 is not yet a mode.*
+
 ---
 
 ## src/dxvk/imgui/dxvk_imgui_about.cpp
@@ -291,6 +294,9 @@ initializer list and can't be lifted into a separate TU.
 - **Inline tweak** at `dxvk_src` files list (rtx_render block) — 2-line addition registering weather sources.
   *Registers `'rtx_render/rtx_fork_weather.cpp'` and `'rtx_render/rtx_fork_weather.h'` in the DXVK build source list.*
 
+- **Inline tweak** at `dxvk_src` files list (rtx_render block, ~line 245) — 2-line addition registering ReSTIR PT sources.
+  *Registers `'rtx_render/rtx_fork_restir_pt_rayquery.cpp'` and `'rtx_render/rtx_fork_restir_pt_rayquery.h'`. The pass's shaders under `src/dxvk/shaders/rtx/{algorithm,pass}/fork_restir_pt/` need no meson entry — the shader compile step takes the whole `shaders/rtx` directory as input.*
+
 ---
 
 ## src/dxvk/rtx_render/graph/rtx_component_list.h
@@ -348,6 +354,12 @@ initializer list and can't be lifted into a separate TU.
 
 - **Hook** at `RtxContext` per-frame entry (weather blender update) — `fork_hooks::updateWeatherBlender` in `rtx_fork_weather.cpp`.
   *Calls `fork_hooks::updateWeatherBlender(*this, GlobalTime::get().deltaTime())` once per frame so the blender can read trigger keys, advance the lerp timeline, and write blended values to the Derived RTX_OPTION layer.*
+
+- **Inline tweak** at `RtxContext::dispatchIntegrate` (ReSTIR PT debug dispatch) — 1 call + `#include "rtx_fork_restir_pt_rayquery.h"`.
+  *Calls `m_common->metaForkReSTIRPT().dispatch(this, rtOutput)` after the integrate-NEE dispatch. Self-gated by `RtxPass` on `rtx.restirPT.enableDebugTrace` (default off), and in phase 1 the pass writes only its own parity buffer plus the debug view, so the rendered image is unchanged. Placed at the slot the ReSTIR PT trace pass will eventually occupy in place of `integrate_indirect`.*
+
+- **Inline tweak** at `RtxContext::updateRaytraceArgsConstantBuffer` (ReSTIR PT cb fill) — 1 call.
+  *Calls `m_common->metaForkReSTIRPT().setRaytraceArgs(constants)` to fill the appended `restirPt*` block of `RaytraceArgs`.*
 
 ---
 
@@ -1147,6 +1159,9 @@ initializer list and can't be lifted into a separate TU.
 
 - **Inline tweak** at `(file scope)` (atmosphere args include) (~line 35) — 1-line addition.
   *Adds `#include "rtx/pass/atmosphere/atmosphere_args.h"` so `AtmosphereArgs` is defined.*
+
+- **Inline tweak** at the END of the `RaytraceArgs` struct (ReSTIR PT block) — one complete 4-scalar (16-byte) group plus two `#define`s after the struct.
+  *Adds `restirPtMaxBounces`, `restirPtFlags`, `restirPtSpecularRoughnessThreshold`, `restirPtDeltaRoughnessThreshold` for the fork-owned ReSTIR PT trace kernel, appended so no existing field offset moves. The group is exactly four scalars wide on purpose — this fork has GPU-hung twice on `RaytraceArgs` misalignment. `RESTIR_PT_FLAG_*` documents the `restirPtFlags` bit layout; the per-dispatch trace/replay mode deliberately does NOT live here (see `ForkReSTIRPTArgs` push constants) because the pass dispatches twice inside one frame while this buffer is uploaded once.*
 
 ---
 
@@ -3616,5 +3631,70 @@ live-edited mid-storm.
 - **`src/dxvk/rtx_render/rtx_fork_precipitation.h`** - fork-owned change. *`glow` / `glowColor` options; `m_materialGlow` / `m_materialGlowColor` registered-state members.*
 - **`src/dxvk/rtx_render/rtx_fork_precipitation.cpp`** - fork-owned change. *ensureMaterial sets emission; refreshDesc change detection extended; Glow widgets in the Appearance overrides tree.*
 - **`RtxOptions.md`** - REGEN PENDING.
+
+---
+
+## Workstream - ReSTIR PT phase 1: replay-disciplined trace kernel + parity harness (fork - 2026-07-27)
+
+Phase 1 of porting ReSTIR PT (Lin et al. 2022, `ReSTIR_PT/Source/RenderPasses/ReSTIRPTPass/`,
+BSD-3-Clause) into this fork. It lands the fork-owned path-tracing kernel and the
+objective test the whole port is gated on, and nothing else: no reservoirs, no
+resampling, no new `IntegrateIndirectMode`.
+
+The mechanism. The reference replays a path by capturing and restoring a serial
+LCG seed, which forces every RNG-consuming site along an offset path to burn
+exactly as many numbers as the base path did. dxvk-remix's RNG is instead
+counter-addressable - `createRNG(pixel, frame, sampleOffset)` indexes a static
+blue-noise volume - so the port replaces seed capture with *hard dimension
+addressing*: every consuming site re-bases at a fixed `(bounce, site)` offset, and
+a path's entire replay identity collapses to `(srcPixel, srcFrame)`. Consumption-count
+variance then cannot desynchronise a replay. The harness proves it: the pass is
+dispatched twice per frame, once tracing and writing `float4(radiance, terminal
+descriptor)` to a scratch buffer, once re-tracing every path from its identity and
+painting `max|traced - replayed| x 1e6` into a debug view. That view must be pure
+black.
+
+Default-path safety: the pass is a `RtxPass` gated on `rtx.restirPT.enableDebugTrace`
+(default false), so with the toggle off it is not dispatched and its buffer is not
+allocated. When on it runs *in addition to* the normal frame and writes only its
+own buffer plus the debug-view texture - the rendered image is untouched either way.
+
+- **`src/dxvk/shaders/rtx/algorithm/fork_restir_pt/restir_pt_rng.slangh`** - NEW fork-owned file.
+  *The replayability contract: `RESTIR_PT_DIMS_PER_BOUNCE`, the named site offsets (lobe 0, direction 1-2, NEE 4-9, RR 12, 13-15 spare) and `restirPtRngAt`. Everything else in the port consumes this.*
+- **`src/dxvk/shaders/rtx/algorithm/fork_restir_pt/restir_pt_path_state.slangh`** - NEW fork-owned file.
+  *`RestirPtPathState`, a port of `ReSTIRPTPass/PathState.slang:17-39,64-243` minus reservoir/builder members and the packed encode/decode, plus the `(srcPixel, srcFrameIdx)` identity pair and the `IBasePayloadState` implementation dxvk-remix's resolve loop requires. Flag bit values are kept identical to the reference so the two diff line by line.*
+- **`src/dxvk/shaders/rtx/algorithm/fork_restir_pt/restir_pt_trace_core.slangh`** - NEW fork-owned file.
+  *The kernel. Ports `generatePath`, `generateRandomReplayPath`, `handleHit`, `handleMiss`, `generateScatterRay`, the Russian roulette draw and the replay loop from `ReSTIRPTPass/PathTracer.slang`, driven through dxvk-remix's `RESOLVE_RAY_QUERY` macro with a fork-owned hit callback so the live integrator is untouched. Ported functions carry `ports <file>:<lines>` pins.*
+- **`src/dxvk/shaders/rtx/pass/fork_restir_pt/fork_restir_pt_trace.comp.slang`** - NEW fork-owned file.
+  *16x16 compute entry point over the downscaled extent, dispatched twice with different push-constant modes.*
+- **`src/dxvk/shaders/rtx/pass/fork_restir_pt/fork_restir_pt_binding_indices.h`** - NEW fork-owned file.
+  *Fresh 100-120 pass-local band with `#error` guards against both `COMMON_MAX_BINDING` and `BINDING_ATMOSPHERE_MIN`. Also declares the `ForkReSTIRPTArgs` push-constant struct.*
+- **`src/dxvk/shaders/rtx/pass/fork_restir_pt/fork_restir_pt_bindings.slangh`** - NEW fork-owned file.
+  *G-buffer inputs cloned from the ReSTIR GI reuse set (the global names are fixed by `RAB_GetGBufferSurface`, only the slots differ), the two sky sources, and the parity buffer.*
+- **`src/dxvk/rtx_render/rtx_fork_restir_pt_rayquery.{h,cpp}`** - NEW fork-owned files.
+  *`DxvkForkReSTIRPTRayQuery : RtxPass`. Owns the parity buffer, both dispatches, the `rtx.restirPT.*` options and their live ImGui widgets.*
+- **`src/dxvk/meson.build`** - index-only, fork.
+  *Registers the two host files. Shaders need no entry.*
+- **`src/dxvk/dxvk_objects.h`** - fork-touchpoint inline tweak.
+  *Forward declaration, `metaForkReSTIRPT()` accessor, `Active<DxvkForkReSTIRPTRayQuery>` member.*
+- **`src/dxvk/dxvk_device.cpp`** - fork-touchpoint inline tweak.
+  *`#include "rtx_render/rtx_fork_restir_pt_rayquery.h"` and `m_forkRestirPtRayQuery(device)` in the `DxvkObjects` member-init list.*
+- **`src/dxvk/rtx_render/rtx_initializer.cpp`** - fork-touchpoint inline tweak.
+  *Include + one `prewarmShaders` call, itself gated on the option so it is a no-op by default.*
+- **`src/dxvk/rtx_render/rtx_types.h`** - fork-touchpoint inline tweak.
+  *Two `RtxFramePassStage` entries, `ReSTIR_PT_Trace` and `ReSTIR_PT_ReplayVerify`, so the aliasing analyzer attributes the two dispatches correctly.*
+- **`src/dxvk/imgui/dxvk_imgui.cpp`** - fork-touchpoint inline tweak.
+  *The two matching `aliasingPassComboEntries` rows (the table mirrors the enum 1:1) and the "ReSTIR PT (Experimental)" panel.*
+- **`src/dxvk/rtx_render/rtx_context.cpp`** - fork-touchpoint inline tweak.
+  *One guarded dispatch after integrate-NEE and one cb-fill call.*
+- **`src/dxvk/shaders/rtx/pass/raytrace_args.h`** - fork-touchpoint inline tweak.
+  *One complete 4-scalar group appended at the struct end, plus the `RESTIR_PT_FLAG_*` bit defines.*
+- **`src/dxvk/shaders/rtx/utility/debug_view_indices.h`** - index-only, fork.
+  *Adds `DEBUG_VIEW_RESTIR_PT_TRACE = 880` and `DEBUG_VIEW_RESTIR_PT_REPLAY_DELTA = 881`, from the free 880-900 block. 878 stays burned.*
+- **`src/dxvk/rtx_render/rtx_debug_view.cpp`** - fork-owned addition.
+  *Two rows in the debug-view name table; the parity row carries a tooltip stating the pass condition (pure black).*
+- **`ThirdPartyLicenses.txt`** - fork-owned addition.
+  *"ReSTIR PT" entry with the reference's NVIDIA BSD-3-Clause text and a note that the ported files retain their "Copyright (c) 2022, Daqi Lin" per-file notices.*
+- **`RtxOptions.md`** - REGEN PENDING (`rtx.restirPT.enableDebugTrace`, `replayParityTest`, `maxBounces`, `enableRussianRoulette`, `specularRoughnessThreshold`, `deltaRoughnessThreshold`).
 
 ---

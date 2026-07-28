@@ -1,0 +1,116 @@
+/*
+* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+#pragma once
+
+#include "rtx/utility/noise.slangh"
+
+// ReSTIR PT (fork) -- replayable RNG dimension addressing.
+//
+// Replaces the reference implementation's seed-capture/restore discipline
+// (Falcor TinyUniformSampleGenerator::getCurrentSeed, captured at
+// ReSTIRPTPass/PathTracer.slang:1393-1397 and :1427-1431, restored at :250)
+// with something strictly stronger.
+//
+// The reference is a *serial* LCG: replaying a path requires every RNG-consuming
+// site along the offset path to draw exactly as many numbers as the base path did,
+// which is why it has to burn samples it does not use
+// (skipLightSampleRandomNumbers, ReSTIRPTPass/PathTracer.slang:796-817, and the
+// unconditional RR draw at :1378-1388). A single missed or extra draw silently
+// desynchronises every subsequent bounce.
+//
+// dxvk-remix's RNG is not serial: `RNG {pixelIdx, seed, temporalIdx}` addresses a
+// static blue-noise volume, so every sample is a pure function of
+// (pixel, frame, sampleOffset) -- see noise.slangh:173-180 (createRNG, whose
+// sampleOffset parameter is documented as existing "for reconstructing a RNG")
+// and noise.slangh:230-249 (getNextSampleBlueNoise). That makes *hard dimension
+// addressing* possible:
+//
+//   THE CONTRACT
+//   ------------
+//   1. Every RNG-consuming site inside the ReSTIR PT kernel constructs its own RNG
+//      via restirPtRngAt(srcPixel, srcFrame, bounce, kRestirPtDim<Site>).
+//   2. No RNG is ever carried across sites, across bounces, or across function
+//      boundaries where the consumption count is control-flow dependent.
+//   3. A path's full replay identity is therefore just (srcPixel, srcFrame) --
+//      8 bytes, exactly the footprint of the reference's initRandomSeed +
+//      rcRandomSeed pair (ReSTIRPTPass/PathReservoir.slang:229,233).
+//
+// Consequence: variable consumption *cannot* desync replay. There is no need for
+// skip functions, and a site that consumes a data-dependent number of samples
+// (e.g. the light RIS loop, whose per-light-type iteration count depends on the
+// frame's light ranges) is still bit-exactly reproducible, because the site always
+// re-bases at the same fixed offset.
+//
+// Note on sub-offset budgets: the per-site reservations below are *correlation*
+// budgets, not correctness budgets. A site that consumes more samples than its
+// reservation will start drawing the same values as the following site (equal
+// R2 shifts into the same blue-noise texel), which costs sampling quality but
+// never determinism. The light-sampling site is the one most likely to exceed
+// its window (the RIS loop scales with cb.risTotalSampleCount); it is given the
+// largest reservation for that reason, and the spare dimensions 13-15 exist so
+// the layout can grow without renumbering.
+//
+// Resampling decisions in the (later-phase) reuse passes deliberately do NOT use
+// this stream -- they use the murmur3-backed RAB_RandomSamplerState
+// (RtxdiApplicationBridge.slangh:345-366), because the codebase itself warns at
+// :344 that table-based blue noise lacks the entropy resampling needs. Those
+// draws never need replaying.
+
+// Stride between consecutive bounces' dimension windows. Mirrors the existing
+// integrator's kApproxRNGSamplesPerBounce (path_state.slangh:39) so the two
+// disciplines are visually comparable, but unlike that constant this one is
+// exact rather than approximate: sites are independently addressed, so the
+// stride only has to be large enough to keep sites uncorrelated.
+#define RESTIR_PT_DIMS_PER_BOUNCE 16
+
+// Lobe selection for the scatter event (1 dim consumed by the material's lobe
+// probability draw). Ports the sampleBSDF lobe draw of
+// ReSTIRPTPass/PathTracer.slang:298-429.
+static const uint kRestirPtDimLobe = 0u;
+// Direction sample for the scatter event (2 dims: the 2D uv of the lobe sample).
+static const uint kRestirPtDimDirection = 1u;
+// Next-event estimation. Reserves dims 4-9 (6 dims) for light selection + area
+// sampling. Ports the shape of generateLightSample,
+// ReSTIRPTPass/PathTracer.slang:752-794.
+static const uint kRestirPtDimNee = 4u;
+// Russian roulette continuation draw (1 dim). Ports
+// ReSTIRPTPass/PathTracer.slang:919-932, called at :1378-1388.
+static const uint kRestirPtDimRR = 12u;
+// Dimensions 13-15 are reserved spare. Claim them in later phases rather than
+// widening RESTIR_PT_DIMS_PER_BOUNCE, which would invalidate every reservoir
+// identity already in flight.
+
+// Constructs the RNG for one addressed site of one bounce of the path identified
+// by (srcPixel, srcFrame). This is the only sanctioned way for the ReSTIR PT
+// kernel to obtain randomness that has to survive replay.
+//
+// srcPixel  -- the pixel the path was *originally* traced from, not the pixel
+//              currently evaluating it. After reuse lands (phase 3+) these differ.
+// srcFrame  -- the frame index the path was originally traced in. The blue-noise
+//              volume is static and temporalIdx is just an integer, so cross-frame
+//              replay is exact.
+// bounce    -- 0 at the primary surface, 1 at the first indirect vertex, etc.
+// site      -- one of the kRestirPtDim* constants above.
+RNG restirPtRngAt(uint2 srcPixel, uint srcFrame, uint bounce, uint site)
+{
+  return createRNG(srcPixel, srcFrame, bounce * RESTIR_PT_DIMS_PER_BOUNCE + site);
+}

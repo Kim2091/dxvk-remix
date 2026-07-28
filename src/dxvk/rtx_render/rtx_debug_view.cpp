@@ -254,6 +254,10 @@ namespace dxvk {
         {DEBUG_VIEW_RESTIR_GI_VIRTUAL_HIT_T, "ReSTIR GI Virtual Hit Distance"},
         {DEBUG_VIEW_RESTIR_GI_VISIBILITY_INVALID_SAMPLES, "ReSTIR GI Visibility Invalid Samples"},
 
+        // Fork: ReSTIR PT (Lin et al. 2022). Requires rtx.restirPT.enableDebugTrace.
+        {DEBUG_VIEW_RESTIR_PT_TRACE, "ReSTIR PT Trace"},
+        {DEBUG_VIEW_RESTIR_PT_REPLAY_DELTA, "ReSTIR PT Replay Parity Delta", "Random-replay correctness check: max|traced - replayed| radiance x 1e6. Must be pure black; any lit pixel means the replay diverged from the base path."},
+
         {DEBUG_VIEW_NEE_CACHE_LIGHT_HISTOGRAM, "NEE Cache Light Histogram"},
         {DEBUG_VIEW_NEE_CACHE_HISTOGRAM, "NEE Cache Triangle Histogram"},
         {DEBUG_VIEW_NEE_CACHE_HASH_MAP, "NEE Cache Hash Map"},

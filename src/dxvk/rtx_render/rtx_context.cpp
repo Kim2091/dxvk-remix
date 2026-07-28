@@ -43,6 +43,7 @@
 #include "rtx_xess.h"
 #include "rtx_rtxdi_rayquery.h"
 #include "rtx_restir_gi_rayquery.h"
+#include "rtx_fork_restir_pt_rayquery.h"
 #include "rtx_composite.h"
 #include "rtx_debug_view.h"
 
@@ -1429,6 +1430,9 @@ namespace dxvk {
     constants.shadowTerminatorArgs.maxArea = std::max(0.f, RtxOptions::ShadowTerminator::maxArea() * RtxOptions::getMeterToWorldUnitScale() * RtxOptions::getMeterToWorldUnitScale());
     constants.shadowTerminatorArgs.maxLength = std::max(0.f, RtxOptions::ShadowTerminator::maxLength() * RtxOptions::getMeterToWorldUnitScale());
 
+    // Fork: ReSTIR PT (Lin et al. 2022) trace kernel parameters.
+    m_common->metaForkReSTIRPT().setRaytraceArgs(constants);
+
     // Upload the constants to the GPU
     {
       Rc<DxvkBuffer> cb = getResourceManager().getConstantsBuffer();
@@ -1573,6 +1577,14 @@ namespace dxvk {
 
     // Integrate indirect - NEE Cache pass
     m_common->metaPathtracerIntegrateIndirect().dispatchNEE(this, rtOutput);
+
+    // Fork: ReSTIR PT (Lin et al. 2022) debug trace + replay-parity harness.
+    // Phase 1 runs IN ADDITION to the normal frame and writes only its own
+    // parity buffer plus (when selected) the debug view, so the rendered image
+    // is untouched. Self-gated on rtx.restirPT.enableDebugTrace via RtxPass, and
+    // sits at the slot the trace pass will eventually occupy in place of
+    // integrate_indirect.
+    m_common->metaForkReSTIRPT().dispatch(this, rtOutput);
   }
 
   void RtxContext::dispatchPathTracing(const Resources::RaytracingOutput& rtOutput) {

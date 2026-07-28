@@ -54,6 +54,7 @@
 #include "rtx_render/rtx_fork_hooks.h"
 #include "rtx_render/rtx_rtxdi_rayquery.h"
 #include "rtx_render/rtx_restir_gi_rayquery.h"
+#include "rtx_render/rtx_fork_restir_pt_rayquery.h"
 #include "rtx_render/rtx_debug_view.h"
 #include "rtx_render/rtx_composite.h"
 #include "rtx_render/rtx_sparse_rendering.h"
@@ -405,6 +406,11 @@ namespace dxvk {
       { RtxFramePassStage::ReSTIR_GI_TemporalReuse, "ReSTIR_GI_TemporalReuse" },
       { RtxFramePassStage::ReSTIR_GI_SpatialReuse, "ReSTIR_GI_SpatialReuse" },
       { RtxFramePassStage::ReSTIR_GI_FinalShading, "ReSTIR_GI_FinalShading" },
+      // Fork: ReSTIR PT (Lin et al. 2022). Mirrors rtx_types.h's RtxFramePassStage
+      // 1:1 and in the same order; a missing row here is a silent gap in the
+      // aliasing-analyzer combo.
+      { RtxFramePassStage::ReSTIR_PT_Trace, "ReSTIR_PT_Trace" },
+      { RtxFramePassStage::ReSTIR_PT_ReplayVerify, "ReSTIR_PT_ReplayVerify" },
       { RtxFramePassStage::Demodulate, "Demodulate" },
       { RtxFramePassStage::NRD, "NRD" },
       { RtxFramePassStage::CompositionAlphaBlend, "CompositionAlphaBlend" },
@@ -3749,6 +3755,17 @@ namespace dxvk {
             ImGui::PopID();
             ImGui::Unindent();
           }
+        }
+
+        // Fork: ReSTIR PT (Lin et al. 2022). Phase 1 is a debug-only trace +
+        // replay-parity harness, not yet an IntegrateIndirectMode, so it is
+        // shown unconditionally rather than under a mode branch.
+        if (RemixGui::CollapsingHeader("ReSTIR PT (Experimental)", collapsingHeaderClosedFlags)) {
+          ImGui::Indent();
+          ImGui::PushID("ReSTIR PT");
+          common->metaForkReSTIRPT().showImguiSettings();
+          ImGui::PopID();
+          ImGui::Unindent();
         }
 
         ImGui::Unindent();

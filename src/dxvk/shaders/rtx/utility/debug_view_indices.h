@@ -331,6 +331,23 @@
 // seam at the wrap boundary.
 #define DEBUG_VIEW_CLOUD_NVDF_SDF 879
 
+// Fork: ReSTIR PT (Lin et al. 2022) diagnostics. Indices taken from the free
+// 880-900 block immediately above the fork cloud range and below the sparse
+// rendering block (901-911). 878 remains deliberately burned, see above.
+//
+// Raw indirect radiance produced by the fork-owned ReSTIR PT trace kernel, one
+// path per pixel from the primary G-buffer surface. Expect a noisy but
+// plausible indirect-light image, comparable in average brightness to the
+// ReSTIR GI signal before denoising.
+#define DEBUG_VIEW_RESTIR_PT_TRACE 880
+// Replay-parity check: max|L_traced - L_replayed| x 1e6, greyscale. This is the
+// phase-1 go/no-go for the whole ReSTIR PT port -- the random-replay discipline
+// (see rtx/algorithm/fork_restir_pt/restir_pt_rng.slangh) is correct if and only
+// if this view is PURE BLACK. The x1e6 scale makes a single float ULP of
+// divergence visible; a full-brightness pixel additionally means either a NaN or
+// a path-length/terminal-kind mismatch between the two runs.
+#define DEBUG_VIEW_RESTIR_PT_REPLAY_DELTA 881
+
 enum class CompositeDebugView : uint32_t {
   Disabled = 0,
   FinalRenderWithMaterialProperties,

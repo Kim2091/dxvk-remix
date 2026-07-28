@@ -33,6 +33,7 @@
 #include "rtx_debug_view.h"
 #include "rtx_sparse_rendering.h"
 #include "rtx_restir_gi_rayquery.h"
+#include "rtx_fork_restir_pt_rayquery.h"
 #include "rtx_taa.h"
 #include "rtx_nis.h"
 #include "rtx_tone_mapping.h"
@@ -162,6 +163,9 @@ namespace dxvk {
 
     pCommon->metaSparseRendering().prewarmShaders(pCommon->pipelineManager());
     pCommon->metaReSTIRGIRayQuery().prewarmShaders(pCommon->pipelineManager());
+    // Fork: ReSTIR PT (Lin et al. 2022) debug trace pass. Self-gated on
+    // rtx.restirPT.enableDebugTrace, so this is a no-op unless it is enabled.
+    pCommon->metaForkReSTIRPT().prewarmShaders(pCommon->pipelineManager());
     pCommon->metaTAA().prewarmShaders(pCommon->pipelineManager());
     pCommon->metaNIS().prewarmShaders(pCommon->pipelineManager());
     pCommon->metaToneMapping().prewarmShaders(pCommon->pipelineManager());

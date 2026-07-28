@@ -244,6 +244,8 @@ dxvk_src = files([
   'rtx_render/rtx_fork_precipitation.h',
   'rtx_render/rtx_fork_rcas.cpp',
   'rtx_render/rtx_fork_rcas.h',
+  'rtx_render/rtx_fork_restir_pt_rayquery.cpp',
+  'rtx_render/rtx_fork_restir_pt_rayquery.h',
   'rtx_render/rtx_fork_submit.cpp',
   'rtx_render/rtx_fork_upscaler_ui.cpp',
   'rtx_render/rtx_fork_tonemap.cpp',
