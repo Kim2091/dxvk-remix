@@ -248,13 +248,27 @@ void main(uint2 threadIndex : SV_DispatchThreadID, uint2 localIndex : SV_GroupTh
     // WRITE THE CLAMP BACK INTO THE RESERVOIR, not just into the shaded output.
     // This page becomes next frame's history; clamping only the output would leave
     // the unclamped path in the reservoir, still selectable, still spreading
-    // through spatial reuse. Scaling F rather than weight keeps F's dual role as
-    // both radiance and RIS target function self-consistent.
+    // through spatial reuse.
+    //
+    // AND `rcVertexIrradiance` IS THE FIELD THAT MATTERS -- scaling F alone made
+    // this whole block a no-op for the reuse loop, which is how it first shipped.
+    // A shift NEVER READS the stored F: it rebuilds the candidate's magnitude from
+    // the frozen suffix, `dstF1 / dstPDF1 * (dstF2 / dstPDF2 * rcVertexIrradiance)`
+    // (restir_pt_shift.slangh:829, and :696 for the escape branch). F is the RIS
+    // target and the directly-shaded radiance; rcVertexIrradiance is what every
+    // future frame re-derives from. Clamping only F therefore re-clamps the output
+    // every frame -- so it measures as working -- while the full-amplitude path
+    // sails on through the history page untouched. Both are scaled here, by the
+    // same factor, so the target, the radiance and the suffix stay consistent.
+    //
+    // (The boiling filter above does not have this hazard: init() clears the whole
+    // reservoir including the suffix, which is why it works and this did not.)
     if (any(clampedRadiance != radiance) && any(radiance > vec3(0.0f)))
     {
       const float clampScale = calcBt709Luminance(clampedRadiance) / max(calcBt709Luminance(radiance), 1e-9f);
 
       reservoir.F *= clampScale;
+      reservoir.rcVertexIrradiance *= clampScale;
       RestirPtReservoirBuffer[reservoirIndex] = reservoir;
 
       radiance = clampedRadiance;
