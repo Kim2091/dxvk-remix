@@ -203,18 +203,20 @@ void AssetReplacer::registerExternalMesh(remixapi_MeshHandle handle, std::vector
     // either inside the EmitCs lambda in remixapi_CreateMesh or via
     // applyPendingMeshCreatesOnCs -- which is the same thread that runs
     // SceneManager::submitExternalDraw. That serialization is what makes
-    // replacing the vector safe: no in-flight draw loop can be holding the
+    // replacing the contents safe: no in-flight draw loop can be holding the
     // reference returned by accessExternalMesh while we swap it. The old
     // RasterGeometry's DxvkBuffer refs drop here, but any command list that
     // already recorded them keeps them alive through DXVK's own lifetime
-    // tracking.
-    if (!refreshGeometry || existing->second.size() != submeshes.size()) {
+    // tracking. We assign THROUGH the unique_ptr rather than replacing it, so
+    // the vector keeps its address (which is why it is heap-held in the first
+    // place -- accessExternalMesh hands out a reference to it).
+    if (!refreshGeometry || existing->second->size() != submeshes.size()) {
       //Logger::info("Ignoring repeated mesh registration (handle=" + tostr(handle) + ") ");
       return;
     }
 
     for (size_t i = 0; i < submeshes.size(); i++) {
-      const GeometryHashes& prev = existing->second[i].hashes;
+      const GeometryHashes& prev = (*existing->second)[i].hashes;
       GeometryHashes& next = submeshes[i].hashes;
 
       // Carry over everything that did NOT change, leaving only VertexPosition
@@ -236,7 +238,7 @@ void AssetReplacer::registerExternalMesh(remixapi_MeshHandle handle, std::vector
       submeshes[i].externalMesh = handle;
     }
 
-    existing->second = std::move(submeshes);
+    *existing->second = std::move(submeshes);
     return;
   }
 

@@ -2595,7 +2595,7 @@ namespace dxvk {
     const bool useExternalPreservePath =
         RtxOptions::enablePreservePath() &&
         submeshes.size() == 1 &&
-        (state.drawCall.transformData.instancesToObject == nullptr ||
+        (state.drawCall.getTransformData().instancesToObject == nullptr ||
          RtxOptions::enablePreservePathForBatchedDraws()) &&
         riReadyForPreserve &&
         replacementInstance->dirtyFlags.isClear() &&
@@ -2613,8 +2613,8 @@ namespace dxvk {
       // preserveReplacementInstance refreshes prims[0]'s BlasEntry::input from
       // it and recalculates the bounding box, matching the dynamic loop's
       // i==0 setup below.
-      state.drawCall.geometryData = submeshes[0];
-      state.drawCall.geometryData.cullMode = state.doubleSided ? VK_CULL_MODE_NONE : VK_CULL_MODE_BACK_BIT;
+      state.drawCall.modifyGeometryData() = submeshes[0];
+      state.drawCall.modifyGeometryData().cullMode = state.doubleSided ? VK_CULL_MODE_NONE : VK_CULL_MODE_BACK_BIT;
 
       preserveReplacementInstance(ctx, state.drawCall, nullptr, replacementInstance);
 
