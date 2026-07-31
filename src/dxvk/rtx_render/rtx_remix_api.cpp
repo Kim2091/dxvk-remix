@@ -1164,12 +1164,20 @@ namespace {
       }
       allocatedSurfaces.push_back(std::move(dst));
     }
+    // Opt-in in-place geometry refresh: the caller is re-submitting a mesh that
+    // is already registered under this hash, with identical topology but moved
+    // vertex positions (FaceGen morphs). Keeping the hash -- and therefore the
+    // handle, the external-draw identity hash, and the spatial-map hash --
+    // stable is what preserves the instance's previous-frame correspondence.
+    const bool refreshGeometry = pnext::find<remixapi_MeshInfoRefreshGeometryEXT>(info) != nullptr;
+
     std::lock_guard lock { s_mutex };
     auto devLock = remixDevice->LockDevice(); // serialize EmitCs vs flush chunk-swap
 
-    remixDevice->EmitCs([cHandle = handle, cSurfaces = std::move(allocatedSurfaces)](dxvk::DxvkContext* ctx) mutable {
+    remixDevice->EmitCs([cHandle = handle, cSurfaces = std::move(allocatedSurfaces),
+                         cRefresh = refreshGeometry](dxvk::DxvkContext* ctx) mutable {
       auto& assets = ctx->getCommonObjects()->getSceneManager().getAssetReplacer();
-      assets->registerExternalMesh(cHandle, std::move(cSurfaces));
+      assets->registerExternalMesh(cHandle, std::move(cSurfaces), cRefresh);
     });
 
     *out_handle = handle;
