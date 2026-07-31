@@ -188,9 +188,55 @@ void AssetReplacer::destroyExternalMaterial(remixapi_MaterialHandle handle) {
   m_extMaterials.erase(handle);
 }
 
-void AssetReplacer::registerExternalMesh(remixapi_MeshHandle handle, std::vector<RasterGeometry>&& submeshes) {
-  if (m_extMeshes.count(handle) > 0) {
-    //Logger::info("Ignoring repeated mesh registration (handle=" + tostr(handle) + ") ");
+void AssetReplacer::registerExternalMesh(remixapi_MeshHandle handle, std::vector<RasterGeometry>&& submeshes,
+                                         bool refreshGeometry) {
+  auto existing = m_extMeshes.find(handle);
+  if (existing != m_extMeshes.end()) {
+    // In-place geometry refresh for CPU-deformed meshes that keep their
+    // topology (FaceGen morphs). Opt-in only: the default remains "ignore the
+    // repeated registration", because the ordinary re-create path re-submits
+    // byte-identical content (a released-but-not-yet-drained handle being
+    // revived), and silently reallocating buffers for that would churn the
+    // BLAS for geometry that never moved.
+    //
+    // Thread safety: every caller reaches this from the render (CS) thread --
+    // either inside the EmitCs lambda in remixapi_CreateMesh or via
+    // applyPendingMeshCreatesOnCs -- which is the same thread that runs
+    // SceneManager::submitExternalDraw. That serialization is what makes
+    // replacing the vector safe: no in-flight draw loop can be holding the
+    // reference returned by accessExternalMesh while we swap it. The old
+    // RasterGeometry's DxvkBuffer refs drop here, but any command list that
+    // already recorded them keeps them alive through DXVK's own lifetime
+    // tracking.
+    if (!refreshGeometry || existing->second.size() != submeshes.size()) {
+      //Logger::info("Ignoring repeated mesh registration (handle=" + tostr(handle) + ") ");
+      return;
+    }
+
+    for (size_t i = 0; i < submeshes.size(); i++) {
+      const GeometryHashes& prev = existing->second[i].hashes;
+      GeometryHashes& next = submeshes[i].hashes;
+
+      // Carry over everything that did NOT change, leaving only VertexPosition
+      // holding the fresh value minted by the caller. Two consumers depend on
+      // this split:
+      //   * DrawCallCache::get buckets on TopologicalHash (Indices |
+      //     GeometryDescriptor). Keeping those stable is what makes it hand
+      //     back the SAME BlasEntry instead of allocating a new one.
+      //   * SceneManager::processGeometryInfo compares Indices (now equal) and
+      //     VertexPosition (now different), which lands on kUpdateBVH -- the
+      //     path that swaps historyBuffer[0]/[1] and assigns
+      //     previousPositionBuffer, i.e. real motion vectors for the morph.
+      next[HashComponents::Indices]            = prev[HashComponents::Indices];
+      next[HashComponents::GeometryDescriptor] = prev[HashComponents::GeometryDescriptor];
+      next[HashComponents::VertexTexcoord]     = prev[HashComponents::VertexTexcoord];
+      next[HashComponents::VertexLayout]       = prev[HashComponents::VertexLayout];
+      next.precombine();
+
+      submeshes[i].externalMesh = handle;
+    }
+
+    existing->second = std::move(submeshes);
     return;
   }
 

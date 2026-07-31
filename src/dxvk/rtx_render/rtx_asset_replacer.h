@@ -288,7 +288,14 @@ namespace dxvk {
     [[nodiscard]] const MaterialData* accessExternalMaterial(remixapi_MaterialHandle handle) const;
     void destroyExternalMaterial(remixapi_MaterialHandle handle);
 
-    void registerExternalMesh(remixapi_MeshHandle handle, std::vector<RasterGeometry>&& submeshes);
+    // refreshGeometry: replace the geometry of an already-registered handle
+    // in place (remixapi_MeshInfoRefreshGeometryEXT) instead of ignoring the
+    // repeated registration. Preserves the previous registration's topology
+    // and layout hashes so the draw-call cache keeps the same BlasEntry and
+    // the scene manager takes its kUpdateBVH history path. Callers must be on
+    // the render (CS) thread -- see the note in the .cpp.
+    void registerExternalMesh(remixapi_MeshHandle handle, std::vector<RasterGeometry>&& submeshes,
+                              bool refreshGeometry = false);
     [[nodiscard]] const std::vector<RasterGeometry>& accessExternalMesh(remixapi_MeshHandle handle) const;
     void destroyExternalMesh(remixapi_MeshHandle handle);
 

@@ -139,6 +139,7 @@ extern "C" {
     REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_PARTICLE_SYSTEM_EXT    = 26,
     REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_GPU_INSTANCING_EXT     = 27,
     REMIXAPI_STRUCT_TYPE_CAMERA_MEDIUM_INFO                   = 28,
+    REMIXAPI_STRUCT_TYPE_MESH_INFO_REFRESH_GEOMETRY_EXT       = 29,
     // NOTE: if adding a new struct, register it in 'rtx_remix_specialization.inl'
     //       and only extend this enum by appending, never adjust the order of these 
     //       as that will break backwards compatibility.
@@ -368,6 +369,34 @@ extern "C" {
     const remixapi_MeshInfoSurfaceTriangles* surfaces_values;
     uint32_t                                 surfaces_count;
   } remixapi_MeshInfo;
+
+  // Link into remixapi_MeshInfo::pNext to REPLACE the geometry of a mesh that
+  // is already registered under the same hash, instead of the default behavior
+  // of ignoring the repeated registration.
+  //
+  // Intended for CPU-deformed geometry whose topology is fixed but whose vertex
+  // positions are rewritten by the host every few frames (e.g. Fallout 4 FaceGen
+  // morphs for lip sync, blinks, and expressions). Re-using the hash is what
+  // makes this work: the mesh handle IS the hash, and the handle feeds both
+  // ExternalDrawState::computeExternalDrawIdentityHash and the spatial-map hash,
+  // so minting a fresh hash per update would hand the scene manager a brand-new
+  // object every time -- a new RtInstance with no previous-frame correspondence,
+  // i.e. no motion vectors and no denoiser history (ghosting).
+  //
+  // On refresh, the runtime carries the previous registration's topology and
+  // layout hashes over to the new surfaces and leaves only VertexPosition fresh.
+  // DrawCallCache therefore keeps the same BlasEntry (it buckets on
+  // TopologicalHash) and processGeometryInfo resolves to kUpdateBVH, which
+  // ping-pongs the history buffers and populates previousPositionBuffer --
+  // giving the morph correct motion vectors rather than merely stable ones.
+  //
+  // The refresh is ignored (falls back to leaving the existing mesh alone) if no
+  // mesh is registered under the hash, or if the surface count differs from the
+  // registered one -- a changed surface count is a different mesh, not a morph.
+  typedef struct remixapi_MeshInfoRefreshGeometryEXT {
+    remixapi_StructType sType;
+    void*               pNext;
+  } remixapi_MeshInfoRefreshGeometryEXT;
 
   typedef remixapi_ErrorCode(REMIXAPI_PTR* PFN_remixapi_CreateMesh)(
     const remixapi_MeshInfo*  info,
