@@ -665,6 +665,9 @@ struct DrawCallState;
 namespace fork_hooks {
   void externalDrawTextureCategories(const MaterialData* material,
                                      DrawCallState& drawCall,
+                                     XXH64_hash_t meshHash,
+                                     const CategoryFlags& baseCategories,
+                                     CameraType::Enum baseCameraType,
                                      XXH64_hash_t& textureHash);
   // Fills in the weather precipitation emitter's draw call (transform + the
   // blend state the generated particle geometry inherits). Needs access to
@@ -853,9 +856,11 @@ private:
   friend struct RemixAPIPrivateAccessor;
 
   // Fork touchpoint: the external-draw texture-category hook needs access to
-  // private setCategory. See docs/fork-touchpoints.md.
+  // private setCategory / removeCategory / categories. See docs/fork-touchpoints.md.
   friend void fork_hooks::externalDrawTextureCategories(
-    const MaterialData* material, DrawCallState& drawCall, XXH64_hash_t& textureHash);
+    const MaterialData* material, DrawCallState& drawCall, XXH64_hash_t meshHash,
+    const CategoryFlags& baseCategories, CameraType::Enum baseCameraType,
+    XXH64_hash_t& textureHash);
 
   // Fork touchpoint: the precipitation emitter builds its DrawCallState from
   // scratch and needs transformData / materialData. See

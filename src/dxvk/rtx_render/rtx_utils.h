@@ -22,6 +22,7 @@
 #pragma once
 
 #include <sstream>
+#include <locale>
 #include <iomanip>
 #include <cassert>
 #include <optional>
@@ -86,6 +87,11 @@ inline const std::string hashToString(XXH64_hash_t hash) {
   //Two Hex Digits per byte
   constexpr uint8_t kNumHexits = sizeof(hash) * 2;
   std::stringstream ss;
+  // Classic locale: this is what the dev menu displays and what "Copy Texture
+  // hash" puts on the clipboard, so it has to be a value the user can paste
+  // straight back into a texture-category list. Under a host that sets a
+  // grouping locale it came out as "1,AC8,CA7,5E4,0AA,123".
+  ss.imbue(std::locale::classic());
   ss << std::uppercase << std::setfill('0') << std::setw(kNumHexits) << std::hex << hash;
   return ss.str();
 }

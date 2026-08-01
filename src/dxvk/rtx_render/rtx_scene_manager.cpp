@@ -2475,6 +2475,11 @@ namespace dxvk {
 
     AxisAlignedBoundingBox geometryBBox;
 
+    // One DrawCallState is reused for every submesh, so snapshot the state the
+    // client actually submitted; the per-submesh category hook resets to it.
+    const CategoryFlags baseCategories = state.drawCall.getCategoryFlags();
+    const CameraType::Enum baseCameraType = state.drawCall.cameraType;
+
     for (size_t i = 0; i < submeshes.size(); i++) {
       state.drawCall.overrideGeometryData(&submeshes[i]);
       state.drawCall.overrideCullMode(state.doubleSided ? VK_CULL_MODE_NONE : VK_CULL_MODE_BACK_BIT);
@@ -2486,9 +2491,12 @@ namespace dxvk {
         fork_hooks::externalDrawMaterialReplacement(*m_pReplacer, material);
 
         state.drawCall.modifyMaterialData().setHashOverride(material->getHash());
-
-        fork_hooks::externalDrawTextureCategories(material, state.drawCall, textureHash);
       }
+
+      // Runs even without a material: a submesh with none is exactly the
+      // untextured case that needs the mesh-hash tagging identity.
+      fork_hooks::externalDrawTextureCategories(
+        material, state.drawCall, meshHash, baseCategories, baseCameraType, textureHash);
 
       const RtxParticleSystemDesc* pParticles = nullptr;
       if (state.optionalParticleDesc.has_value()) {

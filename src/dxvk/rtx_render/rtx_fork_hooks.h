@@ -119,13 +119,23 @@ namespace dxvk {
     void externalDrawMaterialReplacement(
       AssetReplacer& replacer, const MaterialData*& material);
 
-    // Resolves the albedo texture hash from an API material and auto-applies
-    // all texture-based instance categories (Sky, Ignore, WorldUI, etc.).
-    // Writes textureHash out for use by subsequent hooks.
+    // Resolves the identity an API-submitted draw is categorized under and
+    // applies every texture-based instance category (Sky, Ignore, WorldUI, ...)
+    // the dev-menu grid can assign. The identity is the material's albedo
+    // texture hash when it has one, else meshHash — the client's own
+    // remixapi_MeshInfo::hash — so untextured draws are taggable too.
+    // Writes it out through textureHash for use by subsequent hooks.
+    //
+    // baseCategories / baseCameraType are the client-supplied instance state;
+    // the hook resets to them before applying, since submitExternalDraw reuses
+    // one DrawCallState across every submesh and setCategory is add-only.
     // Implementation in rtx_fork_submit.cpp.
     void externalDrawTextureCategories(
       const MaterialData* material,
       DrawCallState& drawCall,
+      XXH64_hash_t meshHash,
+      const CategoryFlags& baseCategories,
+      CameraType::Enum baseCameraType,
       XXH64_hash_t& textureHash);
 
     // Stores per-draw texture hash metadata in SceneManager::m_drawCallMeta

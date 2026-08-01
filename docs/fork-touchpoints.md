@@ -803,8 +803,9 @@ initializer list and can't be lifted into a separate TU.
 - **Hook** at `SceneManager::submitExternalDraw` (inside `if (material != nullptr)`, before `setHashOverride`) → `fork_hooks::externalDrawMaterialReplacement` in `rtx_fork_submit.cpp`
   *Checks for USD material replacements via `getReplacementMaterial()` and updates the `material` pointer in-place if one is found.*
 
-- **Hook** at `SceneManager::submitExternalDraw` (inside `if (material != nullptr)`, after `setHashOverride`) → `fork_hooks::externalDrawTextureCategories` in `rtx_fork_submit.cpp`
-  *Resolves albedo texture hash from the API material's opaque data and auto-applies all texture-based instance categories (Sky, Ignore, WorldUI, WorldMatte, Particle, Beam, DecalStatic, Terrain, AnimatedWater, IgnoreLights, IgnoreAntiCulling, IgnoreMotionBlur, Hidden).*
+- **Hook** at `SceneManager::submitExternalDraw` (inside the submesh loop, after the `if (material != nullptr)` block) → `fork_hooks::externalDrawTextureCategories` in `rtx_fork_submit.cpp`
+  *Resolves the identity the draw is categorized under and applies every texture-based instance category the dev-menu grid can assign (25 sets, parity with `DrawCallState::setupCategoriesForTexture` plus the D3D9 layer's `SmoothNormals` line), then routes `Sky` and `Ignore`, which have no consumer on the external path.*
+  *2026-07-31: signature gained `meshHash`, `baseCategories` and `baseCameraType`. (a) The hook now runs even when `material == nullptr`, and falls back to the API mesh hash when the material has no albedo texture — untextured API draws previously resolved to hash 0, which made them uncategorizable AND unpickable by construction. (b) It resets `categories` / `cameraType` to the client-submitted values first: one `DrawCallState` is reused across every submesh and `setCategory` is add-only, so tags leaked between submeshes and an un-ticked category never cleared. Call site snapshots both before the loop (2 lines).*
 
 - **Hook** at `SceneManager::submitExternalDraw` (after particle setup, before `processDrawCallState`) → `fork_hooks::externalDrawObjectPicking` in `rtx_fork_submit.cpp`
   *Stores per-draw texture hash metadata in `m_drawCallMeta` when object picking is active. Access to the private `m_drawCallMeta` member is granted via a `friend` declaration — see the `rtx_scene_manager.h` entry below.*
@@ -3914,5 +3915,113 @@ and is still documented as tested-and-rejected).
 
 Note: user rtx.conf files carrying `rtx.atmosphere.nubis3SunNearFieldKm` will log a
 harmless unknown-option warning.
+
+---
+
+## 2026-07-31 — dev-menu texture categorization for Remix API games
+
+Assigning a category in the dev-menu texture grid had no live effect on
+API-submitted geometry, and a large untextured mesh could not be picked at all.
+Live re-evaluation was never the problem: `remixapi_DrawInstance` builds a fresh
+`ExternalDrawState` per call and `InstanceManager::updateInstance` overwrites the
+persisted instance flags every frame. The failures were a consumption gap, an
+identity gap, and a UI gate.
+
+- **`src/dxvk/rtx_render/rtx_fork_submit.cpp`** - fork-owned change.
+  *`externalDrawTextureCategories` reworked. (1) **Identity**: falls back to the
+  API mesh hash when the material has no albedo texture. `remixapi_MeshInfo::hash`
+  IS the mesh handle (`rtx_remix_api.cpp:1025`), so this is a stable, client-
+  meaningful, per-mesh key. Previously such a draw resolved to hash 0 and was
+  skipped by both this hook and the object-picking hook — untextured API geometry
+  was uncategorizable and unpickable by construction. (2) **Sky**: promotes
+  `drawCall.cameraType` to `CameraType::Sky`, which is what
+  `rtx_instance_manager.cpp:1024` actually tests; the category bit alone is inert
+  on this path because `cameraType` is frozen from the API's own `categoryFlags`
+  before the hook runs, and `CameraManager::processCameraData` (which closes the
+  loop for D3D9) is only reachable from `commitGeometryToRT`. Done after the
+  transform bake on purpose — there is no registered sky camera for API draws, so
+  re-baking against `CameraType::Sky` would use an uninitialized `RtCamera`.
+  (3) **Ignore**: folded onto `Hidden`. Its only consumer anywhere is
+  `d3d9_rtx.cpp:1132`, inside the D3D9 interception layer. Skipping the submesh
+  the way D3D9 does would leave `replacementInstance->prims[i]` pointing at an
+  RtInstance that stops updating. (4) **Parity**: 12 further category sets added,
+  matching `DrawCallState::setupCategoriesForTexture` plus the D3D9 layer's
+  `SmoothNormals` line; `rtx.skyBoxGeometries` now applies too, keyed on the mesh
+  hash. (5) **Reset**: categories/cameraType reset to the client-submitted values
+  per submesh — one `DrawCallState` is shared across submeshes and `setCategory`
+  is add-only, so tags leaked between submeshes and un-ticking never cleared.
+  (6) Diagnostic `logCategoryKeyOnce`, gated on `rtx.logApiDrawCategoryKeys`.*
+
+- **`src/dxvk/rtx_render/rtx_scene_manager.cpp`** - fork-touchpoint hook call site.
+  *Snapshots `baseCategories` / `baseCameraType` before the submesh loop and moves
+  the category-hook call out of the `if (material != nullptr)` guard — a submesh
+  with no material at all is exactly the untextured case that needs the mesh-hash
+  identity.*
+
+- **`src/dxvk/rtx_render/rtx_types.h`** - fork-touchpoint inline tweak - 2 blocks.
+  *Forward decl + `friend` updated for the new signature. The hook writes
+  `categories` directly (private) to do the per-submesh reset.*
+
+- **`src/dxvk/rtx_render/rtx_fork_hooks.h`** - fork-owned change. *Declaration.*
+
+- **`src/dxvk/imgui/dxvk_imgui.cpp`** - fork-touchpoint inline tweak - 2 blocks.
+  *`texture_popup::produce` defaults `textureFeatureFlags` to `kTextureFlagsDefault`
+  when the hash has no `g_imguiTextureMap` entry, instead of 0. A world click can
+  now resolve to a mesh hash, which has no thumbnail to register; at 0 every
+  category row failed the feature-mask test and the popup opened empty, so the
+  object could not be tagged at all. The flags only ever restrict (render-target-
+  only rows), so an unknown hash is safely treated as an ordinary texture. Also
+  adds the "Log Remix API draw category keys" checkbox to Step 1.*
+
+- **`src/dxvk/rtx_render/rtx_options.h`** - fork-owned change.
+  *`rtx.logApiDrawCategoryKeys` (default off).*
+
+Note: `rtx.lightConverter` ("Add Light to Textures") still cannot match on the API
+path — `shouldConvertToLight` is keyed on the material hash, which
+`submitExternalDraw` overrides with the API material hash, not the texture hash.
+`Terrain` is set but nothing bakes it for external draws (`bakeTerrain` lives in
+`commitGeometryToRT`). Both are pre-existing and out of scope here.
+
+---
+
+## 2026-07-31 — locale-independent number serialization
+
+The dev menu rendered texture hashes as `1,AC8,CA7,5E4,0AA,123` and rtx.conf
+saved `rtx.fallbackLightRadiance = 25,000, 25,000, 25,000`. Not cosmetic: a
+`std::stringstream` is constructed with the **global** locale, and a host
+application can replace it — Dolphin calls `std::locale::global(std::locale(...))`
+with the user's locale at startup (`Source/Core/UICommon/UICommon.cpp:224`), which
+gave every number the runtime writes digit grouping. The read side does not agree:
+hashes come back through `std::stoull` (`rtx_option.cpp:27`), which is C-locale and
+stops at the first separator, and vectors are split on `,` before parsing. So
+**texture category assignments saved under such a host did not survive a restart**,
+and a hash copied out of the dev menu could not be pasted back into a category list.
+
+Fixed by pinning `std::locale::classic()` on the streams that serialize values.
+For a host that never touches the global locale this is a no-op — it is exactly
+the behaviour these call sites already had — so D3D9 titles are unaffected.
+
+- **`src/util/util_string.h`** - fork-touchpoint inline tweak. *`str::format` imbues
+  classic. This is the shared formatter behind logging and much of the option
+  plumbing, hence the broad rebuild.*
+- **`src/util/util_hash_set_layer.h`** - fork-touchpoint inline tweak.
+  *`HashSetLayer::toString` imbues classic — this is the writer for every
+  `rtx.*Textures` list in rtx.conf, i.e. the one that was losing tags.*
+- **`src/dxvk/rtx_render/rtx_option.cpp`** - fork-touchpoint inline tweak.
+  *`hashVectorToString` imbues classic.*
+- **`src/dxvk/rtx_render/rtx_utils.h`** - fork-touchpoint inline tweak.
+  *`hashToString` imbues classic — the grid/popup display and the "Copy Texture
+  hash" clipboard value.*
+- **`src/util/config/config.cpp`** - fork-touchpoint inline tweak - 5 blocks.
+  *The stream-based `Config::generateOptionString` overloads (float, Vector2,
+  Vector2i, Vector3, Vector4) imbue classic. The parse side needs no change: it
+  tokenizes with `std::getline` and converts with `std::stof`/`std::stoi`, none of
+  which consult the C++ locale.*
+
+Known and NOT fixed here: `std::stof` / `std::stoi` follow the **C** locale, which
+Dolphin also sets (`std::setlocale(LC_ALL, ...)`, `UICommon.cpp:222`). Under a
+locale whose decimal separator is a comma, float options would still misparse.
+That is a pre-existing, host-wide hazard independent of the categorization work
+and needs `std::from_chars`, not an imbue.
 
 ---

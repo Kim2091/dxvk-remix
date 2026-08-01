@@ -22,6 +22,7 @@
 #include <array>
 #include <fstream>
 #include <sstream>
+#include <locale>
 #include <iostream>
 #include <regex>
 #include <utility>
@@ -1090,12 +1091,14 @@ namespace dxvk {
 
   std::string Config::generateOptionString(const float& value) {
     std::stringstream ss;
+    ss.imbue(std::locale::classic());
     ss << value;
     return ss.str();
   }
 
   std::string Config::generateOptionString(const Vector2i& value) {
     std::stringstream ss;
+    ss.imbue(std::locale::classic());
     ss << value.x << ", " << value.y;
     return ss.str();
   }
@@ -1103,6 +1106,7 @@ namespace dxvk {
   // NV-DXVK start: added a variant
   std::string Config::generateOptionString(const Vector2& value) {
     std::stringstream ss;
+    ss.imbue(std::locale::classic());
     ss << value.x << ", " << value.y;
     return ss.str();
   }
@@ -1110,6 +1114,7 @@ namespace dxvk {
 
   std::string Config::generateOptionString(const Vector3& value) {
     std::stringstream ss;
+    ss.imbue(std::locale::classic());
     ss << value.x << ", " << value.y << ", " << value.z;
     return ss.str();
   }
@@ -1117,6 +1122,7 @@ namespace dxvk {
   // NV-DXVK start: added a variant
   std::string Config::generateOptionString(const Vector4& value) {
     std::stringstream ss;
+    ss.imbue(std::locale::classic());
     ss << value.x << ", " << value.y << ", " << value.z << ", " << value.w;
     return ss.str();
   }

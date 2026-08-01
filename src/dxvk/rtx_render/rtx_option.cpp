@@ -21,6 +21,8 @@
 */
 #include "rtx_options.h"
 
+#include <locale>
+
 namespace dxvk {
   void fillHashVector(const std::vector<std::string>& rawInput, std::vector<XXH64_hash_t>& hashVectorOutput) {
     for (auto&& hashStr : rawInput) {
@@ -31,6 +33,9 @@ namespace dxvk {
 
   std::string hashVectorToString(const std::vector<XXH64_hash_t>& hashVector) {
     std::stringstream ss;
+    // Classic locale: fillHashVector above parses these back with std::stoull,
+    // which stops at a digit-grouping separator. See util_hash_set_layer.h.
+    ss.imbue(std::locale::classic());
     for (auto&& hash : hashVector) {
       if (ss.tellp() != std::streampos(0))
         ss << ", ";
