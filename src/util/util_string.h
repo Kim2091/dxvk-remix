@@ -24,6 +24,7 @@
 #include <string>
 #include <string_view>
 #include <sstream>
+#include <locale>
 #include <vector>
 
 #include "./com/com_include.h"
@@ -67,6 +68,16 @@ namespace dxvk::str {
   template<typename... Args>
   std::string format(const Args&... args) {
     std::stringstream stream;
+    // A stream is constructed with the *global* locale, and a host application
+    // can move that out from under us: Dolphin calls std::locale::global() with
+    // the user's locale at startup (UICommon.cpp), which made every number this
+    // formatter emits pick up digit grouping — hashes printed and copied out of
+    // the dev menu came back as "1,AC8,CA7,5E4,0AA,123" and rtx.conf saved
+    // "25,000, 25,000, 25,000". The read side is std::stoull/strtoull, which is
+    // C-locale and stops at the first separator, so those values did not round
+    // trip. Pin the classic locale; for a host that never touches the global
+    // one this is exactly the behaviour we already had.
+    stream.imbue(std::locale::classic());
     format1(stream, args...);
     return stream.str();
   }

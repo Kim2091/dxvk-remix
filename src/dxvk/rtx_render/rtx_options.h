@@ -335,7 +335,13 @@ namespace dxvk {
                   "Textures on draw calls whose geometry should have smooth normals generated on the GPU.\n"
                   "This is useful for older D3D9 games where the geometry may be missing smooth normals, especially when using the VertexShader Capture mechanism.\n"
                   "When a draw call matches, area-weighted smooth normals will be computed from the triangle mesh and used for ray tracing.");
-    
+
+    RTX_OPTION("rtx", bool, logApiDrawCategoryKeys, false,
+                  "Logs the hash each Remix API draw call is categorized under, once per distinct value.\n"
+                  "The key is the draw's albedo texture hash, or - when it has no albedo texture - the mesh hash the client passed to CreateMesh.\n"
+                  "This is the value the texture category lists above must contain for a tag to match, and for untextured geometry it is the only way to read it off, since such a draw has no thumbnail in the categorization grid.\n"
+                  "Diagnostic only; leave off during normal play.");
+
   public:
     RTX_OPTION("rtx", bool, showRaytracingOption, true, "Enables or disables the option to toggle ray tracing in the UI. When set to false the ray tracing checkbox will not appear in the Remix UI.");
     RTX_OPTION_ENV("rtx", bool, enableRaytracing, true, "DXVK_ENABLE_RAYTRACING",

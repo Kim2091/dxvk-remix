@@ -2212,7 +2212,7 @@ namespace dxvk {
         const XXH64_hash_t texHashForSizing = g_holdingTexture.load();
         float texturePopupLabelColumnW = 0.0f;
         if (texHashForSizing != kEmptyHash) {
-          uint32_t textureFeatureFlagsForSizing = 0;
+          uint32_t textureFeatureFlagsForSizing = ImGUI::kTextureFlagsDefault;
           const auto pairForSizing = g_imguiTextureMap.find(texHashForSizing);
           if (pairForSizing != g_imguiTextureMap.end()) {
             textureFeatureFlagsForSizing = pairForSizing->second.textureFeatureFlags;
@@ -2233,7 +2233,14 @@ namespace dxvk {
             if (ImGui::Button("Copy Texture hash##texture_popup")) {
               ImGui::SetClipboardText(hashToString(texHash).c_str());
             }
-            uint32_t textureFeatureFlags = 0;
+            // Default rather than 0 for a hash with no catalog entry. A world
+            // click can resolve to one: Remix-API draws with no albedo texture
+            // are tagged by their mesh hash, which has no thumbnail to register.
+            // At 0 every category row fails the feature-mask test below and the
+            // popup opens with nothing in it, so the object cannot be tagged at
+            // all — the flags only ever *restrict* (render-target-only rows), so
+            // treating an unknown hash as an ordinary texture is the safe default.
+            uint32_t textureFeatureFlags = ImGUI::kTextureFlagsDefault;
             const auto& pair = g_imguiTextureMap.find(texHash);
             if (pair != g_imguiTextureMap.end()) {
               textureFeatureFlags = pair->second.textureFeatureFlags;
@@ -2676,6 +2683,7 @@ namespace dxvk {
     if (IMGUI_ADD_TOOLTIP(ImGui::BeginTabItem("Step 1: Categorize Textures", nullptr, tab_item_flags), "Select texture definitions for Remix")) {
       spacing();
       RemixGui::Checkbox("Preserve discarded textures", &RtxOptions::keepTexturesForTaggingObject());
+      RemixGui::Checkbox("Log Remix API draw category keys", &RtxOptions::logApiDrawCategoryKeysObject());
       separator();
 
       // set thumbnail size

@@ -25,6 +25,7 @@
 #include <string>
 #include <vector>
 #include <sstream>
+#include <locale>
 #include <iomanip>
 #include <algorithm>
 #include "util_fast_cache.h"
@@ -156,7 +157,12 @@ namespace dxvk {
     // Positive entries are formatted as "0x...", negative entries as "-0x...".
     std::string toString() const {
       std::stringstream ss;
-      
+      // Locale-independent: this string is written to rtx.conf and read back
+      // with std::stoull, which is C-locale and would stop at a digit-grouping
+      // separator. A host that calls std::locale::global() (Dolphin does) would
+      // otherwise make every saved texture-category hash unparseable.
+      ss.imbue(std::locale::classic());
+
       // Collect positive entries for sorting
       std::vector<XXH64_hash_t> sortedPositives(m_positives.begin(), m_positives.end());
       std::sort(sortedPositives.begin(), sortedPositives.end());
