@@ -342,6 +342,12 @@ namespace dxvk {
                   "This is the value the texture category lists above must contain for a tag to match, and for untextured geometry it is the only way to read it off, since such a draw has no thumbnail in the categorization grid.\n"
                   "Diagnostic only; leave off during normal play.");
 
+    RTX_OPTION("rtx", bool, logReplacementInstanceGC, false,
+                  "Logs one line per frame summarising ReplacementInstance garbage collection: how many are tracked, how many the staleness test considered, how many were destroyed or kept alive, and the age histogram of what survived.\n"
+                  "Use it to answer whether a replacement that outlives the mesh it is anchored to is (a) still being submitted by the client every frame, (b) being kept alive by anti-culling, or (c) never reaching the collector at all.\n"
+                  "Writes to the runtime log, not the host application's log.\n"
+                  "Diagnostic only; leave off during normal play.");
+
   public:
     RTX_OPTION("rtx", bool, showRaytracingOption, true, "Enables or disables the option to toggle ray tracing in the UI. When set to false the ray tracing checkbox will not appear in the Remix UI.");
     RTX_OPTION_ENV("rtx", bool, enableRaytracing, true, "DXVK_ENABLE_RAYTRACING",
