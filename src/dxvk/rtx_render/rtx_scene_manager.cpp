@@ -2548,7 +2548,21 @@ namespace dxvk {
       replacementGeometry.cullMode = state.doubleSided ? VK_CULL_MODE_NONE : VK_CULL_MODE_BACK_BIT;
       replacementGeometry.externalMaterial = nullptr;
 
+      // The template material must be the CLIENT's material for this mesh, resolved the
+      // same way the non-replacement submesh loop below resolves it: drawReplacements
+      // passes renderMaterialData through to prims flagged includeOriginal (the game
+      // mesh kept alongside the additions), while replaced prims override it with their
+      // own USD materials. The blank LegacyMaterialData default that used to be passed
+      // here rendered every includeOriginal anchor solid white once replacement
+      // lifetimes were fixed (BFBB pineapple, 2026-08-04) -- before that fix the
+      // includeOriginal prim never survived to the TLAS, which is why this was latent.
       MaterialData renderMaterialData = LegacyMaterialData().as<OpaqueMaterialData>();
+      const MaterialData* origMaterial = m_pReplacer->accessExternalMaterial(submeshes[0].externalMaterial);
+      if (origMaterial != nullptr) {
+        fork_hooks::externalDrawMaterialReplacement(*m_pReplacer, origMaterial);
+        replacementDrawCall.modifyMaterialData().setHashOverride(origMaterial->getHash());
+        renderMaterialData = *origMaterial;
+      }
       drawReplacements(ctx, &replacementDrawCall, pReplacements, renderMaterialData, replacementInstance);
 
       // Stamp the persistence clock, mirroring this function's tail. Without it the RI is
