@@ -571,6 +571,9 @@ initializer list and can't be lifted into a separate TU.
 
 **Rationale:** All fork additions are an enum definition and `RTX_OPTION(...)` macro declarations inside the `RtxOptions` class body. `RTX_OPTION` expands to an inline static member declaration — it is structurally part of the class definition and cannot be lifted into a separate TU or wrapped in a hook. There is no function body to extract.
 
+- **Inline tweak** at `RtxOptions` class body (`logReplacementInstanceGC` RTX_OPTION) — ~6 LOC, added 2026-08-04.
+  *Declares `RTX_OPTION("rtx", bool, logReplacementInstanceGC, false, ...)` next to the existing `logApiDrawCategoryKeys` diagnostic. Consumed by `DrawCallTracker::garbageCollectReplacementInstances` in `rtx_draw_call_tracker.cpp` (see that file's entry) to answer whether a replacement outliving its anchor is still being submitted, kept by anti-culling, or never reaching the collector.*
+
 - **Inline tweak** at `(file scope namespace dxvk)` (SkyMode enum) — ~5 LOC.
   *Declares the `SkyMode` enum class (`SkyboxRasterization = 0`, `Numos = 1`). Required by `RtxOptions::skyMode` below and by atmosphere hook code in `rtx_fork_atmosphere.cpp` (via the `rtx_options.h` include chain).*
 
@@ -812,6 +815,17 @@ initializer list and can't be lifted into a separate TU.
 
 ---
 
+## src/dxvk/rtx_render/rtx_draw_call_tracker.cpp
+
+**Fork footprint:** +~50 / -0 LOC, log-only (added 2026-08-04)
+
+**Category:** index-only
+
+- **Inline tweak** at `DrawCallTracker::garbageCollectReplacementInstances` — diagnostic accounting behind `RtxOptions::logReplacementInstanceGC` (default off, declared in `rtx_options.h`).
+  *Emits one `[RI-GC]` line per frame: ReplacementInstances tracked (and how many carry replacements), how many the staleness test considered, destroyed and kept alive, a survivor age histogram bucketed on `currentFrame - frameLastSeen` (including a `never-stamped` bucket for the `frameLastSeen == 0` RIs every replaced external draw produces), plus the anti-culling / camera-cut / forceGC inputs. Written because reading this call chain repeatedly produced a wrong fix — see the `submitExternalDraw` NOTE in the `rtx_scene_manager.cpp` entry. Zero cost when the option is off (all accounting is inside `if (logGC)`); no control flow depends on it.*
+
+---
+
 ## src/dxvk/rtx_render/rtx_scene_manager.cpp
 
 **Pre-refactor footprint:** +73 / -2 LOC (migrated 2026-04-18)
@@ -820,6 +834,9 @@ initializer list and can't be lifted into a separate TU.
 - **Hook** at `SceneManager::submitExternalDraw` (before submesh loop) → `fork_hooks::externalDrawMeshReplacement` in `rtx_fork_submit.cpp`
   *Checks for USD mesh/light replacements keyed on the API mesh handle hash; call site handles the early-exit + `drawReplacements` dispatch since those are private SceneManager methods.*
   *2026-07-29 (upstream sync): the call site's replacement-template setup now goes through `DrawCallState::modifyGeometryData()` instead of writing `replacementDrawCall.geometryData` directly — upstream moved `geometryData` into the private section behind that accessor, and `SceneManager` is not a friend of `DrawCallState` (the fork hooks and `D3D9Rtx` are). Same for `modifyMaterialData()` at the `setHashOverride` site below.*
+  *2026-08-04 (fix, TWO load-bearing halves — in-game evidence showed each alone fails):*
+  *(1) The external path ports the D3D9 path's `activeReplacementsMatch` guard — after the RI lookup, `if (replacementInstance->activeReplacements != pReplacements) replacementInstance->clear();` before dispatching to either branch. Without it, an RI wired by one branch could be handed to the other when the replacement lookup transitioned null↔loaded (async load completing, variant toggle, or a race between two submissions); `drawReplacements` only re-initializes when `root == nullptr`, so a 1-prim RI entering it kept its undersized `prims[]` and `PrimInstanceOwner::setReplacementInstance`'s bounds check linked every instance at index ≥ `prims.size()` ONE-WAY — instance→RI with no back-slot. `ReplacementInstance::clear()` marks only `prims[]` on destroy, so those instances stayed permanently alive with dangling owner pointers: invisible to instance GC (only RIs mark instances) and to `prepareSceneData`'s preserve loop (walks RI→prims). Diagnosed in-game (BFBB step-ladder mod): `[RI-EVT]` instrumentation caught the single poisoned frame (`prims 1` against a 5-prim replacement) birthing exactly the 4 observed zombie instances. In the reverse direction (loaded→null), a surviving 5-prim RI entering the non-replacement submesh loop reused `prims[0]`'s replacement instance for the anchor's own geometry via the BlasEntry relink — the "anchor mesh loses its textures" regression seen when the stamp was tried alone.*
+  *(2) The replacement branch stamps `replacementInstance->frameLastSeen` before its early return, mirroring the function's tail. Without the stamp the RI is stale-on-arrival (`frameLastSeen == 0`) and `garbageCollectReplacementInstances` destroys it in the same present it was created — before the TLAS build — so replaced external draws NEVER legitimately rendered; the historically-visible replacement geometry was zombie instances minted by defect (1). Measured proof: with the guard alone deployed, `[RI-EVT]` showed 6391 consecutive healthy `prims 5` submissions with zero zombies and nothing on screen.* Upstream commit `340bc1fc0` ([REMIX-4134], persistence tracking + anti-culling on game draw calls) set that field only on `submitExternalDraw`'s tail — which this early return skips — so every external draw carrying a mesh replacement sits at `frameLastSeen == 0` permanently, and `frameLastSeen` is the only input to `DrawCallTracker::garbageCollectReplacementInstances`' staleness test. **Stamping it regressed the anchor mesh's textures in-game (BFBB: flat untextured geometry) and did not fix the lifetime symptom.** Cause: `SceneManager::prepareSceneData`'s "re-register anti-culled survivors" loop is gated on `ri->frameLastSeen != currentFrameId`, so with the field pinned at 0 it runs `preserveInstance()` over every external RI every frame — and the external draw path depends on that to keep its buffer / texture / material cache indices valid. Any real fix has to preserve that re-registration, or make `submitExternalDraw` not need it. **Also still unset on both external branches: `categoryFlags` and `isSkinned`, which upstream sets on the D3D9 path — inert while anti-culling is off.***
 
 - **Hook** at `SceneManager::submitExternalDraw` (inside `if (material != nullptr)`, before `setHashOverride`) → `fork_hooks::externalDrawMaterialReplacement` in `rtx_fork_submit.cpp`
   *Checks for USD material replacements via `getReplacementMaterial()` and updates the `material` pointer in-place if one is found.*

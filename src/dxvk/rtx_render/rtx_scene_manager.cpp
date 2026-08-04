@@ -325,6 +325,65 @@ namespace dxvk {
     // Instance/light GC: removes entities marked for GC by ReplacementInstance::clear()
     // or marked on creation (ephemeral copies). Back-pointers are already null.
     m_instanceManager.garbageCollection();
+
+    // Companion to [RI-GC]. Instance lifetimes here are ENTIRELY externally managed:
+    // InstanceManager::garbageCollection only reclaims what ReplacementInstance::clear()
+    // marked, so an RtInstance that no live RI points at can never be reclaimed by
+    // anything, and the preserve loop in prepareSceneData (which walks RIs, then prims)
+    // can never refresh its per-frame buffer/material indices — it renders forever with
+    // rotting indices. Two distinct failure shapes are counted:
+    //   ownerless — owner back-pointer is null (cleanly unlinked but never marked);
+    //   ZOMBIE    — owner back-pointer is non-null but not in the tracker's live list,
+    //               i.e. it DANGLES at a destroyed RI. The plain ownerless counter
+    //               cannot see these; validating against the live-RI set can.
+    // The dangling owner pointer is only compared, never dereferenced.
+    if (RtxOptions::logReplacementInstanceGC()) {
+      std::unordered_set<const ReplacementInstance*> liveRis;
+      for (const auto& ri : m_drawCallTracker.getReplacementInstances()) {
+        liveRis.insert(ri.get());
+      }
+
+      const std::vector<RtInstance*>& instances = m_instanceManager.getInstanceTable();
+      uint32_t orphaned = 0, hidden = 0, zombies = 0;
+      for (RtInstance* instance : instances) {
+        const ReplacementInstance* owner = instance->getPrimInstanceOwner().getReplacementInstance();
+        if (owner == nullptr) {
+          ++orphaned;
+        } else if (liveRis.find(owner) == liveRis.end()) {
+          ++zombies;
+        }
+        if (instance->isHidden()) {
+          ++hidden;
+        }
+      }
+
+      // Detail lines only when the zombie population changes, so a persistent zombie
+      // does not spam one line per frame for the rest of the run.
+      static uint32_t s_prevZombies = 0;
+      if (zombies != s_prevZombies) {
+        for (RtInstance* instance : instances) {
+          const ReplacementInstance* owner = instance->getPrimInstanceOwner().getReplacementInstance();
+          if (owner != nullptr && liveRis.find(owner) == liveRis.end()) {
+            Logger::info(str::format(
+                "[RI-EVT] zombie inst ", instance,
+                " ownerDangling ", owner,
+                " primIdx ", instance->getPrimInstanceOwner().getReplacementIndex(),
+                " markedForGC ", instance->isMarkedForGC() ? 1 : 0,
+                " hidden ", instance->isHidden() ? 1 : 0,
+                " surfMatIdx ", instance->surface.surfaceMaterialIndex,
+                " frameAge ", instance->getFrameAge()));
+          }
+        }
+        s_prevZombies = zombies;
+      }
+
+      Logger::info(str::format(
+          "[RI-GC]   instances ", instances.size(),
+          " | ownerless ", orphaned,
+          " | zombies ", zombies,
+          " | hidden ", hidden));
+    }
+
     m_accelManager.garbageCollection();
     m_lightManager.garbageCollection(getCamera());
     m_rayPortalManager.garbageCollection();
@@ -2457,7 +2516,28 @@ namespace dxvk {
     ReplacementInstance* replacementInstance = m_drawCallTracker.findOrCreateReplacementInstance(externalKey);
     replacementInstance->dirtyFlags.clr(ReplacementInstance::kDynamicFeatureMask);
 
-    if (std::vector<AssetReplacement>* pReplacements = fork_hooks::externalDrawMeshReplacement(*m_pReplacer, meshHash)) {
+    std::vector<AssetReplacement>* pReplacements = fork_hooks::externalDrawMeshReplacement(*m_pReplacer, meshHash);
+
+    // Port of the D3D9 path's activeReplacementsMatch guard (see submitDrawState above):
+    // when the replacement set this RI was wired for is not the one the lookup returned
+    // now — async replacement load completing, variant toggle, or the lookup racing from
+    // null to loaded between two submissions — the RI's prims[] is sized and linked for
+    // the OLD set, and drawReplacements only re-initializes when root is null. Without
+    // this clear(), a 1-prim RI from the non-replacement path enters drawReplacements,
+    // setup() never runs, and every instance at index >= prims.size() is linked ONE-WAY
+    // by PrimInstanceOwner::setReplacementInstance's bounds check: the instance points at
+    // the RI but no prims[] slot points back. When the RI is destroyed, clear() marks only
+    // prims[]; the one-way instances are never marked and never unlinked — permanently
+    // alive, invisible to instance GC (only RIs mark instances) and to prepareSceneData's
+    // preserve loop (walks RI->prims), so they render forever with rotting per-frame
+    // buffer/material indices. Diagnosed in-game 2026-08-04 (BFBB step-ladder mod):
+    // [RI-EVT] logs caught the one poisoned frame — 'prims 1' against a 5-prim
+    // replacement — birthing 4 zombie instances with dangling owner pointers.
+    if (replacementInstance->activeReplacements != pReplacements) {
+      replacementInstance->clear();
+    }
+
+    if (pReplacements != nullptr) {
       // Copy the DrawCallState so we don't mutate the caller's state. Point geometryData
       // at submeshes[0] as the replacement geometry template, clear externalMaterial so
       // the USD replacement material takes precedence, and use a neutral default material
@@ -2470,6 +2550,35 @@ namespace dxvk {
 
       MaterialData renderMaterialData = LegacyMaterialData().as<OpaqueMaterialData>();
       drawReplacements(ctx, &replacementDrawCall, pReplacements, renderMaterialData, replacementInstance);
+
+      // Stamp the persistence clock, mirroring this function's tail. Without it the RI is
+      // stale-on-arrival (frameLastSeen == 0) and garbageCollectReplacementInstances destroys
+      // it in the same present it was created -- before the TLAS build -- so replaced external
+      // draws never legitimately rendered at all; what appeared on screen historically was
+      // zombie instances minted by the transition bug the clear() guard above now prevents.
+      //
+      // HISTORY (2026-08-04, all three states observed in-game on the BFBB ladder mod):
+      // stamp WITHOUT the guard cross-wires prims on null<->loaded replacement transitions
+      // (a surviving 5-prim RI enters the non-replacement submesh loop, which reuses
+      // prims[0]'s ladder instance for the anchor's geometry via the BlasEntry relink --
+      // the "anchor mesh loses its textures" regression). Guard WITHOUT the stamp renders
+      // nothing (churn is collected pre-TLAS, and no zombies survive to fake it). The pair
+      // is load-bearing: keep them together.
+      replacementInstance->frameLastSeen = m_device->getCurrentFrameId();
+
+      // Diagnostic: one line per replaced external submission — which RI the lookup
+      // resolved to and which RtInstance sits in prims[0] after drawReplacements.
+      // Correlate with [RI-EVT] destroy-repl / zombie lines from the same frame.
+      if (RtxOptions::logReplacementInstanceGC()) {
+        Logger::info(str::format(
+            "[RI-EVT] extdraw-repl frame ", m_device->getCurrentFrameId(),
+            " mesh 0x", std::hex, meshHash, std::dec,
+            " ri ", static_cast<const void*>(replacementInstance),
+            " id ", replacementInstance->id,
+            " prims ", replacementInstance->prims.size(),
+            " inst0 ", replacementInstance->prims.empty() ? nullptr : replacementInstance->prims[0].getUntyped(),
+            " pos (", worldPos.x, ", ", worldPos.y, ", ", worldPos.z, ")"));
+      }
       return;
     }
 

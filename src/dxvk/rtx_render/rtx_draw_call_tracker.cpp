@@ -356,6 +356,25 @@ namespace dxvk {
       return;
     }
 
+    // Diagnostic: record what a replacement-carrying RI is about to mark for GC.
+    // Correlated with the [RI-EVT] zombie lines — if a zombie instance appears on a
+    // frame whose destroy line does NOT list that pointer, the instance was unlinked
+    // from prims[] (or re-linked elsewhere) before the destroy, and the orphan was
+    // created at that earlier site, not here.
+    if (RtxOptions::logReplacementInstanceGC() && replacementInstance->activeReplacements != nullptr) {
+      std::string primList;
+      for (const PrimInstance& prim : replacementInstance->prims) {
+        primList += str::format(" ", prim.getUntyped());
+      }
+      Logger::info(str::format(
+          "[RI-EVT] destroy-repl frame ", m_device->getCurrentFrameId(),
+          " ri ", static_cast<const void*>(replacementInstance),
+          " id ", replacementInstance->id,
+          " prims ", replacementInstance->prims.size(),
+          " [", primList, " ]",
+          " root ", replacementInstance->root.getUntyped()));
+    }
+
     m_identityHashMap.erase(replacementInstance->identityHash);
 
     eraseFromSpatialMap(m_assetSpatialMaps, replacementInstance->spatialMapHash,
@@ -378,13 +397,48 @@ namespace dxvk {
     const bool forceGC = (m_replacementInstances.size() >=
         RtxOptions::AntiCulling::Object::numObjectsToKeep());
 
+    // Diagnostic accounting. Answers, in one line per frame, whether a replacement that
+    // outlives its anchor is still being submitted, kept alive by anti-culling, or never
+    // considered at all. Survivor ages are bucketed by (currentFrame - frameLastSeen);
+    // "unstamped" counts RIs still at frameLastSeen == 0, which is what every replaced
+    // external draw looks like (see the NOTE in SceneManager::submitExternalDraw).
+    const bool logGC = RtxOptions::logReplacementInstanceGC();
+    struct { uint32_t total, withReplacements, considered, destroyed, keptAlive,
+                      survivorFresh, survivorRecent, survivorStale, survivorUnstamped; } stats {};
+    if (logGC) {
+      stats.total = static_cast<uint32_t>(m_replacementInstances.size());
+      for (const auto& ri : m_replacementInstances) {
+        if (ri->activeReplacements != nullptr) {
+          ++stats.withReplacements;
+        }
+      }
+    }
+
     for (size_t i = 0; i < m_replacementInstances.size();) {
       ReplacementInstance* replacementInstance = m_replacementInstances[i].get();
 
       const bool hasLights = replacementInstance->lightBoundingBox.isValid();
       const bool hasMeshes = replacementInstance->geometryBoundingBox.isValid();
 
+      if (logGC) {
+        if (replacementInstance->frameLastSeen == 0) {
+          ++stats.survivorUnstamped;
+        } else {
+          const uint32_t age = currentFrame - replacementInstance->frameLastSeen;
+          if (age == 0) {
+            ++stats.survivorFresh;
+          } else if (age < 10) {
+            ++stats.survivorRecent;
+          } else {
+            ++stats.survivorStale;
+          }
+        }
+      }
+
       if (replacementInstance->frameLastSeen + numFramesToKeepObjects <= currentFrame) {
+        if (logGC) {
+          ++stats.considered;
+        }
         bool keepAlive = false;
 
         // Only anti-cull RIs that have been matched at least once after creation.
@@ -444,13 +498,39 @@ namespace dxvk {
         }
 
         if (!keepAlive) {
+          if (logGC) {
+            ++stats.destroyed;
+          }
           destroyReplacementInstance(replacementInstance);
           std::swap(m_replacementInstances[i], m_replacementInstances.back());
           m_replacementInstances.pop_back();
           continue;
         }
+        if (logGC) {
+          ++stats.keptAlive;
+        }
       }
       ++i;
+    }
+
+    if (logGC) {
+      Logger::info(str::format(
+          "[RI-GC] frame ", currentFrame,
+          " | tracked ", stats.total, " (", stats.withReplacements, " replaced)",
+          " -> ", m_replacementInstances.size(), " after",
+          " | considered ", stats.considered,
+          ", destroyed ", stats.destroyed,
+          ", kept alive ", stats.keptAlive,
+          " | ages: seen-this-frame ", stats.survivorFresh,
+          ", 1-9 ", stats.survivorRecent,
+          ", 10+ ", stats.survivorStale,
+          ", never-stamped ", stats.survivorUnstamped,
+          " | keep ", numFramesToKeepObjects,
+          ", antiCull obj ", objectAntiCullingEnabled ? 1 : 0,
+          "/light ", lightAntiCullingEnabled ? 1 : 0,
+          ", supported ", isAntiCullingSupported ? 1 : 0,
+          ", cameraCut ", isCameraCut ? 1 : 0,
+          ", forceGC ", forceGC ? 1 : 0));
     }
   }
 
