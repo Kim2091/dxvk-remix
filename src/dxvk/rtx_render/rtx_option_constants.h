@@ -84,6 +84,9 @@ namespace dxvk {
   // ============================================================================
   static constexpr const char* kRtxOptionDxvkConfEnvVar = "DXVK_CONFIG_FILE";
   static constexpr const char* kRtxOptionRtxConfEnvVar = "DXVK_RTX_CONFIG_FILE";
+  // NV-DXVK start: user.conf path from the environment
+  static constexpr const char* kRtxOptionUserConfEnvVar = "DXVK_USER_CONFIG_FILE";
+  // NV-DXVK end
   static constexpr const char* kRtxOptionAppConfigExeEnvVar = "DXVK_USE_CONF_FOR_EXE";  // Override exe path for app config matching
 
   // ============================================================================

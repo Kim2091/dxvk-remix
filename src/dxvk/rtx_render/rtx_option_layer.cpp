@@ -689,10 +689,23 @@ namespace dxvk {
 
     // 6. user.conf (user settings layer) - highest priority for end-user changes (not included in merged config)
     // User layer is designated for UserSetting options only; other options are miscategorized here.
-    s_userLayer = RtxOptionManager::acquireLayer(kRtxOptionUserConfFileName, kRtxOptionLayerUserKey, 1.0f, 0.1f, true, nullptr);
-    if (s_userLayer) {
-      s_userLayer->setCategoryFlags(RtxOptionFlags::UserSetting);
+    // NV-DXVK start: allow the user layer's path to come from the environment
+    // Same shape as the rtx.conf layer above - DXVK_USER_CONFIG_FILE may name a
+    // comma-separated list, later entries win, and the LAST one is what the UI
+    // saves into. Unset reproduces the previous behaviour exactly: a single layer
+    // on the bare name "user.conf", resolved against the working directory.
+    //
+    // It exists because every edit made through the Remix UI targets this layer
+    // (RtxOptionEditTarget::User), so a host that runs several different games
+    // from one executable - an emulator - otherwise pours every game's tagged
+    // texture and mesh hashes into one shared file, where they mean nothing.
+    // rtx.conf could already be redirected per game; this was the missing half.
+    auto userLayers = createLayersFromEnvVar(kRtxOptionUserConfEnvVar, kRtxOptionUserConfFileName, kRtxOptionLayerUserKey);
+    for (auto* layer : userLayers) {
+      layer->setCategoryFlags(RtxOptionFlags::UserSetting);
     }
+    s_userLayer = userLayers.empty() ? nullptr : userLayers.back();
+    // NV-DXVK end
     
     // Load environment variable overrides into the environment layer
     RtxOptionManager::loadAllEnvironmentVariables();

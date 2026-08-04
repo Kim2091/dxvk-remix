@@ -541,6 +541,27 @@ initializer list and can't be lifted into a separate TU.
 
 ---
 
+## src/dxvk/rtx_render/rtx_option_constants.h
+
+**Category:** index-only
+
+- **Inline tweak** at the "RtxOption Environment Variable Names" block (~line 87) — 3 LOC.
+  *Adds `kRtxOptionUserConfEnvVar = "DXVK_USER_CONFIG_FILE"` beside the existing `kRtxOptionDxvkConfEnvVar` / `kRtxOptionRtxConfEnvVar`. A `constexpr` member of the same constant block as its two siblings; there is no function body to extract.*
+
+---
+
+## src/dxvk/rtx_render/rtx_option_layer.cpp
+
+**Category:** index-only
+
+**Rationale:** The change is the layer-6 construction line inside `RtxOptionLayer::initializeSystemLayers`, swapped for the `createLayersFromEnvVar` helper that layers 1 and 3 in the same function already use. Lifting five lines of an initialization sequence into a hook would cost more upstream surface than it removes, and the helper being called is upstream's own.
+
+- **Inline tweak** at `RtxOptionLayer::initializeSystemLayers` step 6 (~line 690) — +12 / -4 LOC (8 of them comment).
+  *`user.conf` was the only config layer whose path could not be set from the environment — it was acquired on the bare filename, resolved against the working directory. It now goes through the same `createLayersFromEnvVar(kRtxOptionUserConfEnvVar, ...)` path as `dxvk.conf` and `rtx.conf`, so it accepts a comma-separated list, later entries win, and `s_userLayer` is the last of them (matching how `s_rtxConfLayer` is chosen four lines up, and therefore which file the UI saves into). `setCategoryFlags(UserSetting)` is applied to every layer in the list rather than only the save target. With the variable unset, `resolveConfigPaths` returns `{ "user.conf" }` and one layer is created under the unchanged layer key — byte-for-byte the previous behaviour.*
+  *Why it matters: every edit made through the Remix UI targets this layer (`dxvk_imgui.cpp` wraps them in `RtxOptionLayerTarget(RtxOptionEditTarget::User)`), so a host running several different games from one executable had no way to keep one game's tagged texture/mesh hashes out of another game's settings. `rtx.conf` could already be redirected; this was the missing half.*
+
+---
+
 ## src/dxvk/rtx_render/rtx_options.h
 
 **Pre-refactor fork footprint:** +32 / -0 LOC (audit 2026-04-18)

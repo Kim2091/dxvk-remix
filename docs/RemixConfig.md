@@ -187,7 +187,20 @@ Some settings can be controlled via environment variables.
 |----------|---------|
 | `DXVK_CONFIG_FILE` | Override path to dxvk.conf |
 | `DXVK_RTX_CONFIG_FILE` | Override path to rtx.conf |
+| `DXVK_USER_CONFIG_FILE` | Override path to user.conf |
 | `DXVK_DOCUMENTATION_WRITE_RTX_OPTIONS_MD` | Set to 1 to regenerate RtxOptions.md |
+
+`DXVK_CONFIG_FILE`, `DXVK_RTX_CONFIG_FILE` and `DXVK_USER_CONFIG_FILE` each accept
+a **comma-separated list** of paths rather than a single one. Layers are applied
+left to right, so later entries win, and the **last** entry is the one the Remix
+UI writes back to when you save that layer. Unset, each falls back to the bare
+filename resolved against the working directory.
+
+That matters most for `DXVK_USER_CONFIG_FILE`, because every edit made through
+the Remix UI targets the user layer. A host that runs several different games
+from one executable — an emulator, or a launcher — can point it at a per-game
+path so that one game's tagged texture and mesh hashes never end up in another
+game's settings, where they would match nothing or, worse, the wrong thing.
 
 ---
 
