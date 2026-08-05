@@ -242,6 +242,48 @@ The vertex format is `remixapi_HardcodedVertex` — position(3) +
 normal(3) + texcoord(2) + color(uint32) + padding to 64 bytes. The
 padding is reserved for future runtime use; leave it zeroed.
 
+### `UpdateMeshBatched`
+
+```c
+remixapi_ErrorCode UpdateMeshBatched(const remixapi_MeshInfo* info);
+```
+
+Batched, vertex-data-only update of an already-registered mesh — the
+target handle is `info->hash`, the same convention as
+`CreateMeshBatched`. The runtime rewrites the registered mesh's vertex
+bytes (positions / normals / texcoords / colors) in place, so the mesh
+keeps its handle and its temporal identity: the BLAS is refit rather
+than rebuilt and the renderer generates real per-vertex motion vectors
+between the old and new pose. Use this for game-CPU-skinned or
+per-frame-regenerated geometry instead of destroy+create — a fresh
+handle per pose has no frame-to-frame identity and produces duplicate
+trails under DLSS / Ray Reconstruction.
+
+Rules:
+
+- **Batched-only.** Like `CreateMeshBatched`, the data is deep-copied
+  at call time and applied at the next render-thread flush point
+  (`DrawInstance`, `Present`, `AutoInstancePersistentLights`), in call
+  order relative to queued mesh creates — a create followed by an
+  update of the same handle within one flush works.
+- **What may change:** the per-vertex bytes only (position, normal,
+  texcoord, color of each `remixapi_HardcodedVertex`).
+- **What may not change:** surface count, per-surface vertex count,
+  index count, and skinning presence must all match the registered
+  mesh. Indices, materials, and skinning data are never updated through
+  this entry point. Any mismatch drops the entire update with a WARN in
+  the log and the mesh keeps rendering its previous vertex data —
+  updates never partially apply.
+- **Ordering with `DestroyMesh`:** destroys apply immediately while
+  updates are deferred, so destroying a handle that still has a queued
+  update results in that update being dropped with a WARN at flush
+  time. Destroy a dynamic mesh only after its last update has flushed
+  (or accept the warning).
+- The slot is appended at the end of `remixapi_Interface`; older
+  runtimes leave it `NULL`, so callers should feature-detect
+  (`if (interface.UpdateMeshBatched != NULL)`) and fall back to
+  destroy+create.
+
 ---
 
 ## Instances (per-frame draw)

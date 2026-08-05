@@ -150,6 +150,12 @@ namespace {
     remixapi_MeshHandle handle;
     uint64_t hash;
     std::vector<OwnedSurface> surfaces;
+    // When true this op is an in-place vertex-data update of an already
+    // registered mesh (remixapi_UpdateMeshBatched) rather than a create.
+    // Both op kinds share one queue so call order is preserved: a create
+    // followed by an update of the same handle in one flush applies in
+    // submission order.
+    bool isUpdate = false;
   };
   // PendingScreenOverlay struct and s_pendingScreenOverlay optional were removed
   // in migration #7b. They now live exclusively in rtx_fork_api_entry.cpp
@@ -1240,6 +1246,25 @@ namespace {
     return REMIXAPI_ERROR_CODE_SUCCESS;
   }
 
+  // Host-visible buffer allocation shared by the batched mesh create path
+  // (buildExternalMeshSurfacesFromOwned) and the in-place vertex update path
+  // (applyExternalMeshUpdateOnCs).
+  dxvk::Rc<dxvk::DxvkBuffer> allocExternalMeshBuffer(dxvk::D3D9DeviceEx* device, size_t sizeInBytes) {
+    if (sizeInBytes == 0) {
+      return {};
+    }
+    auto bufferInfo = dxvk::DxvkBufferCreateInfo {};
+    bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+    bufferInfo.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
+    bufferInfo.access = VK_ACCESS_TRANSFER_WRITE_BIT;
+    bufferInfo.size = dxvk::align(sizeInBytes, dxvk::CACHE_LINE_SIZE);
+    return device->GetDXVKDevice()->createBuffer(
+        bufferInfo,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+        dxvk::DxvkMemoryStats::Category::RTXBuffer,
+        "Remix API mesh buffer");
+  }
+
   // Shared builder used by both the synchronous remixapi_CreateMesh path and
   // the batched path (remixapi_CreateMeshBatched) when the render thread
   // materializes deferred pending mesh creates. Allocates host-visible DXVK
@@ -1250,21 +1275,7 @@ namespace {
     auto allocatedSurfaces = std::vector<dxvk::RasterGeometry> {};
     allocatedSurfaces.reserve(surfaces.size());
 
-    auto allocBuffer = [](dxvk::D3D9DeviceEx* device, size_t sizeInBytes) -> dxvk::Rc<dxvk::DxvkBuffer> {
-      if (sizeInBytes == 0) {
-        return {};
-      }
-      auto bufferInfo = dxvk::DxvkBufferCreateInfo {};
-      bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
-      bufferInfo.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
-      bufferInfo.access = VK_ACCESS_TRANSFER_WRITE_BIT;
-      bufferInfo.size = dxvk::align(sizeInBytes, dxvk::CACHE_LINE_SIZE);
-      return device->GetDXVKDevice()->createBuffer(
-          bufferInfo,
-          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
-          dxvk::DxvkMemoryStats::Category::RTXBuffer,
-          "Remix API mesh buffer");
-    };
+    auto allocBuffer = allocExternalMeshBuffer;
 
     for (const OwnedSurface& src : surfaces) {
       const size_t vertexDataSize = sizeInBytes(src.vertices.data(), src.vertices.size());
@@ -1345,14 +1356,115 @@ namespace {
     return allocatedSurfaces;
   }
 
+  // Apply a deferred remixapi_UpdateMeshBatched op: rewrite the registered
+  // mesh's vertex bytes in place so the mesh keeps its handle, its BlasEntry,
+  // and therefore its temporal identity (kUpdateBVH refit + motion vectors)
+  // instead of being destroyed and re-created per pose. Must run on the
+  // render (CS) thread.
+  //
+  // Buffer safety: never memcpy into the existing mapped buffer — the GPU may
+  // still be executing last frame's vertex-data copy that reads it. Each
+  // update allocates a fresh host-visible buffer and repoints the four vertex
+  // RasterBuffers at it; the old buffer is released via Rc once the command
+  // lists referencing it retire (standard DXVK lifetime tracking).
+  //
+  // LOAD-BEARING hash bump: the update mints a new hashes[VertexShader], NOT
+  // VertexPosition. This is load-bearing — do not "fix" it:
+  //  - VertexShader is one of the three kUpdateBVH triggers in
+  //    SceneManager::processGeometryInfo (alongside VertexPosition and
+  //    boneHash), so bumping it routes the next draw of this handle onto the
+  //    BLAS-refit path (history-buffer swap -> previousPositionBuffer -> real
+  //    per-vertex motion vectors).
+  //  - The default rtx.geometryAssetHashRuleString
+  //    ("positions,indices,geometrydescriptor") INCLUDES VertexPosition and
+  //    EXCLUDES VertexShader, and InstanceManager::updateInstance refreshes
+  //    surface.associatedGeometryHash from that rule on every draw call.
+  //    Bumping VertexPosition would therefore keep DEBUG_VIEW_GEOMETRY_HASH
+  //    flickering per frame and destabilize every asset-hash consumer even
+  //    though mesh identity is fixed. (A user config that adds "vertexshader"
+  //    to the rule re-inherits that flicker for dynamic meshes — accepted.)
+  //  - VertexShader is never set on the API path otherwise (stays kEmptyHash),
+  //    so minting it per update collides with nothing, and keeping
+  //    VertexPosition/VertexTexcoord stable also keeps the draw-call cache's
+  //    multi-entry scoring pointed at the right BlasEntry.
+  void applyExternalMeshUpdateOnCs(dxvk::DxvkContext* ctx, const PendingMeshCreate& mesh) {
+    auto& assets = ctx->getCommonObjects()->getSceneManager().getAssetReplacer();
+    std::vector<dxvk::RasterGeometry>* submeshes = assets->accessExternalMeshMutable(mesh.handle);
+    if (submeshes == nullptr) {
+      dxvk::Logger::warn("UpdateMeshBatched: unknown mesh handle "
+                         + std::to_string(reinterpret_cast<uint64_t>(mesh.handle))
+                         + ", update dropped");
+      return;
+    }
+
+    // Validate the whole op before touching anything so a contract violation
+    // drops the update atomically (the mesh keeps rendering its previous
+    // pose) rather than applying partially. The stored vector is never
+    // resized or reassigned: BlasEntry.input and cached DrawCallStates alias
+    // its elements via overrideGeometryData, so element addresses must stay
+    // stable for the mesh's lifetime.
+    if (submeshes->size() != mesh.surfaces.size()) {
+      dxvk::Logger::warn("UpdateMeshBatched: surface count mismatch for mesh handle "
+                         + std::to_string(reinterpret_cast<uint64_t>(mesh.handle))
+                         + " (registered " + std::to_string(submeshes->size())
+                         + ", update " + std::to_string(mesh.surfaces.size())
+                         + "), update dropped");
+      return;
+    }
+    for (size_t i = 0; i < mesh.surfaces.size(); i++) {
+      const OwnedSurface& src = mesh.surfaces[i];
+      const dxvk::RasterGeometry& dst = (*submeshes)[i];
+      if (dst.vertexCount != src.vertices.size()
+          || dst.indexCount != src.indices.size()
+          || src.hasSkinning
+          || dst.numBonesPerVertex != 0) {
+        dxvk::Logger::warn("UpdateMeshBatched: surface " + std::to_string(i)
+                           + " vertex/index count or skinning presence mismatch for mesh handle "
+                           + std::to_string(reinterpret_cast<uint64_t>(mesh.handle))
+                           + ", update dropped");
+        return;
+      }
+    }
+
+    for (size_t i = 0; i < mesh.surfaces.size(); i++) {
+      const OwnedSurface& src = mesh.surfaces[i];
+      dxvk::RasterGeometry& dst = (*submeshes)[i];
+
+      const size_t vertexDataSize = sizeInBytes(src.vertices.data(), src.vertices.size());
+      dxvk::Rc<dxvk::DxvkBuffer> vertexBuffer = allocExternalMeshBuffer(s_dxvkDevice, vertexDataSize);
+      auto vertexSlice = dxvk::DxvkBufferSlice { vertexBuffer };
+      if (vertexDataSize > 0) {
+        memcpy(vertexSlice.mapPtr(0), src.vertices.data(), vertexDataSize);
+      }
+
+      // Same offsets/strides/formats as create (buildExternalMeshSurfacesFromOwned).
+      dst.positionBuffer = dxvk::RasterBuffer { vertexSlice, offsetof(remixapi_HardcodedVertex, position), sizeof(remixapi_HardcodedVertex), VK_FORMAT_R32G32B32_SFLOAT };
+      dst.normalBuffer   = dxvk::RasterBuffer { vertexSlice, offsetof(remixapi_HardcodedVertex, normal),   sizeof(remixapi_HardcodedVertex), VK_FORMAT_R32G32B32_SFLOAT };
+      dst.texcoordBuffer = dxvk::RasterBuffer { vertexSlice, offsetof(remixapi_HardcodedVertex, texcoord), sizeof(remixapi_HardcodedVertex), VK_FORMAT_R32G32_SFLOAT };
+      dst.color0Buffer   = dxvk::RasterBuffer { vertexSlice, offsetof(remixapi_HardcodedVertex, color),    sizeof(remixapi_HardcodedVertex), VK_FORMAT_B8G8R8A8_UNORM };
+
+      // Everything else — indexBuffer, hashes[Indices/VertexPosition/
+      // VertexTexcoord/GeometryDescriptor/VertexLayout], externalMaterial,
+      // externalMesh tag, vertexCount/indexCount — keeps its create-time
+      // value so topology-keyed caches stay stable.
+      dst.hashes[dxvk::HashComponents::VertexShader] = hack_getNextGeomHash();
+      dst.hashes.precombine();
+    }
+  }
+
   // Drain s_pendingMeshCreates and register each pending mesh with the asset
-  // replacer. Must be called on the render (CS) thread; accepts a DxvkContext.
+  // replacer (or apply it in place for update ops). Must be called on the
+  // render (CS) thread; accepts a DxvkContext.
   void applyPendingMeshCreatesOnCs(dxvk::DxvkContext* ctx, std::vector<PendingMeshCreate>& meshCreates) {
     if (meshCreates.empty()) {
       return;
     }
     auto& assets = ctx->getCommonObjects()->getSceneManager().getAssetReplacer();
     for (auto& mesh : meshCreates) {
+      if (mesh.isUpdate) {
+        applyExternalMeshUpdateOnCs(ctx, mesh);
+        continue;
+      }
       auto allocatedSurfaces = buildExternalMeshSurfacesFromOwned(mesh.surfaces);
       assets->registerExternalMesh(mesh.handle, std::move(allocatedSurfaces));
     }
@@ -1377,31 +1489,15 @@ namespace {
     });
   }
 
-  // Batched mesh creation. Unlike remixapi_CreateMesh, this does not allocate
-  // DXVK buffers or emit a CS command right away; it instead deep-copies the
-  // caller-owned vertex/index/skinning data into s_pendingMeshCreates and
-  // lets a later flush (DrawInstance / Present / AutoInstancePersistentLights)
-  // materialize the mesh on the render thread. This lets API consumers submit
-  // meshes outside a frame boundary without taking the device lock per mesh.
-  remixapi_ErrorCode REMIXAPI_CALL remixapi_CreateMeshBatched(
-    const remixapi_MeshInfo* info,
-    remixapi_MeshHandle* out_handle) {
-    if (!out_handle || !info || info->sType != REMIXAPI_STRUCT_TYPE_MESH_INFO) {
-      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
-    }
-    static_assert(sizeof(remixapi_MeshHandle) == sizeof(info->hash));
-    auto handle = reinterpret_cast<remixapi_MeshHandle>(info->hash);
-    if (!handle) {
-      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
-    }
+  // Deep-copy the caller-owned surface data (vertices/indices/skinning) of a
+  // remixapi_MeshInfo into a PendingMeshCreate so the source pointers can
+  // safely go out of scope before the render thread consumes the op. Shared
+  // by remixapi_CreateMeshBatched and remixapi_UpdateMeshBatched.
+  void deepCopyOwnedSurfaces(const remixapi_MeshInfo& info, PendingMeshCreate& pending) {
+    pending.surfaces.reserve(info.surfaces_count);
 
-    PendingMeshCreate pending;
-    pending.handle = handle;
-    pending.hash = info->hash;
-    pending.surfaces.reserve(info->surfaces_count);
-
-    for (uint32_t i = 0; i < info->surfaces_count; i++) {
-      const auto& src = info->surfaces_values[i];
+    for (uint32_t i = 0; i < info.surfaces_count; i++) {
+      const auto& src = info.surfaces_values[i];
       OwnedSurface dst;
       dst.material = src.material;
 
@@ -1432,6 +1528,30 @@ namespace {
 
       pending.surfaces.push_back(std::move(dst));
     }
+  }
+
+  // Batched mesh creation. Unlike remixapi_CreateMesh, this does not allocate
+  // DXVK buffers or emit a CS command right away; it instead deep-copies the
+  // caller-owned vertex/index/skinning data into s_pendingMeshCreates and
+  // lets a later flush (DrawInstance / Present / AutoInstancePersistentLights)
+  // materialize the mesh on the render thread. This lets API consumers submit
+  // meshes outside a frame boundary without taking the device lock per mesh.
+  remixapi_ErrorCode REMIXAPI_CALL remixapi_CreateMeshBatched(
+    const remixapi_MeshInfo* info,
+    remixapi_MeshHandle* out_handle) {
+    if (!out_handle || !info || info->sType != REMIXAPI_STRUCT_TYPE_MESH_INFO) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    static_assert(sizeof(remixapi_MeshHandle) == sizeof(info->hash));
+    auto handle = reinterpret_cast<remixapi_MeshHandle>(info->hash);
+    if (!handle) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+
+    PendingMeshCreate pending;
+    pending.handle = handle;
+    pending.hash = info->hash;
+    deepCopyOwnedSurfaces(*info, pending);
 
     {
       std::lock_guard lock { s_mutex };
@@ -1439,6 +1559,38 @@ namespace {
     }
 
     *out_handle = handle;
+    return REMIXAPI_ERROR_CODE_SUCCESS;
+  }
+
+  // Batched, vertex-data-only update of an already-registered external mesh
+  // (handle = info->hash). Deep-copies exactly like CreateMeshBatched and
+  // rides the same pending queue with isUpdate = true, so create-then-update
+  // of one handle within a single flush applies in call order. The op is
+  // applied on the CS thread by applyExternalMeshUpdateOnCs, which validates
+  // surface/vertex/index counts and skinning presence against the registered
+  // mesh and drops the update with a WARN on any mismatch.
+  remixapi_ErrorCode REMIXAPI_CALL remixapi_UpdateMeshBatched(
+    const remixapi_MeshInfo* info) {
+    if (!info || info->sType != REMIXAPI_STRUCT_TYPE_MESH_INFO) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    static_assert(sizeof(remixapi_MeshHandle) == sizeof(info->hash));
+    auto handle = reinterpret_cast<remixapi_MeshHandle>(info->hash);
+    if (!handle) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+
+    PendingMeshCreate pending;
+    pending.handle = handle;
+    pending.hash = info->hash;
+    pending.isUpdate = true;
+    deepCopyOwnedSurfaces(*info, pending);
+
+    {
+      std::lock_guard lock { s_mutex };
+      s_pendingMeshCreates.push_back(std::move(pending));
+    }
+
     return REMIXAPI_ERROR_CODE_SUCCESS;
   }
 
@@ -2712,10 +2864,11 @@ extern "C"
       interf.GetVramStats = remixapi_GetVramStats;
       interf.RequestTextureVramFree = remixapi_RequestTextureVramFree;
       interf.GetGameValue = remixapi_GetGameValue;
+      interf.UpdateMeshBatched = remixapi_UpdateMeshBatched;
       // Fork-added vtable slots (extern-C exported; delegated to fork hook)
       dxvk::fork_hooks::remixApiVtableInit(interf);
     }
-    static_assert(sizeof(interf) == 328, "Add/remove function registration");
+    static_assert(sizeof(interf) == 336, "Add/remove function registration");
 
     *out_result = interf;
     return REMIXAPI_ERROR_CODE_SUCCESS;

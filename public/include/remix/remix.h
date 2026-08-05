@@ -191,6 +191,11 @@ namespace remix {
     // thread at the next DrawInstance / Present / AutoInstancePersistentLights
     // flush. Useful for callers submitting meshes outside a frame boundary.
     Result< remixapi_MeshHandle >     CreateMeshBatched(const remixapi_MeshInfo& info);
+    // Batched, vertex-data-only update of an existing mesh (handle = info.hash).
+    // Surface count / vertex count / index count / skinning presence must match
+    // the registered mesh; indices, materials and skinning are never changed.
+    // Applied at the next render-thread flush, in call order with mesh creates.
+    Result< void >                    UpdateMeshBatched(const remixapi_MeshInfo& info);
     Result< void >                    DestroyMesh(remixapi_MeshHandle handle);
     Result< void >                    SetupCamera(const remixapi_CameraInfo& info);
     Result< void >                    SetCameraMediumMaterial(remixapi_MaterialHandle medium);
@@ -249,7 +254,7 @@ namespace remix {
         return status;
       }
 
-      static_assert(sizeof(remixapi_Interface) == 328,
+      static_assert(sizeof(remixapi_Interface) == 336,
                     "Change version, update C++ wrapper when adding new functions");
 
       remix::Interface interfaceInCpp = {};
@@ -742,6 +747,13 @@ namespace remix {
       return status;
     }
     return handle;
+  }
+
+  inline Result< void > Interface::UpdateMeshBatched(const remixapi_MeshInfo& info) {
+    if (!m_CInterface.UpdateMeshBatched) {
+      return REMIXAPI_ERROR_CODE_NOT_INITIALIZED;
+    }
+    return m_CInterface.UpdateMeshBatched(&info);
   }
 
   inline Result< void > Interface::DestroyMesh(remixapi_MeshHandle handle) {

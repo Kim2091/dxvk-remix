@@ -383,6 +383,25 @@ extern "C" {
   typedef remixapi_ErrorCode(REMIXAPI_PTR* PFN_remixapi_DestroyMesh)(
     remixapi_MeshHandle       handle);
 
+  // Batched, vertex-data-only update of an already-registered external mesh.
+  // The target handle is 'info->hash' (same convention as CreateMeshBatched).
+  // Rewrites the mesh's vertex bytes (positions / normals / texcoords /
+  // colors) in place so the runtime keeps the mesh's temporal identity —
+  // the BLAS is refit rather than rebuilt and per-vertex motion vectors are
+  // generated — instead of treating each new pose as a brand-new mesh.
+  // Constraints: surface count, per-surface vertex count, index count, and
+  // skinning presence must all match the registered mesh, or the whole
+  // update is dropped with a WARN (the mesh keeps rendering its previous
+  // vertex data). Indices, materials, and skinning data are never changed
+  // through this entry point. Like CreateMeshBatched, the data is
+  // deep-copied at call time and applied at the next render-thread flush
+  // point (DrawInstance / Present / AutoInstancePersistentLights), in call
+  // order relative to queued mesh creates. Note that DestroyMesh is applied
+  // immediately, so destroying a handle with a queued update results in the
+  // update being dropped with a WARN at flush time.
+  typedef remixapi_ErrorCode(REMIXAPI_PTR* PFN_remixapi_UpdateMeshBatched)(
+    const remixapi_MeshInfo*  info);
+
 
 
   typedef enum remixapi_CameraType {
@@ -1062,6 +1081,7 @@ extern "C" {
     PFN_remixapi_GetVramStats               GetVramStats;
     PFN_remixapi_RequestTextureVramFree     RequestTextureVramFree;
     PFN_remixapi_GetGameValue               GetGameValue;
+    PFN_remixapi_UpdateMeshBatched          UpdateMeshBatched;
   } remixapi_Interface;
 
   REMIXAPI remixapi_ErrorCode REMIXAPI_CALL remixapi_InitializeLibrary(

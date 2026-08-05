@@ -809,6 +809,14 @@ Parameters:
 
 - `remixapi_MeshHandle handle`
 
+### `PFN_remixapi_UpdateMeshBatched`
+
+Returns: `remixapi_ErrorCode`
+
+Parameters:
+
+- `const remixapi_MeshInfo* info`
+
 ### `PFN_remixapi_SetupCamera`
 
 Returns: `remixapi_ErrorCode`
@@ -1167,3 +1175,4 @@ Reordering or inserting in the middle breaks backwards compatibility.
 | `PFN_remixapi_GetVramStats` | `GetVramStats` |  |
 | `PFN_remixapi_RequestTextureVramFree` | `RequestTextureVramFree` |  |
 | `PFN_remixapi_GetGameValue` | `GetGameValue` |  |
+| `PFN_remixapi_UpdateMeshBatched` | `UpdateMeshBatched` |  |
