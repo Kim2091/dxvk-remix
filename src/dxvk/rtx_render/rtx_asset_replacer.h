@@ -290,6 +290,12 @@ namespace dxvk {
 
     void registerExternalMesh(remixapi_MeshHandle handle, std::vector<RasterGeometry>&& submeshes);
     [[nodiscard]] const std::vector<RasterGeometry>& accessExternalMesh(remixapi_MeshHandle handle) const;
+    // Mutable access for in-place vertex-data updates (UpdateMeshBatched).
+    // Returns nullptr when the handle is unknown. Callers must never resize
+    // or reassign the returned vector: BlasEntry.input and cached
+    // DrawCallStates hold pointers to its elements (overrideGeometryData),
+    // so element addresses have to stay stable for the mesh's lifetime.
+    [[nodiscard]] std::vector<RasterGeometry>* accessExternalMeshMutable(remixapi_MeshHandle handle);
     void destroyExternalMesh(remixapi_MeshHandle handle);
 
   private:

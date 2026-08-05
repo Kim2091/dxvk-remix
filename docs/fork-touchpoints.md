@@ -766,7 +766,7 @@ initializer list and can't be lifted into a separate TU.
   *Registers all fork-added API functions into the `remixapi_Interface` vtable. The inline block assigns the anonymous-namespace slots (including `SetGameValue` added in workstream 10); the hook fills the three externally-linked ones.*
 
 - **Inline tweak** at `extern "C"` vtable size static_assert — 1 LOC. Not migrated (fridge-listed).
-  *The `static_assert(sizeof(interf) == 288, ...)` sentinel is the final value in the chain (208 → 240 → 272 → 280 → 288 across five workstreams). Retained inline in `remixapi_InitializeLibrary` as a size sentinel.*
+  *The `static_assert(sizeof(interf) == 336, ...)` sentinel is the final value in the chain (208 → 240 → 272 → 280 → 288 → ... → 328 → 336; 328 → 336 on 2026-08-04 for the `UpdateMeshBatched` slot). Retained inline in `remixapi_InitializeLibrary` as a size sentinel.*
 
 ---
 
@@ -4103,5 +4103,58 @@ containing an API-skinned mesh crashed (BFBB, 2026-08-04, three for three).
   tweak. *`captureMeshBlending` refuses `bonesPerVertex == 0` (logs one line
   naming the mesh, skips blend-data capture) so a producer bug can degrade a
   capture but never take the process down.*
+
+---
+
+## 2026-08-04 — feat: UpdateMeshBatched (temporal identity for regenerated meshes)
+
+Game-CPU-skinned / per-frame-regenerated geometry (Dolphin GX BFBB class)
+submits new vertex bytes every frame; destroy+create mints a fresh handle and
+fresh geometry hashes per pose, so the runtime builds a new BLAS + RtInstance
+every frame — no temporal identity, zero motion vectors, duplicate-trail
+ghosting under DLSS/RR. New batched API entry `UpdateMeshBatched` rewrites an
+existing external mesh's vertex bytes in place and mints a fresh
+`hashes[VertexShader]` (one of the three `kUpdateBVH` triggers in
+`SceneManager::processGeometryInfo`), so the next draw takes the BLAS-refit
+path (history-buffer swap → `previousPositionBuffer` → real per-vertex MVs).
+`VertexShader` — not `VertexPosition` — is bumped because the default
+`rtx.geometryAssetHashRuleString` ("positions,indices,geometrydescriptor")
+includes VertexPosition and `InstanceManager::updateInstance` refreshes
+`surface.associatedGeometryHash` from it every draw; bumping positions would
+keep `DEBUG_VIEW_GEOMETRY_HASH` flickering and destabilize asset-hash
+consumers. VertexShader stays `kEmptyHash` on the API path otherwise.
+
+- **`public/include/remix/remix_c.h`** - fork-touchpoint inline tweak - 2
+  blocks. *`PFN_remixapi_UpdateMeshBatched` typedef (with contract doc block:
+  batched-only, vertex-data-only, counts + skinning presence must match or
+  WARN+drop, flush ordering) + `UpdateMeshBatched` slot appended at the END of
+  `remixapi_Interface` after `GetGameValue`. No `REMIXAPI_VERSION` bump
+  (append-only slot).*
+- **`public/include/remix/remix.h`** - fork-touchpoint inline tweak - 3
+  blocks. *`Interface::UpdateMeshBatched` declaration + inline impl (nullptr
+  slot → `NOT_INITIALIZED`, matching the `GetGameValue` shape) + `sizeof`
+  static_assert 328 → 336.*
+- **`src/dxvk/rtx_render/rtx_remix_api.cpp`** - fork-touchpoint inline tweak -
+  5 blocks. *`PendingMeshCreate.isUpdate` flag (creates and updates share one
+  queue so call order is preserved across a flush); `deepCopyOwnedSurfaces`
+  helper factored out of `remixapi_CreateMeshBatched` (byte-identical copy
+  semantics) and shared with the new anonymous-namespace
+  `remixapi_UpdateMeshBatched`; `allocExternalMeshBuffer` hoisted from the
+  `buildExternalMeshSurfacesFromOwned` lambda and shared with the new
+  `applyExternalMeshUpdateOnCs` (validates surface/vertex/index counts +
+  skinning absence against the registered mesh, WARN+drops atomically on any
+  mismatch, allocates a FRESH host-visible buffer per update — never memcpys
+  into the live mapped buffer the GPU may still read — repoints the four
+  vertex RasterBuffers, bumps `hashes[VertexShader]`, `precombine()`);
+  dispatch branch in `applyPendingMeshCreatesOnCs`; vtable assignment +
+  sentinel 328 → 336.*
+- **`src/dxvk/rtx_render/rtx_asset_replacer.h`** - fork-touchpoint inline
+  tweak. *Declares `accessExternalMeshMutable` (find-or-null) next to the
+  const accessor, with the never-resize/never-reassign contract documented:
+  `BlasEntry.input` and cached DrawCallStates alias the stored vector's
+  elements via `overrideGeometryData`.*
+- **`src/dxvk/rtx_render/rtx_asset_replacer.cpp`** - fork-touchpoint inline
+  tweak. *`accessExternalMeshMutable` body — returns the stored submesh
+  vector or nullptr for unknown handles.*
 
 ---

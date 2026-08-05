@@ -212,6 +212,14 @@ const std::vector<RasterGeometry>& AssetReplacer::accessExternalMesh(remixapi_Me
   return *found->second;
 }
 
+std::vector<RasterGeometry>* AssetReplacer::accessExternalMeshMutable(remixapi_MeshHandle handle) {
+  auto found = m_extMeshes.find(handle);
+  if (found == m_extMeshes.end()) {
+    return nullptr;
+  }
+  return found->second.get();
+}
+
 void AssetReplacer::destroyExternalMesh(remixapi_MeshHandle handle) {
   m_extMeshes.erase(handle);
 }

@@ -79,3 +79,28 @@ between them. Rebuild plugins/hosts against this header.
   Source-only break — the bit layout, enum size, and struct offsets are unchanged
   (bit 24 still exists as `SMOOTH_NORMALS`), so no binary/ABI change and the
   `0.1000.0` version line is unaffected.
+
+
+## [0.1000.1] - 2026-08-04
+
+### Added
+- `remixapi_Interface.UpdateMeshBatched` — batched, vertex-data-only in-place
+  update of an already-registered mesh (handle = `info->hash`). Rewrites the
+  mesh's vertex bytes (positions/normals/texcoords/colors) while keeping the
+  handle, so per-frame-regenerated geometry keeps temporal identity: the BLAS
+  is refit instead of rebuilt and the renderer produces real per-vertex motion
+  vectors (fixes duplicate-trail ghosting under DLSS/RR for game-CPU-skinned
+  meshes). Surface count, per-surface vertex count, index count, and skinning
+  presence must match the registered mesh or the whole update is dropped with
+  a WARN; indices/materials/skinning are never changed through this entry
+  point. Applied at the next render-thread flush point in call order with
+  queued mesh creates. Appended at the end of `remixapi_Interface`
+  (`sizeof` sentinel 328 → 336); older runtimes leave the slot `NULL`, so
+  callers should feature-detect and fall back to destroy+create. No
+  `REMIXAPI_VERSION` bump (append-only slot addition).
+
+### Changed
+
+### Fixed
+
+### Removed
