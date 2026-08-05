@@ -239,6 +239,78 @@ namespace fork_hooks {
   }
 
   // ---------------------------------------------------------------------------
+  // getTextureHashList
+  //
+  // The read counterpart to mutateTextureHashOption. Snapshots the *resolved*
+  // contents of a named RtxOption<fast_unordered_set> — i.e. what the renderer
+  // actually acts on, after every config layer has been folded together — into
+  // a caller-supplied buffer.
+  //
+  // Exists because clients that tag textures through the dev menu have no way
+  // to learn what the user tagged: AddTextureHash/RemoveTextureHash are
+  // write-only, and the dev menu writes the sets directly. A client that wants
+  // to route its own draws by category (Dolphin's ortho/UI routing) has to be
+  // able to poll them back out.
+  //
+  // TRUNCATION CONTRACT (mirrors remixapi_GetGameValue): *out_count is always
+  // written with the true set size, whether or not the data fits. Hashes are
+  // copied only when capacity is large enough for the whole set — a partial
+  // set would be indistinguishable from a small one and would silently mis-tag
+  // draws. The caller detects truncation with (*out_count > capacity), grows
+  // its buffer and retries. Passing capacity == 0 with out_hashes == nullptr is
+  // the legal "how big is it?" probe.
+  //
+  // LOCK ORDER: the caller must hold the remix-api static mutex (s_mutex in
+  // rtx_remix_api.cpp). This function then acquires the RtxOptionImpl update
+  // mutex internally, same direction as mutateTextureHashOption's
+  // addHash/removeHash. Inverting the order would deadlock against the EmitCs
+  // path, which runs lambdas holding the RtxOption mutex and must never
+  // re-enter s_mutex.
+  //
+  // ACCESS NOTE: uses only public RtxOption APIs. getValueNoLock() is public
+  // and documented as "only call this when the mutex is already held" — we do
+  // hold it, which is the same discipline RtxOption::containsHash follows
+  // internally. No friend declaration required.
+  // ---------------------------------------------------------------------------
+  remixapi_ErrorCode getTextureHashList(
+      const char* optionName,
+      uint64_t*   out_hashes,
+      uint32_t    capacity,
+      uint32_t*   out_count) {
+    if (!optionName || optionName[0] == '\0' || !out_count) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    if (capacity > 0 && !out_hashes) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+
+    RtxOptionImpl* option = RtxOptionImpl::getOptionByFullName(std::string { optionName });
+    if (!option) {
+      return REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+    }
+    if (option->getType() != OptionType::HashSet) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+
+    std::lock_guard<std::mutex> lock(RtxOptionImpl::getUpdateMutex());
+
+    // Safe because getType() == HashSet implies T == fast_unordered_set.
+    auto* hashSetOption = static_cast<RtxOption<fast_unordered_set>*>(option);
+    const fast_unordered_set& hashes = hashSetOption->getValueNoLock();
+
+    *out_count = static_cast<uint32_t>(hashes.size());
+
+    if (capacity >= *out_count) {
+      uint32_t i = 0;
+      for (const XXH64_hash_t& h : hashes) {
+        out_hashes[i++] = static_cast<uint64_t>(h);
+      }
+    }
+
+    return REMIXAPI_ERROR_CODE_SUCCESS;
+  }
+
+  // ---------------------------------------------------------------------------
   // drawScreenOverlay (migration #7b)
   //
   // Copies pPixelData into a host-visible staging buffer and stores it in

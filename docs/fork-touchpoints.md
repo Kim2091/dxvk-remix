@@ -58,6 +58,9 @@ check will enforce it if discipline slips.
 - **Block** at `Interface::AddTextureHash` / `Interface::RemoveTextureHash` (inline definitions) — ~16 LOC, planned target `N/A (public header)` in `N/A (public header)`.
   *Inline C++ wrappers for texture-hash category mutation API.*
 
+- **Block** at `Interface::GetTextureHashList` (declaration + inline definition) — ~15 LOC, planned target `N/A (public header)` in `N/A (public header)`.
+  *2026-08-05: C++ wrapper for the texture-hash-set read API. Returns the raw `remixapi_ErrorCode` rather than `Result<void>` (matching `GetGameValue`, whose out-params are also filled on success), and guards the nullptr vtable slot with `NOT_INITIALIZED` so callers running against pre-`0.1000.2` runtimes feature-detect for free.*
+
 - **Block** at `Interface::dxvk_GetTextureHash` (inline definition) — ~13 LOC, planned target `N/A (public header)` in `N/A (public header)`.
   *Inline C++ wrapper that retrieves the DXVK image hash for a D3D9 texture via the fork's dxvk-specific extension slot.*
 
@@ -71,7 +74,7 @@ check will enforce it if discipline slips.
   *C++ wrapper for the `remixapi_SetGameValue` C API slot introduced in workstream 10 (plugin-injected game-state write). Wrapper guards on nullptr vtable slot before dispatching, matching the `SetConfigVariable` shape. Companion readers are graph components `GameValueReadBool` / `GameValueReadNumber`; backing store lives in `rtx_fork_game_state.h`.*
 
 - **Block** at `remixapi_Interface` static_assert updates (file scope) — ~3 LOC (three separate assert sizes), planned target `N/A (public header)` in `N/A (public header)`.
-  *Updates `sizeof(remixapi_Interface)` static_asserts in the C++ header to match each successive vtable extension (208 → 240 → 272 → 280 → 288).*
+  *Updates `sizeof(remixapi_Interface)` static_asserts in the C++ header to match each successive vtable extension (208 → 240 → 272 → 280 → 288 → ... → 328 → 336 → 344; 336 → 344 on 2026-08-05 for the `GetTextureHashList` slot).*
 
 ---
 
@@ -105,6 +108,9 @@ check will enforce it if discipline slips.
 - **Block** at `PFN_remixapi_AddTextureHash` / `PFN_remixapi_RemoveTextureHash` typedefs (file scope) — ~8 LOC, planned target `N/A (public header)` in `N/A (public header)`.
   *Declares function-pointer types for texture-hash category mutation (add/remove a texture hash from a named option set).*
 
+- **Block** at `PFN_remixapi_GetTextureHashList` typedef + `remixapi_GetTextureHashList` declaration (file scope) — ~40 LOC (mostly the contract doc block), planned target `N/A (public header)` in `N/A (public header)`.
+  *2026-08-05: read counterpart to Add/RemoveTextureHash — snapshots the resolved contents of a named hash-set option (`rtx.uiTextures`, `rtx.ignoreTextures`, `rtx.worldSpaceUiTextures`, or any hash-set `RtxOption`) into a caller buffer. Doc block covers the option-name convention and the `GetGameValue`-style truncation contract (`*out_count` always written; hashes copied only when capacity covers the whole set, never partially — a truncated category set would silently mis-route draws).*
+
 - **Block** at `remixapi_Format` enum + `remixapi_TextureInfo` struct (file scope) — ~28 LOC, planned target `N/A (public header)` in `N/A (public header)`.
   *Declares the texture upload type system: format enum mapping to VkFormat values, and the `remixapi_TextureInfo` struct carrying pixel data for `CreateTexture`.*
 
@@ -136,7 +142,7 @@ check will enforce it if discipline slips.
   *Declares the function-pointer type for the plugin-injected game-state write API introduced in workstream 10. The entrypoint stores a single string/string pair under a caller-chosen key in a fork-owned thread-safe map; graph components `GameValueReadBool` / `GameValueReadNumber` read those values by name. The contract doc block above the typedef describes key/value semantics, validation, and lifetime (store survives `Shutdown` / re-init).*
 
 - **Block** at `remixapi_Interface` vtable additions (struct fields) — ~15 LOC spread across the vtable struct, planned target `N/A (public header)` in `N/A (public header)`.
-  *Appends new function-pointer slots to `remixapi_Interface`: `AddTextureHash`, `RemoveTextureHash`, `CreateTexture`, `DestroyTexture`, `dxvk_GetTextureHash`, `CreateMeshBatched`, `GetUIState`/`SetUIState`, `DrawScreenOverlay`, `RegisterCallbacks`, `AutoInstancePersistentLights`, `UpdateLightDefinition`, `CreateLightBatched`, `dxvk_GetSharedD3D11TextureHandle`, `SetGameValue`. 2026-06-27: the upstream `SetCameraMediumMaterial` slot was moved out of the middle of the struct (it had been inherited between `SetupCamera` and `DrawInstance`) to immediately after `Present`, mirroring upstream's canonical tail layout (upstream `2bac8874`); fork slots remain appended after it. Size-neutral move — the `sizeof` sentinel is unchanged. An append-at-end warning comment was restored above the struct.*
+  *Appends new function-pointer slots to `remixapi_Interface`: `AddTextureHash`, `RemoveTextureHash`, `CreateTexture`, `DestroyTexture`, `dxvk_GetTextureHash`, `CreateMeshBatched`, `GetUIState`/`SetUIState`, `DrawScreenOverlay`, `RegisterCallbacks`, `AutoInstancePersistentLights`, `UpdateLightDefinition`, `CreateLightBatched`, `dxvk_GetSharedD3D11TextureHandle`, `SetGameValue`. 2026-06-27: the upstream `SetCameraMediumMaterial` slot was moved out of the middle of the struct (it had been inherited between `SetupCamera` and `DrawInstance`) to immediately after `Present`, mirroring upstream's canonical tail layout (upstream `2bac8874`); fork slots remain appended after it. Size-neutral move — the `sizeof` sentinel is unchanged. An append-at-end warning comment was restored above the struct. 2026-08-05: `GetTextureHashList` appended at the end after `UpdateMeshBatched` (`sizeof` sentinel 336 → 344, no `REMIXAPI_VERSION` bump — append-only slot).*
 
 ---
 
@@ -686,6 +692,9 @@ initializer list and can't be lifted into a separate TU.
 - **Hook** at `(anonymous namespace)` `remixapi_AddTextureHash` / `remixapi_RemoveTextureHash` → `fork_hooks::mutateTextureHashOption` in `rtx_fork_api_entry.cpp` (migrated 2026-04-18, migration #7a).
   *Looks up an `RtxOption<fast_unordered_set>` by full option name and adds or removes a hash via the user config layer. Call sites acquire `s_mutex` then delegate to the hook (which internally takes the RtxOption update mutex — lock order documented alongside `s_mutex`). The call-site signature replaced the local `TextureHashMutation` enum with a plain `bool add` parameter.*
 
+- **Hook** at `extern "C"` `remixapi_GetTextureHashList` → `fork_hooks::getTextureHashList` in `rtx_fork_api_entry.cpp` (added 2026-08-05).
+  *One-liner delegate; acquires `s_mutex` first, same lock order as the Add/Remove entries (the hook internally takes the RtxOption update mutex). Lives in the `extern "C"` block rather than the anonymous namespace because it carries a `REMIXAPI` export declaration in `remix_c.h` — the `remixapi_GetGameValue` shape, which is also its truncation-contract sibling.*
+
 - **Inline tweak** at `convert::toRtDrawState` (skinning hash computation) — 1 LOC, not worth a hook. Not migrated.
   *Calls `skinningData.computeHash()` on the prototype after building skinning data so the skinning hash participates in geometry deduplication.*
 
@@ -766,7 +775,7 @@ initializer list and can't be lifted into a separate TU.
   *Registers all fork-added API functions into the `remixapi_Interface` vtable. The inline block assigns the anonymous-namespace slots (including `SetGameValue` added in workstream 10); the hook fills the three externally-linked ones.*
 
 - **Inline tweak** at `extern "C"` vtable size static_assert — 1 LOC. Not migrated (fridge-listed).
-  *The `static_assert(sizeof(interf) == 336, ...)` sentinel is the final value in the chain (208 → 240 → 272 → 280 → 288 → ... → 328 → 336; 328 → 336 on 2026-08-04 for the `UpdateMeshBatched` slot). Retained inline in `remixapi_InitializeLibrary` as a size sentinel.*
+  *The `static_assert(sizeof(interf) == 344, ...)` sentinel is the final value in the chain (208 → 240 → 272 → 280 → 288 → ... → 328 → 336 → 344; 328 → 336 on 2026-08-04 for the `UpdateMeshBatched` slot, 336 → 344 on 2026-08-05 for the `GetTextureHashList` slot). Retained inline in `remixapi_InitializeLibrary` as a size sentinel.*
 
 ---
 
@@ -4226,5 +4235,50 @@ untextured draw and an untagged draw of a different mesh may fold in the
 surface-material dedup while their `MaterialData` hashes match. Texture-hash
 tags — the common case — cannot hit this: same material ⇒ same albedo ⇒ same
 tag.
+
+---
+
+## 2026-08-05 — feat: GetTextureHashList (read back the dev-menu texture categories)
+
+The texture-category hash sets were write-only from the API's point of view:
+`AddTextureHash` / `RemoveTextureHash` mutate them, and the dev-menu texture
+grid writes them directly, but nothing could read them back. A client that
+wants to route its own draws by what the user tagged — the Dolphin Remix
+backend's ortho/UI routing, whose overlay draws never become runtime draw
+calls and so can never be reached by the runtime's own category application —
+therefore had no way to observe the tags. One append-only read entry closes
+that gap; all the routing then happens client-side.
+
+Truncation follows `remixapi_GetGameValue`: `*out_count` always receives the
+true set size, and hashes are copied only when the buffer covers the *whole*
+set. Copying a partial set was rejected deliberately — a half-read category
+set is indistinguishable from a small one, so it would silently mis-route
+draws instead of telling the caller to grow its buffer.
+
+- **`public/include/remix/remix_c.h`** - fork-touchpoint inline tweak - 2
+  blocks. *`PFN_remixapi_GetTextureHashList` typedef + `REMIXAPI` entry
+  declaration (with the contract doc block: option-name convention, the three
+  texture-category set names, truncation, the `capacity == 0` size probe) +
+  `GetTextureHashList` slot appended at the END of `remixapi_Interface` after
+  `UpdateMeshBatched`. No `REMIXAPI_VERSION` bump (append-only slot).*
+- **`public/include/remix/remix.h`** - fork-touchpoint inline tweak - 3
+  blocks. *`Interface::GetTextureHashList` declaration + inline impl (raw
+  `remixapi_ErrorCode` return and nullptr-slot → `NOT_INITIALIZED`, matching
+  the `GetGameValue` shape) + `sizeof` static_assert 336 → 344.*
+- **`src/dxvk/rtx_render/rtx_remix_api.cpp`** - fork-touchpoint inline tweak -
+  3 blocks. *`remixapi_GetTextureHashList` one-liner delegate in the
+  `extern "C"` block next to `remixapi_GetGameValue` — it lives there, not in
+  the anonymous namespace beside `remixapi_AddTextureHash`, because it carries
+  a `REMIXAPI` export declaration in the public header; vtable assignment;
+  sentinel 336 → 344.*
+- **`src/dxvk/rtx_render/rtx_fork_hooks.h`** - fork-owned change.
+  *Declaration, with the lock-ordering note the Add/Remove hook carries.*
+- **`src/dxvk/rtx_render/rtx_fork_api_entry.cpp`** - fork-owned change.
+  *`fork_hooks::getTextureHashList` body, next to `mutateTextureHashOption`.
+  Same option lookup + `OptionType::HashSet` validation; then takes
+  `RtxOptionImpl::getUpdateMutex()` and reads the resolved set through the
+  public `getValueNoLock()` — legal because we hold the mutex, the same
+  discipline `RtxOption::containsHash` follows internally. No friend
+  declaration.*
 
 ---

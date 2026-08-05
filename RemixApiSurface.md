@@ -923,6 +923,17 @@ Parameters:
 - `const char* textureCategory`
 - `const char* textureHash`
 
+### `PFN_remixapi_GetTextureHashList`
+
+Returns: `remixapi_ErrorCode`
+
+Parameters:
+
+- `const char* optionName`
+- `uint64_t* out_hashes`
+- `uint32_t capacity`
+- `uint32_t* out_count`
+
 ### `PFN_remixapi_Present`
 
 Returns: `remixapi_ErrorCode`
@@ -1177,3 +1188,4 @@ Reordering or inserting in the middle breaks backwards compatibility.
 | `PFN_remixapi_RequestTextureVramFree` | `RequestTextureVramFree` |  |
 | `PFN_remixapi_GetGameValue` | `GetGameValue` |  |
 | `PFN_remixapi_UpdateMeshBatched` | `UpdateMeshBatched` |  |
+| `PFN_remixapi_GetTextureHashList` | `GetTextureHashList` |  |

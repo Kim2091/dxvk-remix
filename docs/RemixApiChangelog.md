@@ -121,3 +121,28 @@ between them. Rebuild plugins/hosts against this header.
   serves both paths.
 
 ### Removed
+
+
+## [0.1000.2] - 2026-08-05
+
+### Added
+- `remixapi_Interface.GetTextureHashList` — the read counterpart to
+  `AddTextureHash` / `RemoveTextureHash`. Snapshots the resolved contents of a
+  named hash-set option (`rtx.uiTextures`, `rtx.ignoreTextures`,
+  `rtx.worldSpaceUiTextures`, or any other `RtxOption` of hash-set type) into a
+  caller-supplied buffer. The category sets were previously write-only from the
+  API's point of view while the dev-menu texture grid wrote them directly, so a
+  client that wanted to route its own draws by the user's tags had no way to
+  learn what was tagged. Truncation follows `GetGameValue`: `*out_count` is
+  always written with the true set size, and hashes are copied only when
+  `capacity >= *out_count` — a partial category set is never written, since it
+  would silently mis-route draws instead of failing loudly. Appended at the end
+  of `remixapi_Interface` (`sizeof` sentinel 336 → 344); older runtimes leave
+  the slot `NULL`, so callers should feature-detect. No `REMIXAPI_VERSION` bump
+  (append-only slot addition).
+
+### Changed
+
+### Fixed
+
+### Removed

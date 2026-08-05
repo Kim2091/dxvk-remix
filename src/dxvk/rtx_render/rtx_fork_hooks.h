@@ -340,6 +340,25 @@ namespace dxvk {
       const char* textureHash,
       bool add);
 
+    // Read counterpart to mutateTextureHashOption. Looks up an
+    // RtxOption<fast_unordered_set> by full option name and snapshots its
+    // resolved contents into out_hashes. *out_count always receives the true
+    // set size; hashes are copied only when capacity is large enough for the
+    // whole set, so the caller detects truncation with (*out_count > capacity)
+    // and retries with a bigger buffer (remixapi_GetGameValue semantics).
+    // Used by remixapi_GetTextureHashList so clients can poll back the
+    // categories the user tagged in the dev menu.
+    // NOTE: the caller is responsible for holding the remix-api static mutex
+    // (s_mutex in rtx_remix_api.cpp) across this call, per the lock ordering
+    // rule documented alongside s_mutex.
+    // No private-member access — uses only public RtxOption APIs.
+    // Implementation in rtx_fork_api_entry.cpp.
+    remixapi_ErrorCode getTextureHashList(
+      const char* optionName,
+      uint64_t*   out_hashes,
+      uint32_t    capacity,
+      uint32_t*   out_count);
+
     // Copies pPixelData into a host-visible staging buffer and stores it in the
     // fork-owned s_pendingScreenOverlay optional. A null pPixelData or zero dims
     // clears the pending overlay. The overlay is flushed to the render thread by
