@@ -33,6 +33,7 @@
 #include "rtx_materials.h"
 #include "rtx_ray_portal_manager.h"
 #include "rtx_terrain_baker.h"
+#include "rtx_fork_hooks.h"
 
 #include "../d3d9/d3d9_state.h"
 #include "rtx_matrix_helpers.h"
@@ -1130,6 +1131,10 @@ namespace dxvk {
             tmpMaterialData.getOpaqueMaterialData().setEmissiveIntensity(RtxOptions::emissiveBlendOverrideEmissiveIntensity());
             tmpMaterialData.getOpaqueMaterialData().setEmissiveColorTexture(tmpMaterialData.getOpaqueMaterialData().getAlbedoOpacityTexture());
           }
+
+          // Fork: category-driven patches (rtx.emissiveTextures force-emissive,
+          // rtx.ignoreAlphaOnTextures on the API path). See rtx_fork_submit.cpp.
+          fork_hooks::patchOpaqueMaterialFromCategories(currentInstance, materialData, tmpMaterialData);
 
           currentInstance.m_isSubsurface = materialData->getOpaqueMaterialData().getSubsurfaceDiffusionProfile();
         }

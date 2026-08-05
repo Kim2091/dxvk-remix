@@ -4158,3 +4158,73 @@ consumers. VertexShader stays `kEmptyHash` on the API path otherwise.
   vector or nullptr for unknown handles.*
 
 ---
+
+## 2026-08-04 — feat: Make Emissive category; fix: Ignore Alpha Channel on the API path
+
+Two dev-menu texture-grid changes. "Make Emissive" is a new category that
+patches the tagged draw's opaque material to emit from its albedo. "Ignore
+Alpha Channel" existed but was inert for API-submitted draws: its real effect
+is the material-level flag set during D3D9's legacy→opaque conversion
+(`rtx_materials.cpp:167`), which API-created materials never pass through —
+the category bit's only other consumer is the opacity-micromap manager. Both
+are now served by one category-driven material patch at instance update,
+which covers BOTH draw paths (`setupCategoriesForTexture` supplies the
+categories for D3D9, `externalDrawTextureCategories` for API draws).
+
+- **`src/dxvk/rtx_render/rtx_fork_submit.cpp`** - fork-owned change.
+  *New `patchOpaqueMaterialFromCategories`: deep-copies the material into the
+  caller's `tmpMaterialData` (the WorldUI patch pattern, self-assign-guarded)
+  and applies MakeEmissive — emission from the albedo texture, or the albedo
+  colour constant for untextured mesh-hash-tagged draws, at
+  `rtx.emissiveTexturesIntensity` — and IgnoreAlphaChannel
+  (`setIgnoreAlphaChannel(true)` when the material does not already carry it).
+  Also `kCategoryNames` += "MakeEmissive" and the `applyCategory` row in
+  `externalDrawTextureCategories`.*
+
+- **`src/dxvk/rtx_render/rtx_instance_manager.cpp`** - fork-touchpoint hook call site.
+  *One dispatch line in `updateInstance` after the WorldUI / emissive-blend
+  patches, inside the Opaque branch, plus the `rtx_fork_hooks.h` include. The
+  patched pointer flows through `preserveInstance`'s onInstanceUpdated event
+  into surface-material creation, exactly like the WorldUI patch above it;
+  tag toggles land the next frame because those caches rebuild per frame.*
+
+- **`src/dxvk/rtx_render/rtx_types.h`** - fork-touchpoint inline tweak.
+  *`InstanceCategories::MakeEmissive` appended before `Count` — every existing
+  category keeps its ordinal (USD attrs and API bits index by it).*
+
+- **`src/dxvk/rtx_render/rtx_types.cpp`** - fork-touchpoint inline tweak.
+  *`setupCategoriesForTexture` parity line for `rtx.emissiveTextures` (the
+  D3D9 path's category source).*
+
+- **`src/dxvk/rtx_render/rtx_options.h`** - fork-touchpoint inline tweak.
+  *`rtx.emissiveTextures` (hash set) + `rtx.emissiveTexturesIntensity` (float,
+  default 1.0). Composes with the global `rtx.emissiveIntensity` at
+  surface-material creation (`rtx_scene_manager.cpp:1671`).*
+
+- **`src/dxvk/imgui/dxvk_imgui.cpp`** - fork-touchpoint inline tweak.
+  *Grid row "Make Emissive (optional)" after "Add Light to Textures".*
+
+- **`src/lssusd/usd_common.h`** - fork-touchpoint inline tweak.
+  *`kRemixCategoryEntries` row for `remix_category:make_emissive` — the table
+  is static_asserted to match the enum count and order.*
+
+- **`src/usd-plugins/RemixCategories/schema.usda`** - fork-touchpoint data change.
+  *Matching `remix_category:make_emissive` attribute.*
+
+- **`public/include/remix/remix_c.h`** - fork-touchpoint inline tweak.
+  *`REMIXAPI_INSTANCE_CATEGORY_BIT_MAKE_EMISSIVE = 1 << 27` — append-only, no
+  ABI change. See `docs/RemixApiChangelog.md` [0.1000.1].*
+
+- **`src/dxvk/rtx_render/rtx_remix_api.cpp`** - fork-touchpoint inline tweak.
+  *Bit→category mapping line in `categoryFlagsToInstanceCategories`;
+  `InstanceCategories::Count` sentinel 26 → 27.*
+
+- **`src/dxvk/rtx_render/rtx_fork_hooks.h`** - fork-owned change. *Declaration.*
+
+Known limit, documented on purpose: a material shared between a MESH-hash-tagged
+untextured draw and an untagged draw of a different mesh may fold in the
+surface-material dedup while their `MaterialData` hashes match. Texture-hash
+tags — the common case — cannot hit this: same material ⇒ same albedo ⇒ same
+tag.
+
+---

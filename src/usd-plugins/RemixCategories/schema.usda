@@ -153,4 +153,9 @@ class "RemixInstanceCategoryAPI" (
         displayGroup = "Remix Categories"
         displayName = "Hair Cards"
     )
+    bool remix_category:make_emissive = 0 (
+        doc = "Textures to render as emissive: the material is patched to emit light from its albedo (texture when it has one, otherwise its albedo colour), scaled by rtx.emissiveTexturesIntensity and the global rtx.emissiveIntensity.\nUse for signs, screens, lava, glowing effects and other surfaces that should light the scene but whose game material carries no emissive data."
+        displayGroup = "Remix Categories"
+        displayName = "Make Emissive"
+    )
 }

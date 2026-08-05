@@ -40,6 +40,7 @@ namespace {
     "DecalNoOffset", "AlphaBlendToCutout", "Terrain", "AnimatedWater",
     "ThirdPersonPlayerModel", "ThirdPersonPlayerBody", "IgnoreBakedLighting",
     "IgnoreTransparencyLayer", "ParticleEmitter", "SmoothNormals", "HairCards",
+    "MakeEmissive",
   };
   static_assert(sizeof(kCategoryNames) / sizeof(kCategoryNames[0]) ==
                   static_cast<size_t>(InstanceCategories::Count),
@@ -220,6 +221,7 @@ namespace {
     applyCategory(RtxOptions::particleEmitterTextures(), InstanceCategories::ParticleEmitter);
     applyCategory(RtxOptions::hairCardTextures(), InstanceCategories::HairCards);
     applyCategory(RtxOptions::smoothNormalsTextures(), InstanceCategories::SmoothNormals);
+    applyCategory(RtxOptions::emissiveTextures(), InstanceCategories::MakeEmissive);
 
     // Mesh-hash sky, mirroring DrawCallState::setupCategoriesForGeometry(). The
     // API mesh handle IS the client's mesh hash, so rtx.skyBoxGeometries works
@@ -260,6 +262,64 @@ namespace {
 
     logCategoryKeyOnce(RtxOptions::logApiDrawCategoryKeys(), key, keyIsMeshHash, meshHash,
                        drawCall.getCategoryFlags());
+  }
+
+  // ---------------------------------------------------------------------------
+  // patchOpaqueMaterialFromCategories
+  //
+  // Category-driven material patches, applied where updateInstance already
+  // patches materials for WorldUI. Both categories here are set from the
+  // dev-menu texture lists on BOTH draw paths (setupCategoriesForTexture for
+  // D3D9, externalDrawTextureCategories above for API draws), so this is the
+  // one consumer each needs.
+  //
+  // Toggling a tag applies on the next frame: the patched MaterialData flows
+  // through preserveInstance's onInstanceUpdated event into surface-material
+  // creation, and those caches rebuild per frame.
+  //
+  // Known edge, accepted: a material shared between a MESH-hash-tagged
+  // untextured draw and an untagged draw patches per instance, so the tag
+  // stays per-draw correct — but the shared surface-material dedup may fold
+  // them while their MaterialData hash matches. Texture-hash tags (the common
+  // case) cannot hit this: same material implies same albedo implies same tag.
+  // ---------------------------------------------------------------------------
+  void patchOpaqueMaterialFromCategories(
+      const RtInstance& instance,
+      const MaterialData*& materialData,
+      MaterialData& tmpStorage) {
+    if (materialData->getType() != MaterialDataType::Opaque) {
+      return;
+    }
+
+    const bool makeEmissive = instance.testCategoryFlags(InstanceCategories::MakeEmissive);
+    const bool ignoreAlpha = instance.testCategoryFlags(InstanceCategories::IgnoreAlphaChannel) &&
+                             !materialData->getOpaqueMaterialData().getIgnoreAlphaChannel();
+    if (!makeEmissive && !ignoreAlpha) {
+      return;
+    }
+
+    // Deep copy once, then patch in place. Guarded so a second patch in one
+    // update cannot self-assign tmpStorage over itself.
+    if (materialData != &tmpStorage) {
+      tmpStorage = *materialData;
+      materialData = &tmpStorage;
+    }
+    auto& opaque = tmpStorage.getOpaqueMaterialData();
+
+    if (makeEmissive) {
+      opaque.setEnableEmission(true);
+      opaque.setEmissiveIntensity(RtxOptions::emissiveTexturesIntensity());
+      if (opaque.getAlbedoOpacityTexture().isValid()) {
+        opaque.setEmissiveColorTexture(opaque.getAlbedoOpacityTexture());
+      } else {
+        // Untextured draw (tagged by mesh hash): glow with its albedo colour.
+        opaque.setEmissiveColorConstant(opaque.getAlbedoConstant());
+      }
+    }
+
+    if (ignoreAlpha) {
+      opaque.setIgnoreAlphaChannel(true);
+    }
   }
 
   // ---------------------------------------------------------------------------

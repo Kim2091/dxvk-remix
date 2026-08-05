@@ -98,9 +98,26 @@ between them. Rebuild plugins/hosts against this header.
   (`sizeof` sentinel 328 → 336); older runtimes leave the slot `NULL`, so
   callers should feature-detect and fall back to destroy+create. No
   `REMIXAPI_VERSION` bump (append-only slot addition).
+- `REMIXAPI_INSTANCE_CATEGORY_BIT_MAKE_EMISSIVE` (bit 27, append-only — no
+  ABI change) and the matching `InstanceCategories::MakeEmissive`. Patches the
+  draw's opaque material to emit light from its albedo (texture when present,
+  else the albedo colour), scaled by the new `rtx.emissiveTexturesIntensity`
+  and the global `rtx.emissiveIntensity`. Also reachable without the API bit
+  by tagging texture/mesh hashes into the new `rtx.emissiveTextures` list —
+  exposed as "Make Emissive" in the dev-menu texture grid and as USD
+  `remix_category:make_emissive`. Unlike the removed
+  `REMIXAPI_INSTANCE_CATEGORY_BIT_LEGACY_EMISSIVE` (which silently routed to
+  SmoothNormals), this bit has a real consumer on both draw paths.
 
 ### Changed
 
 ### Fixed
+- "Ignore Alpha Channel of Textures" (`rtx.ignoreAlphaOnTextures`, dev-menu
+  grid, and `REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_ALPHA_CHANNEL`) now works
+  for API-submitted draws. Its effect is a material-level flag that only
+  D3D9's legacy→opaque material conversion ever set; API-created materials
+  never pass through that conversion, so the tag was inert on the API path.
+  The flag is now applied from the instance category at instance update, which
+  serves both paths.
 
 ### Removed

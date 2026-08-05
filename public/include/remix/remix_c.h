@@ -528,6 +528,11 @@ extern "C" {
     REMIXAPI_INSTANCE_CATEGORY_BIT_SMOOTH_NORMALS            = 1 << 24,
     REMIXAPI_INSTANCE_CATEGORY_BIT_HAIR_CARDS                = 1 << 25,
     REMIXAPI_INSTANCE_CATEGORY_BIT_VIEW_MODEL                = 1 << 26,
+    // Patches the opaque material to emit light from its albedo (texture when
+    // present, else the albedo colour), scaled by rtx.emissiveTexturesIntensity
+    // and the global rtx.emissiveIntensity. Same effect as tagging the draw's
+    // texture hash into rtx.emissiveTextures.
+    REMIXAPI_INSTANCE_CATEGORY_BIT_MAKE_EMISSIVE             = 1 << 27,
   } remixapi_InstanceCategoryBit;
 
   typedef uint32_t remixapi_InstanceCategoryFlags;

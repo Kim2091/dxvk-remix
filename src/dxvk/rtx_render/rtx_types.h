@@ -650,6 +650,10 @@ enum class InstanceCategories : uint32_t {
   ParticleEmitter,
   SmoothNormals,
   HairCards,
+  // Fork: rtx.emissiveTextures — patches the opaque material to
+  // emissive-from-albedo at instance update. Appended at the end so every
+  // existing category keeps its ordinal (USD attrs and API bits index by it).
+  MakeEmissive,
 
   Count,
 };

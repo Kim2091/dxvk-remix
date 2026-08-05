@@ -103,6 +103,25 @@ namespace dxvk {
       CameraType::Enum baseCameraType,
       XXH64_hash_t& textureHash);
 
+    // Applies category-driven opaque-material patches at instance update, for
+    // categories whose effect lives on the MATERIAL rather than the instance:
+    //   - MakeEmissive (rtx.emissiveTextures): rewrites the material to emit
+    //     from its albedo at rtx.emissiveTexturesIntensity.
+    //   - IgnoreAlphaChannel (rtx.ignoreAlphaOnTextures): sets the material's
+    //     ignore-alpha flag. D3D9 sets it during legacy->opaque material
+    //     conversion (rtx_materials.cpp), which API-created materials never
+    //     pass through — without this patch the dev-menu tick is inert on the
+    //     API path.
+    // Deep-copies *materialData into tmpStorage on first patch and repoints
+    // materialData at it — the same pattern as the WorldUI patch above the
+    // call site. No private-member access (RtInstance::testCategoryFlags and
+    // the MaterialData accessors are public).
+    // Implementation in rtx_fork_submit.cpp.
+    void patchOpaqueMaterialFromCategories(
+      const RtInstance& instance,
+      const MaterialData*& materialData,
+      MaterialData& tmpStorage);
+
     // Stores per-draw texture hash metadata in SceneManager::m_drawCallMeta
     // when object picking is active, mirroring the D3D9 draw path.
     // NOTE: requires SceneManager to declare fork_hooks::externalDrawObjectPicking

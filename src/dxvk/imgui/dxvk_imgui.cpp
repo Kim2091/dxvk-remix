@@ -193,6 +193,7 @@ namespace dxvk {
     {"beamtextures", "Beam Texture (optional)", &RtxOptions::beamTexturesObject()},
     {"ignoretransparencytextures", "Ignore Transparency Layer Texture (optional)", &RtxOptions::ignoreTransparencyLayerTexturesObject()},
     {"lightconvertertextures", "Add Light to Textures (optional)", &RtxOptions::lightConverterObject()},
+    {"emissivetextures", "Make Emissive (optional)", &RtxOptions::emissiveTexturesObject()},
     {"decaltextures", "Decal Texture (optional)", &RtxOptions::decalTexturesObject()},
     {"terraintextures", "Terrain Texture", &RtxOptions::terrainTexturesObject()},
     {"watertextures", "Water Texture (optional)", &RtxOptions::animatedWaterTexturesObject()},
