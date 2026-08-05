@@ -408,6 +408,8 @@ namespace dxvk {
     setCategory(InstanceCategories::Terrain, lookupHash(RtxOptions::terrainTextures(), textureHash));
     setCategory(InstanceCategories::Sky, lookupHash(RtxOptions::skyBoxTextures(), textureHash));
 
+    setCategory(InstanceCategories::MakeEmissive, lookupHash(RtxOptions::emissiveTextures(), textureHash));
+
     setCategory(InstanceCategories::ParticleEmitter, lookupHash(RtxOptions::particleEmitterTextures(), textureHash));
     setCategory(InstanceCategories::HairCards, lookupHash(RtxOptions::hairCardTextures(), textureHash));
   }
