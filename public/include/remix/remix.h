@@ -211,6 +211,12 @@ namespace remix {
     remixapi_ErrorCode                GetGameValue(const char* key, char* out_buffer, uint32_t in_buffer_size, uint32_t* out_actual_size);
     Result< void >                    AddTextureHash(const char* textureCategory, const char* textureHash);
     Result< void >                    RemoveTextureHash(const char* textureCategory, const char* textureHash);
+    // Reads back a hash-set option (e.g. "rtx.uiTextures") — the categories the
+    // user tagged in the dev menu. *out_count is always written; hashes are
+    // copied only when capacity covers the whole set, so grow and retry when
+    // *out_count > capacity. Returns NOT_INITIALIZED against runtimes that
+    // predate the slot.
+    remixapi_ErrorCode                GetTextureHashList(const char* optionName, uint64_t* out_hashes, uint32_t capacity, uint32_t* out_count);
 
     // DXVK interoperability
     Result< IDirect3D9Ex* >                  dxvk_CreateD3D9(bool editorModeEnabled = false);
@@ -254,7 +260,7 @@ namespace remix {
         return status;
       }
 
-      static_assert(sizeof(remixapi_Interface) == 336,
+      static_assert(sizeof(remixapi_Interface) == 344,
                     "Change version, update C++ wrapper when adding new functions");
 
       remix::Interface interfaceInCpp = {};
@@ -326,6 +332,16 @@ namespace remix {
       return REMIXAPI_ERROR_CODE_NOT_INITIALIZED;
     }
     return m_CInterface.RemoveTextureHash(textureCategory, textureHash);
+  }
+
+  inline remixapi_ErrorCode Interface::GetTextureHashList(const char* optionName,
+                                                          uint64_t* out_hashes,
+                                                          uint32_t  capacity,
+                                                          uint32_t* out_count) {
+    if (!m_CInterface.GetTextureHashList) {
+      return REMIXAPI_ERROR_CODE_NOT_INITIALIZED;
+    }
+    return m_CInterface.GetTextureHashList(optionName, out_hashes, capacity, out_count);
   }
 
   inline Result< void > Interface::Present(const remixapi_PresentInfo* info) {

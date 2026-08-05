@@ -396,6 +396,65 @@ Registers a texture hash into a named category — used by the asset
 replacer to match captured content against runtime classifications
 (sky, terrain, UI, etc.) without needing per-frame draw-time hints.
 
+### `GetTextureHashList`
+
+```c
+remixapi_ErrorCode GetTextureHashList(
+    const char* optionName,
+    uint64_t*   out_hashes,
+    uint32_t    capacity,
+    uint32_t*   out_count);
+```
+
+The read counterpart to `AddTextureHash` / `RemoveTextureHash`.
+Snapshots the **resolved** contents of a hash-set option — what the
+renderer actually acts on, after every config layer (defaults,
+`rtx.conf`, user layer, dev-menu edits) has been folded together.
+
+`optionName` is the full option name, the same string `AddTextureHash`
+takes. The texture-category sets are:
+
+| Option name                | Dev-menu label   | Effect                        |
+| -------------------------- | ---------------- | ----------------------------- |
+| `rtx.uiTextures`           | UI Texture       | composited as screen-space UI |
+| `rtx.ignoreTextures`       | Ignore           | dropped entirely              |
+| `rtx.worldSpaceUiTextures` | World Space UI   | drawn as world-space geometry |
+
+Any other `RtxOption` of hash-set type is also valid — see
+[`RtxOptions.md`](../RtxOptions.md).
+
+**Truncation contract** (same shape as `GetGameValue`): `*out_count` is
+always written with the true set size. Hashes are copied only when
+`capacity >= *out_count`; a partial set is never written, because a
+truncated category set silently mis-routes draws rather than failing
+loudly. The caller grows its buffer to `*out_count` and calls again.
+`capacity == 0` with `out_hashes == NULL` is the legal size probe.
+
+```c
+uint32_t count = 0;
+uint64_t hashes[256];
+if (iface.GetTextureHashList("rtx.uiTextures", hashes, 256, &count)
+      == REMIXAPI_ERROR_CODE_SUCCESS && count <= 256) {
+  // hashes[0..count) is the complete set
+}
+```
+
+Returns `REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS` for a null/empty
+`optionName`, a null `out_count`, `capacity > 0` with a null
+`out_hashes`, or an option that exists but is not a hash set;
+`REMIXAPI_ERROR_CODE_GENERAL_FAILURE` when no option by that name
+exists.
+
+**Feature detection.** The slot was appended to `remixapi_Interface`
+in `0.1000.2`. Runtimes older than that leave it `NULL` — check the
+pointer before calling and degrade gracefully (the C++ wrapper returns
+`REMIXAPI_ERROR_CODE_NOT_INITIALIZED` for you).
+
+Intended for clients that do their own per-draw routing and need to
+know what the user tagged in the dev menu. The menu writes the sets
+directly, so polling is the only way to observe them; poll once per
+frame rather than per draw.
+
 ---
 
 ## Configuration — `SetConfigVariable`

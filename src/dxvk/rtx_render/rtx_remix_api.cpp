@@ -2810,6 +2810,22 @@ extern "C"
     return REMIXAPI_ERROR_CODE_SUCCESS;
   }
 
+  // Read counterpart to remixapi_AddTextureHash / remixapi_RemoveTextureHash.
+  // Body lives in rtx_fork_api_entry.cpp as fork_hooks::getTextureHashList.
+  //
+  // Unlike GetGameValue (which relies on the GameStateStore's own mutex), this
+  // one touches an RtxOption, so it takes s_mutex first — the same ordering the
+  // Add/RemoveTextureHash entries use, per the lock-ordering rule documented
+  // alongside s_mutex.
+  remixapi_ErrorCode REMIXAPI_CALL remixapi_GetTextureHashList(
+    const char* optionName,
+    uint64_t*   out_hashes,
+    uint32_t    capacity,
+    uint32_t*   out_count) {
+    std::lock_guard lock { s_mutex };
+    return dxvk::fork_hooks::getTextureHashList(optionName, out_hashes, capacity, out_count);
+  }
+
   REMIXAPI remixapi_ErrorCode REMIXAPI_CALL remixapi_InitializeLibrary(const remixapi_InitializeLibraryInfo* info,
                                                                        remixapi_Interface* out_result) {
     if (!info || info->sType != REMIXAPI_STRUCT_TYPE_INITIALIZE_LIBRARY_INFO) {
@@ -2866,10 +2882,11 @@ extern "C"
       interf.RequestTextureVramFree = remixapi_RequestTextureVramFree;
       interf.GetGameValue = remixapi_GetGameValue;
       interf.UpdateMeshBatched = remixapi_UpdateMeshBatched;
+      interf.GetTextureHashList = remixapi_GetTextureHashList;
       // Fork-added vtable slots (extern-C exported; delegated to fork hook)
       dxvk::fork_hooks::remixApiVtableInit(interf);
     }
-    static_assert(sizeof(interf) == 336, "Add/remove function registration");
+    static_assert(sizeof(interf) == 344, "Add/remove function registration");
 
     *out_result = interf;
     return REMIXAPI_ERROR_CODE_SUCCESS;

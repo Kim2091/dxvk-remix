@@ -811,6 +811,45 @@ extern "C" {
     const char* textureCategory,
     const char* textureHash);
 
+  // Read counterpart to AddTextureHash / RemoveTextureHash: snapshots the
+  // resolved contents of a hash-set option into out_hashes.
+  //
+  // `optionName` is the full option name of any Remix hash-set option — the
+  // same string AddTextureHash takes. The texture-category sets are:
+  //   "rtx.uiTextures"            — composited as screen-space UI
+  //   "rtx.ignoreTextures"        — dropped entirely
+  //   "rtx.worldSpaceUiTextures"  — drawn as world-space geometry
+  // Any other RtxOption of hash-set type is also valid.
+  //
+  // Intended for clients that do their own per-draw routing and need to know
+  // what the user tagged in the Remix dev menu; the sets are written directly
+  // by the menu, so polling is the only way to observe them.
+  //
+  // Returns:
+  //   REMIXAPI_ERROR_CODE_SUCCESS — read completed.
+  //   REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS — null/empty optionName, null
+  //     out_count, capacity > 0 with null out_hashes, or the named option
+  //     exists but is not a hash set.
+  //   REMIXAPI_ERROR_CODE_GENERAL_FAILURE — no option by that name.
+  //
+  // On success:
+  //   *out_count = number of hashes in the set (always written)
+  //   if capacity >= *out_count: out_hashes receives all of them, unordered
+  //   if capacity <  *out_count: out_hashes is left untouched — grow the
+  //     buffer to *out_count and call again. A partial set is never written,
+  //     because a truncated category set silently mis-routes draws.
+  //   capacity == 0 with out_hashes == NULL is the legal size probe.
+  typedef remixapi_ErrorCode(REMIXAPI_PTR* PFN_remixapi_GetTextureHashList)(
+    const char* optionName,
+    uint64_t*   out_hashes,
+    uint32_t    capacity,
+    uint32_t*   out_count);
+  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL remixapi_GetTextureHashList(
+    const char* optionName,
+    uint64_t*   out_hashes,
+    uint32_t    capacity,
+    uint32_t*   out_count);
+
   typedef struct remixapi_PresentInfo {
     remixapi_StructType       sType;
     void*                     pNext;
@@ -1087,6 +1126,7 @@ extern "C" {
     PFN_remixapi_RequestTextureVramFree     RequestTextureVramFree;
     PFN_remixapi_GetGameValue               GetGameValue;
     PFN_remixapi_UpdateMeshBatched          UpdateMeshBatched;
+    PFN_remixapi_GetTextureHashList         GetTextureHashList;
   } remixapi_Interface;
 
   REMIXAPI remixapi_ErrorCode REMIXAPI_CALL remixapi_InitializeLibrary(
