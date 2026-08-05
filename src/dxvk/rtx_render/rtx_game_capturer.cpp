@@ -860,6 +860,18 @@ namespace dxvk {
                                          const RasterGeometry& geomData,
                                          const float currentFrameNum,
                                          std::shared_ptr<Mesh> pMesh) {
+    // The weight loop below iterates to (bonesPerVertex - 1) on size_t, so a zero
+    // here underflows to SIZE_MAX and reads until an access violation kills the
+    // process on the exporter thread. numBones > 0 with bonesPerVertex == 0 is a
+    // producer bug (it crashed every capture of a Remix-API skinned scene until
+    // submitExternalDraw gained its sync), but a bad capture must never be able to
+    // take the game down -- skip this mesh's blend data and say so instead.
+    if (pMesh->lssData.bonesPerVertex == 0) {
+      // Only reached for new meshes, so this cannot spam: one line per offending mesh per capture.
+      Logger::err(str::format("[GameCapturer] Mesh ", pMesh->lssData.meshName,
+                              " is skinned (numBones > 0) but bonesPerVertex is 0; skipping blend-data capture."));
+      return;
+    }
     AssetExporter::BufferCallback captureMeshBlendWeightsAsync = [ctx, geomData, currentFrameNum, pMesh](Rc<DxvkBuffer> inBuf) {
       // Prep helper vars
       const size_t numVertices = geomData.vertexCount;

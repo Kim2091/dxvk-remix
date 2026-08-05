@@ -909,7 +909,14 @@ std::unique_ptr<dxvk::ExternalDrawState> dxvk::RemixAPIPrivateAccessor::toRtDraw
       extBones->boneTransforms_count : REMIXAPI_INSTANCE_INFO_MAX_BONES_COUNT;
     prototype.skinningData.minBoneIndex = 0;
     prototype.skinningData.numBones = boneCount;
-    prototype.skinningData.numBonesPerVertex = prototype.getGeometryData().numBonesPerVertex;
+    // The prototype has no geometry attached yet -- the mesh handle is resolved
+    // later, in SceneManager::submitExternalDraw, which syncs this field from the
+    // resolved submesh (bones-per-vertex is a mesh property; the EXT carries only
+    // the matrices). The previous read of getGeometryData().numBonesPerVertex here
+    // always yielded 0 while LOOKING like a real sync, which left SkinningData
+    // self-inconsistent (numBones > 0, bonesPerVertex == 0) and crashed the
+    // capturer. Zero explicitly so nobody mistakes this for the sync point.
+    prototype.skinningData.numBonesPerVertex = 0;
     prototype.skinningData.pBoneMatrices.resize(boneCount);
     for (uint32_t boneIdx = 0; boneIdx < boneCount; boneIdx++) {
       prototype.skinningData.pBoneMatrices[boneIdx] = convert::tomat4(extBones->boneTransforms_values[boneIdx]);
