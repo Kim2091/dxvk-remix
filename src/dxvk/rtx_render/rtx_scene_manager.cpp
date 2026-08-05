@@ -2550,6 +2550,12 @@ namespace dxvk {
       replacementGeometry.cullMode = state.doubleSided ? VK_CULL_MODE_NONE : VK_CULL_MODE_BACK_BIT;
       replacementGeometry.externalMaterial = nullptr;
 
+      // Same numBonesPerVertex sync as the non-replacement loop below -- see the
+      // comment there. The copy above inherited state.drawCall's still-unsynced 0.
+      if (replacementDrawCall.getSkinningState().numBones > 0) {
+        replacementDrawCall.modifySkinningData().numBonesPerVertex = submeshes[0].numBonesPerVertex;
+      }
+
       // The template material must be the CLIENT's material for this mesh, resolved the
       // same way the non-replacement submesh loop below resolves it: drawReplacements
       // passes renderMaterialData through to prims flagged includeOriginal (the game
@@ -2608,6 +2614,22 @@ namespace dxvk {
     for (size_t i = 0; i < submeshes.size(); i++) {
       state.drawCall.overrideGeometryData(&submeshes[i]);
       state.drawCall.overrideCullMode(state.doubleSided ? VK_CULL_MODE_NONE : VK_CULL_MODE_BACK_BIT);
+
+      // On the API path, bones-per-vertex is a property of the MESH (set at
+      // CreateMesh from remixapi_MeshInfoSkinning), while the bone matrices arrive
+      // per-instance via remixapi_InstanceInfoBoneTransformsEXT. toRtDrawState parses
+      // the EXT before the mesh handle is resolved, so it cannot know this value and
+      // leaves it 0 -- and D3D9's finalizeSkinningData, which reconciles the two on
+      // that path, never runs here. This is the first point where the real geometry
+      // is in hand, so make SkinningData self-consistent now. The skinning dispatch
+      // reads the geometry's copy directly and never needed this; the capturer reads
+      // THIS copy, and numBones > 0 with numBonesPerVertex == 0 underflowed its
+      // (bonesPerVertex - 1) weight loop -- crashing every capture of a scene with an
+      // API-skinned mesh (BFBB, 2026-08-04). boneHash covers matrices only, so no
+      // rehash is needed.
+      if (state.drawCall.getSkinningState().numBones > 0) {
+        state.drawCall.modifySkinningData().numBonesPerVertex = submeshes[i].numBonesPerVertex;
+      }
 
       XXH64_hash_t textureHash = 0;
 

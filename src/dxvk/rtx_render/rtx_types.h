@@ -715,6 +715,15 @@ struct DrawCallState {
     return skinningData;
   }
 
+  // Fork touchpoint: mirrors modifyMaterialData/modifyTransformData above. Needed by
+  // SceneManager::submitExternalDraw, which is the first point on the Remix-API path
+  // where the mesh handle has been resolved to real geometry and the instance's
+  // skinning state can be made consistent with it (numBonesPerVertex lives on the
+  // mesh, not in remixapi_InstanceInfoBoneTransformsEXT). See docs/fork-touchpoints.md.
+  SkinningData& modifySkinningData() {
+    return skinningData;
+  }
+
   const FogState& getFogState() const {
     return fogState;
   }

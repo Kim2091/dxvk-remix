@@ -4064,3 +4064,44 @@ That is a pre-existing, host-wide hazard independent of the categorization work
 and needs `std::from_chars`, not an imbue.
 
 ---
+
+## 2026-08-04 — fix: capture crash on Remix-API skinned meshes
+
+First skinned client of the external-draw path (Dolphin GX matrix-palette
+skinning) exposed a self-inconsistency in `SkinningData` that upstream's D3D9
+path can never produce: on the API path, bones-per-vertex is a MESH property
+(`remixapi_MeshInfoSkinning`, baked into the mesh's `RasterGeometry` at
+CreateMesh) while the bone matrices arrive per-instance
+(`remixapi_InstanceInfoBoneTransformsEXT`), and the EXT is parsed before the
+mesh handle is resolved — so the instance's `skinningData.numBonesPerVertex`
+stayed 0 while `numBones > 0`. D3D9 reconciles the two in
+`finalizeSkinningData`, which never runs on the API path. The skinning
+dispatch reads the geometry's copy and worked; the game capturer reads the
+instance's copy, and its blend-weight loop iterates to `bonesPerVertex - 1`
+on `size_t` — a zero underflows to `SIZE_MAX`, the exporter thread reads off
+the end of the weight buffer, and the process dies. Every capture of a scene
+containing an API-skinned mesh crashed (BFBB, 2026-08-04, three for three).
+
+- **`src/dxvk/rtx_render/rtx_types.h`** - fork-touchpoint inline tweak.
+  *Adds `DrawCallState::modifySkinningData()`, mirroring the existing
+  `modifyMaterialData` / `modifyTransformData` / `modifyGeometryData`
+  accessors, so `SceneManager::submitExternalDraw` can perform the sync
+  without a new friend declaration.*
+- **`src/dxvk/rtx_render/rtx_scene_manager.cpp`** - fork-touchpoint inline
+  tweak - 2 blocks in `submitExternalDraw`. *After geometry resolution, when
+  `numBones > 0`, syncs `skinningData.numBonesPerVertex` from the resolved
+  submesh: per-submesh in the non-replacement loop (right after
+  `overrideGeometryData`), and once from `submeshes[0]` on the replacement
+  branch's `replacementDrawCall` copy. `boneHash` covers matrices only, so no
+  rehash. This is the first point on the API path where the mesh is in hand.*
+- **`src/dxvk/rtx_render/rtx_remix_api.cpp`** - fork-touchpoint inline tweak.
+  *`toRtDrawState`'s bones-EXT block set `numBonesPerVertex` from
+  `prototype.getGeometryData()`, which is always empty at that point — a read
+  that yields 0 while looking like a real sync. Now zeroes explicitly with a
+  comment pointing at the real sync site.*
+- **`src/dxvk/rtx_render/rtx_game_capturer.cpp`** - fork-touchpoint inline
+  tweak. *`captureMeshBlending` refuses `bonesPerVertex == 0` (logs one line
+  naming the mesh, skips blend-data capture) so a producer bug can degrade a
+  capture but never take the process down.*
+
+---
