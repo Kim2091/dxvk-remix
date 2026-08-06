@@ -162,6 +162,15 @@ namespace dxvk {
 
 
   D3D9DeviceEx::~D3D9DeviceEx() {
+    // NV-DXVK start: detach window subclasses FIRST, before any teardown below.
+    // D3D9WindowProc runs on the host application's UI thread, which is not this
+    // thread and is still pumping messages while we tear down. It reaches the
+    // device through swapchain->GetDevice(), so leaving the hooks installed for
+    // even the duration of this destructor is a live use-after-free window.
+    // See ResetAllWindowProcs in d3d9_swapchain.h.
+    ResetAllWindowProcs();
+    // NV-DXVK end
+
     Flush();
     SynchronizeCsThread();
 
