@@ -2699,6 +2699,14 @@ namespace dxvk {
         auto& gameState = fork_game_state::GameStateStore::get();
         std::string worldView;
         if (gameState.tryGet(fork_game_state::kTaggingWorldViewKey, worldView)) {
+          std::string followsMenu;
+          gameState.tryGet(fork_game_state::kTaggingWorldViewFollowsMenuKey, followsMenu);
+          const bool autoSwitch = (followsMenu == "1");
+
+          // While the host is driving this from the menu state, the manual
+          // checkbox is showing a value it does not control. Disable it rather
+          // than let it read as an edit that does nothing.
+          ImGui::BeginDisabled(autoSwitch);
           bool enabled = (worldView == "1");
           if (IMGUI_ADD_TOOLTIP(
                 ImGui::Checkbox("Show the game's 2D layer in the world", &enabled),
@@ -2708,6 +2716,17 @@ namespace dxvk {
                 "play normally. Only available when the game is driven through the Remix API "
                 "and its integration supports the mode.")) {
             gameState.set(fork_game_state::kTaggingWorldViewKey, enabled ? "1" : "0");
+          }
+          ImGui::EndDisabled();
+
+          bool followMenu = autoSwitch;
+          if (IMGUI_ADD_TOOLTIP(
+                ImGui::Checkbox("Switch automatically while this menu is open", &followMenu),
+                "Show the 2D layer in the world whenever this menu is open, and put it back the "
+                "moment it closes - so tagging needs no toggling at all. Turn this off to drive "
+                "the view by hand with the checkbox above, which returns to whatever you last "
+                "set it to.")) {
+            gameState.set(fork_game_state::kTaggingWorldViewFollowsMenuKey, followMenu ? "1" : "0");
           }
         }
       }
@@ -2826,6 +2845,17 @@ namespace dxvk {
               }
 
               showTextureSelectionGrid(ctx, uniqueId, numThumbnailsPerRow, thumbnailSize, *height);
+
+              // NV-DXVK start: per-category controls, shown with the category
+              // they belong to. Tagging a texture "Make Emissive" and then
+              // having to leave the menu and edit rtx.conf to say how brightly
+              // it glows is not a workflow - the strength belongs next to the
+              // switch. Multiplies with the global rtx.emissiveIntensity.
+              if (strcmp(uniqueId, "emissivetextures") == 0) {
+                RemixGui::DragFloat("Emissive Intensity", &RtxOptions::emissiveTexturesIntensityObject(),
+                                    0.01f, 0.f, FLT_MAX, "%.3f", sliderFlags);
+              }
+              // NV-DXVK end
             }
           }
           if (isForToggle) {
@@ -3792,6 +3822,14 @@ namespace dxvk {
       }
 
       RemixGui::DragFloat("Emissive Intensity", &RtxOptions::emissiveIntensityObject(), 0.01f, 0.0f, FLT_MAX, "%.3f", sliderFlags);
+      // NV-DXVK start: strength of the "Make Emissive" texture tag, sitting with
+      // the global emissive control it multiplies against - this is where anyone
+      // tuning emissive actually looks, and the option had no widget anywhere at
+      // all before. Deliberately also mirrored inside the Make Emissive category
+      // in the tagging tab, where it is reached while tagging; both widgets edit
+      // this one option, so either is authoritative.
+      RemixGui::DragFloat("Tagged Texture Emissive Intensity", &RtxOptions::emissiveTexturesIntensityObject(), 0.01f, 0.0f, FLT_MAX, "%.3f", sliderFlags);
+      // NV-DXVK end
       RemixGui::Separator();
       RemixGui::SliderInt("RIS Light Sample Count", &RtxOptions::risLightSampleCountObject(), 0, 64);
       RemixGui::Separator();

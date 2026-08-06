@@ -4377,3 +4377,38 @@ expected to let that setting win when it changes and otherwise follow the key,
 so the two controls do not fight.
 
 ---
+
+## Feature - emissive strength + auto tagging view in the dev menu (fork - 2026-08-05)
+
+Two follow-ons to the tagging-view toggle, both user-requested, both in the
+*Step 1: Categorize Textures* tab. No API change — the second rides the same
+game-state store as the first.
+
+**Changes:**
+
+- **`src/dxvk/imgui/dxvk_imgui.cpp`** — inline tweaks.
+  - *`rtx.emissiveTexturesIntensity` had **no widget anywhere** and was
+    reachable only by hand-editing rtx.conf. It is now a slider in **two**
+    deliberate places, both editing the one option: **inside the "Make Emissive
+    (optional)" category** under its texture grid, where it is reached while
+    tagging and the strength sits next to the switch that turns it on; and in
+    **Lighting, directly beneath the global "Emissive Intensity"** it multiplies
+    against, labelled "Tagged Texture Emissive Intensity", which is where anyone
+    tuning emissive actually looks. Neither location alone covers both entry
+    points, and the duplication is cheap — an RtxOption is the single source of
+    truth, so the two widgets track each other live.*
+  - *Second checkbox "Switch automatically while this menu is open", publishing
+    `__remix.tagging.worldViewFollowsMenu`. While it is on the manual checkbox
+    above is `BeginDisabled` — it would otherwise be showing a value it no
+    longer controls, and reading as an edit that does nothing.*
+- **`src/dxvk/rtx_render/rtx_fork_game_state.h`** — fork-owned. *Adds
+  `kTaggingWorldViewFollowsMenuKey`.*
+- **`docs/RemixApi.md`** — the new key, and the host-side contract for it.
+
+**Why the preference is its own key** rather than a third state on
+`worldView`: the manual position has to survive being auto-overridden. Turning
+the preference back off must return to whatever the user last chose by hand,
+not to wherever the menu happened to leave things — which means the host tracks
+the manual position separately from what is in effect.
+
+---

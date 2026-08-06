@@ -640,6 +640,7 @@ on its own.
 | Key | Values | Meaning |
 | :-- | :-- | :-- |
 | `__remix.tagging.worldView` | `"1"` / `"0"` | Route the host's 2D layer through the world so its elements are clickable, and therefore taggable. |
+| `__remix.tagging.worldViewFollowsMenu` | `"1"` / `"0"` | Drive the above from whether the dev menu is open, instead of from its manual position. |
 
 An **untextured** element has no thumbnail, so it can never appear in the
 *Step 1: Categorize Textures* grid — clicking it in the world is its only
@@ -658,6 +659,15 @@ The contract is two-way and the host owns it:
 
 A host with its own equivalent setting should let that setting win when it
 changes, and otherwise follow the key, so the two controls do not fight.
+
+`worldViewFollowsMenu` is a separate key rather than a third state on
+`worldView` so that the manual position **survives being auto-overridden**:
+turning the preference back off must return to whatever the user last chose
+by hand, not to wherever the menu happened to leave things. Hosts should
+therefore track the manual position separately from what is in effect, and
+should keep honouring this key regardless of whether their tag-routing is
+switched on — the view is how an element is reached to tag it in the first
+place, which necessarily precedes the routing that consumes the tag.
 
 When a new fork-side subsystem starts publishing a `__<ns>.*`
 GameStateStore convention or a `rtx.<ns>.*` ConfigVariable namespace

@@ -34,6 +34,16 @@ namespace dxvk {
     // decision to make, not ours.
     static constexpr const char* kTaggingWorldViewKey = "__remix.tagging.worldView";
 
+    // Companion preference, same contract: when "1", the host drives the
+    // tagging view from whether this menu is open instead of from the manual
+    // toggle above, so opening the menu shows the taggable layer and closing it
+    // gives the game back. Separate key rather than a third state on the first
+    // one, because the manual position has to survive being auto-overridden -
+    // turning the preference back off must return to whatever the user last
+    // chose by hand, not to whatever the menu happened to leave behind.
+    static constexpr const char* kTaggingWorldViewFollowsMenuKey =
+      "__remix.tagging.worldViewFollowsMenu";
+
     class GameStateStore {
     public:
       static GameStateStore& get() {
