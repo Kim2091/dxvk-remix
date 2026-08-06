@@ -4343,3 +4343,37 @@ that previously faulted or dropped messages — so native D3D9 behaviour is unch
 whenever the device and swapchain are alive. A D3D9 regression check is still owed.
 
 ---
+
+## Feature - tagging view toggle in the dev menu (fork - 2026-08-05)
+
+**Why:** an untextured element has no thumbnail, so it can never appear in the
+*Step 1: Categorize Textures* grid; clicking it in the world is its only entry
+point. Routing the host's 2D layer into the world is what makes that possible,
+but only the HOST can do it — 2D content submitted through `DrawScreenOverlay`
+arrives as finished pixels and never becomes a runtime draw call. So the toggle
+belonged next to the grid the user is already looking at, while the action stays
+on the host side.
+
+**Mechanism:** the existing `SetGameValue` / `GetGameValue` store, no API change
+— no new vtable slot, no sentinel bump, no vendored-header re-sync. New
+well-known key `__remix.tagging.worldView` (`"1"` / `"0"`), documented in
+[`RemixApi.md`](RemixApi.md#convention-namespaces).
+
+**Changes:**
+
+- **`src/dxvk/rtx_render/rtx_fork_game_state.h`** — fork-owned. *Adds
+  `kTaggingWorldViewKey` so the dev menu and any other consumer cannot drift on
+  the spelling.*
+- **`src/dxvk/imgui/dxvk_imgui.cpp`** — inline tweak in the *Step 1: Categorize
+  Textures* tab, beside the existing tagging checkboxes. *Renders "Show the
+  game's 2D layer in the world" **only when the key is already present in the
+  store**. That presence is the host announcing it supports the mode; a D3D9
+  title has no host listening, and a checkbox that silently does nothing is
+  worse than none. Reads the store for the current state, writes it on toggle.*
+
+**Contract note:** the key is two-way and host-seeded. The runtime never creates
+it — it only reflects and mutates it. A host with its own equivalent setting is
+expected to let that setting win when it changes and otherwise follow the key,
+so the two controls do not fight.
+
+---

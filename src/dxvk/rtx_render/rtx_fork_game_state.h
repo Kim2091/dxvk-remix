@@ -21,6 +21,19 @@
 namespace dxvk {
   namespace fork_game_state {
 
+    // Well-known key: the dev menu's "show the game's 2D layer in the world"
+    // request, values "1" / "0". Two-way and host-owned - the host SEEDS it
+    // from its own setting when it supports the mode (its presence is what
+    // makes the dev-menu checkbox appear at all), the dev menu writes it when
+    // the user toggles, and the host polls it to follow. Declared here so the
+    // dev menu and the API entry point cannot drift on the spelling.
+    //
+    // It lives in the store rather than in an RtxOption because only the host
+    // can act on it: 2D draws submitted through DrawScreenOverlay never become
+    // runtime draw calls, so routing them into the world is the host's
+    // decision to make, not ours.
+    static constexpr const char* kTaggingWorldViewKey = "__remix.tagging.worldView";
+
     class GameStateStore {
     public:
       static GameStateStore& get() {

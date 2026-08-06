@@ -628,6 +628,36 @@ independently of the typed C API.
 | :-- | :-- | :-- |
 | `__weather.*`, `__sky.*` | `SetGameValue` / `GetGameValue` | [`RemixSkyAPI.md`](RemixSkyAPI.md) |
 | `rtx.weather.preset.*` | `SetConfigVariable` | [`RemixSkyAPI.md`](RemixSkyAPI.md) |
+| `__remix.tagging.*` | `SetGameValue` / `GetGameValue` | below |
+
+### `__remix.tagging.*` — host-assisted texture tagging
+
+Unlike the namespaces above, this one is **runtime-defined and
+host-implemented**: the runtime publishes a request, the host carries it
+out. It exists because the dev menu cannot reach every taggable element
+on its own.
+
+| Key | Values | Meaning |
+| :-- | :-- | :-- |
+| `__remix.tagging.worldView` | `"1"` / `"0"` | Route the host's 2D layer through the world so its elements are clickable, and therefore taggable. |
+
+An **untextured** element has no thumbnail, so it can never appear in the
+*Step 1: Categorize Textures* grid — clicking it in the world is its only
+entry point. But 2D content submitted through `DrawScreenOverlay` arrives
+as finished pixels and never becomes a runtime draw call, so only the host
+can put those elements into the world where object picking can see them.
+
+The contract is two-way and the host owns it:
+
+- The host **seeds** the key when it supports the mode. Its presence is
+  what makes the dev-menu checkbox appear at all — the runtime has no
+  other way to know whether a given integration can do this, and a
+  checkbox that silently does nothing is worse than no checkbox.
+- The dev menu **writes** it when the user toggles.
+- The host **polls** it and follows.
+
+A host with its own equivalent setting should let that setting win when it
+changes, and otherwise follow the key, so the two controls do not fight.
 
 When a new fork-side subsystem starts publishing a `__<ns>.*`
 GameStateStore convention or a `rtx.<ns>.*` ConfigVariable namespace
