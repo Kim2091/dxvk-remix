@@ -79,6 +79,7 @@
 #include "rtx_render/rtx_point_instancer_system.h"
 #include "rtx_render/rtx_overlay_window.h"
 #include "rtx_render/rtx_fork_hooks.h"
+#include "rtx_render/rtx_fork_game_state.h"
 
 
 namespace dxvk {
@@ -2685,6 +2686,36 @@ namespace dxvk {
       spacing();
       RemixGui::Checkbox("Preserve discarded textures", &RtxOptions::keepTexturesForTaggingObject());
       RemixGui::Checkbox("Log Remix API draw category keys", &RtxOptions::logApiDrawCategoryKeysObject());
+
+      // NV-DXVK start: client-driven tagging view, for Remix API hosts.
+      // An untextured element has no thumbnail, so the grid below cannot reach
+      // it at all - clicking it in the world is its only entry point, and that
+      // requires the host to route its 2D layer through the world. Only the
+      // host can do that routing (its 2D draws never become runtime draw
+      // calls), so this is a REQUEST published through the game-state store
+      // rather than an RtxOption we could act on ourselves.
+      //
+      // The host seeds the key when it supports the mode, which is also what
+      // gates the widget: a D3D9 title has no host listening, so rendering a
+      // checkbox that silently does nothing would be worse than showing none.
+      {
+        auto& gameState = fork_game_state::GameStateStore::get();
+        std::string worldView;
+        if (gameState.tryGet(fork_game_state::kTaggingWorldViewKey, worldView)) {
+          bool enabled = (worldView == "1");
+          if (IMGUI_ADD_TOOLTIP(
+                ImGui::Checkbox("Show the game's 2D layer in the world", &enabled),
+                "Turns the game's whole 2D layer into clickable world geometry so HUD elements "
+                "can be click-tagged. This is the only way to reach an UNTEXTURED element - it "
+                "has no thumbnail, so it never appears in the grid below. Turn it back off to "
+                "play normally. Only available when the game is driven through the Remix API "
+                "and its integration supports the mode.")) {
+            gameState.set(fork_game_state::kTaggingWorldViewKey, enabled ? "1" : "0");
+          }
+        }
+      }
+      // NV-DXVK end
+
       separator();
 
       // set thumbnail size
