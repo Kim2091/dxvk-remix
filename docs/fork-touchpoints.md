@@ -4282,3 +4282,64 @@ draws instead of telling the caller to grow its buffer.
   declaration.*
 
 ---
+
+## Fix - window subclass outlived the device it reaches through (fork - 2026-08-05)
+
+**Symptom:** the host application crashed every time it tore the Remix device down
+without exiting the process (reproduced continuously by the Dolphin Remix backend
+on "stop emulation"). Symbolized dump: access violation on the host's **main UI
+thread**, inside its own message pump —
+`QCoreApplication::exec` -> `processEvents` -> `PeekMessageW` ->
+`KiUserCallbackDispatcher` -> `SendMessageW` -> `USER32!CallWindowProcW` ->
+`d3d9_remix!dxvk::D3D9WindowProc+0x2fe`:
+
+```
+mov rcx,qword ptr [rbx+10h]   ; swapchain->GetDevice()
+mov rax,qword ptr [rcx]       ; <- AV, loading the device's vtable
+call qword ptr [rax+48h]      ; GetCreationParameters(&create_parms)
+```
+
+**Root cause:** `g_windowProcMap` outlives what it points at, and `D3D9WindowProc`
+reaches two levels deep into it. The swapchain itself read back fine — the dangling
+pointer is the **parent device**. `D3D9SwapChainEx` keeps an un-refcounted
+back-pointer to its parent to avoid a reference cycle, and `remixapi_Shutdown`
+force-releases the device (`while (true) { if (!Release()) break; }`) to a zero
+refcount regardless of who else legitimately holds one, so the device is destroyed
+*underneath* its own swapchain. `~D3D9DeviceEx` does not destroy its swapchains, so
+the swapchain survives with a dead parent and the window proc walks straight into it.
+
+Validity cannot be tested from inside the window proc: the pre-existing
+`AddRef`/`Release` refcount probe is itself a dereference, so on a destroyed object
+it faults rather than reporting. The invariant is therefore enforced by lifetime —
+**no window proc installed by this module outlives the device it reaches through.**
+
+**Changes — `src/d3d9/d3d9_swapchain.{h,cpp}` + `src/d3d9/d3d9_device.cpp`, inline tweaks:**
+
+- New free function **`dxvk::ResetAllWindowProcs()`** (declared in
+  `d3d9_swapchain.h`, defined beside `ResetWindowProc`): detaches every subclass
+  this module installed, restoring the original `WNDPROC` where possible and
+  otherwise nulling the entry's swapchain.
+- **`~D3D9DeviceEx` calls it FIRST**, before `Flush()` / `SynchronizeCsThread()` /
+  `onDestroy()`. `D3D9WindowProc` runs on the host's UI thread, which is not the
+  destructor's thread and keeps pumping messages throughout it, so leaving the
+  hooks installed for even the duration of teardown is a live use-after-free
+  window, not merely a post-teardown one.
+- **`ResetWindowProc`** — erase the entry *only* when the original proc was really
+  restored. When something subclassed on top of us, unchaining is impossible, so
+  keep the entry (the chain must stay intact) and null only `swapchain`.
+  Previously it erased unconditionally, leaving `D3D9WindowProc` installed with no
+  map entry — and its lookup-miss path returns 0 without chaining, silently
+  swallowing every subsequent message to that window.
+- **`D3D9WindowProc`** — test `windowData.swapchain == nullptr` by identity before
+  any use and fall through to the chained proc / `DefWindowProc`.
+- **`HookWindowProc`** — preserve the true original proc across a re-hook. Since
+  `ResetWindowProc` may now legitimately leave us installed, `SetWindowLongPtr`
+  can hand back `D3D9WindowProc` itself as the "previous" proc, and chaining to
+  that is unbounded recursion on the UI thread.
+
+**Scope note:** this path is shared by every D3D9 title, not just API consumers.
+The changes are strictly defensive — the new branches are only reachable in states
+that previously faulted or dropped messages — so native D3D9 behaviour is unchanged
+whenever the device and swapchain are alive. A D3D9 regression check is still owed.
+
+---

@@ -171,17 +171,89 @@ namespace dxvk {
         window, GWLP_WNDPROC));
 
 
-    if (proc == D3D9WindowProc)
+    if (proc == D3D9WindowProc) {
       CallCharsetFunction(
         SetWindowLongPtrW, SetWindowLongPtrA, it->second.unicode,
           window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(it->second.proc));
 
-    g_windowProcMap.erase(window);
+      g_windowProcMap.erase(window);
+      return;
+    }
+
+    // NV-DXVK start: do NOT erase while still installed.
+    // We only get here when something subclassed on top of us after we hooked,
+    // so our proc is in the middle of a chain and unchaining it is impossible
+    // (we cannot rewrite the other subclass's saved "previous" pointer).
+    // Erasing the entry anyway - which is what this used to do - leaves
+    // D3D9WindowProc reachable with no map entry, and its lookup-miss path
+    // returns 0 without chaining, silently swallowing every message the window
+    // ever receives again.
+    //
+    // Worse, the entry also outlived the swapchain it names, and D3D9WindowProc
+    // dereferenced that pointer to decide whether it was safe to dereference
+    // (AddRef/Release to test the refcount) - which is not a test at all once
+    // the object is freed, just an access violation on a dead vtable. That was
+    // a crash on the app's UI thread the moment any message reached the window
+    // after teardown.
+    //
+    // So keep the entry, keep chaining to the real original proc, and drop only
+    // the dying swapchain. Every swapchain-dependent action in D3D9WindowProc
+    // is null-guarded and skipped from here on.
+    it->second.swapchain = nullptr;
+    // NV-DXVK end
   }
+
+
+  // NV-DXVK start: see the declaration in d3d9_swapchain.h for why this exists.
+  void ResetAllWindowProcs() {
+    std::lock_guard lock(g_windowProcMapMutex);
+
+    for (auto it = g_windowProcMap.begin(); it != g_windowProcMap.end(); ) {
+      const HWND window = it->first;
+
+      auto proc = reinterpret_cast<WNDPROC>(
+        CallCharsetFunction(
+        GetWindowLongPtrW, GetWindowLongPtrA, it->second.unicode,
+          window, GWLP_WNDPROC));
+
+      if (proc == D3D9WindowProc) {
+        CallCharsetFunction(
+          SetWindowLongPtrW, SetWindowLongPtrA, it->second.unicode,
+            window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(it->second.proc));
+
+        it = g_windowProcMap.erase(it);
+        continue;
+      }
+
+      // Still chained behind another subclass, so we cannot unhook - keep the
+      // entry forwarding and drop the swapchain, same contract as
+      // ResetWindowProc's tail.
+      it->second.swapchain = nullptr;
+      ++it;
+    }
+  }
+  // NV-DXVK end
 
 
   void D3D9SwapChainEx::HookWindowProc(HWND window) {
     std::lock_guard lock(g_windowProcMapMutex);
+
+    // NV-DXVK start: remember the true original proc before resetting.
+    // ResetWindowProc can legitimately leave us installed (see the comment
+    // there), in which case the SetWindowLongPtr below hands back
+    // D3D9WindowProc *itself* as the "previous" proc - and chaining to that at
+    // the end of D3D9WindowProc is unbounded recursion on the UI thread.
+    // Carrying the original across the re-hook keeps the chain finite.
+    WNDPROC preservedProc = nullptr;
+    bool hadEntry = false;
+    {
+      auto it = g_windowProcMap.find(window);
+      if (it != g_windowProcMap.end()) {
+        preservedProc = it->second.proc;
+        hadEntry = true;
+      }
+    }
+    // NV-DXVK end
 
     ResetWindowProc(window);
 
@@ -192,6 +264,10 @@ namespace dxvk {
       CallCharsetFunction(
       SetWindowLongPtrW, SetWindowLongPtrA, windowData.unicode,
         window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(D3D9WindowProc)));
+    // NV-DXVK start: never let the chain point back at ourselves.
+    if (windowData.proc == D3D9WindowProc)
+      windowData.proc = hadEntry ? preservedProc : nullptr;
+    // NV-DXVK end
     windowData.swapchain = this;
     g_windowProcMap[window] = std::move(windowData);
 
@@ -232,6 +308,31 @@ namespace dxvk {
     // For WM_ENDSESSION, wParam=FALSE means the session shutdown was canceled; skip in that case.
     if (message == WM_DESTROY || (message == WM_ENDSESSION && wParam != 0)) {
       dxvk::sentry::shutdown();
+    }
+    // NV-DXVK end
+
+    // NV-DXVK start: the swapchain that hooked this window can be GONE, not
+    // merely stale - see ResetWindowProc. Once it is freed there is no valid
+    // read through this pointer at all, so it has to be tested by identity
+    // (nulled at teardown) BEFORE any use. The AddRef/Release refcount probe
+    // below is not a substitute: it is itself a virtual call, so on a destroyed
+    // swapchain it faults on the dead vtable rather than reporting anything.
+    // That fault landed on the host app's UI thread, inside its message pump,
+    // the first time any message reached this window after teardown.
+    //
+    // Note the swapchain is not the only stale pointer reachable from here: it
+    // also holds an un-refcounted back-pointer to its parent device, which
+    // ResetAllWindowProcs (called from ~D3D9DeviceEx) is what actually covers.
+    //
+    // With no swapchain there is nothing here to do but keep the chain intact,
+    // which is exactly what the tail of this function does.
+    if (windowData.swapchain == nullptr) {
+      if (windowData.proc) {
+        return CallCharsetFunction(
+          CallWindowProcW, CallWindowProcA, unicode,
+            windowData.proc, window, message, wParam, lParam);
+      }
+      return DefWindowProc(window, message, wParam, lParam);
     }
     // NV-DXVK end
 

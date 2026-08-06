@@ -41,6 +41,19 @@ namespace dxvk {
   class D3D9Surface;
   class DxvkFSRFGPresenter;
 
+  // NV-DXVK start: detach every window subclass this module installed.
+  // Called from ~D3D9DeviceEx. A swapchain can outlive its device - it keeps an
+  // un-refcounted back-pointer to the parent to avoid a reference cycle, and
+  // remixapi_Shutdown force-releases the device to a zero refcount regardless of
+  // who else still holds one - so after the device is gone, every swapchain of
+  // that device has a dangling parent. D3D9WindowProc reaches through exactly
+  // that parent (swapchain->GetDevice()->GetCreationParameters(...)), on the host
+  // application's UI thread, for any message the window receives afterwards.
+  // Nothing reachable from a window proc is safe once the device dies, so the
+  // hooks come out with it rather than being probed for validity later.
+  void ResetAllWindowProcs();
+  // NV-DXVK end
+
   using D3D9SwapChainExBase = D3D9DeviceChild<IDirect3DSwapChain9Ex>;
   class D3D9SwapChainEx : public D3D9SwapChainExBase {
     static constexpr uint32_t NumControlPoints = 256;
