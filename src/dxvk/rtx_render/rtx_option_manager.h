@@ -112,7 +112,18 @@ namespace dxvk {
     // Apply all pending set() calls, synchronize dirty option layers, and invoke onChange callbacks
     // Call at end of frame in dxvk-cs thread
     // forceOnChange causes callbacks for all dirty options, even if the resolved value is unchanged
-    static void applyPendingValues(DxvkDevice* device, bool forceOnChange);
+    // NV-DXVK start: re-resolve per-game config in a resident runtime
+    // invokeCallbacks=false promotes values WITHOUT running any onChange
+    // callback. Exists for the between-games layer refresh: callbacks guard
+    // themselves for a fresh process (GImGui == nullptr skips) but not for a
+    // torn-down one (GImGui dangles from the destroyed menu, the guard passes,
+    // and the null device turns member offsets into wild pointers - the
+    // ImGUI::setupStyle crash). The caller re-marks callback options dirty and
+    // the per-device forced apply in RtxInitializer fires them with a real,
+    // fully constructed device.
+    static void applyPendingValues(DxvkDevice* device, bool forceOnChange,
+                                   bool invokeCallbacks = true);
+    // NV-DXVK end
 
     // Log all effective (resolved) RtxOption values
     static void logEffectiveValues();

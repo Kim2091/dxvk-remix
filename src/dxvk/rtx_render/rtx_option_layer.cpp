@@ -710,9 +710,67 @@ namespace dxvk {
     // Load environment variable overrides into the environment layer
     RtxOptionManager::loadAllEnvironmentVariables();
 
+    // NV-DXVK start: re-resolve per-game config in a resident runtime
+    // Captured HERE, after every env read above, so the fingerprint describes
+    // exactly the environment this layer stack was built from.
+    s_systemLayerEnvFingerprint = computeSystemLayerEnvFingerprint();
+    // NV-DXVK end
+
     Logger::info("RtxOption system layer initialization complete.");
 
     return s_mergedConfig;
   }
+
+  // NV-DXVK start: re-resolve per-game config in a resident runtime
+  std::string RtxOptionLayer::computeSystemLayerEnvFingerprint() {
+    // The three env vars that name config files. Raw values joined verbatim -
+    // any change in what they name is a change, and equal strings cannot name
+    // different files. A newline separator cannot occur inside an env value.
+    return env::getEnvVar(kRtxOptionDxvkConfEnvVar) + "\n" +
+           env::getEnvVar(kRtxOptionRtxConfEnvVar) + "\n" +
+           env::getEnvVar(kRtxOptionUserConfEnvVar);
+  }
+
+  bool RtxOptionLayer::systemLayersEnvChanged() {
+    return s_systemLayerEnvFingerprint != computeSystemLayerEnvFingerprint();
+  }
+
+  const Config& RtxOptionLayer::refreshSystemLayers() {
+    Logger::info("Config environment changed in a resident runtime - rebuilding RtxOption system layers for the new game.");
+
+    // Collect first, release after: releaseLayer erases from the registry, so
+    // it cannot run inside the iteration. Everything with a priority outside
+    // the dynamic range is a system layer; the Default Values layer is the one
+    // exception kept, since code defaults are game-independent. Dynamic layers
+    // belong to graph components and are left to their owners.
+    auto& layerMap = RtxOptionManager::getLayerRegistry();
+    std::vector<const RtxOptionLayer*> systemLayers;
+    for (const auto& [key, layer] : layerMap) {
+      const bool isDynamic = key.priority >= kMinDynamicRtxOptionLayerPriority &&
+                             key.priority <= kMaxDynamicRtxOptionLayerPriority;
+      if (!isDynamic && !(key == kRtxOptionLayerDefaultKey)) {
+        systemLayers.push_back(layer.get());
+      }
+    }
+    for (const RtxOptionLayer* layer : systemLayers) {
+      // System layers hold exactly the one reference their creation took, so
+      // this release removes the layer and strips its values from every option.
+      RtxOptionManager::releaseLayer(layer);
+    }
+
+    // The statics now dangle; null them before the rebuild repopulates them.
+    s_rtxConfLayer = nullptr;
+    s_environmentLayer = nullptr;
+    s_qualityLayer = nullptr;
+    s_derivedLayer = nullptr;
+    s_userLayer = nullptr;
+    // Merged fresh rather than accumulated: initializeSystemLayers() merges
+    // INTO this, and stacking the new game onto the old game's merge would
+    // keep every option the new config does not explicitly set.
+    s_mergedConfig = Config();
+
+    return initializeSystemLayers();
+  }
+  // NV-DXVK end
 
 }  // namespace dxvk

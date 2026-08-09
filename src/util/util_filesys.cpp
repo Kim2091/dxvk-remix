@@ -101,6 +101,33 @@ std::optional<std::ofstream> createDirectoriesAndOpenFile(const std::filesystem:
 bool RtxFileSys::s_bInit = false;
 RtxFileSys::fspath RtxFileSys::s_rootPath;
 RtxFileSys::PathArray RtxFileSys::s_paths;
+// NV-DXVK start: re-resolve per-game paths in a resident runtime
+std::string RtxFileSys::s_envFingerprint;
+
+std::string RtxFileSys::computeEnvFingerprint() {
+  // Raw env values joined verbatim, one per path spec - any change in what
+  // they name is a change, and a newline cannot occur inside an env value.
+  std::string fingerprint;
+  for (const auto& pathSpec : s_pathSpecs) {
+    fingerprint += pathSpec.env.empty() ? std::string() : getEnvVar(pathSpec.env.c_str());
+    fingerprint += '\n';
+  }
+  return fingerprint;
+}
+
+bool RtxFileSys::refreshIfEnvChanged(const std::string& rootPath) {
+  if (s_bInit && s_envFingerprint == computeEnvFingerprint()) {
+    return false;
+  }
+  // Same run-once guard reset init() itself cannot do: the guard exists to
+  // protect against ACCIDENTAL double init, while this path is a deliberate
+  // "the host moved the per-game folders" re-resolve.
+  s_bInit = false;
+  s_paths = {};
+  init(rootPath);
+  return s_bInit;
+}
+// NV-DXVK end
 
 void RtxFileSys::init(const std::string rootPath) {
   if (s_bInit) {
@@ -130,6 +157,9 @@ void RtxFileSys::init(const std::string rootPath) {
     }
     createDirectories(absolute(path));
   }
+  // NV-DXVK start: re-resolve per-game paths in a resident runtime
+  s_envFingerprint = computeEnvFingerprint();
+  // NV-DXVK end
   s_bInit = true;
 }
 

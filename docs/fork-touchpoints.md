@@ -4412,3 +4412,57 @@ not to wherever the menu happened to leave things — which means the host track
 the manual position separately from what is in effect.
 
 ---
+
+## Fix - per-game config in a resident runtime (fork - 2026-08-08)
+
+A host that runs many games from one process (Dolphin) points the config and
+path env vars at a different per-game folder before each game, but the runtime
+resolved both exactly once, under run-once guards. When the DLL stays resident
+across games - which it does in practice; FreeLibrary never unmaps it because
+references outlive Shutdown - the second game read AND SAVED INTO the first
+game's rtx.conf/user.conf, and its captures/logs/mods paths were wrong too.
+Unloading was the old reset mechanism and is unbounded whack-a-mole (three
+unload crash hazards found so far); this makes the resident path correct
+instead.
+
+**Changes:**
+
+- **`src/util/util_filesys.{h,cpp}`** - `RtxFileSys::refreshIfEnvChanged()`:
+  re-runs `init()` when the path env vars (DEFAULT_MODS_DIR,
+  DXVK_CAPTURE_PATH, DXVK_LOG_PATH) no longer carry the values the paths were
+  resolved from. The env fingerprint is captured by `init()` itself.
+- **`src/d3d9/d3d9_main.cpp`** - after the existing ONCE in `CreateD3D9`, call
+  `refreshIfEnvChanged` and, when it fired, re-run `Logger::initRtxLog()` so
+  the runtime log moves to the new game's folder. Sentry deliberately stays as
+  first-initialized.
+- **`src/dxvk/rtx_render/rtx_option_layer.{h,cpp}`** -
+  `systemLayersEnvChanged()` + `refreshSystemLayers()`: tears down every
+  system layer except Default Values (releasing a layer strips its values from
+  every option), resets the cached layer statics and the merged config, and
+  re-runs `initializeSystemLayers()` verbatim against the new environment. The
+  env fingerprint (DXVK_CONFIG_FILE, DXVK_RTX_CONFIG_FILE,
+  DXVK_USER_CONFIG_FILE) is captured at the end of layer initialization.
+- **`src/dxvk/rtx_render/rtx_options.h`** - `RtxOptions::Create()` on its
+  second and later calls (a new DxvkInstance in a resident process - this is
+  REMIX-4106's recreation path) checks the fingerprint and refreshes, then
+  re-resolves options the same way the constructor does:
+  `markOptionsWithCallbacksDirty` + `applyPendingValues(nullptr, force)` -
+  no device exists at that point in either case.
+
+**Why fingerprints and not a flag from the host:** equal env strings cannot
+name different files, so comparing the raw values is exact, needs no API
+addition, and makes the whole feature inert for every normal game - the
+environment never changes, so neither branch ever runs.
+
+---
+
+**Amendment (same day, dump-driven):** the refresh originally mirrored the
+constructor and force-fired every onChange callback with a null device; on the
+first real second-game launch `ImGUI::setupStyle` crashed walking the previous
+game's dead UI (callback guards check `GImGui == nullptr`, which holds in a
+fresh process but dangles in a torn-down one). `applyPendingValues` gained an
+`invokeCallbacks = true` parameter; the refresh promotes values with callbacks
+suppressed and re-marks callback options dirty, so `RtxInitializer`'s existing
+per-device forced apply fires them against the new, fully constructed device.
+
+---
