@@ -353,7 +353,8 @@ private:
       Rc<DxvkContext> ctx,
       const DrawCallState& input,
       const std::vector<AssetReplacement>* pReplacements,
-      ReplacementInstance* replacementInstance);
+      ReplacementInstance* replacementInstance,
+      bool isFirstSubmissionThisFrame = true);
 
   void trackObjectPickingMeta(const DrawCallState& drawCallState, ObjectPickingValue objectPickingValue);
 

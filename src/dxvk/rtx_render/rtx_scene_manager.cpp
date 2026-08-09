@@ -19,6 +19,7 @@
 * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 * DEALINGS IN THE SOFTWARE.
 */
+#include <cmath>
 #include <limits>
 #include <mutex>
 #include <vector>
@@ -60,6 +61,37 @@ namespace {
   XXH64_hash_t spatialMapHashForExternalDrawMesh(remixapi_MeshHandle mesh) {
     const uintptr_t meshId = reinterpret_cast<uintptr_t>(mesh);
     return XXH3_64bits(&meshId, sizeof(meshId));
+  }
+
+  // External clients commonly reconstruct object-to-world from an inverse camera
+  // matrix and the draw's model-view matrix. The two camera terms should cancel for
+  // static geometry, but float roundoff leaves a few ULPs of transform drift while
+  // the camera is moving. The draw tracker intentionally uses exact transforms, so
+  // classify only this numerical residue as unchanged before entering preserve.
+  //
+  // Compare against the last dynamically accepted transform (rather than the prior
+  // submitted transform) so genuine slow motion accumulates and eventually exceeds
+  // the threshold instead of being frozen forever.
+  bool externalTransformsNumericallyEquivalent(const dxvk::Matrix4& a, const dxvk::Matrix4& b) {
+    constexpr float kMaxRoundoffUlps = 16.f;
+    constexpr float kFloatEpsilon = std::numeric_limits<float>::epsilon();
+
+    for (uint32_t row = 0; row < 4; ++row) {
+      for (uint32_t column = 0; column < 4; ++column) {
+        const float av = a[row][column];
+        const float bv = b[row][column];
+        if (!std::isfinite(av) || !std::isfinite(bv)) {
+          return false;
+        }
+
+        const float scale = std::max(1.f, std::max(std::abs(av), std::abs(bv)));
+        if (std::abs(av - bv) > kMaxRoundoffUlps * kFloatEpsilon * scale) {
+          return false;
+        }
+      }
+    }
+
+    return true;
   }
 } // namespace
 
@@ -1270,7 +1302,8 @@ namespace dxvk {
       Rc<DxvkContext> ctx,
       const DrawCallState& input,
       const std::vector<AssetReplacement>* pReplacements,
-      ReplacementInstance* replacementInstance) {
+      ReplacementInstance* replacementInstance,
+      bool isFirstSubmissionThisFrame) {
     ScopedCpuProfileZone();
     // Refresh BlasEntry::input with this frame's draw state BEFORE dispatching preserveInstance.
     // refreshBillboardsForCurrentFrame -> createBeams / createBillboards consult
@@ -1300,7 +1333,9 @@ namespace dxvk {
       [&](RtInstance& instance) {
         instance.surface.isPreservePath = true;
         preserveInstance(instance, &input);
-        m_instanceManager.preserveInstance(instance, input, nullptr);
+        m_instanceManager.preserveInstance(
+            instance, input, nullptr, false, false,
+            isFirstSubmissionThisFrame, isFirstSubmissionThisFrame);
       },
       [&] {
         trackObjectPickingMeta(input, input.drawCallID);
@@ -2516,9 +2551,55 @@ namespace dxvk {
 
     const ReplacementInstance::LookupKey externalKey { identityHash, spatialMapHash, matHash, kEmptyHash, worldPos, xform };
     ReplacementInstance* replacementInstance = m_drawCallTracker.findOrCreateReplacementInstance(externalKey);
-    replacementInstance->dirtyFlags.clr(ReplacementInstance::kDynamicFeatureMask);
 
     std::vector<AssetReplacement>* pReplacements = fork_hooks::externalDrawMeshReplacement(*m_pReplacer, meshHash);
+
+    const uint32_t currentFrameId = m_device->getCurrentFrameId();
+    const bool secondSubmissionThisFrame = replacementInstance->frameLastSeen == currentFrameId;
+    const bool activeReplacementsMatch = replacementInstance->activeReplacements == pReplacements;
+
+    // Dolphin's recovered world transform is V^-1 * MV. Camera motion changes both
+    // inputs, and their cancellation can differ by a handful of float ULPs even for
+    // a static object. DrawCallTracker correctly reports that exact-bit difference
+    // as Transform dirty; suppress it only when it is the sole dirty reason and is
+    // within the numerical roundoff bound. Keep the cached transform so the identity
+    // remains anchored and real sub-threshold motion accumulates across frames.
+    ReplacementInstance::DirtyFlags nonTransformDirtyFlags = replacementInstance->dirtyFlags;
+    nonTransformDirtyFlags.clr(ReplacementInstance::DirtyFlag::Transform);
+    const bool negligibleExternalTransformDrift =
+        replacementInstance->dirtyFlags.test(ReplacementInstance::DirtyFlag::Transform) &&
+        nonTransformDirtyFlags.isClear() &&
+        externalTransformsNumericallyEquivalent(replacementInstance->objectToWorld, xform);
+    if (negligibleExternalTransformDrift) {
+      auto& transforms = state.drawCall.modifyTransformData();
+      transforms.objectToWorld = replacementInstance->objectToWorld;
+      transforms.objectToView = transforms.worldToView * transforms.objectToWorld;
+      replacementInstance->dirtyFlags.clr(ReplacementInstance::DirtyFlag::Transform);
+    }
+
+    // A duplicate API submission may stay on preserve only if this RI's first
+    // submission in the frame was also preserved. If the first submission was
+    // dynamic (real motion, replacement transition, etc.), keep later submissions
+    // dynamic so they cannot erase motion state or relabel the surface as preserved.
+    bool preservedEarlierThisFrame = false;
+    if (secondSubmissionThisFrame) {
+      preservedEarlierThisFrame = true;
+      bool foundInstance = false;
+      for (const PrimInstance& prim : replacementInstance->prims) {
+        const RtInstance* instance = prim.getInstance();
+        if (instance == nullptr) {
+          continue;
+        }
+        foundInstance = true;
+        if (!instance->surface.isPreservePath) {
+          preservedEarlierThisFrame = false;
+          break;
+        }
+      }
+      preservedEarlierThisFrame &= foundInstance;
+    }
+    const bool sameFrameSubmissionPreserveCompatible =
+        !secondSubmissionThisFrame || preservedEarlierThisFrame;
 
     // Port of the D3D9 path's activeReplacementsMatch guard (see submitDrawState above):
     // when the replacement set this RI was wired for is not the one the lookup returned
@@ -2535,7 +2616,7 @@ namespace dxvk {
     // buffer/material indices. Diagnosed in-game 2026-08-04 (BFBB step-ladder mod):
     // [RI-EVT] logs caught the one poisoned frame — 'prims 1' against a 5-prim
     // replacement — birthing 4 zombie instances with dangling owner pointers.
-    if (replacementInstance->activeReplacements != pReplacements) {
+    if (!activeReplacementsMatch) {
       replacementInstance->clear();
     }
 
@@ -2571,7 +2652,44 @@ namespace dxvk {
         replacementDrawCall.modifyMaterialData().setHashOverride(origMaterial->getHash());
         renderMaterialData = *origMaterial;
       }
-      drawReplacements(ctx, &replacementDrawCall, pReplacements, renderMaterialData, replacementInstance);
+
+      // External draws use the same ReplacementInstance tracking as D3D9, but used
+      // to unconditionally take the dynamic replacement path. Preserve the static
+      // replacement instance once the client draw, replacement set, and texture cache
+      // are unchanged. The fallback deliberately remains the complete dynamic path:
+      // it handles asset replacement transitions and recomputes dynamic feature flags.
+      const bool cachedTexturesValidForPreserve =
+          m_device->getCommon()->getTextureManager().getTextureCacheGeneration() ==
+          m_textureCacheGenerationValidForPreserve;
+      const XXH64_hash_t materialIdentityHash =
+          replacementDrawCall.getMaterialData().computeIdentityHash();
+      const bool materialIdentityHashMatch =
+          replacementInstance->legacyMaterialIdentityHash == materialIdentityHash;
+      const bool usePreservePath =
+          RtxOptions::enablePreservePath() &&
+          replacementInstance->dirtyFlags.isClear() &&
+          !RtxOptionManager::isDrawcallTranslationInvalid() &&
+          sameFrameSubmissionPreserveCompatible &&
+          !state.optionalParticleDesc.has_value() &&
+          !replacementDrawCall.getCategoryFlags().test(InstanceCategories::ParticleEmitter) &&
+          !RtxOptions::shouldConvertToLight(replacementDrawCall.getMaterialData().getHash()) &&
+          activeReplacementsMatch &&
+          materialIdentityHashMatch &&
+          cachedTexturesValidForPreserve;
+
+      if (usePreservePath) {
+        preserveReplacementInstance(
+            ctx, replacementDrawCall, pReplacements, replacementInstance,
+            !secondSubmissionThisFrame);
+      } else {
+        // Dynamic feature bits must survive until after the preserve decision. In
+        // particular, a particle-system replacement must never become eligible
+        // merely because a previous draw cleared its flag before this check.
+        replacementInstance->dirtyFlags.clr(ReplacementInstance::kDynamicFeatureMask);
+        drawReplacements(ctx, &replacementDrawCall, pReplacements, renderMaterialData,
+                         replacementInstance);
+        replacementInstance->legacyMaterialIdentityHash = materialIdentityHash;
+      }
 
       // Stamp the persistence clock, mirroring this function's tail. Without it the RI is
       // stale-on-arrival (frameLastSeen == 0) and garbageCollectReplacementInstances destroys
@@ -2586,7 +2704,11 @@ namespace dxvk {
       // the "anchor mesh loses its textures" regression). Guard WITHOUT the stamp renders
       // nothing (churn is collected pre-TLAS, and no zombies survive to fake it). The pair
       // is load-bearing: keep them together.
-      replacementInstance->frameLastSeen = m_device->getCurrentFrameId();
+      replacementInstance->frameLastSeen = currentFrameId;
+      replacementInstance->categoryFlags = replacementDrawCall.getCategoryFlags().raw();
+      replacementInstance->isSkinned = replacementDrawCall.getSkinningState().numBones > 0;
+      replacementInstance->textureTransform = replacementDrawCall.getTransformData().textureTransform;
+      replacementInstance->texgenMode = replacementDrawCall.getTransformData().texgenMode;
 
       // Diagnostic: one line per replaced external submission — which RI the lookup
       // resolved to and which RtInstance sits in prims[0] after drawReplacements.
@@ -2604,12 +2726,69 @@ namespace dxvk {
       return;
     }
 
-    AxisAlignedBoundingBox geometryBBox;
-
-    // One DrawCallState is reused for every submesh, so snapshot the state the
-    // client actually submitted; the per-submesh category hook resets to it.
+    // Original external meshes are usually submitted with one surface. Prepare that
+    // surface's full state before the preserve decision so external material
+    // replacement and texture-derived categories match the dynamic path exactly.
+    // Multi-surface meshes stay dynamic: each surface can have distinct material and
+    // category state, while preserveReplacementInstance accepts one input state.
     const CategoryFlags baseCategories = state.drawCall.getCategoryFlags();
     const CameraType::Enum baseCameraType = state.drawCall.cameraType;
+    if (submeshes.size() == 1) {
+      state.drawCall.overrideGeometryData(&submeshes[0]);
+      state.drawCall.overrideCullMode(state.doubleSided ? VK_CULL_MODE_NONE : VK_CULL_MODE_BACK_BIT);
+
+      if (state.drawCall.getSkinningState().numBones > 0) {
+        state.drawCall.modifySkinningData().numBonesPerVertex = submeshes[0].numBonesPerVertex;
+      }
+
+      XXH64_hash_t textureHash = 0;
+      const MaterialData* material = m_pReplacer->accessExternalMaterial(submeshes[0].externalMaterial);
+      if (material != nullptr) {
+        fork_hooks::externalDrawMaterialReplacement(*m_pReplacer, material);
+        state.drawCall.modifyMaterialData().setHashOverride(material->getHash());
+      }
+      fork_hooks::externalDrawTextureCategories(
+          material, state.drawCall, meshHash, baseCategories, baseCameraType, textureHash);
+      fork_hooks::externalDrawObjectPicking(*m_device, state.drawCall, textureHash, *this);
+
+      const bool cachedTexturesValidForPreserve =
+          m_device->getCommon()->getTextureManager().getTextureCacheGeneration() ==
+          m_textureCacheGenerationValidForPreserve;
+      const XXH64_hash_t materialIdentityHash =
+          state.drawCall.getMaterialData().computeIdentityHash();
+      const bool usePreservePath =
+          RtxOptions::enablePreservePath() &&
+          replacementInstance->dirtyFlags.isClear() &&
+          !RtxOptionManager::isDrawcallTranslationInvalid() &&
+          sameFrameSubmissionPreserveCompatible &&
+          !state.optionalParticleDesc.has_value() &&
+          !state.drawCall.getCategoryFlags().test(InstanceCategories::ParticleEmitter) &&
+          !RtxOptions::shouldConvertToLight(state.drawCall.getMaterialData().getHash()) &&
+          activeReplacementsMatch &&
+          replacementInstance->legacyMaterialIdentityHash == materialIdentityHash &&
+          cachedTexturesValidForPreserve;
+
+      if (usePreservePath) {
+        preserveReplacementInstance(
+            ctx, state.drawCall, nullptr, replacementInstance,
+            !secondSubmissionThisFrame);
+        replacementInstance->frameLastSeen = currentFrameId;
+        replacementInstance->categoryFlags = state.drawCall.getCategoryFlags().raw();
+        replacementInstance->isSkinned = state.drawCall.getSkinningState().numBones > 0;
+        replacementInstance->textureTransform = state.drawCall.getTransformData().textureTransform;
+        replacementInstance->texgenMode = state.drawCall.getTransformData().texgenMode;
+        return;
+      }
+    }
+
+    // Dynamic feature bits are cleared only after the preserve decision so a
+    // particle-system draw cannot become eligible for preservation early.
+    replacementInstance->dirtyFlags.clr(ReplacementInstance::kDynamicFeatureMask);
+
+    AxisAlignedBoundingBox geometryBBox;
+
+    // One DrawCallState is reused for every submesh, so reset category state to
+    // what the client submitted before applying each surface's texture tags.
 
     for (size_t i = 0; i < submeshes.size(); i++) {
       state.drawCall.overrideGeometryData(&submeshes[i]);
@@ -2674,7 +2853,9 @@ namespace dxvk {
       geometryBBox.unionWith(submeshes[i].boundingBox);
     }
 
-    replacementInstance->frameLastSeen = m_device->getCurrentFrameId();
+    replacementInstance->frameLastSeen = currentFrameId;
+    replacementInstance->legacyMaterialIdentityHash =
+        state.drawCall.getMaterialData().computeIdentityHash();
 
     if (geometryBBox.isValid()) {
       replacementInstance->geometryBoundingBox = geometryBBox;
