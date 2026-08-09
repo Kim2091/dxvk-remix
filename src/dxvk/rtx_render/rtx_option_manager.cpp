@@ -151,7 +151,10 @@ namespace dxvk {
     return false;
   }
 
-  void RtxOptionManager::applyPendingValues(DxvkDevice* device, bool forceOnChange) {
+  // NV-DXVK start: re-resolve per-game config in a resident runtime - invokeCallbacks param
+  void RtxOptionManager::applyPendingValues(DxvkDevice* device, bool forceOnChange,
+                                            bool invokeCallbacks) {
+  // NV-DXVK end
     // First, process all pending layer changes (blend strength requests, enable/disable)
     {
       std::unique_lock<std::mutex> lock(RtxOptionImpl::getUpdateMutex());
@@ -192,7 +195,13 @@ namespace dxvk {
         if ((rtxOption->getFlags() & RtxOptionFlags::InvalidatesDrawcallTranslation) != 0) {
           s_drawcallTranslationInvalid = true;
         }
-        rtxOption->invokeOnChangeCallback(device);
+        // NV-DXVK start: re-resolve per-game config in a resident runtime
+        // Values above are promoted either way; only the callback is withheld.
+        // The drawcall-translation flag stays - the values DID change.
+        if (invokeCallbacks) {
+          rtxOption->invokeOnChangeCallback(device);
+        }
+        // NV-DXVK end
       }
 
       numResolves++;

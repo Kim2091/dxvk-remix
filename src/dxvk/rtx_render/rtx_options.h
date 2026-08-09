@@ -2509,8 +2509,34 @@ namespace dxvk {
     static void Create() {
       if (s_instance == nullptr) {
         s_instance = new RtxOptions();
+        return;
       }
-      // If called a second time, nothing to do - singleton already exists with all options initialized.
+      // NV-DXVK start: re-resolve per-game config in a resident runtime
+      // Called again means a new DxvkInstance in a process whose runtime stayed
+      // loaded - an emulator starting its next game. If the host pointed the
+      // config env vars at a different per-game folder since the layers were
+      // built, rebuild them, or this game reads AND SAVES INTO the previous
+      // game's files.
+      //
+      // The re-resolve deliberately DIFFERS from the constructor's: values are
+      // promoted with callbacks SUPPRESSED, then every callback option is
+      // re-marked dirty so RtxInitializer's per-device forced apply (which
+      // runs later in this same device bring-up, rtx_initializer.cpp) fires
+      // them against the new, fully constructed device. The constructor may
+      // fire callbacks deviceless because a fresh process's statics are
+      // pristine and the callbacks' guards (GImGui == nullptr) hold; between
+      // games those statics are torn-down-but-dangling, the guards pass, and
+      // a deviceless callback walks dead memory - ImGUI::setupStyle did,
+      // dump-proven. When the environment is unchanged - every normal game,
+      // and any repeat instance of the same game - none of this runs.
+      if (RtxOptionLayer::systemLayersEnvChanged()) {
+        RtxOptionLayer::refreshSystemLayers();
+        RtxOptionManager::applyPendingValues(nullptr, /* forceOnChange */ true,
+                                             /* invokeCallbacks */ false);
+        RtxOptionManager::markOptionsWithCallbacksDirty();
+        RtxOptionManager::logEffectiveValues();
+      }
+      // NV-DXVK end
     }
 
     // Returns the merged configuration for DXKV Options. This includes all config files loaded from DXVK_CONFIG_FILE and DXVK_RTX_CONFIG_FILE.

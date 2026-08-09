@@ -276,6 +276,27 @@ namespace dxvk {
     // Must be called once during startup before any RtxOptions are accessed.
     // Returns the merged config from all config-file-based layers.
     static const Config& initializeSystemLayers();
+
+    // NV-DXVK start: re-resolve per-game config in a resident runtime
+    // True when the config-file environment variables (DXVK_CONFIG_FILE,
+    // DXVK_RTX_CONFIG_FILE, DXVK_USER_CONFIG_FILE) no longer name the files the
+    // system layers were built from. A host that runs several games from one
+    // process - an emulator - points these at a different per-game folder for
+    // each game, but the layers are built once; without this check the second
+    // game reads AND SAVES INTO the first game's files. For a normal game the
+    // environment never changes, so this stays false and nothing new runs.
+    static bool systemLayersEnvChanged();
+
+    // Tear down every system layer except Default Values (code defaults do not
+    // move between games) and rebuild the stack from the current environment
+    // via initializeSystemLayers(). The programmatic layers (derived, quality,
+    // environment) are rebuilt too: they hold values derived from the previous
+    // game's config, which are exactly what must not leak into the next one.
+    // Caller is responsible for re-resolving options afterwards
+    // (markOptionsWithCallbacksDirty + applyPendingValues), as RtxOptions'
+    // constructor does after the first initializeSystemLayers().
+    static const Config& refreshSystemLayers();
+    // NV-DXVK end
     
     // Get the merged configuration from config.cpp, all dxvk.conf, and all rtx.conf.
     // This includes config.cpp, dxvk.conf, rtx.conf, and baseGameMod rtx.conf.
@@ -314,6 +335,13 @@ namespace dxvk {
 
     // Merged config from all config-file-based layers
     inline static Config s_mergedConfig;
+
+    // NV-DXVK start: re-resolve per-game config in a resident runtime
+    // The config env-var values the system layers were built from, captured at
+    // the end of initializeSystemLayers(). Compared, never parsed.
+    static std::string computeSystemLayerEnvFingerprint();
+    inline static std::string s_systemLayerEnvFingerprint;
+    // NV-DXVK end
 
     // Reference counting - only accessible by RtxOptionManager
     // Thread-safe read of the reference count.

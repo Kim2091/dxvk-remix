@@ -45,13 +45,30 @@ namespace dxvk {
       }
       Logger::initRtxLog();
       util::RtxFileSys::print();
-      
+
       // Initialize Sentry crash reporting (safe to call outside DllMain)
       const auto remixVersion = std::string("dxvk-remix@") + DXVK_VERSION;
       sentry::initialize(remixVersion.c_str());
       // Prompt for crash report upload as early as possible (before any code that might crash on launch)
       sentry::showCrashReportDialogIfNeeded();
     );
+
+    // A resident runtime serving its next game: a host that runs several games
+    // from one process (an emulator) has pointed the per-game path env vars at
+    // a new folder, but the ONCE above ran for the first game. Re-resolve the
+    // paths and re-open the runtime log in the new game's folder; the config
+    // layers are rebuilt by the matching check in RtxOptions::Create(), which
+    // runs later inside this same call. For a normal game the environment
+    // never changes and this is three getenv calls and a string compare.
+    // Sentry deliberately stays as initialized - re-initializing the crash
+    // backend mid-process is a risk with no payoff here.
+    if (util::RtxFileSys::isInitialized()) {
+      const auto exeDir = std::filesystem::path(env::getExePath()).parent_path();
+      if (util::RtxFileSys::refreshIfEnvChanged(exeDir.string())) {
+        Logger::initRtxLog();
+        util::RtxFileSys::print();
+      }
+    }
 // NV-DXVK end
 
 // NV-DXVK start: external API / provide error code on exception

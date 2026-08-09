@@ -69,9 +69,24 @@ private:
   static fspath s_rootPath;
   using PathArray = std::array<fspath, kNumIds>;
   static PathArray s_paths;
+  // NV-DXVK start: re-resolve per-game paths in a resident runtime
+  // The env values the paths were resolved from, captured by init().
+  static std::string s_envFingerprint;
+  static std::string computeEnvFingerprint();
+  // NV-DXVK end
 
 public:
   static void init(const std::string rootPath);
+  // NV-DXVK start: re-resolve per-game paths in a resident runtime
+  // Re-runs init when the path env vars (DEFAULT_MODS_DIR, DXVK_CAPTURE_PATH,
+  // DXVK_LOG_PATH) no longer carry the values the paths were resolved from.
+  // A host that runs several games from one process points these at a
+  // different per-game folder for each game; init's run-once guard otherwise
+  // pins every game to the first game's folders. Returns true when the paths
+  // were re-resolved (callers then re-open anything derived from them, e.g.
+  // the log file). Not-yet-initialized simply initializes and returns true.
+  static bool refreshIfEnvChanged(const std::string& rootPath);
+  // NV-DXVK end
   static bool isInitialized() {
     return s_bInit;
   }
