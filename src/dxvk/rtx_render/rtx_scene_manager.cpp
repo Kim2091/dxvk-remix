@@ -2674,6 +2674,7 @@ namespace dxvk {
           !replacementDrawCall.getCategoryFlags().test(InstanceCategories::ParticleEmitter) &&
           !RtxOptions::shouldConvertToLight(replacementDrawCall.getMaterialData().getHash()) &&
           activeReplacementsMatch &&
+          replacementInstance->categoryFlags == replacementDrawCall.getCategoryFlags().raw() &&
           materialIdentityHashMatch &&
           cachedTexturesValidForPreserve;
 
@@ -2765,6 +2766,7 @@ namespace dxvk {
           !state.drawCall.getCategoryFlags().test(InstanceCategories::ParticleEmitter) &&
           !RtxOptions::shouldConvertToLight(state.drawCall.getMaterialData().getHash()) &&
           activeReplacementsMatch &&
+          replacementInstance->categoryFlags == state.drawCall.getCategoryFlags().raw() &&
           replacementInstance->legacyMaterialIdentityHash == materialIdentityHash &&
           cachedTexturesValidForPreserve;
 

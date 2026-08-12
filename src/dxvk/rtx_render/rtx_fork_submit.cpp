@@ -232,6 +232,18 @@ namespace {
       drawCall.setCategory(InstanceCategories::Sky, true);
     }
 
+    // Ignore must win over Sky. The dev menu stores categories in independent
+    // hash sets, so a texture can legitimately remain in skyBoxTextures after
+    // it is retagged Ignore. Promoting that draw to the sky camera first lets
+    // the raster-sky path render it when skyMode is not Numos, bypassing the
+    // Hidden bit below. Treat Ignore as an explicit request to remove the draw
+    // from every sky path before deciding its camera type.
+    const bool ignored = drawCall.testCategoryFlags(InstanceCategories::Ignore);
+    if (ignored) {
+      drawCall.removeCategory(InstanceCategories::Sky);
+      drawCall.cameraType = CameraType::Main;
+    }
+
     // Sky, routed. The category alone does nothing on this path: the only code
     // that turns sky into "does not occlude" tests drawCall.cameraType
     // (rtx_instance_manager.cpp:1024), and for API draws cameraType was frozen
@@ -256,7 +268,7 @@ namespace {
     // Dropping the submesh outright the way D3D9 does is the wrong shape here:
     // replacementInstance->prims[i] would keep pointing at an RtInstance that
     // stops being updated, and we would be leaning on instance GC to reap it.
-    if (drawCall.testCategoryFlags(InstanceCategories::Ignore)) {
+    if (ignored) {
       drawCall.setCategory(InstanceCategories::Hidden, true);
     }
 
