@@ -1094,7 +1094,7 @@ namespace dxvk {
                     "The hotkey that triggers a GPU crash when the crash hotkey feature is armed.\n"
                     "Default is Ctrl+Shift+Alt+G.");
 
-    RTX_OPTION_ARGS("rtx", bool, enablePreservePath, true,
+    RTX_OPTION_ARGS("rtx", bool, enablePreservePath, false,
                 "When true, Remix attempts to identify draw calls whose state has not changed since last frame and re-use the previous\n"
                 "frame's translation, rather than retranslating the draw call into raytrace-ready scene data.\n"
                 "When false, every submit uses full dynamic geometry and instance processing (drawReplacements / processDrawCallState).\n"
