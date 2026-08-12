@@ -55,6 +55,7 @@
 
 #include "rtx_option_layer.h"
 #include "../../util/util_hash_set_layer.h"
+#include "../../util/util_sentry.h"
 #include "../../util/xxHash/xxhash.h"
 
 #include "rtx_fork_hooks.h"
@@ -2364,6 +2365,24 @@ namespace {
       }
       s_dxvkD3D9 = nullptr;
     }
+
+    // NV-DXVK start: leave nothing of ours registered with the OS.
+    // A host that shuts us down without exiting - anything that runs more than
+    // one title per process - is expected to FreeLibrary afterwards, and it is
+    // what re-runs our one-time init so the next title resolves its own paths.
+    // That unload is only safe if nothing outside this module still points into
+    // it. Sentry's crash backend installs a process-wide exception handler at
+    // startup, and a handler left registered against unmapped code turns the
+    // next exception of ANY kind into an unbounded fault loop - proven by a
+    // crash dump whose stack was RtlpCallVectoredHandlers into an unloaded
+    // d3d9-remix.dll, repeated until the stack ran out. sentry_close() is what
+    // takes it back down.
+    //
+    // Deliberately last: teardown above is exactly where a crash is worth
+    // reporting, so the reporter outlives it.
+    dxvk::sentry::shutdown();
+    // NV-DXVK end
+
     return REMIXAPI_ERROR_CODE_SUCCESS;
   }
 
