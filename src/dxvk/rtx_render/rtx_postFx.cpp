@@ -25,8 +25,10 @@
 #include "dxvk_scoped_annotation.h"
 #include "rtx_render/rtx_shader_manager.h"
 #include "rtx/pass/post_fx/post_fx.h"
+#include "rtx/pass/ntsc/ntsc_vhs.h"
 
 #include <rtx_shaders/post_fx.h>
+#include <rtx_shaders/ntsc_vhs.h>
 #include <rtx_shaders/post_fx_highlight.h>
 #include <rtx_shaders/post_fx_motion_blur.h>
 #include <rtx_shaders/post_fx_motion_blur_prefilter.h>
@@ -53,6 +55,20 @@ namespace dxvk {
     };
 
     PREWARM_SHADER_PIPELINE(PostFxShader);
+
+    class NtscVhsShader : public ManagedShader
+    {
+      SHADER_SOURCE(NtscVhsShader, VK_SHADER_STAGE_COMPUTE_BIT, ntsc_vhs)
+
+      PUSH_CONSTANTS(NtscVhsArgs)
+
+      BEGIN_PARAMETER()
+        SAMPLER2D(NTSC_VHS_INPUT)
+        RW_TEXTURE2D(NTSC_VHS_OUTPUT)
+      END_PARAMETER()
+    };
+
+    PREWARM_SHADER_PIPELINE(NtscVhsShader);
 
     class PostFxMotionBlurShader : public ManagedShader
     {
@@ -361,6 +377,79 @@ namespace dxvk {
     // The lens-effect shader uses a Sampler2D input and an RWTexture2D output. To keep the
     // input/output decoupled (and avoid sampling-while-writing hazards) we write into the
     // intermediate texture and copy it back into the final output.
+    ctx->copyImage(
+      inOutColorTexture.image,
+      { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+      { 0, 0, 0 },
+      rtOutput.m_postFxIntermediateTexture.image,
+      { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+      { 0, 0, 0 },
+      inputSize);
+  }
+
+  void DxvkPostFx::dispatchNtsc(
+    Rc<RtxContext> ctx,
+    Rc<DxvkSampler> linearSampler,
+    const uvec2& mainCameraResolution,
+    const uint32_t frameIdx,
+    const Resources::RaytracingOutput& rtOutput)
+  {
+    (void)mainCameraResolution;
+    if (!ntscEnable()) {
+      return;
+    }
+
+    ScopedGpuProfileZone(ctx, "NTSC VHS");
+    ctx->setFramePassStage(RtxFramePassStage::PostFX);
+
+    const Resources::Resource& inOutColorTexture = rtOutput.m_finalOutput.resource(Resources::AccessType::ReadWrite);
+    const VkExtent3D& inputSize = inOutColorTexture.image->info().extent;
+    const VkExtent3D workgroups = util::computeBlockCount(inputSize, VkExtent3D { NTSC_VHS_TILE_SIZE, NTSC_VHS_TILE_SIZE, 1 });
+
+    NtscVhsArgs args = {};
+    args.imageSize         = { (uint)inputSize.width, (uint)inputSize.height };
+    args.invImageSize      = { 1.0f / (float)inputSize.width, 1.0f / (float)inputSize.height };
+    args.time              = (float)(GlobalTime::get().absoluteTimeMs()) / 1000.0f;
+    args.lumaBW            = ntscLumaBW();
+    args.colorBW           = ntscColorBW();
+    args.ringing            = ntscRinging();
+    args.lumaNoise          = ntscLumaNoise();
+    args.dropoutRate        = ntscTapeDropoutRate();
+    args.dropoutLengthUs    = ntscTapeDropoutLength();
+    args.headSmear          = ntscHeadSmear();
+    args.tapeTrail          = ntscTapeTrail();
+    args.frameIdx            = frameIdx;
+
+    ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
+
+    // Pass 0: NTSC encode/decode approximation plus VHS bandwidth and ringing.
+    args.pass = 0;
+    ctx->pushConstants(0, sizeof(args), &args);
+    ctx->bindResourceView(NTSC_VHS_INPUT, rtOutput.m_finalOutput.view(Resources::AccessType::Read), nullptr);
+    ctx->bindResourceSampler(NTSC_VHS_INPUT, linearSampler);
+    ctx->bindResourceView(NTSC_VHS_OUTPUT, rtOutput.m_postFxIntermediateTexture.view, nullptr);
+    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, NtscVhsShader::getShader());
+    ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
+
+    // Pass 1: Rust order: head smear, luma noise, then tape dropout.
+    args.pass = 1;
+    ctx->pushConstants(0, sizeof(args), &args);
+    ctx->bindResourceView(NTSC_VHS_INPUT, rtOutput.m_postFxIntermediateTexture.view, nullptr);
+    ctx->bindResourceSampler(NTSC_VHS_INPUT, linearSampler);
+    ctx->bindResourceView(NTSC_VHS_OUTPUT, rtOutput.m_finalOutput.view(Resources::AccessType::Write), nullptr);
+    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, NtscVhsShader::getShader());
+    ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
+
+    // Pass 2: tape trail is the final tape-path operation and is luma-only.
+    args.pass = 2;
+    ctx->pushConstants(0, sizeof(args), &args);
+    ctx->bindResourceView(NTSC_VHS_INPUT, rtOutput.m_finalOutput.view(Resources::AccessType::Read), nullptr);
+    ctx->bindResourceSampler(NTSC_VHS_INPUT, linearSampler);
+    ctx->bindResourceView(NTSC_VHS_OUTPUT, rtOutput.m_postFxIntermediateTexture.view, nullptr);
+    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, NtscVhsShader::getShader());
+    ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
+
+    // Hand the final trail pass back to m_finalOutput for downstream passes.
     ctx->copyImage(
       inOutColorTexture.image,
       { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },

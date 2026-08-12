@@ -1901,6 +1901,14 @@ namespace dxvk {
     ScopedCpuProfileZone();
     DxvkPostFx& postFx = m_common->metaPostFx();
     const RtCamera& mainCamera = getSceneManager().getCamera();
+
+    // NTSC/VHS composite runs on its own toggle, independent of the other post-fx.
+    postFx.dispatchNtsc(this,
+      getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE),
+      mainCamera.getShaderConstants().resolution,
+      RtxOptions::rngSeedWithFrameIndex() ? m_device->getCurrentFrameId() : 0,
+      rtOutput);
+
     if (!postFx.enable()) {
       return;
     }

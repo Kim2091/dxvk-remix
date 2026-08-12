@@ -61,6 +61,14 @@ namespace dxvk {
       const uint32_t frameIdx,
       const Resources::RaytracingOutput& rtOutput);
 
+    // NTSC/VHS composite. Post-tonemap, in-place on m_finalOutput.
+    void dispatchNtsc(
+      Rc<RtxContext> ctx,
+      Rc<DxvkSampler> linearSampler,
+      const uvec2& mainCameraResolution,
+      const uint32_t frameIdx,
+      const Resources::RaytracingOutput& rtOutput);
+
     void dispatchHighlighting(
       Rc<RtxContext> ctx,
       const Resources::RaytracingOutput& rtOutput,
@@ -86,6 +94,20 @@ namespace dxvk {
     RTX_OPTION_ARGS("rtx.postfx", bool, enableVignette, true, "Enables vignette post-processing effect.",
                     args.flags = RtxOptionFlags::UserSetting);
     RTX_OPTION("rtx.postfx", bool, desaturateOthersOnHighlight, true, "If true, desaturare all objects that are not highlighted.");
+
+    // --- NTSC/VHS composite look (Kim2091/ntsc-simulator aligned) ---
+    RTX_OPTION_ARGS("rtx.ntsc", bool, ntscEnable, false,
+                    "Enable the NTSC/VHS composite look.",
+                    args.environment = "RTX_NTSC_ENABLE",
+                    args.flags = RtxOptionFlags::UserSetting);
+    RTX_OPTION("rtx.ntsc", float, ntscLumaBW,             3.00f,  "VHS luma bandwidth in MHz (SP~3.0, EP~1.6).");
+    RTX_OPTION("rtx.ntsc", float, ntscColorBW,          425.00f,  "VHS color-under bandwidth in kHz.");
+    RTX_OPTION("rtx.ntsc", float, ntscRinging,            0.30f,  "VHS playback edge-ringing gain.");
+    RTX_OPTION("rtx.ntsc", float, ntscLumaNoise,          0.025f, "Luminance-dependent VHS tape noise amplitude.");
+    RTX_OPTION("rtx.ntsc", float, ntscTapeDropoutRate,   0.50f,  "Average VHS tape dropouts per 480-line frame.");
+    RTX_OPTION("rtx.ntsc", float, ntscTapeDropoutLength, 15.0f,  "Average VHS dropout length in microseconds.");
+    RTX_OPTION("rtx.ntsc", float, ntscHeadSmear,          0.175f, "Worn-head symmetric luma smear strength.");
+    RTX_OPTION("rtx.ntsc", float, ntscTapeTrail,          0.675f, "Causal rightward luma trail strength, 0..1.");
 
   private:
     Rc<vk::DeviceFn> m_vkd;
