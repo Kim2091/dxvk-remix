@@ -422,7 +422,7 @@ namespace dxvk {
 
     ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
 
-    // Pass 0: NTSC encode/decode approximation plus VHS bandwidth and ringing.
+    // Pass 0: direct sRGB/YIQ VHS bandwidth and luma-only ringing.
     args.pass = 0;
     ctx->pushConstants(0, sizeof(args), &args);
     ctx->bindResourceView(NTSC_VHS_INPUT, rtOutput.m_finalOutput.view(Resources::AccessType::Read), nullptr);
@@ -431,7 +431,7 @@ namespace dxvk {
     ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, NtscVhsShader::getShader());
     ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
 
-    // Pass 1: Rust order: head smear, luma noise, then tape dropout.
+    // Pass 1: Rust order: head smear, then band-limited luma noise.
     args.pass = 1;
     ctx->pushConstants(0, sizeof(args), &args);
     ctx->bindResourceView(NTSC_VHS_INPUT, rtOutput.m_postFxIntermediateTexture.view, nullptr);
@@ -440,7 +440,8 @@ namespace dxvk {
     ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, NtscVhsShader::getShader());
     ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
 
-    // Pass 2: tape trail is the final tape-path operation and is luma-only.
+    // Pass 2: dropout follows the completed smear/noise result so the
+    // previous-line compensator copies the same signal Rust would see.
     args.pass = 2;
     ctx->pushConstants(0, sizeof(args), &args);
     ctx->bindResourceView(NTSC_VHS_INPUT, rtOutput.m_finalOutput.view(Resources::AccessType::Read), nullptr);
@@ -449,15 +450,15 @@ namespace dxvk {
     ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, NtscVhsShader::getShader());
     ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
 
-    // Hand the final trail pass back to m_finalOutput for downstream passes.
-    ctx->copyImage(
-      inOutColorTexture.image,
-      { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-      { 0, 0, 0 },
-      rtOutput.m_postFxIntermediateTexture.image,
-      { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-      { 0, 0, 0 },
-      inputSize);
+    // Pass 3: tape trail is the final tape-path operation and is luma-only.
+    // The shader converts display-space RGB back to linear output here.
+    args.pass = 3;
+    ctx->pushConstants(0, sizeof(args), &args);
+    ctx->bindResourceView(NTSC_VHS_INPUT, rtOutput.m_postFxIntermediateTexture.view, nullptr);
+    ctx->bindResourceSampler(NTSC_VHS_INPUT, linearSampler);
+    ctx->bindResourceView(NTSC_VHS_OUTPUT, rtOutput.m_finalOutput.view(Resources::AccessType::Write), nullptr);
+    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, NtscVhsShader::getShader());
+    ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
   }
 
   namespace {

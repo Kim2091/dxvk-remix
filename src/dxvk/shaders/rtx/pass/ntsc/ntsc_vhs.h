@@ -4,8 +4,8 @@
  */
 #pragma once
 
-#define NTSC_VHS_INPUT   0   // Sampler2D  : composited LDR color (read)
-#define NTSC_VHS_OUTPUT  1   // RWTexture2D: processed output (write)
+#define NTSC_VHS_INPUT   0   // Sampler2D  : post-tonemap linear/sRGB color (read)
+#define NTSC_VHS_OUTPUT  1   // RWTexture2D: processed color (write)
 
 #define NTSC_VHS_TILE_SIZE 8
 
@@ -25,6 +25,6 @@ struct NtscVhsArgs {
 
   float  tapeTrail;         // causal luma IIR strength, 0..1
   uint   frameIdx;           // fallback/deterministic animation seed
-  uint   pass;               // 0 = NTSC, 1 = tape stages, 2 = tape trail
+  uint   pass;               // 0 = VHS path, 1 = smear/noise, 2 = dropout, 3 = trail/output
   float  _pad1;
 };

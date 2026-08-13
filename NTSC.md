@@ -7,12 +7,19 @@ It runs after tonemapping on the final LDR image.
 The stages are deliberately ordered like SignalEffects::apply in the Rust
 implementation:
 
-1. NTSC encode/decode approximation with VHS luma and color-under bandwidth.
+1. Direct sRGB/YIQ VHS luma and color-under bandwidth. The render target is
+   not a 4x-subcarrier composite waveform, so synthesizing one at 640 pixels
+   creates exaggerated rainbow/dot-crawl artifacts; the direct YIQ path is the
+   equivalent decoded-image operation.
 2. Playback edge ringing.
 3. Luma-only worn-head smear.
 4. Luminance-dependent tape noise.
 5. Sparse tape dropouts with a previous-line compensator.
 6. Causal luma-only tape trail as the final stage.
+
+The implementation uses four GPU passes so dropout compensation reads the
+already smeared/noisy previous line. The tape path runs in sRGB/YIQ space and
+the final trail pass converts back to the linear post-tonemap render target.
 
 Enable it with:
 
