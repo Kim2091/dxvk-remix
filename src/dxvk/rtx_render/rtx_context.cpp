@@ -1925,7 +1925,9 @@ namespace dxvk {
       mainCamera.getShaderConstants().resolution,
       RtxOptions::rngSeedWithFrameIndex() ? m_device->getCurrentFrameId() : 0,
       primaryDirectNrdArgs.missLinearViewZ,
-      rtOutput);
+      rtOutput,
+      GlobalTime::get().deltaTimeMs(),
+      mainCamera.isViewHistoryInvalidated(m_device->getCurrentFrameId()));
   }
 
   void RtxContext::dispatchPostFxLensEffects(Resources::RaytracingOutput& rtOutput) {

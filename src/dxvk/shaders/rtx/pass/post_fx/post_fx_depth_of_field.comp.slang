@@ -33,39 +33,53 @@ RWTexture2D<float4> OutColorTexture;
 [[vk::binding(POST_FX_DOF_LINEAR_SAMPLER)]]
 SamplerState LinearSampler;
 
+[[vk::binding(POST_FX_DOF_FOCUS_STATE_INPUT)]]
+RWTexture1D<float> FocusState;
+
 layout(push_constant)
 ConstantBuffer<PostFxDepthOfFieldArgs> cb;
 
-float calculateCircleOfConfusion(const float viewDepth)
+// Projects a blur disc size in millimeters onto the output image and
+// normalizes it to the maximum blur radius.
+float lensCoCToNormalized(const float cocMm)
 {
-  const float signedDistance = viewDepth - cb.focusDistance;
-
-  if (signedDistance < -cb.focusRange)
-  {
-    return -saturate((-signedDistance - cb.focusRange) / max(cb.nearTransition, 1e-4f));
-  }
-
-  if (signedDistance > cb.focusRange)
-  {
-    return saturate((signedDistance - cb.focusRange) / max(cb.farTransition, 1e-4f));
-  }
-
-  return 0.0f;
+  const float maxRadiusPixels = max(cb.maxBlurRadius * cb.resolutionScale, 1e-4f);
+  return min(cocMm * cb.sensorToPixels, maxRadiusPixels) / maxRadiusPixels;
 }
 
-float getDepthOfFieldCoC(const float2 uv)
+float calculateCircleOfConfusion(const float viewDepth, const float focusDistance)
+{
+  // Thin-lens blur disc size based on [Lee2008], as popularized by
+  // CinematicDOF (Frans Bouma):
+  //   CoC[mm] = ((f^2 / N) / (Zf - f)) * |Z - Zf| / Z
+  // with focal length f and aperture f-number N as artistic lens parameters.
+  // The hyperbolic 1/Z falloff grows continuously from the focus plane and
+  // asymptotes in the far field, so there are no focus-band edges at all.
+  // cb.apertureTerm precomputes f^2 / N, cb.sensorToPixels projects the CoC
+  // through the 24 mm full-frame sensor height into pixels.
+  const float focusDistanceMm = max(focusDistance * cb.worldUnitToMm, 1e-3f);
+  const float viewDepthMm = max(viewDepth * cb.worldUnitToMm, 1e-3f);
+  const float cocMm = cb.apertureTerm / max(focusDistanceMm - cb.focalLength, 1.0f)
+    * abs(viewDepthMm - focusDistanceMm) / viewDepthMm;
+  const float normalizedCoC = lensCoCToNormalized(cocMm);
+  return viewDepth < focusDistance ? -normalizedCoC : normalizedCoC;
+}
+
+float getDepthOfFieldCoC(const float2 uv, const float focusDistance)
 {
   const float rawViewDepth = PrimaryLinearViewZ.SampleLevel(LinearSampler, uv, 0.0f);
   const float viewDepth = abs(rawViewDepth);
 
-  // The denoiser's miss value is a far-field sentinel. Treat it as far depth
-  // while retaining the explicit comparison for exact sky pixels.
+  // The denoiser's miss value is a far-field sentinel. Sky sits at infinity,
+  // where the lens curve asymptotes to apertureTerm / (Zf - f): focusing far
+  // away leaves the sky nearly sharp instead of always fully blurred.
   if (rawViewDepth == cb.missLinearViewZ || viewDepth == cb.missLinearViewZ)
   {
-    return 1.0f;
+    const float focusDistanceMm = max(focusDistance * cb.worldUnitToMm, 1e-3f);
+    return lensCoCToNormalized(cb.apertureTerm / max(focusDistanceMm - cb.focalLength, 1.0f));
   }
 
-  return calculateCircleOfConfusion(viewDepth);
+  return calculateCircleOfConfusion(viewDepth, focusDistance);
 }
 
 [shader("compute")]
@@ -80,8 +94,11 @@ void main(
   }
 
   const float2 uv = (float2(pixelPos) + 0.5f) * cb.invImageSize;
+  const float focusDistance = max(cb.autoFocusEnabled != 0
+    ? FocusState[0] + cb.autoFocusOffset
+    : cb.focusDistance, 1e-4f);
   const float4 centerColor = InColorTexture[pixelPos];
-  const float centerCoC = getDepthOfFieldCoC(uv);
+  const float centerCoC = getDepthOfFieldCoC(uv, focusDistance);
   const float centerRadius = abs(centerCoC) * cb.maxBlurRadius * cb.resolutionScale;
 
   if (centerRadius <= 0.0f || cb.sampleCount == 0)
@@ -109,7 +126,7 @@ void main(
     const float angle = phase + float(i) * goldenAngle;
     const float2 sampleOffset = float2(cos(angle), sin(angle)) * sampleRadius;
     const float2 sampleUv = (float2(pixelPos) + 0.5f + sampleOffset) * cb.invImageSize;
-    const float sampleCoC = getDepthOfFieldCoC(sampleUv);
+    const float sampleCoC = getDepthOfFieldCoC(sampleUv, focusDistance);
     const float sampleCoCRadius = abs(sampleCoC) * cb.maxBlurRadius * cb.resolutionScale;
     const float sampleDistance = length(sampleOffset);
 

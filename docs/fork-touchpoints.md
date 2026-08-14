@@ -4007,8 +4007,12 @@ first migrated extension effect and is disabled by default.
 Depth of Field is a reorderable HDR member of the fork-owned post-processing
 stack. It runs after Bloom and Motion Blur, before tonemapping, and uses a
 single output-resolution gather pass over the render-resolution linear view-Z
-buffer. The effect is disabled by default and exposes user-layer options for
-manual focus distance, transitions, blur radius, and sample quality.
+buffer. Blur disc size follows the thin-lens model popularized by CinematicDOF
+([Lee2008]): focal length and aperture f-number are artistic lens parameters,
+so the circle of confusion grows continuously from the focus plane with no
+focus-band edges. The effect is disabled by default and exposes user-layer
+options for manual focus distance, lens parameters, blur radius, and sample
+quality.
 
 - **`src/dxvk/shaders/rtx/pass/post_fx/post_fx.h`** and
   **`src/dxvk/shaders/rtx/pass/post_fx/post_fx_depth_of_field.comp.slang`** -
@@ -4028,3 +4032,31 @@ manual focus distance, transitions, blur radius, and sample quality.
   persisted order, and optional-member enumeration.
 - **`RtxOptions.md`** - regenerate the options golden file for the new
   `rtx.dof.*` user settings.
+
+---
+
+## Workstream - DoF auto-focus (fork - 2026-08-14)
+
+Depth of Field can optionally track a robust focus measurement from the
+path-traced linear view-Z buffer. A small disk of taps around the focus point
+is reduced to a median depth, passed through an optical-power dead zone and
+asymmetric reciprocal-distance smoothing (faster toward near subjects, slower
+toward far), and held steady while the sampled region is pure sky. A one-texel
+GPU state image carries the smoothed distance, resets on camera cuts, and
+drives the shared lens-based circle-of-confusion curve in the existing gather
+pass; manual focus remains unchanged when Auto Focus is disabled.
+
+- **`src/dxvk/shaders/rtx/pass/post_fx/post_fx.h`**,
+  **`src/dxvk/shaders/rtx/pass/post_fx/post_fx_dof_auto_focus.comp.slang`**,
+  and **`src/dxvk/shaders/rtx/pass/post_fx/post_fx_depth_of_field.comp.slang`** -
+  add the auto-focus binding contract, disk-sampled median view-Z measurement,
+  dead-zone and sky-hold hysteresis, reciprocal-distance temporal smoothing,
+  and an optional state-backed focus distance in the gather shader.
+- **`src/dxvk/rtx_render/rtx_postFx.cpp` / `.h`** - add auto-focus options
+  and UI controls, persistent state allocation, GPU dispatch, and the DoF
+  state binding.
+- **`src/dxvk/rtx_render/rtx_context.cpp`** - pass frame delta time and camera
+  history invalidation to the DoF adapter.
+- **`src/dxvk/imgui/rtx_user_menu.cpp`** - add the quick-menu Auto Focus toggle.
+- **`docs/PostProcessingStack.md`** and **`RtxOptions.md`** - document the
+  self-driven focus path and regenerated options.

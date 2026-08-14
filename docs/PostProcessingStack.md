@@ -24,8 +24,12 @@ remain outside the stack at their existing frame stages.
 
 The stack preserves the existing backend behavior and adds NTSC/VHS as a
 display-space effect plus Depth of Field as an HDR effect, both disabled by
-default. Their dispatch positions remain inside the ordered stack without
-moving either fixed color-domain anchor.
+default. Depth of Field can optionally track a median-filtered screen-space
+view-Z measurement sampled around a configurable focus point and drive the
+lens-based (focal length and f-number) circle of confusion,
+while retaining the original artistic manual-focus path. Their
+dispatch positions remain inside the ordered stack without moving either
+fixed color-domain anchor.
 
 ## Ordering and persistence
 

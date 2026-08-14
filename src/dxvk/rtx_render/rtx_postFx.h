@@ -59,7 +59,9 @@ namespace dxvk {
       const uvec2& mainCameraResolution,
       const uint32_t frameIdx,
       const float missLinearViewZ,
-      const Resources::RaytracingOutput& rtOutput);
+      const Resources::RaytracingOutput& rtOutput,
+      const float frameTimeMilliseconds,
+      const bool cameraCutDetected);
 
     // Lens effects phase (chromatic aberration + vignette). Runs after tonemapping
     // so it operates on post-tonemap LDR data — these are display-space lens artifacts.
@@ -96,6 +98,7 @@ namespace dxvk {
     inline bool isPostFxEnabled() const { return enable(); }
     inline bool isMotionBlurEnabled() const { return enable() && enableMotionBlur() && motionBlurSampleCount() > 0 && exposureFraction() > 0.0f; }
     inline bool isDofEnabled() const { return enable() && dofEnable() && sampleCount() > 0; }
+    inline bool isDofAutoFocusEnabled() const { return isDofEnabled() && autoFocusEnable(); }
     inline bool isChromaticAberrationEnabled() const { return enable() && enableLensEffects() && enableChromaticAberration() && chromaticAberrationAmount() > 0.0f; }
     inline bool isVignetteEnabled() const { return enable() && enableLensEffects() && enableVignette() && vignetteIntensity() > 0.0f; }
 
@@ -117,17 +120,39 @@ namespace dxvk {
                     "Enable the depth-of-field effect.",
                     args.environment = "RTX_DOF_ENABLE",
                     args.flags = RtxOptionFlags::UserSetting);
+    RTX_OPTION_ARGS("rtx.dof", bool, autoFocusEnable, false,
+                    "Measure and smoothly track the depth-of-field focus distance from the screen.",
+                    args.environment = "RTX_DOF_AUTO_FOCUS_ENABLE",
+                    args.flags = RtxOptionFlags::UserSetting);
+    RTX_OPTION_ARGS("rtx.dof", float, autoFocusTau, 0.25f,
+                    "Auto-focus smoothing time constant in seconds when focus moves to a nearer distance.",
+                    args.flags = RtxOptionFlags::UserSetting);
+    RTX_OPTION_ARGS("rtx.dof", float, autoFocusFarTauScale, 3.0f,
+                    "Multiplier applied to the auto-focus smoothing time constant when focus moves to a farther distance.",
+                    args.flags = RtxOptionFlags::UserSetting);
+    RTX_OPTION_ARGS("rtx.dof", float, autoFocusDeadZone, 0.03f,
+                    "Relative optical-power change below which auto-focus holds the current focus distance.",
+                    args.flags = RtxOptionFlags::UserSetting);
+    RTX_OPTION_ARGS("rtx.dof", float, autoFocusRegionRadius, 0.02f,
+                    "Normalized radius (fraction of the smaller image dimension) of the disk sampled around the auto-focus point.",
+                    args.flags = RtxOptionFlags::UserSetting);
+    RTX_OPTION_ARGS("rtx.dof", float, autoFocusPointX, 0.5f,
+                    "Normalized horizontal screen position used for auto-focus.",
+                    args.flags = RtxOptionFlags::UserSetting);
+    RTX_OPTION_ARGS("rtx.dof", float, autoFocusPointY, 0.5f,
+                    "Normalized vertical screen position used for auto-focus.",
+                    args.flags = RtxOptionFlags::UserSetting);
+    RTX_OPTION_ARGS("rtx.dof", float, autoFocusOffset, 0.0f,
+                    "World-unit offset added to the measured auto-focus distance.",
+                    args.flags = RtxOptionFlags::UserSetting);
     RTX_OPTION_ARGS("rtx.dof", float, focusDistance, 5.0f,
-                    "Depth-of-field focus distance in world units.",
+                    "Manual depth-of-field focus distance in world units.",
                     args.flags = RtxOptionFlags::UserSetting);
-    RTX_OPTION_ARGS("rtx.dof", float, focusRange, 1.0f,
-                    "Fully sharp depth band around the focus distance in world units.",
+    RTX_OPTION_ARGS("rtx.dof", float, focalLength, 100.0f,
+                    "Lens focal length in millimeters. Longer lenses produce a shallower depth of field.",
                     args.flags = RtxOptionFlags::UserSetting);
-    RTX_OPTION_ARGS("rtx.dof", float, nearTransition, 2.0f,
-                    "Near-field blur transition distance in world units.",
-                    args.flags = RtxOptionFlags::UserSetting);
-    RTX_OPTION_ARGS("rtx.dof", float, farTransition, 10.0f,
-                    "Far-field blur transition distance in world units.",
+    RTX_OPTION_ARGS("rtx.dof", float, fNumber, 2.8f,
+                    "Lens aperture f-number. Higher values deepen the depth of field, lower values produce more blur.",
                     args.flags = RtxOptionFlags::UserSetting);
     RTX_OPTION_ARGS("rtx.dof", float, maxBlurRadius, 16.0f,
                     "Maximum blur radius in pixels at 1080p.",
@@ -152,6 +177,8 @@ namespace dxvk {
   private:
     Rc<vk::DeviceFn> m_vkd;
     Rc<DxvkBuffer> m_highlightingValues;
+    Resources::Resource m_dofFocusState;
+    bool m_dofFocusStateReset = true;
 
     RTX_OPTION("rtx.postfx", bool,  enableMotionBlurNoiseSample, true, "Enable random distance sampling for every step along the motion vector. The random pattern is generated with interleaved gradient noise.");
     RTX_OPTION("rtx.postfx", bool,  enableMotionBlurEmissive, true, "Enable Motion Blur for Emissive surfaces. Disable this when the motion blur on emissive surfaces cause severe artifacts.");

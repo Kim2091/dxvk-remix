@@ -37,6 +37,10 @@
 #define POST_FX_DOF_PRIMARY_LINEAR_VIEW_Z_INPUT                1
 #define POST_FX_DOF_OUTPUT                                     2
 #define POST_FX_DOF_LINEAR_SAMPLER                             3
+#define POST_FX_DOF_FOCUS_STATE_INPUT                          4
+
+#define POST_FX_DOF_AF_PRIMARY_LINEAR_VIEW_Z_INPUT             0
+#define POST_FX_DOF_AF_FOCUS_STATE_INPUT_OUTPUT                1
 
 #define POST_FX_INPUT  0
 #define POST_FX_OUTPUT 1
@@ -88,14 +92,28 @@ struct PostFxDepthOfFieldArgs {
   float2 invMainCameraResolution;
   float2 inputOverOutputViewSize;
   float  focusDistance;
-  float  focusRange;
-  float  nearTransition;
-  float  farTransition;
+  float  focalLength;
+  float  apertureTerm;
+  float  worldUnitToMm;
+  float  sensorToPixels;
   float  maxBlurRadius;
   float  missLinearViewZ;
   float  resolutionScale;
   uint   sampleCount;
   uint   frameIdx;
+  uint   autoFocusEnabled;
+  float  autoFocusOffset;
+};
+
+struct PostFxDofAutoFocusArgs {
+  float2 focusPoint;
+  float  missLinearViewZ;
+  float  deltaTimeSecs;
+  float  tauSeconds;
+  uint   forceReset;
+  float  regionRadius;
+  float  deadZone;
+  float  farTauScale;
 };
 
 struct PostFxMotionBlurPrefilterArgs {

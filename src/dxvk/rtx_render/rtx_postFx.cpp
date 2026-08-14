@@ -28,6 +28,7 @@
 #include "rtx/pass/ntsc/ntsc_vhs.h"
 
 #include <rtx_shaders/post_fx.h>
+#include <rtx_shaders/post_fx_dof_auto_focus.h>
 #include <rtx_shaders/post_fx_depth_of_field.h>
 #include <rtx_shaders/ntsc_vhs.h>
 #include <rtx_shaders/post_fx_highlight.h>
@@ -91,6 +92,20 @@ namespace dxvk {
 
     PREWARM_SHADER_PIPELINE(PostFxMotionBlurShader);
 
+    class PostFxDofAutoFocusShader : public ManagedShader
+    {
+      SHADER_SOURCE(PostFxDofAutoFocusShader, VK_SHADER_STAGE_COMPUTE_BIT, post_fx_dof_auto_focus)
+
+      PUSH_CONSTANTS(PostFxDofAutoFocusArgs)
+
+      BEGIN_PARAMETER()
+        TEXTURE2D(POST_FX_DOF_AF_PRIMARY_LINEAR_VIEW_Z_INPUT)
+        RW_TEXTURE1D(POST_FX_DOF_AF_FOCUS_STATE_INPUT_OUTPUT)
+      END_PARAMETER()
+    };
+
+    PREWARM_SHADER_PIPELINE(PostFxDofAutoFocusShader);
+
     class PostFxDepthOfFieldShader : public ManagedShader
     {
       SHADER_SOURCE(PostFxDepthOfFieldShader, VK_SHADER_STAGE_COMPUTE_BIT, post_fx_depth_of_field)
@@ -102,6 +117,7 @@ namespace dxvk {
         TEXTURE2D(POST_FX_DOF_PRIMARY_LINEAR_VIEW_Z_INPUT)
         RW_TEXTURE2D(POST_FX_DOF_OUTPUT)
         SAMPLER(POST_FX_DOF_LINEAR_SAMPLER)
+        RW_TEXTURE1D_READONLY(POST_FX_DOF_FOCUS_STATE_INPUT)
       END_PARAMETER()
     };
 
@@ -182,10 +198,24 @@ namespace dxvk {
       return;
     }
 
-    RemixGui::DragFloat("Focus Distance (world units)", &focusDistanceObject(), 0.1f, 0.0f, 10000.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
-    RemixGui::DragFloat("Focus Range (world units)", &focusRangeObject(), 0.1f, 0.0f, 10000.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
-    RemixGui::DragFloat("Near Transition (world units)", &nearTransitionObject(), 0.1f, 0.0f, 10000.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
-    RemixGui::DragFloat("Far Transition (world units)", &farTransitionObject(), 0.1f, 0.0f, 10000.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+    RemixGui::Checkbox("Auto Focus", &autoFocusEnableObject());
+    if (autoFocusEnable()) {
+      ImGui::Indent();
+      RemixGui::DragFloat("Auto Focus Tau (s)", &autoFocusTauObject(), 0.01f, 0.01f, 2.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+      RemixGui::DragFloat("Auto Focus Far Tau Scale", &autoFocusFarTauScaleObject(), 0.1f, 1.0f, 10.0f, "%.1f", ImGuiSliderFlags_AlwaysClamp);
+      RemixGui::DragFloat("Auto Focus Dead Zone", &autoFocusDeadZoneObject(), 0.005f, 0.0f, 0.5f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+      RemixGui::DragFloat("Auto Focus Region Radius", &autoFocusRegionRadiusObject(), 0.001f, 0.0f, 0.25f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
+      RemixGui::DragFloat("Auto Focus Point X", &autoFocusPointXObject(), 0.01f, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+      RemixGui::DragFloat("Auto Focus Point Y", &autoFocusPointYObject(), 0.01f, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+      RemixGui::DragFloat("Auto Focus Offset (world units)", &autoFocusOffsetObject(), 0.1f, -10000.0f, 10000.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+      ImGui::Unindent();
+    } else {
+      RemixGui::DragFloat("Focus Distance (world units)", &focusDistanceObject(), 0.1f, 0.0f, 10000.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+    }
+
+    RemixGui::DragFloat("Focal Length (mm)", &focalLengthObject(), 1.0f, 10.0f, 300.0f, "%.0f", ImGuiSliderFlags_AlwaysClamp);
+    RemixGui::DragFloat("Aperture (f-number)", &fNumberObject(), 0.1f, 1.0f, 22.0f, "f/%.1f", ImGuiSliderFlags_AlwaysClamp);
+
     RemixGui::DragFloat("Maximum Blur Radius (pixels at 1080p)", &maxBlurRadiusObject(), 0.5f, 0.0f, 256.0f, "%.1f", ImGuiSliderFlags_AlwaysClamp);
     RemixGui::DragInt("Depth of Field Sample Count", &sampleCountObject(), 1.0f, 1, 64, "%d", ImGuiSliderFlags_AlwaysClamp);
   }
@@ -451,13 +481,51 @@ namespace dxvk {
     const uvec2& mainCameraResolution,
     const uint32_t frameIdx,
     const float missLinearViewZ,
-    const Resources::RaytracingOutput& rtOutput)
+    const Resources::RaytracingOutput& rtOutput,
+    const float frameTimeMilliseconds,
+    const bool cameraCutDetected)
   {
     if (!enable()) {
       return;
     }
     if (!isDofEnabled()) {
+      // Keep the state reset armed so enabling DoF/Auto Focus cannot consume
+      // stale state from a previous scene or an unwritten first frame.
+      m_dofFocusStateReset = true;
       return;
+    }
+
+    if (!m_dofFocusState.isValid()) {
+      DxvkImageCreateInfo desc;
+      desc.type = VK_IMAGE_TYPE_1D;
+      desc.flags = 0;
+      desc.sampleCount = VK_SAMPLE_COUNT_1_BIT;
+      desc.numLayers = 1;
+      desc.mipLevels = 1;
+      desc.stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+      desc.access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+      desc.tiling = VK_IMAGE_TILING_OPTIMAL;
+      desc.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+      desc.extent = VkExtent3D { 1, 1, 1 };
+
+      DxvkImageViewCreateInfo viewInfo;
+      viewInfo.type = VK_IMAGE_VIEW_TYPE_1D;
+      viewInfo.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+      viewInfo.minLevel = 0;
+      viewInfo.numLevels = 1;
+      viewInfo.minLayer = 0;
+      viewInfo.numLayers = 1;
+      viewInfo.format = desc.format = VK_FORMAT_R32_SFLOAT;
+      viewInfo.usage = desc.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+
+      m_dofFocusState.image = ctx->getDevice()->createImage(
+        desc,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        DxvkMemoryStats::Category::RTXRenderTarget,
+        "dof auto focus state");
+      m_dofFocusState.view = ctx->getDevice()->createImageView(m_dofFocusState.image, viewInfo);
+      ctx->changeImageLayout(m_dofFocusState.image, VK_IMAGE_LAYOUT_GENERAL);
+      m_dofFocusStateReset = true;
     }
 
     ScopedGpuProfileZone(ctx, "PostFx Depth of Field");
@@ -473,22 +541,55 @@ namespace dxvk {
     args.invMainCameraResolution = float2(1.0f / (float)mainCameraResolution.x, 1.0f / (float)mainCameraResolution.y);
     args.inputOverOutputViewSize = float2((float)mainCameraResolution.x * args.invImageSize.x, (float)mainCameraResolution.y * args.invImageSize.y);
     args.focusDistance = focusDistance();
-    args.focusRange = focusRange();
-    args.nearTransition = nearTransition();
-    args.farTransition = farTransition();
+    args.focalLength = std::max(focalLength(), 1.0f);
+    args.apertureTerm = args.focalLength * args.focalLength / std::max(fNumber(), 0.1f);
+    // 1 meter == scale world units == 1000 mm, so 1 world unit == 1000 / scale mm.
+    args.worldUnitToMm = 1000.0f / std::max(RtxOptions::getMeterToWorldUnitScale(), 1e-4f);
+    // Project millimeters of CoC through the 24 mm full-frame sensor height into pixels.
+    args.sensorToPixels = (float)inputSize.height / 24.0f;
     args.maxBlurRadius = maxBlurRadius();
     args.missLinearViewZ = missLinearViewZ;
     args.resolutionScale = (float)inputSize.height / 1080.0f;
     args.sampleCount = sampleCount();
     args.frameIdx = frameIdx;
+    args.autoFocusEnabled = isDofAutoFocusEnabled() ? 1 : 0;
+    args.autoFocusOffset = autoFocusOffset();
 
     ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
+
+    if (isDofAutoFocusEnabled()) {
+      ScopedGpuProfileZone(ctx, "PostFx DoF Auto Focus");
+
+      PostFxDofAutoFocusArgs autoFocusArgs = {};
+      autoFocusArgs.focusPoint = { autoFocusPointX(), autoFocusPointY() };
+      autoFocusArgs.missLinearViewZ = missLinearViewZ;
+      const float fallbackMs = RtxOptions::timeDeltaBetweenFrames() > 0.0f
+        ? RtxOptions::timeDeltaBetweenFrames()
+        : 16.6f;
+      const float effectiveFrameTimeMs = frameTimeMilliseconds > 0.0f
+        ? frameTimeMilliseconds
+        : fallbackMs;
+      autoFocusArgs.deltaTimeSecs = effectiveFrameTimeMs * 0.001f;
+      autoFocusArgs.tauSeconds = autoFocusTau();
+      autoFocusArgs.forceReset = (m_dofFocusStateReset || cameraCutDetected) ? 1 : 0;
+      autoFocusArgs.regionRadius = autoFocusRegionRadius();
+      autoFocusArgs.deadZone = autoFocusDeadZone();
+      autoFocusArgs.farTauScale = autoFocusFarTauScale();
+
+      ctx->pushConstants(0, sizeof(autoFocusArgs), &autoFocusArgs);
+      ctx->bindResourceView(POST_FX_DOF_AF_PRIMARY_LINEAR_VIEW_Z_INPUT, rtOutput.m_primaryLinearViewZ.view, nullptr);
+      ctx->bindResourceView(POST_FX_DOF_AF_FOCUS_STATE_INPUT_OUTPUT, m_dofFocusState.view, nullptr);
+      ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, PostFxDofAutoFocusShader::getShader());
+      ctx->dispatch(1, 1, 1);
+    }
+
     ctx->pushConstants(0, sizeof(args), &args);
 
     ctx->bindResourceView(POST_FX_DOF_INPUT, inOutColorTexture.view, nullptr);
     ctx->bindResourceView(POST_FX_DOF_PRIMARY_LINEAR_VIEW_Z_INPUT, rtOutput.m_primaryLinearViewZ.view, nullptr);
     ctx->bindResourceView(POST_FX_DOF_OUTPUT, rtOutput.m_postFxIntermediateTexture.view, nullptr);
     ctx->bindResourceSampler(POST_FX_DOF_LINEAR_SAMPLER, linearSampler);
+    ctx->bindResourceView(POST_FX_DOF_FOCUS_STATE_INPUT, m_dofFocusState.view, nullptr);
     ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, PostFxDepthOfFieldShader::getShader());
     ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
 
@@ -502,6 +603,10 @@ namespace dxvk {
       { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
       { 0, 0, 0 },
       inputSize);
+
+    // Keep reset armed while Auto Focus is disabled so the next enable starts
+    // from the current target instead of blending from stale state.
+    m_dofFocusStateReset = !isDofAutoFocusEnabled();
   }
 
   void DxvkPostFx::dispatchNtsc(
