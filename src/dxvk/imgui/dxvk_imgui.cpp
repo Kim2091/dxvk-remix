@@ -3979,24 +3979,7 @@ namespace dxvk {
           common->metaTAA().showImguiSettings();
       }
 
-      if (RemixGui::CollapsingHeader("Bloom", collapsingHeaderClosedFlags))
-        common->metaBloom().showImguiSettings();
-
-      if (RemixGui::CollapsingHeader("Auto Exposure", collapsingHeaderClosedFlags))
-        common->metaAutoExposure().showImguiSettings();
-
-      if (RemixGui::CollapsingHeader("Tonemapping", collapsingHeaderClosedFlags))
-      {
-        RemixGui::Separator();
-        common->metaToneMapping().showImguiSettings();
-        RemixGui::Separator();
-      }
-
-      if (RemixGui::CollapsingHeader("Post FX", collapsingHeaderClosedFlags))
-        common->metaPostFx().showImguiSettings();
-
-      if (RemixGui::CollapsingHeader("sRGB + Dither", collapsingHeaderClosedFlags))
-        common->metaSRGBDither().showImguiSettings();
+      fork_hooks::showPostProcessingStackSettings(ctx);
 
       ImGui::Unindent();
     }

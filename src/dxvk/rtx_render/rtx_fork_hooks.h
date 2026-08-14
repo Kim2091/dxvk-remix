@@ -74,6 +74,18 @@ namespace dxvk {
 
   namespace fork_hooks {
 
+    // Dispatches the fork-owned post-processing stack. The stack preserves
+    // the HDR/display-space boundary while allowing compatible effects to be
+    // reordered through the developer UI.
+    void dispatchPostProcessingStack(
+      Rc<RtxContext> ctx,
+      Resources::RaytracingOutput& rtOutput,
+      bool performSRGBConversion);
+
+    // Draws the ordered post-processing stack UI and the existing effect
+    // settings beneath it.
+    void showPostProcessingStackSettings(const Rc<DxvkContext>& ctx);
+
     // Constructs the RtxAtmosphere instance during RtxContext initialization.
     // Must be called after GlobalTime::get().init() in the RtxContext constructor.
     // NOTE: requires RtxContext to declare this as a friend for access to the

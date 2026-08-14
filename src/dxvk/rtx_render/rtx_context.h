@@ -61,10 +61,15 @@ namespace dxvk {
   // above; RtxContext is forward-declared here so the fork_hooks signatures compile
   // before the class definition is encountered.
   class RtxContext;
+  class RtxPostProcessingStack;
   namespace fork_weather {
     class WeatherBlender;
   } // namespace fork_weather
   namespace fork_hooks {
+    void dispatchPostProcessingStack(
+      Rc<RtxContext> ctx,
+      Resources::RaytracingOutput& rtOutput,
+      bool performSRGBConversion);
     void initAtmosphere(RtxContext&);
     void updateAtmosphereConstants(RtxContext&, RaytraceArgs&);
     void bindAtmosphereLuts(RtxContext&);
@@ -253,6 +258,7 @@ namespace dxvk {
     void dispatchToneMapping(const Resources::RaytracingOutput& rtOutput);
     void dispatchBloom(const Resources::RaytracingOutput& rtOutput);
     void dispatchPostFxMotionBlur(Resources::RaytracingOutput& rtOutput);
+    void dispatchPostFxNtsc(Resources::RaytracingOutput& rtOutput);
     void dispatchPostFxLensEffects(Resources::RaytracingOutput& rtOutput);
     void dispatchSRGBDither(const Resources::RaytracingOutput& rtOutput, bool performSRGBConversion);
     void dispatchDebugView(Rc<DxvkImage>& srcImage, const Resources::RaytracingOutput& rtOutput, bool captureScreenImage);
@@ -382,6 +388,7 @@ namespace dxvk {
     friend bool fork_hooks::isFsrUpscalerActive(RtxContext&);
     friend void fork_hooks::dispatchFsrUpscale(RtxContext&, const Resources::RaytracingOutput&);
     friend void fork_hooks::dispatchRcasSharpening(RtxContext&, const Resources::RaytracingOutput&);
+    friend class RtxPostProcessingStack;
     friend void fork_hooks::dispatchFsrFrameGeneration(RtxContext&, const Rc<DxvkImage>&);
     friend void fork_hooks::setFsrDownscaleExtent(RtxContext&, const VkExtent3D&, VkExtent3D&);
   };

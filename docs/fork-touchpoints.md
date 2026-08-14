@@ -3955,3 +3955,47 @@ Note: user rtx.conf files carrying `rtx.atmosphere.nubis3SunNearFieldKm` will lo
 harmless unknown-option warning.
 
 ---
+
+## Workstream - ordered post-processing stack (fork - 2026-08-13)
+
+The frame's post-tonemap effects now enter through one fork-owned dispatcher.
+The stack keeps HDR effects before the fixed tonemapping boundary, display-space
+effects after it, and sRGB conversion/dither as the terminal pass. Reorderable
+effects are persisted as `rtx.postfx.stackOrder`; invalid, missing, or
+cross-domain entries are normalized back to the built-in order. NTSC/VHS is the
+first migrated extension effect and is disabled by default.
+
+- **`src/dxvk/rtx_render/rtx_fork_post_processing.cpp` / `.h`** - fork-owned
+  stack registry, ordering resolver, developer-menu drag/drop UI, reset action,
+  and dispatch boundary. Existing Bloom, motion blur, tonemapping, lens
+  effects, and sRGB/dither implementations remain the effect backends, while
+  the stack owns their stable IDs and color-domain constraints.
+- **`src/dxvk/rtx_render/rtx_context.cpp` / `.h`** - hook call at the frame's
+  final-output stage, a friend declaration for the stack, and the small context
+  adapter that supplies the camera/frame/sampler state required by NTSC/VHS.
+- **`src/dxvk/imgui/dxvk_imgui.cpp`** - replaces the split post-processing
+  settings tree with the stack UI hook; Composition and TAA-U remain outside
+  the stack because they operate before final post-processing.
+- **`src/dxvk/rtx_render/rtx_fork_hooks.h`** - declares the stack dispatch and
+  UI hooks used by the upstream frame/UI call sites.
+- **`src/dxvk/rtx_render/rtx_postFx.cpp` / `.h`** - adds the NTSC/VHS effect
+  adapter, its user-facing options, UI controls, four-pass resource ping-pong,
+  and GPU profile label. Its legacy settings are split into per-effect panels
+  so the stack rows own the enable controls. The existing motion-blur and
+  lens-effect paths remain unchanged apart from being called by the stack.
+- **`src/dxvk/rtx_render/rtx_bloom.cpp` / `.h`** and
+  **`src/dxvk/rtx_render/rtx_tone_mapping.cpp` / `.h`** - separate each
+  effect's enable checkbox from its detailed settings so the stack can present
+  one row toggle and one expandable settings panel per effect.
+- **`src/dxvk/meson.build`** - registers the fork-owned stack translation unit.
+- **`tests/rtx/meson.build`** - tightens the optional APIC test-project guard to
+  check for the `meson.build` file it includes, allowing runtime-only builds in
+  checkouts that contain staged APIC binaries without the optional test source.
+- **`meson.build`** - applies the same file-existence guard to the optional
+  `nv-private` project, which may be present as a staged asset directory without
+  its Meson project file.
+- **`src/dxvk/shaders/rtx/pass/ntsc/ntsc_vhs.comp.slang` / `.h`** - fork-owned
+  four-pass tape-path compute shader and shared push-constant/binding contract.
+- **`NTSC.md`** - documents the effect's signal model and configuration.
+- **`docs/PostProcessingStack.md`** - records the stack topology, ordering
+  invariants, and the deferred external-tonemapper ABI decision.

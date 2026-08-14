@@ -767,23 +767,12 @@ namespace dxvk {
         RtxDustParticles& dust = m_common->metaDustParticles();
         dust.simulateAndDraw(this, m_state, rtOutput);
 
-        dispatchBloom(rtOutput);
-
-        // Motion blur runs before tonemapping while the image is still in linear HDR space.
-        dispatchPostFxMotionBlur(rtOutput);
-
-        dispatchToneMapping(rtOutput);
-
-        // Lens effects (chromatic aberration, vignette) run AFTER tonemapping. They are
-        // display-space artifacts so they operate on post-tonemap LDR data.
-        dispatchPostFxLensEffects(rtOutput);
-
         // Final output pass converts the linear post-tonemap LDR image to sRGB and applies
         // dithering as the very last step. SRGB conversion is suppressed for screenshot
         // captures (WAR for TREX-553: NVTT implicitly applies sRGB during dds->png conversion
         // for 16bit float formats).
         const bool performSRGBConversion = !captureScreenImage && g_allowSrgbConversionForOutput;
-        dispatchSRGBDither(rtOutput, performSRGBConversion);
+        fork_hooks::dispatchPostProcessingStack(this, rtOutput, performSRGBConversion);
 
         // Composite screen overlay (from external C API) after tone mapping, before screenshot capture.
         dispatchScreenOverlay(rtOutput);
@@ -1904,6 +1893,18 @@ namespace dxvk {
       RtxOptions::rngSeedWithFrameIndex() ? m_device->getCurrentFrameId() : 0,
       rtOutput,
       mainCamera.isViewHistoryInvalidated(m_device->getCurrentFrameId()));
+  }
+
+  void RtxContext::dispatchPostFxNtsc(Resources::RaytracingOutput& rtOutput) {
+    ScopedCpuProfileZone();
+    DxvkPostFx& postFx = m_common->metaPostFx();
+    const RtCamera& mainCamera = getSceneManager().getCamera();
+
+    postFx.dispatchNtsc(this,
+      getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE),
+      mainCamera.getShaderConstants().resolution,
+      RtxOptions::rngSeedWithFrameIndex() ? m_device->getCurrentFrameId() : 0,
+      rtOutput);
   }
 
   void RtxContext::dispatchPostFxLensEffects(Resources::RaytracingOutput& rtOutput) {
