@@ -1907,6 +1907,27 @@ namespace dxvk {
       rtOutput);
   }
 
+  void RtxContext::dispatchPostFxDof(Resources::RaytracingOutput& rtOutput) {
+    ScopedCpuProfileZone();
+    DxvkPostFx& postFx = m_common->metaPostFx();
+    const RtCamera& mainCamera = getSceneManager().getCamera();
+    if (!postFx.enable()) {
+      return;
+    }
+
+    NrdArgs primaryDirectNrdArgs;
+    NrdArgs primaryIndirectNrdArgs;
+    NrdArgs secondaryNrdArgs;
+    getDenoiseArgs(primaryDirectNrdArgs, primaryIndirectNrdArgs, secondaryNrdArgs);
+
+    postFx.dispatchDof(this,
+      getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE),
+      mainCamera.getShaderConstants().resolution,
+      RtxOptions::rngSeedWithFrameIndex() ? m_device->getCurrentFrameId() : 0,
+      primaryDirectNrdArgs.missLinearViewZ,
+      rtOutput);
+  }
+
   void RtxContext::dispatchPostFxLensEffects(Resources::RaytracingOutput& rtOutput) {
     ScopedCpuProfileZone();
     DxvkPostFx& postFx = m_common->metaPostFx();

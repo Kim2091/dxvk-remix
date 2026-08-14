@@ -33,6 +33,11 @@
 #define POST_FX_MOTION_BLUR_NEAREST_SAMPLER                   6
 #define POST_FX_MOTION_BLUR_LINEAR_SAMPLER                    7
 
+#define POST_FX_DOF_INPUT                                      0
+#define POST_FX_DOF_PRIMARY_LINEAR_VIEW_Z_INPUT                1
+#define POST_FX_DOF_OUTPUT                                     2
+#define POST_FX_DOF_LINEAR_SAMPLER                             3
+
 #define POST_FX_INPUT  0
 #define POST_FX_OUTPUT 1
 
@@ -75,6 +80,22 @@ struct PostFxArgs {
   bool   enableMotionBlurEmissive;
   float  jitterStrength;
   float  motionBlurDlfgDeduction;
+};
+
+struct PostFxDepthOfFieldArgs {
+  uint2  imageSize;
+  float2 invImageSize;
+  float2 invMainCameraResolution;
+  float2 inputOverOutputViewSize;
+  float  focusDistance;
+  float  focusRange;
+  float  nearTransition;
+  float  farTransition;
+  float  maxBlurRadius;
+  float  missLinearViewZ;
+  float  resolutionScale;
+  uint   sampleCount;
+  uint   frameIdx;
 };
 
 struct PostFxMotionBlurPrefilterArgs {

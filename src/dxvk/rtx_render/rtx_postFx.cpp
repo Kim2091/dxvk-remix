@@ -28,6 +28,7 @@
 #include "rtx/pass/ntsc/ntsc_vhs.h"
 
 #include <rtx_shaders/post_fx.h>
+#include <rtx_shaders/post_fx_depth_of_field.h>
 #include <rtx_shaders/ntsc_vhs.h>
 #include <rtx_shaders/post_fx_highlight.h>
 #include <rtx_shaders/post_fx_motion_blur.h>
@@ -89,6 +90,22 @@ namespace dxvk {
     };
 
     PREWARM_SHADER_PIPELINE(PostFxMotionBlurShader);
+
+    class PostFxDepthOfFieldShader : public ManagedShader
+    {
+      SHADER_SOURCE(PostFxDepthOfFieldShader, VK_SHADER_STAGE_COMPUTE_BIT, post_fx_depth_of_field)
+
+      PUSH_CONSTANTS(PostFxDepthOfFieldArgs)
+
+      BEGIN_PARAMETER()
+        TEXTURE2D(POST_FX_DOF_INPUT)
+        TEXTURE2D(POST_FX_DOF_PRIMARY_LINEAR_VIEW_Z_INPUT)
+        RW_TEXTURE2D(POST_FX_DOF_OUTPUT)
+        SAMPLER(POST_FX_DOF_LINEAR_SAMPLER)
+      END_PARAMETER()
+    };
+
+    PREWARM_SHADER_PIPELINE(PostFxDepthOfFieldShader);
 
     class PostFxMotionBlurPrefilterShader : public ManagedShader
     {
@@ -158,6 +175,19 @@ namespace dxvk {
     RemixGui::DragFloat("Motion Blur Minimum Velocity Threshold (unit: pixel)", &motionBlurMinimumVelocityThresholdInPixelObject(), 0.01f, 0.01f, 3.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
     RemixGui::DragFloat("Motion Blur Dynamic Deduction", &motionBlurDynamicDeductionObject(), 0.001f, 0.0f, 1.0f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
     RemixGui::DragFloat("Motion Blur Jitter Strength", &motionBlurJitterStrengthObject(), 0.001f, 0.0f, 1.0f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
+  }
+
+  void DxvkPostFx::showDofImguiSettings() {
+    if (!isDofEnabled()) {
+      return;
+    }
+
+    RemixGui::DragFloat("Focus Distance (world units)", &focusDistanceObject(), 0.1f, 0.0f, 10000.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+    RemixGui::DragFloat("Focus Range (world units)", &focusRangeObject(), 0.1f, 0.0f, 10000.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+    RemixGui::DragFloat("Near Transition (world units)", &nearTransitionObject(), 0.1f, 0.0f, 10000.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+    RemixGui::DragFloat("Far Transition (world units)", &farTransitionObject(), 0.1f, 0.0f, 10000.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+    RemixGui::DragFloat("Maximum Blur Radius (pixels at 1080p)", &maxBlurRadiusObject(), 0.5f, 0.0f, 256.0f, "%.1f", ImGuiSliderFlags_AlwaysClamp);
+    RemixGui::DragInt("Depth of Field Sample Count", &sampleCountObject(), 1.0f, 1, 64, "%d", ImGuiSliderFlags_AlwaysClamp);
   }
 
   void DxvkPostFx::showLensEffectsImguiSettings() {
@@ -405,6 +435,65 @@ namespace dxvk {
     // The lens-effect shader uses a Sampler2D input and an RWTexture2D output. To keep the
     // input/output decoupled (and avoid sampling-while-writing hazards) we write into the
     // intermediate texture and copy it back into the final output.
+    ctx->copyImage(
+      inOutColorTexture.image,
+      { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+      { 0, 0, 0 },
+      rtOutput.m_postFxIntermediateTexture.image,
+      { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+      { 0, 0, 0 },
+      inputSize);
+  }
+
+  void DxvkPostFx::dispatchDof(
+    Rc<RtxContext> ctx,
+    Rc<DxvkSampler> linearSampler,
+    const uvec2& mainCameraResolution,
+    const uint32_t frameIdx,
+    const float missLinearViewZ,
+    const Resources::RaytracingOutput& rtOutput)
+  {
+    if (!enable()) {
+      return;
+    }
+    if (!isDofEnabled()) {
+      return;
+    }
+
+    ScopedGpuProfileZone(ctx, "PostFx Depth of Field");
+    ctx->setFramePassStage(RtxFramePassStage::PostFX);
+
+    const Resources::Resource& inOutColorTexture = rtOutput.m_finalOutput.resource(Resources::AccessType::ReadWrite);
+    const VkExtent3D& inputSize = inOutColorTexture.image->info().extent;
+    const VkExtent3D workgroups = util::computeBlockCount(inputSize, VkExtent3D { POST_FX_TILE_SIZE, POST_FX_TILE_SIZE, 1 });
+
+    PostFxDepthOfFieldArgs args = {};
+    args.imageSize = { (uint)inputSize.width, (uint)inputSize.height };
+    args.invImageSize = { 1.0f / (float)inputSize.width, 1.0f / (float)inputSize.height };
+    args.invMainCameraResolution = float2(1.0f / (float)mainCameraResolution.x, 1.0f / (float)mainCameraResolution.y);
+    args.inputOverOutputViewSize = float2((float)mainCameraResolution.x * args.invImageSize.x, (float)mainCameraResolution.y * args.invImageSize.y);
+    args.focusDistance = focusDistance();
+    args.focusRange = focusRange();
+    args.nearTransition = nearTransition();
+    args.farTransition = farTransition();
+    args.maxBlurRadius = maxBlurRadius();
+    args.missLinearViewZ = missLinearViewZ;
+    args.resolutionScale = (float)inputSize.height / 1080.0f;
+    args.sampleCount = sampleCount();
+    args.frameIdx = frameIdx;
+
+    ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
+    ctx->pushConstants(0, sizeof(args), &args);
+
+    ctx->bindResourceView(POST_FX_DOF_INPUT, inOutColorTexture.view, nullptr);
+    ctx->bindResourceView(POST_FX_DOF_PRIMARY_LINEAR_VIEW_Z_INPUT, rtOutput.m_primaryLinearViewZ.view, nullptr);
+    ctx->bindResourceView(POST_FX_DOF_OUTPUT, rtOutput.m_postFxIntermediateTexture.view, nullptr);
+    ctx->bindResourceSampler(POST_FX_DOF_LINEAR_SAMPLER, linearSampler);
+    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, PostFxDepthOfFieldShader::getShader());
+    ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
+
+    // Keep the sampled input and storage output separate to avoid a
+    // sampling-while-writing hazard.
     ctx->copyImage(
       inOutColorTexture.image,
       { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },

@@ -51,6 +51,16 @@ namespace dxvk {
       const Resources::RaytracingOutput& rtOutput,
       const bool cameraCutDetected);
 
+    // Depth of field phase. Runs before tonemapping while the image is still
+    // in linear HDR space and reads the render-resolution linear view-Z.
+    void dispatchDof(
+      Rc<RtxContext> ctx,
+      Rc<DxvkSampler> linearSampler,
+      const uvec2& mainCameraResolution,
+      const uint32_t frameIdx,
+      const float missLinearViewZ,
+      const Resources::RaytracingOutput& rtOutput);
+
     // Lens effects phase (chromatic aberration + vignette). Runs after tonemapping
     // so it operates on post-tonemap LDR data — these are display-space lens artifacts.
     // Reads and writes m_finalOutput in place.
@@ -79,11 +89,13 @@ namespace dxvk {
 
     void showImguiSettings();
     void showMotionBlurImguiSettings();
+    void showDofImguiSettings();
     void showLensEffectsImguiSettings();
     void showNtscImguiSettings();
 
     inline bool isPostFxEnabled() const { return enable(); }
     inline bool isMotionBlurEnabled() const { return enable() && enableMotionBlur() && motionBlurSampleCount() > 0 && exposureFraction() > 0.0f; }
+    inline bool isDofEnabled() const { return enable() && dofEnable() && sampleCount() > 0; }
     inline bool isChromaticAberrationEnabled() const { return enable() && enableLensEffects() && enableChromaticAberration() && chromaticAberrationAmount() > 0.0f; }
     inline bool isVignetteEnabled() const { return enable() && enableLensEffects() && enableVignette() && vignetteIntensity() > 0.0f; }
 
@@ -100,6 +112,29 @@ namespace dxvk {
     RTX_OPTION_ARGS("rtx.postfx", bool, enableVignette, true, "Enables vignette post-processing effect.",
                     args.flags = RtxOptionFlags::UserSetting);
     RTX_OPTION("rtx.postfx", bool, desaturateOthersOnHighlight, true, "If true, desaturare all objects that are not highlighted.");
+
+    RTX_OPTION_ARGS("rtx.dof", bool, dofEnable, false,
+                    "Enable the depth-of-field effect.",
+                    args.environment = "RTX_DOF_ENABLE",
+                    args.flags = RtxOptionFlags::UserSetting);
+    RTX_OPTION_ARGS("rtx.dof", float, focusDistance, 5.0f,
+                    "Depth-of-field focus distance in world units.",
+                    args.flags = RtxOptionFlags::UserSetting);
+    RTX_OPTION_ARGS("rtx.dof", float, focusRange, 1.0f,
+                    "Fully sharp depth band around the focus distance in world units.",
+                    args.flags = RtxOptionFlags::UserSetting);
+    RTX_OPTION_ARGS("rtx.dof", float, nearTransition, 2.0f,
+                    "Near-field blur transition distance in world units.",
+                    args.flags = RtxOptionFlags::UserSetting);
+    RTX_OPTION_ARGS("rtx.dof", float, farTransition, 10.0f,
+                    "Far-field blur transition distance in world units.",
+                    args.flags = RtxOptionFlags::UserSetting);
+    RTX_OPTION_ARGS("rtx.dof", float, maxBlurRadius, 16.0f,
+                    "Maximum blur radius in pixels at 1080p.",
+                    args.flags = RtxOptionFlags::UserSetting);
+    RTX_OPTION_ARGS("rtx.dof", uint, sampleCount, 16,
+                    "Number of depth-of-field gather samples.",
+                    args.flags = RtxOptionFlags::UserSetting);
 
     RTX_OPTION_ARGS("rtx.ntsc", bool, ntscEnable, false,
                     "Enable the NTSC/VHS composite look.",

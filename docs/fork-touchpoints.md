@@ -3999,3 +3999,32 @@ first migrated extension effect and is disabled by default.
 - **`NTSC.md`** - documents the effect's signal model and configuration.
 - **`docs/PostProcessingStack.md`** - records the stack topology, ordering
   invariants, and the deferred external-tonemapper ABI decision.
+
+---
+
+## Workstream - HDR depth-of-field post-processing (fork - 2026-08-14)
+
+Depth of Field is a reorderable HDR member of the fork-owned post-processing
+stack. It runs after Bloom and Motion Blur, before tonemapping, and uses a
+single output-resolution gather pass over the render-resolution linear view-Z
+buffer. The effect is disabled by default and exposes user-layer options for
+manual focus distance, transitions, blur radius, and sample quality.
+
+- **`src/dxvk/shaders/rtx/pass/post_fx/post_fx.h`** and
+  **`src/dxvk/shaders/rtx/pass/post_fx/post_fx_depth_of_field.comp.slang`** -
+  add the DoF binding/push-constant contract and the native gather-based CoC
+  shader, including far-field miss handling and near-field bleed.
+- **`src/dxvk/rtx_render/rtx_postFx.cpp` / `.h`** - add the managed DoF shader,
+  user options/settings, output-resolution dispatch, linear view-Z sampling,
+  GPU profile label, and intermediate-texture ping-pong copy.
+- **`src/dxvk/rtx_render/rtx_context.cpp` / `.h`** - add the stack dispatch
+  adapter, camera/sampler/frame state, and denoiser miss-linear-view-Z
+  sentinel plumbing.
+- **`src/dxvk/rtx_render/rtx_fork_post_processing.cpp` / `.h`** - register the
+  stable `depth_of_field` effect ID, default HDR ordering, row toggle/settings
+  panel, and dispatch switch entry.
+- **`src/dxvk/imgui/rtx_user_menu.cpp`** - add the quick-menu DoF enable toggle.
+- **`docs/PostProcessingStack.md`** - document the new HDR lane topology,
+  persisted order, and optional-member enumeration.
+- **`RtxOptions.md`** - regenerate the options golden file for the new
+  `rtx.dof.*` user settings.
