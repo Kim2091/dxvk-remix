@@ -157,6 +157,9 @@ namespace dxvk {
     RTX_OPTION_ARGS("rtx.dof", float, maxBlurRadius, 16.0f,
                     "Maximum blur radius in pixels at 1080p.",
                     args.flags = RtxOptionFlags::UserSetting);
+    RTX_OPTION_ARGS("rtx.dof", float, bokehMinIntensity, 1.0f,
+                    "Minimum intensity of inner bokeh taps. 0: strongest halo, 1: uniform disk.",
+                    args.flags = RtxOptionFlags::UserSetting);
     RTX_OPTION_ARGS("rtx.dof", uint, sampleCount, 16,
                     "Number of depth-of-field gather samples.",
                     args.flags = RtxOptionFlags::UserSetting);

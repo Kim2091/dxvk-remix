@@ -217,6 +217,7 @@ namespace dxvk {
     RemixGui::DragFloat("Aperture (f-number)", &fNumberObject(), 0.1f, 1.0f, 22.0f, "f/%.1f", ImGuiSliderFlags_AlwaysClamp);
 
     RemixGui::DragFloat("Maximum Blur Radius (pixels at 1080p)", &maxBlurRadiusObject(), 0.5f, 0.0f, 256.0f, "%.1f", ImGuiSliderFlags_AlwaysClamp);
+    RemixGui::DragFloat("Minimum Bokeh Tap Intensity", &bokehMinIntensityObject(), 0.01f, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
     RemixGui::DragInt("Depth of Field Sample Count", &sampleCountObject(), 1.0f, 1, 64, "%d", ImGuiSliderFlags_AlwaysClamp);
   }
 
@@ -554,6 +555,7 @@ namespace dxvk {
     args.frameIdx = frameIdx;
     args.autoFocusEnabled = isDofAutoFocusEnabled() ? 1 : 0;
     args.autoFocusOffset = autoFocusOffset();
+    args.bokehMinIntensity = bokehMinIntensity();
 
     ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
 

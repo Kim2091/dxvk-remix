@@ -134,7 +134,14 @@ void main(
     // near-field tap to bleed over a sharper background pixel.
     if (sampleCoCRadius >= sampleDistance)
     {
-      const float weight = sampleCoC < 0.0f ? 1.25f : 1.0f;
+      // Attenuating inner taps while keeping outer taps bright gives
+      // defocused highlights a controllable disk and halo shape. The tap
+      // index, rather than the randomized angle, defines the radial ramp.
+      const float tapIndexFraction = sampleCount > 1u
+        ? float(i) / float(sampleCount - 1u)
+        : 1.0f;
+      const float tapIntensity = lerp(saturate(cb.bokehMinIntensity), 1.0f, tapIndexFraction);
+      const float weight = (sampleCoC < 0.0f ? 1.25f : 1.0f) * tapIntensity;
       accumulatedColor += InColorTexture.SampleLevel(LinearSampler, sampleUv, 0.0f).rgb * weight;
       accumulatedWeight += weight;
     }

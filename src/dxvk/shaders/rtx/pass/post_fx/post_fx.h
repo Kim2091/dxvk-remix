@@ -103,6 +103,7 @@ struct PostFxDepthOfFieldArgs {
   uint   frameIdx;
   uint   autoFocusEnabled;
   float  autoFocusOffset;
+  float  bokehMinIntensity;
 };
 
 struct PostFxDofAutoFocusArgs {
