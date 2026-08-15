@@ -160,6 +160,9 @@ namespace dxvk {
     RTX_OPTION_ARGS("rtx.dof", float, bokehMinIntensity, 1.0f,
                     "Minimum intensity of inner bokeh taps. 0: strongest halo, 1: uniform disk.",
                     args.flags = RtxOptionFlags::UserSetting);
+    RTX_OPTION_ARGS("rtx.dof", float, bokehFilterStrength, 0.25f,
+                    "Strength of the low-radius bokeh reconstruction filter. 0: Disabled, 1: Full strength.",
+                    args.flags = RtxOptionFlags::UserSetting);
     RTX_OPTION_ARGS("rtx.dof", uint, sampleCount, 16,
                     "Number of depth-of-field gather samples.",
                     args.flags = RtxOptionFlags::UserSetting);

@@ -65,15 +65,19 @@ float calculateCircleOfConfusion(const float viewDepth, const float focusDistanc
   return viewDepth < focusDistance ? -normalizedCoC : normalizedCoC;
 }
 
-float getDepthOfFieldCoC(const float2 uv, const float focusDistance)
+bool isMissDepth(const float rawViewDepth)
 {
-  const float rawViewDepth = PrimaryLinearViewZ.SampleLevel(LinearSampler, uv, 0.0f);
+  return rawViewDepth == cb.missLinearViewZ || abs(rawViewDepth) == cb.missLinearViewZ;
+}
+
+float getDepthOfFieldCoCFromViewDepth(const float rawViewDepth, const float focusDistance)
+{
   const float viewDepth = abs(rawViewDepth);
 
   // The denoiser's miss value is a far-field sentinel. Sky sits at infinity,
   // where the lens curve asymptotes to apertureTerm / (Zf - f): focusing far
   // away leaves the sky nearly sharp instead of always fully blurred.
-  if (rawViewDepth == cb.missLinearViewZ || viewDepth == cb.missLinearViewZ)
+  if (isMissDepth(rawViewDepth))
   {
     const float focusDistanceMm = max(focusDistance * cb.worldUnitToMm, 1e-3f);
     return lensCoCToNormalized(cb.apertureTerm / max(focusDistanceMm - cb.focalLength, 1.0f));
@@ -93,15 +97,20 @@ void main(
     return;
   }
 
-  const float2 uv = (float2(pixelPos) + 0.5f) * cb.invImageSize;
+  const float2 pixelCenter = float2(pixelPos) + 0.5f;
+  const float2 uv = pixelCenter * cb.invImageSize;
   const float focusDistance = max(cb.autoFocusEnabled != 0
     ? FocusState[0] + cb.autoFocusOffset
     : cb.focusDistance, 1e-4f);
   const float4 centerColor = InColorTexture[pixelPos];
-  const float centerCoC = getDepthOfFieldCoC(uv, focusDistance);
-  const float centerRadius = abs(centerCoC) * cb.maxBlurRadius * cb.resolutionScale;
+  const float rawCenterViewDepth = PrimaryLinearViewZ.SampleLevel(LinearSampler, uv, 0.0f);
+  const float centerViewDepth = abs(rawCenterViewDepth);
+  const bool centerIsMiss = isMissDepth(rawCenterViewDepth);
+  const float centerCoC = getDepthOfFieldCoCFromViewDepth(rawCenterViewDepth, focusDistance);
+  const float maxBlurRadius = cb.maxBlurRadius * cb.resolutionScale;
+  const float centerRadius = abs(centerCoC) * maxBlurRadius;
 
-  if (centerRadius <= 0.0f || cb.sampleCount == 0)
+  if (maxBlurRadius <= 0.0f || cb.sampleCount == 0)
   {
     OutColorTexture[pixelPos] = centerColor;
     return;
@@ -115,37 +124,106 @@ void main(
   const float goldenAngle = 2.3999632f;
   const uint sampleCount = min(cb.sampleCount, 64u);
 
-  float3 accumulatedColor = centerColor.rgb;
-  float accumulatedWeight = 1.0f;
+  // Gather the destination surface over its own CoC. Foreground samples that
+  // belong to a nearer layer are excluded here and composited from their own
+  // source footprints below.
+  float3 resolvedColor = centerColor.rgb;
+  if (centerRadius > 0.0f)
+  {
+    float3 accumulatedColor = centerColor.rgb;
+    float accumulatedWeight = 1.0f;
+
+    [loop]
+    for (uint i = 0; i < sampleCount; ++i)
+    {
+      const float sampleFraction = (float(i) + 0.5f) / float(sampleCount);
+      const float sampleRadius = sqrt(sampleFraction) * centerRadius;
+      const float angle = phase + float(i) * goldenAngle;
+      const float2 sampleOffset = float2(cos(angle), sin(angle)) * sampleRadius;
+      const float2 sampleUv = (pixelCenter + sampleOffset) * cb.invImageSize;
+      const float rawSampleViewDepth = PrimaryLinearViewZ.SampleLevel(LinearSampler, sampleUv, 0.0f);
+      const float sampleViewDepth = abs(rawSampleViewDepth);
+      const bool sampleIsMiss = isMissDepth(rawSampleViewDepth);
+      const float sampleCoC = getDepthOfFieldCoCFromViewDepth(rawSampleViewDepth, focusDistance);
+      const float sampleCoCRadius = abs(sampleCoC) * maxBlurRadius;
+      const float depthTolerance = max(centerViewDepth * 1e-3f, 1e-3f);
+      const bool sampleIsInFront = !sampleIsMiss
+        && (centerIsMiss || sampleViewDepth < centerViewDepth - depthTolerance);
+      const bool isForegroundSource = sampleCoC < 0.0f && sampleIsInFront;
+
+      if (sampleCoCRadius >= sampleRadius && !isForegroundSource)
+      {
+        // Attenuating inner taps while keeping outer taps bright gives
+        // defocused highlights a controllable disk and halo shape. The tap
+        // index, rather than the randomized angle, defines the radial ramp.
+        const float tapIndexFraction = sampleCount > 1u
+          ? float(i) / float(sampleCount - 1u)
+          : 1.0f;
+        const float tapIntensity = lerp(saturate(cb.bokehMinIntensity), 1.0f, tapIndexFraction);
+        accumulatedColor += InColorTexture.SampleLevel(LinearSampler, sampleUv, 0.0f).rgb * tapIntensity;
+        accumulatedWeight += tapIntensity;
+      }
+    }
+
+    resolvedColor = accumulatedColor / accumulatedWeight;
+  }
+
+  // Evaluate foreground scattering in gather form. Samples are distributed
+  // over the maximum possible support, but each sample is accepted using the
+  // source pixel's CoC, not the destination's. This allows a near-field CoC
+  // disc to cross a geometry silhouette and cover a focused destination.
+  float3 foregroundColor = 0.0f;
+  float foregroundWeight = 0.0f;
+  const float maxBlurRadiusSq = maxBlurRadius * maxBlurRadius;
+  const float minBokehIntensity = saturate(cb.bokehMinIntensity);
+  const float meanBokehIntensity = minBokehIntensity
+    + (1.0f - minBokehIntensity) * (2.0f / 3.0f);
 
   [loop]
   for (uint i = 0; i < sampleCount; ++i)
   {
+    // sqrt distributes equal-weight samples uniformly over the maximum CoC
+    // disc, which makes this a Monte Carlo estimate of source splatting.
     const float sampleFraction = (float(i) + 0.5f) / float(sampleCount);
-    const float sampleRadius = sqrt(sampleFraction) * centerRadius;
-    const float angle = phase + float(i) * goldenAngle;
+    const float sampleRadius = sqrt(sampleFraction) * maxBlurRadius;
+    const float angle = phase + (float(i) + 0.5f) * goldenAngle;
     const float2 sampleOffset = float2(cos(angle), sin(angle)) * sampleRadius;
-    const float2 sampleUv = (float2(pixelPos) + 0.5f + sampleOffset) * cb.invImageSize;
-    const float sampleCoC = getDepthOfFieldCoC(sampleUv, focusDistance);
-    const float sampleCoCRadius = abs(sampleCoC) * cb.maxBlurRadius * cb.resolutionScale;
-    const float sampleDistance = length(sampleOffset);
+    const float2 sampleUv = (pixelCenter + sampleOffset) * cb.invImageSize;
+    const float rawSampleViewDepth = PrimaryLinearViewZ.SampleLevel(LinearSampler, sampleUv, 0.0f);
+    const float sampleViewDepth = abs(rawSampleViewDepth);
+    const bool sampleIsMiss = isMissDepth(rawSampleViewDepth);
+    const float sampleCoC = getDepthOfFieldCoCFromViewDepth(rawSampleViewDepth, focusDistance);
+    const float sampleCoCRadius = -sampleCoC * maxBlurRadius;
+    const float depthTolerance = max(centerViewDepth * 1e-3f, 1e-3f);
+    const bool sampleIsInFront = !sampleIsMiss
+      && (centerIsMiss || sampleViewDepth < centerViewDepth - depthTolerance);
 
-    // Foreground taps are intentionally not depth-rejected, allowing a
-    // near-field tap to bleed over a sharper background pixel.
-    if (sampleCoCRadius >= sampleDistance)
+    if (sampleCoC < 0.0f && sampleIsInFront && sampleCoCRadius > 0.0f)
     {
-      // Attenuating inner taps while keeping outer taps bright gives
-      // defocused highlights a controllable disk and halo shape. The tap
-      // index, rather than the randomized angle, defines the radial ramp.
-      const float tapIndexFraction = sampleCount > 1u
-        ? float(i) / float(sampleCount - 1u)
-        : 1.0f;
-      const float tapIntensity = lerp(saturate(cb.bokehMinIntensity), 1.0f, tapIndexFraction);
-      const float weight = (sampleCoC < 0.0f ? 1.25f : 1.0f) * tapIntensity;
-      accumulatedColor += InColorTexture.SampleLevel(LinearSampler, sampleUv, 0.0f).rgb * weight;
-      accumulatedWeight += weight;
+      const float coverage = smoothstep(-0.75f, 0.75f, sampleCoCRadius - sampleRadius);
+      if (coverage > 0.0f)
+      {
+        const float radialFraction = saturate(sampleRadius / sampleCoCRadius);
+        const float bokehWeight = lerp(minBokehIntensity, 1.0f, radialFraction)
+          / max(meanBokehIntensity, 1e-4f);
+
+        // Uniform sampling uses the maximum disc. Correct for the source
+        // disc's smaller area so a full opaque foreground still integrates to
+        // unit coverage regardless of its CoC radius.
+        const float footprintWeight = coverage * bokehWeight * maxBlurRadiusSq
+          / max(sampleCoCRadius * sampleCoCRadius, 1.0f) / float(sampleCount);
+        foregroundColor += InColorTexture.SampleLevel(LinearSampler, sampleUv, 0.0f).rgb
+          * footprintWeight;
+        foregroundWeight += footprintWeight;
+      }
     }
   }
 
-  OutColorTexture[pixelPos] = float4(accumulatedColor / accumulatedWeight, centerColor.a);
+  if (foregroundWeight > 0.0f)
+  {
+    resolvedColor = lerp(resolvedColor, foregroundColor / foregroundWeight,
+      saturate(foregroundWeight));
+  }
+
+  OutColorTexture[pixelPos] = float4(resolvedColor, centerColor.a);
 }

@@ -30,6 +30,7 @@
 #include <rtx_shaders/post_fx.h>
 #include <rtx_shaders/post_fx_dof_auto_focus.h>
 #include <rtx_shaders/post_fx_depth_of_field.h>
+#include <rtx_shaders/post_fx_dof_resolve.h>
 #include <rtx_shaders/ntsc_vhs.h>
 #include <rtx_shaders/post_fx_highlight.h>
 #include <rtx_shaders/post_fx_motion_blur.h>
@@ -122,6 +123,23 @@ namespace dxvk {
     };
 
     PREWARM_SHADER_PIPELINE(PostFxDepthOfFieldShader);
+
+    class PostFxDofResolveShader : public ManagedShader
+    {
+      SHADER_SOURCE(PostFxDofResolveShader, VK_SHADER_STAGE_COMPUTE_BIT, post_fx_dof_resolve)
+
+      PUSH_CONSTANTS(PostFxDepthOfFieldArgs)
+
+      BEGIN_PARAMETER()
+        TEXTURE2D(POST_FX_DOF_RESOLVE_INPUT)
+        TEXTURE2D(POST_FX_DOF_RESOLVE_PRIMARY_LINEAR_VIEW_Z_INPUT)
+        RW_TEXTURE2D(POST_FX_DOF_RESOLVE_OUTPUT)
+        SAMPLER(POST_FX_DOF_RESOLVE_LINEAR_SAMPLER)
+        RW_TEXTURE1D_READONLY(POST_FX_DOF_RESOLVE_FOCUS_STATE_INPUT)
+      END_PARAMETER()
+    };
+
+    PREWARM_SHADER_PIPELINE(PostFxDofResolveShader);
 
     class PostFxMotionBlurPrefilterShader : public ManagedShader
     {
@@ -218,6 +236,7 @@ namespace dxvk {
 
     RemixGui::DragFloat("Maximum Blur Radius (pixels at 1080p)", &maxBlurRadiusObject(), 0.5f, 0.0f, 256.0f, "%.1f", ImGuiSliderFlags_AlwaysClamp);
     RemixGui::DragFloat("Minimum Bokeh Tap Intensity", &bokehMinIntensityObject(), 0.01f, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+    RemixGui::DragFloat("Bokeh Reconstruction Strength", &bokehFilterStrengthObject(), 0.01f, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
     RemixGui::DragInt("Depth of Field Sample Count", &sampleCountObject(), 1.0f, 1, 64, "%d", ImGuiSliderFlags_AlwaysClamp);
   }
 
@@ -556,6 +575,7 @@ namespace dxvk {
     args.autoFocusEnabled = isDofAutoFocusEnabled() ? 1 : 0;
     args.autoFocusOffset = autoFocusOffset();
     args.bokehMinIntensity = bokehMinIntensity();
+    args.bokehFilterStrength = bokehFilterStrength();
 
     ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
 
@@ -595,16 +615,15 @@ namespace dxvk {
     ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, PostFxDepthOfFieldShader::getShader());
     ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
 
-    // Keep the sampled input and storage output separate to avoid a
-    // sampling-while-writing hazard.
-    ctx->copyImage(
-      inOutColorTexture.image,
-      { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-      { 0, 0, 0 },
-      rtOutput.m_postFxIntermediateTexture.image,
-      { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-      { 0, 0, 0 },
-      inputSize);
+    // Reconstruct the sparse gather taps without changing depth visibility.
+    // Near-field coverage is handled by the source-footprint gather above.
+    ctx->bindResourceView(POST_FX_DOF_RESOLVE_INPUT, rtOutput.m_postFxIntermediateTexture.view, nullptr);
+    ctx->bindResourceView(POST_FX_DOF_RESOLVE_PRIMARY_LINEAR_VIEW_Z_INPUT, rtOutput.m_primaryLinearViewZ.view, nullptr);
+    ctx->bindResourceView(POST_FX_DOF_RESOLVE_OUTPUT, rtOutput.m_finalOutput.view(Resources::AccessType::Write), nullptr);
+    ctx->bindResourceSampler(POST_FX_DOF_RESOLVE_LINEAR_SAMPLER, linearSampler);
+    ctx->bindResourceView(POST_FX_DOF_RESOLVE_FOCUS_STATE_INPUT, m_dofFocusState.view, nullptr);
+    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, PostFxDofResolveShader::getShader());
+    ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
 
     // Keep reset armed while Auto Focus is disabled so the next enable starts
     // from the current target instead of blending from stale state.

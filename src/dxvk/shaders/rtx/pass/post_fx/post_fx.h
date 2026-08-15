@@ -39,6 +39,12 @@
 #define POST_FX_DOF_LINEAR_SAMPLER                             3
 #define POST_FX_DOF_FOCUS_STATE_INPUT                          4
 
+#define POST_FX_DOF_RESOLVE_INPUT                              0
+#define POST_FX_DOF_RESOLVE_PRIMARY_LINEAR_VIEW_Z_INPUT        1
+#define POST_FX_DOF_RESOLVE_OUTPUT                             2
+#define POST_FX_DOF_RESOLVE_LINEAR_SAMPLER                     3
+#define POST_FX_DOF_RESOLVE_FOCUS_STATE_INPUT                  4
+
 #define POST_FX_DOF_AF_PRIMARY_LINEAR_VIEW_Z_INPUT             0
 #define POST_FX_DOF_AF_FOCUS_STATE_INPUT_OUTPUT                1
 
@@ -104,6 +110,7 @@ struct PostFxDepthOfFieldArgs {
   uint   autoFocusEnabled;
   float  autoFocusOffset;
   float  bokehMinIntensity;
+  float  bokehFilterStrength;
 };
 
 struct PostFxDofAutoFocusArgs {
