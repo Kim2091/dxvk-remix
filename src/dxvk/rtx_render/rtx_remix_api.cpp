@@ -1789,7 +1789,17 @@ namespace {
     if (!d3d9Device) {
       return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
     }
-    auto dxvkDevice = dynamic_cast<dxvk::D3D9DeviceEx*>(d3d9Device);
+    // The caller is outside this module and may hand over anything: a COM object from another
+    // runtime, a bridge-side proxy, or a pointer that is not a polymorphic C++ object at all.
+    // dynamic_cast does not return null for those - it throws std::__non_rtti_object, which then
+    // escapes this extern "C" boundary and takes the process down. Rejecting the device is the
+    // documented outcome for a non-Remix one, so report that rather than letting the throw out.
+    dxvk::D3D9DeviceEx* dxvkDevice = nullptr;
+    try {
+      dxvkDevice = dynamic_cast<dxvk::D3D9DeviceEx*>(d3d9Device);
+    } catch (...) {
+      dxvkDevice = nullptr;
+    }
     if (!dxvkDevice) {
       return REMIXAPI_ERROR_CODE_REGISTERING_NON_REMIX_D3D9_DEVICE;
     }
@@ -1799,7 +1809,13 @@ namespace {
       assert(0);
       return REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
     }
-    auto dxvkD3d9Ex = dynamic_cast<IDirect3D9Ex*>(dxvkD3d9);
+    // Same hazard: GetDirect3D hands back whatever the device holds.
+    IDirect3D9Ex* dxvkD3d9Ex = nullptr;
+    try {
+      dxvkD3d9Ex = dynamic_cast<IDirect3D9Ex*>(dxvkD3d9);
+    } catch (...) {
+      dxvkD3d9Ex = nullptr;
+    }
     if (!dxvkD3d9Ex) {
       assert(0);
       return REMIXAPI_ERROR_CODE_NOT_INITIALIZED;
