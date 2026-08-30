@@ -402,9 +402,19 @@ remixapi_ErrorCode REMIXAPI_CALL remixapi_dxvk_RegisterD3D9Device(IDirect3DDevic
   if (!d3d9Device) {
     return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
   }
-  Logger::err("[remixapi_dxvk_RegisterD3D9Device] Not yet supported. Device used by Remix API defaults to "
-                                                 "most recently created by client application.");
-  return REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+  // The client cannot forward this: a 32-bit client device pointer means nothing to the
+  // 64-bit server. It does not need to. The server already calls dxvk_RegisterD3D9Device
+  // with the real runtime device from its own CreateDevice/CreateDeviceEx handler (see
+  // server/main.cpp), so the device the Remix API targets is already the right one by the
+  // time a caller gets here, and the state the caller asked for is the state that holds.
+  //
+  // Reporting failure for an already-satisfied request is what breaks callers - the GTA IV
+  // comp mod does not survive the error return. Say what is true instead, and warn about
+  // the assumption: with more than one device the API targets the most recently created
+  // one, which is not necessarily the one being passed in here.
+  Logger::warn("[remixapi_dxvk_RegisterD3D9Device] Not forwarded. The Remix API already targets the "
+               "device the server created; with multiple devices it is the most recent one.");
+  return REMIXAPI_ERROR_CODE_SUCCESS;
 }
 
 // https://stackoverflow.com/a/27490954
