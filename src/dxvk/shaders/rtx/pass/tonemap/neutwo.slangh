@@ -106,7 +106,10 @@ float3 neutwo_MaxChannel(float3 x)
 {
     float maxCh = max(max(abs(x.r), abs(x.g)), abs(x.b));
     float scaled = neutwo_Neutwo(maxCh);
-    return x * (scaled / maxCh);
+    // Guard the degenerate case the way ComputeMaxChannelScale above already does:
+    // a black pixel gives maxCh == 0 and scaled == 0, so the unguarded ratio is 0/0.
+    // The curve maps 0 to 0, so returning x is the right answer for it.
+    return maxCh != 0.0f ? x * (scaled / maxCh) : x;
 }
 
 float3 neutwo_PerChannel(float3 x)
