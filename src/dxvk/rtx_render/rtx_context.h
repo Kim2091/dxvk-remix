@@ -64,10 +64,6 @@ namespace dxvk {
   namespace fork_weather {
     class WeatherBlender;
   } // namespace fork_weather
-
-  // Defined in rtx_neural_uplift.h; declared here so dispatchNeuralUplift can name it
-  // without that header reaching everything that includes this one.
-  enum class NeuralUpliftInjectionPoint : int;
   namespace fork_hooks {
     void initAtmosphere(RtxContext&);
     void updateAtmosphereConstants(RtxContext&, RaytraceArgs&);
@@ -240,8 +236,7 @@ namespace dxvk {
     void dispatchDenoise(const Resources::RaytracingOutput& rtOutput);
     void dispatchComposite(const Resources::RaytracingOutput& rtOutput);
     void dispatchReplaceCompositeWithDebugView(const Resources::RaytracingOutput& rtOutput);
-    void dispatchNeuralUplift(const Resources::RaytracingOutput& rtOutput,
-                              NeuralUpliftInjectionPoint callSite);
+    void dispatchNeuralUplift(const Resources::RaytracingOutput& rtOutput, bool displayEncoded);
     void dispatchNIS(const Resources::RaytracingOutput& rtOutput);
     void dispatchXeSS(const Resources::RaytracingOutput& rtOutput);
     void dispatchTemporalAA(const Resources::RaytracingOutput& rtOutput);
