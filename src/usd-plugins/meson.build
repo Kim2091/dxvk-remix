@@ -3,15 +3,18 @@
 # deployed alongside the DLL by scripts-common/install_usd_plugins.bat.
 
 usd_schema_plugins_cpp_compiler = meson.get_compiler('cpp')
-if usd_schema_plugins_cpp_compiler.get_id() != 'msvc'
+if usd_schema_plugins_cpp_compiler.get_argument_syntax() != 'msvc'
   error('USD-SCHEMA-PLUGINS requires the MSVC compiler.')
 endif
 
 usd_schema_plugins_isdebug = get_option('buildtype') == 'debug'
 usd_schema_plugins_is_woa = target_machine.cpu() == 'armv8'
 
+packman_program = build_os == 'windows' \
+  ? join_paths(meson.current_source_dir(), '../../scripts-common/packman/packman.cmd') \
+  : join_paths(meson.current_source_dir(), '../../scripts-common/packman/packman')
 packman_result = run_command(
-  join_paths(meson.current_source_dir(), '../../scripts-common/packman/packman.cmd'),
+  packman_program,
   'pull',
   join_paths(meson.current_source_dir(), 'packman-external.xml'),
   '-p', 'windows-x86_64',

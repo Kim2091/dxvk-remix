@@ -244,11 +244,11 @@ void AssetReplacer::updateSecretReplacements() {
 
 namespace {
   std::string tostr(const remixapi_MaterialHandle& h) {
-    static_assert(sizeof h == sizeof uint64_t);
+    static_assert(sizeof(h) == sizeof(uint64_t));
     return std::to_string(reinterpret_cast<uint64_t>(h));
   }
   std::string tostr(const remixapi_MeshHandle& h) {
-    static_assert(sizeof h == sizeof uint64_t);
+    static_assert(sizeof(h) == sizeof(uint64_t));
     return std::to_string(reinterpret_cast<uint64_t>(h));
   }
 }
@@ -427,4 +427,3 @@ void AssetReplacer::destroyExternalMesh(remixapi_MeshHandle handle) {
 }
 
 } // namespace dxvk
-
