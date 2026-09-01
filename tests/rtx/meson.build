@@ -10,7 +10,9 @@ endif
 
 subdir('apps/RemixAPI')
 subdir('apps/RemixAPI_C')
-subdir('apps/HydraTestRender')
+if dxvk_is_msvc and build_os == 'windows'
+  subdir('apps/HydraTestRender')
+endif
 
 if dxvk_is_ninja
   # apps that are compiled as a part of dxvk-remix
@@ -18,8 +20,12 @@ if dxvk_is_ninja
     'apics/RemixAPI'            : RemixAPI_exepath,
     'apics/RemixAPI_C'          : RemixAPI_C_exepath,
     'apics/RemixAPI_MediumTest' : RemixAPI_MediumTest_exepath,
-    'apics/HydraTestRender'     : HydraTestRender_exepath
   }
+  if dxvk_is_msvc and build_os == 'windows'
+    dxvkrt_output_targets += {
+      'apics/HydraTestRender'  : HydraTestRender_exepath
+    }
+  endif
 endif
 
 endif

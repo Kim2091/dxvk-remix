@@ -41,7 +41,8 @@ current_build_dir_norm = meson.current_build_dir().replace('\\', '/')
 #   Implications: in very rare circumstances (clean clone, editing meson), get_dependencies
 #     script will be called twice on the same build. This will not be noticeable as packman
 #     early outs if everything's already fetched, so the waste is negligible + forgiveable.
-get_dependencies_script_path = join_paths(global_src_root_norm, 'scripts-common/update-deps.cmd')
+get_dependencies_script_name = build_machine.system() == 'windows' ? 'update-deps.cmd' : 'update-deps.sh'
+get_dependencies_script_path = join_paths(global_src_root_norm, 'scripts-common', get_dependencies_script_name)
 message('Downloading dependencies...')
 packman_out = run_command(get_dependencies_script_path, 'packman-external.xml', 'update-deps.log', check: true)
 message(packman_out.stdout().strip())
@@ -69,7 +70,8 @@ vs_project_defines += '_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR;'
 
 
 dxvk_compiler = meson.get_compiler('cpp')
-dxvk_is_msvc = dxvk_compiler.get_id() == 'msvc'
+dxvk_is_msvc = dxvk_compiler.get_argument_syntax() == 'msvc'
+cpp_define_prefix = dxvk_is_msvc ? '/D' : '-D'
 dxvk_is_ninja = meson.backend() == 'ninja'
 dxvk_is_woa = target_machine.cpu() == 'armv8'
 dxvk_is_woa_ec = target_machine.cpu() == 'arm64ec'
@@ -105,7 +107,7 @@ if dxvk_is_msvc
 endif
 
 if enable_rtxio == true
-  add_global_arguments('/DWITH_RTXIO', language : 'cpp')
+  add_global_arguments(cpp_define_prefix + 'WITH_RTXIO', language : 'cpp')
   vs_project_defines += 'WITH_RTXIO;'
 endif
 
@@ -121,16 +123,16 @@ if release_build
 endif
 
 if get_option('buildtype') == 'release'
-  add_project_arguments('/DNDEBUG', language : 'cpp')
+  add_project_arguments(cpp_define_prefix + 'NDEBUG', language : 'cpp')
   # note: this define depends on the build type, so it's not included in vs_project_defines
 elif get_option('buildtype') == 'debugoptimized'
-  add_project_arguments('/DDEBUG_OPTIMIZED', language : 'cpp')
+  add_project_arguments(cpp_define_prefix + 'DEBUG_OPTIMIZED', language : 'cpp')
   # note: this define depends on the build type, so it's not included in vs_project_defines
 endif
 
 if dxvk_is_ninja
   # workarounds for our strange symbol name differences when embedding MDL
-  add_global_arguments('/DBUILD_NINJA=1', language : 'cpp')
+  add_global_arguments(cpp_define_prefix + 'BUILD_NINJA=1', language : 'cpp')
   vs_project_defines += 'BUILD_NINJA=1;'
 
   if dxvk_is_woa_ec
@@ -144,11 +146,11 @@ if dxvk_is_ninja
   endif
 
 else
-  add_global_arguments('/DBUILD_NINJA=0', language : 'cpp')
+  add_global_arguments(cpp_define_prefix + 'BUILD_NINJA=0', language : 'cpp')
   vs_project_defines += 'BUILD_NINJA=0;'
 endif
 
-add_global_arguments('/DBUILD_SOURCE_ROOT="' + global_src_root_norm + '/"', language : 'cpp')
+add_global_arguments(cpp_define_prefix + 'BUILD_SOURCE_ROOT="' + global_src_root_norm + '/"', language : 'cpp')
 vs_project_defines += 'BUILD_SOURCE_ROOT="' + global_src_root_norm + '/";'
 
 # c++17 was added in 15.3, older version needs c++latest
@@ -160,7 +162,7 @@ if dxvk_is_msvc and dxvk_compiler.version().version_compare('<15.3')
     dxvk_cpp_std='c++latest'
   endif
 else
-  if dxvk_is_ninja
+  if dxvk_is_msvc and dxvk_is_ninja
     dxvk_cpp_std='vc++17'
   else
     dxvk_cpp_std='c++17'
@@ -180,8 +182,14 @@ if dxvk_compiler.get_id() == 'clang'
   endif
 endif
 
+if dxvk_compiler.get_id() == 'clang-cl'
+  add_project_arguments('/clang:-fno-strict-enums', language: 'cpp')
+endif
+
 if not dxvk_is_msvc
   add_project_arguments('-D_WIN32_WINNT=0xa00', language : 'cpp')
+  add_project_arguments('-DPXR_STATIC', language : 'cpp')
+  add_project_arguments('-DNO_AVX', '-msse4.1', language : 'cpp')
 
   if get_option('build_id') and dxvk_compiler.has_link_argument('-Wl,--build-id')
     add_global_link_arguments('-Wl,--build-id', language: 'cpp')
@@ -202,12 +210,12 @@ if not dxvk_is_msvc
 endif
 
 remix_api_include_path = include_directories('./public/include')
-add_global_arguments('/DREMIX_LIBRARY_EXPORTS=1', language : 'cpp')
+add_global_arguments(cpp_define_prefix + 'REMIX_LIBRARY_EXPORTS=1', language : 'cpp')
 
 if dxvk_is_woa
   nrc_include_path = 'external/nrc_arm64/include'
 else
-  nrc_include_path = 'submodules/nrc/include'
+  nrc_include_path = 'submodules/nrc/Include'
 endif
 
 nsight_graphics_capture_supported = target_machine.cpu_family() == 'x86_64'
@@ -250,7 +258,7 @@ endif
 dxvk_extradep = [ ]
 
 if dxvk_is_msvc
-  wrc = find_program('rc')
+  wrc = find_program(build_os == 'windows' ? 'rc' : 'scripts-common/xwin/llvm-rc')
 else
   add_global_link_arguments('-static', '-static-libgcc', language: 'c')
   add_global_link_arguments('-static', '-static-libgcc', '-static-libstdc++', language: 'cpp')
@@ -320,9 +328,15 @@ if enable_rtxio == true
 endif
 
 # Shader Compile Tools
-glsl_compiler = find_program('external/glslangvalidator/glslangValidator')
-slang_compiler = find_program('external/slang/slangc')
-spirv_val = find_program('external/spirv_tools/spirv-val')
+if build_os == 'windows'
+  glsl_compiler = find_program('external/glslangvalidator/glslangValidator')
+  slang_compiler = find_program('external/slang/slangc')
+  spirv_val = find_program('external/spirv_tools/spirv-val')
+else
+  glsl_compiler = find_program('scripts-common/wine-glslang-validator.sh')
+  slang_compiler = find_program('scripts-common/wine-slangc.sh')
+  spirv_val = find_program('scripts-common/wine-spirv-val.sh')
+endif
 python_interpreter = find_program('python3', 'python')
 shader_compile_script = join_paths(global_src_root_norm, 'scripts-common/compile_shaders.py')
 
@@ -425,11 +439,11 @@ endif
 
 rtx_shaders_runtime_command_argument_string = ' '.join(rtx_shaders_runtime_command_arguments)
 
-add_global_arguments('/DRUNTIME_SHADER_RECOMPILATION_PYTHON_ARGUMENTS="' + rtx_shaders_runtime_command_argument_string + '"', language : 'cpp')
+add_global_arguments(cpp_define_prefix + 'RUNTIME_SHADER_RECOMPILATION_PYTHON_ARGUMENTS="' + rtx_shaders_runtime_command_argument_string + '"', language : 'cpp')
 vs_project_defines += 'RUNTIME_SHADER_RECOMPILATION_PYTHON_ARGUMENTS="' + rtx_shaders_runtime_command_argument_string + '";'
-add_global_arguments('/DRUNTIME_SHADER_RECOMPILATION_SHADER_SOURCE_PATH="' + rtx_shader_source_directory + '"', language : 'cpp')
+add_global_arguments(cpp_define_prefix + 'RUNTIME_SHADER_RECOMPILATION_SHADER_SOURCE_PATH="' + rtx_shader_source_directory + '"', language : 'cpp')
 vs_project_defines += 'RUNTIME_SHADER_RECOMPILATION_SHADER_SOURCE_PATH="' + rtx_shader_source_directory + '";'
-add_global_arguments('/DRUNTIME_SHADER_RECOMPILATION_SPIRV_BINARY_OUTPUT_PATH="' + rtx_shader_output_directory + '"', language : 'cpp')
+add_global_arguments(cpp_define_prefix + 'RUNTIME_SHADER_RECOMPILATION_SPIRV_BINARY_OUTPUT_PATH="' + rtx_shader_output_directory + '"', language : 'cpp')
 vs_project_defines += 'RUNTIME_SHADER_RECOMPILATION_SPIRV_BINARY_OUTPUT_PATH="' + rtx_shader_output_directory + '";'
 
 exe_ext = ''
@@ -488,6 +502,7 @@ else
 endif
 copy_script_path = join_paths(global_src_root_norm, 'scripts-common/copy' + script_extension)
 recursive_copy_path = join_paths(global_src_root_norm, 'scripts-common/recursive_copy' + script_extension)
+install_file_script_path = join_paths(global_src_root_norm, 'scripts-common/install_file_in_dir' + script_extension)
 
 if get_option('enable_tracy')
   add_project_arguments('-DTRACY_ENABLE', language : 'cpp')
@@ -498,7 +513,11 @@ if get_option('enable_tracy')
 endif
 
 # embedding compiler
-xxd_exe = find_program('external/nv_xxd/nv_xxd')
+if build_os == 'windows'
+  xxd_exe = find_program('external/nv_xxd/nv_xxd')
+else
+  xxd_exe = find_program('scripts-common/wine-nv-xxd.sh')
+endif
 embedding_compiler = generator(xxd_exe,
     output : '@PLAINNAME@.h',
     arguments : [ '@INPUT@', '@OUTPUT@', '@BASENAME@' ]
@@ -565,7 +584,7 @@ nrc_dll_name = 'NRC_Vulkan.dll'
 if dxvk_is_woa
   nrc_dll_path = join_paths(global_src_root_norm, 'external/nrc_arm64/bin/')
 else
-  nrc_dll_path = join_paths(global_src_root_norm, 'submodules/nrc/bin/')
+  nrc_dll_path = join_paths(global_src_root_norm, 'submodules/nrc/Bin/')
 endif
 
 xess_dll_path = join_paths(global_src_root_norm, 'submodules/xess/bin/')
@@ -739,14 +758,16 @@ if dxvk_is_ninja or dxvk_is_woa_ec
     install_data(join_paths(usd_lib_path, 'bin', get_option('buildtype') == 'debug' ? 'tbbmalloc_debug.dll' : 'tbbmalloc.dll'), install_dir : output_path, install_tag: target_suffix)
     install_data(join_paths(usd_lib_path, 'bin', get_option('buildtype') == 'debug' ? 'tbb12_debug.dll' : 'tbb12.dll'), install_dir : output_path, install_tag: target_suffix)
     # Python DLL not needed for nopy USD build
-    install_data(join_paths(global_src_root_norm, 'src', 'usd-plugins', 'plugInfo.json'), install_dir : join_paths(output_path, 'usd', 'plugins'), install_tag: target_suffix) 
+    if dxvk_is_msvc and build_os == 'windows'
+      install_data(join_paths(global_src_root_norm, 'src', 'usd-plugins', 'plugInfo.json'), install_dir : join_paths(output_path, 'usd', 'plugins'), install_tag: target_suffix)
 
-    # install USD plugins
-    meson.add_install_script(
-      join_paths(global_src_root_norm, 'scripts-common/install_usd_plugins.bat'),
-      output_path,
-      install_tag: target_suffix 
-    )
+      # install USD plugins
+      meson.add_install_script(
+        join_paths(global_src_root_norm, 'scripts-common/install_usd_plugins.bat'),
+        output_path,
+        install_tag: target_suffix
+      )
+    endif
 
     install_data(join_paths(nrc_dll_path, nrc_dll_name), install_dir : output_path, install_tag: target_suffix)
     install_data(join_paths(nrc_dll_path, 'cudart64_13.dll'), install_dir : output_path, install_tag: target_suffix)
@@ -794,13 +815,13 @@ if dxvk_is_ninja or dxvk_is_woa_ec
       # intentionally using two install jobs here so we can have unique tags
       # the exe only allows test applications to be compiled and installed, without installing the runtime.  Such copy-less runtime testing scenarios exist in CI.
       meson.add_install_script(
-        join_paths(global_src_root_norm, 'scripts-common/install_file_in_dir.bat'),
+        install_file_script_path,
         src_exe, output_path,
         install_tag: target_suffix + '_exeonly'
       )
       # the regular path allows the exe to be built and deployed along with a runtime.  Such scenarios exist during local development, when launching from VS for example.
       meson.add_install_script(
-        join_paths(global_src_root_norm, 'scripts-common/install_file_in_dir.bat'),
+        install_file_script_path,
         src_exe, output_path,
         install_tag: target_suffix
       )
@@ -808,7 +829,7 @@ if dxvk_is_ninja or dxvk_is_woa_ec
 
     if t != '_output'
       meson.add_install_script(
-        join_paths(global_src_root_norm, 'scripts-common/install_file_in_dir.bat'),
+        install_file_script_path,
         join_paths(current_build_dir_norm, 'src/d3d9', 'd3d9.dll'), output_path,
         install_tag: target_suffix
       )
@@ -825,7 +846,7 @@ if dxvk_is_ninja or dxvk_is_woa_ec
 	  # ensure we copy everything to these special targets, the PDB is important!
       # A release build copies only the DLL, so the output folder holds nothing that records local paths.
       meson.add_install_script(
-        join_paths(global_src_root_norm, 'scripts-common/install_file_in_dir.bat'),
+        install_file_script_path,
         join_paths(current_build_dir_norm, 'src/d3d9', release_build ? 'd3d9.dll' : 'd3d9.*'), output_path,
         install_tag: target_suffix
       )
@@ -833,21 +854,23 @@ if dxvk_is_ninja or dxvk_is_woa_ec
 
   endforeach
 
-  # generate VS project files for ninja
-  # note: this writes to <source root>/_vs, which is outside the build directory
-  vsproj = run_command(python_interpreter,
-                      join_paths(global_src_root_norm, 'vsgen/generate_vs_project_files.py'),
-                      vs_gen_cmdline,
-                      check: false)
+  if dxvk_is_msvc and build_os == 'windows'
+    # generate VS project files for ninja
+    # note: this writes to <source root>/_vs, which is outside the build directory
+    vsproj = run_command(python_interpreter,
+                        join_paths(global_src_root_norm, 'vsgen/generate_vs_project_files.py'),
+                        vs_gen_cmdline,
+                        check: false)
 
-  if vsproj.stdout().strip() != ''
-    message(vsproj.stdout().strip())
-  endif
-  if vsproj.stderr().strip() != ''
-    message(vsproj.stderr().strip())
-  endif
-  if vsproj.returncode() != 0
-    error('generate_vs_project_files failed')
+    if vsproj.stdout().strip() != ''
+      message(vsproj.stdout().strip())
+    endif
+    if vsproj.stderr().strip() != ''
+      message(vsproj.stderr().strip())
+    endif
+    if vsproj.returncode() != 0
+      error('generate_vs_project_files failed')
+    endif
   endif
 endif # dxvk_is_ninja
 

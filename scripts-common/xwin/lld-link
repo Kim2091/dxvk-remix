@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+xwin_root="${DXVK_XWIN_ROOT:-${XDG_CACHE_HOME:-${HOME}/.cache}/xwin/dxvk-remix}"
+
+exec /usr/bin/lld-link "$@" \
+  "/libpath:${xwin_root}/crt/lib/x86_64" \
+  "/libpath:${xwin_root}/sdk/lib/ucrt/x86_64" \
+  "/libpath:${xwin_root}/sdk/lib/um/x86_64"

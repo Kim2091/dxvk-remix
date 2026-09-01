@@ -25,7 +25,7 @@
 #include <cfloat>
 #include <cmath>
 #include <filesystem>
-#include <Shlwapi.h>
+#include <shlwapi.h>
 
 #include "rtx.h"
 #include "rtx_pre_exposure.h"

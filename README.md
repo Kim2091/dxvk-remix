@@ -263,6 +263,43 @@ git submodule update --init --recursive   # if you cloned without --recursive
 .\bridge\scripts\build.ps1
 ```
 
+**Linux cross-build with clang-cl.** Linux can build the x64 Windows runtime directly with clang-cl. This is a
+cross-build: the output is still `d3d9.dll`, not a native Linux library. Only the x64 target is supported.
+
+Install Git, LLVM/clang (including `clang-cl`, `lld-link`, `llvm-lib` and `llvm-rc`), Meson, Ninja, Python 3, Wine,
+curl or wget, and Rust/Cargo. For example:
+
+```bash
+# Arch Linux
+sudo pacman -S --needed base-devel git clang lld llvm meson ninja python wine rust curl
+
+# Ubuntu/Debian
+sudo apt install build-essential git clang lld llvm meson ninja-build python3 wine64 cargo curl
+```
+
+Install [xwin](https://github.com/Jake-Shadle/xwin) and use it to get the Microsoft CRT and Windows SDK files.
+Passing `--accept-license` accepts Microsoft's license terms for those downloads.
+
+```bash
+cargo install xwin
+xwin --accept-license splat --output "${XDG_CACHE_HOME:-$HOME/.cache}/xwin/dxvk-remix"
+```
+
+Configure and build from the cloned repository. Wine runs the Windows-only shader and embedding tools during the build.
+
+```bash
+PATH="$PWD/scripts-common/xwin:$PATH" meson setup _Comp64Clang \
+  --cross-file build-win64-clang.txt \
+  --buildtype debugoptimized \
+  -Denable_tests=false
+
+PATH="$PWD/scripts-common/xwin:$PATH" meson compile -C _Comp64Clang d3d9
+```
+
+The runtime and its symbols are written to `_Comp64Clang/src/d3d9/`. For later builds, rerun only `meson compile`. Set
+`DXVK_XWIN_ROOT` before setup and compilation if the xwin files are somewhere other than the default cache path.
+Deploy the DLL together with the runtime dependencies from the same build, such as the USD and TBB DLLs.
+
 To deploy builds to games automatically, copy `gametargets.example.conf` to `gametargets.conf` and edit the paths.
 [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md) has the full walkthrough. Contributors should also read
 [AGENTS.md](AGENTS.md) (the repository rules), [branch names](docs/BRANCHING.md), the

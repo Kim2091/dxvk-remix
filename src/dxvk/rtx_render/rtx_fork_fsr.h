@@ -30,7 +30,7 @@
 #include "../util/rc/util_rc.h"
 #include "../util/rc/util_rc_ptr.h"
 
-#include <Windows.h>
+#include <windows.h>
 
 #include <string>
 #include <vector>
