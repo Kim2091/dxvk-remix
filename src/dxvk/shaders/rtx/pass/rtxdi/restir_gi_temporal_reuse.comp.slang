@@ -212,7 +212,7 @@ void main(int2 thread_id : SV_DispatchThreadID)
     float roughWeight = 1.0 - surface.opaqueSurfaceMaterialInteraction.isotropicRoughness;
     const float normalDotOutputDirection = dot(surface.opaqueSurfaceMaterialInteraction.shadingNormal, surface.minimalRayInteraction.viewDirection);
     const float albedoLuminance = calcBt709Luminance(surface.opaqueSurfaceMaterialInteraction.albedo);
-    const vec3 fresnel = evalOpaqueSchlickFresnel(surface.opaqueSurfaceMaterialInteraction.baseReflectivity, normalDotOutputDirection);
+    const vec3 fresnel = evalOpaqueSchlickFresnel(surface.opaqueSurfaceMaterialInteraction.baseReflectivity, normalDotOutputDirection, cb.opaqueMaterialArgs.fresnelGrazing);
     const float fresnelLuminance = calcBt709Luminance(fresnel);
     float specularWeight = fresnelLuminance / (fresnelLuminance + albedoLuminance);
     reflectionWeight = specularWeight * roughWeight;

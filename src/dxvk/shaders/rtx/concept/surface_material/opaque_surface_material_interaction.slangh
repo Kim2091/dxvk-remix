@@ -874,7 +874,7 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   // Note: Opacity factored into albedo and base reflectivity to ensure NEE and indirect lighting off of objects with opacity properly
   // account for how much light is being transmitted due to the opacity (similar to how Fresnel on glass works).
   opaqueSurfaceMaterialInteraction.albedo = surface.isMatte ? vec3(0) : albedoToAdjustedAlbedo(albedo, metallic, opacity);
-  opaqueSurfaceMaterialInteraction.baseReflectivity = surface.isMatte ? vec3(0) : calcBaseReflectivity(albedo, metallic, opacity);
+  opaqueSurfaceMaterialInteraction.baseReflectivity = surface.isMatte ? vec3(0) : calcBaseReflectivity(albedo, metallic, opacity, cb.opaqueMaterialArgs.specularLevel);
    
   // Note: Roughness loaded from texture is a perceptual roughness value (for optimal encoding), so this works as intended.
   calcRoughness(roughness, opaqueSurfaceMaterial.anisotropy,
@@ -1035,7 +1035,7 @@ bool opaqueSurfaceMaterialInteractionCalcLobeProbability(
   // in the albedo approximations below.
   const vec3 albedo = opaqueSurfaceMaterialInteraction.albedo;
   const vec3 fresnel =
-    evalOpaqueSchlickFresnel(opaqueSurfaceMaterialInteraction.baseReflectivity, normalDotOutputDirection);
+    evalOpaqueSchlickFresnel(opaqueSurfaceMaterialInteraction.baseReflectivity, normalDotOutputDirection, cb.opaqueMaterialArgs.fresnelGrazing);
 
   // Note: I think these should be using a preintegrated albedo calculation (e.g. the EnvBRDF approximation for specular
   // albedo), but I am not 100% sure if that is the intended "ideal" quantity to be using for a lobe's weight (when only the outgoing
@@ -1315,7 +1315,7 @@ SurfaceMaterialInteractionSample opaqueSurfaceMaterialInteractionCalcSpecularRef
   // Calculate the throughput of the sample
 
   const vec3 fresnel = evalOpaqueSchlickFresnel(
-    opaqueSurfaceMaterialInteraction.baseReflectivity, outputDirectionDotMicrofacetNormal);
+    opaqueSurfaceMaterialInteraction.baseReflectivity, outputDirectionDotMicrofacetNormal, cb.opaqueMaterialArgs.fresnelGrazing);
 
   // Todo: Pass in a material mode similar to the resolve mode to control this sort of material simplification option.
 #ifdef OPAQUE_MATERIAL_USE_THIN_FILM
@@ -1430,7 +1430,7 @@ SurfaceMaterialInteractionSample opaqueSurfaceMaterialInteractionCalcDiffuseTran
   const float /* o.h */ outputDirectionDotMicrofacetNormal = outputDirection.z;
 
   const vec3 fresnel = evalOpaqueSchlickFresnel(
-    opaqueSurfaceMaterialInteraction.baseReflectivity, outputDirectionDotMicrofacetNormal);
+    opaqueSurfaceMaterialInteraction.baseReflectivity, outputDirectionDotMicrofacetNormal, cb.opaqueMaterialArgs.fresnelGrazing);
   const vec3 transmissionFresnel = vec3(1.0f, 1.0f, 1.0f) - fresnel;
 
   SurfaceMaterialInteractionSample materialSample;
@@ -1633,7 +1633,7 @@ SurfaceMaterialInteractionPSRSample opaqueSurfaceMaterialInteractionCalcPSRRefle
   // Calculate the attenuation of the sample
 
   const vec3 fresnel = evalOpaqueSchlickFresnel(
-    opaqueSurfaceMaterialInteraction.baseReflectivity, outputDirectionDotMicrofacetNormal);
+    opaqueSurfaceMaterialInteraction.baseReflectivity, outputDirectionDotMicrofacetNormal, cb.opaqueMaterialArgs.fresnelGrazing);
 
   // Todo: Pass in a material mode similar to the resolve mode to control this sort of material simplification option.
 #ifdef OPAQUE_MATERIAL_USE_THIN_FILM
@@ -1879,7 +1879,7 @@ SurfaceMaterialInteractionSplitWeight opaqueSurfaceMaterialInteractionCalcApprox
   }
 
   // Calculate the weight
-  const vec3 fresnel = evalOpaqueSchlickFresnel(opaqueSurfaceMaterialInteraction.baseReflectivity, outputDirectionDotMicrofacetNormal);
+  const vec3 fresnel = evalOpaqueSchlickFresnel(opaqueSurfaceMaterialInteraction.baseReflectivity, outputDirectionDotMicrofacetNormal, cb.opaqueMaterialArgs.fresnelGrazing);
   const float normalDistributionFunction = evalGGXNormalDistributionIsotropic(opaqueSurfaceMaterialInteraction.isotropicRoughness, normalDotMicrofacetNormal);
   // Note: Actual shadowing/masking (G) function omitted from visibility calculation for a cheaper approximation.
   const float visibility = safePositiveDivide(float(1), float(4) * normalDotInputDirection * normalDotOutputDirection, materialEpsilon);
@@ -1958,7 +1958,7 @@ SurfaceMaterialInteractionSplitWeight opaqueSurfaceMaterialInteractionCalcProjec
   // Calculate the weight
 
   const vec3 fresnel = evalOpaqueSchlickFresnel(
-    opaqueSurfaceMaterialInteraction.baseReflectivity, outputDirectionDotMicrofacetNormal);
+    opaqueSurfaceMaterialInteraction.baseReflectivity, outputDirectionDotMicrofacetNormal, cb.opaqueMaterialArgs.fresnelGrazing);
 
   // Todo: Pass in a material mode similar to the resolve mode to control this sort of material simplification option.
 #ifdef OPAQUE_MATERIAL_USE_THIN_FILM
