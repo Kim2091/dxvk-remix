@@ -358,25 +358,39 @@ vec3 evalSunShadowing(vec3 samplePos, vec3 sunDir, Texture2D transmittanceLut,
     transmittanceLut, lutSampler, max(radius - args.planetRadius, 0.0f), sunZenithCosAngle, args);
 }
 
-// evalSunShadowing for a march sample that may have fallen below the planet's surface, shading it
-// as the ground point directly above it instead of as buried rock.
+// evalSunShadowing for a march sample that has fallen below the atmosphere frame's ground plane,
+// shading it at the surface directly above instead of as buried rock.
 //
-// The atmosphere frame puts its origin ON the surface, directly under the camera, so every ray
-// aimed below the horizon is underground from its very first step. Those samples are not really
-// inside the planet: the game's world continues below the camera, and the lower half of the sky
-// stands in for distant terrain the atmosphere model knows nothing about. Treating them as the
-// ground-level air they stand in for keeps that half a continuation of the horizon haze, with the
-// sun's phase glow intact.
+// The aerial perspective volume is the only caller, and only it should be. That volume integrates
+// the air between the camera and real scene geometry, and its frame puts the ground at the camera's
+// own altitude - but the world has relief on both sides of that plane. Terrain standing below the
+// camera is reached through samples the planet model calls underground, and evalPlanetShadow zeroes
+// the sun at every one of them, so the column loses its single-scatter term outright.
 //
-// Without the clamp evalPlanetShadow returns zero for every one of them, so single scattering
-// vanishes and only the multiscatter fill survives. That fill carries no phase term and, at ground
-// level, no directional variation either — every below-horizon direction integrates the same
-// nearly-constant value, which is what turns the lower half of the daytime sky into one flat dark
-// disc. Nights look unaffected only because the deep-night fade in evalSkyRadiance scales the whole
-// atmosphere term to zero and the stars, airglow and moons that remain are composited on top.
+// That is what produces a hard horizontal line across the view with distant terrain hazed above it
+// and bare below. The edge is sharp for a reason worth recording: evalPlanetShadow insets its test
+// sphere by planetRadius * 1e-5, which at Earth radius is 64 m, so the term does not die at the
+// horizon but at a fixed DEPTH of 64 m below the frame origin. A fixed depth subtends an angle that
+// shrinks as 1/distance, and the pixels nearest the horizon are the ones looking at the farthest
+// terrain and therefore carrying the most haze - so the transition is sharpest exactly where it is
+// most visible. Extinction meanwhile keeps accruing, and the volume's alpha is achromatic, so the
+// region below the line is dimmed without being hazed rather than left untouched.
 //
-// A no-op for any sample at or above the surface, so above-horizon rays are untouched — including
-// the planet shadow rising into the atmosphere at sunset, which this must not defeat.
+// The density lookup in that same march already treats these samples as ground-level air, clamping
+// altitude into [0, atmosphereThickness]. This is that clamp applied to the visibility term so the
+// two agree about where the air is.
+//
+// A strict no-op at or above the surface: for any ray leaving the origin with dirYUp.y >= 0 the
+// sample radius exceeds planetRadius for all t > 0, so the branch cannot fire and aerial
+// perspective above the horizon is untouched. It is also a no-op within the 64 m epsilon band,
+// where the transmittance lookup was already being called with a clamped altitude of zero - so the
+// only samples whose result changes are precisely the ones that were wrongly zeroed. The clamped
+// point sits at radius planetRadius, outside the inset shadow sphere, so it still runs a genuine
+// horizon test and still returns zero once the sun sets.
+//
+// The sky path deliberately does NOT use this. Marching real air below the horizon is what paints a
+// second sun down there, because the ray keeps the sun's Mie phase term; the sky answers the
+// question at lookup time instead. See sampleSkyViewLutForRay.
 vec3 evalSunShadowingClampedToSurface(vec3 samplePos, vec3 sunDir, Texture2D transmittanceLut,
                                       SamplerState lutSampler, AtmosphereArgs args) {
   const vec3 planetCenter = getPlanetCenter(args);
@@ -462,19 +476,14 @@ vec3 evalAtmosphereRadiance(
     t0 = 0.0f;  // Start from camera position
   }
   
-  // Stop at the planet's surface, but only for an origin genuinely above it.
-  //
-  // Every caller marches from the atmosphere frame's origin, which sits ON the surface — so for a
-  // ray aimed below the horizon the near root is exactly t == 0 and this clamp deliberately does
-  // not fire. Terminating there would collapse the span to nothing and return black for the whole
-  // lower hemisphere. The march continues instead, and evalSunShadowingClampedToSurface shades the
-  // resulting sub-surface samples as the ground-level air they stand in for; see that helper.
+  // Check if ray intersects planet
   float tPlanet0, tPlanet1;
-  const bool hitsPlanet = intersectSphere(rayOrigin, rayDir, planetCenter, args.planetRadius, tPlanet0, tPlanet1);
-
+  bool hitsPlanet = intersectSphere(rayOrigin, rayDir, planetCenter, args.planetRadius, tPlanet0, tPlanet1);
+  
+  // Clamp to valid range
   t0 = max(0.0f, t0);
   if (hitsPlanet && tPlanet0 > 0.0f) {
-    t1 = tPlanet0;
+    t1 = tPlanet0;  // Stop at planet surface
   }
   
   if (t1 <= t0) {
@@ -567,7 +576,7 @@ vec3 evalAtmosphereRadiance(
     // Earth's shadow rise into the atmosphere at sunset.
     vec3 up = normalize(samplePos - planetCenter);
     float sunZenithCosAngle = dot(up, normalize(sunDir));
-    vec3 sunTransmittance = evalSunShadowingClampedToSurface(samplePos, normalize(sunDir), transmittanceLut, transmittanceLutSampler, args);
+    vec3 sunTransmittance = evalSunShadowing(samplePos, normalize(sunDir), transmittanceLut, transmittanceLutSampler, args);
 
     // Multiscattering: blended between analytical (preset-faithful, artistic
     // control surface) and LUT-based hemisphere integration (physical, Hillaire
@@ -980,27 +989,92 @@ vec3 sampleSkyAmbientForVolume(vec3 dirYUp,
 // not depend on).
 //
 // Differs from sampleSkyAmbientForVolume in two ways: no cloud-transmittance
-// multiplication, and no below-horizon clamp — the sky-miss path needs the
-// full sphere because the atmosphereFade ramp in evalSkyRadiance multiplies
-// the result down to zero at deep night for any direction. Both halves of the
-// LUT are populated by the bake (uv.y ∈ [0, 1] maps elevation [-π/2, +π/2]).
+// multiplication, and a below-horizon reconstruction rather than a clamp to zero.
+//
+// The LUT's lower half is unusable, and it is worth being precise about why,
+// because it is not the bake being wrong. The bake marches from an eye sitting
+// exactly ON the planet sphere, so for any downward ray the near root is exactly
+// t == 0, the `tPlanet0 > 0` ground truncation never fires, and the march runs
+// through the planet's interior — where evalPlanetShadow correctly reports every
+// sample as occluded. Two things then zero it: single scattering dies with the
+// planet shadow, and the multiscattering LUT's row 0 is itself exactly zero
+// (computeMultiscattering also samples from the surface, so every one of its
+// directions terminates at t == 0). The result is not a dark slab but exact
+// black past roughly 2 to 5 degrees of depression, with a ~63 m worth of
+// surface epsilon as the only transition. That step against a bright horizon is
+// the hard edge.
+//
+// Before the EGSR 2020 rewrite neither mechanism existed, and the same march
+// simply ran on through the planet with the air flattened to sea level. Measured
+// against a reimplementation of that older pipeline, what it produced was:
+//
+//   - away from the sun, the horizon's colour held essentially unchanged all the
+//     way to the nadir (+9 to +13% red, within 2% on green and blue),
+//   - on the sun's azimuth at low sun, a sharp falloff instead — down to 0.07 of
+//     the horizon in red with the sun at 3 degrees — because the horizon carries
+//     the Mie aureole (g = 0.97) and a downward ray's phase angle does not,
+//   - at the nadir, a single azimuth-independent colour, numerically within a few
+//     percent of the horizon colour 90 degrees off the sun.
+//
+// So: relax each direction from its own azimuth's horizon colour toward the
+// azimuth-averaged one, approximated by the two azimuths 90 degrees away. That
+// reproduces all three behaviours at once — it holds the horizon away from the
+// sun, it suppresses the aureole on the sun's azimuth (the cross-azimuth pair
+// does not carry it), and it converges to one colour at the nadir. Crucially it
+// never paints a second sun, which is what marching real air down there does.
+//
+// The weight is 1 - exp(-sin(depression) * rate), zero at the horizon, so the two
+// halves meet with no seam and no discontinuity in the first derivative either.
+// Same construction as the night sky's airglowHorizonBoost, which is why that has
+// never shown an edge. Fit against the measured relaxation, at rate 6: 0.41 vs
+// 0.45 at -5 degrees, 0.79 vs 0.75 at -15, 0.95 vs 0.87 at -30, 0.998 vs 1.00 at
+// the nadir.
+//
+// The cloud sky-bleed in evalSkyRadiance is deliberately left alone. It is also
+// held at the horizon row below the horizon, which is what it did before the
+// rewrite too, and it matches this hold-the-horizon behaviour. Fading it is what
+// makes the region read as a flat slab at a different value.
 //
 // dirYUp must be normalized and in Y-up space; caller does the isZUp swap.
 vec3 sampleSkyViewLutForRay(vec3 dirYUp,
+                            AtmosphereArgs args,
                             Texture2D<float4> skyViewLut,
                             SamplerState lutSampler) {
   // Direction -> (azimuth, elevation) UV. Mirrors sky_view_lut.comp.slang:52-53
   // exactly so the bake and the lookup agree on the parameterization.
-  float elevation = asin(clamp(dirYUp.y, -1.0f, 1.0f));
+  //
+  // saturate rather than clamp(-1, 1): every below-horizon direction lands on the
+  // horizon row of its own azimuth, the convention cloudDomeDirToUv already uses.
+  // Above the horizon the two are identical, so the visible sky is bit-for-bit
+  // unchanged by this function.
+  float elevation = asin(saturate(dirYUp.y));
   float azimuth = atan2(dirYUp.z, dirYUp.x);
   if (azimuth < 0.0f) azimuth += 2.0f * kPi;
   // Non-linear elevation encoding: must match sky_view_lut.comp.slang bake transform.
   // Concentrates texels near the horizon where color changes most rapidly.
   float elevSign = sign(elevation);
   float elevV = elevSign * sqrt(abs(elevation) / (kPi * 0.5f)) * 0.5f + 0.5f;
-  vec2 uv = vec2(azimuth / (2.0f * kPi), elevV);
+  const float u = azimuth / (2.0f * kPi);
 
-  return skyViewLut.SampleLevel(lutSampler, uv, 0).rgb;
+  vec3 radiance = skyViewLut.SampleLevel(lutSampler, vec2(u, elevV), 0).rgb;
+
+  const float belowHorizon = max(-dirYUp.y, 0.0f);  // sin(depression angle)
+  if (belowHorizon <= 0.0f) {
+    return radiance;
+  }
+
+  // The azimuth-averaged horizon, approximated by the two azimuths 90 degrees
+  // away. The sampler is REPEAT-U for exactly this kind of azimuth arithmetic, so
+  // u +/- 0.25 needs no wrap handling. Two extra taps, on below-horizon pixels only.
+  const vec3 cross0 = skyViewLut.SampleLevel(lutSampler, vec2(u + 0.25f, elevV), 0).rgb;
+  const vec3 cross1 = skyViewLut.SampleLevel(lutSampler, vec2(u - 0.25f, elevV), 0).rgb;
+
+  const float w = 1.0f - exp(-belowHorizon * max(args.skyBelowHorizonRelaxRate, 0.0f));
+  radiance = lerp(radiance, 0.5f * (cross0 + cross1), w);
+
+  // Nadir brightness, ramped through the same weight so the horizon itself is
+  // untouched no matter how this is set. 1.0 reproduces the pre-rewrite measurement.
+  return radiance * lerp(1.0f, max(args.skyBelowHorizonNadirScale, 0.0f), w);
 }
 
 // Structure for volumetric sun light sample
@@ -2121,10 +2195,7 @@ vec3 evalAtmosphereInScatterSegment<TSunOccluder : IAtmosphereSunOccluder>(
 
   t0 = max(max(0.0f, t0), startDistance);
 
-  // Stop at the planet surface, then at the caller's far bound. As in evalAtmosphereRadiance this
-  // never fires for a ray aimed below the horizon, because the march origin sits on the surface and
-  // the near root is then t == 0 — which is what lets the volume keep hazing scene geometry that
-  // stands below the camera.
+  // Stop at the planet surface, then at the caller's far bound.
   float tPlanet0, tPlanet1;
   const bool hitsPlanet = intersectSphere(rayOrigin, rayDir, planetCenter, args.planetRadius, tPlanet0, tPlanet1);
   if (hitsPlanet && tPlanet0 > 0.0f) {

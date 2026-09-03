@@ -515,7 +515,13 @@ struct AtmosphereArgs {
                                       // pad_cloudSunsetAmbient0 slot; CB layout unchanged.
 
   // ----- Cloud-edge / halo tuning (fork — 2026-06-13). Exposed live in ImGui. -----
-  float padRetired9;                  // retired: legacy view coverage-gate softness.
+  // Below-horizon sky (fork). See sampleSkyViewLutForRay for the full account; in short, the
+  // sky-view LUT's lower half bakes to black because the march starts on the planet's surface, and
+  // before the EGSR 2020 rewrite it did not, which is where the gradient people remember came from.
+  // These reproduce that measured behaviour at lookup time without touching any bake.
+  //
+  // Ride the former padRetired9 / padRetired11 slots; CB layout unchanged.
+  float skyBelowHorizonRelaxRate;     // Rate the lower sky relaxes to the azimuth-averaged horizon.
   float cloudEdgeAmbientFade;         // Density at which a thin sample's (horizon-tinted) ambient
                                       // reaches full strength [0..~0.5]. Below it the ambient fades
                                       // toward 0 so the soft skirt doesn't read as grey-brown haze.
@@ -524,7 +530,7 @@ struct AtmosphereArgs {
   // sun term where it was added to the froxel SH in volume_integrator.slangh.
   // That injection was removed on 2026-06-28 (it double-counted the sun, which
   // is already sampled by the volume NEE loop), leaving this with no consumer.
-  float padRetired11;
+  float skyBelowHorizonNadirScale;    // Brightness reached at the nadir. 1.0 = hold horizon brightness.
 
   // ----- Artistic sunset color controls (fork — 2026-06-14) -----
   // Counteract the desaturation introduced when sunset reddening moved onto the

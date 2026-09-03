@@ -382,6 +382,10 @@ namespace {
     args.cameraRight                 = vec3(0.0f, 0.0f, 0.0f);
     args.cameraUp                    = vec3(0.0f, 0.0f, 0.0f);
     args.skyIndirectRadianceScale    = 0.0f;
+    // Read by sampleSkyViewLutForRay at lookup time and by no bake at all, so they must not key the
+    // LUT cascade - without this, dragging either slider re-bakes the whole cascade for nothing.
+    args.skyBelowHorizonRelaxRate    = 0.0f;
+    args.skyBelowHorizonNadirScale   = 0.0f;
     args.lightningStrikePosKm        = vec3(0.0f, 0.0f, 0.0f);
     args.lightningFlashIntensity     = 0.0f;
     args.lightningEnvelope           = 0.0f;
@@ -1037,9 +1041,9 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
   args.cloudLightingLodThreshold = RtxAtmosphere::cloudLightingLodThreshold();
   args.padRetired7 = 0.0f;
   args.padRetired8 = 0u;
-  args.padRetired9 = 0.0f;
+  args.skyBelowHorizonRelaxRate = std::max(RtxAtmosphere::skyBelowHorizonRelaxRate(), 0.0f);
   args.padRetired10 = 0.0f;
-  args.padRetired11 = 0.0f;
+  args.skyBelowHorizonNadirScale = std::max(RtxAtmosphere::skyBelowHorizonNadirScale(), 0.0f);
 
   return args;
 }

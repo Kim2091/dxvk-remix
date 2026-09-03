@@ -962,6 +962,27 @@ public:
                "LUT taps, night sky, moons, cloud composite, temporal "
                "smoothing I/O). Sky renders grey while unchecked.");
 
+    RTX_OPTION("rtx.atmosphere", float, skyBelowHorizonRelaxRate, 6.0f,
+               "How quickly the sky below the horizon relaxes from its own "
+               "azimuth's horizon colour toward the azimuth-averaged one. The "
+               "sky-view LUT bakes its lower half to black - the march starts "
+               "on the planet surface, so it runs through the planet where the "
+               "sun is correctly occluded - so below the horizon the lookup "
+               "reconstructs from the horizon row instead. Relaxing across "
+               "azimuth is what reproduces the pre-EGSR-2020 behaviour: the "
+               "horizon colour holds away from the sun, but the Mie aureole on "
+               "the sun's azimuth does not bleed downward into a second sun. "
+               "Lower spreads the relaxation further down; higher tightens it "
+               "to the horizon. Default 6.0, fitted to the old pipeline.");
+
+    RTX_OPTION("rtx.atmosphere", float, skyBelowHorizonNadirScale, 1.0f,
+               "Brightness looking straight down, as a fraction of the horizon. "
+               "Ramped in through the same weight as the relaxation, so the "
+               "horizon itself is unaffected at any setting. 1.0 (default) holds "
+               "horizon brightness all the way down, which is what the sky did "
+               "before the EGSR 2020 rewrite; lower it to darken the lower "
+               "hemisphere toward the ground.");
+
     RTX_OPTION("rtx.atmosphere", float, skyViewRebakeGranularityDeg, 0.1f,
                "Angular granularity (degrees) of sun/moon motion that "
                "triggers a sky-view LUT re-bake. Default 0.1 (in-game "

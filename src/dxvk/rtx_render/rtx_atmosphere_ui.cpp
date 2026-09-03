@@ -908,6 +908,23 @@ void RtxAtmosphere::showImguiSettings(WeatherBlender* blender) {
             ">1 amplifies the warm horizon hues the physical model renders accurately but undersaturated; 1.0 = no change. "
             "Feeds the sky-view LUT, so clouds inherit the warmer ambient.");
 
+        // Below-horizon sky. Neither feeds a bake - both act at lookup time in
+        // sampleSkyViewLutForRay - so they are live with no LUT re-bake behind them.
+        RemixGui::DragFloat("Below-Horizon Relax Rate", &RtxAtmosphere::skyBelowHorizonRelaxRateObject(), 0.1f, 0.0f, 30.0f, "%.2f", sliderFlags);
+        RemixGui::SetTooltipToLastWidgetOnHover(
+            "How quickly the sky below the horizon relaxes from its own azimuth's horizon colour toward the "
+            "azimuth-averaged one. The LUT's lower half bakes to black (the march starts on the planet surface and "
+            "runs through the planet, where the sun is correctly occluded), so below the horizon the lookup "
+            "reconstructs from the horizon row. Relaxing across azimuth is what holds the horizon colour away from "
+            "the sun while stopping the sun's Mie aureole bleeding downward as a second sun. Lower spreads the "
+            "relaxation further down; higher tightens it to the horizon. 6.0 is fitted to the pre-EGSR-2020 sky.");
+
+        RemixGui::DragFloat("Below-Horizon Nadir Scale", &RtxAtmosphere::skyBelowHorizonNadirScaleObject(), 0.01f, 0.0f, 2.0f, "%.2f", sliderFlags);
+        RemixGui::SetTooltipToLastWidgetOnHover(
+            "Brightness looking straight down, as a fraction of the horizon's. Ramped in through the same weight as "
+            "the relaxation, so the horizon is unaffected at any setting. 1.0 holds horizon brightness all the way "
+            "down, matching the old sky; lower to darken the lower hemisphere toward the ground.");
+
         dragFloatWithWeatherOverride(
             "Sky Indirect Scale", &RtxAtmosphere::skyIndirectRadianceScaleObject(),
             WEATHER_OVERRIDE_PTR(skyIndirectRadianceScale),
