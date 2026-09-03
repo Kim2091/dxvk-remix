@@ -29,13 +29,18 @@ runtime.
 
 - **Batched mesh creation** — `CreateMeshBatched` for high-throughput
   geometry submission paths.
+- **Batched mesh updates** — `UpdateMeshBatched` rewrites an existing
+  external mesh's vertex data in place, keeping temporal identity (and
+  therefore motion vectors) for geometry the game regenerates every
+  frame. See [Dolphin and resident-host support](#dolphin-and-resident-host-support).
 - **Batched light creation + deferred updates** — `CreateLightBatched`,
   `UpdateLightDefinition` for per-frame light churn.
 - **UI state query/set** — `GetUIState` / `SetUIState` so plugins can
   observe and drive Remix's developer UI from outside the runtime.
-- **Texture-hash category mutation** — `AddTextureHash`,
+- **Texture-hash category mutation and readback** — `AddTextureHash`,
   `RemoveTextureHash`, `dxvk_GetTextureHash` for plugin-driven texture
-  classification at runtime.
+  classification at runtime, plus `GetTextureHashList` to read back a
+  snapshot of any `HashSet` RtxOption by full option name.
 - **D3D11 shared-texture handles** — `dxvk_GetSharedD3D11TextureHandle`
   for interop with D3D11-side rendering paths.
 - **VRAM control** — `RequestTextureVramFree`, `RequestVramCompaction`,
@@ -100,6 +105,121 @@ the apply pass always runs in operator-only mode.
 - **HW skinning** with capture and replacement parity, so skinned
   meshes injected via the Remix API path participate in capture and
   asset replacement the same as fixed-pipeline geometry.
+
+### Dolphin and resident-host support
+
+The runtime half of the Dolphin Remix backend (client:
+[`Kim2091/dolphin`](https://github.com/Kim2091/dolphin) branch
+`remix-backend`, which vendors `remix_c.h` from
+`feat/numos-panel-curation` @ `08cccb4c`). Dolphin drives Remix
+entirely through the C API and keeps one process alive across many
+games — two things that broke assumptions the runtime had never had
+to question.
+
+**Running several games from one process**
+
+- **Per-game paths and config re-resolved** — a host that points the
+  path and config env vars at a different folder before each game was
+  ignored: both were resolved once under run-once guards, so a
+  resident runtime kept reading and saving into the first game's
+  files. `CreateD3D9` now refreshes `RtxFileSys` and the log when the
+  path vars change, and `RtxOptions::Create`'s repeat-call path
+  rebuilds the system option layers when the config vars change.
+  Unchanged environment runs none of it.
+- **`DXVK_USER_CONFIG_FILE`** — `user.conf` was the one config layer
+  whose path could not be redirected, resolved as a bare filename
+  against the working directory. It now goes through the same
+  `createLayersFromEnvVar` path as `dxvk.conf` and `rtx.conf`. Every
+  edit made in the Remix UI targets the user layer, so without this
+  one game's tagged hashes landed in another game's settings.
+- **Window subclasses detached when the device is destroyed** —
+  `remixapi_Shutdown` force-releases the device to a zero refcount
+  regardless of who else holds one, so the swapchain outlived its
+  parent and `D3D9WindowProc` walked into freed memory on the host
+  application's UI thread.
+- **Sentry shut down before runtime unload**, so a later exception
+  cannot dispatch into unmapped module code.
+- **Number formatting pinned to `std::locale::classic()`** in
+  `dxvk::str::format` and `Config::generateOptionString`. A host can
+  replace the global locale out from under the runtime — Dolphin does,
+  at startup — and every hash printed or written to `rtx.conf` came
+  out digit-grouped (`1,AC8,CA7,5E4,0AA,123`). The read side is
+  `stoull`/`strtoull`, which is C-locale and stops at the first
+  separator, so none of it round-tripped.
+
+**Texture categorization on the API path**
+
+- **Dev-menu categories now reach API-submitted draws** — Sky, Ignore
+  and the rest of the grid-assigned categories never applied to
+  API geometry. The hook resolved identity from the albedo hash
+  alone, so untextured draws had none at all — and untextured is
+  exactly what the occluders turned out to be. Identity now falls
+  back to the client's own `remixapi_MeshInfo::hash`, and the hook
+  resets to the client-supplied categories and camera type before
+  applying, since `submitExternalDraw` reuses one `DrawCallState`
+  across every submesh while `setCategory` is add-only.
+- **`GetTextureHashList`** — categories could be mutated from the
+  client (`AddTextureHash` / `RemoveTextureHash`) but never read
+  back, so a client routing its own draws — Dolphin's screen-overlay
+  UI path, where `rtx.uiTextures` has no runtime consumer — could not
+  learn what the user had tagged. Returns a snapshot of any `HashSet`
+  RtxOption by full option name.
+- **Make Emissive category** (`rtx.emissiveTextures` +
+  `rtx.emissiveTexturesIntensity`, USD `remix_category:make_emissive`,
+  API bit `MAKE_EMISSIVE`) patches the tagged draw's opaque material
+  to emit from its albedo. **Ignore Alpha Channel** is fixed on the
+  API path in the same change: its real effect was a material flag
+  set only in D3D9's legacy→opaque conversion, so the tag was inert
+  for API-created materials. Both are now applied by one fork hook at
+  instance update, covering both draw paths.
+- **Tagging view** — an untextured element has no thumbnail, so it
+  never appears in the grid and clicking it in the world is its only
+  entry point; routing the 2D layer into the world is something only
+  the host can do, since overlay draws never become runtime draw
+  calls. The dev menu publishes the request through the existing
+  game-state store as `__remix.tagging.worldView`, with an automatic
+  mode under `__remix.tagging.worldViewFollowsMenu` that follows the
+  menu's open state. Host-seeded, so a title with no host listening
+  shows nothing rather than a control that silently does nothing.
+- **Emissive tag strength surfaced** —
+  `rtx.emissiveTexturesIntensity` had no widget anywhere and was
+  reachable only by hand-editing `rtx.conf`. It now appears both in
+  the Make Emissive category and in Lighting under the global
+  Emissive Intensity it multiplies against.
+- **Ignore takes precedence over Sky**, and a category change
+  bypasses the preserve path for one dynamic update. The preserve
+  path is **off by default** — not broadly compatible yet.
+
+**External mesh correctness**
+
+- **`UpdateMeshBatched`** — games that CPU-skin characters resubmit
+  new vertex bytes every frame, and recreating the mesh each time
+  destroys temporal identity, so that geometry rendered with zero
+  motion vectors and ghosted under DLSS/RR. The batched-only entry
+  point rewrites an existing external mesh's vertex data in place, on
+  a fresh buffer rather than the live mapped one, and bumps
+  `hashes[VertexShader]` so the BLAS is refit with history buffers
+  populated and the mesh gains real per-vertex motion vectors.
+- **Capture crash on skinned external meshes fixed** — on the API
+  path bones-per-vertex is a mesh property while the bone matrices
+  arrive per-instance, and `toRtDrawState` parses the EXT before the
+  mesh handle is resolved, so `numBonesPerVertex` stayed 0 with
+  `numBones > 0`. The skinning dispatch reads the geometry's copy and
+  worked; the capturer reads the instance's copy, and its
+  `(bonesPerVertex - 1)` weight loop underflowed `size_t` and read off
+  the end of the blend-weight buffer, killing the process on every
+  capture of a scene containing an API-skinned mesh.
+- **External mesh replacement lifetime fixed** — replaced external
+  draws were stale-on-arrival (`frameLastSeen == 0`), so their
+  `ReplacementInstance` was destroyed in the same present it was
+  created, before the TLAS build; what rendered historically was
+  zombie instances. Adds the `rtx.logReplacementInstanceGC`
+  diagnostics that measured the mechanism.
+- **`includeOriginal` replacement prims resolve their client
+  material** — the external replacement branch passed a blank
+  `LegacyMaterialData` default, so an enhanced anchor mesh rendered
+  solid white. Latent until the lifetime fix above, because that prim
+  never previously survived to the TLAS.
 
 ### Capture and overlay quality-of-life
 
