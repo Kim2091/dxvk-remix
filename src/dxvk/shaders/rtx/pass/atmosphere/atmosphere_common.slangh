@@ -1892,10 +1892,46 @@ bool intersectCloudSlabRay(vec3 originYUpKm, vec3 dirYUp, AtmosphereArgs args,
   return tExitKm > 0.0f;
 }
 
-// Camera-centered grid -> UVW for trilinear sampling.
-// Horizontal axes tile-wrap (`frac()`); vertical clamps to the slab.
-// Camera-origin convention: cloud math elsewhere treats the camera as the
-// world origin in Y-up space, so the grid is anchored at the origin too.
+// Horizontal resolution of the D_sun / D_ambient voxel grids. Mirrors
+// RtxAtmosphere::kCloudVoxelGridX / kCloudVoxelGridZ (rtx_atmosphere.h:1317-1319) — the two must
+// stay in lockstep, because this value sets the snap step below and its CPU twin sets the grid's
+// cache key (normalizeForVoxelGridKey, rtx_atmosphere.cpp).
+static const float kCloudVoxelGridResolutionXZ = 256.0f;
+
+// Origin of the D_sun / D_ambient voxel box, in world-anchored Y-up km, snapped to a whole voxel.
+//
+// (fork — 2026-09-05, world-space cloud migration Stage 3.) THE bug this stage exists to fix: the
+// bake and the sample disagreed about which frame the grid lived in.
+//
+//   * Bake side: cloudVoxelUVWToWorld returned positions in [-half,+half] around ZERO — a
+//     camera-RELATIVE offset — and the bake integrand then added args.cameraWorldPosYUpKm back on
+//     to reach the 2D control fields (cloud_nubis3_common.slangh, the sampleXZKm line).
+//   * Sample side: cloudVoxelWorldToUVW is handed march positions, which are
+//     cameraWorldPosYUpKm + dir*t — already world-ABSOLUTE — and subtracted nothing.
+//
+// The two were therefore offset from one another by exactly cameraWorldPosYUpKm. That was
+// invisible for as long as the anchor was identically zero, which Stage 0 measured to be the case
+// on Gamebryo/Fallout: New Vegas — and which Stage 2 ended. Past that point the march samples the
+// wrong voxel, by an error that grows with how far the anchor has travelled. It cannot be papered
+// over by relying on frac() to wrap the difference away either: the hex de-tiling lattice is a
+// golden-ratio lattice and is NOT periodic over the grid extent, so the field baked at one origin
+// is genuinely not the field rendered at another. cloud_nvdf.h:39-40 already warned that these
+// grids' comments and UVW mapping disagreed; this is that disagreement, named and removed.
+//
+// The fix is one origin that both sides call. Snapping it to a whole voxel is what stops the grid
+// shimmering under motion: an unsnapped origin would re-sample at a sub-voxel offset every frame,
+// so a static cloud would crawl. floor() (not round()) matches the CPU cache key exactly.
+vec3 cloudVoxelGridOriginKm(AtmosphereArgs args) {
+  const float voxelSizeXZ = max(args.cloudVoxelGridExtentKm / kCloudVoxelGridResolutionXZ, 1e-6f);
+  const float originX = floor(args.cameraWorldPosYUpKm.x / voxelSizeXZ) * voxelSizeXZ;
+  const float originZ = floor(args.cameraWorldPosYUpKm.z / voxelSizeXZ) * voxelSizeXZ;
+  // No vertical term: the box's vertical span is the slab itself, addressed by altitude below,
+  // not by an origin offset.
+  return vec3(originX, 0.0f, originZ);
+}
+
+// World (Y-up km, ABSOLUTE) -> UVW for trilinear sampling.
+// Horizontal axes tile-wrap (`frac()`) about the snapped grid origin; vertical clamps to the slab.
 vec3 cloudVoxelWorldToUVW(vec3 worldPosKm, AtmosphereArgs args, bool isZUp) {
   // Convert to Y-up if the caller is in Z-up space.
   //
@@ -1910,34 +1946,57 @@ vec3 cloudVoxelWorldToUVW(vec3 worldPosKm, AtmosphereArgs args, bool isZUp) {
 
   const float halfExtent = 0.5f * args.cloudVoxelGridExtentKm;
   const float invExtent  = 1.0f / max(args.cloudVoxelGridExtentKm, 0.0001f);
-  const float invVert    = 1.0f / max(args.cloudVoxelGridVerticalKm, 0.0001f);
 
-  float u = frac((posYUp.x + halfExtent) * invExtent);
-  float w = frac((posYUp.z + halfExtent) * invExtent);
-  // Vertical: 0 at slab bottom (cloudAltitude), 1 at slab top.
-  //
-  // TODO(world-space cloud migration Stage 3): this `v` still uses a FLAT vertical — a plain
-  // Y-minus-altitude offset with no reference to getPlanetCenter / getPlanetCenterWorldKm at all.
-  // Stage 1 (2026-09-05) deliberately left it alone: the D_sun/D_ambient voxel grid this feeds is
-  // baked and sampled entirely in the camera-relative frame over a span of kilometers, where planet
-  // curvature is invisible at float precision, so re-anchoring it now would be a no-op change wearing
-  // a risky diff. Re-anchoring it for real is Stage 3's job (grid re-anchoring), and doing it here
-  // would muddy Stage 1's acceptance test — a ground-level A/B expected to be near-identical to
-  // pre-migration behavior at planetRadius=952.
-  float v = saturate((posYUp.y - args.cloudAltitude) * invVert);
+  // Rebase onto the shared snapped origin so this agrees with cloudVoxelUVWToWorld's inverse
+  // (fork — 2026-09-05, Stage 3). With cameraWorldPosYUpKm == 0 the origin snaps to zero and
+  // `rel` is `posYUp`, i.e. this reduces exactly to the pre-Stage-3 mapping.
+  const vec3 rel = posYUp - cloudVoxelGridOriginKm(args);
+
+  float u = frac((rel.x + halfExtent) * invExtent);
+  float w = frac((rel.z + halfExtent) * invExtent);
+
+  // Vertical: 0 at slab bottom (cloudAltitude), 1 at slab top — now measured as altitude above
+  // the ONE planet (Stage 1's shared sphere) rather than as a flat Y offset, so the grid's
+  // vertical addresses the same shells the march intersects. Over a 12 km box on a 6371 km planet
+  // the two differ by only ~3 m at the corners, so this is not a look change; it matters because
+  // forward and inverse must agree exactly, and the inverse below places voxel centres ON the
+  // shell. A flat forward against a spherical inverse would reintroduce precisely the
+  // bake/sample mismatch this stage removes.
+  float v = computeCloudHeightFractionC(posYUp, getPlanetCenterWorldKm(args), args.planetRadius,
+                                        args.cloudAltitude, args.cloudVoxelGridVerticalKm);
 
   return vec3(u, v, w);
 }
 
-// UVW -> world (Y-up, km). Inverse of cloudVoxelWorldToUVW for the
-// non-wrapped representative position (uses the [-half, +half] horizontal
-// range centered on the camera). Used by the bake shaders to find the world
-// position represented by each voxel.
+// UVW -> world (Y-up, km, ABSOLUTE). Exact inverse of cloudVoxelWorldToUVW for the non-wrapped
+// representative position. Used by the bake shaders to find the world position each voxel stands
+// for.
+//
+// (fork — 2026-09-05, world-space cloud migration Stage 3.) This used to return a camera-RELATIVE
+// offset, which is why the bake integrand had to add args.cameraWorldPosYUpKm back on before it
+// could sample the 2D control fields. It now returns an absolute position, so THAT ADDITION HAS
+// BEEN REMOVED at its call site (cloud_nubis3_common.slangh) — leaving it would double-count the
+// anchor and reintroduce this stage's bug with the sign flipped.
 vec3 cloudVoxelUVWToWorld(vec3 uvw, AtmosphereArgs args) {
+  const vec3  originKm   = cloudVoxelGridOriginKm(args);
   const float halfExtent = 0.5f * args.cloudVoxelGridExtentKm;
-  float x = -halfExtent + uvw.x * args.cloudVoxelGridExtentKm;
-  float z = -halfExtent + uvw.z * args.cloudVoxelGridExtentKm;
-  float y = args.cloudAltitude + uvw.y * args.cloudVoxelGridVerticalKm;
+
+  const float x = originKm.x - halfExtent + uvw.x * args.cloudVoxelGridExtentKm;
+  const float z = originKm.z - halfExtent + uvw.z * args.cloudVoxelGridExtentKm;
+
+  // Vertical: place the voxel centre ON the shell at this altitude, inverting
+  // computeCloudHeightFractionC rather than adding a flat Y offset. Solving
+  //   |p - c| = R + alt   for p.y, with p.xz and c known
+  // gives p.y = c.y + sqrt((R + alt)^2 - (p.x - c.x)^2 - (p.z - c.z)^2), taking the root above the
+  // planet centre. The max() guards the degenerate case of a horizontal offset so large it cannot
+  // reach the shell at all, which the grid extent makes unreachable in practice.
+  const vec3  centerKm = getPlanetCenterWorldKm(args);
+  const float altKm    = args.cloudAltitude + uvw.y * args.cloudVoxelGridVerticalKm;
+  const float shellR   = args.planetRadius + altKm;
+  const float dx = x - centerKm.x;
+  const float dz = z - centerKm.z;
+  const float y  = centerKm.y + sqrt(max(shellR * shellR - dx * dx - dz * dz, 0.0f));
+
   return vec3(x, y, z);
 }
 

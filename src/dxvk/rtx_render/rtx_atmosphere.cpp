@@ -468,9 +468,29 @@ namespace {
     const float stepKm = std::max(RtxAtmosphere::cloudVoxelGridRebakeGranularityKm(), 1e-5f);
     args.cloudWindOffset.x     = quantizeDirComponent(windKm.x, stepKm);
     args.cloudWindOffset.y     = quantizeDirComponent(windKm.y, stepKm);
-    args.cameraWorldPosYUpKm.x = quantizeDirComponent(camKm.x, stepKm);
+    // Horizontal: snap to a whole voxel, byte-for-byte the same expression
+    // cloudVoxelGridOriginKm() uses on the GPU (atmosphere_common.slangh) — floor(), not
+    // round(), and the same step (fork — 2026-09-05, world-space cloud migration Stage 3).
+    //
+    // This MUST match, and must not simply reuse stepKm. cloudVoxelGridRebakeGranularityKm
+    // defaults to 0.1 km while a voxel is cloudNoiseTileKm/256 (~47 m at the 12 km default):
+    // two different numbers. Keying on the coarser one would let the GPU's snapped origin
+    // step to a new voxel WITHOUT changing the cache key, so the grid would be sampled at an
+    // origin the bake never produced — cloud lighting sliding or popping as the player walks,
+    // with nothing in the key to explain it. Keying on the snapped origin itself makes bake
+    // and sample incapable of disagreeing: the key changes exactly when the origin does.
+    //
+    // Keep kCloudVoxelGridResolutionXZ in lockstep with RtxAtmosphere::kCloudVoxelGridX
+    // (private, hence the local mirror) and with the shader-side constant of the same name.
+    constexpr float kCloudVoxelGridResolutionXZ = 256.0f;
+    const float voxelSizeXZ =
+      std::max(args.cloudVoxelGridExtentKm / kCloudVoxelGridResolutionXZ, 1e-6f);
+    args.cameraWorldPosYUpKm.x = std::floor(camKm.x / voxelSizeXZ) * voxelSizeXZ;
+    args.cameraWorldPosYUpKm.z = std::floor(camKm.z / voxelSizeXZ) * voxelSizeXZ;
+    // Vertical stays on the coarse granularity: the grid origin has no y term (the box's
+    // vertical span is the slab, addressed by altitude), so .y only needs to re-key the
+    // spherical vertical mapping as the eye climbs.
     args.cameraWorldPosYUpKm.y = quantizeDirComponent(camKm.y, stepKm);
-    args.cameraWorldPosYUpKm.z = quantizeDirComponent(camKm.z, stepKm);
 
     // Cloud ANIMATION must be in this key (fork — 2026-07-30). The base
     // normalizer zeroes cloudBoilPhase / cloudEvolutionOffset* on the grounds

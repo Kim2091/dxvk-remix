@@ -657,10 +657,11 @@ float sampleCloudBakeDensity(vec3 samplePos, float hf,
 // 8 uniform-step taps; coverage / type noise sampled once at the start
 // position (the cumulus wavelength is much longer than the tap span, so the
 // reuse is harmless and saves 2×kSamples FBM evaluations). The 2D field
-// sample is world-anchored via cameraWorldPosYUpKm (fork — 2026-05-17): the
-// ~300 km-wavelength coverage/type fields do not tile-wrap within the grid,
-// so without the anchor the bake read coverage at the world origin instead
-// of at the player.
+// sample is world-anchored (fork — 2026-05-17; re-expressed 2026-09-05, world-space cloud
+// migration Stage 3): the ~300 km-wavelength coverage/type fields do not tile-wrap within
+// the grid, so the bake must read coverage at the player rather than at the world origin.
+// That anchoring now arrives in worldPosYUpKm itself, which cloudVoxelUVWToWorld returns
+// already absolute; it is no longer re-added here.
 float sampleCloudSunOpticalDepthAtWorld(vec3 worldPosYUpKm, vec3 sunDirYUp,
                                          AtmosphereArgs args,
                                          SamplerState cloudSampler,
@@ -730,8 +731,13 @@ float sampleCloudSunOpticalDepthAtWorld(vec3 worldPosYUpKm, vec3 sunDirYUp,
   // the path exactly.)
   float tapJitter = hash31(worldPosYUpKm * 173.3f);
 
-  vec2 sampleXZKm = vec2(worldPosYUpKm.x + args.cameraWorldPosYUpKm.x,
-                         worldPosYUpKm.z + args.cameraWorldPosYUpKm.z);
+  // worldPosYUpKm is ABSOLUTE as of the world-space cloud migration Stage 3 (fork —
+  // 2026-09-05): cloudVoxelUVWToWorld now rebases onto the shared snapped grid origin and
+  // returns a world position, so the args.cameraWorldPosYUpKm that used to be added back on
+  // here is already included. Adding it a second time would double-count the anchor and put
+  // the ~300 km-wavelength coverage/type fields at twice the player's offset — the very
+  // bake/sample mismatch Stage 3 exists to remove, with the sign flipped.
+  vec2 sampleXZKm = vec2(worldPosYUpKm.x, worldPosYUpKm.z);
   float typeNoise     = cloudControlField2D(sampleXZKm * args.cloudTypeNoiseScale,     200.0f);
   float coverageNoise = cloudControlField2D(sampleXZKm * args.cloudCoverageNoiseScale, 250.0f);
   float typeLocal     = saturate(args.cloudTypeMean     + (typeNoise     - 0.5f) * args.cloudTypeSpread);
@@ -874,8 +880,13 @@ float sampleCloudAmbientOpticalDepthAtWorld(vec3 worldPosYUpKm,
 
   // Same world-anchored single-position coverage/type sample as the sun
   // integral above.
-  vec2 sampleXZKm = vec2(worldPosYUpKm.x + args.cameraWorldPosYUpKm.x,
-                         worldPosYUpKm.z + args.cameraWorldPosYUpKm.z);
+  // worldPosYUpKm is ABSOLUTE as of the world-space cloud migration Stage 3 (fork —
+  // 2026-09-05): cloudVoxelUVWToWorld now rebases onto the shared snapped grid origin and
+  // returns a world position, so the args.cameraWorldPosYUpKm that used to be added back on
+  // here is already included. Adding it a second time would double-count the anchor and put
+  // the ~300 km-wavelength coverage/type fields at twice the player's offset — the very
+  // bake/sample mismatch Stage 3 exists to remove, with the sign flipped.
+  vec2 sampleXZKm = vec2(worldPosYUpKm.x, worldPosYUpKm.z);
   float typeNoise     = cloudControlField2D(sampleXZKm * args.cloudTypeNoiseScale,     200.0f);
   float coverageNoise = cloudControlField2D(sampleXZKm * args.cloudCoverageNoiseScale, 250.0f);
   float typeLocal     = saturate(args.cloudTypeMean     + (typeNoise     - 0.5f) * args.cloudTypeSpread);
