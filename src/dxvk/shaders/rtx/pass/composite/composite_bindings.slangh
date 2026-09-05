@@ -104,6 +104,37 @@ Texture3D<float4> AtmosphereAerialPerspectiveLut;
 layout(binding = COMPOSITE_ATMOSPHERE_AERIAL_PERSPECTIVE_SAMPLER)
 SamplerState AtmosphereAerialPerspectiveSampler;
 
+// Cloud composite (fork — 2026-09-05, world-space cloud migration Stage 4b). See
+// applyCloudComposite in composite.comp.slang. CompositeCloudRender / CompositeCloudDepth are the
+// SAME m_cloudRenderRT / m_cloudDepthRT resources RtxAtmosphere writes each frame in
+// dispatchCloudScreenPass (called from injectRTX right after dispatchPathTracing) — bound at new
+// slots here because composite has its own descriptor set. CompositeCloudRender is bilinearly
+// sampled (matches the legacy evalSkyRadiance upsample exactly at cloudRenderResolutionScale = 1);
+// CompositeCloudDepth is read with Load (point-sampled) only — never through this sampler — for the
+// same reason PrimaryLinearViewZ is point-sampled everywhere else: averaging two surfaces' depths
+// across a silhouette produces a value that matches neither.
+layout(binding = COMPOSITE_ATMOSPHERE_CLOUD_RENDER_INPUT)
+Texture2D<float4> CompositeCloudRender;
+layout(binding = COMPOSITE_ATMOSPHERE_CLOUD_RENDER_SAMPLER)
+SamplerState CompositeCloudRenderSampler;
+layout(binding = COMPOSITE_ATMOSPHERE_CLOUD_DEPTH_INPUT)
+Texture2D<float2> CompositeCloudDepth;
+
+// Cloud temporal-history ping-pong (fork — 2026-09-05, Stage 4b). Same pair of RGBA16F + R16_UINT
+// ping-pong resources previously bound (at different slots) to the common ray-tracing bindings for
+// evalSkyRadiance's now-removed primary-ray EMA — see RtxAtmosphere::getPreviousCloudHistory /
+// getCurrentCloudHistory. RtxAtmosphere::bindResources resolves the ping-pong swap for this frame
+// once, earlier (from the G-buffer pass's common-bindings setup), so Prev/Curr here already refer to
+// the correct pair — composite must NOT swap again.
+layout(binding = COMPOSITE_ATMOSPHERE_CLOUD_HISTORY_PREV_INPUT)
+Texture2D<float4> CompositeCloudHistoryPrev;
+layout(binding = COMPOSITE_ATMOSPHERE_CLOUD_HISTORY_CURR_OUTPUT)
+RWTexture2D<float4> CompositeCloudHistoryCurr;
+layout(binding = COMPOSITE_ATMOSPHERE_CLOUD_HISTORY_FRAME_ID_PREV_INPUT)
+Texture2D<uint> CompositeCloudHistoryFrameIdPrev;
+layout(binding = COMPOSITE_ATMOSPHERE_CLOUD_HISTORY_FRAME_ID_CURR_OUTPUT)
+RWTexture2D<uint> CompositeCloudHistoryFrameIdCurr;
+
 layout(binding = COMPOSITE_ACTIVE_PIXEL_MASK_INPUT)
 Texture2D<uint> SparseRenderingActivePixelMask;
 

@@ -68,6 +68,19 @@
 // cloud-debug block to 39-43.
 #define DEBUG_VIEW_BINDING_CLOUD_NVDF_SDF_INPUT                                             43
 
+// Fork: cloud depth companion (world-space cloud migration Stage 4b, 2026-09-05; RG32F, r = entry
+// distance km, g = transmittance-weighted mean cloud depth km). Sampled (point/Load only, never
+// bilinear) by DEBUG_VIEW_CLOUD_DEPTH (881) and DEBUG_VIEW_CLOUD_REPROJECTION (883). Extends the
+// contiguous fork-owned cloud-debug block to 39-45.
+#define DEBUG_VIEW_BINDING_CLOUD_DEPTH_RT_INPUT                                             44
+
+// Fork: cloud-history frame-id ping-pong, PREVIOUS slot only (R16_UINT; world-space cloud migration
+// Stage 4b, 2026-09-05). Read-only diagnostic companion to DEBUG_VIEW_CLOUD_REPROJECTION (883)'s
+// history-rejection-reason channel — the same age-check composite.comp.slang's applyCloudComposite
+// performs against composite's own CompositeCloudHistoryFrameIdPrev, at a separate binding slot here
+// because this pass has its own descriptor set.
+#define DEBUG_VIEW_BINDING_CLOUD_HISTORY_FRAME_ID_PREV_INPUT                                45
+
 // Slot 38 was DEBUG_VIEW_BINDING_PRIMARY_CLOUD_SHADOW_FACTOR_INPUT (fork
 // screen-space cloud-shadow texture, debug view 878). Removed 2026-06-19 with
 // the screen-space cloud-shadow system; number left reserved (no descriptor

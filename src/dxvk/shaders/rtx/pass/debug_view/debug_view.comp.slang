@@ -117,6 +117,18 @@ Texture3D<float> DebugViewCloudNvdfSdf;
 // The cloud shadow now folds onto the sun radiance in the NEE; enum 875/877
 // read the D_sun grid directly for cloud-on-terrain shadow diagnostics.
 
+// Fork: cloud depth companion (world-space cloud migration Stage 4b, 2026-09-05; r = entry distance
+// km, g = transmittance-weighted mean cloud depth km). Visualized by DEBUG_VIEW_CLOUD_DEPTH (881)
+// and consumed (point-sampled only) by DEBUG_VIEW_CLOUD_REPROJECTION (883).
+[[vk::binding(DEBUG_VIEW_BINDING_CLOUD_DEPTH_RT_INPUT)]]
+Texture2D<float2> DebugViewCloudDepthRT;
+
+// Fork: cloud-history frame-id ping-pong, PREVIOUS slot only (world-space cloud migration Stage 4b,
+// 2026-09-05). Read-only here — used by DEBUG_VIEW_CLOUD_REPROJECTION (883) to show the REAL
+// history-rejection reason (age check), not a current-frame proxy for it.
+[[vk::binding(DEBUG_VIEW_BINDING_CLOUD_HISTORY_FRAME_ID_PREV_INPUT)]]
+Texture2D<uint> DebugViewCloudHistoryFrameIdPrev;
+
 [[vk::binding(DEBUG_VIEW_BINDING_VOLUME_RESERVOIRS_INPUT)]]
 Texture3D<uint4> VolumeReservoirs;
 
@@ -876,6 +888,119 @@ vec4 loadInput(inout RNG randomState, ivec2 threadId)
       value = vec4(outColor, 1.0f);
     }
     break;
+  case DEBUG_VIEW_CLOUD_DEPTH:
+    {
+      // Fork diagnostic (world-space cloud migration, Stage 4b, 2026-09-05). Point-sampled read
+      // (cloudNativeTexel — never bilinear) of the depth companion at THIS pass's own native
+      // resolution. See the enum's registration comment (rtx_debug_view.cpp) for the channel
+      // legend.
+      uint2 cloudDepthDim;
+      DebugViewCloudDepthRT.GetDimensions(cloudDepthDim.x, cloudDepthDim.y);
+      const vec2 depthKm = DebugViewCloudDepthRT[cloudNativeTexel(threadId, cloudDepthDim)];
+      const float entryKm = depthKm.x;
+      const float meanKm = depthKm.y;
+
+      const vec3 outColor = (entryKm >= 0.0f) ? turboColormap(saturate(meanKm / 20.0f)) : vec3(0.0f);
+      value = vec4(outColor, entryKm);
+    }
+    break;
+  case DEBUG_VIEW_CLOUD_TRANSMITTANCE_ON_GEOMETRY:
+    {
+      // Fork diagnostic (world-space cloud migration, Stage 4b, 2026-09-05). Sky / miss pixels
+      // stay black (same cb.nrd.missLinearViewZ exact-sentinel test as enums 880/884 — populated
+      // for this enum in RtxDebugView::dispatch the same way).
+      const float linearViewZ = PrimaryLinearViewZ[threadId].x;
+      const bool isSkyMiss = (linearViewZ == cb.nrd.missLinearViewZ);
+
+      vec3 outColor = vec3(0.0f);
+      if (!isSkyMiss)
+      {
+        uint2 cloudRenderDim;
+        DebugViewCloudRenderRT.GetDimensions(cloudRenderDim.x, cloudRenderDim.y);
+        const float cloudTransmittance = DebugViewCloudRenderRT[cloudNativeTexel(threadId, cloudRenderDim)].a;
+        outColor = vec3(saturate(1.0f - cloudTransmittance));
+      }
+      value = vec4(outColor, 1.0f);
+    }
+    break;
+  case DEBUG_VIEW_CLOUD_REPROJECTION:
+    {
+      // Fork diagnostic (world-space cloud migration, Stage 4b, 2026-09-05). Recomputes the SAME
+      // reprojection composite.comp.slang's applyCloudComposite performs (rotation term +
+      // translation parallax term), duplicated rather than shared -- see the enum's registration
+      // comment for the full channel legend and why this is current-frame-only.
+      uint2 cloudDepthDim;
+      DebugViewCloudDepthRT.GetDimensions(cloudDepthDim.x, cloudDepthDim.y);
+      const vec2 depthKm = DebugViewCloudDepthRT[cloudNativeTexel(threadId, cloudDepthDim)];
+      const float entryKm = depthKm.x;
+      const float meanKm = depthKm.y;
+
+      vec3 outColor = vec3(0.0f);
+      float rejectReason = 0.0f;  // 0 = would accept history
+
+      if (entryKm < 0.0f)
+      {
+        rejectReason = 0.33f;  // no cloud along this ray -- nothing to reject
+      }
+      else
+      {
+        const CameraDirections rayDirections = cameraPixelCoordinateToDirection(cb.camera, ivec2(threadId));
+        const bool isZUpFlag = (cb.isZUp != 0u);
+        const bool flipUpAxis = (cb.atmosphereArgs.flipUpAxis != 0);
+        const vec3 viewDirYUp = normalize(worldToAtmosphereYUp(
+            rayDirections.worldDirection, isZUpFlag, flipUpAxis));
+
+        // ---- rotation-only term (duplicate of geometry_resolver.slangh's calcMotionVectorForRayMiss) ----
+        vec4 prevNDC = mul(cb.camera.prevWorldToProjection, vec4(rayDirections.worldDirection, 0.0f));
+        prevNDC /= prevNDC.w;
+        const vec2 ndc = cameraPixelCoordinateToNDC(cb.camera, ivec2(threadId));
+        const vec2 rotationMV = (prevNDC.xy - ndc.xy) * vec2(0.5f, -0.5f) * vec2(cb.camera.resolution);
+
+        // ---- translation parallax term (duplicate of composite.comp.slang's
+        // cloudParallaxMotionVectorPixels -- see that function for the full derivation) ----
+        const vec3 deltaKm = cb.cloudAnchorDeltaYUpKm;
+        const vec3 deltaPerp = deltaKm - viewDirYUp * dot(deltaKm, viewDirYUp);
+        const vec3 rightAxis = cb.atmosphereArgs.cloudRenderRightYUp;
+        const vec3 upAxis    = cb.atmosphereArgs.cloudRenderUpYUp;
+        const float rightLenSq = max(dot(rightAxis, rightAxis), 1e-9f);
+        const float upLenSq    = max(dot(upAxis, upAxis), 1e-9f);
+        const float viewAxisCosine = max(abs(dot(viewDirYUp, normalize(cb.atmosphereArgs.cloudRenderForwardYUp))), 1e-3f);
+        const float zForwardKm = max(meanKm, 0.05f) * viewAxisCosine;
+        vec2 parallaxNdcDelta;
+        parallaxNdcDelta.x = dot(deltaPerp, rightAxis) / (zForwardKm * rightLenSq);
+        parallaxNdcDelta.y = dot(deltaPerp, upAxis)    / (zForwardKm * upLenSq);
+        const vec2 parallaxMV = parallaxNdcDelta * vec2(0.5f, -0.5f) * vec2(cb.camera.resolution);
+
+        outColor = vec3(saturate(length(parallaxMV) / 4.0f));
+
+        const vec2 prevPixelF = vec2(threadId) + rotationMV + parallaxMV;
+        const int2 prevPixel = int2(floor(prevPixelF + 0.5f));
+        const bool reprojValid = all(prevPixel >= int2(0, 0)) && all(prevPixel < int2(cb.camera.resolution));
+
+        if (!reprojValid)
+        {
+          rejectReason = 1.0f;  // off-screen reprojection -- no valid history either way
+        }
+        else if (cb.atmosphereArgs.cloudHistoryWeight <= 0.0f)
+        {
+          rejectReason = 0.66f;  // anchor cut this frame (RtxAtmosphere::m_cloudAnchorCutThisFrame)
+        }
+        else
+        {
+          const uint historyFrameId = DebugViewCloudHistoryFrameIdPrev[prevPixel];
+          const uint expectedPrevFrameId = (cb.frameIdx - 1u) & 0xFFFFu;
+          const bool ageValid = (historyFrameId == expectedPrevFrameId) && (historyFrameId != 0xFFFFu);
+          rejectReason = ageValid ? 0.0f : 1.0f;
+        }
+      }
+
+      // R = parallax magnitude (saturated 0..1 over 0..4px), G = reject reason -- see the enum's
+      // registration comment for the full legend. Packed as R/G (not R/alpha) so the debug view's
+      // per-channel pseudo-color modes read either signal in isolation without an alpha convention
+      // clashing with the coverage/opacity meaning alpha carries in most other debug views.
+      value = vec4(outColor.r, rejectReason, 0.0f, 1.0f);
+    }
+    break;
   case DEBUG_VIEW_NRC_UPDATE_RADIANCE:
   case DEBUG_VIEW_NRC_UPDATE_THROUGHPUT:
   case DEBUG_VIEW_NRC_UPDATE_RADIANCE_MULTIPLIED_BY_THROUGHPUT:
@@ -1207,6 +1332,25 @@ void storeDebugViewOutputStatistics(vec4 value, uint groupIndex)
     InterlockedAddFloat(DebugViewStatistics[3], groupSum.w);
   }
 #endif
+}
+
+// Fork helper (world-space cloud migration Stage 4b, 2026-09-05): maps a G-buffer/composite-
+// resolution pixel coordinate to the NEAREST native texel of the (possibly smaller,
+// cloudRenderResolutionScale-scaled) cloud render RT / depth companion. Mirrors composite.comp.
+// slang's sampleCloudDepthKm exactly (point-sampled, never bilinear -- see that function's header
+// comment for why), duplicated here rather than shared: this pass has its own descriptor set and no
+// common include point with composite for cloud helpers (same reasoning as enum 880's cloudSlabSpan
+// duplication). Zero dims (extent not yet known) falls back to identity, matching every other cloud
+// dimension-ratio fallback in this migration.
+ivec2 cloudNativeTexel(uint2 pixelCoordinate, uint2 rtDim)
+{
+  if (cb.atmosphereArgs.cloudRenderFullDimX == 0u || cb.atmosphereArgs.cloudRenderFullDimY == 0u)
+  {
+    return ivec2(pixelCoordinate);
+  }
+  const vec2 uv = (vec2(pixelCoordinate) + 0.5f)
+                / vec2(float(cb.atmosphereArgs.cloudRenderFullDimX), float(cb.atmosphereArgs.cloudRenderFullDimY));
+  return clamp(ivec2(uv * vec2(rtDim)), ivec2(0), ivec2(rtDim) - ivec2(1));
 }
 
 [shader("compute")]

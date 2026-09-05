@@ -130,6 +130,17 @@ namespace dxvk {
         TEXTURE3D(COMPOSITE_ATMOSPHERE_AERIAL_PERSPECTIVE_INPUT)
         SAMPLER(COMPOSITE_ATMOSPHERE_AERIAL_PERSPECTIVE_SAMPLER)
 
+        // Cloud composite (fork — 2026-09-05, world-space cloud migration Stage 4b). See
+        // applyCloudComposite in composite.comp.slang / the doc comment on these slots in
+        // composite_binding_indices.h.
+        TEXTURE2D(COMPOSITE_ATMOSPHERE_CLOUD_RENDER_INPUT)
+        SAMPLER(COMPOSITE_ATMOSPHERE_CLOUD_RENDER_SAMPLER)
+        TEXTURE2D(COMPOSITE_ATMOSPHERE_CLOUD_DEPTH_INPUT)
+        TEXTURE2D(COMPOSITE_ATMOSPHERE_CLOUD_HISTORY_PREV_INPUT)
+        RW_TEXTURE2D(COMPOSITE_ATMOSPHERE_CLOUD_HISTORY_CURR_OUTPUT)
+        TEXTURE2D(COMPOSITE_ATMOSPHERE_CLOUD_HISTORY_FRAME_ID_PREV_INPUT)
+        RW_TEXTURE2D(COMPOSITE_ATMOSPHERE_CLOUD_HISTORY_FRAME_ID_CURR_OUTPUT)
+
         RW_TEXTURE2D(COMPOSITE_PRIMARY_ALBEDO_INPUT_OUTPUT)
         RW_TEXTURE2D(COMPOSITE_ACCUMULATED_FINAL_OUTPUT_INPUT_OUTPUT)
 
@@ -402,8 +413,8 @@ namespace dxvk {
 
     // Aerial perspective volume. Null outside Numos / when the feature is off, where the shader also
     // skips sampling it (aerialPerspectiveLutSize == 0).
+    RtxAtmosphere& atmosphere = ctx->getCommonObjects()->metaAtmosphere();
     {
-      RtxAtmosphere& atmosphere = ctx->getCommonObjects()->metaAtmosphere();
       const Resources::Resource aerialPerspectiveLut = atmosphere.getAerialPerspectiveLut();
       const bool aerialPerspectiveActive = RtxOptions::skyMode() == SkyMode::Numos
         && RtxAtmosphere::aerialPerspective()
@@ -412,6 +423,49 @@ namespace dxvk {
       ctx->bindResourceSampler(COMPOSITE_ATMOSPHERE_AERIAL_PERSPECTIVE_SAMPLER, linearSampler);
       ctx->bindResourceView(COMPOSITE_ATMOSPHERE_AERIAL_PERSPECTIVE_INPUT,
         aerialPerspectiveActive ? aerialPerspectiveLut.view : nullptr, nullptr);
+    }
+
+    // Cloud composite (fork — 2026-09-05, world-space cloud migration Stage 4b). Binds the SAME
+    // m_cloudRenderRT / m_cloudDepthRT resources RtxAtmosphere::dispatchCloudScreenPass wrote for
+    // THIS frame (called from injectRTX right after dispatchPathTracing, before this composite
+    // dispatch runs) at composite's own descriptor slots — see applyCloudComposite in
+    // composite.comp.slang for why the composite lives here now instead of in evalSkyRadiance.
+    // atmosphere.initialize() is not called here: RtxAtmosphere::bindResources (called earlier, for
+    // the G-buffer pass's common ray-tracing bindings) already initialized these resources and
+    // resolved this frame's cloud-history ping-pong swap; composite must read the SAME resolved
+    // Prev/Curr pair, not swap again.
+    {
+      const Resources::Resource& cloudRenderRT = atmosphere.getCloudRenderRT();
+      if (cloudRenderRT.isValid()) {
+        ctx->bindResourceView(COMPOSITE_ATMOSPHERE_CLOUD_RENDER_INPUT, cloudRenderRT.view, nullptr);
+      }
+      // Clamp-to-edge, not the REPEAT-U sky-view sampler evalSkyRadiance used to share: this RT is
+      // screen-space content, and this pass reads it via a straight full-extent uv (no half-texel
+      // clamp trick), so clamping at the sampler is simpler and equally correct.
+      ctx->bindResourceSampler(COMPOSITE_ATMOSPHERE_CLOUD_RENDER_SAMPLER, linearSampler);
+
+      const Resources::Resource& cloudDepthRT = atmosphere.getCloudDepthRT();
+      if (cloudDepthRT.isValid()) {
+        ctx->bindResourceView(COMPOSITE_ATMOSPHERE_CLOUD_DEPTH_INPUT, cloudDepthRT.view, nullptr);
+      }
+
+      const auto& cloudHistoryPrev = atmosphere.getPreviousCloudHistory();
+      const auto& cloudHistoryCurr = atmosphere.getCurrentCloudHistory();
+      if (cloudHistoryPrev.isValid()) {
+        ctx->bindResourceView(COMPOSITE_ATMOSPHERE_CLOUD_HISTORY_PREV_INPUT, cloudHistoryPrev.view, nullptr);
+      }
+      if (cloudHistoryCurr.isValid()) {
+        ctx->bindResourceView(COMPOSITE_ATMOSPHERE_CLOUD_HISTORY_CURR_OUTPUT, cloudHistoryCurr.view, nullptr);
+      }
+
+      const auto& cloudFrameIdPrev = atmosphere.getPreviousCloudHistoryFrameId();
+      const auto& cloudFrameIdCurr = atmosphere.getCurrentCloudHistoryFrameId();
+      if (cloudFrameIdPrev.isValid()) {
+        ctx->bindResourceView(COMPOSITE_ATMOSPHERE_CLOUD_HISTORY_FRAME_ID_PREV_INPUT, cloudFrameIdPrev.view, nullptr);
+      }
+      if (cloudFrameIdCurr.isValid()) {
+        ctx->bindResourceView(COMPOSITE_ATMOSPHERE_CLOUD_HISTORY_FRAME_ID_CURR_OUTPUT, cloudFrameIdCurr.view, nullptr);
+      }
     }
 
     compositeArgs.camera = sceneManager.getCamera().getShaderConstants();
@@ -452,6 +506,10 @@ namespace dxvk {
     compositeArgs.sparseRenderingArgs = rtOutput.m_raytraceArgs.sparseRenderingArgs;
     compositeArgs.volumeArgs = rtOutput.m_raytraceArgs.volumeArgs;
     compositeArgs.atmosphereArgs = rtOutput.m_raytraceArgs.atmosphereArgs;
+    // Cloud composite parallax reprojection input (fork — 2026-09-05, world-space cloud migration
+    // Stage 4b) — see composite_args.h's doc comment on this field for why it exists outside
+    // AtmosphereArgs. `atmosphere` was already fetched above for the aerial perspective LUT.
+    compositeArgs.cloudAnchorDeltaYUpKm = atmosphere.getCloudAnchor().deltaKm;
     compositeArgs.outputParticleLayer = ctx->useRayReconstruction() && rayReconstruction.useParticleBuffer();
     compositeArgs.outputSecondarySignalToParticleLayer = ctx->useRayReconstruction() && rayReconstruction.preprocessSecondarySignal();
     compositeArgs.enableDemodulateAttenuation = ctx->useRayReconstruction() && rayReconstruction.demodulateAttenuation();

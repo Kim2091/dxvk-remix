@@ -387,9 +387,6 @@ void integratePathVertex(
       skyRadiance = evalSkyRadiance(pathState.direction, cb.atmosphereArgs,
                                      pathState.pixelCoordinate, cb.frameIdx,
                                      cb.isZUp != 0,
-                                     /*enableCloudTemporalSmoothing=*/ false,
-                                     vec2(0.0f, 0.0f),
-                                     uint2(0u, 0u),
                                      /*isPrimaryRay=*/ false,
                                      /*applySkyIndirectRadianceScale=*/ pathState.skyGatherEligible);
     }

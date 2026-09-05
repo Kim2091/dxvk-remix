@@ -1923,18 +1923,18 @@ void geometryResolverVertex(
 #ifdef ATMOSPHERE_AVAILABLE
     else if (cb.skyMode == 1)
     {
-      // Primary view ray — enable cloud temporal smoothing. The motion vector
-      // for sky misses comes from calcMotionVectorForRayMiss (already used
-      // below to write PrimaryScreenSpaceMotionVector), and historyResolution
-      // is the downscaled render extent (where this raygen writes).
-      const vec2 cloudMotion = calcMotionVectorForRayMiss(geometryResolverState.pixelCoordinate);
-      const uint2 cloudHistoryRes = cb.camera.resolution;
+      // Primary view ray. Cloudless here (fork — 2026-09-05, world-space cloud migration Stage 4b):
+      // this call used to also pass a motion vector and history resolution so evalSkyRadiance could
+      // read the cloud RT and blend a screen-space temporal history right here, INSIDE
+      // dispatchPathTracing. That composite has moved to composite.comp.slang, which runs after
+      // RtxAtmosphere::dispatchCloudScreenPass has written THIS frame's cloud RT — this call site
+      // runs before that pass even starts, so it could only ever see last frame's march.
+      // isPrimaryRay=true still matters: it keeps this call from falling through to the secondary
+      // dome LUT (wrong ray direction for that LUT's key), so skyRadiance here is the cloudless
+      // sky/atmosphere/stars/moons, with clouds added later.
       skyRadiance = evalSkyRadiance(ray.direction, cb.atmosphereArgs,
                                      geometryResolverState.pixelCoordinate, cb.frameIdx,
                                      cb.isZUp != 0,
-                                     /*enableCloudTemporalSmoothing=*/ true,
-                                     cloudMotion,
-                                     cloudHistoryRes,
                                      /*isPrimaryRay=*/ true);
     }
 #endif

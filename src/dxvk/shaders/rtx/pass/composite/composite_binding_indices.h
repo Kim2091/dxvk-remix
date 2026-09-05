@@ -72,6 +72,21 @@
 #define COMPOSITE_ATMOSPHERE_AERIAL_PERSPECTIVE_INPUT               60
 #define COMPOSITE_ATMOSPHERE_AERIAL_PERSPECTIVE_SAMPLER             61
 
+// Cloud composite (fork — 2026-09-05, world-space cloud migration Stage 4b). The primary-ray cloud
+// composite + its temporal EMA relocated here from evalSkyRadiance (atmosphere_sky.slangh) — see
+// applyCloudComposite in composite.comp.slang. These are NEW composite-local binding slots for the
+// same underlying resources RtxAtmosphere already owns (m_cloudRenderRT / m_cloudDepthRT / the
+// cloud-history ping-pong pair) — composite has its own descriptor set (composite_bindings.slangh),
+// separate from the common ray-tracing bindings (common_bindings.slangh) the old primary-ray read
+// used, so it needs its own slots rather than reusing BINDING_ATMOSPHERE_CLOUD_RENDER_RT etc.
+#define COMPOSITE_ATMOSPHERE_CLOUD_RENDER_INPUT                     62
+#define COMPOSITE_ATMOSPHERE_CLOUD_RENDER_SAMPLER                   63
+#define COMPOSITE_ATMOSPHERE_CLOUD_DEPTH_INPUT                      64
+#define COMPOSITE_ATMOSPHERE_CLOUD_HISTORY_PREV_INPUT               65
+#define COMPOSITE_ATMOSPHERE_CLOUD_HISTORY_CURR_OUTPUT              66
+#define COMPOSITE_ATMOSPHERE_CLOUD_HISTORY_FRAME_ID_PREV_INPUT      67
+#define COMPOSITE_ATMOSPHERE_CLOUD_HISTORY_FRAME_ID_CURR_OUTPUT     68
+
 // Inputs/Outputs
 
 #define COMPOSITE_PRIMARY_ALBEDO_INPUT_OUTPUT                       30

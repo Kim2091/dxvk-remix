@@ -409,8 +409,18 @@ void applyVolumetricLighting(
   out vec3 alphaBlendOutput,
   out float backgroundAlpha,
   out vec3 radianceOutput,
-  out vec4 particleLayerOutput)
+  out vec4 particleLayerOutput,
+  // Alpha-blend surface hit distance, world/game units, and whether one was actually found at this
+  // pixel (fork — 2026-09-05, world-space cloud migration Stage 4b). AlphaBlendSurface is otherwise
+  // fully local to this function; applyCloudComposite needs the surface's own distance to decide how
+  // much of the cloud it should be fogged by (see cloudDepthVisibility) -- foliage rendered crisp
+  // through a cloud the ground beneath it is already fogged by is the artefact this exists to avoid.
+  out bool alphaBlendSurfaceValid,
+  out float alphaBlendHitDistance)
 {
+  alphaBlendSurfaceValid = false;
+  alphaBlendHitDistance = 0.0f;
+
   // Override the default volume sampling RNG seed offset
   setVolumeSamplingRngSeed(1);
 
@@ -454,6 +464,8 @@ void applyVolumetricLighting(
     {
       vec3 particleNormal = surface.normal;
       backgroundAlpha = surface.backgroundTransparency;
+      alphaBlendSurfaceValid = true;
+      alphaBlendHitDistance = surface.hitT;
 
       vec4 totalLight = vec4(centerLight.xyz, 1);
 
@@ -661,6 +673,295 @@ void applyAerialPerspective(
   radianceOutput = radianceOutput * transmittance + inScatter;
 }
 
+// ============================================================================
+// Cloud composite (fork — 2026-09-05, world-space cloud migration Stage 4b)
+// ============================================================================
+//
+// This whole section is the relocated other half of evalSkyRadiance's former primary-ray cloud
+// composite (atmosphere_sky.slangh) -- see that function's header comment for the ordering
+// argument (dispatchCloudScreenPass now runs after dispatchPathTracing, so the G-buffer pass that
+// calls evalSkyRadiance can never see THIS frame's cloud march; composite runs after both, so it
+// can). Composited into `radianceOutput` / `alphaBlendOutput` -- both composite-local, already
+// DENOISED-and-combined locals (see compositeResult: remodulatedTotalPrimaryRadiance, the denoised
+// primary signal, and sharedRadiance are folded into radianceOutput well before applyCloudComposite
+// runs) -- never into SharedRadiance. Archaeology commit 30d20a8f5 added its cloud in-scatter to
+// SharedRadiance from inside raygen, which composite.comp.slang adds AFTER the denoised primary
+// radiance; that ordering sparkles on geometry and ghosts under ray reconstruction. Nothing here
+// touches SharedRadianceRG/B.
+
+// Bilinear upsample of the cloud render RT, verbatim port of evalSkyRadiance's former primary-ray
+// read (atmosphere_sky.slangh, pre-Stage-4b) onto composite's own CompositeCloudRender /
+// CompositeCloudRenderSampler binding. At cloudRenderResolutionScale = 1.0 the uv lands exactly on
+// texel centers, so this returns bit-identical values to the removed code -- the acceptance
+// invariant for this stage ("sky pixels unchanged"). CompositeCloudRenderSampler is a dedicated
+// clamp-to-edge sampler (composite's own, not the shared REPEAT-U sky-view sampler evalSkyRadiance
+// used) -- this content is screen-space, never spherical, so clamping is simpler and no less
+// correct; the half-texel inset is kept anyway so the sampled uv range matches the removed code's
+// exactly.
+vec4 sampleCloudRenderRT(uint2 pixelCoordinate, AtmosphereArgs args)
+{
+  if (args.cloudRenderFullDimX != 0u && args.cloudRenderFullDimY != 0u)
+  {
+    vec2 uv = (vec2(pixelCoordinate) + 0.5f)
+            / vec2(float(args.cloudRenderFullDimX), float(args.cloudRenderFullDimY));
+    uint2 rtDim;
+    CompositeCloudRender.GetDimensions(rtDim.x, rtDim.y);
+    vec2 halfTexel = 0.5f / vec2(rtDim);
+    uv = clamp(uv, halfTexel, vec2(1.0f) - halfTexel);
+    return CompositeCloudRender.SampleLevel(CompositeCloudRenderSampler, uv, 0.0f);
+  }
+  return CompositeCloudRender.Load(int3(pixelCoordinate, 0));
+}
+
+// Point-sampled (never bilinear) read of the depth companion -- r = entry distance km, g =
+// transmittance-weighted mean cloud depth km, both from RtxAtmosphere::dispatchCloudScreenPass /
+// cloud_render.comp.slang. Mirrors sampleCloudRenderRT's dimension-ratio mapping so the same native
+// texel a bilinear color fetch blends AROUND is the one this reads exactly, but with Load instead of
+// SampleLevel: averaging two different surfaces' depths across a silhouette is meaningless (the same
+// reasoning cloud_render.comp.slang's own PrimaryLinearViewZ read and debug views 880/884 already
+// follow -- see their comments). (-1, 0) is the "no cloud entered" sentinel.
+vec2 sampleCloudDepthKm(uint2 pixelCoordinate, AtmosphereArgs args)
+{
+  if (args.cloudRenderFullDimX != 0u && args.cloudRenderFullDimY != 0u)
+  {
+    vec2 uv = (vec2(pixelCoordinate) + 0.5f)
+            / vec2(float(args.cloudRenderFullDimX), float(args.cloudRenderFullDimY));
+    uint2 rtDim;
+    CompositeCloudDepth.GetDimensions(rtDim.x, rtDim.y);
+    ivec2 texel = clamp(ivec2(uv * vec2(rtDim)), ivec2(0), ivec2(rtDim) - ivec2(1));
+    return CompositeCloudDepth.Load(int3(texel, 0));
+  }
+  return CompositeCloudDepth.Load(int3(pixelCoordinate, 0));
+}
+
+// Depth-ratio visibility rule (fork — 2026-09-05). Answers "how much of the marched cloud actually
+// sits between the camera and a surface at surfaceKm" using only the depth companion's entry/mean.
+// entryKm < 0 means the march never found any cloud along this ray at all (cloud_render.comp.slang's
+// sentinel) -- 0 visibility, nothing to composite. Otherwise the march's own depth-aware clamp
+// (Stage 4a: tMaxClamp = this pixel's own surface distance) already guarantees entryKm <= meanKm <=
+// surfaceKm for the pixel the RT was actually written at, so at cloudRenderResolutionScale = 1.0 this
+// saturates to 1 everywhere a real opaque hit exists -- a deliberate no-op that keeps a fogged-hill
+// pixel's own value exactly what the march produced. Below scale 1.0 the color channel is
+// BILINEARLY upsampled (sampleCloudRenderRT) and can blend in a farther neighbour's brighter cloud
+// sample; this is the one-tap safeguard against that bleeding onto a surface that is provably nearer
+// than any cloud (surfaceKm < entryKm ramps to 0). It is not a bilateral resample -- that is Stage
+// 6's job (bilateral upsample tuning is explicitly out of scope here) -- just a correctness clamp.
+float cloudDepthVisibility(float entryKm, float meanKm, float surfaceKm)
+{
+  if (entryKm < 0.0f)
+  {
+    return 0.0f;
+  }
+  const float featherKm = max(meanKm - entryKm, 0.05f);  // 50 m floor guards the divide
+  return saturate((surfaceKm - entryKm) / featherKm);
+}
+
+// Rotation-only screen motion vector for the cloud's own pixel, in pixels. Deliberate duplicate of
+// geometry_resolver.slangh's calcMotionVectorForRayMiss rather than a shared call: that function
+// also drives the general-purpose PrimaryScreenSpaceMotionVector / DLSSRR outputs (unrelated to
+// clouds) and must not be touched by this migration. Exact same math, parameterized on an explicit
+// world direction instead of re-deriving one from pixelCoordinate, since the caller already has
+// primaryRayDirections.worldDirection on hand.
+vec2 cloudRotationMotionVectorPixels(vec3 currentWorldDirection, uint2 pixelCoordinate)
+{
+  vec4 prevNDC = mul(cb.camera.prevWorldToProjection, vec4(currentWorldDirection, 0.0f));
+  prevNDC /= prevNDC.w;
+  const vec2 ndc = cameraPixelCoordinateToNDC(cb.camera, ivec2(pixelCoordinate));
+  const vec2 motionVectorNDC = prevNDC.xy - ndc.xy;
+  return motionVectorNDC * vec2(0.5, -0.5) * vec2(cb.camera.resolution);
+}
+
+// Translation parallax correction (fork — 2026-09-05). calcMotionVectorForRayMiss / the rotation-only
+// term above treats the ray as a pure direction (w=0), exact for content at infinite distance but
+// wrong for the cloud layer, which now carries real depth (AtmosphereCloudDepth). On the
+// Gamebryo-family engine this migration targets, cb.camera.prevWorldToProjection's translation is
+// permanently zero (RtCamera::getPosition() reads a rotation-only D3D view matrix -- see
+// RtxAtmosphere::updateFrame's anchor-resolution block), so there is no way to recover camera
+// translation from the projection matrices at all, at any depth. The separate cloud-anchor system
+// (Stage 2) is the only source of a real translation signal on this target; this is its first
+// shader-side consumer (cb.cloudAnchorDeltaYUpKm, populated CPU-side from
+// RtxAtmosphere::getCloudAnchor().deltaKm -- see composite_args.h).
+//
+// Approximation, linearized around the current view ray: a world point P = cameraPos + viewDirYUp *
+// depthKm stays fixed when the camera moves; only the component of this frame's camera motion
+// PERPENDICULAR to the ray shifts P's apparent screen position (the parallel component only changes
+// depth, not where it lands). The cloud-render camera basis vectors (cloudRenderRightYUp /
+// UpYUp, pre-scaled by tan(halfFovX)*aspect / tan(halfFovY) -- see RtxAtmosphere::
+// setCloudRenderCameraBasis) are exactly the vectors cloud_render.comp.slang itself uses to build a
+// per-pixel viewDirYUp from NDC; inverting that construction to first order near the current ray
+// converts the perpendicular world-space shift into an NDC delta. viewAxisCosine converts the
+// EUCLIDEAN depthKm (the march's own "distance along the ray" convention -- see
+// marchCloudSlab/marchCloudLayers) into the forward-axis (view-space) distance the NDC mapping is
+// actually defined against, the same conversion cloud_render.comp.slang's own depth clamp already
+// performs in the opposite direction.
+//
+// This is a per-pixel-local linearization (exact at screen center, mildly approximate toward wide-
+// FOV edges where viewDirYUp diverges from the central forward axis) and ignores second-order
+// rotation/translation coupling -- acceptable for a soft, depth-uncertain background layer, and
+// materially better than the pure-rotation term alone for the case that actually regressed:
+// strafing under the deck with the view direction roughly fixed.
+vec2 cloudParallaxMotionVectorPixels(vec3 viewDirYUp, float depthKm, AtmosphereArgs args)
+{
+  const vec3 deltaKm = cb.cloudAnchorDeltaYUpKm;  // this frame's camera motion, Y-up km (cur - prev)
+
+  // Strip the along-ray component -- it changes depth, not screen position.
+  const vec3 deltaPerp = deltaKm - viewDirYUp * dot(deltaKm, viewDirYUp);
+
+  const vec3 rightAxis = args.cloudRenderRightYUp;  // pre-scaled by tan(halfFovX) * aspect
+  const vec3 upAxis    = args.cloudRenderUpYUp;     // pre-scaled by tan(halfFovY)
+  const float rightLenSq = max(dot(rightAxis, rightAxis), 1e-9f);
+  const float upLenSq    = max(dot(upAxis, upAxis), 1e-9f);
+
+  const float viewAxisCosine = max(abs(dot(viewDirYUp, normalize(args.cloudRenderForwardYUp))), 1e-3f);
+  const float zForwardKm = max(depthKm, 0.05f) * viewAxisCosine;
+
+  vec2 ndcDelta;
+  ndcDelta.x = dot(deltaPerp, rightAxis) / (zForwardKm * rightLenSq);
+  ndcDelta.y = dot(deltaPerp, upAxis)    / (zForwardKm * upLenSq);
+
+  // Same NDC -> pixel convention as the rotation-only term (y flip, half-resolution scale).
+  return ndcDelta * vec2(0.5, -0.5) * vec2(cb.camera.resolution);
+}
+
+// Combined reprojection motion vector for the cloud history: rotation (reliable on this target) plus
+// the translation parallax correction above (the signal the rotation-only term structurally cannot
+// carry). `depthKm` should be the pixel's own mean cloud depth (already floored by the caller).
+vec2 cloudReprojectionMotionVectorPixels(
+  uint2 pixelCoordinate, CameraDirections primaryRayDirections, float depthKm, AtmosphereArgs args)
+{
+  const vec3 viewDirYUp = normalize(worldToAtmosphereYUp(
+    primaryRayDirections.worldDirection, args.isZUp != 0u, args.flipUpAxis != 0));
+
+  const vec2 rotationMV = cloudRotationMotionVectorPixels(primaryRayDirections.worldDirection, pixelCoordinate);
+  const vec2 parallaxMV = cloudParallaxMotionVectorPixels(viewDirYUp, depthKm, args);
+  return rotationMV + parallaxMV;
+}
+
+// Composites the Nubis Cubed cloud render RT (m_cloudRenderRT / m_cloudDepthRT, written this frame
+// by RtxAtmosphere::dispatchCloudScreenPass, called right after dispatchPathTracing) over BOTH sky
+// and geometry. Previously (pre-Stage-4a) this only ran on sky-miss pixels, because it lived inside
+// evalSkyRadiance's primary-miss branch; it now also runs on opaque hits, because the cloud march
+// clamps against PrimaryLinearViewZ (Stage 4a) -- a hill whose surface pokes up INTO the deck
+// genuinely has cloud in front of it along this ray, and the whole point of this stage is to fog it
+// exactly as the sky is fogged, rather than leaving it (and any foliage on it) crisp.
+void applyCloudComposite(
+  uint2 pixelCoordinate,
+  bool primaryMiss,
+  float viewDistance,
+  uint frameIdx,
+  CameraDirections primaryRayDirections,
+  inout vec3 radianceOutput,
+  inout vec3 alphaBlendOutput,
+  bool alphaBlendSurfaceValid,
+  float alphaBlendHitDistance)
+{
+  AtmosphereArgs args = cb.atmosphereArgs;
+  if (args.cloudRenderRTEnable == 0u)
+  {
+    return;
+  }
+
+  const vec4 cloudRT = sampleCloudRenderRT(pixelCoordinate, args);
+  // Same alpha-convention flip evalSkyRadiance always applied: the RT stores TRANSMITTANCE, the
+  // premultiplied-over composite below wants OPACITY.
+  vec4 currentCloud = vec4(cloudRT.rgb, 1.0f - cloudRT.a);
+
+  const vec2 cloudDepthKm = sampleCloudDepthKm(pixelCoordinate, args);
+  const float entryKm = cloudDepthKm.x;
+  const float meanKm  = cloudDepthKm.y;
+  const float kmPerWorldUnit = 1.0f / max(args.worldUnitsPerKm, 1e-6f);
+
+  // Defensive depth gate -- see cloudDepthVisibility's header comment. A no-op on every sky pixel
+  // (there is no surface to be nearer than the cloud) and, at cloudRenderResolutionScale = 1.0, a
+  // no-op on every geometry pixel too (the march already clamped there). This is what makes "sky
+  // pixels unchanged" and "geometry inside the deck is fogged" both true from the same code path.
+  if (!primaryMiss)
+  {
+    const float surfaceKm = viewDistance * kmPerWorldUnit;
+    const float visibility = cloudDepthVisibility(entryKm, meanKm, surfaceKm);
+    currentCloud *= visibility;
+  }
+  else if (entryKm < 0.0f)
+  {
+    currentCloud = vec4(0.0f);
+  }
+
+  // ---- Temporal EMA (relocated from evalSkyRadiance; now parallax-aware -- see
+  // cloudReprojectionMotionVectorPixels). Reprojects into the SAME cloud-history ping-pong pair
+  // evalSkyRadiance used to own (RtxAtmosphere owns the actual swap; composite reads whichever pair
+  // RtxAtmosphere::bindResources already resolved as Prev/Curr for this frame, during the G-buffer
+  // pass's common-bindings setup -- composite must not swap again). ----
+  vec4 smoothedCloud = currentCloud;
+  if (all(cb.camera.resolution > uint2(0u, 0u)))
+  {
+    const vec2 motionVectorPixels = cloudReprojectionMotionVectorPixels(
+      pixelCoordinate, primaryRayDirections, max(meanKm, 0.05f), args);
+    const vec2 prevPixelF = vec2(pixelCoordinate) + motionVectorPixels;
+    const int2 prevPixel = int2(floor(prevPixelF + 0.5f));
+
+    const bool reprojValid = all(prevPixel >= int2(0, 0))
+                          && all(prevPixel < int2(cb.camera.resolution));
+
+    bool historyValid = false;
+    vec4 history = vec4(0.0f);
+    if (reprojValid)
+    {
+      history = CompositeCloudHistoryPrev[prevPixel];
+
+      // Age check: reject history whose stored frame-id doesn't match the immediately previous
+      // frame (companion R16_UINT ping-pong; catches stale history at pixels that were
+      // foreground-occluded last frame). Sentinel 0xFFFF collides harmlessly with startup and the
+      // once-per-65536-frames wrap.
+      const uint historyFrameId = CompositeCloudHistoryFrameIdPrev[prevPixel];
+      const uint expectedPrevFrameId = (frameIdx - 1u) & 0xFFFFu;
+      const bool ageValid = (historyFrameId == expectedPrevFrameId) && (historyFrameId != 0xFFFFu);
+
+      historyValid = ageValid && ((history.a > 0.001f) || (currentCloud.a < 0.001f));
+    }
+
+    if (historyValid)
+    {
+      // Anchor-cut history rejection (fork — 2026-09-05): reuses the SAME signal Stage 2 built for
+      // exactly this purpose rather than inventing a second one. RtxAtmosphere::getAtmosphereArgs
+      // already zeroes args.cloudHistoryWeight for one frame when m_cloudAnchorCutThisFrame fires
+      // (a teleport / cell transition / camera-world-override toggle) -- with historyWeight == 0 the
+      // lerp below collapses to `currentCloud` unconditionally, which IS full history rejection.
+      const float historyWeight = saturate(args.cloudHistoryWeight)
+                                * (1.0f - 0.8f * saturate(args.lightningHistoryFade));
+      smoothedCloud = lerp(currentCloud, history, historyWeight);
+    }
+    else
+    {
+      smoothedCloud = currentCloud;
+    }
+
+    CompositeCloudHistoryCurr[pixelCoordinate] = smoothedCloud;
+    CompositeCloudHistoryFrameIdCurr[pixelCoordinate] = frameIdx & 0xFFFFu;
+  }
+
+  // Premultiplied over -- identical operation to the removed evalSkyRadiance code, just relocated.
+  radianceOutput = radianceOutput * (1.0f - smoothedCloud.a) + smoothedCloud.rgb;
+
+  // ---- Alpha-blended (foliage / particle) surfaces ----
+  // Depth-ratio rule (fork — 2026-09-05): the alpha-blend surface has no march-side depth clamp of
+  // its own (cloud_render.comp.slang only clamps against the OPAQUE PrimaryLinearViewZ, never
+  // against AlphaBlendGBuffer's hitT), so unlike the opaque path above, this gate is NOT a no-op --
+  // it is the only thing that keeps foliage from rendering crisp through a cloud the ground beneath
+  // it is already fogged by. Reuses cloudDepthVisibility exactly as the opaque path does: a surface
+  // at or beyond the cloud's mean depth is "as deep into the cloud as the marched mass" and gets the
+  // full smoothedCloud composite; one entirely in front of the cloud's entry gets none; a surface
+  // partway between entry and mean gets a proportional blend. Foliage sitting on the same ground the
+  // opaque composite above just fogged will read alphaSurfaceKm ~= surfaceKm and so end up fogged the
+  // same amount -- the specific "crisp foliage in a foggy scene" artefact this item exists to avoid.
+  if (alphaBlendSurfaceValid && entryKm >= 0.0f)
+  {
+    const float alphaSurfaceKm = alphaBlendHitDistance * kmPerWorldUnit;
+    const float alphaVisibility = cloudDepthVisibility(entryKm, meanKm, alphaSurfaceKm);
+    alphaBlendOutput = alphaBlendOutput * (1.0f - smoothedCloud.a * alphaVisibility)
+                     + smoothedCloud.rgb * alphaVisibility;
+  }
+}
+
 void applyFog(
   float viewDistance,
   float radianceScale,
@@ -771,6 +1072,8 @@ vec4 compositeResult(
   float backgroundAlpha;
   vec3 radianceOutput;
   vec3 sharedFinalOutput;
+  bool alphaBlendSurfaceValid;
+  float alphaBlendHitDistance;
 
   // Determine radiance scales for sparse rendering. Scaling only applies at union-active pixels;
   // at inactive pixels the contributions that would be scaled (alpha blend, fog, sky) come from
@@ -826,7 +1129,8 @@ vec4 compositeResult(
     pixelCoordinate, randomState, primaryRayDirections, pixelIsActive, primaryMiss, viewDistance,
     radianceScale, volumetricRadianceScale, remodulatedTotalSecondaryRadiance, sharedRadiance,
     volumetricPreintegratedRadiance, volumeAttenuation, alphaBlendOutput, backgroundAlpha,
-    radianceOutput, particleLayerOutput);
+    radianceOutput, particleLayerOutput,
+    alphaBlendSurfaceValid, alphaBlendHitDistance);
 
   // Calculate final combined radiance output
   // Note: The primary hit accumulated radiance value is not affected by the throughput (rather takes attenuation into account
@@ -838,6 +1142,19 @@ vec4 compositeResult(
 
   // Applied before the sky so it only affects geometry; the sky already carries its full column.
   applyAerialPerspective(pixelCoordinate, primaryMiss, viewDistance, volumeAttenuation, radianceOutput);
+
+  // Cloud composite (fork — 2026-09-05, world-space cloud migration Stage 4b). Placed immediately
+  // after aerial perspective and before the dome-light sky contribution / fog: the composite is the
+  // same premultiplied-over evalSkyRadiance used to do, just relocated to where this frame's cloud RT
+  // actually exists (see applyCloudComposite's own header comment). radianceOutput at this point is
+  // exactly what evalSkyRadiance's primary branch used to see as `radiance` right before its own
+  // (now-removed) composite: for a sky pixel that is remodulatedTotalPrimaryRadiance (clearColor,
+  // zero contribution) + sharedRadiance (the cloudless sky/atmosphere/star/moon radiance
+  // geometry_resolver.slangh wrote) + volumetrics; for a geometry hit it is the denoised primary
+  // radiance with aerial perspective already folded in.
+  applyCloudComposite(
+    pixelCoordinate, primaryMiss, viewDistance, cb.frameIdx, primaryRayDirections,
+    radianceOutput, alphaBlendOutput, alphaBlendSurfaceValid, alphaBlendHitDistance);
 
   // Add sky radiance
   applySkyContribution(pixelCoordinate, primaryRayDirections, primaryMiss, radianceScale, volumeAttenuation, radianceOutput);

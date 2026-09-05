@@ -345,9 +345,38 @@
 // a bug to chase.
 #define DEBUG_VIEW_CLOUD_SEGMENT_CLASSIFICATION 880
 
-// IDs 881, 882 and 883 are reserved for later stages of the world-space
-// cloud migration (post-Stage-0) and are deliberately NOT allocated here —
-// do not assign them to unrelated views.
+// Cloud depth companion (fork — world-space cloud migration Stage 4b, 2026-09-05). Visualizes
+// AtmosphereCloudDepth (r = entry distance km, g = transmittance-weighted mean cloud depth km),
+// point-sampled exactly as composite.comp.slang's applyCloudComposite reads it — never bilinear (see
+// that function's sampleCloudDepthKm). RGB = mean depth on the Turbo colormap over 0-20 km (black =
+// sentinel / no cloud along this ray, blue -> green -> yellow -> red as mean depth approaches 20 km).
+// Alpha = entry distance, RAW km (not normalized — read it with the debug view's per-channel /
+// statistics tools, same convention as the raw-magnitude channel in enum 877).
+#define DEBUG_VIEW_CLOUD_DEPTH 881
+// Cloud transmittance on geometry (fork — world-space cloud migration Stage 4b, 2026-09-05).
+// Greyscale cloud alpha (1 - AtmosphereCloudRender.a, the same opacity convention
+// applyCloudComposite composites with) at pixels that resolved an opaque hit; sky-miss pixels are
+// painted black (mirrors DEBUG_VIEW_CLOUD_CALIBRATION_RINGS' isSkyMiss test — cb.nrd.missLinearViewZ
+// against PrimaryLinearViewZ, current-frame sources only). White = fully opaque cloud between camera
+// and surface, black = surface not fogged (either no cloud in front of it, or a genuine miss).
+#define DEBUG_VIEW_CLOUD_TRANSMITTANCE_ON_GEOMETRY 882
+// Cloud reprojection (fork — world-space cloud migration Stage 4b, 2026-09-05). Current-frame
+// sources only (this pass's own G-buffer / AtmosphereCloudDepth reads; the depth companion is
+// point-sampled, matching the same silhouette-safety reasoning as enums 880/884). Recomputes the
+// SAME rotation + translation-parallax reprojection composite.comp.slang's applyCloudComposite
+// performs (duplicated, not shared — same reasoning as enum 880's cloudSlabSpan duplication: zero
+// risk to the production composite from a diagnostic view).
+//   R (0..1, saturated) = magnitude of the parallax correction ALONE, in pixels / 4 — this equals
+//     (parallax-reprojected pixel - rotation-only pixel) by construction, since the combined
+//     reprojection is rotation-only PLUS this term. A strafe under the deck that smears before this
+//     stage should light this channel up broadly; near-zero everywhere means the parallax term is
+//     contributing ~nothing (e.g. camera not translating, or cloud very distant this frame).
+//   G = history-rejection reason as a 4-level step: 0 = would accept history, 0.33 = no cloud along
+//     this ray (nothing to reject), 0.66 = anchor cut (cloudHistoryWeight forced to 0 this frame —
+//     see RtxAtmosphere's m_cloudAnchorCutThisFrame), 1.0 = stale age or off-screen reprojection
+//     (CompositeCloudHistoryFrameIdPrev doesn't match this frame - 1, or the reprojected pixel falls
+//     outside the screen).
+#define DEBUG_VIEW_CLOUD_REPROJECTION 883
 
 // Cloud calibration rings (fork — world-space cloud migration, Stage 0,
 // 2026-09-05). Iso-distance rings painted on resolved geometry at 0.5 / 1 /

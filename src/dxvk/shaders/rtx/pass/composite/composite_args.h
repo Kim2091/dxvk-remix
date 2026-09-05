@@ -114,4 +114,20 @@ struct CompositeArgs {
   float postFilterThreshold;
   uint writeRayReconstructionHitDistance;
   float pad1;
+
+  // Cloud composite parallax reprojection (fork — 2026-09-05, world-space cloud migration Stage 4b).
+  // This frame's cloud-anchor world-space motion, Y-up km (RtxAtmosphere::getCloudAnchor().deltaKm
+  // == posYUpKm - prevPosYUpKm; see rtx_atmosphere.h's CloudAnchor struct). NOT part of
+  // AtmosphereArgs -- that struct cannot grow (see its own alignment-discipline comment) and this
+  // value is composite-only, never feeding a bake or a LUT cache key. Needed because the reliable
+  // reprojection matrix (cb.camera.prevWorldToProjection) only carries camera ROTATION on the
+  // Gamebryo-family engine this migration targets: RtCamera::getPosition() reads a rotation-only D3D
+  // view matrix (see RtxAtmosphere::updateFrame's anchor-resolution block), so a pure-direction
+  // reprojection (as the existing rotation-only screen motion vector already does) is the only thing
+  // that matrix can supply. The cloud RT now carries real depth (AtmosphereCloudDepth), so a
+  // translating camera needs a real parallax correction on top of that rotation-only term -- this is
+  // the one place a translation signal for that correction can come from. See
+  // applyCloudComposite / cloudParallaxMotionVectorPixels in composite.comp.slang.
+  vec3 cloudAnchorDeltaYUpKm;
+  float pad2;
 };

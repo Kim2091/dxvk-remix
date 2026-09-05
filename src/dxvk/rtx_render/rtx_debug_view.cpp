@@ -265,6 +265,46 @@ namespace dxvk {
                                 "same four colours interpolate as a continuous ramp (fading toward black\n"
                                 "past 5 km) so any pixel's approximate distance reads at a glance, not\n"
                                 "just the exact ring positions. Sky / miss pixels are painted black."},
+        {DEBUG_VIEW_CLOUD_DEPTH, "Atmosphere: Cloud Depth Companion (World-Space Stage 4b)",
+                                "Fork diagnostic (world-space cloud migration, Stage 4b, 2026-09-05).\n"
+                                "Visualizes AtmosphereCloudDepth (produced by cloud_render.comp.slang /\n"
+                                "RtxAtmosphere::dispatchCloudScreenPass), point-sampled exactly as\n"
+                                "composite.comp.slang's applyCloudComposite reads it - never bilinear.\n"
+                                "RGB: transmittance-weighted mean cloud depth on the Turbo colormap over\n"
+                                "0-20 km (black = sentinel / no cloud along this ray at all, blue -> green\n"
+                                "-> yellow -> red as mean depth approaches 20 km).\n"
+                                "Alpha: entry distance, RAW km (not normalized - read with the debug\n"
+                                "view's per-channel / statistics tools)."},
+        {DEBUG_VIEW_CLOUD_TRANSMITTANCE_ON_GEOMETRY, "Atmosphere: Cloud Transmittance On Geometry (World-Space Stage 4b)",
+                                "Fork diagnostic (world-space cloud migration, Stage 4b, 2026-09-05).\n"
+                                "Greyscale cloud alpha (1 - AtmosphereCloudRender.a, the same opacity\n"
+                                "convention applyCloudComposite composites with) at pixels that resolved\n"
+                                "an opaque hit. Sky / miss pixels are painted black (same\n"
+                                "cb.nrd.missLinearViewZ exact-sentinel test as enums 880/884).\n"
+                                "White = fully opaque cloud between camera and surface (surface should\n"
+                                "read heavily fogged in the final composite); black = surface not\n"
+                                "fogged (no cloud in front of it along this ray, or a genuine miss)."},
+        {DEBUG_VIEW_CLOUD_REPROJECTION, "Atmosphere: Cloud Reprojection (World-Space Stage 4b)",
+                                "Fork diagnostic (world-space cloud migration, Stage 4b, 2026-09-05).\n"
+                                "Recomputes the SAME rotation + translation-parallax reprojection\n"
+                                "composite.comp.slang's applyCloudComposite performs, from current-frame\n"
+                                "sources only (this pass's own G-buffer + AtmosphereCloudDepth reads -\n"
+                                "the depth companion is point-sampled, matching enums 880/884's\n"
+                                "silhouette-safety reasoning).\n"
+                                "R: magnitude of the translation-parallax correction ALONE, in pixels,\n"
+                                "saturated over 0-4 px. This equals (parallax-reprojected pixel -\n"
+                                "rotation-only pixel) by construction. Strafing under the deck should\n"
+                                "light this channel up broadly if the parallax term is doing real work;\n"
+                                "near-zero everywhere with the camera translating under a nearby cloud\n"
+                                "would indicate the correction is not engaging.\n"
+                                "G: history-rejection reason, a 4-level step -\n"
+                                "  0.00 = would accept history\n"
+                                "  0.33 = no cloud along this ray (nothing to reject)\n"
+                                "  0.66 = anchor cut this frame (RtxAtmosphere::m_cloudAnchorCutThisFrame\n"
+                                "         forced cloudHistoryWeight to 0 - teleport / cell transition /\n"
+                                "         camera-world-override toggle)\n"
+                                "  1.00 = stale age (CompositeCloudHistoryFrameIdPrev doesn't match this\n"
+                                "         frame - 1) or the reprojected pixel fell off-screen"},
         {DEBUG_VIEW_CASCADE_LEVEL, "Terrain: Cascade Level"},
 
         {DEBUG_VIEW_VIRTUAL_HIT_DISTANCE, "Virtual Hit Distance"},
@@ -730,6 +770,8 @@ namespace dxvk {
         TEXTURE3D(DEBUG_VIEW_BINDING_CLOUD_D_AMBIENT_INPUT)
         TEXTURE2D(DEBUG_VIEW_BINDING_CLOUD_RENDER_RT_INPUT)
         TEXTURE3D(DEBUG_VIEW_BINDING_CLOUD_NVDF_SDF_INPUT)
+        TEXTURE2D(DEBUG_VIEW_BINDING_CLOUD_DEPTH_RT_INPUT)
+        TEXTURE2D(DEBUG_VIEW_BINDING_CLOUD_HISTORY_FRAME_ID_PREV_INPUT)
 
         RW_TEXTURE2D(DEBUG_VIEW_BINDING_ACCUMULATED_DEBUG_VIEW_INPUT_OUTPUT)
 
@@ -1350,6 +1392,10 @@ namespace dxvk {
     // views that don't need them simply ignore the values.
     debugViewArgs.atmosphereArgs = rtOutput.m_raytraceArgs.atmosphereArgs;
     debugViewArgs.isZUp = rtOutput.m_raytraceArgs.isZUp;
+    // Fork: mirrors CompositeArgs::cloudAnchorDeltaYUpKm (world-space cloud migration Stage 4b,
+    // 2026-09-05) so DEBUG_VIEW_CLOUD_REPROJECTION (883) can recompute composite's parallax motion
+    // vector. See that field's doc comment in composite_args.h / debug_view_args.h.
+    debugViewArgs.cloudAnchorDeltaYUpKm = common.metaAtmosphere().getCloudAnchor().deltaKm;
 
     if (displayType() == DebugViewDisplayType::Standard) {
       debugViewArgs.pseudoColorMode = pseudoColorMode();
@@ -1407,6 +1453,13 @@ namespace dxvk {
       // DIRECT_* cases immediately above — same "primary ray" data.
       case DEBUG_VIEW_CLOUD_SEGMENT_CLASSIFICATION:
       case DEBUG_VIEW_CLOUD_CALIBRATION_RINGS:
+      // Fork (world-space cloud migration, Stage 4b, 2026-09-05): same reasoning as the two enums
+      // above -- DEBUG_VIEW_CLOUD_TRANSMITTANCE_ON_GEOMETRY needs cb.nrd.missLinearViewZ for its own
+      // isSkyMiss test, and the other two are grouped in for consistency (harmless for the cases
+      // that don't end up reading cb.nrd at all).
+      case DEBUG_VIEW_CLOUD_DEPTH:
+      case DEBUG_VIEW_CLOUD_TRANSMITTANCE_ON_GEOMETRY:
+      case DEBUG_VIEW_CLOUD_REPROJECTION:
         debugViewArgs.nrd = common.metaPrimaryDirectLightDenoiser().getNrdArgs();
         break;
       case DEBUG_VIEW_DENOISED_PRIMARY_INDIRECT_DIFFUSE_RADIANCE:
@@ -1543,6 +1596,21 @@ namespace dxvk {
       const Resources::Resource& cloudRenderRT = atmosphere.getCloudRenderRT();
       if (cloudRenderRT.isValid()) {
         ctx->bindResourceView(DEBUG_VIEW_BINDING_CLOUD_RENDER_RT_INPUT, cloudRenderRT.view, nullptr);
+      }
+    }
+    // Fork: cloud depth companion + history frame-id (world-space cloud migration Stage 4b,
+    // 2026-09-05). Read-only diagnostics for DEBUG_VIEW_CLOUD_DEPTH (881),
+    // DEBUG_VIEW_CLOUD_TRANSMITTANCE_ON_GEOMETRY (882) and DEBUG_VIEW_CLOUD_REPROJECTION (883).
+    {
+      const Resources::Resource& cloudDepthRT = atmosphere.getCloudDepthRT();
+      if (cloudDepthRT.isValid()) {
+        ctx->bindResourceView(DEBUG_VIEW_BINDING_CLOUD_DEPTH_RT_INPUT, cloudDepthRT.view, nullptr);
+      }
+    }
+    {
+      const Resources::Resource& cloudHistoryFrameIdPrev = atmosphere.getPreviousCloudHistoryFrameId();
+      if (cloudHistoryFrameIdPrev.isValid()) {
+        ctx->bindResourceView(DEBUG_VIEW_BINDING_CLOUD_HISTORY_FRAME_ID_PREV_INPUT, cloudHistoryFrameIdPrev.view, nullptr);
       }
     }
 

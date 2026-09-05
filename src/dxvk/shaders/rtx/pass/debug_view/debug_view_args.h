@@ -161,4 +161,13 @@ struct DebugViewArgs {
 
   uvec2 renderToOutputResolution;
   vec2 renderToOutputToDebugViewResolution;
+
+  // Fork: mirrors CompositeArgs::cloudAnchorDeltaYUpKm (world-space cloud migration Stage 4b,
+  // 2026-09-05) so DEBUG_VIEW_CLOUD_REPROJECTION (883) can recompute the SAME parallax motion
+  // vector composite.comp.slang's applyCloudComposite does, from current-frame sources only. See
+  // composite_args.h's doc comment on that field for the full rationale. Copied verbatim from
+  // RtxAtmosphere::getCloudAnchor().deltaKm at debug-view dispatch time, mirroring the existing
+  // atmosphereArgs mirror above.
+  vec3 cloudAnchorDeltaYUpKm;
+  float pad2;
 };
