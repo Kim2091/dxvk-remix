@@ -210,6 +210,51 @@ namespace dxvk {
                                 "placement-map clusters; the green outline is clean (no speckle =\n"
                                 "JFA converged); the pattern is seamless across the tile wrap; and\n"
                                 "dragging Cloud Cell Size re-bakes it live (amortized, ~6 frames)."},
+        {DEBUG_VIEW_CLOUD_SEGMENT_CLASSIFICATION, "Atmosphere: Cloud Segment Classification (World-Space Stage 0)",
+                                "Fork diagnostic (world-space cloud migration, Stage 0, 2026-09-05).\n"
+                                "Per-pixel classification of how the PRIMARY ray's cloud slab span\n"
+                                "[tEntry, tExit] relates to the resolved G-buffer surface at distance\n"
+                                "tSurface. The span is computed by DUPLICATING (not calling — and not\n"
+                                "modifying) the exact ray-vs-shell intersection marchCloudSlab performs\n"
+                                "(cloud_march_common.slangh, ~line 1000) at production's call shape:\n"
+                                "tMinClamp=0 / tMaxClamp=0, i.e. \"march the full reachable span\" — the\n"
+                                "same 0/0 clamps cloud_render.comp.slang and cloud_secondary_lut.comp.slang\n"
+                                "always pass today.\n"
+                                "  Black   - sky / miss pixel: no resolved surface, nothing to classify.\n"
+                                "  Blue    - ray never reaches the cloud slab (misses the shell entirely,\n"
+                                "            or the reachable span is empty / behind the camera).\n"
+                                "  Yellow  - camera is already inside the slab (the span starts at t=0).\n"
+                                "  Red     - the slab lies entirely beyond the surface (tEntry > tSurface):\n"
+                                "            the resolved geometry fully occludes the cloud.\n"
+                                "  Magenta - the surface sits inside the slab span.\n"
+                                "  Green   - the slab and the camera-to-surface segment overlap (the\n"
+                                "            cloud is fully between the camera and the surface).\n"
+                                "EXPECTED RESULT ON FIRST RUN: red on essentially every pixel that hits\n"
+                                "geometry. This is the correct outcome and the entire point of the view —\n"
+                                "it demonstrates that today's cloud slab is anchored to the camera (the\n"
+                                "base/top shells are centred on a planet sphere directly beneath the\n"
+                                "CAMERA, not beneath true world-space ground) and is consequently\n"
+                                "unreachable by world geometry: the slab sits tens of kilometres out\n"
+                                "along the ray while resolved scene distances are comparatively tiny. Do\n"
+                                "not tune constants to turn this green and do not treat red as a\n"
+                                "regression — green/magenta becoming common is a later migration stage's\n"
+                                "success criterion, not this one's."},
+        {DEBUG_VIEW_CLOUD_CALIBRATION_RINGS, "Atmosphere: Calibration Rings (World-Space Stage 0)",
+                                "Fork diagnostic (world-space cloud migration, Stage 0, 2026-09-05).\n"
+                                "Paints iso-distance rings on resolved geometry at 0.5 / 1 / 2 / 5 km\n"
+                                "from the camera, computed as viewDistance * kmPerWorldUnit where\n"
+                                "kmPerWorldUnit = 1 / args.worldUnitsPerKm — the same conversion the\n"
+                                "cloud-ground-shadow diagnostics (enum 877) already use; no new CB field.\n"
+                                "Purpose: worldUnitsPerKm today is derived from rtx.sceneScale, which\n"
+                                "commit dd515e082 documented as \"not a reliable measurement of the world\n"
+                                "space\". Stand at an in-game landmark whose real-world separation from\n"
+                                "the camera is known, compare where its ring lands, and back out the\n"
+                                "game's true world-units-per-km from the mismatch.\n"
+                                "Bands: 0.5 km = red, 1 km = yellow, 2 km = green, 5 km = blue — each a\n"
+                                "thin bright core fading to its hue at the band edge. Between bands the\n"
+                                "same four colours interpolate as a continuous ramp (fading toward black\n"
+                                "past 5 km) so any pixel's approximate distance reads at a glance, not\n"
+                                "just the exact ring positions. Sky / miss pixels are painted black."},
         {DEBUG_VIEW_CASCADE_LEVEL, "Terrain: Cascade Level"},
 
         {DEBUG_VIEW_VIRTUAL_HIT_DISTANCE, "Virtual Hit Distance"},
@@ -1341,6 +1386,17 @@ namespace dxvk {
       case DEBUG_VIEW_DENOISED_PRIMARY_DIRECT_SPECULAR_RADIANCE:
       case DEBUG_VIEW_DENOISED_PRIMARY_DIRECT_DIFFUSE_HIT_T:
       case DEBUG_VIEW_DENOISED_PRIMARY_DIRECT_SPECULAR_HIT_T:
+      // Fork (world-space cloud migration, Stage 0): these two per-pixel
+      // G-buffer painters need cb.nrd.missLinearViewZ to tell a sky/miss
+      // pixel apart from a real hit (DEBUG_VIEW_CLOUD_CALIBRATION_RINGS
+      // paints miss pixels black). Without this case, debugViewArgs.nrd
+      // would keep the zero-initialized value from its declaration above
+      // when denoiseDirectAndIndirectLightingSeparately() is on, since
+      // neither enum matches any other case in this switch. Mirrors the
+      // primary-direct selection already used for the DENOISED_PRIMARY_
+      // DIRECT_* cases immediately above — same "primary ray" data.
+      case DEBUG_VIEW_CLOUD_SEGMENT_CLASSIFICATION:
+      case DEBUG_VIEW_CLOUD_CALIBRATION_RINGS:
         debugViewArgs.nrd = common.metaPrimaryDirectLightDenoiser().getNrdArgs();
         break;
       case DEBUG_VIEW_DENOISED_PRIMARY_INDIRECT_DIFFUSE_RADIANCE:

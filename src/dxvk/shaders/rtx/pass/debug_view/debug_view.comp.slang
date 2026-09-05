@@ -629,6 +629,204 @@ vec4 loadInput(inout RNG randomState, ivec2 threadId)
   // DEBUG_VIEW_CLOUD_SHADOW_FACTOR_RAW (enum 878) removed 2026-06-19 with the
   // screen-space cloud-shadow system. Use enum 875/877 (D_sun grid reads) for
   // cloud-on-terrain shadow diagnostics.
+  case DEBUG_VIEW_CLOUD_SEGMENT_CLASSIFICATION:
+    {
+      // Fork diagnostic (world-space cloud migration, Stage 0, 2026-09-05).
+      // Classifies how the PRIMARY ray's cloud slab span relates to the
+      // resolved G-buffer surface. Full legend + the expected "red almost
+      // everywhere" first-run reading (correct, not a bug) are documented on
+      // the enum's registration in rtx_debug_view.cpp.
+      //
+      // The span math below is DUPLICATED from marchCloudSlab
+      // (cloud_march_common.slangh, ~line 1000-1020) rather than calling or
+      // refactoring it — this view must carry zero risk to the production
+      // march, which cloud_march_common.slangh is off-limits for behavioural
+      // changes here regardless. It reproduces exactly production's call
+      // shape: marchCloudLayers is always invoked with tMinClamp=0 and
+      // tMaxClamp=0 (cloud_render.comp.slang, cloud_secondary_lut.comp.slang)
+      // — "march the full reachable span, unclamped by any surface" — so
+      // tEntry = max(t1base, 0), tExit = t1top, exactly as marchCloudSlab
+      // computes them for those tMinClamp/tMaxClamp values.
+
+      // (fork — 2026-09-05, Stage 0 follow-up) Both the ray direction and the
+      // surface distance are taken from CURRENT-frame sources only.
+      //
+      // The first cut of this view took the ray from the G-buffer world
+      // position (PreviousWorldPosition_WorldTriangleNormal, as enums 875/877
+      // do) while testing for sky against the current frame's
+      // PrimaryLinearViewZ. Mixing the two frames produced a one-frame-stale
+      // yellow fringe that visibly lagged the camera along every silhouette:
+      // at a pixel that resolves geometry THIS frame but was sky LAST frame,
+      // the stale world position yields a meaningless segment, and the
+      // classifier lands on yellow — "camera already inside the slab", the
+      // single most misleading colour here, since yellow is exactly the
+      // signal one watches for during cloud fly-through.
+      //
+      // Reconstructing the ray from the camera and the pixel removes the
+      // G-buffer position from this view entirely, so there is no frame to be
+      // stale. Jittered to match the primary ray that wrote PrimaryLinearViewZ.
+      const CameraDirections rayDirections =
+          cameraPixelCoordinateToDirection(cb.camera, ivec2(threadId));
+
+      // Sky / miss pixels are not classifiable and stay black, exactly as enum
+      // 884 does. cb.nrd.missLinearViewZ is populated for this enum in
+      // RtxDebugView::dispatch (rtx_debug_view.cpp), so this is an exact
+      // sentinel comparison, not a heuristic threshold.
+      const float linearViewZ = PrimaryLinearViewZ[threadId].x;
+      const bool isSkyMiss = (linearViewZ == cb.nrd.missLinearViewZ);
+
+      // PrimaryLinearViewZ is a view-space DEPTH, not a distance along the ray.
+      // Divide by the ray's projection onto the view axis to recover the true
+      // slant range, or every off-centre pixel reads short. abs() keeps this
+      // handedness-agnostic (cb.camera may be LHS or RHS).
+      const float viewAxisCosine = max(abs(rayDirections.viewDirection.z), 1e-6f);
+      const float cameraToSurfaceLength = linearViewZ / viewAxisCosine;
+
+      vec3 outColor;
+      if (isSkyMiss) {
+        outColor = vec3(0.0f);
+      } else if (cameraToSurfaceLength <= 1e-6f) {
+        // Degenerate segment on a pixel that DID resolve a surface: it is
+        // coincident with the camera, so there is no direction to classify
+        // along. Distinct from the sky case handled above.
+        outColor = vec3(0.0f, 0.0f, 1.0f);
+      } else {
+        const bool isZUpFlag = (cb.isZUp != 0u);
+        const bool flipUpAxis = (cb.atmosphereArgs.flipUpAxis != 0);
+        const vec3 viewDirYUp = normalize(worldToAtmosphereYUp(
+            rayDirections.worldDirection, isZUpFlag, flipUpAxis));
+
+        const float kmPerWorldUnit = 1.0f / max(cb.atmosphereArgs.worldUnitsPerKm, 1e-6f);
+        const float tSurfaceKm = cameraToSurfaceLength * kmPerWorldUnit;
+
+        // ---- marchCloudSlab's shell setup, duplicated verbatim ----
+        const float cloudR = cloudPlanetRadius(cb.atmosphereArgs);
+        const vec3 planetCenter = vec3(0.0f, -cloudR, 0.0f);
+        const float baseRadius = cloudR + cb.atmosphereArgs.cloudAltitude;
+        const float topRadius  = cloudR + cb.atmosphereArgs.cloudAltitude
+                                        + cb.atmosphereArgs.cloudThickness;
+
+        float t0base, t1base, t0top, t1top;
+        const bool hitBase = intersectSphere(vec3(0.0f), viewDirYUp, planetCenter, baseRadius, t0base, t1base);
+        const bool hitTop  = intersectSphere(vec3(0.0f), viewDirYUp, planetCenter, topRadius,  t0top,  t1top);
+
+        if (!hitBase || !hitTop) {
+          outColor = vec3(0.0f, 0.0f, 1.0f);  // blue: ray misses the shell entirely
+        } else {
+          // tMinClamp=0 / tMaxClamp=0, matching production exactly (see
+          // comment above) — tMaxClamp>0 branch never taken, so tExit is
+          // just t1top, unclamped.
+          const float tEntry = max(t1base, 0.0f);
+          const float tExit  = t1top;
+          if (tEntry >= tExit || tExit <= 0.0f) {
+            outColor = vec3(0.0f, 0.0f, 1.0f);  // blue: no reachable span (mirrors marchCloudSlab's early-out)
+          } else if (tEntry <= 0.0f) {
+            outColor = vec3(1.0f, 1.0f, 0.0f);  // yellow: camera already inside the slab
+          } else if (tEntry > tSurfaceKm) {
+            outColor = vec3(1.0f, 0.0f, 0.0f);  // red: slab entirely beyond the surface
+          } else if (tSurfaceKm <= tExit) {
+            outColor = vec3(1.0f, 0.0f, 1.0f);  // magenta: surface sits inside the slab
+          } else {
+            outColor = vec3(0.0f, 1.0f, 0.0f);  // green: slab and visible segment overlap
+          }
+        }
+      }
+      value = vec4(outColor, 1.0f);
+    }
+    break;
+  case DEBUG_VIEW_CLOUD_CALIBRATION_RINGS:
+    {
+      // Fork diagnostic (world-space cloud migration, Stage 0, 2026-09-05).
+      // Iso-distance rings at 0.5 / 1 / 2 / 5 km from the camera, painted on
+      // resolved geometry, to calibrate worldUnitsPerKm against known
+      // in-game map distances (see the enum's registration comment in
+      // rtx_debug_view.cpp for the full legend and rationale).
+
+      // Sky / miss pixels stay black. cb.nrd.missLinearViewZ is populated
+      // for this enum in RtxDebugView::dispatch (rtx_debug_view.cpp) the
+      // same way the DENOISED_PRIMARY_DIRECT_* cases populate it, so this
+      // is an exact sentinel comparison, not a heuristic threshold.
+      const float linearViewZ = PrimaryLinearViewZ[threadId].x;
+      const bool isSkyMiss = (linearViewZ == cb.nrd.missLinearViewZ);
+
+      vec3 outColor = vec3(0.0f);
+      if (!isSkyMiss) {
+        // (fork — 2026-09-05, Stage 0 follow-up) Current-frame sources only,
+        // for the same reason enum 880 above was reworked: pairing the
+        // PREVIOUS frame's G-buffer world position with THIS frame's
+        // PrimaryLinearViewZ leaves a one-frame-stale fringe along every
+        // silhouette that lags the camera. It is far less lurid here than
+        // 880's yellow outline was — a thin band of wrong distance rather
+        // than a wrong classification — but this is the view the world unit
+        // scale gets calibrated against, so a stale edge is exactly the kind
+        // of small systematic error worth not having.
+        //
+        // PrimaryLinearViewZ is a view-space DEPTH; dividing by the ray's
+        // projection onto the view axis recovers the slant range, which is
+        // what an iso-DISTANCE ring needs. abs() keeps it handedness-agnostic.
+        const CameraDirections rayDirections =
+            cameraPixelCoordinateToDirection(cb.camera, ivec2(threadId));
+        const float viewAxisCosine = max(abs(rayDirections.viewDirection.z), 1e-6f);
+        const float viewDistance = linearViewZ / viewAxisCosine;
+
+        const float kmPerWorldUnit = 1.0f / max(cb.atmosphereArgs.worldUnitsPerKm, 1e-6f);
+        const float viewDistanceKm = viewDistance * kmPerWorldUnit;
+
+        // Ring anchors: distance (km) and a distinct hue per radius, warm-to-
+        // cool with increasing distance so the ramp reads as a legend.
+        const float d0 = 0.5f, d1 = 1.0f, d2 = 2.0f, d3 = 5.0f;
+        const vec3 col0 = vec3(1.00f, 0.15f, 0.15f);  // 0.5 km - red
+        const vec3 col1 = vec3(1.00f, 0.85f, 0.05f);  // 1   km - yellow
+        const vec3 col2 = vec3(0.15f, 1.00f, 0.25f);  // 2   km - green
+        const vec3 col3 = vec3(0.15f, 0.55f, 1.00f);  // 5   km - blue
+
+        // Continuous ramp between/around the anchors — the "legend-friendly"
+        // part, letting a pixel's distance be read approximately even off an
+        // exact ring.
+        vec3 rampColor;
+        if (viewDistanceKm <= d0) {
+          rampColor = col0 * saturate(viewDistanceKm / d0);
+        } else if (viewDistanceKm <= d1) {
+          rampColor = lerp(col0, col1, saturate((viewDistanceKm - d0) / (d1 - d0)));
+        } else if (viewDistanceKm <= d2) {
+          rampColor = lerp(col1, col2, saturate((viewDistanceKm - d1) / (d2 - d1)));
+        } else if (viewDistanceKm <= d3) {
+          rampColor = lerp(col2, col3, saturate((viewDistanceKm - d2) / (d3 - d2)));
+        } else {
+          // Beyond the outermost ring: fade toward black over another 5 km
+          // so "off the calibrated range" reads distinctly from the 5 km
+          // band itself.
+          rampColor = lerp(col3, vec3(0.0f), saturate((viewDistanceKm - d3) / d3));
+        }
+
+        // Thin bright calibration bands at each exact ring distance,
+        // brightening to a near-white core so they read as marks rather
+        // than just ramp boundaries.
+        outColor = rampColor;
+        {
+          const float hw = max(d0 * 0.015f, 0.004f);
+          const float d = abs(viewDistanceKm - d0);
+          if (d < hw) { const float core = 1.0f - saturate(d / hw); outColor = lerp(col0, vec3(1.0f), core * core); }
+        }
+        {
+          const float hw = max(d1 * 0.015f, 0.004f);
+          const float d = abs(viewDistanceKm - d1);
+          if (d < hw) { const float core = 1.0f - saturate(d / hw); outColor = lerp(col1, vec3(1.0f), core * core); }
+        }
+        {
+          const float hw = max(d2 * 0.015f, 0.004f);
+          const float d = abs(viewDistanceKm - d2);
+          if (d < hw) { const float core = 1.0f - saturate(d / hw); outColor = lerp(col2, vec3(1.0f), core * core); }
+        }
+        {
+          const float hw = max(d3 * 0.015f, 0.004f);
+          const float d = abs(viewDistanceKm - d3);
+          if (d < hw) { const float core = 1.0f - saturate(d / hw); outColor = lerp(col3, vec3(1.0f), core * core); }
+        }
+      }
+      value = vec4(outColor, 1.0f);
+    }
+    break;
   case DEBUG_VIEW_NRC_UPDATE_RADIANCE:
   case DEBUG_VIEW_NRC_UPDATE_THROUGHPUT:
   case DEBUG_VIEW_NRC_UPDATE_RADIANCE_MULTIPLIED_BY_THROUGHPUT:

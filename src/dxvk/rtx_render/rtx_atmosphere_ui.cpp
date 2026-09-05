@@ -994,6 +994,144 @@ void RtxAtmosphere::showImguiSettings(WeatherBlender* blender) {
       // they stay discoverable but can't be dragged when inert.
       const bool layer2On  = RtxAtmosphere::cloudLayer2Enable();
 
+      // ---- World-space cloud migration, Stage 0: read-only diagnostics -----
+      // (fork — 2026-09-05, world-space cloud migration Stage 0)
+      // Everything in this subtree reads RtxAtmosphere::CloudAnchor (see its doc comment in
+      // rtx_atmosphere.h) plus the one calibration knob it depends on, cloudScale. Nothing here
+      // writes to AtmosphereArgs or touches a shader, so it cannot change a single rendered pixel —
+      // it exists so a human can watch, on a live game, whether a camera-view-matrix-derived world
+      // position is even usable as a cloud anchor before a later stage builds real world-space
+      // clouds on top of it. Placed first in the Clouds tree, ahead of Basic, because this is
+      // diagnostic instrumentation the user will come here looking for deliberately, not a
+      // look-tuning knob to stumble on.
+      // Default-open (fork — 2026-09-05, Stage 0 follow-up): this subtree is
+      // the readout that answers whether a camera-view-matrix anchor is usable
+      // at all on the running engine, so it should be visible the moment the
+      // Clouds tree is opened rather than needing a third click to find. The
+      // look-tuning subtrees below stay closed by default as before.
+      ImGui::SetNextItemOpen(true, ImGuiCond_Once);
+      if (ImGui::TreeNode("World Space")) {
+        RemixGui::DragFloat("Cloud Scene Unit Scale", &RtxAtmosphere::cloudScaleObject(),
+                            0.001f, 0.0f, 1000.0f, "%.5f", sliderFlags);
+        RemixGui::SetTooltipToLastWidgetOnHover(
+            "Game units per centimetre used only by the cloud world-space anchor conversion "
+            "(cloudWorldUnitsPerKm). 0 inherits the global Scene Unit Scale (rtx.sceneScale) for "
+            "legacy behaviour. Set a positive value once you have measured game units per cm for "
+            "THIS game specifically — rtx.sceneScale drives several unrelated systems and is not a "
+            "reliable measurement of the space clouds actually occupy. Changing this does not "
+            "affect the sky, aerial perspective, or global volumetrics.");
+
+        ImGui::Separator();
+
+        // Read-only snapshot filled once per frame by RtxAtmosphere::updateFrame. Safe to read here
+        // even before the first frame has run: CloudAnchor default-constructs to all-zero, and every
+        // derived value below (length(), the /2pi turn count, cloudWorldUnitsPerKm()'s own clamp)
+        // stays finite at that state.
+        const CloudAnchor& anchor = getCloudAnchor();
+
+        const char* anchorSourceName = "Unknown";
+        switch (anchor.source) {
+          case CloudAnchor::Source::CameraViewMatrix: anchorSourceName = "Camera View Matrix"; break;
+          default: break;
+        }
+        ImGui::Text("Anchor Source                %s", anchorSourceName);
+        RemixGui::SetTooltipToLastWidgetOnHover(
+            "What produced the readouts below. Stage 0 implements only the camera view matrix; "
+            "later stages may add an explicit game-pushed override or a scene-heuristic estimator "
+            "for engines where the view matrix carries no translation at all — see the warning at "
+            "the bottom of this panel.");
+
+        ImGui::Text("Raw Position (no freecam)   %10.2f, %10.2f, %10.2f",
+                    anchor.rawWorldUnits.x, anchor.rawWorldUnits.y, anchor.rawWorldUnits.z);
+        RemixGui::SetTooltipToLastWidgetOnHover(
+            "camera.getPosition(freecam=false), in raw game units, unconverted (still whatever "
+            "handedness/up-axis the engine's view-to-world matrix uses). This is the position "
+            "actually pushed to the cloud shadow lookup today.");
+
+        ImGui::Text("Raw Position (freecam)      %10.2f, %10.2f, %10.2f",
+                    anchor.rawWorldUnitsFreecam.x, anchor.rawWorldUnitsFreecam.y, anchor.rawWorldUnitsFreecam.z);
+        RemixGui::SetTooltipToLastWidgetOnHover(
+            "camera.getPosition(freecam=true), in raw game units. Shown beside the non-freecam "
+            "reading above because the two can disagree: the cloud render basis takes its "
+            "ORIENTATION with freecam=true, while the position pushed to the cloud shadow lookup "
+            "uses freecam=false. That mismatch is a known bug left for a later migration stage to "
+            "fix — recorded here, not fixed, so the fix has a measured before/after instead of a "
+            "guess.");
+
+        ImGui::Text("Derived Position (Y-up, km) %10.3f, %10.3f, %10.3f",
+                    anchor.posYUpKm.x, anchor.posYUpKm.y, anchor.posYUpKm.z);
+        RemixGui::SetTooltipToLastWidgetOnHover(
+            "Raw Position (no freecam), converted into the atmosphere's Y-up frame and into "
+            "cloud-space kilometres via Cloud Scene Unit Scale above (cloudWorldUnitsPerKm) — "
+            "deliberately NOT the aerial-perspective or legacy Scene Unit Scale conversion.");
+
+        const float deltaKmMagnitude = length(anchor.deltaKm);
+        ImGui::Text("|Delta| This Frame (km)     %10.5f", deltaKmMagnitude);
+        RemixGui::SetTooltipToLastWidgetOnHover(
+            "Magnitude of this frame's change in Derived Position — how far the anchor moved since "
+            "last frame. A long run of exactly zero here, even while the view keeps turning, is the "
+            "pattern Cumulative Rotation / Ever Moved below are actually watching for.");
+
+        const float resolvedScale = RtxAtmosphere::cloudWorldUnitsPerKm();
+        const bool cloudScaleOverridesSceneScale = RtxAtmosphere::cloudScale() > 0.0f;
+        ImGui::Text("Resolved Scale (units/km)   %12.1f  [%s]", resolvedScale,
+                    cloudScaleOverridesSceneScale ? "Cloud Scene Unit Scale" : "inherited Scene Unit Scale");
+        RemixGui::SetTooltipToLastWidgetOnHover(
+            "cloudWorldUnitsPerKm(): 100000 * (Cloud Scene Unit Scale if positive, else "
+            "rtx.sceneScale), clamped away from zero. This is the divisor behind Derived Position "
+            "above; the bracket names which of the two is currently in effect.");
+
+        ImGui::Separator();
+
+        ImGui::Text("Static Frames                %u", anchor.staticFrameCount);
+        RemixGui::SetTooltipToLastWidgetOnHover(
+            "Consecutive frames where |Delta| has been exactly zero while the view direction is "
+            "still changing. Readout only — it does NOT gate the warning below, because a player "
+            "standing still and looking around produces exactly this pattern on a perfectly "
+            "healthy world-space engine too.");
+
+        ImGui::Text("Ever Moved This Session      %s", anchor.everMoved ? "true" : "false");
+        RemixGui::SetTooltipToLastWidgetOnHover(
+            "Latched true the first time Raw Position (no freecam) is ever observed to differ from "
+            "this session's first sample; never clears once set. Paired with Cumulative Rotation "
+            "below as the only signal that actually tells 'not moving right now' apart from "
+            "'incapable of ever reporting movement'.");
+
+        const float cumulativeTurns = anchor.cumulativeRotationRadians / (2.0f * dxvk::kPi);
+        ImGui::Text("Cumulative Rotation         %10.2f rad  (%.3f turns)",
+                    anchor.cumulativeRotationRadians, cumulativeTurns);
+        RemixGui::SetTooltipToLastWidgetOnHover(
+            "Session-cumulative view rotation: sum of acos(dot(forward, prevForward)) taken every "
+            "frame after the first, shown here in full turns (divide by 2*pi) because that is the "
+            "readable unit. Exists only to pair with Ever Moved above as the warning gate.");
+
+        // Mirrors rtx_atmosphere.cpp's kWarnRotationRadians (search that name there): four full
+        // turns. Keep this threshold, and the wording below, in lockstep with that Logger::warn if
+        // either changes — this panel is meant to be the same measurement made visible, not a
+        // second opinion on top of it.
+        constexpr float kWarnRotationRadians = 4.0f * 2.0f * dxvk::kPi;
+        if (!anchor.everMoved && anchor.cumulativeRotationRadians > kWarnRotationRadians) {
+          // Same amber used for the upscaler panel's "fault" status color (rtx_fork_upscaler_ui.cpp).
+          constexpr ImVec4 kWarnColor { 250 / 255.f, 176 / 255.f, 50 / 255.f, 1.0f };
+          ImGui::PushStyleColor(ImGuiCol_Text, kWarnColor);
+          ImGui::TextWrapped(
+              "The position has never changed even once across %.1f turns of view rotation this "
+              "session. A real play session ordinarily moves the tracked position at least once "
+              "well before that much looking-around accumulates; never seeing that suggests this "
+              "engine keeps camera translation out of the D3D view matrix, so a world-space anchor "
+              "will need an explicit source rather than the camera view matrix.",
+              cumulativeTurns);
+          ImGui::PopStyleColor();
+          RemixGui::SetTooltipToLastWidgetOnHover(
+              "This reports a measurement, not a verdict: what has been observed this session, not "
+              "a diagnosis. Check whether the game's view matrix actually carries translation "
+              "(RtCamera::getPosition(), rtx_camera.cpp:57-59) before concluding a "
+              "camera-view-matrix anchor is unusable on this engine.");
+        }
+
+        ImGui::TreePop();
+      }
+
       ImGui::SetNextItemOpen(true, ImGuiCond_Once);
       if (ImGui::TreeNode("Basic")) {
         dragFloatWithWeatherOverride(

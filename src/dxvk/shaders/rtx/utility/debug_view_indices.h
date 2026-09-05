@@ -333,6 +333,33 @@
 // seam at the wrap boundary.
 #define DEBUG_VIEW_CLOUD_NVDF_SDF 879
 
+// Cloud segment classification (fork — world-space cloud migration, Stage 0,
+// 2026-09-05). Per-pixel colour classification of how the PRIMARY ray's
+// cloud slab span relates to the resolved G-buffer surface (blue = ray
+// never meets the slab, red = slab entirely beyond the surface, green =
+// slab/visible-segment overlap, yellow = camera inside the slab, magenta =
+// surface inside the slab). See the full legend and the expected
+// red-almost-everywhere first-run reading in its registration comment in
+// rtx_debug_view.cpp — that reading is the diagnostic working correctly
+// (today's slab is camera-anchored and unreachable by world geometry), not
+// a bug to chase.
+#define DEBUG_VIEW_CLOUD_SEGMENT_CLASSIFICATION 880
+
+// IDs 881, 882 and 883 are reserved for later stages of the world-space
+// cloud migration (post-Stage-0) and are deliberately NOT allocated here —
+// do not assign them to unrelated views.
+
+// Cloud calibration rings (fork — world-space cloud migration, Stage 0,
+// 2026-09-05). Iso-distance rings painted on resolved geometry at 0.5 / 1 /
+// 2 / 5 km from the camera (viewDistance * kmPerWorldUnit, kmPerWorldUnit =
+// 1 / args.worldUnitsPerKm — no new CB field). Lets the user compare ring
+// placement against known in-game map distances to back out the game's
+// true world-units-per-km, since the current value is derived from
+// rtx.sceneScale (commit dd515e082: "not a reliable measurement of the
+// world space"). See the full legend in its registration comment in
+// rtx_debug_view.cpp.
+#define DEBUG_VIEW_CLOUD_CALIBRATION_RINGS 884
+
 enum class CompositeDebugView : uint32_t {
   Disabled = 0,
   FinalRenderWithMaterialProperties,

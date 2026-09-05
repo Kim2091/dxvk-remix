@@ -572,6 +572,21 @@ void RtxAtmosphere::computeTimeCycleSunAngles(float timeOfDayHours, float& outEl
   outAzimuthDeg = azimuthRad / dxvk::kDegreesToRadians + RtxAtmosphere::northOffsetDegrees();
 }
 
+// World-space cloud migration, Stage 0 (2026-09-05): single source of truth for the cloud
+// world-unit conversion. Follows the aerialPerspectiveScale "positive overrides, else inherit"
+// pattern (see the fill below in getAtmosphereArgs()) rather than trusting rtx.sceneScale
+// outright, for the reason dd515e082 gave aerial perspective its own scale: rtx.sceneScale
+// drives several unrelated systems and is not a reliable measurement of the world space clouds
+// actually occupy. Replaces two previously independent copies of this arithmetic — the
+// worldUnitsPerKm fill below and the setCloudShadowCameraPosition push in updateFrame — which
+// could not drift apart even before this existed (both read the same options) but now provably
+// cannot regardless of what either site does around it.
+float RtxAtmosphere::cloudWorldUnitsPerKm() {
+  const float configuredScale = RtxAtmosphere::cloudScale();
+  return 100000.0f * std::max(
+    configuredScale > 0.0f ? configuredScale : RtxOptions::sceneScale(), 1e-5f);
+}
+
 AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
   AtmosphereArgs args = {};
 
@@ -924,11 +939,13 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
   // Voxel-grid cloud-on-terrain shadow plumbing (fork — 2026-05-12, C6).
   //   * cloudVoxelShadowsEnable / cloudShadowMarchStrength surface the C6
   //     RTX_OPTIONs to the shader.
-  //   * worldUnitsPerKm derives from RtxAtmosphere::sceneScale (cm per game
-  //     unit): 1 km = 100000 cm and 1 cm = sceneScale game units, so
-  //     1 km = 100000 * sceneScale game units. Matches the canonical
-  //     getMeterToWorldUnitScale = 100 * sceneScale (world units per meter)
-  //     convention used everywhere else in the runtime.
+  //   * worldUnitsPerKm derives from RtxAtmosphere::cloudWorldUnitsPerKm() (cm per game
+  //     unit): 1 km = 100000 cm and 1 cm = the selected scale's game units, so
+  //     1 km = 100000 * scale game units, where scale is rtx.atmosphere.cloudScale when
+  //     positive else rtx.sceneScale (cloudScale added 2026-09-05, Stage 0 of the world-space
+  //     cloud migration — see its doc comment in rtx_atmosphere.h). At cloudScale's 0 = inherit
+  //     default this matches the canonical getMeterToWorldUnitScale = 100 * sceneScale (world
+  //     units per meter) convention used everywhere else in the runtime, exactly as before.
   //   * cameraWorldPosYUpKm is pushed by setCloudShadowCameraPosition()
   //     before computeLuts runs; default value is zero (no
   //     setCloudShadowCameraPosition call yet → camera-relative reframe
@@ -943,8 +960,7 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
     // texture it used to scale was deleted). >= 0 clamp matches the old composite
     // populate.
     args.cloudShadowFactorStrength = std::max(RtxAtmosphere::cloudShadowFactorStrength(), 0.0f);
-    const float sceneScale = std::max(RtxOptions::sceneScale(), 1e-5f);
-    args.worldUnitsPerKm = 100000.0f * sceneScale;
+    args.worldUnitsPerKm = cloudWorldUnitsPerKm();
     // Column presence feather band riding the former pad_c6_0 slot (fork —
     // 2026-06-11, column-shaping rework); CB layout unchanged.
     args.cloudColumnFeather = RtxAtmosphere::cloudColumnFeather();
@@ -2602,6 +2618,95 @@ AtmosphereArgs RtxAtmosphere::updateFrame(RtxContext& ctx,
     return flipUpAxisForYUp ? Vector3(yUp.x, -yUp.y, yUp.z) : yUp;
   };
 
+  // ---- World-space cloud migration, Stage 0: instrumentation only (2026-09-05) ----
+  // Record this frame's cloud anchor before anything downstream runs, reusing toYUp rather than
+  // writing a second world -> Y-up conversion. None of this reaches AtmosphereArgs, so it cannot
+  // change a single rendered pixel; it exists to answer whether RtCamera's view matrix is even a
+  // usable anchor source on every target engine before a later stage builds on top of it.
+  {
+    const Vector3 rawWorldUnits        = camera.getPosition(/*freecam=*/false);
+    const Vector3 rawWorldUnitsFreecam = camera.getPosition(/*freecam=*/true);
+    // Both freecam variants are recorded, not just the one the rest of this function uses, because
+    // the existing code below is itself inconsistent about which it wants: the render basis just
+    // above takes the camera's ORIENTATION with freecam=true, but the POSITION pushed to
+    // setCloudShadowCameraPosition further down has always used freecam=false. That mismatch is a
+    // known bug for a later stage to fix — recorded here, not fixed, so the fix has a measured
+    // before/after instead of a guess.
+    const Vector3 posYUpKm = toYUp(rawWorldUnits) * (1.0f / cloudWorldUnitsPerKm());
+
+    const Vector3 prevPosYUpKm = m_cloudAnchor.posYUpKm;
+    const Vector3 deltaKm = posYUpKm - prevPosYUpKm;
+    const Vector3 forwardYUpForAnchor = toYUp(forward);
+
+    // Per-frame streak, ImGui readout only — NOT the warning gate below. deltaKm==0 while the view
+    // rotates is also exactly what a perfectly healthy world-space engine reports while the player
+    // is standing still looking around, so a short streak of this proves nothing on its own; see
+    // everMoved / cumulativeRotationRadians for the signal that can actually tell the two apart.
+    const bool isStaticThisFrame = (deltaKm == Vector3(0.0f, 0.0f, 0.0f));
+    const bool isRotatingThisFrame = (forwardYUpForAnchor != m_cloudAnchorPrevDirectionYUp);
+    m_cloudAnchor.staticFrameCount =
+      (isStaticThisFrame && isRotatingThisFrame) ? (m_cloudAnchor.staticFrameCount + 1u) : 0u;
+
+    // Session-lifetime "has this ever actually moved" latch, plus cumulative view rotation — the
+    // pair that DOES gate the warning below. everMoved compares against the first sample this
+    // session took (not last frame's), so it can't be fooled by a move-then-return-to-start, and
+    // the very first frame is excluded from both so the arbitrary default-initialized start state
+    // (m_cloudAnchorFirstRawWorldUnits / m_cloudAnchorPrevDirectionYUp before any real sample) can
+    // never register as "movement" or "rotation" on its own.
+    if (!m_cloudAnchorHasFirstSample) {
+      m_cloudAnchorFirstRawWorldUnits = rawWorldUnits;
+      m_cloudAnchorHasFirstSample = true;
+    } else {
+      if (rawWorldUnits != m_cloudAnchorFirstRawWorldUnits) {
+        m_cloudAnchor.everMoved = true;
+      }
+      const float cosAngle = std::min(std::max(
+        dot(forwardYUpForAnchor, m_cloudAnchorPrevDirectionYUp), -1.0f), 1.0f);
+      m_cloudAnchor.cumulativeRotationRadians += std::acos(cosAngle);
+    }
+
+    m_cloudAnchor.rawWorldUnits        = rawWorldUnits;
+    m_cloudAnchor.rawWorldUnitsFreecam = rawWorldUnitsFreecam;
+    m_cloudAnchor.posYUpKm             = posYUpKm;
+    m_cloudAnchor.prevPosYUpKm         = prevPosYUpKm;
+    m_cloudAnchor.deltaKm              = deltaKm;
+    m_cloudAnchor.source               = CloudAnchor::Source::CameraViewMatrix;
+    m_cloudAnchorPrevDirectionYUp      = forwardYUpForAnchor;
+
+    const float resolvedScale = cloudWorldUnitsPerKm();
+    const bool cloudScaleOverridesSceneScale = RtxAtmosphere::cloudScale() > 0.0f;
+    ONCE(Logger::info(str::format(
+      "[RTX Atmosphere] Cloud anchor calibration (one-shot): source=CameraViewMatrix rawWorldUnits=(",
+      rawWorldUnits.x, ", ", rawWorldUnits.y, ", ", rawWorldUnits.z, ") rawWorldUnitsFreecam=(",
+      rawWorldUnitsFreecam.x, ", ", rawWorldUnitsFreecam.y, ", ", rawWorldUnitsFreecam.z, ") posYUpKm=(",
+      posYUpKm.x, ", ", posYUpKm.y, ", ", posYUpKm.z, ") cloudWorldUnitsPerKm=", resolvedScale,
+      " cloudScaleOverridesSceneScale=", (cloudScaleOverridesSceneScale ? "true" : "false"),
+      " zUp=", (isZUp ? "true" : "false"), " flipUpAxis=", (flipUpAxisForYUp ? "true" : "false"))));
+
+    // Gamebryo-family engines (Fallout: New Vegas) put camera translation in the *world* matrices
+    // and hand D3D a rotation-only view matrix, so getPosition() — literally getViewToWorld()[3]
+    // (rtx_camera.cpp:57-59) — never moves. A prior in-game probe on the sibling repo (daecda4b0)
+    // found exactly this: "getPos=(0,0,0) no matter how the player flew." The distinguishing signal
+    // is not "static right now" (a standing-still player produces that on a healthy engine too) but
+    // "static ALWAYS": the reported position has never once changed despite the view having swept
+    // several full turns — a span generous enough that a real play session would almost certainly
+    // have moved the position at least once within it. kWarnRotationRadians below is four full
+    // turns; raise it if this ever fires on a legitimately world-space engine.
+    constexpr float kWarnRotationRadians = 4.0f * 2.0f * dxvk::kPi;
+    if (!m_cloudAnchor.everMoved && m_cloudAnchor.cumulativeRotationRadians > kWarnRotationRadians) {
+      ONCE(Logger::warn(str::format(
+        "[RTX Atmosphere] Cloud anchor position has not changed even once across ",
+        m_cloudAnchor.cumulativeRotationRadians, " radians (~",
+        m_cloudAnchor.cumulativeRotationRadians / (2.0f * dxvk::kPi), " full turns) of accumulated "
+        "view rotation this session. A real play session ordinarily moves the tracked position at "
+        "least once well before that much looking-around accumulates; never seeing that suggests "
+        "this engine keeps camera translation out of the D3D view matrix (RtCamera::getPosition() "
+        "may be reading a rotation-only matrix — see rtx_camera.cpp:57-59). If so, world-anchored "
+        "clouds will need an explicit anchor source rather than the camera view matrix — check "
+        "whether the game's view matrix carries translation before relying on this path.")));
+    }
+  }
+
   const Vector3 forwardYUp = toYUp(forward);
   const Vector3 rightYUp   = toYUp(right);
   const Vector3 upYUp      = toYUp(up);
@@ -2616,8 +2721,7 @@ AtmosphereArgs RtxAtmosphere::updateFrame(RtxContext& ctx,
     static_cast<uint32_t>(ctx.getDevice()->getCurrentFrameId()));
 
   const Vector3 cameraPosWorldUnitsYUp = toYUp(camera.getPosition(/*freecam=*/false));
-  const float sceneScaleSafe = std::max(RtxOptions::sceneScale(), 1e-5f);
-  const float kmPerWorldUnit = 1.0f / (100000.0f * sceneScaleSafe);
+  const float kmPerWorldUnit = 1.0f / cloudWorldUnitsPerKm();
   setCloudShadowCameraPosition(cameraPosWorldUnitsYUp * kmPerWorldUnit);
 
   // Aerial perspective is fitted to this frame's frustum; push before any getAtmosphereArgs read.
