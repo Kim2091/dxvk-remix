@@ -129,13 +129,19 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
 
   vec3 accumColor = vec3(0.0f);
   float viewTransmittance = 1.0f;
+  // Depth-companion outputs are unused here (fork — 2026-09-05, world-space cloud migration Stage
+  // 4a): only cloud_render.comp.slang's screen pass writes a depth companion RT. Signature-only
+  // change to marchCloudLayers -- same pattern Stage 1 used when it added tMin/tMaxClamp to
+  // marchEchoDeck: no render delta for this bake.
+  float unusedEntryDistanceKm, unusedMeanCloudDepthKm;
   // The LUT bake's jitter is already frame-constant, so the adaptive march's
   // near (animated) and far (static) hashes are the same value here.
   marchCloudLayers(viewDirYUp, jitter, jitter,
                    /*tMinClamp=*/0.0f,
                    /*tMaxClamp=*/0.0f,
                    args.cloudViewSamples, ctx, args,
-                   accumColor, viewTransmittance);
+                   accumColor, viewTransmittance,
+                   unusedEntryDistanceKm, unusedMeanCloudDepthKm);
 
   cloudSecondaryLutOutput[pixelCoord] = vec4(accumColor, viewTransmittance);
 }

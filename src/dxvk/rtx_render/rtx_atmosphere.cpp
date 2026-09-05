@@ -160,6 +160,10 @@ namespace dxvk {
         SAMPLER(9)
         TEXTURE3D(13)
         TEXTURE3D(14)
+        // Depth-aware march inputs/outputs (fork — 2026-09-05, world-space cloud migration Stage
+        // 4a) — see the matching binding declarations in cloud_render.comp.slang.
+        TEXTURE2D(15)
+        RW_TEXTURE2D(16)
       END_PARAMETER()
     };
     PREWARM_SHADER_PIPELINE(CloudRenderShader);
@@ -1666,15 +1670,18 @@ void RtxAtmosphere::computeLuts(Rc<DxvkContext> ctx) {
     dispatchCloudAmbientDensityGrid(ctx);
   }
 
-  // Cloud render compute pass (Nubis Cubed 2023, fork — 2026-05-12, C4).
-  // Runs every frame after the voxel grid bakes so it reads up-to-date
-  // D_sun / D_ambient. As of the full-rate flip 2026-05-19, both grids
-  // are rebaked every frame above, so the render reads zero-frame-stale
-  // data.
+  // Cloud render compute pass — MOVED OUT of computeLuts (fork — 2026-09-05, world-space cloud
+  // migration Stage 4a; was here, gated on debugDispatchCloudRender, from the 2026-05-12 C4 add
+  // through Stage 3). It is now RtxAtmosphere::dispatchCloudScreenPass, called from
+  // RtxContext::injectRTX immediately after dispatchPathTracing — the one piece of per-frame cloud
+  // work that needs a depth to clamp against, which does not exist until that G-buffer raytracing
+  // pass has run this frame. Everything else that used to sit in this comment's vicinity (the
+  // voxel-grid bakes above, the secondary LUT below) still runs HERE, unchanged: the march reads
+  // them, so they must still be fresh before dispatchCloudScreenPass fires later this frame.
   //
-  // NOTE: m_cloudRenderRT is allocated/resized externally via
-  // ensureCloudRenderRT() before this dispatch fires. dispatchCloudRender
-  // early-outs cleanly if the RT isn't valid yet (first frame, zero extent).
+  // NOTE: m_cloudRenderRT / m_cloudDepthRT are allocated/resized externally via
+  // ensureCloudRenderRT() before dispatchCloudScreenPass fires. dispatchCloudRender (called from
+  // there) early-outs cleanly if the RT isn't valid yet (first frame, zero extent).
   // Secondary-ray cloud LUT bake (fork — 2026-06-10, perf). Runs after the
   // voxel-grid bakes (the march reads D_sun / D_ambient) behind the same
   // write→read barrier pattern. Gated on the same option the shader-side
@@ -1688,19 +1695,10 @@ void RtxAtmosphere::computeLuts(Rc<DxvkContext> ctx) {
     dispatchCloudSecondaryLut(ctx);
   }
 
-  // NOTE (perf-bisect rationale): this dispatch runs whenever the RT is
-  // valid, INDEPENDENT of cloudRenderRTEnable — turning that option off
-  // makes primary sky-miss cloudless but leaves this pass running, so
-  // frame-time A/B via cloudRenderRTEnable never isolates the pass cost.
-  // The debug toggle is the only lever that actually skips it.
-  if (RtxAtmosphere::debugDispatchCloudRender() && m_cloudRenderRT.isValid()) {
-    ctx->emitMemoryBarrier(0,
-      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-      VK_ACCESS_SHADER_WRITE_BIT,
-      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-      VK_ACCESS_SHADER_READ_BIT);
-    dispatchCloudRender(ctx);
-  }
+  // Cloud render dispatch itself no longer lives here — see dispatchCloudScreenPass (fork —
+  // 2026-09-05, world-space cloud migration Stage 4a). debugDispatchCloudRender's gate and the
+  // write→read barrier that used to guard this call moved there with it, unchanged in spirit: see
+  // that function's doc comment.
 
   // Final barrier: Ensure all LUTs are written before use in ray tracing
   ctx->emitMemoryBarrier(0,
@@ -2238,7 +2236,7 @@ void RtxAtmosphere::ensureCloudRenderRT(Rc<DxvkContext> ctx,
 
   const bool extentsMatch = (m_cloudRenderExtent.width  == scaledExtent.width)
                          && (m_cloudRenderExtent.height == scaledExtent.height);
-  if (extentsMatch && m_cloudRenderRT.isValid()) {
+  if (extentsMatch && m_cloudRenderRT.isValid() && m_cloudDepthRT.isValid()) {
     return;
   }
 
@@ -2254,6 +2252,32 @@ void RtxAtmosphere::ensureCloudRenderRT(Rc<DxvkContext> ctx,
     0,                          // imageCreateFlags
     VK_IMAGE_USAGE_STORAGE_BIT, // extraUsageFlags (SAMPLED implied)
     VkClearColorValue{},        // clearValue (zero -- "no cloud, full transmittance")
+    1);                         // mipLevels
+
+  // Depth companion (fork — 2026-09-05, world-space cloud migration Stage 4a): entry distance (r)
+  // + transmittance-weighted mean cloud depth (g), both km. SAME extent and resize cadence as
+  // m_cloudRenderRT above -- allocated together rather than through an independent ensure path so
+  // the two can never drift out of pixel alignment on a resize (Stage 4b's reprojection depends on
+  // that alignment).
+  //
+  // Format: R32G32_SFLOAT, not R16G16_SFLOAT. Horizon-grazing cloud spans reach 50+ km (see the
+  // adaptive-step-count comment in cloud_march_common.slangh's marchCloudSlab), and float16's
+  // ~2^-10 relative step size at that magnitude is on the order of tens of metres per representable
+  // value -- coarse enough to visibly stair-step a parallax reprojection built on it. Full float32
+  // removes the concern entirely; the extra 4 bytes/pixel is modest since this RT is typically
+  // allocated at a fraction of native resolution (cloudRenderResolutionScale).
+  m_cloudDepthRT = Resources::createImageResource(
+    ctx,
+    "Atmosphere Cloud Depth RT",
+    extent3D,
+    VK_FORMAT_R32G32_SFLOAT,
+    1,                          // numLayers
+    VK_IMAGE_TYPE_2D,
+    VK_IMAGE_VIEW_TYPE_2D,
+    0,                          // imageCreateFlags
+    VK_IMAGE_USAGE_STORAGE_BIT, // extraUsageFlags (SAMPLED implied)
+    VkClearColorValue{},        // clearValue (zero -- overwritten every texel every frame, see
+                                // cloud_render.comp.slang's unconditional depth-companion write)
     1);                         // mipLevels
 
   m_cloudRenderExtent = downscaleExtent;
@@ -2421,7 +2445,55 @@ void RtxAtmosphere::advanceLightning(float dt) {
   }
 }
 
-void RtxAtmosphere::dispatchCloudRender(Rc<DxvkContext> ctx) {
+// Cloud screen pass entry point (fork — 2026-09-05, world-space cloud migration Stage 4a). Called
+// from RtxContext::injectRTX immediately after dispatchPathTracing(rtOutput) -- see that call site
+// and this function's declaration in rtx_atmosphere.h for the full rationale (PrimaryLinearViewZ
+// does not exist before dispatchPathTracing's G-buffer raytracing has run this frame).
+//
+// What stayed behind in updateFrame/computeLuts: the AtmosphereArgs computation (updateFrame
+// proper) and every OTHER per-frame cloud bake -- the placement map / NVDF chain, the D_sun /
+// D_ambient voxel grids, the secondary-ray dome LUT. All of those still run from computeLuts,
+// unchanged, because the march below reads them and they must already be fresh by the time this
+// function fires later in the frame. Only the screen-pass DISPATCH relocated; nothing about how
+// its inputs are prepared changed.
+void RtxAtmosphere::dispatchCloudScreenPass(RtxContext& ctx, const Resources::RaytracingOutput& rtOutput) {
+  // Debug bisect gate, carried over verbatim from the pre-split call site in computeLuts (fork —
+  // 2026-06-11, perf-bisect diagnostic). This dispatch runs whenever the RT is valid, INDEPENDENT
+  // of cloudRenderRTEnable -- that option only gates the sky-miss COMPOSITE (evalSkyRadiance),
+  // leaving this dispatch running so its cost is still paid; debugDispatchCloudRender is the only
+  // lever that actually skips it, for an A/B frame-time read.
+  if (!RtxAtmosphere::debugDispatchCloudRender() || !m_cloudRenderRT.isValid()) {
+    return;
+  }
+
+  // Write→read barrier, carried over verbatim from the pre-split call site. The D_sun / D_ambient
+  // voxel grids, the NVDF SDF, and the sky-view / cloud-sky-transmittance LUTs this pass samples
+  // were last written by computeLuts earlier in this same command buffer (inside updateFrame, long
+  // before dispatchVolumetrics / dispatchPathTracing even ran) -- a full frame's worth of ray
+  // tracing has been recorded between that write and this read, so in practice this barrier is
+  // stricter than strictly required today. Kept anyway: it is cheap, and it is what actually
+  // guarantees the grids are visible rather than relying on however much GPU work happens to fall
+  // between the two in any future reordering.
+  //
+  // Note what this barrier does NOT cover: rtOutput.m_primaryLinearViewZ, written by this frame's
+  // G-buffer raytracing pass (RtxContext::dispatchPathTracing, called immediately before this
+  // function). That cross-pass read is handled the same way every other pass in injectRTX reads a
+  // G-buffer output written earlier the same frame -- bind + trackResource<DxvkAccess::Read> below
+  // (see dispatchCloudRender), with no additional manual barrier. DemodulatePass::dispatch reads
+  // several of the same G-buffer textures this way with zero emitMemoryBarrier calls anywhere in
+  // rtx_demodulate.cpp; this pass follows that established convention rather than the LUT-bake
+  // cascade's explicit-barrier idiom, which is specific to back-to-back compute writes/reads within
+  // computeLuts itself.
+  ctx.emitMemoryBarrier(0,
+    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+    VK_ACCESS_SHADER_WRITE_BIT,
+    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+    VK_ACCESS_SHADER_READ_BIT);
+
+  dispatchCloudRender(&ctx, rtOutput);
+}
+
+void RtxAtmosphere::dispatchCloudRender(Rc<DxvkContext> ctx, const Resources::RaytracingOutput& rtOutput) {
   ScopedGpuProfileZone(ctx, "Atmosphere Cloud Render (Nubis Cubed)");
 
   if (!m_cloudRenderRT.isValid()) {
@@ -2471,11 +2543,26 @@ void RtxAtmosphere::dispatchCloudRender(Rc<DxvkContext> ctx) {
   ctx->bindResourceView(13, m_cloudNvdfSdf[m_cloudNvdfSdfFront].view, nullptr);
   ctx->bindResourceView(14, m_cloudDetailNoise3D.view, nullptr);
 
+  // Depth-aware march inputs (fork — 2026-09-05, world-space cloud migration Stage 4a). This pass
+  // now runs after RtxContext::dispatchPathTracing (see dispatchCloudScreenPass), so
+  // rtOutput.m_primaryLinearViewZ holds THIS frame's resolved primary-ray depth — read-only here,
+  // it is a resource this same command buffer wrote earlier this frame (the G-buffer raytracing
+  // pass), the same cross-pass read pattern DemodulatePass::dispatch uses for other G-buffer
+  // outputs (bind + track, no extra manual barrier — see that file for the precedent this follows).
+  // Slot 16 is the depth companion RT this pass writes; see ensureCloudRenderRT for its format
+  // rationale and common_binding_indices.h for why the shared-binding index (217) differs from
+  // this pass-local slot (16) — this descriptor set is local to cloud_render.comp.slang and does
+  // not share numbering with the common ray-tracing bindings.
+  ctx->bindResourceView(15, rtOutput.m_primaryLinearViewZ.view, nullptr);
+  ctx->bindResourceView(16, m_cloudDepthRT.view, nullptr);
+
   ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_cloudDSun.image);
   ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_cloudDAmbient.image);
   ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_cloudNvdfSdf[m_cloudNvdfSdfFront].image);
   ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_cloudDetailNoise3D.image);
   ctx->getCommandList()->trackResource<DxvkAccess::Write>(m_cloudRenderRT.image);
+  ctx->getCommandList()->trackResource<DxvkAccess::Read>(rtOutput.m_primaryLinearViewZ.image);
+  ctx->getCommandList()->trackResource<DxvkAccess::Write>(m_cloudDepthRT.image);
   if (m_skyViewLut.isValid()) {
     ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_skyViewLut.image);
   }
@@ -2900,6 +2987,12 @@ void RtxAtmosphere::bindResources(RtxContext& ctx) {
   }
   if (m_cloudRenderRT.isValid()) {
     ctx.bindResourceView(BINDING_ATMOSPHERE_CLOUD_RENDER_RT, m_cloudRenderRT.view, nullptr);
+  }
+  // Depth companion (fork — 2026-09-05, world-space cloud migration Stage 4a). Wired into the
+  // common ray-tracing bindings the same way as the RT above; no shader samples
+  // AtmosphereCloudDepth yet (Stage 4b's composite is the first consumer).
+  if (m_cloudDepthRT.isValid()) {
+    ctx.bindResourceView(BINDING_ATMOSPHERE_CLOUD_DEPTH_RT, m_cloudDepthRT.view, nullptr);
   }
   if (m_cloudSecondaryLut.isValid()) {
     ctx.bindResourceView(BINDING_ATMOSPHERE_CLOUD_SECONDARY_LUT, m_cloudSecondaryLut.view, nullptr);

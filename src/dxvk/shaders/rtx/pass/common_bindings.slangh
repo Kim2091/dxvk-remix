@@ -198,3 +198,13 @@ SamplerState AtmosphereSkyViewSampler;
 // (REPEAT-U wraps the azimuth seam, CLAMP-V pins the nadir/zenith rows).
 layout(binding = BINDING_ATMOSPHERE_CLOUD_SECONDARY_LUT)
 Texture2D<float4> AtmosphereCloudSecondaryLut;
+
+// Cloud depth companion (fork — 2026-09-05, world-space cloud migration Stage 4a). Same extent as
+// AtmosphereCloudRender (allocated/resized together, see RtxAtmosphere::ensureCloudRenderRT):
+// r = entry distance, g = transmittance-weighted mean cloud depth, both km. Produced by
+// cloud_render.comp.slang via RtxAtmosphere::dispatchCloudScreenPass, called from injectRTX right
+// after dispatchPathTracing so the march can clamp against this frame's PrimaryLinearViewZ (see
+// that function's header comment for why the clamp needs the G-buffer to exist first). No
+// consumer yet -- wired here so Stage 4b's depth-aware composite needs no further plumbing.
+layout(binding = BINDING_ATMOSPHERE_CLOUD_DEPTH_RT)
+Texture2D<float2> AtmosphereCloudDepth;

@@ -56,6 +56,17 @@ public:
   // never written back into RtxOptions.
   AtmosphereArgs updateFrame(RtxContext& ctx, const WeatherSnapshot* weather, float deltaTimeSeconds);
 
+  // Cloud screen pass: the per-pixel view march that writes the cloud render RT + its depth
+  // companion (fork — 2026-09-05, world-space cloud migration Stage 4a). Split out of
+  // updateFrame/computeLuts because it is the one piece of per-frame cloud work that needs
+  // PrimaryLinearViewZ to clamp its march against — which does not exist until
+  // RtxContext::dispatchPathTracing's G-buffer raytracing has run THIS frame, long after
+  // updateFrame (which only computes AtmosphereArgs and bakes the LUTs/grids the march itself
+  // depends on) returns. Call exactly once per frame, immediately after dispatchPathTracing in
+  // RtxContext::injectRTX -- calling it any earlier reads either the miss sentinel or a stale
+  // PrimaryLinearViewZ for every pixel.
+  void dispatchCloudScreenPass(RtxContext& ctx, const Resources::RaytracingOutput& rtOutput);
+
   // Binds all atmosphere/cloud resources used by ray-tracing shaders.
   void bindResources(RtxContext& ctx);
 
@@ -92,6 +103,12 @@ public:
 
   // Screen-space RGBA16F at downscale extent: premultiplied cloud rgb + transmittance alpha, per frame.
   const Resources::Resource& getCloudRenderRT() const { return m_cloudRenderRT; }
+
+  // Depth companion to the cloud render RT (fork — 2026-09-05, world-space cloud migration Stage
+  // 4a). Same extent, allocated/resized alongside it (see ensureCloudRenderRT). RG32F: r = entry
+  // distance, g = transmittance-weighted mean cloud depth, both in km. Written by
+  // dispatchCloudScreenPass; no consumer yet (Stage 4b).
+  const Resources::Resource& getCloudDepthRT() const { return m_cloudDepthRT; }
 
   // 256x256 RGBA16F dome LUT baked per frame (was 256x128 before the Stage 2 full-sphere mapping);
   // supplies clouds to secondary rays (indirect/PSR/reflection).
@@ -1295,7 +1312,10 @@ private:
   void dispatchCloudDetailNoiseBake(Rc<DxvkContext> ctx);  // once at init, fixed pattern
   void dispatchCloudSunDensityGrid(Rc<DxvkContext> ctx);   // round-robin every 8 frames
   void dispatchCloudAmbientDensityGrid(Rc<DxvkContext> ctx);
-  void dispatchCloudRender(Rc<DxvkContext> ctx);
+  // rtOutput supplies PrimaryLinearViewZ for the depth-aware march clamp (fork — 2026-09-05,
+  // world-space cloud migration Stage 4a); see dispatchCloudScreenPass's doc comment for why this
+  // can no longer run from inside computeLuts.
+  void dispatchCloudRender(Rc<DxvkContext> ctx, const Resources::RaytracingOutput& rtOutput);
   void dispatchCloudSecondaryLut(Rc<DxvkContext> ctx);
 
   static constexpr uint32_t kTransmittanceLutWidth = 512;
@@ -1360,6 +1380,10 @@ private:
   uint32_t            m_cloudNvdfSdfFront = 0;
   Resources::Resource m_cloudDetailNoise3D;
   Resources::Resource m_cloudRenderRT;
+  // Depth companion (fork — 2026-09-05, world-space cloud migration Stage 4a): allocated/resized
+  // in lockstep with m_cloudRenderRT by ensureCloudRenderRT, same extent. See getCloudDepthRT's
+  // doc comment for the channel layout.
+  Resources::Resource m_cloudDepthRT;
   VkExtent2D          m_cloudRenderExtent = { 0u, 0u };
   VkExtent2D          m_cloudRenderFullExtent = { 0u, 0u };
   RtxMipmap::Resource m_cloudSecondaryLut;

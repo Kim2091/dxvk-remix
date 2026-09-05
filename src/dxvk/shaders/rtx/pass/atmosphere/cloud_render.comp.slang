@@ -35,6 +35,16 @@
 // Composited into primary sky-miss when cloudRenderRTEnable is on (gated by
 // RTX_OPTION). A debug view (enum 876) shows the raw RT for inspection.
 //
+// Depth-aware march (fork — 2026-09-05, world-space cloud migration Stage 4a). This pass now runs
+// AFTER RtxContext::dispatchPathTracing (RtxAtmosphere::dispatchCloudScreenPass, called from
+// injectRTX), so PrimaryLinearViewZ holds a resolved primary-ray depth for every pixel this frame.
+// The march below reads it (binding 15) and passes the converted distance as marchCloudLayers'
+// tMaxClamp, so a cloud never marches past the geometry a primary ray already hit; a sky-miss
+// pixel has no such geometry, so its tMax is 0 ("no clamp") and its result is UNCHANGED from Stage
+// 3. The march also now writes a depth companion (binding 16, cloudDepthOutput): entry distance and
+// a transmittance-weighted mean cloud depth, both km. Nothing composites it yet -- the sky-miss
+// composite in evalSkyRadiance (atmosphere_sky.slangh) is untouched this stage; that is Stage 4b.
+//
 // Coordinate frame: ray-vs-slab intersection runs in camera-at-origin Y-up
 // space (the established cloud-math convention — see `intersectCloudLayer`'s
 // "Ray origin is at the camera (0,0,0) in Y-up space" comment), so the
@@ -117,6 +127,20 @@ Texture3D<float> AtmosphereCloudNvdfSdf;
 layout(binding = 14)
 Texture3D<float4> AtmosphereCloudDetailNoise3D;
 
+// Depth-aware march inputs/outputs (fork — 2026-09-05, world-space cloud migration Stage 4a).
+// Local slots 15/16 in THIS pass's own small descriptor set -- unrelated to the numbering of the
+// shared common-ray-tracing bindings (BINDING_ATMOSPHERE_CLOUD_DEPTH_RT = 217 there; see
+// common_binding_indices.h). PrimaryLinearViewZ is read-only here: RtxAtmosphere::dispatchCloudRender
+// binds rtOutput.m_primaryLinearViewZ, the SAME resource RtxContext::dispatchPathTracing's
+// G-buffer raytracing wrote for this frame just before this dispatch runs (see
+// RtxAtmosphere::dispatchCloudScreenPass for why the ordering matters). cloudDepthOutput is this
+// pass's own depth companion, written unconditionally every pixel just like cloudRenderOutput above.
+layout(binding = 15)
+Texture2D<float> PrimaryLinearViewZ;
+
+layout(binding = 16, rg32f)
+RWTexture2D<float2> cloudDepthOutput;
+
 // Include the helper library AFTER the texture globals are declared so the
 // ATMOSPHERE_AVAILABLE-gated helper bodies resolve to our local declarations.
 #include "rtx/pass/atmosphere/atmosphere_common.slangh"
@@ -155,6 +179,10 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
   }
   if (args.cloudEnabled < 0.5f || effectiveCoverageMean < 0.01f || args.cloudViewSamples == 0u) {
     cloudRenderOutput[pixelCoord] = vec4(0.0f, 0.0f, 0.0f, 1.0f);
+    // Depth companion (fork — 2026-09-05, Stage 4a): (-1, 0) is the same "no entry / no cloud"
+    // sentinel pair marchCloudLayers reports when it finds nothing -- written here too so every
+    // texel of BOTH render targets is defined every frame, matching cloudRenderOutput's coverage.
+    cloudDepthOutput[pixelCoord] = vec2(-1.0f, 0.0f);
     return;
   }
 
@@ -187,6 +215,56 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
   // page-142 ambient term (sampleSkyAmbientForVolume) is unaffected by this removal — that helper
   // has its own below-horizon clamp and is untouched this stage.
 
+  // ===== Depth-aware march clamp (fork — 2026-09-05, world-space cloud migration Stage 4a) =====
+  //
+  // Resolution mismatch: this pass runs at cloudRenderResolutionScale x the downscale extent
+  // (outputDim above), while PrimaryLinearViewZ lives at the FULL downscale extent --
+  // args.cloudRenderFullDimX/Y, the very same published dims evalSkyRadiance uses to upsample THIS
+  // pass's own output the other way (atmosphere_sky.slangh's cloudRenderRTEnable branch: uv =
+  // (pixelCoord + 0.5) / fullDim, then bilinear-samples the smaller RT). uv here is that same
+  // normalized coordinate already computed above for the view-ray reconstruction, so the mapping
+  // into PrimaryLinearViewZ's resolution is just the reverse of that established convention:
+  // primaryCoord = floor(uv * fullDim). NEAREST, not bilinear -- PrimaryLinearViewZ is a per-pixel
+  // depth, and averaging two different surfaces' depths across a silhouette produces a value that
+  // corresponds to neither, which is exactly the "cloud bleeding around silhouette edges" failure
+  // mode a wrong mapping here would cause. Zero dims (first frames, extent not yet known) falls back
+  // to "no clamp", mirroring evalSkyRadiance's own zero-dims fallback.
+  float tMaxKm = 0.0f;  // 0 = no clamp (cloud_march_common.slangh's tMaxClamp convention)
+  if (args.cloudRenderFullDimX != 0u && args.cloudRenderFullDimY != 0u) {
+    ivec2 fullDim = ivec2(int(args.cloudRenderFullDimX), int(args.cloudRenderFullDimY));
+    ivec2 primaryCoord = ivec2(uv * vec2(fullDim));
+    primaryCoord = clamp(primaryCoord, ivec2(0), fullDim - ivec2(1));
+
+    const float linearViewZ = PrimaryLinearViewZ[primaryCoord].x;
+
+    // Miss sentinel (fork — 2026-09-05): exact equality against the SAME constant
+    // NRDContext::getNrdArgs() (rtx_nrd_context.cpp) derives as
+    // nrd::CommonSettings{}.denoisingRange + 1.0f, protected there by a static_assert pinning the
+    // NRD library default -- mirrors debug_view.comp.slang enum 880/884's identical
+    // `linearViewZ == cb.nrd.missLinearViewZ` test ("exact sentinel comparison, not a heuristic
+    // threshold"). This pass has no binding for the RaytraceArgs CB that sentinel actually lives
+    // in -- its own descriptor set carries only AtmosphereArgs + the cloud-specific textures above
+    // -- so rather than plumb the whole CB through for one float, the compile-time-constant value
+    // is reproduced directly. It is NOT runtime-configurable (the assert would fail to compile
+    // before this could ever go stale silently).
+    const float kPrimaryLinearViewZMissSentinel = 500001.0f;
+    if (linearViewZ != kPrimaryLinearViewZMissSentinel) {
+      // PrimaryLinearViewZ is a view-space DEPTH, not a distance along the ray -- divide by the
+      // ray's projection onto the view (forward) axis to recover the slant range. debug_view.comp.slang
+      // enum 884 does the identical conversion via cameraPixelCoordinateToDirection(cb.camera, ...);
+      // this pass already carries the camera's Y-up forward basis vector (cloudRenderForwardYUp,
+      // unit length -- see RtxAtmosphere::updateFrame's setCloudRenderCameraBasis push) and this
+      // pixel's own Y-up view direction, so the same cosine-to-view-axis comes from those instead
+      // of reconstructing a camera-space ray.
+      const float viewAxisCosine = max(abs(dot(viewDirYUp, normalize(args.cloudRenderForwardYUp))), 1e-6f);
+      const float cameraToSurfaceLength = linearViewZ / viewAxisCosine;
+      const float kmPerWorldUnit = 1.0f / max(args.worldUnitsPerKm, 1e-6f);
+      tMaxKm = cameraToSurfaceLength * kmPerWorldUnit;
+    }
+    // else: sky-miss pixel, no surface to clamp against -- tMaxKm stays 0 ("no clamp"), so this
+    // pixel's march is UNCHANGED from Stage 3. This is the acceptance-test invariant for this stage.
+  }
+
   float jitter = fastJitter(pixelCoord, args.cloudRenderFrameIdx).x;
   // Static per-pixel hash for far-field jitter (animated < 250 m, static beyond — no distant shimmer).
   float jitterStatic = fastJitter(pixelCoord, 0u).x;
@@ -202,18 +280,28 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
   // (no doubling — Nubis Cubed equations take raw cloudDensity as extinction).
   // marchCloudLayers sequences layer 1 (cumulus) then the optional layer-2
   // cirrus deck front-to-back, zeroing the moon coefficients for layer 2.
-  // The 0/0 distance clamps mean "march the full slab" — bit-identical to
-  // the pre-extraction inline march.
+  // tMinClamp stays 0/no-op (unchanged this stage — only the far bound is depth-aware); tMaxClamp
+  // is now tMaxKm (fork — 2026-09-05, Stage 4a), 0 on a sky-miss pixel ("march the full slab",
+  // bit-identical to the pre-Stage-4a march) and the converted slant range to the resolved surface
+  // everywhere else.
   vec3 accumColor = vec3(0.0f);
   float viewTransmittance = 1.0f;
+  float entryDistanceKm;
+  float meanCloudDepthKm;
 
   marchCloudLayers(viewDirYUp, jitter, jitterStatic,
                    /*tMinClamp=*/0.0f,
-                   /*tMaxClamp=*/0.0f,
+                   /*tMaxClamp=*/tMaxKm,
                    args.cloudViewSamples, ctx, args,
-                   accumColor, viewTransmittance);
+                   accumColor, viewTransmittance,
+                   entryDistanceKm, meanCloudDepthKm);
 
   // Output is premultiplied: rgb = accumulated cloud radiance,
   // a = view-ray cloud transmittance.
   cloudRenderOutput[pixelCoord] = vec4(accumColor, viewTransmittance);
+
+  // Depth companion (fork — 2026-09-05, world-space cloud migration Stage 4a): r = entry distance,
+  // g = transmittance-weighted mean cloud depth, both km. Written unconditionally so every texel is
+  // defined every frame, matching cloudRenderOutput's coverage above. No consumer yet -- Stage 4b.
+  cloudDepthOutput[pixelCoord] = vec2(entryDistanceKm, meanCloudDepthKm);
 }

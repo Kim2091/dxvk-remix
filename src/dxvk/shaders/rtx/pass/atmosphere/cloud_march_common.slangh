@@ -35,8 +35,15 @@
 //     layer-1 + optional-layer-2 sequencing. The tMinClamp / tMaxClamp
 //     parameters clamp the marched segment to camera distances
 //     [tMinClamp, tMaxClamp] (0 disables the respective clamp); passing
-//     0/0 reproduces the pre-extraction march bit-for-bit. Both current
-//     consumers pass 0/0 — the clamps exist for split-march experiments.
+//     0/0 reproduces the pre-extraction march bit-for-bit. cloud_render.comp.slang is now the
+//     first caller to pass a nonzero tMaxClamp (fork — 2026-09-05, world-space cloud migration
+//     Stage 4a): it clamps the march to the resolved primary-ray surface, using the depth
+//     conversion documented at that call site. cloud_secondary_lut.comp.slang still passes 0/0.
+//   * marchCloudLayers also reports two depth-companion outputs (Stage 4a): entryDistanceKm (where
+//     the layer-1 span started) and meanCloudDepthKm (a transmittance-weighted mean distance
+//     through whatever cloud material either layer found), both in km. Threaded down through
+//     marchCloudSlab / marchEchoDeck / integrateCloudSample — see the accumulator parameters on
+//     each. Only cloud_render.comp.slang's depth companion RT consumes them today.
 //
 // The dome-direction mapping the LUT bake + sampler share
 // (cloudDomeUvToDir / cloudDomeDirToUv) lives in atmosphere_common.slangh
@@ -780,7 +787,16 @@ bool integrateCloudSample(float tSampleKm,
                           AtmosphereArgs args,
                           inout vec3  accumColor,
                           inout float viewTransmittance,
-                          out float sdfStepKmOut) {
+                          out float sdfStepKmOut,
+                          // Depth-companion accumulators (fork — 2026-09-05, world-space cloud
+                          // migration Stage 4a). Running sums for the transmittance-weighted mean
+                          // cloud depth the screen pass writes to its depth companion RT; see the
+                          // accumulation site below for the exact weight and marchCloudLayers for
+                          // where the running sums are finalized into a mean. Unused (but still
+                          // correctly accumulated) by callers that don't consume a depth output —
+                          // cloud_secondary_lut.comp.slang passes throwaway locals.
+                          inout float sumWeightedDistKm,
+                          inout float sumWeight) {
   sdfStepKmOut = 0.0f;
 
   // World-anchored sample position (Y-up km). The slab intersection in the
@@ -990,6 +1006,14 @@ bool integrateCloudSample(float tSampleKm,
   // keep the camera-at-origin convention), so haze/fade behave identically
   // across passes.
   accumColor += stepRadiance * viewTransmittance * aerialT_haze;
+  // Depth-companion accumulation (fork — 2026-09-05, world-space cloud migration Stage 4a):
+  // sampleWeight (computed above for the lighting LOD gate) is EXACTLY the coefficient this
+  // sample's color is weighted by in the accumColor update just above -- viewTransmittance has not
+  // been mutated between the two -- so reusing it here gives a true transmittance-weighted mean
+  // distance at zero extra cost. marchCloudLayers divides sumWeightedDistKm / sumWeight once, after
+  // both layers have contributed.
+  sumWeightedDistKm += tSampleKm * sampleWeight;
+  sumWeight         += sampleWeight;
   viewTransmittance *= mix(1.0f, stepTransmittance, aerialT_fade);
   return true;
 }
@@ -1080,7 +1104,18 @@ void marchCloudSlab(vec3   viewDirYUp,
                     CloudShadeContext ctx,
                     AtmosphereArgs args,
                     inout vec3  accumColor,
-                    inout float viewTransmittance) {
+                    inout float viewTransmittance,
+                    // Depth-companion outputs (fork — 2026-09-05, world-space cloud migration Stage
+                    // 4a). entryDistanceKm is written once below, unconditionally, the moment this
+                    // slab's span is known valid -- layer 1 (this function, always marched first,
+                    // front-to-back) is "the marched span" the screen pass's depth companion means
+                    // by "entry distance"; marchEchoDeck's layer-2 span does not touch it.
+                    // sumWeightedDistKm / sumWeight are the same running accumulators
+                    // integrateCloudSample updates, threaded through so both layers contribute to
+                    // one combined mean-depth estimate.
+                    inout float entryDistanceKm,
+                    inout float sumWeightedDistKm,
+                    inout float sumWeight) {
   // Slab intersection (fork — 2026-09-05, world-space cloud migration Stage 1). Was inline
   // ray-sphere tests against the base + top shells of the curvature-adjusted cloud planet, taking
   // the far root of each unconditionally; now cloudSlabSpan, which shares the one planet centre and
@@ -1096,6 +1131,12 @@ void marchCloudSlab(vec3   viewDirYUp,
   }
   if (tEntry >= tExit || tExit <= 0.0f) return;
   tEntry = max(tEntry, 0.0f);
+
+  // Entry distance (fork — 2026-09-05, Stage 4a): geometric slab-entry distance, in km, regardless
+  // of whether any density is actually found along the ray -- "where the marched span started" is a
+  // property of the slab geometry, not the cloud coverage. Written only once every call reaches
+  // this point (every earlier `return` leaves the caller's initialized sentinel untouched).
+  entryDistanceKm = tEntry;
 
   // Adaptive step count (fork — 2026-06-12, adaptive march sampling). A
   // FIXED step count across a span that varies from ~4 km (zenith) to
@@ -1157,7 +1198,7 @@ void marchCloudSlab(vec3   viewDirYUp,
                                           typeNoiseEntry, typeNoiseExit,
                                           coverageNoiseEntry, coverageNoiseExit,
                                           ctx, args, accumColor, viewTransmittance,
-                                          sdfStepKm);
+                                          sdfStepKm, sumWeightedDistKm, sumWeight);
       // SDF empty-space skip (fork — Nubis3 conversion Phase C). The sampler
       // reported a guaranteed-empty radius around this sample (min hex tap,
       // coverage- and wobble-conservative); jump the loop index so the next
@@ -1235,7 +1276,7 @@ void marchCloudSlab(vec3   viewDirYUp,
                          typeNoiseEntry, typeNoiseExit,
                          coverageNoiseEntry, coverageNoiseExit,
                          ctx, args, accumColor, viewTransmittance,
-                         sdfStepKm);
+                         sdfStepKm, sumWeightedDistKm, sumWeight);
     t += stepKm;
   }
 
@@ -1293,7 +1334,15 @@ void marchEchoDeck(vec3   viewDirYUp,
                    CloudShadeContext ctx,
                    AtmosphereArgs args,
                    inout vec3  accumColor,
-                   inout float viewTransmittance) {
+                   inout float viewTransmittance,
+                   // Depth-companion accumulators (fork — 2026-09-05, world-space cloud migration
+                   // Stage 4a) — same running sums marchCloudSlab threads through
+                   // integrateCloudSample, so the echo deck's contribution folds into the same
+                   // combined mean-depth estimate. No entryDistanceKm parameter here: layer 1
+                   // (marchCloudSlab) owns "where the marched span started" by definition (it
+                   // always marches first, front-to-back).
+                   inout float sumWeightedDistKm,
+                   inout float sumWeight) {
   // Slab intersection via the shared helper (fork — 2026-09-05, world-space cloud migration
   // Stage 1) — see cloudSlabSpan's comment and marchCloudSlab's identical swap above.
   float tEntry, tExit;
@@ -1460,7 +1509,14 @@ void marchEchoDeck(vec3   viewDirYUp,
 
     float aerialT_haze = exp(-args.cloudAerialHazePerKm * t);
     float aerialT_fade = exp(-args.cloudAerialFadePerKm * t);
+    // sampleWeight named explicitly here (fork — 2026-09-05, world-space cloud migration Stage 4a)
+    // so the depth-companion accumulation below can reuse it -- the exact same value implicit in
+    // the accumColor update, computed before viewTransmittance is mutated. Purely a refactor of the
+    // existing expression: the accumColor write is byte-identical to before.
+    float sampleWeight = viewTransmittance * aerialT_haze * (1.0f - stepTransmittance);
     accumColor += stepRadiance * viewTransmittance * aerialT_haze;
+    sumWeightedDistKm += t * sampleWeight;
+    sumWeight         += sampleWeight;
     viewTransmittance *= mix(1.0f, stepTransmittance, aerialT_fade);
   }
 }
@@ -1482,7 +1538,17 @@ void marchCloudLayers(vec3  viewDirYUp,
                       CloudShadeContext ctx,
                       AtmosphereArgs args,
                       inout vec3  accumColor,
-                      inout float viewTransmittance) {
+                      inout float viewTransmittance,
+                      // Depth-companion outputs (fork — 2026-09-05, world-space cloud migration
+                      // Stage 4a). entryDistanceKm: the geometric slab-entry distance (km) of the
+                      // layer-1 march, or -1.0f if layer 1 never found a valid span (rare -- see
+                      // marchCloudSlab). meanCloudDepthKm: the transmittance-weighted mean distance
+                      // (km) through whatever cloud material both layers found along the ray, or
+                      // 0.0f if none (the running weight never left ~0). Only cloud_render.comp.slang
+                      // consumes these; cloud_secondary_lut.comp.slang passes throwaway locals --
+                      // see that file's call site.
+                      out float entryDistanceKm,
+                      out float meanCloudDepthKm) {
   // Per-ray shading precompute (fork — 2026-07-30, perf). Fills the
   // view-direction-dependent half of the context ONCE, replacing the same work
   // repeated at every march sample. Both layers share it: every term here is
@@ -1491,6 +1557,13 @@ void marchCloudLayers(vec3  viewDirYUp,
   // feed these fields).
   ctx = cloudShadeContextBeginRay(ctx, viewDirYUp, args);
 
+  // Depth-companion accumulators (fork — 2026-09-05, Stage 4a), initialized to the "nothing found
+  // yet" sentinels documented above and folded into a single mean-depth value once both layers
+  // have run (see the divide at the bottom of this function).
+  entryDistanceKm = -1.0f;
+  float sumWeightedDistKm = 0.0f;
+  float sumWeight = 0.0f;
+
   marchCloudSlab(viewDirYUp, pixelJitter, pixelJitterStatic,
                  args.cloudAltitude, args.cloudThickness,
                  args.cloudTypeMean, args.cloudCoverageMean,
@@ -1498,7 +1571,8 @@ void marchCloudLayers(vec3  viewDirYUp,
                  /*slabNoiseSeedOffset=*/0.0f,
                  tMinClamp, tMaxClamp,
                  sampleCount, ctx, args,
-                 accumColor, viewTransmittance);
+                 accumColor, viewTransmittance,
+                 entryDistanceKm, sumWeightedDistKm, sumWeight);
 
   // Layer 2 echo deck — same slab model at a gapped altitude, marched cheaply.
   // Reads its own coverage/type spread via an args copy so the shared density
@@ -1548,6 +1622,14 @@ void marchCloudLayers(vec3  viewDirYUp,
                   args.cloudLayer2NoiseSeed,
                   tMinClamp, tMaxClamp,
                   ctx, args2,
-                  accumColor, viewTransmittance);
+                  accumColor, viewTransmittance,
+                  sumWeightedDistKm, sumWeight);
   }
+
+  // Finalize the depth companion (fork — 2026-09-05, Stage 4a): both layers have now contributed
+  // whatever weight they found, so this is the one point where the running sums become a mean.
+  // sumWeight stays ~0 only when neither layer put any cloud material on the ray (both slabs
+  // missed, or every sample density-gated out) -- meanCloudDepthKm is meaningless there, so it
+  // reports the "no cloud" sentinel instead of dividing by (near) zero.
+  meanCloudDepthKm = (sumWeight > 1e-6f) ? (sumWeightedDistKm / sumWeight) : 0.0f;
 }

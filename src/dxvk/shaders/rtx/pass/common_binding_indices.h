@@ -130,11 +130,24 @@
 // placement map itself lives on as an NVDF-occupancy bake input, bound at the
 // bake passes' own slots; do not reuse without a collision audit)
 
+// Cloud depth companion (fork — 2026-09-05, world-space cloud migration Stage 4a). RG32F
+// screen-space RT at the SAME extent as BINDING_ATMOSPHERE_CLOUD_RENDER_RT (allocated and resized
+// together — see RtxAtmosphere::ensureCloudRenderRT): r = entry distance (km, where the marched
+// span started), g = transmittance-weighted mean cloud depth (km). 32-bit float, not 16 — the
+// march reaches 50+ km at the horizon (see the adaptive-step comment in
+// cloud_march_common.slangh), and float16's ~2^-10 relative step size there is tens of metres per
+// representable value, coarse enough to visibly stair-step the parallax reprojection this exists
+// for. Produced by cloud_render.comp.slang via RtxAtmosphere::dispatchCloudScreenPass (called from
+// injectRTX right after dispatchPathTracing, so the march can clamp against this frame's
+// PrimaryLinearViewZ). Wired into the common ray-tracing bindings now so Stage 4b's compositor
+// needs no further plumbing; nothing samples it yet.
+#define BINDING_ATMOSPHERE_CLOUD_DEPTH_RT 217
+
 // Fork atmosphere/cloud bindings occupy a contiguous range ABOVE COMMON_MAX_BINDING
 // (which only covers the base common bindings). Expose the range so passes that
 // also bind their own resources (e.g. sparse rendering) can assert no overlap.
 #define BINDING_ATMOSPHERE_MIN                   BINDING_ATMOSPHERE_TRANSMITTANCE_LUT
-#define BINDING_ATMOSPHERE_MAX                   BINDING_ATMOSPHERE_CLOUD_SECONDARY_LUT
+#define BINDING_ATMOSPHERE_MAX                   BINDING_ATMOSPHERE_CLOUD_DEPTH_RT
 
 #define COMMON_MAX_BINDING                       BINDING_SAMPLER_READBACK_BUFFER
 #define COMMON_NUM_BINDINGS                      (COMMON_MAX_BINDING + 1)
@@ -192,6 +205,7 @@
   TEXTURE3D(BINDING_ATMOSPHERE_CLOUD_D_SUN)                         \
   TEXTURE3D(BINDING_ATMOSPHERE_CLOUD_D_AMBIENT)                     \
   SAMPLER(BINDING_ATMOSPHERE_SKY_VIEW_SAMPLER)                      \
-  TEXTURE2D(BINDING_ATMOSPHERE_CLOUD_SECONDARY_LUT)
+  TEXTURE2D(BINDING_ATMOSPHERE_CLOUD_SECONDARY_LUT)                 \
+  TEXTURE2D(BINDING_ATMOSPHERE_CLOUD_DEPTH_RT)
 
 #endif

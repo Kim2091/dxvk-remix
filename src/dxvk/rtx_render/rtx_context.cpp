@@ -685,6 +685,16 @@ namespace dxvk {
         // Path Tracing
         dispatchPathTracing(rtOutput);
 
+        // Cloud screen pass (fork — 2026-09-05, world-space cloud migration Stage 4a). MUST run
+        // here, immediately after dispatchPathTracing and nowhere earlier: the march below clamps
+        // against rtOutput.m_primaryLinearViewZ, which dispatchPathTracing's G-buffer raytracing
+        // (metaPathtracerGbuffer) just finished writing for every pixel this frame. Before that
+        // call PrimaryLinearViewZ either holds last frame's stale content or is uninitialized, so
+        // moving this any earlier would clamp against the wrong frame's geometry (or none at all).
+        // See RtxAtmosphere::dispatchCloudScreenPass's doc comment for what stays behind in
+        // updateFrame/computeLuts instead.
+        m_common->metaAtmosphere().dispatchCloudScreenPass(*this, rtOutput);
+
         // Neural Radiance Cache
         m_common->metaNeuralRadianceCache().dispatchTrainingAndResolve(*this, rtOutput);
 
