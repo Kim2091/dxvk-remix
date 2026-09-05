@@ -234,16 +234,18 @@ float intersectSphereNearest(vec3 origin, vec3 direction, vec3 center, float rad
 
 // Distance from the camera-frame origin (the eye) to the planet centre - the eye's radius.
 // One planet: clouds, atmosphere, ground and horizon all measure against this (fork —
-// 2026-09-05, world-space cloud migration Stage 1; ported from archaeology commit 30d20a8f5).
+// 2026-09-05, world-space cloud migration Stage 1/2; ported from archaeology commit 30d20a8f5).
 //
-// Stage 1 deliberately returns args.planetRadius ALONE. The reference this was ported from
-// returns `args.planetRadius + args.cameraAltitudeKm`, but AtmosphereArgs on this branch has no
-// cameraAltitudeKm field yet — adding one is a CB-layout change and Stage 2's job, not this one's
-// (see the CRITICAL note on atmosphere_args.h's cloudCurvature field for why layout changes are
-// kept out of this stage). Written so Stage 2 only has to add the term back:
-//   return args.planetRadius + args.cameraAltitudeKm;
+// Stage 1 returned args.planetRadius ALONE, because AtmosphereArgs had no cameraAltitudeKm field
+// yet (adding one was a CB-layout change reserved for this stage — see the CRITICAL note on
+// atmosphere_args.h's cameraAltitudeKm field, which repurposes the retired padRetired10 slot rather
+// than growing the struct). Stage 2 adds the term back: the eye now sits at a real altitude above
+// the surface instead of welded to it, which is what lets a ray aimed below the horizon actually
+// hit the planet at a positive distance (see the ground-radiance block in evalAtmosphereRadiance)
+// and what gives the sky-view LUT bake genuine altitude parallax (see its reconciliation with this
+// function in evalAtmosphereRadiance's doc comment below).
 float getEyeRadius(AtmosphereArgs args) {
-  return args.planetRadius;
+  return args.planetRadius + args.cameraAltitudeKm;
 }
 
 // Planet centre for the atmosphere's internal Y-up frame, whose origin sits AT THE CAMERA.
@@ -256,11 +258,11 @@ float getEyeRadius(AtmosphereArgs args) {
 // under the camera makes curvature say the thing it should: distant things fall away from WHERE
 // YOU ARE, invariantly under travel.
 //
-// Until Stage 2 gives getEyeRadius a real cameraAltitudeKm term, the eye sits exactly on the
-// planet's surface (radius == planetRadius), same as before this stage — this function's OUTPUT is
-// unchanged today. What changes is that it is now the single place callers ask, instead of each
-// re-deriving vec3(0, -radius, 0) with whichever radius they happened to be holding (see
-// cloudPlanetRadius's retirement below for the two-sphere bug that caused).
+// getEyeRadius(args) now carries a real cameraAltitudeKm term (fork — 2026-09-05, world-space
+// cloud migration Stage 2), so the eye recedes from the surface as the camera climbs instead of
+// staying welded to it — this is now the single place callers ask, instead of each re-deriving
+// vec3(0, -radius, 0) with whichever radius they happened to be holding (see cloudPlanetRadius's
+// retirement below for the two-sphere bug that caused).
 vec3 getPlanetCenter(AtmosphereArgs args) {
   return vec3(0.0f, -getEyeRadius(args), 0.0f);
 }
@@ -489,20 +491,32 @@ vec3 evalAtmosphereRadiance(
 ) {
   // Intersect ray with atmosphere
   //
-  // Deliberately NOT getPlanetCenter(args) (fork — 2026-09-05, world-space cloud migration Stage 1).
-  // The only caller (sky_view_lut.comp.slang's computeSkyView) bakes this from a hardcoded
-  // `cameraPos = vec3(0, 0, 0)`, i.e. "assume camera at ground level" — a simplification the
-  // reference this was ported from (archaeology commit 30d20a8f5) left in place too, and its own
-  // author's commit message names "no camera position" as one of that WIP's unresolved failures.
-  // getPlanetCenter(args) pulls args.cameraAltitudeKm straight off the CB (once Stage 2 adds it)
-  // regardless of what rayOrigin was actually passed in here, which would silently put the planet
-  // centre at the REAL camera altitude under a ray that is pretending to originate at altitude 0 —
-  // reintroducing a two-frames-disagreeing-about-the-eye bug of exactly the shape this stage exists
-  // to remove. Resolving that mismatch (by either plumbing the real altitude into this bake or
-  // teaching this function to ask for it explicitly) is Sky-view LUT altitude key work — Stage 2's,
-  // not this one's. Today getEyeRadius(args) == args.planetRadius exactly (no altitude term yet), so
-  // this hardcoded formula and getPlanetCenter(args) agree bit-for-bit; only future stages diverge.
-  vec3 planetCenter = vec3(0.0f, -args.planetRadius, 0.0f);
+  // NOW getPlanetCenter(args) (fork — 2026-09-05, world-space cloud migration Stage 2 — reconciles
+  // the split Stage 1 deliberately left open; see that stage's comment, quoted in spirit below).
+  //
+  // Stage 1 kept this hardcoded to vec3(0, -args.planetRadius, 0) because its only caller
+  // (sky_view_lut.comp.slang's computeSkyView) baked from `cameraPos = vec3(0, 0, 0)` under the
+  // comment "assume camera at ground level" — i.e. rayOrigin here meant "the ground", not "the
+  // eye". Routing this through getPlanetCenter(args), which now subtracts a real
+  // cameraAltitudeKm, while the caller still meant altitude-0-ground by its origin would have put
+  // the planet centre at the REAL camera altitude under a ray pretending to start at altitude 0 —
+  // exactly the two-frames-disagreeing-about-the-eye bug this whole migration exists to remove.
+  //
+  // Stage 2 resolves the split from the OTHER side: sky_view_lut.comp.slang's `cameraPos =
+  // vec3(0,0,0)` no longer means "ground" — it means "the eye, wherever it actually is", the same
+  // convention every other real-ray-origin caller in this file already uses (evalSunShadowing,
+  // evalAtmosphereInScatterSegment, and getPlanetCenter's own doc comment). With that
+  // reinterpretation, distance(rayOrigin, getPlanetCenter(args)) == getEyeRadius(args) exactly —
+  // the eye sits at the correct real-altitude radius, not glued to the ground — and this is the
+  // ONLY caller, so no other rayOrigin convention is broken by the change.
+  //
+  // NOTE on the archaeology reference: commit 30d20a8f5 updated sky_view_lut.comp.slang's comment
+  // to claim exactly this ("the frame's origin IS the eye... the bake becomes altitude-aware for
+  // free") but its own evalAtmosphereRadiance kept the hardcoded vec3(0, -args.planetRadius, 0)
+  // unchanged — so in that WIP commit the comment's claim was never actually true; the sky-view
+  // bake stayed exactly as ground-welded as before. This stage makes the code match that claim for
+  // real, rather than reproducing the mismatch.
+  const vec3 planetCenter = getPlanetCenter(args);
   float t0, t1;
   
   // Check if we're inside or outside the atmosphere
@@ -707,13 +721,15 @@ vec3 evalAtmosphereRadiance(
   // genuinely looks like. The haze is doing the visible work at horizon distances anyway, so the
   // lower hemisphere reads as terrain receding into air rather than as a painted band.
   //
-  // hitsPlanet / tPlanet0 rarely fire in THIS stage: getEyeRadius(args) is still exactly
-  // args.planetRadius (see its comment), so the ray origin sits exactly on the ground sphere and the
-  // near-root clamp above has essentially zero margin to land on the positive side of zero. This
-  // term is ported now anyway per the Stage 1 plan — the load-bearing fix for the "flat dark disc"
-  // this stage must not introduce is evalSunShadowingClampedToSurface above; this ground term is the
-  // second half of the same fix and starts pulling real weight once Stage 2 gives getEyeRadius a
-  // nonzero cameraAltitudeKm and tPlanet0 has room to land above zero.
+  // hitsPlanet / tPlanet0 now actually fire (fork — 2026-09-05, world-space cloud migration Stage
+  // 2): getEyeRadius(args) carries a real cameraAltitudeKm term and planetCenter above is
+  // getPlanetCenter(args), so a ray aimed below the horizon meets the planet at a genuine
+  // tPlanet0 > 0 with real margin, instead of the near-zero margin Stage 1 described (eye welded
+  // exactly to the ground sphere, getEyeRadius(args) == args.planetRadius). This is the second
+  // half of the "flat dark disc" fix alongside evalSunShadowingClampedToSurface above — that one
+  // keeps below-horizon shadow sampling sane while the eye still sat on the surface; this one is
+  // what actually gives the below-horizon hemisphere a lit ground to terminate on now that the
+  // eye has somewhere to look down FROM.
   if (hitsPlanet && tPlanet0 > 0.0f) {
     const vec3 groundPos    = rayOrigin + rayDir * tPlanet0;
     const vec3 groundNormal = normalize(groundPos - planetCenter);
@@ -822,13 +838,25 @@ float computeCloudHeightFraction(vec3 samplePos, AtmosphereArgs args) {
 }
 
 // =============================================================================
-// Cloud dome-LUT direction mapping (fork — 2026-06-10).
+// Cloud dome-LUT direction mapping (fork — 2026-06-10; full-sphere fork —
+// 2026-09-05, world-space cloud migration Stage 2; ported from archaeology
+// commit 30d20a8f5).
 //
-// The secondary-ray cloud LUT is keyed (azimuth, elevation) over the upper
-// hemisphere with elevation resolution concentrated near the horizon:
-// elevation = (pi/2) * v^2. Horizon-grazing rays carry the most cloud
-// detail per texel (the slab spans ~90 km edge-on at the horizon vs ~4 km
-// at zenith), so v^2 spends ~70% of the rows below 30 degrees elevation.
+// The secondary-ray cloud LUT is keyed (azimuth, elevation) with elevation
+// resolution concentrated near the horizon. Originally elevation = (pi/2) *
+// v^2 over the UPPER HEMISPHERE ONLY (v in [0,1]): horizon-grazing rays carry
+// the most cloud detail per texel (the slab spans ~90 km edge-on at the
+// horizon vs ~4 km at zenith), so v^2 spent ~70% of the rows below 30 degrees
+// elevation — but every below-horizon direction clamped straight onto the
+// horizon row (cloudDomeDirToUv's old `clamp(dirYUp.y, 0.0f, 1.0f)`), so a
+// camera above the deck saw its own reflection as a horizon smear rather than
+// the deck actually below it. Signed elevation = l*l*sign(l) * (pi/2), l =
+// uv.y*2-1 in [-1,1], keeps the identical quadratic concentration near the
+// horizon in BOTH directions — same encoding sky_view_lut.comp.slang already
+// uses — and covers the full sphere. Cost: with the row count unchanged this
+// would halve above-horizon resolution, so kCloudSecondaryLutHeight
+// (rtx_atmosphere.h) doubled from 128 to 256 alongside this change to hold it
+// steady.
 //
 // Writer (cloud_secondary_lut.comp.slang) and sampler (evalSkyRadiance in
 // atmosphere_sky.slangh) must agree exactly — both call these two helpers.
@@ -836,15 +864,20 @@ float computeCloudHeightFraction(vec3 samplePos, AtmosphereArgs args) {
 // not include the march library.
 // =============================================================================
 vec3 cloudDomeUvToDir(vec2 uv) {
-  float azimuth   = uv.x * 2.0f * kPi;
-  float elevation = (0.5f * kPi) * uv.y * uv.y;
+  float azimuth = uv.x * 2.0f * kPi;
+  float l = uv.y * 2.0f - 1.0f;
+  float elevation = l * l * sign(l) * (0.5f * kPi);
   float cosEl = cos(elevation);
   return vec3(sin(azimuth) * cosEl, sin(elevation), cos(azimuth) * cosEl);
 }
 
 vec2 cloudDomeDirToUv(vec3 dirYUp) {
-  float elevation = asin(clamp(dirYUp.y, 0.0f, 1.0f));
-  float v = sqrt(elevation / (0.5f * kPi));
+  float elevation = asin(clamp(dirYUp.y, -1.0f, 1.0f));
+  // Inverse of cloudDomeUvToDir's l*l*sign(l): l = sqrt(|elevation| / (pi/2)) * sign(elevation),
+  // then rescale from [-1,1] back to v in [0,1]. The y-clamp above used to be [0, 1], which is
+  // exactly what folded the entire lower hemisphere onto v = 0 (the horizon row).
+  float l = sqrt(abs(elevation) / (0.5f * kPi)) * sign(elevation);
+  float v = (l + 1.0f) * 0.5f;
   // Same azimuth convention as cloudDomeUvToDir: az 0 = +Z, increasing
   // toward +X. atan2 gives u in [-0.5, 0.5); wrap to [0, 1) here with frac so
   // sampling correctness no longer depends on the sampler's address mode

@@ -93,7 +93,8 @@ public:
   // Screen-space RGBA16F at downscale extent: premultiplied cloud rgb + transmittance alpha, per frame.
   const Resources::Resource& getCloudRenderRT() const { return m_cloudRenderRT; }
 
-  // 256x128 RGBA16F dome LUT baked per frame; supplies clouds to secondary rays (indirect/PSR/reflection).
+  // 256x256 RGBA16F dome LUT baked per frame (was 256x128 before the Stage 2 full-sphere mapping);
+  // supplies clouds to secondary rays (indirect/PSR/reflection).
   const Resources::Resource& getCloudSecondaryLut() const { return m_cloudSecondaryLut; }
 
   // Recreates the cloud render RT on resize; cheap when extent is unchanged.
@@ -109,31 +110,50 @@ public:
   // Push camera world position (Y-up km) for the D_sun voxel grid shadow lookup. Must be called before computeLuts.
   void setCloudShadowCameraPosition(const Vector3& cameraWorldPosYUpKm);
 
-  // ---- World-space cloud migration, Stage 0: instrumentation only (2026-09-05) ----
-  // Clouds today sample AtmosphereArgs::cameraWorldPosYUpKm, a camera-relative reframe origin —
-  // there is no real world-space cloud position yet. Before spending a later stage rewiring the
-  // shaders onto one, this records what a CPU-side anchor derived from the camera view matrix
-  // would look like, and whether it is even trustworthy on every target engine. See everMoved /
-  // cumulativeRotationRadians below for why that question has a concrete, measurable answer —
-  // and why it is NOT staticFrameCount, despite that being the obvious first guess.
+  // ---- World-space cloud migration, Stage 0/2: anchor and altitude datum (2026-09-05) ----
+  // Clouds today sample AtmosphereArgs::cameraWorldPosYUpKm, a camera-relative reframe origin.
+  // Stage 0 recorded what a CPU-side anchor derived from the camera view matrix would look like,
+  // and whether it is even trustworthy on every target engine — it was NOT, on Fallout: New Vegas
+  // (see everMoved / cumulativeRotationRadians below for the measurement). Stage 2 acts on that
+  // finding: it adds an explicit game-pushed override source (Source::CameraWorldOverride) and
+  // actually resolves and routes an anchor into AtmosphereArgs for the first time. A
+  // runtime/heuristic estimator for engines with neither a usable view matrix nor an explicit push
+  // remains a separate, deliberately unimplemented later decision.
   struct CloudAnchor {
-    // What produced posYUpKm. Stage 0 implements only the camera view matrix; later stages add
-    // an explicit game-pushed override and a scene-heuristic estimator for engines where the
-    // view matrix carries no translation at all (see everMoved).
+    // What produced posYUpKm this frame.
     enum class Source : uint32_t {
       CameraViewMatrix = 0,
+      // Explicit game-pushed override (fork — 2026-09-05, world-space cloud migration Stage 2):
+      // rtx.atmosphere.useCameraWorldOverride + cameraWorldOverride. This is FNV's path — the
+      // sibling Remix wrapper pushes the engine's own camera position here every frame because
+      // RtCamera::getPosition() never will (see everMoved below). A runtime/heuristic estimator
+      // for engines with neither this nor a usable view matrix is intentionally NOT implemented;
+      // it would be a distinct Source value added by a later stage, not this one.
+      CameraWorldOverride = 1,
     };
 
     // camera.getPosition(freecam=false) and (freecam=true), unconverted (still whatever
     // handedness/up-axis the engine's view-to-world matrix uses). Both are recorded because nothing
     // in this frame's cloud setup agrees on which to use — see the mismatch note at the fill site
-    // in updateFrame.
+    // in updateFrame. NOTE: rawWorldUnits always holds the RAW VIEW MATRIX reading, even when
+    // Source::CameraWorldOverride is active — see resolvedRawWorldUnits below for what actually
+    // fed posYUpKm this frame. Keeping the two separate is deliberate: everMoved /
+    // cumulativeRotationRadians exist specifically to keep measuring whether the view matrix
+    // itself ever moves, and that measurement must not be masked just because the override has
+    // made the question moot for rendering purposes.
     Vector3 rawWorldUnits        { 0.0f, 0.0f, 0.0f };
     Vector3 rawWorldUnitsFreecam { 0.0f, 0.0f, 0.0f };
 
-    // rawWorldUnits converted into the atmosphere's Y-up frame and into cloud-space kilometres via
-    // cloudWorldUnitsPerKm() — deliberately NOT the aerial-perspective or legacy sceneScale
-    // conversion; see that helper's doc comment for why clouds get their own scale knob.
+    // The raw units actually behind posYUpKm this frame (fork — 2026-09-05, world-space cloud
+    // migration Stage 2): equal to rawWorldUnits when source == CameraViewMatrix, or to
+    // rtx.atmosphere.cameraWorldOverride() verbatim when source == CameraWorldOverride. Same raw
+    // game-unit convention camera.getPosition() would have returned this frame either way — see
+    // that RTX_OPTION's doc comment for the exact contract expected of the game integration.
+    Vector3 resolvedRawWorldUnits { 0.0f, 0.0f, 0.0f };
+
+    // resolvedRawWorldUnits converted into the atmosphere's Y-up frame and into cloud-space
+    // kilometres via cloudWorldUnitsPerKm() — deliberately NOT the aerial-perspective or legacy
+    // sceneScale conversion; see that helper's doc comment for why clouds get their own scale knob.
     Vector3 posYUpKm     { 0.0f, 0.0f, 0.0f };
     Vector3 prevPosYUpKm { 0.0f, 0.0f, 0.0f };
     Vector3 deltaKm      { 0.0f, 0.0f, 0.0f };  // posYUpKm - prevPosYUpKm, this frame vs last
@@ -242,13 +262,47 @@ public:
     // "is not a reliable measurement of the world space" it happens to also feed. Aerial perspective got its
     // own override first because it was the system where the disagreement was loudest; clouds still trust
     // rtx.sceneScale outright, and cloud-vs-geometry intersection (the point of this migration) is exactly
-    // where a mismatch stops being invisible. 0 = inherit keeps every existing config bit-identical; this is
-    // Stage 0 instrumentation only — nothing yet routes cloud geometry through the value this produces.
+    // where a mismatch stops being invisible. 0 = inherit keeps every existing config bit-identical.
+    // Stage 0 (2026-09-05) added this as instrumentation only; Stage 2 (2026-09-05) now routes the
+    // resolved CloudAnchor's posYUpKm — which this scale divides into — through
+    // setCloudShadowCameraPosition into AtmosphereArgs::cameraWorldPosYUpKm, so this genuinely
+    // calibrates cloud geometry today.
     RTX_OPTION_ARGS("rtx.atmosphere", float, cloudScale, 0.0f,
                "Defines the clouds' own scene-unit scale, in game units per centimetre. 0 inherits rtx.sceneScale "
                "for legacy behaviour; a positive value overrides it only for the cloud world-space conversion "
                "(cloudWorldUnitsPerKm), without changing the sky, aerial perspective, or global volumetrics.",
                args.minValue = 0.0f);
+    // Cloud world-anchor override (fork — 2026-09-05, world-space cloud migration Stage 2). Stage 0
+    // measured, in-game on Fallout: New Vegas, that RtCamera::getPosition() is permanently (0,0,0) —
+    // Gamebryo-family engines keep camera translation out of the D3D view matrix entirely (see
+    // CloudAnchor::everMoved's doc comment for the measurement). On such an engine the camera view
+    // matrix is not a usable anchor source at any point, so an explicit push from the game
+    // integration is not optional — it is the only way world-anchored clouds do anything there.
+    // When enabled, cameraWorldOverride is used instead of camera.getPosition(freecam=false)
+    // everywhere the resolved CloudAnchor feeds AtmosphereArgs (see updateFrame's anchor-resolve
+    // block). Off by default so every engine where the view matrix already carries translation (GTA
+    // 4, most games) is unaffected.
+    RTX_OPTION("rtx.atmosphere", bool, useCameraWorldOverride, false,
+               "Anchor world-space clouds to rtx.atmosphere.cameraWorldOverride instead of the Remix "
+               "camera position. Required on camera-relative engines where RtCamera::getPosition() "
+               "reads as (0,0,0) — without it the cloud volume welds to the view and produces no "
+               "parallax while walking. The game integration is expected to push the real camera "
+               "world position here every frame.");
+    RTX_OPTION("rtx.atmosphere", Vector3, cameraWorldOverride, Vector3(0.0f, 0.0f, 0.0f),
+               "Camera world position, in the SAME raw game units / convention RtCamera::getPosition() "
+               "would have returned this frame (before any Y-up conversion or cloudWorldUnitsPerKm "
+               "scaling — updateFrame applies both, identically to the camera-view-matrix path). Used "
+               "as the world-space cloud anchor when useCameraWorldOverride is true. Pushed per-frame "
+               "by the game integration (e.g. the FalloutNV Remix wrapper, which already reads the "
+               "engine's camera NiPoint3).");
+    RTX_OPTION("rtx.atmosphere", float, cloudAnchorCutKm, 0.5f,
+               "Per-frame movement (km) of the resolved cloud anchor that counts as a camera cut, "
+               "forcing a one-frame reset of the screen-space cloud temporal history. "
+               "RtCamera::isCameraCut() cannot substitute for this: it compares the same view-matrix "
+               "translation that CloudAnchor::everMoved found permanently fixed on Fallout: New Vegas, "
+               "so it never fires there. A teleport, a cell transition, or toggling "
+               "useCameraWorldOverride can all move the anchor by more than a real walking/flying "
+               "player would in one frame; 0 disables the reset entirely.");
     RTX_OPTION_ARGS("rtx.atmosphere", float, aerialPerspectiveDepthRangeMeters, 32000.0f,
                "Far bound in meters of the aerial perspective volume's depth axis. The 32 slices are distributed "
                "exponentially from the global volumetrics handoff out to here, so each carries the same relative "
@@ -391,7 +445,30 @@ public:
                "Rotates the whole solar arc so the model's north lines up with the game world's north. Adjust until "
                "sunrise comes from the direction the game world treats as east.",
                args.minValue = -360.0f, args.maxValue = 360.0f);
-    // rtx.atmosphere.altitude retired 2026-07-17: fed AtmosphereArgs::viewAltitude which nothing read.
+    // rtx.atmosphere.altitude retired 2026-07-17: fed AtmosphereArgs::viewAltitude (the CB slot
+    // renamed cameraAltitudeKm below) which at the time nothing read. Camera-height calibration
+    // (fork — 2026-09-05, world-space cloud migration Stage 2; ported from archaeology commit
+    // 30d20a8f5). A game's vertical world coordinate is not necessarily a physical altitude — FNV's
+    // exterior worldspace, for one, has no reason to read as sea level at Y=0. These three convert
+    // the resolved CloudAnchor's raw Y-up height into the atmosphere's one shared vertical frame
+    // before placing the planet, the clouds, or the density field against it (see getEyeRadius in
+    // atmosphere_common.slangh and the calibration block in getAtmosphereArgs()).
+    RTX_OPTION("rtx.atmosphere", float, seaLevelWorldKm, 0.0f,
+               "World-space Y-up height in km that counts as atmosphere sea level. Subtracted from "
+               "the resolved cloud anchor's measured height before cloud and atmosphere placement. "
+               "Set this to the raw camera height the ONCE calibration log in updateFrame reports "
+               "for a location this game treats as ground level.");
+    RTX_OPTION_ARGS("rtx.atmosphere", float, altitudeScale, 1.0f,
+               "Multiplier from the anchor's height above seaLevelWorldKm to physical altitude. Use "
+               "this when a game's vertical world scale differs from rtx.sceneScale / "
+               "rtx.atmosphere.cloudScale.",
+               args.minValue = 0.0f);
+    // Retains the useful old Numos control: an intentional physical observer-height offset applied
+    // AFTER the game's raw coordinate has been calibrated by the two options above.
+    RTX_OPTION("rtx.atmosphere", float, viewAltitudeKm, 0.0f,
+               "Physical camera altitude offset in km, added after seaLevelWorldKm and altitudeScale "
+               "have calibrated the anchor's raw height. Raise it to move the observer toward the "
+               "cloud deck without moving the deck itself.");
     RTX_OPTION("rtx.atmosphere", float, airDensity, 1.0f, "Density of air molecules multiplier (1.0 = clear sky).");
     RTX_OPTION("rtx.atmosphere", float, aerosolDensity, 1.1f, "Density of aerosols/dust multiplier (1.0 = typical).");
     RTX_OPTION("rtx.atmosphere", float, ozoneDensity, 1.0f, "Density of ozone layer multiplier (1.0 = typical).");
@@ -1066,6 +1143,16 @@ public:
                "sun animates. Non-direction parameter changes always "
                "re-bake immediately.");
 
+    RTX_OPTION("rtx.atmosphere", float, skyViewAltitudeRebakeGranularityKm, 0.05f,
+               "Vertical granularity (km) of camera altitude motion that triggers a sky-view LUT "
+               "re-bake (fork — 2026-09-05, world-space cloud migration Stage 2). The sky-view bake "
+               "became altitude-dependent once getEyeRadius gained a real cameraAltitudeKm term, so "
+               "climbing or descending must re-bake it — but at full float precision, ANY vertical "
+               "motion at all would re-bake the whole transmittance/multiscatter/sky-view cascade "
+               "every frame, same class of cost as skyViewRebakeGranularityDeg above prevents for "
+               "sun motion. Default 0.05 km (50 m). 0 disables the re-bake, freezing the sky at "
+               "whatever altitude it was last baked for.");
+
     RTX_OPTION("rtx.atmosphere", bool, skyLutCacheKeySplitEnable, true,
                "Re-bake each atmosphere LUT only when its actual inputs "
                "change: star-field animation no longer re-bakes any LUT, and "
@@ -1244,7 +1331,14 @@ private:
   static constexpr uint32_t kCloudDetailNoise3DSize = 128;
 
   static constexpr uint32_t kCloudSecondaryLutWidth  = 256;
-  static constexpr uint32_t kCloudSecondaryLutHeight = 128;
+  // 128 -> 256 (fork — 2026-09-05, world-space cloud migration Stage 2). cloudDomeDirToUv /
+  // cloudDomeUvToDir (atmosphere_common.slangh) now map the FULL sphere instead of the upper
+  // hemisphere only, so the same 128 rows that used to cover elevation [0, 90] degrees would now
+  // be stretched across [-90, 90] — halving vertical resolution on every direction that used to be
+  // representable at all. Doubling the row count keeps above-horizon resolution unchanged and adds
+  // equivalent resolution below the horizon, where a camera above the deck now needs real texel
+  // density instead of the single clamped horizon row it used to read.
+  static constexpr uint32_t kCloudSecondaryLutHeight = 256;
 
   // Keep in lockstep with kPlacementMapSize in cloud_placement_map_baker.comp.slang.
   static constexpr uint32_t kCloudPlacementMapSize = 512;
@@ -1277,8 +1371,11 @@ private:
   uint32_t m_cloudRenderFrameIdx   { 0u };
   Vector3  m_cameraWorldPosYUpKm   { 0.0f, 0.0f, 0.0f };
 
-  // Stage 0 cloud-anchor calibration snapshot; see the CloudAnchor doc comment above. Filled once
-  // per frame in updateFrame, right after the toYUp lambda and before setCloudShadowCameraPosition.
+  // Cloud-anchor calibration snapshot; see the CloudAnchor doc comment above. Filled once per frame
+  // in updateFrame, right after the toYUp lambda and before setCloudShadowCameraPosition. Stage 0
+  // (2026-09-05) made it diagnostic-only; Stage 2 (2026-09-05) additionally resolves the source
+  // (view matrix vs explicit override) that setCloudShadowCameraPosition and getAtmosphereArgs()
+  // actually consume.
   CloudAnchor m_cloudAnchor;
   // Previous frame's Y-up camera forward, kept only to feed CloudAnchor::staticFrameCount's (ImGui
   // readout only) and cumulativeRotationRadians' "did the view rotate" tests. Not part of the
@@ -1292,6 +1389,11 @@ private:
   // more than the default-initialized state colliding with wherever the camera happens to start.
   Vector3 m_cloudAnchorFirstRawWorldUnits { 0.0f, 0.0f, 0.0f };
   bool    m_cloudAnchorHasFirstSample     { false };
+  // Set once per frame by updateFrame's anchor-resolve block (|deltaKm| > cloudAnchorCutKm), read
+  // by the const getAtmosphereArgs() to force a one-frame reset of the cloud temporal history (fork
+  // — 2026-09-05, world-space cloud migration Stage 2). See cloudAnchorCutKm's doc comment for why
+  // RtCamera::isCameraCut() cannot substitute for this on the engine this migration targets.
+  bool    m_cloudAnchorCutThisFrame        { false };
 
   // Time-of-day clock. Integrated once per frame by advanceTimeCycle(); read by the const
   // getAtmosphereArgs(). m_lastAuthoredTimeOfDayHours tracks the option so an edit to it (UI scrub,

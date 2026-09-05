@@ -116,8 +116,9 @@
 // the same texture.
 #define BINDING_ATMOSPHERE_SKY_VIEW_SAMPLER 214
 
-// Secondary-ray cloud LUT (fork — 2026-06-10, perf). 256x128 RGBA16F dome
-// keyed (azimuth, elevation = (pi/2)*v^2) holding the full Nubis cloud march
+// Secondary-ray cloud LUT (fork — 2026-06-10, perf; full-sphere fork — 2026-09-05, world-space
+// cloud migration Stage 2). 256x256 RGBA16F dome (was 256x128, upper hemisphere only) keyed
+// (azimuth, signed elevation = l*l*sign(l) * (pi/2)) holding the full Nubis cloud march
 // per direction: rgb = premultiplied cloud radiance, a = view transmittance
 // (same convention as BINDING_ATMOSPHERE_CLOUD_RENDER_RT). Baked once per
 // frame by cloud_secondary_lut.comp.slang; consumed by evalSkyRadiance's

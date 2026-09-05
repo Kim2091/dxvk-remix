@@ -48,9 +48,20 @@ vec3 computeSkyView(vec2 uv, AtmosphereArgs args,
                     Texture2D<float4> transmittanceLut,
                     SamplerState lutSampler,
                     Texture2D<float4> multiscatteringLut) {
-  // Assume camera at ground level
-  float cameraAltitude = 0.0f;
-  vec3 cameraPos = vec3(0.0f, cameraAltitude, 0.0f);
+  // The frame's origin IS the eye (fork — 2026-09-05, world-space cloud migration Stage 2). This
+  // used to read "Assume camera at ground level", with a `cameraAltitude` local hard-coded to 0 —
+  // that is why the sky looked identical from a valley floor and from orbit, and why below-horizon
+  // rays started underground on their very first march step. The numeric value is UNCHANGED
+  // (still the origin) — what changed is what the origin means: evalAtmosphereRadiance's
+  // planetCenter is now getPlanetCenter(args), which places the planet at
+  // args.planetRadius + args.cameraAltitudeKm below whatever this origin is. So leaving this at
+  // (0,0,0) and letting getPlanetCenter do the work is what makes the bake altitude-aware — no
+  // separate altitude offset needs adding here, and none should be, or the eye would be offset
+  // twice (once here, once inside getPlanetCenter). See getEyeRadius's doc comment
+  // (atmosphere_common.slangh) and evalAtmosphereRadiance's reconciliation comment for the full
+  // reasoning, including why the archaeology reference this was ported from claimed this same
+  // change without actually making it.
+  vec3 cameraPos = vec3(0.0f, 0.0f, 0.0f);
 
   // Non-linear elevation encoding (matches reference bufferB.glsl):
   // l*l*sign(l) concentrates texels near the horizon where color gradients

@@ -877,21 +877,20 @@ vec3 evalSkyRadiance(
     }
     cloudLayer = vec4(cloudRT.rgb, 1.0f - cloudRT.a);
   } else if (args.cloudSecondaryLutEnable != 0u && !isPrimaryRay) {
-    // Secondary-ray cloud LUT (fork — 2026-06-10, perf). Indirect / PSR /
-    // reflection sky-miss rays read the per-frame 256x128 dome LUT baked by
-    // cloud_secondary_lut.comp.slang instead of a full per-ray cloud march —
-    // that hidden march cost (back when these rays ran the now-removed
-    // analytical view-march) rivaled the visible cloud pass. The LUT replaced
-    // it. The LUT stores the same (premultiplied rgb, TRANSMITTANCE)
-    // convention as the cloud RT above, so the same alpha reconciliation
-    // applies. Parallax from the ray origin being a surface point rather
-    // than the camera is negligible (scene-scale offsets vs km-scale cloud
-    // distances). Deliberate look change vs legacy: secondary rays now see
-    // the same Nubis Cubed clouds the primary rays see, not the legacy
-    // Wrenninge analytical approximation. Below-horizon directions clamp to
-    // the horizon row via cloudDomeDirToUv's y-clamp — downward sky-miss
-    // rays are horizon-adjacent in practice. Azimuth seam wraps via the
-    // sampler's REPEAT-U address mode.
+    // Secondary-ray cloud LUT (fork — 2026-06-10, perf; full-sphere fork — 2026-09-05,
+    // world-space cloud migration Stage 2). Indirect / PSR / reflection sky-miss rays read the
+    // per-frame 256x256 dome LUT baked by cloud_secondary_lut.comp.slang instead of a full per-ray
+    // cloud march — that hidden march cost (back when these rays ran the now-removed analytical
+    // view-march) rivaled the visible cloud pass. The LUT replaced it. The LUT stores the same
+    // (premultiplied rgb, TRANSMITTANCE) convention as the cloud RT above, so the same alpha
+    // reconciliation applies. Parallax from the ray origin being a surface point rather than the
+    // camera is negligible (scene-scale offsets vs km-scale cloud distances). Deliberate look
+    // change vs legacy: secondary rays now see the same Nubis Cubed clouds the primary rays see,
+    // not the legacy Wrenninge analytical approximation. Below-horizon directions used to clamp to
+    // the horizon row via cloudDomeDirToUv's old y-clamp — a camera above the deck saw its own
+    // reflection as a horizon smear rather than the deck actually below it; cloudDomeDirToUv now
+    // maps the full sphere, so downward directions read real below-horizon LUT content instead.
+    // Azimuth seam wraps via the sampler's REPEAT-U address mode.
     vec2 domeUv = cloudDomeDirToUv(viewDirYUp);
     vec4 lut = AtmosphereCloudSecondaryLut.SampleLevel(AtmosphereSkyViewSampler, domeUv, 0.0f);
     cloudLayer = vec4(lut.rgb, 1.0f - lut.a);
@@ -910,8 +909,8 @@ vec3 evalSkyRadiance(
   // so a colored deck (orange sunset cumulus, grey overcast) never tints the
   // clear sky around it — leaving vivid blue gaps between warm clouds. Here the
   // sky picks up a fraction of the LOCAL cloud radiance as colored inscatter.
-  // Source is the secondary cloud dome LUT: it is low-res (256x128) and so
-  // inherently smooth, giving a neighborhood-averaged cloud color per view
+  // Source is the secondary cloud dome LUT: it is low-res (256x256, was 256x128 before Stage 2's
+  // full-sphere mapping) and so inherently smooth, giving a neighborhood-averaged cloud color per view
   // direction — bright/colored next to a cloud, ~0 in open sky far from any —
   // exactly the spatial falloff a bleed wants, with no extra blur pass. The
   // bleed is added to `radiance` BEFORE the cloud composite below, so the
@@ -922,9 +921,11 @@ vec3 evalSkyRadiance(
     vec2 bleedUv = cloudDomeDirToUv(viewDirYUp);
     // Sample a COARSE mip of the secondary cloud dome LUT (fork — 2026-06-19):
     // a wide neighborhood blur in one tap. Sampling mip 0 here showed the LUT's
-    // coarse 256x128 texels as faceted cloud edges, and gave ~0 in true gaps
+    // coarse texels as faceted cloud edges, and gave ~0 in true gaps
     // (no spread). The blurred mip both removes the facets and spreads cloud
-    // color smoothly into the open sky next to clouds. Mip 4 = 16x8 (~16x blur).
+    // color smoothly into the open sky next to clouds. Mip 4 = 16x16 (~16x blur;
+    // was 16x8 before Stage 2's full-sphere mapping doubled the LUT height —
+    // fork — 2026-09-05, world-space cloud migration Stage 2).
     // Requires the LUT's mip chain (RtxAtmosphere::dispatchCloudSecondaryLut)
     // and a sampler with mipmapLodMax > 0 (the shared sky-view sampler sets it).
     const float kBleedMip = 4.0f;
@@ -935,9 +936,10 @@ vec3 evalSkyRadiance(
     // pixels read very different LUT columns. Sampled at a coarse mip this is an
     // azimuthal pinwheel/funnel that the bleed strength amplifies (the "weird
     // artifact at the top of the sky" when Sky Cloud Bleed is turned up). The
-    // secondary LUT only has 6 mips (max 8x4), so it can't be blurred
-    // azimuth-flat at the pole; instead fade the contribution over the top of
-    // the dome, where the slab is thinnest (≈4 km edge-on, the least cloud color
+    // secondary LUT only has 6 mips (max 8x8, was 8x4 before Stage 2's height
+    // doubling), so it can't be blurred azimuth-flat at the pole; instead fade
+    // the contribution over the top of the dome, where the slab is thinnest
+    // (≈4 km edge-on, the least cloud color
     // to bleed) and the singularity lives. viewDirYUp.y = sin(elevation): the
     // band 0.95..0.9995 is ≈72°..88° elevation.
     const float zenithFade = 1.0f - smoothstep(0.95f, 0.9995f, viewDirYUp.y);

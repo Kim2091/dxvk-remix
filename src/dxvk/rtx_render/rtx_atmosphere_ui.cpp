@@ -994,16 +994,18 @@ void RtxAtmosphere::showImguiSettings(WeatherBlender* blender) {
       // they stay discoverable but can't be dragged when inert.
       const bool layer2On  = RtxAtmosphere::cloudLayer2Enable();
 
-      // ---- World-space cloud migration, Stage 0: read-only diagnostics -----
-      // (fork — 2026-09-05, world-space cloud migration Stage 0)
+      // ---- World-space cloud migration, Stage 0/2: anchor and altitude datum -----
+      // (fork — 2026-09-05, world-space cloud migration Stage 0/2)
       // Everything in this subtree reads RtxAtmosphere::CloudAnchor (see its doc comment in
-      // rtx_atmosphere.h) plus the one calibration knob it depends on, cloudScale. Nothing here
-      // writes to AtmosphereArgs or touches a shader, so it cannot change a single rendered pixel —
-      // it exists so a human can watch, on a live game, whether a camera-view-matrix-derived world
-      // position is even usable as a cloud anchor before a later stage builds real world-space
-      // clouds on top of it. Placed first in the Clouds tree, ahead of Basic, because this is
-      // diagnostic instrumentation the user will come here looking for deliberately, not a
-      // look-tuning knob to stumble on.
+      // rtx_atmosphere.h) plus the RTX_OPTIONs that resolve and calibrate it: cloudScale (the
+      // anchor's unit conversion), useCameraWorldOverride / cameraWorldOverride (the explicit
+      // anchor source Stage 2 adds), and seaLevelWorldKm / altitudeScale / viewAltitudeKm (the
+      // altitude datum). Stage 0 was read-only diagnostics only; Stage 2 makes the override and
+      // datum controls here EDITABLE — this subtree now writes AtmosphereArgs, through
+      // updateFrame's anchor-resolve block and getAtmosphereArgs()'s calibration block. Placed
+      // first in the Clouds tree, ahead of Basic, because this is the control surface for whether
+      // world-anchored clouds work AT ALL on a camera-relative engine, not a look-tuning knob to
+      // stumble on.
       // Default-open (fork — 2026-09-05, Stage 0 follow-up): this subtree is
       // the readout that answers whether a camera-view-matrix anchor is usable
       // at all on the running engine, so it should be visible the moment the
@@ -1023,6 +1025,29 @@ void RtxAtmosphere::showImguiSettings(WeatherBlender* blender) {
 
         ImGui::Separator();
 
+        // Anchor source override (fork — 2026-09-05, world-space cloud migration Stage 2). Stage 0
+        // measured, in-game on Fallout: New Vegas, that RtCamera::getPosition() never moves — an
+        // anchor source that is not the view matrix is therefore not optional on that target. These
+        // two controls are that source: the game integration (e.g. the FalloutNV Remix wrapper)
+        // pushes cameraWorldOverride every frame and flips useCameraWorldOverride on once, after
+        // which the readouts below reflect it instead of the camera view matrix.
+        RemixGui::Checkbox("Use Camera World Override", &RtxAtmosphere::useCameraWorldOverrideObject());
+        RemixGui::SetTooltipToLastWidgetOnHover(
+            "Anchor world-space clouds to Camera World Override below instead of the Remix camera "
+            "position. Required on camera-relative engines where RtCamera::getPosition() reads as "
+            "(0,0,0) — without it the cloud volume welds to the view and produces no parallax while "
+            "walking. The game integration is expected to push the real camera world position every "
+            "frame regardless of whether this is currently checked.");
+        RemixGui::DragFloat3("Camera World Override", &RtxAtmosphere::cameraWorldOverrideObject(),
+                             1.0f, -1.0e7f, 1.0e7f, "%.1f", sliderFlags);
+        RemixGui::SetTooltipToLastWidgetOnHover(
+            "Camera world position, in the SAME raw game units / convention RtCamera::getPosition() "
+            "would have returned this frame. Normally pushed by the game integration every frame "
+            "(e.g. the FalloutNV Remix wrapper); editable here for manual testing. Only used as the "
+            "anchor while Use Camera World Override above is checked.");
+
+        ImGui::Separator();
+
         // Read-only snapshot filled once per frame by RtxAtmosphere::updateFrame. Safe to read here
         // even before the first frame has run: CloudAnchor default-constructs to all-zero, and every
         // derived value below (length(), the /2pi turn count, cloudWorldUnitsPerKm()'s own clamp)
@@ -1031,22 +1056,25 @@ void RtxAtmosphere::showImguiSettings(WeatherBlender* blender) {
 
         const char* anchorSourceName = "Unknown";
         switch (anchor.source) {
-          case CloudAnchor::Source::CameraViewMatrix: anchorSourceName = "Camera View Matrix"; break;
+          case CloudAnchor::Source::CameraViewMatrix:    anchorSourceName = "Camera View Matrix"; break;
+          case CloudAnchor::Source::CameraWorldOverride: anchorSourceName = "Camera World Override"; break;
           default: break;
         }
         ImGui::Text("Anchor Source                %s", anchorSourceName);
         RemixGui::SetTooltipToLastWidgetOnHover(
-            "What produced the readouts below. Stage 0 implements only the camera view matrix; "
-            "later stages may add an explicit game-pushed override or a scene-heuristic estimator "
-            "for engines where the view matrix carries no translation at all — see the warning at "
-            "the bottom of this panel.");
+            "Which source actually won this frame — the camera view matrix, or Camera World "
+            "Override above when Use Camera World Override is checked. A runtime/heuristic "
+            "estimator for engines with neither a usable view matrix nor an explicit push is "
+            "intentionally NOT implemented; see the warning at the bottom of this panel for what to "
+            "do instead if you land there.");
 
         ImGui::Text("Raw Position (no freecam)   %10.2f, %10.2f, %10.2f",
                     anchor.rawWorldUnits.x, anchor.rawWorldUnits.y, anchor.rawWorldUnits.z);
         RemixGui::SetTooltipToLastWidgetOnHover(
             "camera.getPosition(freecam=false), in raw game units, unconverted (still whatever "
-            "handedness/up-axis the engine's view-to-world matrix uses). This is the position "
-            "actually pushed to the cloud shadow lookup today.");
+            "handedness/up-axis the engine's view-to-world matrix uses). Diagnostic ONLY — always "
+            "the raw camera view matrix reading, even while Anchor Source above reads Camera World "
+            "Override; see Resolved Position below for what is actually in use this frame.");
 
         ImGui::Text("Raw Position (freecam)      %10.2f, %10.2f, %10.2f",
                     anchor.rawWorldUnitsFreecam.x, anchor.rawWorldUnitsFreecam.y, anchor.rawWorldUnitsFreecam.z);
@@ -1058,12 +1086,21 @@ void RtxAtmosphere::showImguiSettings(WeatherBlender* blender) {
             "fix — recorded here, not fixed, so the fix has a measured before/after instead of a "
             "guess.");
 
+        ImGui::Text("Resolved Position            %10.2f, %10.2f, %10.2f",
+                    anchor.resolvedRawWorldUnits.x, anchor.resolvedRawWorldUnits.y, anchor.resolvedRawWorldUnits.z);
+        RemixGui::SetTooltipToLastWidgetOnHover(
+            "The raw units ACTUALLY behind Derived Position below this frame (fork — 2026-09-05, "
+            "world-space cloud migration Stage 2): equal to Raw Position (no freecam) when Anchor "
+            "Source is Camera View Matrix, or to Camera World Override verbatim when it is Camera "
+            "World Override. This is what setCloudShadowCameraPosition actually received.");
+
         ImGui::Text("Derived Position (Y-up, km) %10.3f, %10.3f, %10.3f",
                     anchor.posYUpKm.x, anchor.posYUpKm.y, anchor.posYUpKm.z);
         RemixGui::SetTooltipToLastWidgetOnHover(
-            "Raw Position (no freecam), converted into the atmosphere's Y-up frame and into "
+            "Resolved Position above, converted into the atmosphere's Y-up frame and into "
             "cloud-space kilometres via Cloud Scene Unit Scale above (cloudWorldUnitsPerKm) — "
-            "deliberately NOT the aerial-perspective or legacy Scene Unit Scale conversion.");
+            "deliberately NOT the aerial-perspective or legacy Scene Unit Scale conversion. This is "
+            "what actually reaches AtmosphereArgs::cameraWorldPosYUpKm today.");
 
         const float deltaKmMagnitude = length(anchor.deltaKm);
         ImGui::Text("|Delta| This Frame (km)     %10.5f", deltaKmMagnitude);
@@ -1108,9 +1145,13 @@ void RtxAtmosphere::showImguiSettings(WeatherBlender* blender) {
         // Mirrors rtx_atmosphere.cpp's kWarnRotationRadians (search that name there): four full
         // turns. Keep this threshold, and the wording below, in lockstep with that Logger::warn if
         // either changes — this panel is meant to be the same measurement made visible, not a
-        // second opinion on top of it.
+        // second opinion on top of it. Gated on !useCameraWorldOverride() (fork — 2026-09-05,
+        // world-space cloud migration Stage 2), mirroring the CPU-side gate added alongside it:
+        // once the override is on and actually resolving the anchor, this would otherwise keep
+        // warning about a problem that already has its fix checked above.
         constexpr float kWarnRotationRadians = 4.0f * 2.0f * dxvk::kPi;
-        if (!anchor.everMoved && anchor.cumulativeRotationRadians > kWarnRotationRadians) {
+        if (!RtxAtmosphere::useCameraWorldOverride()
+            && !anchor.everMoved && anchor.cumulativeRotationRadians > kWarnRotationRadians) {
           // Same amber used for the upscaler panel's "fault" status color (rtx_fork_upscaler_ui.cpp).
           constexpr ImVec4 kWarnColor { 250 / 255.f, 176 / 255.f, 50 / 255.f, 1.0f };
           ImGui::PushStyleColor(ImGuiCol_Text, kWarnColor);
@@ -1118,8 +1159,9 @@ void RtxAtmosphere::showImguiSettings(WeatherBlender* blender) {
               "The position has never changed even once across %.1f turns of view rotation this "
               "session. A real play session ordinarily moves the tracked position at least once "
               "well before that much looking-around accumulates; never seeing that suggests this "
-              "engine keeps camera translation out of the D3D view matrix, so a world-space anchor "
-              "will need an explicit source rather than the camera view matrix.",
+              "engine keeps camera translation out of the D3D view matrix. Enable Use Camera World "
+              "Override above and push the game's real camera position through Camera World "
+              "Override instead of relying on the camera view matrix.",
               cumulativeTurns);
           ImGui::PopStyleColor();
           RemixGui::SetTooltipToLastWidgetOnHover(
@@ -1128,6 +1170,57 @@ void RtxAtmosphere::showImguiSettings(WeatherBlender* blender) {
               "(RtCamera::getPosition(), rtx_camera.cpp:57-59) before concluding a "
               "camera-view-matrix anchor is unusable on this engine.");
         }
+
+        ImGui::Separator();
+
+        // Altitude datum (fork — 2026-09-05, world-space cloud migration Stage 2). Calibrates the
+        // resolved anchor's raw Y-up height (Derived Position's y component above) into the
+        // physical altitude every other atmosphere system shares — see getEyeRadius
+        // (atmosphere_common.slangh) and the calibration block in getAtmosphereArgs().
+        RemixGui::DragFloat("Sea Level (world km)", &RtxAtmosphere::seaLevelWorldKmObject(),
+                            0.01f, -1000.0f, 1000.0f, "%.3f", sliderFlags);
+        RemixGui::SetTooltipToLastWidgetOnHover(
+            "World-space Y-up height in km that counts as atmosphere sea level. Subtracted from "
+            "Derived Position's y component before cloud and atmosphere placement. Set this to the "
+            "raw camera height the ONCE calibration log in updateFrame reports for a location this "
+            "game treats as ground level.");
+        RemixGui::DragFloat("Altitude Scale", &RtxAtmosphere::altitudeScaleObject(),
+                            0.01f, 0.0f, 100.0f, "%.3f", sliderFlags);
+        RemixGui::SetTooltipToLastWidgetOnHover(
+            "Multiplier from the anchor's height above Sea Level to physical altitude. Use this "
+            "when a game's vertical world scale differs from rtx.sceneScale / Cloud Scene Unit "
+            "Scale.");
+        RemixGui::DragFloat("View Altitude (km)", &RtxAtmosphere::viewAltitudeKmObject(),
+                            0.1f, -50.0f, 50.0f, "%.2f", sliderFlags);
+        RemixGui::SetTooltipToLastWidgetOnHover(
+            "Physical camera altitude offset in km, added after Sea Level and Altitude Scale have "
+            "calibrated the anchor's raw height. Raise it to move the observer toward the cloud "
+            "deck without moving the deck itself.");
+
+        // Recomputes getAtmosphereArgs()'s calibration formula directly from the datum options and
+        // Derived Position above, rather than calling getAtmosphereArgs() itself just for a
+        // display value — same pattern Resolved Scale above uses for cloudWorldUnitsPerKm().
+        const float derivedCameraAltitudeKm =
+            (anchor.posYUpKm.y - RtxAtmosphere::seaLevelWorldKm()) * RtxAtmosphere::altitudeScale()
+            + RtxAtmosphere::viewAltitudeKm();
+        ImGui::Text("Camera Altitude (km)        %10.3f", derivedCameraAltitudeKm);
+        RemixGui::SetTooltipToLastWidgetOnHover(
+            "(Derived Position.y - Sea Level) * Altitude Scale + View Altitude — the calibrated "
+            "value that reaches AtmosphereArgs::cameraAltitudeKm this frame. Feeds getEyeRadius "
+            "(atmosphere_common.slangh): the eye sits at planetRadius + this value.");
+
+        ImGui::Separator();
+
+        RemixGui::DragFloat("Anchor Cut Threshold (km)", &RtxAtmosphere::cloudAnchorCutKmObject(),
+                            0.05f, 0.0f, 50.0f, "%.2f", sliderFlags);
+        RemixGui::SetTooltipToLastWidgetOnHover(
+            "Per-frame movement (km) of |Delta| This Frame above that counts as a camera cut, "
+            "forcing a one-frame reset of the screen-space cloud temporal history. "
+            "RtCamera::isCameraCut() cannot substitute for this — it compares the same view-matrix "
+            "translation Ever Moved above found permanently fixed on Fallout: New Vegas. A "
+            "teleport, a cell transition, or toggling Use Camera World Override can all move the "
+            "anchor by more than a real walking/flying player would in one frame; 0 disables the "
+            "reset entirely.");
 
         ImGui::TreePop();
       }

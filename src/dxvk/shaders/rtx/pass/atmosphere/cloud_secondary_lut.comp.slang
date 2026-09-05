@@ -20,12 +20,14 @@
 * DEALINGS IN THE SOFTWARE.
 */
 
-// Secondary-Ray Cloud LUT Compute Pass (fork — 2026-06-10, perf).
+// Secondary-Ray Cloud LUT Compute Pass (fork — 2026-06-10, perf; full-sphere fork — 2026-09-05,
+// world-space cloud migration Stage 2).
 //
-// Bakes the full cloud view march into a small 256x128 RGBA16F dome LUT
-// keyed by (azimuth, elevation = (pi/2)*v^2 — see cloudDomeUvToDir in
-// atmosphere_common.slangh). rgb = premultiplied cloud radiance,
-// a = view transmittance — the same convention as the screen-space
+// Bakes the full cloud view march into a small 256x256 RGBA16F dome LUT keyed by (azimuth,
+// signed elevation = l*l*sign(l) * (pi/2), l = uv.y*2-1 — see cloudDomeUvToDir in
+// atmosphere_common.slangh; was 256x128 over the upper hemisphere only, elevation = (pi/2)*v^2,
+// before Stage 2 made the mapping cover the full sphere and doubled the row count to match). rgb =
+// premultiplied cloud radiance, a = view transmittance — the same convention as the screen-space
 // AtmosphereCloudRender RT.
 //
 // Why: indirect / PSR / reflection rays that reach sky-miss would otherwise
