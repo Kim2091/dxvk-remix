@@ -232,9 +232,45 @@ float intersectSphereNearest(vec3 origin, vec3 direction, vec3 center, float rad
   return t0 < 0.0f ? t1 : t0;
 }
 
-// Planet centre for the atmosphere's internal Y-up frame, whose origin sits on the ground.
+// Distance from the camera-frame origin (the eye) to the planet centre - the eye's radius.
+// One planet: clouds, atmosphere, ground and horizon all measure against this (fork —
+// 2026-09-05, world-space cloud migration Stage 1; ported from archaeology commit 30d20a8f5).
+//
+// Stage 1 deliberately returns args.planetRadius ALONE. The reference this was ported from
+// returns `args.planetRadius + args.cameraAltitudeKm`, but AtmosphereArgs on this branch has no
+// cameraAltitudeKm field yet — adding one is a CB-layout change and Stage 2's job, not this one's
+// (see the CRITICAL note on atmosphere_args.h's cloudCurvature field for why layout changes are
+// kept out of this stage). Written so Stage 2 only has to add the term back:
+//   return args.planetRadius + args.cameraAltitudeKm;
+float getEyeRadius(AtmosphereArgs args) {
+  return args.planetRadius;
+}
+
+// Planet centre for the atmosphere's internal Y-up frame, whose origin sits AT THE CAMERA.
+//
+// The frame is camera-relative and re-centred every frame: the planet's centre is always directly
+// below the eye. That is deliberate, not an approximation of a globe. The game world is a flat
+// plane, so a sphere pinned under the WORLD ORIGIN would sink that plane by d^2/2R as the player
+// walked away from it - 52 m at 10 km on a 6371 km planet, and proportionally worse on a smaller
+// one (this is precisely the bug this stage fixes — see getPlanetCenterWorldKm below). Re-centring
+// under the camera makes curvature say the thing it should: distant things fall away from WHERE
+// YOU ARE, invariantly under travel.
+//
+// Until Stage 2 gives getEyeRadius a real cameraAltitudeKm term, the eye sits exactly on the
+// planet's surface (radius == planetRadius), same as before this stage — this function's OUTPUT is
+// unchanged today. What changes is that it is now the single place callers ask, instead of each
+// re-deriving vec3(0, -radius, 0) with whichever radius they happened to be holding (see
+// cloudPlanetRadius's retirement below for the two-sphere bug that caused).
 vec3 getPlanetCenter(AtmosphereArgs args) {
-  return vec3(0.0f, -args.planetRadius, 0.0f);
+  return vec3(0.0f, -getEyeRadius(args), 0.0f);
+}
+
+// The same centre expressed in the WORLD-anchored Y-up km frame that the cloud density fields use
+// (args.cameraWorldPosYUpKm + rayOffset). Geometry and density must be measured against the same
+// centre; see computeCloudHeightFractionC for what went wrong when they were not (fork —
+// 2026-09-05, world-space cloud migration Stage 1; ported from archaeology commit 30d20a8f5).
+vec3 getPlanetCenterWorldKm(AtmosphereArgs args) {
+  return args.cameraWorldPosYUpKm - vec3(0.0f, getEyeRadius(args), 0.0f);
 }
 
 // Shadowing of the atmosphere by the planet itself — the Vis term of the paper's Equation 4.
@@ -358,6 +394,45 @@ vec3 evalSunShadowing(vec3 samplePos, vec3 sunDir, Texture2D transmittanceLut,
     transmittanceLut, lutSampler, max(radius - args.planetRadius, 0.0f), sunZenithCosAngle, args);
 }
 
+// evalSunShadowing for a march sample that may have fallen below the planet's surface, shading it
+// as the ground point directly above it instead of as buried rock (fork — 2026-09-05, world-space
+// cloud migration Stage 1; ported verbatim from archaeology commit 30d20a8f5).
+//
+// The atmosphere frame puts its origin ON the surface, directly under the camera (getEyeRadius is
+// still exactly planetRadius in this stage — see its comment), so a ray aimed below the horizon can
+// be underground from its very first step: the near-root clamp in evalAtmosphereRadiance that would
+// stop it at the surface has near-zero margin to fire on on a ray whose origin sits exactly on the
+// sphere. Those samples are not really inside the planet: the game's world continues below the
+// camera, and the lower half of the sky stands in for distant terrain the atmosphere model knows
+// nothing about. Treating them as the ground-level air they stand in for keeps that half a
+// continuation of the horizon haze, with the sun's phase glow intact.
+//
+// Without the clamp evalPlanetShadow returns zero for every one of them (a ray cast outward from
+// inside the shrunk test sphere immediately re-hits it, reading as "blocked"), so single scattering
+// vanishes and only the multiscatter fill survives. That fill carries no phase term and, at ground
+// level, no directional variation either — every below-horizon direction integrates the same
+// nearly-constant value, which is what turns the lower half of the daytime sky into one flat dark
+// disc. This is exactly the failure mode the cloud_render.comp.slang horizon knife (viewDirYUp.y <=
+// 0.001f early-out) was hiding by never letting the view march look below the horizon in the first
+// place; removing that knife this stage is what makes this function load-bearing rather than dead
+// code. Nights look unaffected only because the deep-night fade in evalSkyRadiance scales the whole
+// atmosphere term to zero and the stars, airglow and moons that remain are composited on top.
+//
+// A no-op for any sample at or above the surface, so above-horizon rays are untouched — including
+// the planet shadow rising into the atmosphere at sunset, which this must not defeat.
+vec3 evalSunShadowingClampedToSurface(vec3 samplePos, vec3 sunDir, Texture2D transmittanceLut,
+                                      SamplerState lutSampler, AtmosphereArgs args) {
+  const vec3 planetCenter = getPlanetCenter(args);
+  const vec3 toSample = samplePos - planetCenter;
+  const float radius = length(toSample);
+
+  const vec3 clampedPos = (radius < args.planetRadius)
+    ? planetCenter + toSample * (args.planetRadius / max(radius, kAtmosphereEpsilon))
+    : samplePos;
+
+  return evalSunShadowing(clampedPos, sunDir, transmittanceLut, lutSampler, args);
+}
+
 // Distributes N march samples along a span with a power curve so steps start short near the ray
 // origin, where the air is densest, and lengthen with distance.
 //
@@ -413,6 +488,20 @@ vec3 evalAtmosphereRadiance(
   int numSamples = 32
 ) {
   // Intersect ray with atmosphere
+  //
+  // Deliberately NOT getPlanetCenter(args) (fork — 2026-09-05, world-space cloud migration Stage 1).
+  // The only caller (sky_view_lut.comp.slang's computeSkyView) bakes this from a hardcoded
+  // `cameraPos = vec3(0, 0, 0)`, i.e. "assume camera at ground level" — a simplification the
+  // reference this was ported from (archaeology commit 30d20a8f5) left in place too, and its own
+  // author's commit message names "no camera position" as one of that WIP's unresolved failures.
+  // getPlanetCenter(args) pulls args.cameraAltitudeKm straight off the CB (once Stage 2 adds it)
+  // regardless of what rayOrigin was actually passed in here, which would silently put the planet
+  // centre at the REAL camera altitude under a ray that is pretending to originate at altitude 0 —
+  // reintroducing a two-frames-disagreeing-about-the-eye bug of exactly the shape this stage exists
+  // to remove. Resolving that mismatch (by either plumbing the real altitude into this bake or
+  // teaching this function to ask for it explicitly) is Sky-view LUT altitude key work — Stage 2's,
+  // not this one's. Today getEyeRadius(args) == args.planetRadius exactly (no altitude term yet), so
+  // this hardcoded formula and getPlanetCenter(args) agree bit-for-bit; only future stages diverge.
   vec3 planetCenter = vec3(0.0f, -args.planetRadius, 0.0f);
   float t0, t1;
   
@@ -530,7 +619,11 @@ vec3 evalAtmosphereRadiance(
     // Earth's shadow rise into the atmosphere at sunset.
     vec3 up = normalize(samplePos - planetCenter);
     float sunZenithCosAngle = dot(up, normalize(sunDir));
-    vec3 sunTransmittance = evalSunShadowing(samplePos, normalize(sunDir), transmittanceLut, transmittanceLutSampler, args);
+    // evalSunShadowingClampedToSurface, not the bare evalSunShadowing (fork — 2026-09-05,
+    // world-space cloud migration Stage 1). Below-horizon samples along this march can fall under
+    // the planet's surface (see that function's doc comment for why); without the clamp they read
+    // as shadowed rock and single scattering vanishes across the whole lower hemisphere.
+    vec3 sunTransmittance = evalSunShadowingClampedToSurface(samplePos, normalize(sunDir), transmittanceLut, transmittanceLutSampler, args);
 
     // Multiscattering: blended between analytical (preset-faithful, artistic
     // control surface) and LUT-based hemisphere integration (physical, Hillaire
@@ -596,7 +689,48 @@ vec3 evalAtmosphereRadiance(
     L += contribution;
     transmittance *= sampleTransmittance;
   }
-  
+
+  // Ground radiance for rays that terminate on the planet (fork — 2026-09-05, world-space cloud
+  // migration Stage 1; ported verbatim from archaeology commit 30d20a8f5). Hillaire EGSR 2020's
+  // RenderSkyRayMarching does exactly this when its tGround is positive: shade the hit point as a
+  // Lambertian surface lit by the attenuated sun, and carry it back to the eye through the
+  // transmittance the march just accumulated.
+  //
+  //   L += T(eye -> ground) * albedo/pi * sunIlluminance * T(ground -> sun) * NdotL
+  //
+  // kGroundAlbedo is deliberately the SAME constant the multiscattering LUT bakes its ground bounce
+  // with (multiscattering_lut.comp.slang) - the two model the same surface, and letting them
+  // disagree would make the sky brighter than the ground it is supposedly bouncing off.
+  //
+  // Note what is NOT here: a skylight term. In shadow, or with the sun down, this ground goes to
+  // black and only the in-scattered haze in front of it remains, which is what distant unlit terrain
+  // genuinely looks like. The haze is doing the visible work at horizon distances anyway, so the
+  // lower hemisphere reads as terrain receding into air rather than as a painted band.
+  //
+  // hitsPlanet / tPlanet0 rarely fire in THIS stage: getEyeRadius(args) is still exactly
+  // args.planetRadius (see its comment), so the ray origin sits exactly on the ground sphere and the
+  // near-root clamp above has essentially zero margin to land on the positive side of zero. This
+  // term is ported now anyway per the Stage 1 plan — the load-bearing fix for the "flat dark disc"
+  // this stage must not introduce is evalSunShadowingClampedToSurface above; this ground term is the
+  // second half of the same fix and starts pulling real weight once Stage 2 gives getEyeRadius a
+  // nonzero cameraAltitudeKm and tPlanet0 has room to land above zero.
+  if (hitsPlanet && tPlanet0 > 0.0f) {
+    const vec3 groundPos    = rayOrigin + rayDir * tPlanet0;
+    const vec3 groundNormal = normalize(groundPos - planetCenter);
+    const vec3 sunDirN      = normalize(sunDir);
+    const float NdotL       = max(dot(groundNormal, sunDirN), 0.0f);
+    if (NdotL > 0.0f) {
+      const vec3 sunTransmittanceToGround =
+        evalSunShadowing(groundPos, sunDirN, transmittanceLut, transmittanceLutSampler, args);
+      const vec3 groundRadiance = (kGroundAlbedo / kPi) * args.sunIlluminance
+                                * sunTransmittanceToGround * NdotL;
+      const vec3 groundContribution = transmittance * groundRadiance;
+      if (!any(isnan(groundContribution)) && !any(isinf(groundContribution))) {
+        L += groundContribution;
+      }
+    }
+  }
+
   // Final sanitization: replace any NaN/Inf with zero
   L = max(L, vec3(0.0f));
   if (any(isnan(L)) || any(isinf(L))) {
@@ -635,41 +769,51 @@ vec3 evalAtmosphereRadiance(
 // the cloud_render compute pass and the secondary dome LUT bake (the per-ray
 // analytical sky-pass render that once also used them was removed 2026-06-19).
 
-// Effective planet radius for the cloud sphere. cloudCurvature=0 reproduces
-// the real planet radius (very subtle dome at Earth scale). Higher values
-// shrink the effective radius exponentially so clouds visibly curve down
-// toward the horizon. Atmospheric scattering math still uses the real
-// planet radius — only cloud sphere intersections are affected.
-float cloudPlanetRadius(AtmosphereArgs args) {
-  const float kMinRadius = 100.0f;  // km, floor at maximum curvature
-  return max(kMinRadius, args.planetRadius * exp(-args.cloudCurvature * 5.0f));
-}
-
-// Compute height fraction within the cloud slab from a world-space sample
-// position. hf=0 at slab base (cloudAltitude); hf=1 at slab top
-// (cloudAltitude + cloudThickness). Saturates outside the slab. Uses the
-// effective cloud planet radius so geometry is consistent with curvature.
+// cloudPlanetRadius() RETIRED (fork — 2026-09-05, world-space cloud migration Stage 1).
 //
-// The slab-parametric overload accepts explicit altitude / thickness for
-// callers marching a non-default slab (layer 2 cirrus deck, etc.). The
-// args-only overload below stays semantically identical to the original
-// for everything still marching the primary cumulus slab.
-// Radius-parameterized core (fork — 2026-07-30, cloud march perf). cloudPlanetRadius
-// evaluates an exp() and is frame-CONSTANT, but the march calls this helper up to
-// five times per sample (the density tap, two near-field sun taps, two moon taps),
-// so the exp was being re-evaluated deep inside the hot loop. Callers that already
-// hold the radius (marchCloudSlab / the shade context) pass it in; the convenience
-// overloads below preserve the original signatures bit-for-bit.
-float computeCloudHeightFractionR(vec3 samplePos, float cloudR,
-                                   float slabAltitudeKm, float slabThicknessKm) {
-  vec3 planetCenter = vec3(0.0f, -cloudR, 0.0f);
-  float altitudeAboveSea = length(samplePos - planetCenter) - cloudR;
+// It returned planetRadius * exp(-cloudCurvature * 5), floored at 100 km: at the pinned
+// cloudCurvature of 0.38 that put the clouds on a ~953 km sphere while the atmosphere kept using
+// the real 6371 km one. Two planets in one image, with two different horizons (~50 km vs ~160 km) —
+// this file's own comment conceded the split: "Atmospheric scattering math still uses the real
+// planet radius, only cloud sphere intersections are affected." That is precisely the bug this
+// migration exists to remove; see getPlanetCenter / getPlanetCenterWorldKm above.
+//
+// Clouds now intersect getPlanetCenter(args) at args.planetRadius, the same sphere the atmosphere
+// marches and the same one the ground terminates on. Curvature is no longer a dial that fakes a
+// look; it is whatever the planet's radius implies. planetRadius is the single exposed knob — turn
+// it down and the deck, the haze, the horizon distance and the horizon dip all curve together,
+// because they are finally the same sphere. rtx.atmosphere.cloudCurvature is retired in lockstep
+// (see rtx_atmosphere.h) and args.cloudCurvature is no longer read anywhere in shader code — the CB
+// field itself stays in place (atmosphere_args.h has no spare rows; see the CRITICAL note there).
+
+// Cloud slab height fraction. hf=0 at the slab base (slabAltitudeKm above sea level), hf=1 at the
+// slab top (slabAltitudeKm + slabThicknessKm). Saturates outside the slab (fork — 2026-09-05,
+// world-space cloud migration Stage 1; ported verbatim from archaeology commit 30d20a8f5, which
+// named it computeCloudHeightFractionC there too).
+//
+// samplePos is WORLD-anchored (args.cameraWorldPosYUpKm + rayOffset) because the density fields it
+// accompanies are world-anchored, which is what gives the volume its parallax. planetCenterWorldKm
+// is therefore world-anchored too — see getPlanetCenterWorldKm, the point directly below the CAMERA
+// at the eye's radius.
+//
+// Both being in the same frame is the whole point. The predecessor, computeCloudHeightFractionR,
+// took a bare radius and rebuilt the centre as vec3(0, -cloudR, 0) — a sphere under the WORLD
+// ORIGIN — while marchCloudSlab intersected shells centred under the CAMERA (getPlanetCenter).
+// Geometry and density therefore lived on two different spheres, and the error grew as the square of
+// how far the player had walked from the origin: at 10 km out the deck's altitude read ~52 m low, at
+// 50 km out ~1.3 km low — more than the deck is thick, i.e. the deck silently slid out of its own
+// slab. computeCloudHeightFractionR is retired along with it (no callers remain — every former
+// caller now holds a planetCenterWorldKm + planetRadiusKm pair instead of a bare radius; see
+// CloudShadeContext in cloud_march_common.slangh).
+float computeCloudHeightFractionC(vec3 samplePos, vec3 planetCenterWorldKm, float planetRadiusKm,
+                                  float slabAltitudeKm, float slabThicknessKm) {
+  float altitudeAboveSea = length(samplePos - planetCenterWorldKm) - planetRadiusKm;
   return saturate((altitudeAboveSea - slabAltitudeKm) / max(slabThicknessKm, 0.001f));
 }
 
 float computeCloudHeightFraction(vec3 samplePos, AtmosphereArgs args,
                                   float slabAltitudeKm, float slabThicknessKm) {
-  return computeCloudHeightFractionR(samplePos, cloudPlanetRadius(args),
+  return computeCloudHeightFractionC(samplePos, getPlanetCenterWorldKm(args), args.planetRadius,
                                      slabAltitudeKm, slabThicknessKm);
 }
 
@@ -713,7 +857,8 @@ vec2 cloudDomeDirToUv(vec3 dirYUp) {
 // Intersect view ray with the cloud shell. Returns true and the hit distance
 // if we hit the upward-looking cloud sphere at altitude args.cloudAltitude.
 // Ray origin is at the camera (0,0,0) in Y-up space; the cloud sphere uses
-// the effective curvature-adjusted planet radius (see cloudPlanetRadius).
+// the one planet shared with the atmosphere (fork — 2026-09-05, world-space cloud migration
+// Stage 1; ported from archaeology commit 30d20a8f5 — see getPlanetCenter).
 bool intersectCloudLayer(vec3 rayDir, AtmosphereArgs args, out float t, out vec3 hitPos) {
   t = -1.0f;
   hitPos = vec3(0.0f);
@@ -721,9 +866,8 @@ bool intersectCloudLayer(vec3 rayDir, AtmosphereArgs args, out float t, out vec3
   // Looking below the horizon: no cloud layer hit above us.
   if (rayDir.y <= 0.001f) return false;
 
-  float cloudR = cloudPlanetRadius(args);
-  vec3 planetCenter = vec3(0.0f, -cloudR, 0.0f);
-  float cloudSphereRadius = cloudR + args.cloudAltitude;
+  vec3 planetCenter = getPlanetCenter(args);
+  float cloudSphereRadius = args.planetRadius + args.cloudAltitude;
 
   float t0, t1;
   if (!intersectSphere(vec3(0.0f), rayDir, planetCenter, cloudSphereRadius, t0, t1)) {
@@ -1738,6 +1882,15 @@ vec3 cloudVoxelWorldToUVW(vec3 worldPosKm, AtmosphereArgs args, bool isZUp) {
   float u = frac((posYUp.x + halfExtent) * invExtent);
   float w = frac((posYUp.z + halfExtent) * invExtent);
   // Vertical: 0 at slab bottom (cloudAltitude), 1 at slab top.
+  //
+  // TODO(world-space cloud migration Stage 3): this `v` still uses a FLAT vertical — a plain
+  // Y-minus-altitude offset with no reference to getPlanetCenter / getPlanetCenterWorldKm at all.
+  // Stage 1 (2026-09-05) deliberately left it alone: the D_sun/D_ambient voxel grid this feeds is
+  // baked and sampled entirely in the camera-relative frame over a span of kilometers, where planet
+  // curvature is invisible at float precision, so re-anchoring it now would be a no-op change wearing
+  // a risky diff. Re-anchoring it for real is Stage 3's job (grid re-anchoring), and doing it here
+  // would muddy Stage 1's acceptance test — a ground-level A/B expected to be near-identical to
+  // pre-migration behavior at planetRadius=952.
   float v = saturate((posYUp.y - args.cloudAltitude) * invVert);
 
   return vec3(u, v, w);

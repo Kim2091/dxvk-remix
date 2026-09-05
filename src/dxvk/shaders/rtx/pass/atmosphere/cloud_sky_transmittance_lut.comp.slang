@@ -74,6 +74,13 @@ void main(uint2 threadId : SV_DispatchThreadID) {
   // Below-horizon directions: no cloud occlusion (consumer clamps elevation >= 0
   // anyway). 1.0 stored as a safety floor so a stray below-horizon sample
   // doesn't darken the sky-ambient term.
+  //
+  // Unchanged this stage (fork — 2026-09-05, world-space cloud migration Stage 1). This early-out
+  // stays independent of intersectCloudLayer's own dir.y <= 0.001 gate below on purpose: the
+  // consumer (sampleSkyAmbientForVolume in atmosphere_common.slangh) only ever reads the upper
+  // hemisphere of this LUT, so there is no correctness reason to march the deck's now-reachable
+  // underside (cloudSlabSpan, cloud_march_common.slangh) into cells nothing samples. Extending this
+  // bake to the lower hemisphere is Piece-2 territory (Stage 5), not this one's.
   if (dirYUp.y <= 0.001f) {
     cloudSkyTransmittanceLutOutput[threadId] = 1.0f;
     return;
@@ -87,6 +94,12 @@ void main(uint2 threadId : SV_DispatchThreadID) {
 
   // Intersect the cloud slab. intersectCloudLayer's dir.y > 0.001 gate above
   // means this returns true for all sample directions we keep.
+  //
+  // intersectCloudLayer now intersects the ONE planet (getPlanetCenter(args) at args.planetRadius,
+  // fork — 2026-09-05, world-space cloud migration Stage 1) instead of the retired cloud-only
+  // cloudPlanetRadius() sphere, so this LUT's cumulus footprint automatically tracks whatever
+  // planetRadius the atmosphere uses — no local change needed here beyond this call already going
+  // through the shared helper.
   float t;
   vec3 hitPos;
   if (!intersectCloudLayer(dirYUp, args, t, hitPos)) {

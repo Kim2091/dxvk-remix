@@ -637,16 +637,26 @@ vec4 loadInput(inout RNG randomState, ivec2 threadId)
       // everywhere" first-run reading (correct, not a bug) are documented on
       // the enum's registration in rtx_debug_view.cpp.
       //
-      // The span math below is DUPLICATED from marchCloudSlab
-      // (cloud_march_common.slangh, ~line 1000-1020) rather than calling or
-      // refactoring it — this view must carry zero risk to the production
-      // march, which cloud_march_common.slangh is off-limits for behavioural
-      // changes here regardless. It reproduces exactly production's call
-      // shape: marchCloudLayers is always invoked with tMinClamp=0 and
-      // tMaxClamp=0 (cloud_render.comp.slang, cloud_secondary_lut.comp.slang)
-      // — "march the full reachable span, unclamped by any surface" — so
-      // tEntry = max(t1base, 0), tExit = t1top, exactly as marchCloudSlab
-      // computes them for those tMinClamp/tMaxClamp values.
+      // The span math below is DUPLICATED from cloudSlabSpan
+      // (cloud_march_common.slangh, ~line 995-1063; called from marchCloudSlab
+      // and marchEchoDeck) rather than calling or including that header
+      // directly — this view must carry zero risk to the production march,
+      // and cloud_march_common.slangh's OWN functions additionally reference
+      // texture-global names (AtmosphereCloudNvdfSdf, AtmosphereCloudDSun,
+      // BlueNoise, ...) that this pass has no bindings for, so pulling that
+      // header in here would need new binding slots wired through the debug
+      // view's root signature for a diagnostic that only needs cloudSlabSpan's
+      // handful of ray-sphere tests. Duplicated instead, kept an EXACT mirror
+      // of that function (fork — 2026-09-05, world-space cloud migration
+      // Stage 1: previously duplicated the OLD far-root-only span math
+      // instead, which read the retired cloudPlanetRadius()). It reproduces
+      // exactly production's call shape: marchCloudLayers is always invoked
+      // with tMinClamp=0 and tMaxClamp=0 (cloud_render.comp.slang,
+      // cloud_secondary_lut.comp.slang) — "march the full reachable span,
+      // unclamped by any surface" — and those clamps are strict no-ops
+      // against cloudSlabSpan's own output (tEntry is already >= 0 in every
+      // one of its branches, and tMaxClamp > 0.0f is false), so omitting them
+      // here changes nothing.
 
       // (fork — 2026-09-05, Stage 0 follow-up) Both the ray direction and the
       // surface distance are taken from CURRENT-frame sources only.
@@ -699,29 +709,68 @@ vec4 loadInput(inout RNG randomState, ivec2 threadId)
         const float kmPerWorldUnit = 1.0f / max(cb.atmosphereArgs.worldUnitsPerKm, 1e-6f);
         const float tSurfaceKm = cameraToSurfaceLength * kmPerWorldUnit;
 
-        // ---- marchCloudSlab's shell setup, duplicated verbatim ----
-        const float cloudR = cloudPlanetRadius(cb.atmosphereArgs);
-        const vec3 planetCenter = vec3(0.0f, -cloudR, 0.0f);
-        const float baseRadius = cloudR + cb.atmosphereArgs.cloudAltitude;
-        const float topRadius  = cloudR + cb.atmosphereArgs.cloudAltitude
-                                        + cb.atmosphereArgs.cloudThickness;
+        // ---- cloudSlabSpan, duplicated exactly (see the header comment above
+        // for why this is a duplication rather than an #include) ----
+        // getPlanetCenter / getEyeRadius, not the retired cloudPlanetRadius() sphere (fork —
+        // 2026-09-05, world-space cloud migration Stage 1). getEyeRadius(cb.atmosphereArgs) ==
+        // cb.atmosphereArgs.planetRadius exactly this stage (no cameraAltitudeKm term yet), so the
+        // camera sits at that same radius from planetCenter by construction — see getPlanetCenter's
+        // doc comment. baseRadius/topRadius are built from planetRadius directly (matching
+        // cloudSlabSpan's own parameter, ctx.planetRadiusKm == args.planetRadius), not from the eye
+        // radius, so the two agree only because they're the same value in THIS stage.
+        const vec3 planetCenter = getPlanetCenter(cb.atmosphereArgs);
+        const float planetRadiusKm = cb.atmosphereArgs.planetRadius;
+        const float baseRadius = planetRadiusKm + cb.atmosphereArgs.cloudAltitude;
+        const float topRadius  = planetRadiusKm + cb.atmosphereArgs.cloudAltitude
+                                                 + cb.atmosphereArgs.cloudThickness;
 
-        float t0base, t1base, t0top, t1top;
-        const bool hitBase = intersectSphere(vec3(0.0f), viewDirYUp, planetCenter, baseRadius, t0base, t1base);
-        const bool hitTop  = intersectSphere(vec3(0.0f), viewDirYUp, planetCenter, topRadius,  t0top,  t1top);
+        float t0top, t1top;
+        const bool hitTop = intersectSphere(vec3(0.0f), viewDirYUp, planetCenter, topRadius, t0top, t1top);
 
-        if (!hitBase || !hitTop) {
-          outColor = vec3(0.0f, 0.0f, 1.0f);  // blue: ray misses the shell entirely
+        if (!hitTop || t1top <= 0.0f) {
+          outColor = vec3(0.0f, 0.0f, 1.0f);  // blue: ray misses the top shell entirely, or it's wholly behind us
         } else {
-          // tMinClamp=0 / tMaxClamp=0, matching production exactly (see
-          // comment above) — tMaxClamp>0 branch never taken, so tExit is
-          // just t1top, unclamped.
-          const float tEntry = max(t1base, 0.0f);
-          const float tExit  = t1top;
+          float t0base, t1base;
+          const bool hitsBase = intersectSphere(vec3(0.0f), viewDirYUp, planetCenter, baseRadius, t0base, t1base);
+
+          float tEntry, tExit;
+          if (!hitsBase || t1base <= 0.0f) {
+            // Base shell missed entirely, or wholly behind us: the full top-shell chord is slab.
+            tEntry = max(t0top, 0.0f);
+            tExit  = t1top;
+          } else if (t0base > 0.0f) {
+            // Base shell ahead of the eye — eye outside/above it: the near span only. Structurally
+            // unreachable in THIS stage (see the migration-stage note below), but present so the
+            // diagnostic already tells the truth once Stage 2 makes it reachable.
+            tEntry = max(t0top, 0.0f);
+            tExit  = t0base;
+          } else {
+            // Eye at or below the base shell — the far span. The legacy ground-level path, and (in
+            // THIS stage) the ONLY path an eye whose radius is exactly planetRadius can take, since
+            // baseRadius = planetRadius + cloudAltitude is strictly larger for any cloudAltitude > 0.
+            tEntry = max(t1base, 0.0f);
+            tExit  = t1top;
+          }
+
+          // Planet clip, mirroring cloudSlabSpan exactly.
+          float tPlanet0, tPlanet1;
+          if (intersectSphere(vec3(0.0f), viewDirYUp, planetCenter, planetRadiusKm, tPlanet0, tPlanet1)
+              && tPlanet0 > 0.0f) {
+            tExit = min(tExit, tPlanet0);
+          }
+
           if (tEntry >= tExit || tExit <= 0.0f) {
-            outColor = vec3(0.0f, 0.0f, 1.0f);  // blue: no reachable span (mirrors marchCloudSlab's early-out)
+            outColor = vec3(0.0f, 0.0f, 1.0f);  // blue: no reachable span (mirrors cloudSlabSpan's false return)
           } else if (tEntry <= 0.0f) {
-            outColor = vec3(1.0f, 1.0f, 0.0f);  // yellow: camera already inside the slab
+            // yellow: camera already inside the slab. Migration-stage note (fork — 2026-09-05):
+            // NOT reachable under a normal config THIS stage — getEyeRadius(args) == args.planetRadius
+            // exactly (no cameraAltitudeKm yet), so the eye's distance from planetCenter is always
+            // strictly less than baseRadius for any cloudAltitude > 0, and this branch requires the
+            // eye to have READ tEntry as <= 0, i.e. to already be at or past the base shell. It
+            // becomes reachable once Stage 2 gives getEyeRadius a real cameraAltitudeKm that can
+            // exceed cloudAltitude (flying up into the deck) — the code path is correct now so that
+            // stage doesn't have to touch this view.
+            outColor = vec3(1.0f, 1.0f, 0.0f);
           } else if (tEntry > tSurfaceKm) {
             outColor = vec3(1.0f, 0.0f, 0.0f);  // red: slab entirely beyond the surface
           } else if (tSurfaceKm <= tExit) {

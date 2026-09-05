@@ -170,11 +170,22 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
                               + ndc.x * args.cloudRenderRightYUp
                               + ndc.y * args.cloudRenderUpYUp);
 
-  // Below-horizon view direction: no clouds above this pixel.
-  if (viewDirYUp.y <= 0.001f) {
-    cloudRenderOutput[pixelCoord] = vec4(0.0f, 0.0f, 0.0f, 1.0f);
-    return;
-  }
+  // No below-horizon early-out (fork — 2026-09-05, world-space cloud migration Stage 1; ported
+  // from archaeology commit 30d20a8f5).
+  //
+  // This used to read `if (viewDirYUp.y <= 0.001f) { write clear; return; }`, on the reasoning that
+  // there are "no clouds above this pixel". That is true of the deck's TOP and irrelevant to its
+  // UNDERSIDE, which from any eye below the deck fills every direction down to the true horizon.
+  // Because the camera was welded to the surface (getEyeRadius(args) == args.planetRadius exactly —
+  // still true this stage), the deck's far edge asymptoted to exactly y == 0, so cutting at y == 0
+  // cut precisely along that edge and produced the hard horizon line the sky ended on — the single
+  // most visible artifact of the old model.
+  //
+  // marchCloudSlab / marchEchoDeck now terminate these rays on the planet via cloudSlabSpan
+  // (cloud_march_common.slangh) instead, which is a real occluder rather than a screen-space rule,
+  // so the deck reaches the horizon and stops there on its own. Below-horizon sky radiance for the
+  // page-142 ambient term (sampleSkyAmbientForVolume) is unaffected by this removal — that helper
+  // has its own below-horizon clamp and is untouched this stage.
 
   float jitter = fastJitter(pixelCoord, args.cloudRenderFrameIdx).x;
   // Static per-pixel hash for far-field jitter (animated < 250 m, static beyond — no distant shimmer).

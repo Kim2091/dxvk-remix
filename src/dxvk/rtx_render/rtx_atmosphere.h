@@ -628,11 +628,14 @@ public:
                "Number of ray-march steps through the cloud slab. Higher = better quality, more cost. Range 1..32.");
     RTX_OPTION("rtx.atmosphere", float, cloudThickness, 3.05f,
                "Vertical depth of the cloud slab in km.");
-    RTX_OPTION("rtx.atmosphere", float, cloudCurvature, 0.38f,
-               "Sky-dome curvature for the cloud layer: 0 = real-planet radius "
-               "(nearly flat ceiling), 1 = tight dome (clouds visibly curve down "
-               "to the horizon). Only affects cloud sphere intersections; "
-               "atmospheric scattering still uses the real planet radius.");
+    // rtx.atmosphere.cloudCurvature retired 2026-09-05 (world-space cloud migration Stage 1): fed
+    // the now-deleted cloudPlanetRadius(), which shrank clouds onto a SEPARATE, smaller sphere
+    // (~953 km at the pinned 0.38 default) than the one the atmosphere/ground/horizon used
+    // (planetRadius, 6371 km default) — two planets in one image. Clouds now intersect the same
+    // planet as everything else (see getPlanetCenter in atmosphere_common.slangh); planetRadius is
+    // the single knob that curves them all together. AtmosphereArgs::cloudCurvature (the CB field)
+    // is NOT removed — see the CRITICAL layout note at its declaration in atmosphere_args.h — but is
+    // no longer read by any shader; RtxAtmosphere::pushConstants now always writes 0 to it.
 
     RTX_OPTION("rtx.atmosphere", float, cloudSkyAmbientStrength, 0.0f,
                "Overall strength of the volumetric sky-ambient illumination term "

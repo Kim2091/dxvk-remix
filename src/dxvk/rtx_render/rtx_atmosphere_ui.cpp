@@ -1519,10 +1519,12 @@ void RtxAtmosphere::showImguiSettings(WeatherBlender* blender) {
       }
 
       // Horizon & Haze tree demoted to conf-only 2026-07-17
-      // (preset-tunability pass): cloudCurvature (set-once, pinned 0.38),
-      // cloudAerialHazePerKm + cloudAerialFadePerKm (still per-preset
-      // editable in the Weather panel — they are weather-preset fields
-      // "Distance Haze" / "Horizon Fade" under Clouds > Distance).
+      // (preset-tunability pass): cloudCurvature (set-once, pinned 0.38) —
+      // fully retired 2026-09-05, world-space cloud migration Stage 1; see
+      // rtx_atmosphere.h — cloudAerialHazePerKm + cloudAerialFadePerKm are
+      // still per-preset editable in the Weather panel (they are
+      // weather-preset fields "Distance Haze" / "Horizon Fade" under
+      // Clouds > Distance).
 
       ImGui::TreePop();
     }

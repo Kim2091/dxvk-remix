@@ -29,10 +29,11 @@
 // here then never end up in their compiled SPIR-V.
 //
 // Cloud and atmosphere helpers used by both the sky path and the ground
-// shadow term (intersectSphere, cloudPlanetRadius, computeCloudHeightFraction,
+// shadow term (intersectSphere, getPlanetCenter, computeCloudHeightFraction,
 // intersectCloudLayer, evalCloudGroundShadow,
 // getTransmittanceToSun, evalAtmosphereRadiance, hash31, fbmNoise2D, etc.)
 // stay in atmosphere_common.slangh and are pulled in via the include below.
+// (cloudPlanetRadius retired — fork, world-space cloud migration Stage 1, 2026-09-05.)
 
 #include "rtx/pass/atmosphere/atmosphere_common.slangh"
 

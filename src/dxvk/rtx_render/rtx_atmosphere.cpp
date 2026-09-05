@@ -790,7 +790,11 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
     args.cloudThickness = wx ? wx->cloudThickness : RtxAtmosphere::cloudThickness();
     args.cloudLayer2TypeSpread = RtxAtmosphere::cloudLayer2TypeSpread();
     args.cloudViewSamples = RtxAtmosphere::cloudViewSamples();
-    args.cloudCurvature = RtxAtmosphere::cloudCurvature();
+    // rtx.atmosphere.cloudCurvature retired 2026-09-05 (world-space cloud migration Stage 1) — see
+    // the retirement comment at its former RTX_OPTION in rtx_atmosphere.h. The CB field itself
+    // cannot be removed (no spare rows in AtmosphereArgs; see atmosphere_args.h), so it is written a
+    // harmless constant instead of a live option value that no shader reads anymore.
+    args.cloudCurvature = 0.0f;
     args.cloudTypeMean = wx ? wx->cloudTypeMean : RtxAtmosphere::cloudTypeMean();
     args.cloudTypeSpread = wx ? wx->cloudTypeSpread : RtxAtmosphere::cloudTypeSpread();
     args.cloudTypeNoiseScale = wx ? wx->cloudTypeNoiseScale : RtxAtmosphere::cloudTypeNoiseScale();

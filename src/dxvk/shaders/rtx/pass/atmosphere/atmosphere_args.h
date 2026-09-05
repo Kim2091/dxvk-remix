@@ -262,7 +262,14 @@ struct AtmosphereArgs {
   vec2 cloudWindOffset;     // Accumulated wind-driven UV offset (km)
   float skyIndirectRadianceScale; // Diffuse-indirect sky radiance multiplier (>=0). Reuses the
                                   // former pad_cloudAnisotropy slot; CB layout unchanged.
-  float cloudCurvature;     // 0 = Earth-scale dome, 1 = tight dome
+  // RETIRED (fork — 2026-09-05, world-space cloud migration Stage 1): no longer read by any
+  // shader (cloudPlanetRadius(), its only consumer, is deleted — see atmosphere_common.slangh).
+  // CRITICAL: this field is NOT removed, moved, or resized — AtmosphereArgs is a GPU constant
+  // buffer with no spare rows, and changing its layout is a separate, dangerous change out of
+  // scope for this stage. RtxAtmosphere::getAtmosphereArgs now writes 0 here unconditionally
+  // (rtx_atmosphere.cpp); the RTX_OPTION that used to feed it is retired in lockstep
+  // (rtx_atmosphere.h).
+  float cloudCurvature;     // Retired; value unused. Was: 0 = Earth-scale dome, 1 = tight dome.
 
   // ----- Cloud volumetric / appearance enhancements (fork) -----
   // Cloud detail-shading pass (fork — 2026-07-14). Four scalars reuse the

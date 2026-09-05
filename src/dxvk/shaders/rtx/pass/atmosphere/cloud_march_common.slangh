@@ -78,11 +78,14 @@
 // because they go unused — a deterministic estimate avoids Jensen's-inequality
 // bias on the convex exp(-x) shadow estimator.
 // =============================================================================
-// cloudRadiusKm (fork — 2026-07-30, perf): the frame-constant cloud planet radius,
-// passed in so the per-tap height fraction skips cloudPlanetRadius' exp().
+// planetCenterWorldKm / planetRadiusKm (fork - 2026-09-05, world-space cloud migration Stage 1;
+// ported from archaeology commit 30d20a8f5). The taps walk WORLD-anchored positions (cloudHitPos is
+// world-anchored), so they must measure altitude against the world-anchored centre. Supersedes the
+// cloudRadiusKm parameter, which named a cloud-only planet that no longer exists (see
+// cloudPlanetRadius's retirement in atmosphere_common.slangh).
 float sampleCloudSunOpticalDepth_local(vec3 cloudHitPos, vec3 sunDir,
                                         float typeLocal, float coverageLocal,
-                                        float cloudRadiusKm,
+                                        vec3 planetCenterWorldKm, float planetRadiusKm,
                                         AtmosphereArgs args) {
   if (sunDir.y <= 0.01f) return 0.0f;
 
@@ -92,7 +95,7 @@ float sampleCloudSunOpticalDepth_local(vec3 cloudHitPos, vec3 sunDir,
 
   for (int i = 0; i < kTaps; ++i) {
     vec3 p = cloudHitPos + sunDir * (kStepKm * float(i + 1));
-    float hf = computeCloudHeightFractionR(p, cloudRadiusKm,
+    float hf = computeCloudHeightFractionC(p, planetCenterWorldKm, planetRadiusKm,
                                            args.cloudAltitude, args.cloudThickness);
     float d = sampleCloudDensityNubis3Coarse(p, hf, typeLocal, coverageLocal, 1.0f, args,
                                              AtmosphereCloudNvdfSdf, AtmosphereCloudDetailNoise3D,
@@ -114,7 +117,7 @@ float sampleCloudSunOpticalDepth_localSlab(vec3 cloudHitPos, vec3 sunDir,
                                            float typeLocal, float coverageLocal,
                                            float slabAltitudeKm, float slabThicknessKm,
                                            float slabDensityScale, vec3 fieldOffsetKm,
-                                           float cloudRadiusKm,
+                                           vec3 planetCenterWorldKm, float planetRadiusKm,
                                            AtmosphereArgs args) {
   if (sunDir.y <= 0.01f) return 0.0f;
 
@@ -124,7 +127,7 @@ float sampleCloudSunOpticalDepth_localSlab(vec3 cloudHitPos, vec3 sunDir,
 
   for (int i = 0; i < kTaps; ++i) {
     vec3 p = cloudHitPos + sunDir * (kStepKm * float(i + 1));
-    float hf = computeCloudHeightFractionR(p, cloudRadiusKm, slabAltitudeKm, slabThicknessKm);
+    float hf = computeCloudHeightFractionC(p, planetCenterWorldKm, planetRadiusKm, slabAltitudeKm, slabThicknessKm);
     // fieldOffsetKm decorrelates the deck's density FIELD from layer 1 (the
     // echo-deck seed offset) while hf stays on the true position — see the
     // matching tap in marchEchoDeck.
@@ -196,8 +199,14 @@ struct CloudShadeContext {
   vec3  nightLight;
   float moonBaseSigma;
   uint  msOctaveCount;
-  float cloudRadiusKm;       // cloudPlanetRadius(args) — an exp(), formerly
-                             // re-evaluated up to 5x per march sample.
+  // One planet, held in the two frames the march needs it in (fork - 2026-09-05, world-space cloud
+  // migration Stage 1; ported from archaeology commit 30d20a8f5). Replaces cloudRadiusKm, which
+  // cached cloudPlanetRadius(args)'s exp() — gone with the fake cloud planet (see its retirement in
+  // atmosphere_common.slangh), so there is nothing left to hoist, only frames to keep straight.
+  vec3  planetCenterKm;      // getPlanetCenter(args): CAMERA-relative. Shell/planet intersections.
+  vec3  planetCenterWorldKm; // getPlanetCenterWorldKm(args): WORLD-anchored. Height fractions,
+                             // which travel with the world-anchored density fields.
+  float planetRadiusKm;      // args.planetRadius. The atmosphere's radius, not a cloud-only one.
   float darkenStrength;      // Underside-light darkening amount. ZERO through the
                              // whole night / low-sun band, and when it is zero
                              // verticalLight is exactly 1 — which makes the
@@ -629,7 +638,11 @@ CloudShadeContext buildCloudShadeContext(AtmosphereArgs args) {
   // ---- Frame-constant hoists out of the per-sample evaluator (fork —
   // 2026-07-30, cloud march perf). Each is the verbatim subexpression it
   // replaces, so the shaded result is unchanged. ----
-  ctx.cloudRadiusKm = cloudPlanetRadius(args);
+  // One-planet geometry (fork — 2026-09-05, world-space cloud migration Stage 1): both frames the
+  // march needs, computed once per frame instead of re-derived per call site.
+  ctx.planetCenterKm      = getPlanetCenter(args);
+  ctx.planetCenterWorldKm = getPlanetCenterWorldKm(args);
+  ctx.planetRadiusKm      = args.planetRadius;
 
   const float kUndersideSunFadeElev = 0.35f;
   const float kMicroAoGain          = 1.5f;  // detailSigned excursion (~±0.3) -> shading units
@@ -771,8 +784,10 @@ bool integrateCloudSample(float tSampleKm,
   sdfStepKmOut = 0.0f;
 
   // World-anchored sample position (Y-up km). The slab intersection in the
-  // caller runs with ray origin = vec3(0) and planet center = (0, -cloudR, 0),
-  // so tSampleKm is measured along the view ray from the camera. Adding
+  // caller runs with ray origin = vec3(0) and planet center = ctx.planetCenterKm
+  // (getPlanetCenter(args) — fork, world-space cloud migration Stage 1, 2026-09-05; was
+  // (0, -cloudR, 0) under the retired cloud-only radius), so tSampleKm is measured along the view
+  // ray from the camera. Adding
   // cameraWorldPosYUpKm anchors the sample's WORLD position to the player's
   // km-scale Y-up coordinates — the noise/coverage/type fields then translate
   // with the world rather than with the camera, giving the parallax depth cue
@@ -797,7 +812,7 @@ bool integrateCloudSample(float tSampleKm,
   float typeLocal     = saturate(slabTypeMean     + (typeNoise     - 0.5f) * args.cloudTypeSpread);
   float coverageLocal = saturate(slabCoverageMean + (coverageNoise - 0.5f) * args.cloudCoverageSpread);
 
-  float hf = computeCloudHeightFractionR(samplePos, ctx.cloudRadiusKm,
+  float hf = computeCloudHeightFractionC(samplePos, ctx.planetCenterWorldKm, ctx.planetRadiusKm,
                                          slabAltitudeKm, slabThicknessKm);
   float detailSigned;
   // Nubis3 model outputs: the real NVDF dimensional profile and the LIVE
@@ -923,7 +938,7 @@ bool integrateCloudSample(float tSampleKm,
     if (density >= kMoonShadowSkipDensity && refineLighting) {
       moonOpticalDepth = sampleCloudSunOpticalDepth_local(
           samplePos, ctx.combinedMoonDir, typeLocal, coverageLocal,
-          ctx.cloudRadiusKm, args);
+          ctx.planetCenterWorldKm, ctx.planetRadiusKm, args);
     }
     float moonShadow = exp(-moonOpticalDepth * ctx.moonBaseSigma);
     // msMoonAniso (the Wrenninge phase-octave sum) is ray-constant — precomputed
@@ -980,6 +995,76 @@ bool integrateCloudSample(float tSampleKm,
 }
 
 // =============================================================================
+// Ray-vs-cloud-slab span in the camera-relative Y-up frame (fork - 2026-09-05, world-space cloud
+// migration Stage 1; ported verbatim from archaeology commit 30d20a8f5).
+//
+// Returns the marchable [tEntry, tExit] segment of the spherical annulus between the slab's base
+// and top shells for an eye at ANY radius, then clips it against the planet.
+//
+// What this replaces (the far-root-only selection formerly inline in marchCloudSlab and
+// marchEchoDeck) took the far root of each shell unconditionally: tEntry = t1base, tExit = t1top.
+// That is correct only while the eye is below the deck, which was the only case the old frame could
+// express, because the camera sat welded to the surface at altitude 0 (getEyeRadius(args) ==
+// args.planetRadius exactly — still true THIS stage; see that function's comment). With a real
+// cameraAltitudeKm (Stage 2) the eye can also be inside the slab or above it, so the span is now the
+// honest set difference [t0top, t1top] minus (t0base, t1base). Below the deck it reduces to exactly
+// [t1base, t1top] - the legacy result, unchanged. This is why the correctness bar for Stage 1 is "at
+// planetRadius=952, near-identical to before": the far-root branch below IS the legacy path, reached
+// unconditionally while the eye's radius equals getEyeRadius(args) (i.e. always, until Stage 2).
+//
+// The planet clip is what replaces cloud_render's viewDirYUp.y <= 0.001 early-out (removed this
+// stage). That test cut the deck off at eye level with a knife, and that cut IS the hard horizon
+// line the sky used to end on: the deck's far edge asymptotes to y == 0, so slicing at y == 0 slices
+// exactly along it. The real terminator is the ground. A below-horizon ray now marches the deck's
+// UNDERSIDE receding away from the eye and stops where it strikes the planet, so the deck runs down
+// to the true horizon and ends there because something is genuinely in the way. A ray passing
+// between the horizon and the tangent misses the planet and keeps going, which is also correct -
+// that is the deck still visible beyond the horizon.
+//
+// Piece-2 marching (rendering the deck's far underside when looking down through a gap in the near
+// side) is explicitly NOT this function's job yet — Stage 5 owns it; this ports the reference's
+// single-piece selection exactly as it stands, matching that stage's stated deferral.
+bool cloudSlabSpan(vec3 rayDirYUp, vec3 planetCenter, float planetRadiusKm,
+                   float slabAltitudeKm, float slabThicknessKm,
+                   out float tEntry, out float tExit) {
+  tEntry = 0.0f;
+  tExit  = -1.0f;
+
+  const float baseRadius = planetRadiusKm + slabAltitudeKm;
+  const float topRadius  = planetRadiusKm + slabAltitudeKm + slabThicknessKm;
+
+  float t0top, t1top;
+  if (!intersectSphere(vec3(0.0f), rayDirYUp, planetCenter, topRadius, t0top, t1top)) return false;
+  if (t1top <= 0.0f) return false;
+
+  float t0base, t1base;
+  const bool hitsBase = intersectSphere(vec3(0.0f), rayDirYUp, planetCenter, baseRadius,
+                                        t0base, t1base);
+
+  if (!hitsBase || t1base <= 0.0f) {
+    // Base shell missed entirely, or wholly behind us: the full top-shell chord is slab.
+    tEntry = max(t0top, 0.0f);
+    tExit  = t1top;
+  } else if (t0base > 0.0f) {
+    // Base shell ahead of the eye, so the eye is outside/above it: march the NEAR span only. This
+    // is the case that makes looking down through the deck from above it render at all.
+    tEntry = max(t0top, 0.0f);
+    tExit  = t0base;
+  } else {
+    // Eye at or below the base shell - the far span. The legacy ground-level path.
+    tEntry = max(t1base, 0.0f);
+    tExit  = t1top;
+  }
+
+  float tPlanet0, tPlanet1;
+  if (intersectSphere(vec3(0.0f), rayDirYUp, planetCenter, planetRadiusKm, tPlanet0, tPlanet1)
+      && tPlanet0 > 0.0f) {
+    tExit = min(tExit, tPlanet0);
+  }
+
+  return tExit > tEntry && tExit > 0.0f;
+}
+
 void marchCloudSlab(vec3   viewDirYUp,
                     float  pixelJitter,
                     float  pixelJitterStatic,
@@ -996,21 +1081,15 @@ void marchCloudSlab(vec3   viewDirYUp,
                     AtmosphereArgs args,
                     inout vec3  accumColor,
                     inout float viewTransmittance) {
-  // Slab intersection (mirrors the original main() body — same ray-sphere
-  // tests against the base + top shells of the curvature-adjusted cloud
-  // planet, but with slabAltitudeKm / slabThicknessKm threaded through so
-  // layer 2 hits its own altitude band).
-  float cloudR = ctx.cloudRadiusKm;  // == cloudPlanetRadius(args), hoisted per frame
-  vec3 planetCenter = vec3(0.0f, -cloudR, 0.0f);
-  float baseRadius = cloudR + slabAltitudeKm;
-  float topRadius  = cloudR + slabAltitudeKm + slabThicknessKm;
+  // Slab intersection (fork — 2026-09-05, world-space cloud migration Stage 1). Was inline
+  // ray-sphere tests against the base + top shells of the curvature-adjusted cloud planet, taking
+  // the far root of each unconditionally; now cloudSlabSpan, which shares the one planet centre and
+  // radius with the rest of the atmosphere and additionally clips against the planet (see its
+  // comment for why — this is what lets cloud_render drop the below-horizon early-out).
+  float tEntry, tExit;
+  if (!cloudSlabSpan(viewDirYUp, ctx.planetCenterKm, ctx.planetRadiusKm,
+                     slabAltitudeKm, slabThicknessKm, tEntry, tExit)) return;
 
-  float t0base, t1base, t0top, t1top;
-  if (!intersectSphere(vec3(0.0f), viewDirYUp, planetCenter, baseRadius, t0base, t1base)) return;
-  if (!intersectSphere(vec3(0.0f), viewDirYUp, planetCenter, topRadius,  t0top,  t1top))  return;
-
-  float tEntry = t1base;
-  float tExit  = t1top;
   tEntry = max(tEntry, tMinClamp);
   if (tMaxClamp > 0.0f) {
     tExit = min(tExit, tMaxClamp);
@@ -1192,8 +1271,14 @@ void marchCloudSlab(vec3   viewDirYUp,
 // same coverage/type control-field machinery driven by the deck's own
 // mean / spread / seed knobs (= the "varied echo" — a decorrelated but
 // related cloudscape via cloudLayer2NoiseSeed), and the same Beer-Lambert +
-// aerial-perspective accumulation. The split-march tMin/tMax clamps are
-// dropped — the echo deck never needs the partition experiment.
+// aerial-perspective accumulation. The caller's distance clamps apply to both
+// decks (fork — 2026-09-05, world-space cloud migration Stage 1: the split-march tMin/tMax clamps
+// were dropped here on the reasoning that "the echo deck never needs the partition experiment", but
+// the clamp isn't only for that experiment — it is also how a resolved surface hit is threaded
+// through so a surface cannot receive cloud behind its own resolved point. Neither current caller
+// (cloud_render.comp.slang, cloud_secondary_lut.comp.slang) passes a nonzero clamp today, so this is
+// a signature-only change with no render delta yet; it exists so a future depth-aware caller
+// (Stage 4) does not have to re-plumb the deck separately from layer 1).
 // =============================================================================
 void marchEchoDeck(vec3   viewDirYUp,
                    float  pixelJitter,
@@ -1203,22 +1288,23 @@ void marchEchoDeck(vec3   viewDirYUp,
                    float  slabCoverageMean,
                    float  slabDensityScale,
                    float  slabNoiseSeedOffset,
+                   float  tMinClamp,
+                   float  tMaxClamp,
                    CloudShadeContext ctx,
                    AtmosphereArgs args,
                    inout vec3  accumColor,
                    inout float viewTransmittance) {
-  float cloudR = ctx.cloudRadiusKm;  // == cloudPlanetRadius(args), hoisted per frame
-  vec3 planetCenter = vec3(0.0f, -cloudR, 0.0f);
-  float baseRadius = cloudR + slabAltitudeKm;
-  float topRadius  = cloudR + slabAltitudeKm + slabThicknessKm;
-
-  float t0base, t1base, t0top, t1top;
-  if (!intersectSphere(vec3(0.0f), viewDirYUp, planetCenter, baseRadius, t0base, t1base)) return;
-  if (!intersectSphere(vec3(0.0f), viewDirYUp, planetCenter, topRadius,  t0top,  t1top))  return;
-
-  float tEntry = max(t1base, 0.0f);
-  float tExit  = t1top;
+  // Slab intersection via the shared helper (fork — 2026-09-05, world-space cloud migration
+  // Stage 1) — see cloudSlabSpan's comment and marchCloudSlab's identical swap above.
+  float tEntry, tExit;
+  if (!cloudSlabSpan(viewDirYUp, ctx.planetCenterKm, ctx.planetRadiusKm,
+                     slabAltitudeKm, slabThicknessKm, tEntry, tExit)) return;
+  tEntry = max(tEntry, tMinClamp);
+  if (tMaxClamp > 0.0f) {
+    tExit = min(tExit, tMaxClamp);
+  }
   if (tEntry >= tExit || tExit <= 0.0f) return;
+  tEntry = max(tEntry, 0.0f);
 
   // Low step budget — the echo deck's headline perf lever, user-adjustable via
   // cloudLayer2StepFloor / cloudLayer2StepMax (decoupled from layer 1's
@@ -1287,7 +1373,7 @@ void marchEchoDeck(vec3   viewDirYUp,
     float typeLocal     = saturate(slabTypeMean     + (typeNoise     - 0.5f) * args.cloudTypeSpread);
     float coverageLocal = saturate(slabCoverageMean + (coverageNoise - 0.5f) * args.cloudCoverageSpread);
 
-    float hf = computeCloudHeightFractionR(samplePos, cloudR,
+    float hf = computeCloudHeightFractionC(samplePos, ctx.planetCenterWorldKm, ctx.planetRadiusKm,
                                            slabAltitudeKm, slabThicknessKm);
     float nubisProfile;
     float detailSigned;
@@ -1343,7 +1429,7 @@ void marchEchoDeck(vec3   viewDirYUp,
         moonOpticalDepth = sampleCloudSunOpticalDepth_localSlab(
             samplePos, ctx.combinedMoonDir, typeLocal, coverageLocal,
             slabAltitudeKm, slabThicknessKm, slabDensityScale, fieldOffsetKm,
-            cloudR, args);
+            ctx.planetCenterWorldKm, ctx.planetRadiusKm, args);
       }
       float moonShadow = exp(-moonOpticalDepth * ctx.moonBaseSigma);
       // Ray-constant phase-octave sum — see cloudShadeContextBeginRay.
@@ -1460,6 +1546,7 @@ void marchCloudLayers(vec3  viewDirYUp,
                   args.cloudLayer2TypeMean, args.cloudLayer2CoverageMean,
                   args.cloudLayer2DensityScale,
                   args.cloudLayer2NoiseSeed,
+                  tMinClamp, tMaxClamp,
                   ctx, args2,
                   accumColor, viewTransmittance);
   }
