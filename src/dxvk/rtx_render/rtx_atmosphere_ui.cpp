@@ -1249,8 +1249,16 @@ void RtxAtmosphere::showImguiSettings(WeatherBlender* blender) {
             0.05f, 0.0f, 4.0f, "%.2f", sliderFlags);
         RemixGui::SetTooltipToLastWidgetOnHover(
             "Cloud opacity. Higher = thicker / darker clouds.");
+        // Lower bound 0.5 -> 0.05 km and finer step (fork — 2026-09-05, world-space cloud
+        // migration): this range was authored against the uncorrected unit scale, where
+        // worldUnitsPerKm came from rtx.sceneScale (10000 units/km on FNV). With
+        // rtx.atmosphere.cloudScale set to the real Gamebryo figure (~0.704 -> 70400 units/km)
+        // the world converts to ~7x fewer km, so a deck at a given ALTITUDE IN KM sits ~7x
+        // higher relative to the terrain. Reproducing the pre-correction look needs roughly
+        // 0.8 / 7.04 = 0.11 km, which the old 0.5 km floor made unreachable -- the slider
+        // bottomed out with the clouds still far too high.
         RemixGui::DragFloat("Altitude", &RtxAtmosphere::cloudAltitudeObject(),
-                            0.1f, 0.5f, 12.0f, "%.1f km", sliderFlags);
+                            0.01f, 0.05f, 12.0f, "%.2f km", sliderFlags);
         RemixGui::SetTooltipToLastWidgetOnHover(
             "Cloud layer altitude (km above the ground).");
         dragFloatWithWeatherOverride(

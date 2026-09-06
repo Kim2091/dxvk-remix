@@ -1131,7 +1131,13 @@ public:
                "internal (DLSS-input) resolution [0.25..1]. 0.5 = quarter the "
                "pixels (~4x cheaper cloud march); 1.0 = native (legacy, "
                "bit-exact). Applies on the next frame; live-tunable.");
-    RTX_OPTION("rtx.atmosphere", float, cloudHistoryWeight, 0.85f,
+    // [FNV-TEST-DEFAULT] was 0.85f -- set to 0 on 2026-09-05 because the cloud EMA's
+    // reprojection is measurably broken: with 0.85 the deck ghosts heavily behind moving
+    // geometry and against the sky, and setting this to 0 removes it ENTIRELY. That is a
+    // diagnosis, not a fix -- see the commit message. Tolerable for now only because
+    // cloudViewSamplesMax is high enough that the raw march is already clean; it will stop
+    // being tolerable the moment Stage 6 lowers sample counts for performance.
+    RTX_OPTION("rtx.atmosphere", float, cloudHistoryWeight, 0.0f,
                "EMA history weight of the cloud temporal smoother [0..0.98]. "
                "Higher = smoother/softer clouds that respond slowly; lower = "
                "crisper, faster-responding clouds with more visible per-frame "
