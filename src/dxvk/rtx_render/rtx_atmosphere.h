@@ -299,17 +299,13 @@ public:
     // everywhere the resolved CloudAnchor feeds AtmosphereArgs (see updateFrame's anchor-resolve
     // block). Off by default so every engine where the view matrix already carries translation (GTA
     // 4, most games) is unaffected.
-    // [FNV-TEST-DEFAULT] was false -- captured from the FNV config 2026-09-05 for
-    // world-space cloud testing. NOT a shipping default; revert before merge.
-    RTX_OPTION("rtx.atmosphere", bool, useCameraWorldOverride, true,
+    RTX_OPTION("rtx.atmosphere", bool, useCameraWorldOverride, false,
                "Anchor world-space clouds to rtx.atmosphere.cameraWorldOverride instead of the Remix "
                "camera position. Required on camera-relative engines where RtCamera::getPosition() "
                "reads as (0,0,0) — without it the cloud volume welds to the view and produces no "
                "parallax while walking. The game integration is expected to push the real camera "
                "world position here every frame.");
-    // [FNV-TEST-DEFAULT] was Vector3(0.0f, 0.0f, 0.0f) -- captured from the FNV config 2026-09-05 for
-    // world-space cloud testing. NOT a shipping default; revert before merge.
-    RTX_OPTION("rtx.atmosphere", Vector3, cameraWorldOverride, Vector3(-68449.3f, 8624.88f, 19146.9f),
+    RTX_OPTION("rtx.atmosphere", Vector3, cameraWorldOverride, Vector3(0.0f, 0.0f, 0.0f),
                "Camera world position, in the SAME raw game units / convention RtCamera::getPosition() "
                "would have returned this frame (before any Y-up conversion or cloudWorldUnitsPerKm "
                "scaling — updateFrame applies both, identically to the camera-view-matrix path). Used "
@@ -393,9 +389,7 @@ public:
                "2 = trace, then invert the result. The halo must survive ONLY where a ray found geometry. A "
                "screen that stays uniformly lit means the rays are hitting nothing.",
                args.minValue = 0, args.maxValue = 2);
-    // [FNV-TEST-DEFAULT] was 1000.0f -- captured from the FNV config 2026-09-05 for
-    // world-space cloud testing. NOT a shipping default; revert before merge.
-    RTX_OPTION_ARGS("rtx.atmosphere", float, aerialPerspectiveSceneShadowRangeMeters, 4600.0f,
+    RTX_OPTION_ARGS("rtx.atmosphere", float, aerialPerspectiveSceneShadowRangeMeters, 1000.0f,
                "How far from the camera, in meters, scene geometry is allowed to shadow the aerial perspective "
                "column. Samples past this trace nothing and are treated as sunlit, which is what the air above the "
                "rooftops actually is - and a ray launched from kilometres out would only pay for a bounds test it "
@@ -418,13 +412,9 @@ public:
                "overrides the sun light's half-angle WITHOUT changing the visible sun disc — larger = "
                "softer penumbra, for artistic soft shadows under a small sun.");
     RTX_OPTION("rtx.atmosphere", float, sunIntensity, 1.0f, "Strength of Sun.");
-    // [FNV-TEST-DEFAULT] was 15.0f -- captured from the FNV config 2026-09-05 for
-    // world-space cloud testing. NOT a shipping default; revert before merge.
-    RTX_OPTION("rtx.atmosphere", float, sunElevation, 50.0f,
+    RTX_OPTION("rtx.atmosphere", float, sunElevation, 15.0f,
                "Sun elevation in degrees. Game-drivable per-frame; persists when saved unless overridden by a runtime push.");
-    // [FNV-TEST-DEFAULT] was 0.0f -- captured from the FNV config 2026-09-05 for
-    // world-space cloud testing. NOT a shipping default; revert before merge.
-    RTX_OPTION("rtx.atmosphere", float, sunRotation, 254.37f,
+    RTX_OPTION("rtx.atmosphere", float, sunRotation, 0.0f,
                "Sun rotation in degrees. Game-drivable per-frame; persists when saved unless overridden by a runtime push.");
 
     RTX_OPTION("rtx.atmosphere", bool, flipUpAxis, false,
@@ -705,9 +695,7 @@ public:
 
     RTX_OPTION("rtx.atmosphere", bool, cloudEnabled, true, "Enable procedural cloud rendering.");
     RTX_OPTION("rtx.atmosphere", float, cloudDensity, 4.0f, "Cloud opacity/density multiplier.");
-    // [FNV-TEST-DEFAULT] was 1.3f -- captured from the FNV config 2026-09-05 for
-    // world-space cloud testing. NOT a shipping default; revert before merge.
-    RTX_OPTION("rtx.atmosphere", float, cloudAltitude, 0.8f, "Cloud layer altitude in kilometers.");
+    RTX_OPTION("rtx.atmosphere", float, cloudAltitude, 1.3f, "Cloud layer altitude in kilometers.");
     RTX_OPTION("rtx.atmosphere", Vector3, cloudColor, Vector3(0.89f, 0.92f, 1.0f), "Base cloud color (albedo).");
     RTX_OPTION("rtx.atmosphere", float, cloudWindSpeed, 0.02f, "Cloud drift speed in km/s. Clouds scroll with this velocity.");
     RTX_OPTION("rtx.atmosphere", float, cloudWindDirection, 45.0f, "Cloud wind direction in degrees (0 = +X, 90 = +Z).");
@@ -732,9 +720,7 @@ public:
                "0 = shadows fully muted (voxel grid still runs but its output is mixed away).");
     RTX_OPTION("rtx.atmosphere", uint32_t, cloudViewSamples, 32,
                "Number of ray-march steps through the cloud slab. Higher = better quality, more cost. Range 1..32.");
-    // [FNV-TEST-DEFAULT] was 3.05f -- captured from the FNV config 2026-09-05 for
-    // world-space cloud testing. NOT a shipping default; revert before merge.
-    RTX_OPTION("rtx.atmosphere", float, cloudThickness, 1.1f,
+    RTX_OPTION("rtx.atmosphere", float, cloudThickness, 3.05f,
                "Vertical depth of the cloud slab in km.");
     // rtx.atmosphere.cloudCurvature retired 2026-09-05 (world-space cloud migration Stage 1): fed
     // the now-deleted cloudPlanetRadius(), which shrank clouds onto a SEPARATE, smaller sphere
@@ -769,9 +755,7 @@ public:
                "shading contrast, lower = brighter, flatter body fill. (Doc fixed "
                "2026-07-14; the old text had the direction inverted.)");
 
-    // [FNV-TEST-DEFAULT] was 1.0f -- captured from the FNV config 2026-09-05 for
-    // world-space cloud testing. NOT a shipping default; revert before merge.
-    RTX_OPTION("rtx.atmosphere", float, cloudTypeMean, 0.1f,
+    RTX_OPTION("rtx.atmosphere", float, cloudTypeMean, 1.0f,
                "Mean cloud type across the sky [0,1]: 0=stratus, 0.5=stratocumulus, 1=cumulus.");
     RTX_OPTION("rtx.atmosphere", float, cloudTypeSpread, 0.54f,
                "Spatial variation amplitude for cloud type [0,1]. 0=uniform, 1=full range across the sky.");
@@ -779,9 +763,7 @@ public:
                "Region size frequency for type noise. Numerically smaller = larger spatial features. "
                "Capped at 0.0034 in the UI because faster variation puts visible 2D-noise cell "
                "structure at sub-cumulus scales (regular grid of cumulus blobs).");
-    // [FNV-TEST-DEFAULT] was 0.29f -- captured from the FNV config 2026-09-05 for
-    // world-space cloud testing. NOT a shipping default; revert before merge.
-    RTX_OPTION("rtx.atmosphere", float, cloudCoverageMean, 0.16f,
+    RTX_OPTION("rtx.atmosphere", float, cloudCoverageMean, 0.29f,
                "Mean cloud coverage across the sky [0,1]: 0=clear, 1=overcast.");
     RTX_OPTION("rtx.atmosphere", float, cloudCoverageSpread, 0.0f,
                "Spatial variation amplitude for coverage [0,1]. 0=uniform, 1=full range.");
@@ -801,9 +783,7 @@ public:
 
     // Per-column model: derives per-cloud base/top from a baked placement map and re-keys all vertical shaping
     // on each cloud's own normalized height, fixing the old "stacked disconnected puffs" read.
-    // [FNV-TEST-DEFAULT] was 2.0f -- captured from the FNV config 2026-09-05 for
-    // world-space cloud testing. NOT a shipping default; revert before merge.
-    RTX_OPTION("rtx.atmosphere", float, cloudCellSizeKm, 1.4f,
+    RTX_OPTION("rtx.atmosphere", float, cloudCellSizeKm, 2.0f,
                "Average cloud-cluster footprint in km [0.5..6] for the "
                "placement map bake. Smaller = many small clouds; larger = "
                "fewer, broader banks. Re-bakes the placement map live on "
@@ -833,9 +813,7 @@ public:
                "level-set offset small; re-bakes amortized only when the "
                "drift crosses a step). Nonzero pins the bake nominal for "
                "debugging or look-tuning.");
-    // [FNV-TEST-DEFAULT] was 0.6f -- captured from the FNV config 2026-09-05 for
-    // world-space cloud testing. NOT a shipping default; revert before merge.
-    RTX_OPTION("rtx.atmosphere", float, nvdfProfileDepthKm, 0.38f,
+    RTX_OPTION("rtx.atmosphere", float, nvdfProfileDepthKm, 0.6f,
                "Nubis3: depth into the cloud body (km) over which the "
                "dimensional profile ramps 0 -> 1 [0.1..3]. Small = dense "
                "hard-shelled clouds; large = soft translucent-edged bodies. "
@@ -846,9 +824,7 @@ public:
                "coverage changes grow/shrink clouds more aggressively "
                "(bodies merge sooner at high coverage). Applies live with "
                "zero rebakes.");
-    // [FNV-TEST-DEFAULT] was 0.42f -- captured from the FNV config 2026-09-05 for
-    // world-space cloud testing. NOT a shipping default; revert before merge.
-    RTX_OPTION("rtx.atmosphere", float, nubis3ErosionStrength, 0.36f,
+    RTX_OPTION("rtx.atmosphere", float, nubis3ErosionStrength, 0.42f,
                "Nubis3: scale on the wispy/billowy noise composite that "
                "erodes the dimensional profile [0..2]. 0 = smooth un-eroded "
                "bodies (pure SDF blobs); 1 = paper-faithful erosion; higher "
@@ -858,9 +834,7 @@ public:
                "[0..1], which lifts low densities to bring out definition "
                "in wisps and edges. 0 = off (raw erosion output). Applies "
                "live.");
-    // [FNV-TEST-DEFAULT] was 1.5f -- captured from the FNV config 2026-09-05 for
-    // world-space cloud testing. NOT a shipping default; revert before merge.
-    RTX_OPTION("rtx.atmosphere", float, nvdfBodyErosionStrength, 0.0f,
+    RTX_OPTION("rtx.atmosphere", float, nvdfBodyErosionStrength, 1.5f,
                "Nubis3: strength of the 3D noise carve applied to the cloud "
                "BODIES in the NVDF occupancy bake [0..1.5]. The carve shifts "
                "the placement waterline per voxel, baking concavity "
@@ -873,9 +847,7 @@ public:
                "high-frequency noise into the erosion composite close to the "
                "camera for fly-through crispness. 1 = the paper's 10% max "
                "mix at the nearest range; 0 = off. Applies live.");
-    // [FNV-TEST-DEFAULT] was 1.11f -- captured from the FNV config 2026-09-05 for
-    // world-space cloud testing. NOT a shipping default; revert before merge.
-    RTX_OPTION("rtx.atmosphere", float, nubis3ShapeVarietyKm, 0.79f,
+    RTX_OPTION("rtx.atmosphere", float, nubis3ShapeVarietyKm, 1.11f,
                "Nubis3: mid-frequency SHAPE displacement amplitude in km "
                "[0..1.5] (the GT7 mid-band role). Pushes/pulls the body "
                "iso-surface by up to half this at ~2.4 km wavelengths — "
@@ -907,9 +879,7 @@ public:
                "granulation on lit faces and scalloped wisp edges, the grain "
                "the sqrt-adaptive march can resolve but the base texture "
                "tops out above. 0 = off. Applies live.");
-    // [FNV-TEST-DEFAULT] was 2.28f -- captured from the FNV config 2026-09-05 for
-    // world-space cloud testing. NOT a shipping default; revert before merge.
-    RTX_OPTION("rtx.atmosphere", float, nubis3EdgeErosion, 1.56f,
+    RTX_OPTION("rtx.atmosphere", float, nubis3EdgeErosion, 2.28f,
                "Nubis3: edge wisp cut [0..3]. Extra erosion shaped by the "
                "wispy noise channel, concentrated at the silhouette and "
                "fading by mid-shell — cuts trailing wisp shapes out of cloud "
@@ -951,9 +921,7 @@ public:
                "defaults). Raise the spacing or lower the cap to trade "
                "quality for speed; 0 = legacy fixed count (banding "
                "returns). Applies live.");
-    // [FNV-TEST-DEFAULT] was 64 -- captured from the FNV config 2026-09-05 for
-    // world-space cloud testing. NOT a shipping default; revert before merge.
-    RTX_OPTION("rtx.atmosphere", uint32_t, cloudViewSamplesMax, 256,
+    RTX_OPTION("rtx.atmosphere", uint32_t, cloudViewSamplesMax, 64,
                "Hard cap on cloud samples per ray [32..256] — the "
                "performance governor for cloudViewStepKm. 64 resolves the "
                "default spacing out to ~6 km of cloud span; lower costs "
