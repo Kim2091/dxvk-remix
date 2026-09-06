@@ -431,9 +431,12 @@ namespace dxvk {
     // dispatch runs) at composite's own descriptor slots — see applyCloudComposite in
     // composite.comp.slang for why the composite lives here now instead of in evalSkyRadiance.
     // atmosphere.initialize() is not called here: RtxAtmosphere::bindResources (called earlier, for
-    // the G-buffer pass's common ray-tracing bindings) already initialized these resources and
-    // resolved this frame's cloud-history ping-pong swap; composite must read the SAME resolved
-    // Prev/Curr pair, not swap again.
+    // the G-buffer pass's common ray-tracing bindings) already initialized these resources.
+    // This frame's cloud-history ping-pong swap is resolved earlier still, in
+    // RtxAtmosphere::updateFrame (fork -- moved there 2026-09-06, open issue #2; it used to be
+    // resolved by whichever RT pass bound the common resources first, which made this dependency
+    // an unwritten assumption rather than an ordering guarantee). Composite must read the SAME
+    // resolved Prev/Curr pair, not swap again.
     {
       const Resources::Resource& cloudRenderRT = atmosphere.getCloudRenderRT();
       if (cloudRenderRT.isValid()) {

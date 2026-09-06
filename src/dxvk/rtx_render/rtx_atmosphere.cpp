@@ -2780,6 +2780,16 @@ AtmosphereArgs RtxAtmosphere::updateFrame(RtxContext& ctx,
   advanceCloudMotion(deltaTimeSeconds);
   advanceTimeCycle(deltaTimeSeconds);
 
+  // Cloud temporal history is frame state too (fork -- 2026-09-06, open issue #2; was resolved
+  // from bindResources, i.e. from whichever RT pass bound first). Advancing it here puts it with
+  // the other once-per-frame integrators above and ahead of every consumer: the cloud screen pass,
+  // the RT passes' bindings, and the composite all run later in the frame and now read a pair that
+  // is already resolved. Sitting after the non-Numos early return above is deliberate -- with the
+  // Numos sky off there is no cloud history worth allocating or swapping, and bindResources'
+  // isValid() guards already handle the resources simply not existing.
+  onFrameAdvanceForCloudHistory(static_cast<uint32_t>(ctx.getDevice()->getCurrentFrameId()));
+  ensureCloudHistoryResources(&ctx, ctx.getResourceManager().getDownscaleDimensions());
+
   const RtCamera& camera = ctx.getSceneManager().getCamera();
   const Vector3 forward = camera.getDirection(/*freecam=*/true);
   const Vector3 right   = camera.getRight(/*freecam=*/true);
@@ -2998,10 +3008,18 @@ void RtxAtmosphere::bindResources(RtxContext& ctx) {
     ctx.bindResourceView(BINDING_ATMOSPHERE_CLOUD_SECONDARY_LUT, m_cloudSecondaryLut.view, nullptr);
   }
 
-  onFrameAdvanceForCloudHistory(static_cast<uint32_t>(ctx.getDevice()->getCurrentFrameId()));
-  const VkExtent3D downscaledExtent = ctx.getResourceManager().getDownscaleDimensions();
-  ensureCloudHistoryResources(&ctx, downscaledExtent);
-
+  // The cloud-history ping-pong advance and the resource allocation used to happen HERE (fork --
+  // moved to updateFrame 2026-09-06, open issue #2). This function is reached once per RT pass
+  // that binds the common ray-tracing resources, not once per frame, so per-frame state was being
+  // advanced from whichever pass happened to bind first. It was idempotent -- the advance
+  // early-outs on a repeated frame id -- so it was not broken, but the ownership was wrong in a
+  // way that would bite silently: the composite reads the resolved Prev/Curr pair and merely
+  // ASSUMED some earlier pass had resolved it, so disabling or reordering RT passes could leave
+  // the composite reading an unswapped pair with nothing to indicate why. updateFrame runs exactly
+  // once per frame, before any of these passes (RtxContext::injectRTX calls
+  // updateRaytraceArgsConstantBuffer at rtx_context.cpp:680, well ahead of dispatchPathTracing at
+  // :686), so the pair is already resolved by the time anything binds it. This function now only
+  // reads it.
   const auto& cloudPrev = getPreviousCloudHistory();
   const auto& cloudCurr = getCurrentCloudHistory();
   if (cloudPrev.isValid()) {
