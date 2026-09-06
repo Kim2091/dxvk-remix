@@ -1137,6 +1137,18 @@ public:
                "crisper, faster-responding clouds with more visible per-frame "
                "jitter. 0 disables the temporal blend entirely (raw jittered "
                "march). 0.92 = the previous hardcoded value. Applies live.");
+    // Ray-reconstruction routing of the cloud composite (fork — 2026-09-05, ghosting follow-up).
+    // Composite-only, like cloudHistoryWeight: it reaches the shader through CompositeArgs, never
+    // AtmosphereArgs, so it is invisible to every bake and LUT cache key by construction.
+    RTX_OPTION("rtx.atmosphere", bool, cloudCompositeRRTransparencyLayer, true,
+               "With DLSS ray reconstruction, composite the cloud in-scatter that lands on "
+               "GEOMETRY through RR's transparency (particle) layer instead of the denoised "
+               "radiance. RR reprojects the denoised signal with each surface's own motion "
+               "vector, which the cloud does not follow, so cloud fog on moving geometry "
+               "otherwise smears behind it (a raised Pip-Boy, terrain sliding past while "
+               "walking). Sky pixels are unaffected either way. Inert without ray "
+               "reconstruction or when rtx.rayreconstruction.particleBufferMode is None. "
+               "Disable to A/B the artefact. Applies live.");
 
     RTX_OPTION("rtx.atmosphere", bool, cloudSecondaryLutEnable, true,
                "Supply clouds to secondary rays (indirect bounces, PSR, "

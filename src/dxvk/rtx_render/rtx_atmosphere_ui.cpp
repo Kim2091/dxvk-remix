@@ -1585,6 +1585,14 @@ void RtxAtmosphere::showImguiSettings(WeatherBlender* blender) {
             "lower = crisper detail with more visible per-frame jitter. "
             "0 = raw jittered march (no temporal blend). 0.92 = previous "
             "hardcoded behavior. Applies live.");
+        RemixGui::Checkbox("RR Transparency Layer For Cloud On Geometry",
+                           &RtxAtmosphere::cloudCompositeRRTransparencyLayerObject());
+        RemixGui::SetTooltipToLastWidgetOnHover(
+            "With DLSS ray reconstruction, route the cloud fog composited onto "
+            "geometry through RR's transparency layer so RR does not reproject "
+            "it with the surface's motion vector. Fixes cloud smearing behind "
+            "moving geometry (Pip-Boy, terrain while walking). Sky pixels are "
+            "unaffected. Uncheck to A/B. Applies live.");
         RemixGui::DragFloat("Cloud Sample Spacing", &RtxAtmosphere::cloudViewStepKmObject(),
                             0.01f, 0.0f, 1.0f, "%.2f km", sliderFlags);
         RemixGui::SetTooltipToLastWidgetOnHover(

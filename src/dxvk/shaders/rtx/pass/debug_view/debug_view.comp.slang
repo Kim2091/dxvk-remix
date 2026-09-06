@@ -944,7 +944,11 @@ vec4 loadInput(inout RNG randomState, ivec2 threadId)
       }
       else
       {
-        const CameraDirections rayDirections = cameraPixelCoordinateToDirection(cb.camera, ivec2(threadId));
+        // jitter = false, in lockstep with composite's cloudReprojectionMotionVectorPixels (fork —
+        // 2026-09-05, ghosting follow-up): the cloud RT and its history are pixel-centre quantities,
+        // so the reprojected direction must be the unjittered one -- see that function's comment.
+        const CameraDirections rayDirections =
+          cameraPixelCoordinateToDirection(cb.camera, ivec2(threadId), /*jitter=*/ false);
         const bool isZUpFlag = (cb.isZUp != 0u);
         const bool flipUpAxis = (cb.atmosphereArgs.flipUpAxis != 0);
         const vec3 viewDirYUp = normalize(worldToAtmosphereYUp(

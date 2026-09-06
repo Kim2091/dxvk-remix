@@ -737,15 +737,20 @@ vec2 sampleCloudDepthKm(uint2 pixelCoordinate, AtmosphereArgs args)
 // Depth-ratio visibility rule (fork — 2026-09-05). Answers "how much of the marched cloud actually
 // sits between the camera and a surface at surfaceKm" using only the depth companion's entry/mean.
 // entryKm < 0 means the march never found any cloud along this ray at all (cloud_render.comp.slang's
-// sentinel) -- 0 visibility, nothing to composite. Otherwise the march's own depth-aware clamp
-// (Stage 4a: tMaxClamp = this pixel's own surface distance) already guarantees entryKm <= meanKm <=
-// surfaceKm for the pixel the RT was actually written at, so at cloudRenderResolutionScale = 1.0 this
-// saturates to 1 everywhere a real opaque hit exists -- a deliberate no-op that keeps a fogged-hill
-// pixel's own value exactly what the march produced. Below scale 1.0 the color channel is
-// BILINEARLY upsampled (sampleCloudRenderRT) and can blend in a farther neighbour's brighter cloud
-// sample; this is the one-tap safeguard against that bleeding onto a surface that is provably nearer
-// than any cloud (surfaceKm < entryKm ramps to 0). It is not a bilateral resample -- that is Stage
-// 6's job (bilateral upsample tuning is explicitly out of scope here) -- just a correctness clamp.
+// sentinel) -- 0 visibility, nothing to composite.
+//
+// Since e7298993f this is THE geometry occlusion for the cloud composite, not a safeguard (fork —
+// 2026-09-05, ghosting follow-up; the earlier text here still described it as a no-op left over from
+// Stage 4a's march-side clamp). The march no longer clamps to PrimaryLinearViewZ --
+// cloud_render.comp.slang marches the full reachable span at every pixel so the RT, and the temporal
+// history built on it, stays a pure function of view direction -- so the only thing standing between
+// a marched cloud and the surface in front of it is this ramp, applied per frame AFTER the EMA. A
+// surface at or beyond the transmittance-weighted mean depth gets the full composite, one nearer than
+// the entry gets none, and one in between gets a proportional blend: a soft, depth-uncertain answer,
+// which is the honest one for a volume whose only per-pixel depth summary is (entry, mean). Removing
+// or short-circuiting it would fog every near surface, Pip-Boy included. The 50 m feather floor also
+// bounds the ramp when the eye is inside the deck (entryKm == 0), where mean - entry can be
+// arbitrarily small.
 float cloudDepthVisibility(float entryKm, float meanKm, float surfaceKm)
 {
   if (entryKm < 0.0f)
@@ -826,13 +831,29 @@ vec2 cloudParallaxMotionVectorPixels(vec3 viewDirYUp, float depthKm, AtmosphereA
 // Combined reprojection motion vector for the cloud history: rotation (reliable on this target) plus
 // the translation parallax correction above (the signal the rotation-only term structurally cannot
 // carry). `depthKm` should be the pixel's own mean cloud depth (already floored by the caller).
-vec2 cloudReprojectionMotionVectorPixels(
-  uint2 pixelCoordinate, CameraDirections primaryRayDirections, float depthKm, AtmosphereArgs args)
+//
+// UNJITTERED direction, deliberately (fork — 2026-09-05, ghosting follow-up). The cloud RT is marched
+// from pixel-centre rays (cloud_render.comp.slang builds its own NDC from pixelCoord + 0.5, no
+// jitter) and the history it feeds is indexed by pixel, so the quantity being reprojected is "the
+// cloud along the UNJITTERED direction of pixel p". The rest of composite reconstructs
+// primaryRayDirections WITH the DLSS jitter (cameraPixelCoordinateToDirection's two-argument overload
+// defaults to jitter = true), which is right for everything that has to line up with the path
+// tracer's jittered primary rays and wrong here: projecting a jittered direction through
+// prevWorldToProjection and differencing against the unjittered NDC of cameraPixelCoordinateToNDC
+// leaves the per-frame jitter (Halton 2/3, up to +-0.5 px at render resolution) baked into the motion
+// vector, and floor(x + 0.5) then rounds the history fetch to the wrong neighbour on roughly half of
+// all frames -- a permanent ~1 px wobble of the reprojected history under DLSS, i.e. a spatial blur of
+// the smoothed deck, not a trail. calcMotionVectorForRayMiss, which this duplicates, passes
+// jitter = false for exactly this reason; the Stage 4b port reused composite's jittered directions.
+vec2 cloudReprojectionMotionVectorPixels(uint2 pixelCoordinate, float depthKm, AtmosphereArgs args)
 {
-  const vec3 viewDirYUp = normalize(worldToAtmosphereYUp(
-    primaryRayDirections.worldDirection, args.isZUp != 0u, args.flipUpAxis != 0));
+  const CameraDirections cloudRayDirections =
+    cameraPixelCoordinateToDirection(cb.camera, ivec2(pixelCoordinate), /*jitter=*/ false);
 
-  const vec2 rotationMV = cloudRotationMotionVectorPixels(primaryRayDirections.worldDirection, pixelCoordinate);
+  const vec3 viewDirYUp = normalize(worldToAtmosphereYUp(
+    cloudRayDirections.worldDirection, args.isZUp != 0u, args.flipUpAxis != 0));
+
+  const vec2 rotationMV = cloudRotationMotionVectorPixels(cloudRayDirections.worldDirection, pixelCoordinate);
   const vec2 parallaxMV = cloudParallaxMotionVectorPixels(viewDirYUp, depthKm, args);
   return rotationMV + parallaxMV;
 }
@@ -840,18 +861,24 @@ vec2 cloudReprojectionMotionVectorPixels(
 // Composites the Nubis Cubed cloud render RT (m_cloudRenderRT / m_cloudDepthRT, written this frame
 // by RtxAtmosphere::dispatchCloudScreenPass, called right after dispatchPathTracing) over BOTH sky
 // and geometry. Previously (pre-Stage-4a) this only ran on sky-miss pixels, because it lived inside
-// evalSkyRadiance's primary-miss branch; it now also runs on opaque hits, because the cloud march
-// clamps against PrimaryLinearViewZ (Stage 4a) -- a hill whose surface pokes up INTO the deck
-// genuinely has cloud in front of it along this ray, and the whole point of this stage is to fog it
-// exactly as the sky is fogged, rather than leaving it (and any foliage on it) crisp.
+// evalSkyRadiance's primary-miss branch; it now also runs on opaque hits, gated per frame by
+// cloudDepthVisibility against the resolved surface distance -- a hill whose surface pokes up INTO
+// the deck genuinely has cloud in front of it along this ray, and the whole point of this stage is to
+// fog it exactly as the sky is fogged, rather than leaving it (and any foliage on it) crisp.
+//
+// backgroundAlpha / particleLayerOutput (fork — 2026-09-05, ghosting follow-up): the alpha-blend
+// surface's coverage (applyVolumetricLighting's backgroundAlpha) and the DLSS-RR transparency layer,
+// needed by the alpha-blend in-scatter weighting and the ray-reconstruction routing respectively --
+// see the two composite blocks at the end of this function.
 void applyCloudComposite(
   uint2 pixelCoordinate,
   bool primaryMiss,
   float viewDistance,
   uint frameIdx,
-  CameraDirections primaryRayDirections,
+  float backgroundAlpha,
   inout vec3 radianceOutput,
   inout vec3 alphaBlendOutput,
+  inout vec4 particleLayerOutput,
   bool alphaBlendSurfaceValid,
   float alphaBlendHitDistance)
 {
@@ -898,7 +925,7 @@ void applyCloudComposite(
   if (all(cb.camera.resolution > uint2(0u, 0u)))
   {
     const vec2 motionVectorPixels = cloudReprojectionMotionVectorPixels(
-      pixelCoordinate, primaryRayDirections, max(meanKm, 0.05f), args);
+      pixelCoordinate, max(meanKm, 0.05f), args);
     const vec2 prevPixelF = vec2(pixelCoordinate) + motionVectorPixels;
     const int2 prevPixel = int2(floor(prevPixelF + 0.5f));
 
@@ -945,8 +972,8 @@ void applyCloudComposite(
   // ---- Opaque geometry: occlusion applied HERE, after the EMA (fork — 2026-09-05, Stage 4b fix).
   // smoothedCloud is the temporally stable, view-direction-only cloud along this ray; how much of
   // it sits in FRONT of the resolved surface is a per-frame property of this frame's depth buffer
-  // and must never enter the history. Structurally identical to the alpha-blend path below, which
-  // is where this pattern was already correct.
+  // and must never enter the history. Same shape as the alpha-blend path below, which was already
+  // gating after the EMA (though see the (1 - backgroundAlpha) note there).
   float opaqueVisibility = 1.0f;
   if (!primaryMiss)
   {
@@ -954,28 +981,80 @@ void applyCloudComposite(
     opaqueVisibility = cloudDepthVisibility(entryKm, meanKm, surfaceKm);
   }
 
-  // Premultiplied over -- identical operation to the removed evalSkyRadiance code, just relocated.
-  // On a sky pixel opaqueVisibility is 1.0 and this is exactly that operation.
-  radianceOutput = radianceOutput * (1.0f - smoothedCloud.a * opaqueVisibility)
-                 + smoothedCloud.rgb * opaqueVisibility;
+  // Ray-reconstruction routing (fork — 2026-09-05, ghosting follow-up; design register item 10).
+  // radianceOutput ends up in the composite output DLSS-RR denoises, and RR reprojects that signal
+  // with the pixel's PRIMARY motion vector, which on a geometry hit is the surface's own. The cloud
+  // in-scatter composited onto that surface is not attached to the surface -- under translation it
+  // is screen-static, and under rotation it follows the rotation-only cloud reprojection above, not
+  // the surface's parallax -- so RR drags it along with the surface every frame and its history
+  // never agrees with the current frame: a bright cloud smear trailing any moving geometry (a
+  // Pip-Boy swinging up, terrain sliding past while walking), the artefact the design register
+  // anticipated for DLSS one stage after the EMA. The additive term is therefore routed into the RR
+  // transparency layer (NGX pInTransparencyLayer -- the same premultiplied layer secondary/PSR
+  // radiance and alpha-blended particles already use, composited by RR OVER its denoised output
+  // without that output's temporal history; DxvkRayReconstruction::particleBufferMode), and only the
+  // multiplicative transmittance stays in the denoised signal. That term is screen-static too, but a
+  // darkening dragged with a surface reads as a soft shadow rather than a bright trail, and
+  // demodulateAttenuation's 0.3 alpha floor makes a fully layer-based over impossible for dense cloud
+  // without leaking 30% of the surface through it -- so the split is deliberate, not partial. Like
+  // every other particle-layer term, the routed in-scatter is not touched by applyFog (see the
+  // disabled particle-layer fog line there). Sky pixels keep the full over in radianceOutput: their
+  // MV is rotation-only (calcMotionVectorForRayMiss), which IS the cloud's own motion, and this
+  // preserves "sky pixels unchanged" against the pre-4b path. With cb.outputParticleLayer == 0 (no RR,
+  // or particleBufferMode None) or rtx.atmosphere.cloudCompositeRRTransparencyLayer off, this is the
+  // plain premultiplied over -- identical to the removed evalSkyRadiance operation, just relocated.
+  const bool routeToTransparencyLayer =
+    (cb.outputParticleLayer != 0u) && (cb.cloudCompositeRRTransparencyLayer != 0u);
+
+  const float opaqueTransmittance = 1.0f - smoothedCloud.a * opaqueVisibility;
+  const vec3  opaqueInScatter     = smoothedCloud.rgb * opaqueVisibility;
+  if (routeToTransparencyLayer && !primaryMiss)
+  {
+    radianceOutput *= opaqueTransmittance;
+    particleLayerOutput.xyz += opaqueInScatter;
+  }
+  else
+  {
+    // On a sky pixel opaqueVisibility is 1.0 and this is exactly the pre-4b operation.
+    radianceOutput = radianceOutput * opaqueTransmittance + opaqueInScatter;
+  }
 
   // ---- Alpha-blended (foliage / particle) surfaces ----
-  // Depth-ratio rule (fork — 2026-09-05): the alpha-blend surface has no march-side depth clamp of
-  // its own (cloud_render.comp.slang only clamps against the OPAQUE PrimaryLinearViewZ, never
-  // against AlphaBlendGBuffer's hitT), so unlike the opaque path above, this gate is NOT a no-op --
-  // it is the only thing that keeps foliage from rendering crisp through a cloud the ground beneath
-  // it is already fogged by. Reuses cloudDepthVisibility exactly as the opaque path does: a surface
-  // at or beyond the cloud's mean depth is "as deep into the cloud as the marched mass" and gets the
-  // full smoothedCloud composite; one entirely in front of the cloud's entry gets none; a surface
-  // partway between entry and mean gets a proportional blend. Foliage sitting on the same ground the
-  // opaque composite above just fogged will read alphaSurfaceKm ~= surfaceKm and so end up fogged the
-  // same amount -- the specific "crisp foliage in a foggy scene" artefact this item exists to avoid.
+  // Depth-ratio rule (fork — 2026-09-05): the same cloudDepthVisibility gate as the opaque path,
+  // evaluated against the alpha-blend surface's OWN hit distance (AlphaBlendGBuffer's hitT) rather
+  // than the opaque PrimaryLinearViewZ behind it -- a surface at or beyond the cloud's mean depth is
+  // "as deep into the cloud as the marched mass" and gets the full smoothedCloud composite; one
+  // entirely in front of the cloud's entry gets none; a surface partway between entry and mean gets a
+  // proportional blend. Foliage sitting on the same ground the opaque composite above just fogged
+  // will read alphaSurfaceKm ~= surfaceKm and so end up fogged the same amount -- the specific "crisp
+  // foliage in a foggy scene" artefact this item exists to avoid.
   if (alphaBlendSurfaceValid && entryKm >= 0.0f)
   {
     const float alphaSurfaceKm = alphaBlendHitDistance * kmPerWorldUnit;
     const float alphaVisibility = cloudDepthVisibility(entryKm, meanKm, alphaSurfaceKm);
-    alphaBlendOutput = alphaBlendOutput * (1.0f - smoothedCloud.a * alphaVisibility)
-                     + smoothedCloud.rgb * alphaVisibility;
+
+    // alphaBlendOutput is PREMULTIPLIED by the surface's own coverage: applyVolumetricLighting scales
+    // it by (1 - backgroundAlpha) before returning it, and finalOutput adds it to radianceOutput *
+    // backgroundAlpha. Any in-scatter added over it must carry the same factor -- exactly as that
+    // function's own fog and volumetric in-scatter terms do. Stage 4b added the cloud in-scatter at
+    // full weight (fixed here, fork — 2026-09-05, ghosting follow-up): on a mostly transparent alpha
+    // surface (backgroundAlpha -> 1) the pixel then received the cloud twice, once through
+    // radianceOutput and once here -- a bright cloud fringe on every foliage edge inside the deck.
+    // The transmittance needs no such factor; it multiplies a value that already carries it.
+    const float alphaTransmittance = 1.0f - smoothedCloud.a * alphaVisibility;
+    const vec3  alphaInScatter     = smoothedCloud.rgb * alphaVisibility * (1.0f - backgroundAlpha);
+    if (routeToTransparencyLayer)
+    {
+      // Same RR reasoning as the opaque block: the alpha-blend radiance is part of the signal RR
+      // denoises and reprojects with the primary motion vector, so its cloud in-scatter goes to the
+      // transparency layer as well, transmittance stays multiplicative.
+      alphaBlendOutput *= alphaTransmittance;
+      particleLayerOutput.xyz += alphaInScatter;
+    }
+    else
+    {
+      alphaBlendOutput = alphaBlendOutput * alphaTransmittance + alphaInScatter;
+    }
   }
 }
 
@@ -1169,9 +1248,12 @@ vec4 compositeResult(
   // zero contribution) + sharedRadiance (the cloudless sky/atmosphere/star/moon radiance
   // geometry_resolver.slangh wrote) + volumetrics; for a geometry hit it is the denoised primary
   // radiance with aerial perspective already folded in.
+  // backgroundAlpha and particleLayerOutput (fork — 2026-09-05, ghosting follow-up): the alpha-blend
+  // coverage the in-scatter must be weighted by, and the DLSS-RR transparency layer the geometry
+  // in-scatter is routed into -- see applyCloudComposite's two composite blocks.
   applyCloudComposite(
-    pixelCoordinate, primaryMiss, viewDistance, cb.frameIdx, primaryRayDirections,
-    radianceOutput, alphaBlendOutput, alphaBlendSurfaceValid, alphaBlendHitDistance);
+    pixelCoordinate, primaryMiss, viewDistance, cb.frameIdx, backgroundAlpha,
+    radianceOutput, alphaBlendOutput, particleLayerOutput, alphaBlendSurfaceValid, alphaBlendHitDistance);
 
   // Add sky radiance
   applySkyContribution(pixelCoordinate, primaryRayDirections, primaryMiss, radianceScale, volumeAttenuation, radianceOutput);

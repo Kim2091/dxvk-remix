@@ -510,6 +510,10 @@ namespace dxvk {
     // Stage 4b) — see composite_args.h's doc comment on this field for why it exists outside
     // AtmosphereArgs. `atmosphere` was already fetched above for the aerial perspective LUT.
     compositeArgs.cloudAnchorDeltaYUpKm = atmosphere.getCloudAnchor().deltaKm;
+    // Cloud-on-geometry in-scatter -> RR transparency layer (fork — 2026-09-05, ghosting follow-up).
+    // The shader additionally requires outputParticleLayer (set just below), so this is inert
+    // without ray reconstruction or with particleBufferMode == None.
+    compositeArgs.cloudCompositeRRTransparencyLayer = RtxAtmosphere::cloudCompositeRRTransparencyLayer() ? 1u : 0u;
     compositeArgs.outputParticleLayer = ctx->useRayReconstruction() && rayReconstruction.useParticleBuffer();
     compositeArgs.outputSecondarySignalToParticleLayer = ctx->useRayReconstruction() && rayReconstruction.preprocessSecondarySignal();
     compositeArgs.enableDemodulateAttenuation = ctx->useRayReconstruction() && rayReconstruction.demodulateAttenuation();

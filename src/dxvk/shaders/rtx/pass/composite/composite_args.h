@@ -129,5 +129,10 @@ struct CompositeArgs {
   // the one place a translation signal for that correction can come from. See
   // applyCloudComposite / cloudParallaxMotionVectorPixels in composite.comp.slang.
   vec3 cloudAnchorDeltaYUpKm;
-  float pad2;
+  // Routes the cloud in-scatter composited onto GEOMETRY into the DLSS-RR transparency layer instead
+  // of the denoised radiance (fork — 2026-09-05, ghosting follow-up; design register item 10). Rides
+  // the former pad2 slot, so the CB layout is unchanged. Only consulted when outputParticleLayer is
+  // set; see applyCloudComposite in composite.comp.slang. Mirrors
+  // rtx.atmosphere.cloudCompositeRRTransparencyLayer.
+  uint cloudCompositeRRTransparencyLayer;
 };
