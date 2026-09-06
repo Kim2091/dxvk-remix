@@ -39,8 +39,9 @@
 //     first caller to pass a nonzero tMaxClamp (fork — 2026-09-05, world-space cloud migration
 //     Stage 4a): it clamps the march to the resolved primary-ray surface, using the depth
 //     conversion documented at that call site. cloud_secondary_lut.comp.slang still passes 0/0.
-//   * marchCloudLayers also reports two depth-companion outputs (Stage 4a): entryDistanceKm (where
-//     the layer-1 span started) and meanCloudDepthKm (a transmittance-weighted mean distance
+//   * marchCloudLayers also reports two depth-companion outputs (Stage 4a): entryDistanceKm (the nearest
+//     distance at which EITHER layer found actual cloud material, -1 if neither did; this was
+//     "where the layer-1 span started" before 2026-09-06) and meanCloudDepthKm (a transmittance-weighted mean distance
 //     through whatever cloud material either layer found), both in km. Threaded down through
 //     marchCloudSlab / marchEchoDeck / integrateCloudSample — see the accumulator parameters on
 //     each. Only cloud_render.comp.slang's depth companion RT consumes them today.
@@ -796,7 +797,12 @@ bool integrateCloudSample(float tSampleKm,
                           // correctly accumulated) by callers that don't consume a depth output —
                           // cloud_secondary_lut.comp.slang passes throwaway locals.
                           inout float sumWeightedDistKm,
-                          inout float sumWeight) {
+                          inout float sumWeight,
+                          // Entry distance (fork -- 2026-09-06, occlusion accuracy). Nearest
+                          // distance along this ray at which the march actually found cloud
+                          // material, threaded through every caller so both layers narrow the
+                          // same value. -1 on entry means "nothing found yet".
+                          inout float firstDensityDistanceKm) {
   sdfStepKmOut = 0.0f;
 
   // World-anchored sample position (Y-up km). The slab intersection in the
@@ -846,6 +852,15 @@ bool integrateCloudSample(float tSampleKm,
                                            sdfStepKmOut);
   if (density < 0.001f) {
     return false;
+  }
+
+  // First-density-hit entry (fork -- 2026-09-06, occlusion accuracy). Reuses the empty-sample
+  // gate immediately above as the definition of "cloud starts here", so this introduces no new
+  // threshold: whatever the march already counts as material is what sets the entry distance.
+  // Narrowed with a min rather than a plain first-write because the two layers share one value
+  // and either may hold the nearer cloud along a given ray.
+  if (firstDensityDistanceKm < 0.0f || tSampleKm < firstDensityDistanceKm) {
+    firstDensityDistanceKm = tSampleKm;
   }
 
   // ===== Contribution-weighted lighting LOD (fork — 2026-07-30, perf) =====
@@ -1132,11 +1147,18 @@ void marchCloudSlab(vec3   viewDirYUp,
   if (tEntry >= tExit || tExit <= 0.0f) return;
   tEntry = max(tEntry, 0.0f);
 
-  // Entry distance (fork — 2026-09-05, Stage 4a): geometric slab-entry distance, in km, regardless
-  // of whether any density is actually found along the ray -- "where the marched span started" is a
-  // property of the slab geometry, not the cloud coverage. Written only once every call reaches
-  // this point (every earlier `return` leaves the caller's initialized sentinel untouched).
-  entryDistanceKm = tEntry;
+  // Entry distance (fork — 2026-09-05, Stage 4a): this WAS the geometric slab-entry
+  // distance, in km, written regardless of whether any density was actually found along the ray --
+  // "where the marched span started" as a property of the slab geometry, not the cloud coverage.
+  //
+  // SUPERSEDED (fork -- 2026-09-06, occlusion accuracy). `entryDistanceKm = tEntry` used to sit
+  // here. Its consumer, cloudDepthVisibility in composite.comp.slang, ramps cloud occlusion up
+  // from the entry distance, so reporting where the slab GEOMETRY starts fogs every surface past
+  // that point even when the nearest actual cloud along the ray is kilometres further out --
+  // which is the "clouds drawn over geometry they should be behind" artefact. The distance is now
+  // narrowed to the first sample carrying real density, inside integrateCloudSample and inside
+  // marchEchoDeck. A ray whose slab is empty leaves the caller's -1 sentinel untouched: the
+  // honest answer, and the one loadCurrentCloudOpacity already reads as "no cloud on this pixel".
 
   // Adaptive step count (fork — 2026-06-12, adaptive march sampling). A
   // FIXED step count across a span that varies from ~4 km (zenith) to
@@ -1198,7 +1220,7 @@ void marchCloudSlab(vec3   viewDirYUp,
                                           typeNoiseEntry, typeNoiseExit,
                                           coverageNoiseEntry, coverageNoiseExit,
                                           ctx, args, accumColor, viewTransmittance,
-                                          sdfStepKm, sumWeightedDistKm, sumWeight);
+                                          sdfStepKm, sumWeightedDistKm, sumWeight, entryDistanceKm);
       // SDF empty-space skip (fork — Nubis3 conversion Phase C). The sampler
       // reported a guaranteed-empty radius around this sample (min hex tap,
       // coverage- and wobble-conservative); jump the loop index so the next
@@ -1276,7 +1298,7 @@ void marchCloudSlab(vec3   viewDirYUp,
                          typeNoiseEntry, typeNoiseExit,
                          coverageNoiseEntry, coverageNoiseExit,
                          ctx, args, accumColor, viewTransmittance,
-                         sdfStepKm, sumWeightedDistKm, sumWeight);
+                         sdfStepKm, sumWeightedDistKm, sumWeight, entryDistanceKm);
     t += stepKm;
   }
 
@@ -1338,11 +1360,15 @@ void marchEchoDeck(vec3   viewDirYUp,
                    // Depth-companion accumulators (fork — 2026-09-05, world-space cloud migration
                    // Stage 4a) — same running sums marchCloudSlab threads through
                    // integrateCloudSample, so the echo deck's contribution folds into the same
-                   // combined mean-depth estimate. No entryDistanceKm parameter here: layer 1
-                   // (marchCloudSlab) owns "where the marched span started" by definition (it
-                   // always marches first, front-to-back).
+                   // combined mean-depth estimate. entryDistanceKm is threaded here too (fork --
+                   // 2026-09-06, occlusion accuracy; layer 2 deliberately had no such parameter
+                   // before). Once entry means "first density hit" rather than "where layer 1's
+                   // slab started", layer 2 has to be able to set it: a ray crossing an empty
+                   // patch of layer 1 into cirrus would otherwise keep the -1 sentinel and have
+                   // its perfectly real layer-2 cloud zeroed by loadCurrentCloudOpacity.
                    inout float sumWeightedDistKm,
-                   inout float sumWeight) {
+                   inout float sumWeight,
+                   inout float entryDistanceKm) {
   // Slab intersection via the shared helper (fork — 2026-09-05, world-space cloud migration
   // Stage 1) — see cloudSlabSpan's comment and marchCloudSlab's identical swap above.
   float tEntry, tExit;
@@ -1515,6 +1541,11 @@ void marchEchoDeck(vec3   viewDirYUp,
     // existing expression: the accumColor write is byte-identical to before.
     float sampleWeight = viewTransmittance * aerialT_haze * (1.0f - stepTransmittance);
     accumColor += stepRadiance * viewTransmittance * aerialT_haze;
+    // Same first-density-hit narrowing layer 1 does inside integrateCloudSample. This site is
+    // already past this layer's own `density < 0.001f` gate, so reaching it means real material.
+    if (entryDistanceKm < 0.0f || t < entryDistanceKm) {
+      entryDistanceKm = t;
+    }
     sumWeightedDistKm += t * sampleWeight;
     sumWeight         += sampleWeight;
     viewTransmittance *= mix(1.0f, stepTransmittance, aerialT_fade);
@@ -1540,9 +1571,13 @@ void marchCloudLayers(vec3  viewDirYUp,
                       inout vec3  accumColor,
                       inout float viewTransmittance,
                       // Depth-companion outputs (fork — 2026-09-05, world-space cloud migration
-                      // Stage 4a). entryDistanceKm: the geometric slab-entry distance (km) of the
-                      // layer-1 march, or -1.0f if layer 1 never found a valid span (rare -- see
-                      // marchCloudSlab). meanCloudDepthKm: the transmittance-weighted mean distance
+                      // Stage 4a; redefined 2026-09-06, occlusion
+                      // accuracy). entryDistanceKm: the nearest distance (km) at which EITHER
+                      // layer found actual cloud material, or -1.0f if neither did -- an empty
+                      // slab and a slab with no cloud along this ray are deliberately the same
+                      // answer now, which is what lets cloudDepthVisibility stop fogging surfaces
+                      // that sit in front of the nearest real cloud.
+                      // meanCloudDepthKm: the transmittance-weighted mean distance
                       // (km) through whatever cloud material both layers found along the ray, or
                       // 0.0f if none (the running weight never left ~0). Only cloud_render.comp.slang
                       // consumes these; cloud_secondary_lut.comp.slang passes throwaway locals --
@@ -1623,7 +1658,7 @@ void marchCloudLayers(vec3  viewDirYUp,
                   tMinClamp, tMaxClamp,
                   ctx, args2,
                   accumColor, viewTransmittance,
-                  sumWeightedDistKm, sumWeight);
+                  sumWeightedDistKm, sumWeight, entryDistanceKm);
   }
 
   // Finalize the depth companion (fork — 2026-09-05, Stage 4a): both layers have now contributed

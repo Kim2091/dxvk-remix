@@ -748,16 +748,27 @@ vec2 sampleCloudDepthKm(uint2 pixelCoordinate, AtmosphereArgs args)
 // surface at or beyond the transmittance-weighted mean depth gets the full composite, one nearer than
 // the entry gets none, and one in between gets a proportional blend: a soft, depth-uncertain answer,
 // which is the honest one for a volume whose only per-pixel depth summary is (entry, mean). Removing
-// or short-circuiting it would fog every near surface, Pip-Boy included. The 50 m feather floor also
-// bounds the ramp when the eye is inside the deck (entryKm == 0), where mean - entry can be
-// arbitrarily small.
+// or short-circuiting it would fog every near surface, Pip-Boy included.
+//
+// The feather is now the cloud's own extent (fork -- 2026-09-06, occlusion accuracy). entryKm used
+// to be the geometric slab-entry distance, which made `mean - entry` a distance from an arbitrary
+// geometric boundary rather than a property of the cloud, and the 50 m floor existed to keep that
+// meaningless quantity from collapsing. entryKm is now the first distance at which either layer
+// found real density (see marchCloudLayers), so `mean - entry` is the real span from where the
+// cloud starts to its transmittance-weighted centre: the ramp is extent-proportional by
+// construction, wide for a deep cumulus tower and tight for a thin wisp, with no tuned constant.
+// What remains is a pure divide guard, three orders of magnitude below the old floor so that it
+// binds only on genuinely degenerate spans instead of quietly widening every thin cloud's ramp to
+// 50 m. The eye-inside-the-deck case the old floor also covered is handled by the redefinition
+// itself: with the eye in cloud the first density hit is ~0 and the centroid is well inside the
+// deck, so the span is large, not small.
 float cloudDepthVisibility(float entryKm, float meanKm, float surfaceKm)
 {
   if (entryKm < 0.0f)
   {
     return 0.0f;
   }
-  const float featherKm = max(meanKm - entryKm, 0.05f);  // 50 m floor guards the divide
+  const float featherKm = max(meanKm - entryKm, 1e-3f);  // 1 m: divide guard only, not a look knob
   return saturate((surfaceKm - entryKm) / featherKm);
 }
 
