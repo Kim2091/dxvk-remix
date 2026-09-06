@@ -1184,6 +1184,25 @@ void RtxAtmosphere::showImguiSettings(WeatherBlender* blender) {
             "Derived Position's y component before cloud and atmosphere placement. Set this to the "
             "raw camera height the ONCE calibration log in updateFrame reports for a location this "
             "game treats as ground level.");
+        // "Set to Here" (fork -- 2026-09-06, world-space cloud migration follow-up). The tooltip
+        // above asks the user to read a raw height out of a one-shot log line and retype it here.
+        // That retyping step is why this datum stayed at its 0.0 default on FNV -- and a zero datum
+        // silently redefines the Altitude slider from the "km above the ground" its own tooltip
+        // promises into "km above world Y=0". At the corrected unit scale (cloudScale ~0.704) the
+        // terrain itself sits well above that zero, so the deck lands far too high and the only way
+        // to push it back down is to bottom the Altitude slider out -- which is exactly what the
+        // 0.5 -> 0.05 km floor change in 03b1acff7 was working around. Capturing the anchor on the
+        // frame the player is standing on ground removes the retyping, and with it the workaround.
+        // NOTE: this stores a value in KM, so it is only valid for the scale it was captured at --
+        // rescaling cloudScale invalidates it. docs/cloud-units-proposal.md replaces this with
+        // groundLevelWorldUnits in raw engine units, which is scale-independent by construction.
+        if (ImGui::Button("Set to Here", ImVec2(120, 0))) {
+          RtxAtmosphere::seaLevelWorldKmObject().setDeferred(anchor.posYUpKm.y);
+        }
+        RemixGui::SetTooltipToLastWidgetOnHover(
+            "Set Sea Level to the resolved anchor's current height, so Altitude reads as height "
+            "above wherever the camera is standing right now. Stand somewhere the game treats as "
+            "ground level before clicking. Re-capture after changing Cloud Scene Unit Scale.");
         RemixGui::DragFloat("Altitude Scale", &RtxAtmosphere::altitudeScaleObject(),
                             0.01f, 0.0f, 100.0f, "%.3f", sliderFlags);
         RemixGui::SetTooltipToLastWidgetOnHover(
