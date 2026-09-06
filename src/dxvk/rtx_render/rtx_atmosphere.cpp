@@ -3018,25 +3018,13 @@ void RtxAtmosphere::bindResources(RtxContext& ctx) {
   // the composite reading an unswapped pair with nothing to indicate why. updateFrame runs exactly
   // once per frame, before any of these passes (RtxContext::injectRTX calls
   // updateRaytraceArgsConstantBuffer at rtx_context.cpp:680, well ahead of dispatchPathTracing at
-  // :686), so the pair is already resolved by the time anything binds it. This function now only
-  // reads it.
-  const auto& cloudPrev = getPreviousCloudHistory();
-  const auto& cloudCurr = getCurrentCloudHistory();
-  if (cloudPrev.isValid()) {
-    ctx.bindResourceView(BINDING_ATMOSPHERE_CLOUD_HISTORY_PREV, cloudPrev.view, nullptr);
-  }
-  if (cloudCurr.isValid()) {
-    ctx.bindResourceView(BINDING_ATMOSPHERE_CLOUD_HISTORY_CURR, cloudCurr.view, nullptr);
-  }
-
-  const auto& cloudFrameIdPrev = getPreviousCloudHistoryFrameId();
-  const auto& cloudFrameIdCurr = getCurrentCloudHistoryFrameId();
-  if (cloudFrameIdPrev.isValid()) {
-    ctx.bindResourceView(BINDING_ATMOSPHERE_CLOUD_HISTORY_FRAME_ID_PREV, cloudFrameIdPrev.view, nullptr);
-  }
-  if (cloudFrameIdCurr.isValid()) {
-    ctx.bindResourceView(BINDING_ATMOSPHERE_CLOUD_HISTORY_FRAME_ID_CURR, cloudFrameIdCurr.view, nullptr);
-  }
+  // :686), so the pair is already resolved by the time anything binds it. As of open issue #5
+  // below, this function no longer touches the pair at all.
+  // Cloud history is no longer bound here (fork -- 2026-09-06, open issue #5). These four
+  // resources were bound into every RT pass but read by none: the cloud temporal EMA lives in
+  // the composite, which binds them itself at COMPOSITE_ATMOSPHERE_CLOUD_HISTORY_*. Two of
+  // them were RW, so each RT pass paid a barrier for them. The resources themselves are still
+  // allocated and swapped in updateFrame -- only these dead bindings are gone.
 
   // REPEAT wrapping matches the shader's frac-based tilable texcoords.
   {

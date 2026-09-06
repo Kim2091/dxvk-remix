@@ -132,23 +132,11 @@ Texture2D AtmosphereSkyViewLut;
 layout(binding = BINDING_ATMOSPHERE_CLOUD_NOISE_SAMPLER)
 SamplerState AtmosphereCloudNoise3DSampler;
 
-// Cloud history textures (fork). See atmosphere_bindings.slangh for full notes.
-layout(rgba16f, binding = BINDING_ATMOSPHERE_CLOUD_HISTORY_PREV)
-Texture2D<float4> AtmosphereCloudHistoryPrev;
-
-layout(rgba16f, binding = BINDING_ATMOSPHERE_CLOUD_HISTORY_CURR)
-RWTexture2D<float4> AtmosphereCloudHistoryCurr;
-
-// Cloud history frame-id ping-pong (fork). R16_UINT companion to the color
-// pair above, carrying the frame index at which each pixel was last written
-// by the sky-miss path. Used to reject stale history at pixels that were
-// foreground-occluded last frame. See atmosphere_bindings.slangh for the
-// full mechanism.
-layout(r16ui, binding = BINDING_ATMOSPHERE_CLOUD_HISTORY_FRAME_ID_PREV)
-Texture2D<uint> AtmosphereCloudHistoryFrameIdPrev;
-
-layout(r16ui, binding = BINDING_ATMOSPHERE_CLOUD_HISTORY_FRAME_ID_CURR)
-RWTexture2D<uint> AtmosphereCloudHistoryFrameIdCurr;
+// Cloud history is NOT declared for ray-tracing passes (fork -- 2026-09-06, open issue #5).
+// The cloud temporal EMA moved into the composite, which binds the same resources at its own
+// COMPOSITE_ATMOSPHERE_CLOUD_HISTORY_* slots; nothing here ever read these. Declaring them
+// bound two RW images into every RT pass and cost a barrier per pass for nothing.
+// See atmosphere_bindings.slangh, which still declares them for the cloud passes.
 
 // Cloud-occluded sky-ambient transmittance LUT (fork). 2D (azimuth, elevation),
 // R16F single-channel, baked per frame from camera position by
