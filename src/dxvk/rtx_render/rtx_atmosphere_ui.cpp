@@ -726,13 +726,16 @@ void RtxAtmosphere::showImguiSettings(WeatherBlender* blender) {
             "the two do not double count.");
 
         if (RtxAtmosphere::aerialPerspective()) {
-          RemixGui::DragFloat("Scene Unit Scale", &RtxAtmosphere::aerialPerspectiveScaleObject(),
-                              0.001f, 0.0f, 1000.0f, "%.5f", sliderFlags);
+          // Read-only now (fork -- 2026-09-06, units/altitude redesign). Aerial perspective shares
+          // Units Per Metre with the clouds rather than carrying a second answer to "how big is a
+          // game unit", because a disagreement between haze distance and cloud distance is exactly
+          // the kind of error nobody traces back to a config. Shown rather than hidden so the
+          // number the Range and Near Fade controls below are calibrated against stays visible.
+          ImGui::Text("Units Per Metre             %10.2f", RtxAtmosphere::resolveUnitsPerMeter());
           RemixGui::SetTooltipToLastWidgetOnHover(
-              "Game units per centimetre used only by aerial perspective. 0 uses the global Scene Unit "
-              "Scale for legacy behaviour. Set a positive value when that global scale does not match "
-              "the geometry distance that this haze volume should use; clouds, sky, and global "
-              "volumetrics are not changed.");
+              "Game units per real metre, shared with the clouds. Set it under Clouds > World Space; "
+              "it calibrates the Range, Near Fade and Scene Shadow Range controls below. Unlike the "
+              "clouds, aerial perspective ignores Cloud World Compression - haze stays physical.");
 
           RemixGui::DragFloat("Range", &RtxAtmosphere::aerialPerspectiveDepthRangeMetersObject(),
                               100.0f, 100.0f, 200000.0f, "%.0f m", sliderFlags);
@@ -1013,8 +1016,26 @@ void RtxAtmosphere::showImguiSettings(WeatherBlender* blender) {
       // look-tuning subtrees below stay closed by default as before.
       ImGui::SetNextItemOpen(true, ImGuiCond_Once);
       if (ImGui::TreeNode("World Space")) {
-        RemixGui::DragFloat("Cloud Scene Unit Scale", &RtxAtmosphere::cloudScaleObject(),
-                            0.001f, 0.0f, 1000.0f, "%.5f", sliderFlags);
+        // Scale, split into measurement and artistic compression (fork -- 2026-09-06,
+        // units/altitude redesign). Previously one "Cloud Scene Unit Scale" carried both, which is
+        // why entering a game's true figure looked like a regression: on Fallout: New Vegas the
+        // working number is the true 70.4 u/m divided by a deliberate ~7x compression.
+        RemixGui::DragFloat("Units Per Metre", &RtxAtmosphere::unitsPerMeterObject(),
+                            0.1f, 0.0f, 10000.0f, "%.2f", sliderFlags);
+        RemixGui::SetTooltipToLastWidgetOnHover(
+            "How many game units make one real metre - a measurement of the game, not a look "
+            "setting. 70.4 for Gamebryo (Fallout / Skyrim), 100 for a centimetre engine, 39.37 for "
+            "an inch engine. 0 inherits it from the global Scene Unit Scale. Shared with the aerial "
+            "perspective so both agree about the size of the world. To change how large the "
+            "cloudscape reads, use Cloud World Compression instead of skewing this.");
+        RemixGui::DragFloat("Cloud World Compression", &RtxAtmosphere::cloudWorldCompressionObject(),
+                            0.05f, 0.1f, 50.0f, "%.2f", sliderFlags);
+        RemixGui::SetTooltipToLastWidgetOnHover(
+            "Shrinks the whole cloudscape by this factor - deck height, depth, cell and tile size, "
+            "wind and anchor distances together. 1 means the cloud system's metres are real metres. "
+            "Larger values suit a map built smaller than the region it depicts, where a physically "
+            "correct cloudscape reads far too high and too large. Around 7 for Fallout: New Vegas. "
+            "Clouds only; the aerial perspective stays physical.");
         RemixGui::SetTooltipToLastWidgetOnHover(
             "Game units per centimetre used only by the cloud world-space anchor conversion "
             "(cloudWorldUnitsPerKm). 0 inherits the global Scene Unit Scale (rtx.sceneScale) for "
@@ -1177,44 +1198,26 @@ void RtxAtmosphere::showImguiSettings(WeatherBlender* blender) {
         // resolved anchor's raw Y-up height (Derived Position's y component above) into the
         // physical altitude every other atmosphere system shares — see getEyeRadius
         // (atmosphere_common.slangh) and the calibration block in getAtmosphereArgs().
-        RemixGui::DragFloat("Sea Level (world km)", &RtxAtmosphere::seaLevelWorldKmObject(),
-                            0.01f, -1000.0f, 1000.0f, "%.3f", sliderFlags);
+        // Datum in RAW ENGINE UNITS (fork -- 2026-09-06, units/altitude redesign; was
+        // "Sea Level (world km)"). A km-valued datum is relative to the scale in force when it was
+        // captured, so re-scaling silently moved the ground out from under the deck. This is the
+        // number the calibration log prints, and Set to Here captures it directly.
+        RemixGui::DragFloat("Ground Level (world units)", &RtxAtmosphere::groundLevelWorldUnitsObject(),
+                            10.0f, -1000000.0f, 1000000.0f, "%.1f", sliderFlags);
         RemixGui::SetTooltipToLastWidgetOnHover(
-            "World-space Y-up height in km that counts as atmosphere sea level. Subtracted from "
-            "Derived Position's y component before cloud and atmosphere placement. Set this to the "
-            "raw camera height the ONCE calibration log in updateFrame reports for a location this "
-            "game treats as ground level.");
-        // "Set to Here" (fork -- 2026-09-06, world-space cloud migration follow-up). The tooltip
-        // above asks the user to read a raw height out of a one-shot log line and retype it here.
-        // That retyping step is why this datum stayed at its 0.0 default on FNV -- and a zero datum
-        // silently redefines the Altitude slider from the "km above the ground" its own tooltip
-        // promises into "km above world Y=0". At the corrected unit scale (cloudScale ~0.704) the
-        // terrain itself sits well above that zero, so the deck lands far too high and the only way
-        // to push it back down is to bottom the Altitude slider out -- which is exactly what the
-        // 0.5 -> 0.05 km floor change in 03b1acff7 was working around. Capturing the anchor on the
-        // frame the player is standing on ground removes the retyping, and with it the workaround.
-        // NOTE: this stores a value in KM, so it is only valid for the scale it was captured at --
-        // rescaling cloudScale invalidates it. docs/cloud-units-proposal.md replaces this with
-        // groundLevelWorldUnits in raw engine units, which is scale-independent by construction.
+            "The height, in the game's own world units, that counts as ground level - altitude "
+            "zero. Cloud heights are measured up from here. Use Set to Here rather than typing a "
+            "number. Unaffected by unit-scale changes.");
         if (ImGui::Button("Set to Here", ImVec2(120, 0))) {
-          RtxAtmosphere::seaLevelWorldKmObject().setDeferred(anchor.posYUpKm.y);
+          // Raw resolved anchor height in the engine's own up axis, pre-toYUp: exactly what the
+          // option stores, so no scale or axis conversion can go stale between capture and use.
+          const Vector3& raw = anchor.resolvedRawWorldUnits;
+          RtxAtmosphere::groundLevelWorldUnitsObject().setDeferred(RtxOptions::zUp() ? raw.z : raw.y);
         }
         RemixGui::SetTooltipToLastWidgetOnHover(
-            "Set Sea Level to the resolved anchor's current height, so Altitude reads as height "
-            "above wherever the camera is standing right now. Stand somewhere the game treats as "
-            "ground level before clicking. Re-capture after changing Cloud Scene Unit Scale.");
-        RemixGui::DragFloat("Altitude Scale", &RtxAtmosphere::altitudeScaleObject(),
-                            0.01f, 0.0f, 100.0f, "%.3f", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Multiplier from the anchor's height above Sea Level to physical altitude. Use this "
-            "when a game's vertical world scale differs from rtx.sceneScale / Cloud Scene Unit "
-            "Scale.");
-        RemixGui::DragFloat("View Altitude (km)", &RtxAtmosphere::viewAltitudeKmObject(),
-                            0.1f, -50.0f, 50.0f, "%.2f", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Physical camera altitude offset in km, added after Sea Level and Altitude Scale have "
-            "calibrated the anchor's raw height. Raise it to move the observer toward the cloud "
-            "deck without moving the deck itself.");
+            "Set Ground Level to where the camera is standing right now, so cloud heights read as "
+            "height above the ground. Stand somewhere the game treats as ground level before "
+            "clicking. Unlike the old sea-level datum this stays correct if you change the scale.");
 
         // Recomputes getAtmosphereArgs()'s calibration formula directly from the datum options and
         // Derived Position above, rather than calling getAtmosphereArgs() itself just for a
@@ -1276,16 +1279,18 @@ void RtxAtmosphere::showImguiSettings(WeatherBlender* blender) {
         // higher relative to the terrain. Reproducing the pre-correction look needs roughly
         // 0.8 / 7.04 = 0.11 km, which the old 0.5 km floor made unreachable -- the slider
         // bottomed out with the clouds still far too high.
-        RemixGui::DragFloat("Altitude", &RtxAtmosphere::cloudAltitudeObject(),
-                            0.01f, 0.05f, 12.0f, "%.2f km", sliderFlags);
+        // Metres, not km (fork -- 2026-09-06, units/altitude redesign). "0.05 km" for a 50 m
+        // feature was the readability problem; the CB fields keep their km meaning and are filled
+        // by dividing by 1000. Rule the panel follows: heights are metres, sizes stay kilometres.
+        RemixGui::DragFloat("Altitude", &RtxAtmosphere::cloudBaseHeightMetersObject(),
+                            10.0f, 50.0f, 12000.0f, "%.0f m", sliderFlags);
         RemixGui::SetTooltipToLastWidgetOnHover(
-            "Cloud layer altitude (km above the ground).");
-        dragFloatWithWeatherOverride(
-            "Depth", &RtxAtmosphere::cloudThicknessObject(),
-            WEATHER_OVERRIDE_PTR(cloudThickness),
-            0.05f, 0.1f, 5.0f, "%.2f km", sliderFlags);
+            "Height of the cloud deck's underside above the ground datum, in metres.");
+        RemixGui::DragFloat("Depth", &RtxAtmosphere::cloudDepthMetersObject(),
+                            50.0f, 100.0f, 8000.0f, "%.0f m", sliderFlags);
         RemixGui::SetTooltipToLastWidgetOnHover(
-            "Vertical depth of the cloud layer in km.");
+            "Vertical depth of the cloud deck in metres. While a weather preset is active the "
+            "preset supplies this value instead.");
         colorEdit3WithWeatherOverride(
             "Color", &RtxAtmosphere::cloudColorObject(),
             WEATHER_OVERRIDE_PTR(cloudColor));
@@ -1552,14 +1557,15 @@ void RtxAtmosphere::showImguiSettings(WeatherBlender* blender) {
             "layer. Off by default. Voxel-grid terrain shadows still come "
             "from layer 1 only.");
         ImGui::BeginDisabled(!layer2On);
-        RemixGui::DragFloat("Layer 2 Altitude", &RtxAtmosphere::cloudLayer2AltitudeObject(),
-                            0.1f, 0.5f, 20.0f, "%.1f km", sliderFlags);
+        RemixGui::DragFloat("Layer 2 Altitude", &RtxAtmosphere::cloudLayer2BaseHeightMetersObject(),
+                            50.0f, 500.0f, 20000.0f, "%.0f m", sliderFlags);
         RemixGui::SetTooltipToLastWidgetOnHover(
-            "Layer-2 altitude in km. Default 7.5 km targets the cirrus band.");
-        RemixGui::DragFloat("Layer 2 Depth", &RtxAtmosphere::cloudLayer2ThicknessObject(),
-                            0.05f, 0.05f, 3.0f, "%.2f km", sliderFlags);
+            "Height of the second deck's underside above the ground datum, in metres. The default "
+            "targets the cirrus band.");
+        RemixGui::DragFloat("Layer 2 Depth", &RtxAtmosphere::cloudLayer2DepthMetersObject(),
+                            50.0f, 50.0f, 6000.0f, "%.0f m", sliderFlags);
         RemixGui::SetTooltipToLastWidgetOnHover(
-            "Vertical depth of the layer-2 slab. Cirrus is thin - default 0.5 km.");
+            "Vertical depth of the second deck in metres. Cirrus is thin.");
         RemixGui::DragFloat("Layer 2 Coverage", &RtxAtmosphere::cloudLayer2CoverageMeanObject(),
                             0.01f, 0.0f, 1.0f, "%.2f", sliderFlags);
         RemixGui::SetTooltipToLastWidgetOnHover(

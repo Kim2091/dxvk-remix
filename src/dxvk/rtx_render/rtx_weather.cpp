@@ -722,7 +722,7 @@ namespace dxvk { namespace {
     s.cloudWindSpeed             = RtxAtmosphere::cloudWindSpeed();
     s.cloudWindDirection         = RtxAtmosphere::cloudWindDirection();
     s.cloudShadowStrength        = RtxAtmosphere::cloudShadowStrength();
-    s.cloudThickness             = RtxAtmosphere::cloudThickness();
+    s.cloudThickness             = RtxAtmosphere::cloudDepthMeters() * 0.001f;
     s.cloudUndersideLightSigma = RtxAtmosphere::cloudUndersideLightSigma();
     s.cloudBottomDarkening     = RtxAtmosphere::cloudBottomDarkening();
     s.cloudAerialFadePerKm     = RtxAtmosphere::cloudAerialFadePerKm();

@@ -220,6 +220,22 @@ public:
   // updateFrame — so they cannot drift apart. Follows the same "positive overrides, else
   // inherit" pattern as aerialPerspectiveScale; see cloudScale()'s doc comment.
   static float cloudWorldUnitsPerKm();
+  // Game units per real metre: unitsPerMeter when set, else inherited from rtx.sceneScale.
+  // The measurement half of the scale; cloudWorldUnitsPerKm divides it by cloudWorldCompression.
+  static float resolveUnitsPerMeter();
+
+  // Deprecated-option migrations (fork -- 2026-09-06, units/altitude redesign). Each fires when
+  // any config layer sets the retired key, moves the value into its replacement, then clears the
+  // old key from stronger layers so a re-save drops it. See rtx_atmosphere.cpp for the transforms.
+  static void cloudAltitudeOnChange(DxvkDevice* device);
+  static void cloudThicknessOnChange(DxvkDevice* device);
+  static void cloudLayer2AltitudeOnChange(DxvkDevice* device);
+  static void cloudLayer2ThicknessOnChange(DxvkDevice* device);
+  static void cloudScaleOnChange(DxvkDevice* device);
+  static void aerialPerspectiveScaleOnChange(DxvkDevice* device);
+  static void seaLevelWorldKmOnChange(DxvkDevice* device);
+  static void viewAltitudeKmOnChange(DxvkDevice* device);
+  static void altitudeScaleOnChange(DxvkDevice* device);
 
   // Allocate cloud history ping-pong at the downscaled extent; cheap when unchanged. Call once per frame.
   void ensureCloudHistoryResources(Rc<DxvkContext> ctx, const VkExtent3D& downscaledExtent);
@@ -270,11 +286,10 @@ public:
                "global volumetrics froxel range renders at full saturation and contrast. Where global volumetrics are "
                "enabled the march starts past that grid's range, so the two hand off instead of double counting.");
     RTX_OPTION_ARGS("rtx.atmosphere", float, aerialPerspectiveScale, 0.0f,
-               "Defines the aerial perspective's own scene-unit scale, in game units per centimetre. 0 uses "
-               "rtx.sceneScale for legacy behaviour; a positive value overrides it only for aerial perspective. "
-               "This calibrates the Range, Near Fade, and Scene Shadow Range controls without changing clouds, "
-               "the sky, or global volumetrics.",
-               args.minValue = 0.0f);
+               "*DEPRECATED* replaced by rtx.atmosphere.unitsPerMeter, which the clouds and the aerial "
+               "perspective now share so they cannot disagree about the size of the world. An existing value "
+               "is migrated automatically; re-save your config to silence the notice.",
+               args.onChangeCallback = &aerialPerspectiveScaleOnChange, args.flags = RtxOptionFlags::NoSave);
     // Sibling of aerialPerspectiveScale, added for the same reason (dd515e082, 2026-08-21): rtx.sceneScale
     // "is not a reliable measurement of the world space" it happens to also feed. Aerial perspective got its
     // own override first because it was the system where the disagreement was loudest; clouds still trust
@@ -285,10 +300,61 @@ public:
     // setCloudShadowCameraPosition into AtmosphereArgs::cameraWorldPosYUpKm, so this genuinely
     // calibrates cloud geometry today.
     RTX_OPTION_ARGS("rtx.atmosphere", float, cloudScale, 0.0f,
-               "Defines the clouds' own scene-unit scale, in game units per centimetre. 0 inherits rtx.sceneScale "
-               "for legacy behaviour; a positive value overrides it only for the cloud world-space conversion "
-               "(cloudWorldUnitsPerKm), without changing the sky, aerial perspective, or global volumetrics.",
+               "*DEPRECATED* replaced by rtx.atmosphere.unitsPerMeter (the measurement) and "
+               "rtx.atmosphere.cloudWorldCompression (the artistic choice). An existing value is migrated "
+               "automatically; re-save your config to silence the notice.",
+               args.onChangeCallback = &cloudScaleOnChange, args.flags = RtxOptionFlags::NoSave);
+    // ===== Units, compression and datum (fork -- 2026-09-06, units/altitude redesign) =====
+    //
+    // These three replace six overlapping knobs. The old set asked "how big is a game unit?" three
+    // separate times (rtx.sceneScale, aerialPerspectiveScale, cloudScale), added a vertical-only
+    // fourth (altitudeScale), expressed the datum in km at the current scale so that changing the
+    // scale silently moved the ground (seaLevelWorldKm), and carried an offset that is
+    // algebraically just a datum shift (viewAltitudeKm). All six are deprecated below and migrate
+    // into these.
+    //
+    // The split that makes it work: unitsPerMeter is a MEASUREMENT of the game (one number, knowable
+    // and checkable), while cloudWorldCompression is an ARTISTIC CHOICE about how large the modelled
+    // region should read. Previously those two were multiplied together inside a single "scale"
+    // value, which is why a correct measurement looked like a bug -- on Fallout: New Vegas the
+    // working 10,000 units/km is the true 70,400 divided by a deliberate ~7x compression, and with
+    // one knob there was no way to say that. unitsPerMeter = 70.4 with cloudWorldCompression = 7.04
+    // states it exactly and reproduces the same number.
+    RTX_OPTION_ARGS("rtx.atmosphere", float, unitsPerMeter, 0.0f,
+               "How many game units make one real metre. This is a measurement of the game, not a look "
+               "setting: 70.4 for Gamebryo titles, 100 for a centimetre engine, 39.37 for an inch engine. "
+               "0 inherits it from rtx.sceneScale. Shared by the clouds and the aerial perspective, so both "
+               "agree about the size of the world. To change how large the cloudscape reads, use Cloud World "
+               "Compression instead -- leave this at the true figure.",
                args.minValue = 0.0f);
+    RTX_OPTION_ARGS("rtx.atmosphere", float, cloudWorldCompression, 1.0f,
+               "Shrinks the whole cloudscape by this factor: deck height, depth, cell size, tile size, wind "
+               "and anchor distances all together. 1 means the cloud system's metres are real metres. Larger "
+               "values suit a map built smaller than the region it depicts, where a physically correct "
+               "cloudscape reads as far too high and too large -- roughly 7 for Fallout: New Vegas. Affects "
+               "clouds only; the aerial perspective stays physical.",
+               args.minValue = 0.1f);
+    // Raw engine units, deliberately NOT km: km-valued datums are relative to the scale in force when
+    // they were captured, so re-scaling silently moved the ground out from under the deck. This is
+    // read in the engine's own up axis before toYUp, so it is exactly the number the calibration log
+    // prints and the "Set to Here" button captures.
+    RTX_OPTION("rtx.atmosphere", float, groundLevelWorldUnits, 0.0f,
+               "The height, in the game's own world units along its up axis, that counts as ground level "
+               "(altitude zero). Cloud heights are measured up from here. Use the Set to Here button while "
+               "standing on ground the game treats as sea level rather than typing a number. Unaffected by "
+               "unit-scale changes, unlike the sea-level option it replaces.");
+
+    // ===== Cloud placement, in metres (fork -- 2026-09-06, units/altitude redesign) =====
+    // Heights are metres, sizes stay kilometres. A 50 m feature spelled "0.05 km" was the readability
+    // problem these fix; the CB fields keep their km meaning and are filled by dividing by 1000.
+    RTX_OPTION("rtx.atmosphere", float, cloudBaseHeightMeters, 1300.0f,
+               "Height of the cloud deck's underside above the ground datum, in metres.");
+    RTX_OPTION("rtx.atmosphere", float, cloudDepthMeters, 3050.0f,
+               "Vertical depth of the cloud deck, in metres, measured up from its base.");
+    RTX_OPTION("rtx.atmosphere", float, cloudLayer2BaseHeightMeters, 5500.0f,
+               "Height of the second (echo/cirrus) deck's underside above the ground datum, in metres.");
+    RTX_OPTION("rtx.atmosphere", float, cloudLayer2DepthMeters, 2000.0f,
+               "Vertical depth of the second (echo/cirrus) deck, in metres.");
     // Cloud world-anchor override (fork — 2026-09-05, world-space cloud migration Stage 2). Stage 0
     // measured, in-game on Fallout: New Vegas, that RtCamera::getPosition() is permanently (0,0,0) —
     // Gamebryo-family engines keep camera translation out of the D3D view matrix entirely (see
@@ -470,22 +536,23 @@ public:
     // the resolved CloudAnchor's raw Y-up height into the atmosphere's one shared vertical frame
     // before placing the planet, the clouds, or the density field against it (see getEyeRadius in
     // atmosphere_common.slangh and the calibration block in getAtmosphereArgs()).
-    RTX_OPTION("rtx.atmosphere", float, seaLevelWorldKm, 0.0f,
-               "World-space Y-up height in km that counts as atmosphere sea level. Subtracted from "
-               "the resolved cloud anchor's measured height before cloud and atmosphere placement. "
-               "Set this to the raw camera height the ONCE calibration log in updateFrame reports "
-               "for a location this game treats as ground level.");
+    RTX_OPTION_ARGS("rtx.atmosphere", float, seaLevelWorldKm, 0.0f,
+               "*DEPRECATED* replaced by rtx.atmosphere.groundLevelWorldUnits, which stores the datum in raw "
+               "engine units so that changing the unit scale no longer moves the ground. An existing value is "
+               "converted automatically; re-save your config to silence the notice.",
+               args.onChangeCallback = &seaLevelWorldKmOnChange, args.flags = RtxOptionFlags::NoSave);
     RTX_OPTION_ARGS("rtx.atmosphere", float, altitudeScale, 1.0f,
-               "Multiplier from the anchor's height above seaLevelWorldKm to physical altitude. Use "
-               "this when a game's vertical world scale differs from rtx.sceneScale / "
-               "rtx.atmosphere.cloudScale.",
-               args.minValue = 0.0f);
+               "*DEPRECATED* a vertical-only scale has no equivalent in the new scheme, which assumes one "
+               "unit size for all three axes. Set rtx.atmosphere.unitsPerMeter to the game's true scale "
+               "instead. A non-default value here is reported and ignored.",
+               args.onChangeCallback = &altitudeScaleOnChange, args.flags = RtxOptionFlags::NoSave);
     // Retains the useful old Numos control: an intentional physical observer-height offset applied
     // AFTER the game's raw coordinate has been calibrated by the two options above.
-    RTX_OPTION("rtx.atmosphere", float, viewAltitudeKm, 0.0f,
-               "Physical camera altitude offset in km, added after seaLevelWorldKm and altitudeScale "
-               "have calibrated the anchor's raw height. Raise it to move the observer toward the "
-               "cloud deck without moving the deck itself.");
+    RTX_OPTION_ARGS("rtx.atmosphere", float, viewAltitudeKm, 0.0f,
+               "*DEPRECATED* this was algebraically a second datum shift, not an independent control, so it "
+               "folds into rtx.atmosphere.groundLevelWorldUnits. An existing value is converted automatically; "
+               "re-save your config to silence the notice.",
+               args.onChangeCallback = &viewAltitudeKmOnChange, args.flags = RtxOptionFlags::NoSave);
     RTX_OPTION("rtx.atmosphere", float, airDensity, 1.0f, "Density of air molecules multiplier (1.0 = clear sky).");
     RTX_OPTION("rtx.atmosphere", float, aerosolDensity, 1.1f, "Density of aerosols/dust multiplier (1.0 = typical).");
     RTX_OPTION("rtx.atmosphere", float, ozoneDensity, 1.0f, "Density of ozone layer multiplier (1.0 = typical).");
@@ -695,7 +762,10 @@ public:
 
     RTX_OPTION("rtx.atmosphere", bool, cloudEnabled, true, "Enable procedural cloud rendering.");
     RTX_OPTION("rtx.atmosphere", float, cloudDensity, 4.0f, "Cloud opacity/density multiplier.");
-    RTX_OPTION("rtx.atmosphere", float, cloudAltitude, 1.3f, "Cloud layer altitude in kilometers.");
+    RTX_OPTION_ARGS("rtx.atmosphere", float, cloudAltitude, 1.3f,
+               "*DEPRECATED* replaced by rtx.atmosphere.cloudBaseHeightMeters (same height in metres). "
+               "An existing value is migrated automatically; re-save your config to silence the notice.",
+               args.onChangeCallback = &cloudAltitudeOnChange, args.flags = RtxOptionFlags::NoSave);
     RTX_OPTION("rtx.atmosphere", Vector3, cloudColor, Vector3(0.89f, 0.92f, 1.0f), "Base cloud color (albedo).");
     RTX_OPTION("rtx.atmosphere", float, cloudWindSpeed, 0.02f, "Cloud drift speed in km/s. Clouds scroll with this velocity.");
     RTX_OPTION("rtx.atmosphere", float, cloudWindDirection, 45.0f, "Cloud wind direction in degrees (0 = +X, 90 = +Z).");
@@ -720,8 +790,10 @@ public:
                "0 = shadows fully muted (voxel grid still runs but its output is mixed away).");
     RTX_OPTION("rtx.atmosphere", uint32_t, cloudViewSamples, 32,
                "Number of ray-march steps through the cloud slab. Higher = better quality, more cost. Range 1..32.");
-    RTX_OPTION("rtx.atmosphere", float, cloudThickness, 3.05f,
-               "Vertical depth of the cloud slab in km.");
+    RTX_OPTION_ARGS("rtx.atmosphere", float, cloudThickness, 3.05f,
+               "*DEPRECATED* replaced by rtx.atmosphere.cloudDepthMeters (same depth in metres). "
+               "An existing value is migrated automatically; re-save your config to silence the notice.",
+               args.onChangeCallback = &cloudThicknessOnChange, args.flags = RtxOptionFlags::NoSave);
     // rtx.atmosphere.cloudCurvature retired 2026-09-05 (world-space cloud migration Stage 1): fed
     // the now-deleted cloudPlanetRadius(), which shrank clouds onto a SEPARATE, smaller sphere
     // (~953 km at the pinned 0.38 default) than the one the atmosphere/ground/horizon used
@@ -1246,12 +1318,14 @@ public:
                "decorrelates the deck's coverage/type field from layer 1 so it "
                "reads as a related-but-different cloudscape. Voxel-grid terrain "
                "shadows + ground-shadow NEE remain layer-1-only.");
-    RTX_OPTION("rtx.atmosphere", float, cloudLayer2Altitude, 5.5f,
-               "Altitude (km) of the layer-2 deck base. The gap between the "
-               "layer-1 top (cloudAltitude + cloudThickness) and this value is "
-               "the clear-sky band separating the two decks.");
-    RTX_OPTION("rtx.atmosphere", float, cloudLayer2Thickness, 2.0f,
-               "Vertical depth (km) of the layer-2 deck.");
+    RTX_OPTION_ARGS("rtx.atmosphere", float, cloudLayer2Altitude, 5.5f,
+               "*DEPRECATED* replaced by rtx.atmosphere.cloudLayer2BaseHeightMeters (same height in metres). "
+               "An existing value is migrated automatically; re-save your config to silence the notice.",
+               args.onChangeCallback = &cloudLayer2AltitudeOnChange, args.flags = RtxOptionFlags::NoSave);
+    RTX_OPTION_ARGS("rtx.atmosphere", float, cloudLayer2Thickness, 2.0f,
+               "*DEPRECATED* replaced by rtx.atmosphere.cloudLayer2DepthMeters (same depth in metres). "
+               "An existing value is migrated automatically; re-save your config to silence the notice.",
+               args.onChangeCallback = &cloudLayer2ThicknessOnChange, args.flags = RtxOptionFlags::NoSave);
     RTX_OPTION("rtx.atmosphere", float, cloudLayer2TypeMean, 0.6f,
                "[0,1] mean cloud type for layer 2. Low values (~0.05) sample "
                "the LUT's stratus-shaped column — appropriate for cirrus.");
@@ -1414,6 +1488,9 @@ private:
   Vector3  m_cloudRenderUpYUp      { 0.0f, 1.0f, 0.0f };
   uint32_t m_cloudRenderFrameIdx   { 0u };
   Vector3  m_cameraWorldPosYUpKm   { 0.0f, 0.0f, 0.0f };
+  // groundLevelWorldUnits resolved into the same Y-up km frame as m_cameraWorldPosYUpKm, computed
+  // in updateFrame where the toYUp lambda and the up-axis flip are in scope (fork -- 2026-09-06).
+  float    m_groundLevelYUpKm      { 0.0f };
 
   // Cloud-anchor calibration snapshot; see the CloudAnchor doc comment above. Filled once per frame
   // in updateFrame, right after the toYUp lambda and before setCloudShadowCameraPosition. Stage 0

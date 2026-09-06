@@ -199,7 +199,7 @@ flag) but should be pushed every frame from a weather-driving plugin.
 |---|---|---|---|
 | `rtx.atmosphere.cloudEnabled` | bool | `True` | Master switch for the procedural cloud layer. |
 | `rtx.atmosphere.cloudDensity` | float | `1.65` | Cloud opacity/density multiplier. Scales extinction along the march. |
-| `rtx.atmosphere.cloudAltitude` | float | `1.3` | Cloud-layer base altitude, km. |
+| `rtx.atmosphere.cloudAltitude` | float | `1.3` | *Deprecated* - migrates to `cloudBaseHeightMeters` (metres). Still accepted. |
 | `rtx.atmosphere.cloudColor` | Vector3 | `0.89, 0.92, 1.0` | Base cloud albedo. Tint away from white for stylized color grading. |
 | `rtx.atmosphere.cloudWindSpeed` | float | `0.02` | Cloud drift speed, km/s. Wind offset accumulates from elapsed time. |
 | `rtx.atmosphere.cloudWindDirection` | float | `45.0` | Wind direction, degrees. 0 = +X, 90 = +Z. |
@@ -213,7 +213,7 @@ Ray-march quality:
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `rtx.atmosphere.cloudViewSamples` | uint32 | `32` | Ray-march steps through the cloud slab. Range 1–32. Higher = better quality, higher cost. |
-| `rtx.atmosphere.cloudThickness` | float | `2.75` | Vertical depth of the cloud slab, km. |
+| `rtx.atmosphere.cloudThickness` | float | `2.75` | *Deprecated* - migrates to `cloudDepthMeters` (metres). Still accepted. |
 | `rtx.atmosphere.cloudCurvature` | float | `0.38` | Sky-dome curvature for the cloud sphere: 0 = real-planet radius (nearly flat ceiling), 1 = tight dome. Does not affect atmospheric math. |
 
 Shadow and color polish:

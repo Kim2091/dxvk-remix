@@ -180,7 +180,9 @@ The cloud field participates in three places outside its own RT:
    common knobs:
    - `cloudCoverageMean` -- overall cloudiness, 0 = clear, 1 = overcast.
    - `cloudDensity` -- per-cumulus opacity multiplier.
-   - `cloudAltitude` / `cloudThickness` -- vertical placement.
+   - `cloudBaseHeightMeters` / `cloudDepthMeters` -- vertical placement, in metres above the
+     `groundLevelWorldUnits` datum. Renamed 2026-09-06 from `cloudAltitude` / `cloudThickness`
+     (km); existing configs migrate automatically on load.
    - `cloudShadowMarchStrength` -- pre-denoise darkness of cloud-on-terrain
      shadows (multiplier inside the `exp(-OD * density * march)` term).
    - `cloudShadowStrength` -- master fade for the same; defaults to 0.5,

@@ -628,10 +628,164 @@ void RtxAtmosphere::computeTimeCycleSunAngles(float timeOfDayHours, float& outEl
 // worldUnitsPerKm fill below and the setCloudShadowCameraPosition push in updateFrame — which
 // could not drift apart even before this existed (both read the same options) but now provably
 // cannot regardless of what either site does around it.
+// Game units per real metre (fork -- 2026-09-06, units/altitude redesign). The measurement half of
+// the old "scale" knobs: what the game's unit actually is, with no artistic content. Inheriting
+// from rtx.sceneScale when unset keeps every existing config bit-identical -- 100 * 0.1 u/cm is
+// the same 10 u/m the old expression produced.
+// ===== Deprecated-option migrations (fork -- 2026-09-06, units/altitude redesign) =====
+//
+// Each fires when a config layer sets a retired key. migrateValuesTo walks the layers
+// (rtx.conf, user.conf, ...) so a per-layer value keeps its layer, then clearFromStrongerLayers
+// drops the old key so re-saving writes only the new one. Transforms decline (return false) when
+// the destination already carries a value, so an explicitly-set new option beats a migrated one.
+//
+// Each transform recomputes what it needs locally rather than reading the new options, so the
+// order in which two of these callbacks fire cannot change the result.
+
+namespace {
+  // Shared by the four placement migrations: km -> m, declining if the metre option is already set.
+  bool kmToMeters(const GenericValue& src, GenericValue& dest, bool destHasExistingValue) {
+    if (destHasExistingValue) {
+      return false;
+    }
+    dest.f = src.f * 1000.0f;
+    return true;
+  }
+
+  // The cloud unit scale in force BEFORE this redesign, rebuilt from the deprecated options alone,
+  // so the datum migrations can turn a km-denominated datum back into raw engine units. Reading the
+  // new options here would make the result depend on callback ordering.
+  float legacyCloudUnitsPerKm() {
+    const float k = RtxAtmosphere::cloudScale();
+    return 100000.0f * std::max(k > 0.0f ? k : RtxOptions::sceneScale(), 1e-5f);
+  }
+
+  void logMigrated(const char* from, const char* to) {
+    Logger::info(str::format("[Deprecated Config] rtx.atmosphere.", from,
+                             " has been migrated to rtx.atmosphere.", to,
+                             ". Please re-save your config to get rid of this message."));
+  }
+
+  // Units per CENTIMETRE -> units per metre. Compression stays at its 1.0 default on purpose: the
+  // old single number fused measurement and artistic compression, and nothing in an old config says
+  // which part was which, so 1 reproduces the old look exactly. The panel now exposes the split.
+  bool scaleToUnitsPerMeter(const GenericValue& src, GenericValue& dest, bool destHasExistingValue) {
+    if (destHasExistingValue || src.f <= 0.0f) {
+      return false;
+    }
+    dest.f = src.f * 100.0f;
+    return true;
+  }
+}
+
+void RtxAtmosphere::cloudAltitudeOnChange(DxvkDevice*) {
+  if (cloudAltitude.migrateValuesTo(&cloudBaseHeightMetersObject(), kmToMeters)) {
+    cloudAltitude.clearFromStrongerLayers(RtxOptionLayer::getDefaultLayer());
+    logMigrated("cloudAltitude", "cloudBaseHeightMeters");
+  }
+}
+
+void RtxAtmosphere::cloudThicknessOnChange(DxvkDevice*) {
+  if (cloudThickness.migrateValuesTo(&cloudDepthMetersObject(), kmToMeters)) {
+    cloudThickness.clearFromStrongerLayers(RtxOptionLayer::getDefaultLayer());
+    logMigrated("cloudThickness", "cloudDepthMeters");
+  }
+}
+
+void RtxAtmosphere::cloudLayer2AltitudeOnChange(DxvkDevice*) {
+  if (cloudLayer2Altitude.migrateValuesTo(&cloudLayer2BaseHeightMetersObject(), kmToMeters)) {
+    cloudLayer2Altitude.clearFromStrongerLayers(RtxOptionLayer::getDefaultLayer());
+    logMigrated("cloudLayer2Altitude", "cloudLayer2BaseHeightMeters");
+  }
+}
+
+void RtxAtmosphere::cloudLayer2ThicknessOnChange(DxvkDevice*) {
+  if (cloudLayer2Thickness.migrateValuesTo(&cloudLayer2DepthMetersObject(), kmToMeters)) {
+    cloudLayer2Thickness.clearFromStrongerLayers(RtxOptionLayer::getDefaultLayer());
+    logMigrated("cloudLayer2Thickness", "cloudLayer2DepthMeters");
+  }
+}
+
+void RtxAtmosphere::cloudScaleOnChange(DxvkDevice*) {
+  if (cloudScale.migrateValuesTo(&unitsPerMeterObject(), scaleToUnitsPerMeter)) {
+    cloudScale.clearFromStrongerLayers(RtxOptionLayer::getDefaultLayer());
+    logMigrated("cloudScale", "unitsPerMeter");
+  }
+}
+
+void RtxAtmosphere::aerialPerspectiveScaleOnChange(DxvkDevice*) {
+  if (aerialPerspectiveScale.migrateValuesTo(&unitsPerMeterObject(), scaleToUnitsPerMeter)) {
+    aerialPerspectiveScale.clearFromStrongerLayers(RtxOptionLayer::getDefaultLayer());
+    logMigrated("aerialPerspectiveScale", "unitsPerMeter");
+    Logger::info("[Deprecated Config] The clouds and the aerial perspective now share "
+                 "rtx.atmosphere.unitsPerMeter. If they were calibrated differently before, check the "
+                 "aerial perspective Range and Near Fade values.");
+  }
+}
+
+// seaLevelWorldKm was a height in km AT THE SCALE THEN IN FORCE, so it converts back to raw engine
+// units by multiplying by that same legacy scale -- precisely the fragility the replacement removes.
+// These accumulate rather than declining on an existing value, because the sea-level datum and the
+// view-altitude offset both fold into the one ground datum.
+void RtxAtmosphere::seaLevelWorldKmOnChange(DxvkDevice*) {
+  auto toWorldUnits = [](const GenericValue& src, GenericValue& dest, bool) {
+    if (src.f == 0.0f) {
+      return false;
+    }
+    dest.f += src.f * legacyCloudUnitsPerKm();
+    return true;
+  };
+  if (seaLevelWorldKm.migrateValuesTo(&groundLevelWorldUnitsObject(), toWorldUnits)) {
+    seaLevelWorldKm.clearFromStrongerLayers(RtxOptionLayer::getDefaultLayer());
+    logMigrated("seaLevelWorldKm", "groundLevelWorldUnits");
+  }
+}
+
+// (h - s) * a + v == (h - (s - v/a)) * a, so a positive view-altitude offset is a NEGATIVE shift of
+// the datum: raising the observer is the same as lowering the ground.
+void RtxAtmosphere::viewAltitudeKmOnChange(DxvkDevice*) {
+  auto toWorldUnits = [](const GenericValue& src, GenericValue& dest, bool) {
+    if (src.f == 0.0f) {
+      return false;
+    }
+    const float a = std::max(RtxAtmosphere::altitudeScale(), 1e-5f);
+    dest.f -= src.f * legacyCloudUnitsPerKm() / a;
+    return true;
+  };
+  if (viewAltitudeKm.migrateValuesTo(&groundLevelWorldUnitsObject(), toWorldUnits)) {
+    viewAltitudeKm.clearFromStrongerLayers(RtxOptionLayer::getDefaultLayer());
+    logMigrated("viewAltitudeKm", "groundLevelWorldUnits");
+  }
+}
+
+// Not migratable: a vertical-only multiplier has no equivalent once one unit size covers all three
+// axes. Reported rather than silently changing the look.
+void RtxAtmosphere::altitudeScaleOnChange(DxvkDevice*) {
+  if (RtxAtmosphere::altitudeScale() != 1.0f) {
+    Logger::warn(str::format(
+      "[Deprecated Config] rtx.atmosphere.altitudeScale = ", RtxAtmosphere::altitudeScale(),
+      " is no longer supported and has been ignored. It scaled the vertical axis alone; the cloud "
+      "system now assumes one unit size for all three axes. Set rtx.atmosphere.unitsPerMeter to the "
+      "true scale instead."));
+  }
+}
+
+float RtxAtmosphere::resolveUnitsPerMeter() {
+  const float configured = RtxAtmosphere::unitsPerMeter();
+  if (configured > 0.0f) {
+    return configured;
+  }
+  return 100.0f * std::max(RtxOptions::sceneScale(), 1e-5f);
+}
+
+// Cloud world scale = measurement / artistic compression (fork -- 2026-09-06). Splitting these
+// apart is the point of the redesign: previously one number carried both, so setting the true
+// measurement looked like a regression. On Fallout: New Vegas the working 10,000 units/km is the
+// true 70,400 divided by a deliberate ~7x compression; unitsPerMeter = 70.4 with
+// cloudWorldCompression = 7.04 now says exactly that and yields the same number.
 float RtxAtmosphere::cloudWorldUnitsPerKm() {
-  const float configuredScale = RtxAtmosphere::cloudScale();
-  return 100000.0f * std::max(
-    configuredScale > 0.0f ? configuredScale : RtxOptions::sceneScale(), 1e-5f);
+  const float compression = std::max(RtxAtmosphere::cloudWorldCompression(), 0.1f);
+  return std::max(1000.0f * resolveUnitsPerMeter() / compression, 1e-3f);
 }
 
 AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
@@ -800,7 +954,7 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
   {
     args.cloudColor = wx ? wx->cloudColor : RtxAtmosphere::cloudColor();
     args.cloudDensity = wx ? wx->cloudDensity : RtxAtmosphere::cloudDensity();
-    args.cloudAltitude = RtxAtmosphere::cloudAltitude();
+    args.cloudAltitude = RtxAtmosphere::cloudBaseHeightMeters() * 0.001f;
     args.cloudEnabled = RtxAtmosphere::cloudEnabled() ? 1.0f : 0.0f;
 
     // Unified cloud motion (fork — 2026-06-21). Wind advection, field-evolution
@@ -834,7 +988,7 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
 
   // Cloud volumetric / appearance enhancements
   {
-    args.cloudThickness = wx ? wx->cloudThickness : RtxAtmosphere::cloudThickness();
+    args.cloudThickness = wx ? wx->cloudThickness : RtxAtmosphere::cloudDepthMeters() * 0.001f;
     args.cloudLayer2TypeSpread = RtxAtmosphere::cloudLayer2TypeSpread();
     args.cloudViewSamples = RtxAtmosphere::cloudViewSamples();
     // rtx.atmosphere.cloudCurvature retired 2026-09-05 (world-space cloud migration Stage 1) — see
@@ -1038,10 +1192,12 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
     // Adding viewAltitudeKm directly to the raw coordinate, skipping the datum/scale correction,
     // was the earlier archaeology attempt's mistake: a nonzero local map origin could still place
     // the eye below the planet or far above the cloud deck.
-    const float rawCameraHeightKm = m_cameraWorldPosYUpKm.y;
-    args.cameraAltitudeKm =
-      (rawCameraHeightKm - RtxAtmosphere::seaLevelWorldKm()) * RtxAtmosphere::altitudeScale()
-      + RtxAtmosphere::viewAltitudeKm();
+    // Simplified to one subtraction (fork -- 2026-09-06, units/altitude redesign). Was
+    // (h - seaLevelWorldKm) * altitudeScale + viewAltitudeKm, i.e. a datum in km, a vertical-only
+    // scale, and a post-offset that is algebraically just another datum shift. m_groundLevelYUpKm
+    // is groundLevelWorldUnits carried into this same Y-up km frame by updateFrame, so the datum is
+    // now stored in raw engine units and cannot silently move when the unit scale changes.
+    args.cameraAltitudeKm = m_cameraWorldPosYUpKm.y - m_groundLevelYUpKm;
     // The world-anchored cloud-density field (computeCloudHeightFractionC, via
     // getPlanetCenterWorldKm) must measure height against the SAME calibrated altitude the shell
     // geometry (getEyeRadius / getPlanetCenter) uses. Leaving the raw, uncalibrated Y here would
@@ -1062,10 +1218,13 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
     // scale drives several unrelated systems and is not a reliable measurement of the world space
     // used by the aerial perspective composite, so a positive aerialPerspectiveScale overrides it
     // here without changing the sky, clouds, or global volumetrics.
-    const float configuredScale = RtxAtmosphere::aerialPerspectiveScale();
-    const float aerialPerspectiveScale = std::max(
-      configuredScale > 0.0f ? configuredScale : RtxOptions::sceneScale(), 1e-5f);
-    const float worldUnitsPerMeter = 100.0f * aerialPerspectiveScale;
+    // Shares unitsPerMeter with the clouds (fork -- 2026-09-06, units/altitude redesign; was its own
+    // aerialPerspectiveScale). Two options answering "how big is a game unit" could disagree, and a
+    // disagreement between haze distance and cloud distance is exactly the kind of error nobody
+    // traces back to a config. Deliberately NOT divided by cloudWorldCompression: compression is an
+    // artistic choice about how large the cloudscape reads, whereas haze is physical and should
+    // stay tied to the real measurement.
+    const float worldUnitsPerMeter = resolveUnitsPerMeter();
     args.aerialPerspectiveWorldUnitsPerKm = 1000.0f * worldUnitsPerMeter;
     args.aerialPerspectiveLutSize = RtxAtmosphere::aerialPerspective()
       ? static_cast<uint32_t>(std::max(RtxAtmosphere::aerialPerspectiveLutResolution(), 1))
@@ -1130,8 +1289,8 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
   // look is preserved bit-for-bit until the user opts in.
   {
     args.cloudLayer2Enable        = RtxAtmosphere::cloudLayer2Enable() ? 1u : 0u;
-    args.cloudLayer2Altitude      = RtxAtmosphere::cloudLayer2Altitude();
-    args.cloudLayer2Thickness     = RtxAtmosphere::cloudLayer2Thickness();
+    args.cloudLayer2Altitude      = RtxAtmosphere::cloudLayer2BaseHeightMeters() * 0.001f;
+    args.cloudLayer2Thickness     = RtxAtmosphere::cloudLayer2DepthMeters() * 0.001f;
     args.cloudLayer2TypeMean      = RtxAtmosphere::cloudLayer2TypeMean();
     args.cloudLayer2CoverageMean  = RtxAtmosphere::cloudLayer2CoverageMean();
     args.cloudLayer2DensityScale  = RtxAtmosphere::cloudLayer2DensityScale();
@@ -2419,8 +2578,9 @@ void RtxAtmosphere::advanceLightning(float dt) {
     const float r = std::sqrt(kMinStrikeKm * kMinStrikeKm
                               + (maxR * maxR - kMinStrikeKm * kMinStrikeKm) * rand01());
     const float ang = rand01() * 2.0f * 3.14159265358979323846f;
-    const float cloudThicknessKm = m_weatherOverride ? m_weatherOverride->cloudThickness : RtxAtmosphere::cloudThickness();
-    const float strikeY = RtxAtmosphere::cloudAltitude() + 0.15f * cloudThicknessKm;
+    const float cloudThicknessKm = m_weatherOverride ? m_weatherOverride->cloudThickness
+                                                     : RtxAtmosphere::cloudDepthMeters() * 0.001f;
+    const float strikeY = RtxAtmosphere::cloudBaseHeightMeters() * 0.001f + 0.15f * cloudThicknessKm;
     m_lightningStrikePosKm = Vector3(m_cameraWorldPosYUpKm.x + std::cos(ang) * r,
                                      strikeY,
                                      m_cameraWorldPosYUpKm.z + std::sin(ang) * r);
@@ -2803,6 +2963,19 @@ AtmosphereArgs RtxAtmosphere::updateFrame(RtxContext& ctx,
     const Vector3 yUp = isZUp ? Vector3(v.x, v.z, v.y) : v;
     return flipUpAxisForYUp ? Vector3(yUp.x, -yUp.y, yUp.z) : yUp;
   };
+
+  // Ground datum, carried into the same Y-up km frame the anchor uses (fork -- 2026-09-06,
+  // units/altitude redesign). groundLevelWorldUnits is a single height along the ENGINE's own up
+  // axis, so it is placed in that axis' slot and pushed through the same toYUp above rather than
+  // being compared against a Y-up value directly -- that is what makes it survive zUp and
+  // flipUpAxis without a second sign convention to keep in step. Resolved here, once per frame,
+  // because toYUp and the axis flags are in scope here and getAtmosphereArgs() is const.
+  {
+    const float groundUnits = RtxAtmosphere::groundLevelWorldUnits();
+    const Vector3 groundEngine = isZUp ? Vector3(0.0f, 0.0f, groundUnits)
+                                       : Vector3(0.0f, groundUnits, 0.0f);
+    m_groundLevelYUpKm = toYUp(groundEngine).y / cloudWorldUnitsPerKm();
+  }
 
   // ---- World-space cloud migration, Stage 0/2: anchor resolution (2026-09-05) ----
   // Record this frame's cloud anchor before anything downstream runs, reusing toYUp rather than
