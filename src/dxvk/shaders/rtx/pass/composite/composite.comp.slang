@@ -871,20 +871,23 @@ void applyCloudComposite(
   const float meanKm  = cloudDepthKm.y;
   const float kmPerWorldUnit = 1.0f / max(args.worldUnitsPerKm, 1e-6f);
 
-  // Defensive depth gate -- see cloudDepthVisibility's header comment. A no-op on every sky pixel
-  // (there is no surface to be nearer than the cloud) and, at cloudRenderResolutionScale = 1.0, a
-  // no-op on every geometry pixel too (the march already clamped there). This is what makes "sky
-  // pixels unchanged" and "geometry inside the deck is fogged" both true from the same code path.
-  if (!primaryMiss)
-  {
-    const float surfaceKm = viewDistance * kmPerWorldUnit;
-    const float visibility = cloudDepthVisibility(entryKm, meanKm, surfaceKm);
-    currentCloud *= visibility;
-  }
-  else if (entryKm < 0.0f)
+  // "The march found no span at all" is a property of the view ray, not of geometry, so it is safe
+  // to apply before the EMA -- unlike the occlusion gate, which is deliberately deferred until
+  // after it (see below).
+  if (entryKm < 0.0f)
   {
     currentCloud = vec4(0.0f);
   }
+
+  // NOTE: the geometry occlusion gate does NOT belong here (fork — 2026-09-05, Stage 4b fix).
+  // It used to multiply currentCloud by cloudDepthVisibility() at this point, before the temporal
+  // EMA below. That made the smoothed signal a function of geometry while the EMA's reprojection
+  // only knows about view direction and cloud depth, so any change in the depth buffer under a
+  // pixel blended in a history value computed against different occlusion entirely -- a smear
+  // trailing the Pip-Boy as it swings up, and cloud ghosting dragging behind geometry while
+  // walking. cloud_render.comp.slang's march-side tMaxClamp was removed for the same reason.
+  // The gate now runs after the EMA, where it carries no history, exactly as the alpha-blended
+  // path below always did.
 
   // ---- Temporal EMA (relocated from evalSkyRadiance; now parallax-aware -- see
   // cloudReprojectionMotionVectorPixels). Reprojects into the SAME cloud-history ping-pong pair
@@ -939,8 +942,22 @@ void applyCloudComposite(
     CompositeCloudHistoryFrameIdCurr[pixelCoordinate] = frameIdx & 0xFFFFu;
   }
 
+  // ---- Opaque geometry: occlusion applied HERE, after the EMA (fork — 2026-09-05, Stage 4b fix).
+  // smoothedCloud is the temporally stable, view-direction-only cloud along this ray; how much of
+  // it sits in FRONT of the resolved surface is a per-frame property of this frame's depth buffer
+  // and must never enter the history. Structurally identical to the alpha-blend path below, which
+  // is where this pattern was already correct.
+  float opaqueVisibility = 1.0f;
+  if (!primaryMiss)
+  {
+    const float surfaceKm = viewDistance * kmPerWorldUnit;
+    opaqueVisibility = cloudDepthVisibility(entryKm, meanKm, surfaceKm);
+  }
+
   // Premultiplied over -- identical operation to the removed evalSkyRadiance code, just relocated.
-  radianceOutput = radianceOutput * (1.0f - smoothedCloud.a) + smoothedCloud.rgb;
+  // On a sky pixel opaqueVisibility is 1.0 and this is exactly that operation.
+  radianceOutput = radianceOutput * (1.0f - smoothedCloud.a * opaqueVisibility)
+                 + smoothedCloud.rgb * opaqueVisibility;
 
   // ---- Alpha-blended (foliage / particle) surfaces ----
   // Depth-ratio rule (fork — 2026-09-05): the alpha-blend surface has no march-side depth clamp of

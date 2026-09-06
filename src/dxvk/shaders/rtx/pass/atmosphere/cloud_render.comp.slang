@@ -215,55 +215,31 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
   // page-142 ambient term (sampleSkyAmbientForVolume) is unaffected by this removal — that helper
   // has its own below-horizon clamp and is untouched this stage.
 
-  // ===== Depth-aware march clamp (fork — 2026-09-05, world-space cloud migration Stage 4a) =====
+  // ===== The march is deliberately NOT clamped by geometry depth =====
+  // (fork — 2026-09-05, world-space cloud migration Stage 4b fix.)
   //
-  // Resolution mismatch: this pass runs at cloudRenderResolutionScale x the downscale extent
-  // (outputDim above), while PrimaryLinearViewZ lives at the FULL downscale extent --
-  // args.cloudRenderFullDimX/Y, the very same published dims evalSkyRadiance uses to upsample THIS
-  // pass's own output the other way (atmosphere_sky.slangh's cloudRenderRTEnable branch: uv =
-  // (pixelCoord + 0.5) / fullDim, then bilinear-samples the smaller RT). uv here is that same
-  // normalized coordinate already computed above for the view-ray reconstruction, so the mapping
-  // into PrimaryLinearViewZ's resolution is just the reverse of that established convention:
-  // primaryCoord = floor(uv * fullDim). NEAREST, not bilinear -- PrimaryLinearViewZ is a per-pixel
-  // depth, and averaging two different surfaces' depths across a silhouette produces a value that
-  // corresponds to neither, which is exactly the "cloud bleeding around silhouette edges" failure
-  // mode a wrong mapping here would cause. Zero dims (first frames, extent not yet known) falls back
-  // to "no clamp", mirroring evalSkyRadiance's own zero-dims fallback.
-  float tMaxKm = 0.0f;  // 0 = no clamp (cloud_march_common.slangh's tMaxClamp convention)
-  if (args.cloudRenderFullDimX != 0u && args.cloudRenderFullDimY != 0u) {
-    ivec2 fullDim = ivec2(int(args.cloudRenderFullDimX), int(args.cloudRenderFullDimY));
-    ivec2 primaryCoord = ivec2(uv * vec2(fullDim));
-    primaryCoord = clamp(primaryCoord, ivec2(0), fullDim - ivec2(1));
-
-    const float linearViewZ = PrimaryLinearViewZ[primaryCoord].x;
-
-    // Miss sentinel (fork — 2026-09-05): exact equality against the SAME constant
-    // NRDContext::getNrdArgs() (rtx_nrd_context.cpp) derives as
-    // nrd::CommonSettings{}.denoisingRange + 1.0f, protected there by a static_assert pinning the
-    // NRD library default -- mirrors debug_view.comp.slang enum 880/884's identical
-    // `linearViewZ == cb.nrd.missLinearViewZ` test ("exact sentinel comparison, not a heuristic
-    // threshold"). This pass has no binding for the RaytraceArgs CB that sentinel actually lives
-    // in -- its own descriptor set carries only AtmosphereArgs + the cloud-specific textures above
-    // -- so rather than plumb the whole CB through for one float, the compile-time-constant value
-    // is reproduced directly. It is NOT runtime-configurable (the assert would fail to compile
-    // before this could ever go stale silently).
-    const float kPrimaryLinearViewZMissSentinel = 500001.0f;
-    if (linearViewZ != kPrimaryLinearViewZMissSentinel) {
-      // PrimaryLinearViewZ is a view-space DEPTH, not a distance along the ray -- divide by the
-      // ray's projection onto the view (forward) axis to recover the slant range. debug_view.comp.slang
-      // enum 884 does the identical conversion via cameraPixelCoordinateToDirection(cb.camera, ...);
-      // this pass already carries the camera's Y-up forward basis vector (cloudRenderForwardYUp,
-      // unit length -- see RtxAtmosphere::updateFrame's setCloudRenderCameraBasis push) and this
-      // pixel's own Y-up view direction, so the same cosine-to-view-axis comes from those instead
-      // of reconstructing a camera-space ray.
-      const float viewAxisCosine = max(abs(dot(viewDirYUp, normalize(args.cloudRenderForwardYUp))), 1e-6f);
-      const float cameraToSurfaceLength = linearViewZ / viewAxisCosine;
-      const float kmPerWorldUnit = 1.0f / max(args.worldUnitsPerKm, 1e-6f);
-      tMaxKm = cameraToSurfaceLength * kmPerWorldUnit;
-    }
-    // else: sky-miss pixel, no surface to clamp against -- tMaxKm stays 0 ("no clamp"), so this
-    // pixel's march is UNCHANGED from Stage 3. This is the acceptance-test invariant for this stage.
-  }
+  // Stage 4a clamped tMaxClamp to the slant range of the resolved surface, so a cloud never marched
+  // past the geometry in front of it. That was exact, and it was wrong, for a reason that only
+  // shows up in motion: it makes the contents of this render target a function of GEOMETRY. The
+  // composite then runs a temporal EMA over that target and reprojects the history with a motion
+  // vector built from the camera basis and the cloud's own depth -- which knows nothing about where
+  // geometry moved. So whenever the depth buffer changed under a pixel, the EMA blended in a
+  // history value computed against completely different occlusion, and the stale value took roughly
+  // 1/(1-cloudHistoryWeight) frames to wash out. In practice: a heavy smear trailing the Pip-Boy as
+  // it swings up, and cloud ghosting dragging behind world geometry while walking.
+  //
+  // A signal an EMA smooths must be a function of view direction only, so that rotation-only
+  // reprojection is valid for it. This pass therefore marches the full reachable span and reports
+  // entry / mean depth alongside it, and the OCCLUSION IS APPLIED PER-FRAME IN THE COMPOSITE, after
+  // the EMA, where it carries no history (composite.comp.slang, applyCloudComposite). That is
+  // already exactly how the alpha-blended path there worked.
+  //
+  // Cost: pixels with near geometry now march cloud that is later discarded. That is a real
+  // regression in this pass's cost and belongs to Stage 6 -- a conservative clamp (a per-tile
+  // maximum depth, say) could recover most of it without reintroducing a per-pixel geometry
+  // dependence. Correctness first.
+  //
+  // PrimaryLinearViewZ (binding 15) stays bound but unread here, for that follow-up.
 
   float jitter = fastJitter(pixelCoord, args.cloudRenderFrameIdx).x;
   // Static per-pixel hash for far-field jitter (animated < 250 m, static beyond — no distant shimmer).
@@ -280,10 +256,9 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
   // (no doubling — Nubis Cubed equations take raw cloudDensity as extinction).
   // marchCloudLayers sequences layer 1 (cumulus) then the optional layer-2
   // cirrus deck front-to-back, zeroing the moon coefficients for layer 2.
-  // tMinClamp stays 0/no-op (unchanged this stage — only the far bound is depth-aware); tMaxClamp
-  // is now tMaxKm (fork — 2026-09-05, Stage 4a), 0 on a sky-miss pixel ("march the full slab",
-  // bit-identical to the pre-Stage-4a march) and the converted slant range to the resolved surface
-  // everywhere else.
+  // Both clamps are 0/no-op: the full reachable span is marched for every pixel, sky or geometry
+  // alike, so this target stays a pure function of view direction and is therefore safe to smooth
+  // temporally. See the no-clamp rationale above.
   vec3 accumColor = vec3(0.0f);
   float viewTransmittance = 1.0f;
   float entryDistanceKm;
@@ -291,7 +266,7 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
 
   marchCloudLayers(viewDirYUp, jitter, jitterStatic,
                    /*tMinClamp=*/0.0f,
-                   /*tMaxClamp=*/tMaxKm,
+                   /*tMaxClamp=*/0.0f,
                    args.cloudViewSamples, ctx, args,
                    accumColor, viewTransmittance,
                    entryDistanceKm, meanCloudDepthKm);
