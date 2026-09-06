@@ -1131,30 +1131,32 @@ public:
                "internal (DLSS-input) resolution [0.25..1]. 0.5 = quarter the "
                "pixels (~4x cheaper cloud march); 1.0 = native (legacy, "
                "bit-exact). Applies on the next frame; live-tunable.");
-    // [FNV-TEST-DEFAULT] was 0.85f -- set to 0 on 2026-09-05 because the cloud EMA's
-    // reprojection is measurably broken: with 0.85 the deck ghosts heavily behind moving
-    // geometry and against the sky, and setting this to 0 removes it ENTIRELY. That is a
-    // diagnosis, not a fix -- see the commit message. Tolerable for now only because
-    // cloudViewSamplesMax is high enough that the raw march is already clean; it will stop
-    // being tolerable the moment Stage 6 lowers sample counts for performance.
-    RTX_OPTION("rtx.atmosphere", float, cloudHistoryWeight, 0.0f,
+    // Default restored to 0.85 on 2026-09-06 (fork, EMA rectification) from the temporary 0 that
+    // 03b1acff7 set after the in-game measurement that 0 removed the cloud ghosting entirely. The
+    // composite's EMA now fetches its reprojected history bilinearly with per-tap age validation and
+    // clips it to the current frame's 3x3 neighbourhood (cloudHistoryClampGamma), which bounds any
+    // history/current disagreement to the local spread at every weight -- see applyCloudComposite in
+    // composite.comp.slang for the reasoning and for what was and was not proven about the original
+    // fault. Stage 6's sample-count reduction leans on this smoother.
+    RTX_OPTION("rtx.atmosphere", float, cloudHistoryWeight, 0.85f,
                "EMA history weight of the cloud temporal smoother [0..0.98]. "
                "Higher = smoother/softer clouds that respond slowly; lower = "
                "crisper, faster-responding clouds with more visible per-frame "
                "jitter. 0 disables the temporal blend entirely (raw jittered "
-               "march). 0.92 = the previous hardcoded value. Applies live.");
-    // Ray-reconstruction routing of the cloud composite (fork — 2026-09-05, ghosting follow-up).
-    // Composite-only, like cloudHistoryWeight: it reaches the shader through CompositeArgs, never
-    // AtmosphereArgs, so it is invisible to every bake and LUT cache key by construction.
-    RTX_OPTION("rtx.atmosphere", bool, cloudCompositeRRTransparencyLayer, true,
-               "With DLSS ray reconstruction, composite the cloud in-scatter that lands on "
-               "GEOMETRY through RR's transparency (particle) layer instead of the denoised "
-               "radiance. RR reprojects the denoised signal with each surface's own motion "
-               "vector, which the cloud does not follow, so cloud fog on moving geometry "
-               "otherwise smears behind it (a raised Pip-Boy, terrain sliding past while "
-               "walking). Sky pixels are unaffected either way. Inert without ray "
-               "reconstruction or when rtx.rayreconstruction.particleBufferMode is None. "
-               "Disable to A/B the artefact. Applies live.");
+               "march). 0.92 = the previous hardcoded value. The reprojected "
+               "history is neighbourhood-clipped (cloudHistoryClampGamma), so a "
+               "high weight cannot trail. Applies live.");
+    // Cloud temporal-EMA neighbourhood clip (fork — 2026-09-06, EMA rectification). Composite-only,
+    // like cloudHistoryWeight: it reaches the shader through CompositeArgs, never AtmosphereArgs, so
+    // it is invisible to every bake and LUT cache key by construction.
+    RTX_OPTION("rtx.atmosphere", float, cloudHistoryClampGamma, 1.25f,
+               "Neighbourhood clip strength of the cloud temporal smoother [0..4]. The "
+               "reprojected history is clipped to mean +- gamma * stddev of the current "
+               "frame's 3x3 cloud neighbourhood before the EMA blend, so a reprojection "
+               "error can never trail further than the local spread. Lower = tighter "
+               "(crisper, less smoothing under fast motion); higher = looser (smoother, "
+               "more tolerant of jitter noise at low sample counts). 0 disables the clip "
+               "entirely -- the unrectified pre-2026-09-06 blend, for A/B only. Applies live.");
 
     RTX_OPTION("rtx.atmosphere", bool, cloudSecondaryLutEnable, true,
                "Supply clouds to secondary rays (indirect bounces, PSR, "

@@ -1589,18 +1589,19 @@ void RtxAtmosphere::showImguiSettings(WeatherBlender* blender) {
                             0.005f, 0.0f, 0.98f, "%.2f", sliderFlags);
         RemixGui::SetTooltipToLastWidgetOnHover(
             "EMA history weight of the cloud temporal smoother. Higher = "
-            "smoother but softer/smearier clouds that respond slowly; "
-            "lower = crisper detail with more visible per-frame jitter. "
-            "0 = raw jittered march (no temporal blend). 0.92 = previous "
-            "hardcoded behavior. Applies live.");
-        RemixGui::Checkbox("RR Transparency Layer For Cloud On Geometry",
-                           &RtxAtmosphere::cloudCompositeRRTransparencyLayerObject());
+            "smoother clouds that respond slowly; lower = crisper detail "
+            "with more visible per-frame jitter. 0 = raw jittered march (no "
+            "temporal blend). The history is neighbourhood-clipped (see "
+            "Temporal Clamp) so a high weight cannot trail. Applies live.");
+        RemixGui::DragFloat("Temporal Clamp", &RtxAtmosphere::cloudHistoryClampGammaObject(),
+                            0.01f, 0.0f, 4.0f, "%.2f", sliderFlags);
         RemixGui::SetTooltipToLastWidgetOnHover(
-            "With DLSS ray reconstruction, route the cloud fog composited onto "
-            "geometry through RR's transparency layer so RR does not reproject "
-            "it with the surface's motion vector. Fixes cloud smearing behind "
-            "moving geometry (Pip-Boy, terrain while walking). Sky pixels are "
-            "unaffected. Uncheck to A/B. Applies live.");
+            "Neighbourhood clip strength of the cloud temporal smoother: the "
+            "reprojected history is clipped to mean +- gamma * stddev of the "
+            "current frame's 3x3 cloud neighbourhood before blending, so a "
+            "reprojection error can never trail further than the local spread. "
+            "Lower = tighter/crisper; higher = looser/smoother. 0 = no clip "
+            "(the pre-2026-09-06 blend, for A/B only). Applies live.");
         RemixGui::DragFloat("Cloud Sample Spacing", &RtxAtmosphere::cloudViewStepKmObject(),
                             0.01f, 0.0f, 1.0f, "%.2f km", sliderFlags);
         RemixGui::SetTooltipToLastWidgetOnHover(

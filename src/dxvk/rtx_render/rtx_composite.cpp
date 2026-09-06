@@ -510,10 +510,10 @@ namespace dxvk {
     // Stage 4b) — see composite_args.h's doc comment on this field for why it exists outside
     // AtmosphereArgs. `atmosphere` was already fetched above for the aerial perspective LUT.
     compositeArgs.cloudAnchorDeltaYUpKm = atmosphere.getCloudAnchor().deltaKm;
-    // Cloud-on-geometry in-scatter -> RR transparency layer (fork — 2026-09-05, ghosting follow-up).
-    // The shader additionally requires outputParticleLayer (set just below), so this is inert
-    // without ray reconstruction or with particleBufferMode == None.
-    compositeArgs.cloudCompositeRRTransparencyLayer = RtxAtmosphere::cloudCompositeRRTransparencyLayer() ? 1u : 0u;
+    // Cloud temporal-EMA neighbourhood clip strength (fork — 2026-09-06, EMA rectification) -- see
+    // composite_args.h's doc comment on the field and applyCloudComposite in composite.comp.slang.
+    // Composite-only like cloudHistoryWeight; never reaches AtmosphereArgs or a LUT cache key.
+    compositeArgs.cloudHistoryClampGamma = std::max(RtxAtmosphere::cloudHistoryClampGamma(), 0.0f);
     compositeArgs.outputParticleLayer = ctx->useRayReconstruction() && rayReconstruction.useParticleBuffer();
     compositeArgs.outputSecondarySignalToParticleLayer = ctx->useRayReconstruction() && rayReconstruction.preprocessSecondarySignal();
     compositeArgs.enableDemodulateAttenuation = ctx->useRayReconstruction() && rayReconstruction.demodulateAttenuation();
@@ -585,8 +585,9 @@ namespace dxvk {
     // cloudShadowFactorStrength) multiply on post-denoise primary direct radiance
     // were deleted when the cloud shadow moved onto the sun term in the NEE
     // (atmosphere_common.slangh). The contrast knob is now populated into
-    // atmosphereArgs (rtx_atmosphere.cpp). composite_args.h::pad1/pad2 are the
-    // retired cloudShadowFactorStrength / cloudShadowIndirectStrength CB slots.
+    // atmosphereArgs (rtx_atmosphere.cpp). composite_args.h::pad2 is the
+    // retired cloudShadowIndirectStrength CB slot; the former pad1 slot (retired
+    // cloudShadowFactorStrength) now carries cloudHistoryClampGamma (fork — 2026-09-06).
 
     const bool sparseRenderingEnabled = rtOutput.m_raytraceArgs.sparseRenderingArgs.mode != SparseRenderingMode::Off;
 

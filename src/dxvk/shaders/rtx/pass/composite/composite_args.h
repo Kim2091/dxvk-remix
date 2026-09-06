@@ -113,7 +113,12 @@ struct CompositeArgs {
   float alphaBlendSurfacePackMult; // for packing/unpacking hitT into Float16 in AlphaBlendSurface
   float postFilterThreshold;
   uint writeRayReconstructionHitDistance;
-  float pad1;
+  // Cloud temporal-EMA neighbourhood clip strength (fork — 2026-09-06, EMA rectification): the
+  // reprojected history is clipped to mean +- cloudHistoryClampGamma * stddev of the current frame's
+  // 3x3 cloud neighbourhood before the blend (see applyCloudComposite in composite.comp.slang). 0
+  // disables the clip (A/B only). Rides the former pad1 slot; CB layout unchanged. Mirrors
+  // rtx.atmosphere.cloudHistoryClampGamma. Composite-only, never a bake or LUT cache-key input.
+  float cloudHistoryClampGamma;
 
   // Cloud composite parallax reprojection (fork — 2026-09-05, world-space cloud migration Stage 4b).
   // This frame's cloud-anchor world-space motion, Y-up km (RtxAtmosphere::getCloudAnchor().deltaKm
@@ -129,10 +134,9 @@ struct CompositeArgs {
   // the one place a translation signal for that correction can come from. See
   // applyCloudComposite / cloudParallaxMotionVectorPixels in composite.comp.slang.
   vec3 cloudAnchorDeltaYUpKm;
-  // Routes the cloud in-scatter composited onto GEOMETRY into the DLSS-RR transparency layer instead
-  // of the denoised radiance (fork — 2026-09-05, ghosting follow-up; design register item 10). Rides
-  // the former pad2 slot, so the CB layout is unchanged. Only consulted when outputParticleLayer is
-  // set; see applyCloudComposite in composite.comp.slang. Mirrors
-  // rtx.atmosphere.cloudCompositeRRTransparencyLayer.
-  uint cloudCompositeRRTransparencyLayer;
+  // Retired 2026-09-06 (fork): was cloudCompositeRRTransparencyLayer, 794ffd716's DLSS-RR
+  // transparency-layer routing of cloud-on-geometry in-scatter, removed with its premise -- see the
+  // note above the opaque composite in applyCloudComposite (composite.comp.slang). Slot kept so the
+  // CB layout is unchanged.
+  uint pad2;
 };

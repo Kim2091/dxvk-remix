@@ -767,6 +767,13 @@ float cloudDepthVisibility(float entryKm, float meanKm, float surfaceKm)
 // clouds) and must not be touched by this migration. Exact same math, parameterized on an explicit
 // world direction instead of re-deriving one from pixelCoordinate, since the caller already has
 // primaryRayDirections.worldDirection on hand.
+// On this Gamebryo target the view matrix carries no translation (RtCamera::getPosition() is
+// permanently (0,0,0), measured), so the camera sits at the world origin and the w = 0 direction
+// reprojection here is EXACTLY the w = 1 position reprojection a geometry motion vector would do for
+// a point at any finite cloud depth: after the perspective divide the two differ only in clip z
+// (fork — 2026-09-06, EMA rectification; settles the "miss MV is wrong for a finite deck" question
+// for this target -- wrong in principle, moot in practice. A translating camera is what the
+// parallax term below exists for).
 vec2 cloudRotationMotionVectorPixels(vec3 currentWorldDirection, uint2 pixelCoordinate)
 {
   vec4 prevNDC = mul(cb.camera.prevWorldToProjection, vec4(currentWorldDirection, 0.0f));
@@ -858,6 +865,97 @@ vec2 cloudReprojectionMotionVectorPixels(uint2 pixelCoordinate, float depthKm, A
   return rotationMV + parallaxMV;
 }
 
+// Current-frame cloud sample at `pixelCoordinate` in the composite's OPACITY convention (fork —
+// 2026-09-06, EMA rectification). The RT stores TRANSMITTANCE in .a; the premultiplied-over
+// composite and the history both want opacity, so the flip evalSkyRadiance always applied happens
+// here, once. Zeroed when the march found no slab span along this ray at all (depth companion entry
+// sentinel < 0, cloud_render.comp.slang) -- the entry distance is the GEOMETRIC slab entry
+// (cloud_march_common.slangh, marchCloudSlab), a property of the view ray alone and never of the
+// per-frame jitter or of geometry, so it is safe to bake into the signal the EMA smooths. This is
+// the one definition of "the cloud along pixel p this frame": the 3x3 neighbourhood statistics and
+// the centre sample in applyCloudComposite both go through it, so the clamp box and the value being
+// clamped agree by construction.
+vec4 loadCurrentCloudOpacity(uint2 pixelCoordinate, AtmosphereArgs args)
+{
+  const vec4 cloudRT = sampleCloudRenderRT(pixelCoordinate, args);
+  const float entryKm = sampleCloudDepthKm(pixelCoordinate, args).x;
+  return (entryKm < 0.0f) ? vec4(0.0f) : vec4(cloudRT.rgb, 1.0f - cloudRT.a);
+}
+
+// Clips `history` toward the centre of the box [aabbMin, aabbMax] along the ray from that centre
+// (fork — 2026-09-06, EMA rectification). The usual temporal-AA "clip" rather than a per-component
+// clamp: a history sample outside the box keeps its hue / opacity ratio instead of collapsing onto
+// a box corner. A history already inside the box is returned untouched, so with a correct
+// reprojection this is a no-op down to the jitter-noise level.
+vec4 clipCloudHistoryToAABB(vec4 aabbMin, vec4 aabbMax, vec4 history)
+{
+  const vec4 center = 0.5f * (aabbMax + aabbMin);
+  const vec4 extent = 0.5f * (aabbMax - aabbMin) + vec4(1e-4f);
+  const vec4 offset = history - center;
+  const vec4 unit   = abs(offset) / extent;
+  const float maxUnit = max(max(unit.x, unit.y), max(unit.z, unit.w));
+  return (maxUnit > 1.0f) ? (center + offset / maxUnit) : history;
+}
+
+// Bilinear, per-tap age-validated fetch of the reprojected cloud history (fork — 2026-09-06, EMA
+// rectification). Replaces the nearest-texel floor(prevPixelF + 0.5f) read the smoother has used
+// since it lived in evalSkyRadiance. `prevPixelF` is in texel-INDEX space (integer == texel), so
+// the four taps are floor(prevPixelF) and its +1 neighbours weighted by frac(prevPixelF) -- the same
+// convention the old round() read used, just not quantised. Nearest-texel fetch quantised any
+// sub-half-pixel motion to zero: under slow rotation (< 0.5 px/frame) the history was never
+// advanced at all, so the EMA output trailed the true cloud by ~w/(1-w) frames of motion (~6 frames
+// at 0.85), and just above 0.5 px/frame it over-shot by up to half a pixel the other way. Bilinear
+// fetch makes the reprojected history a continuous function of the motion vector.
+//
+// Each tap is validated against the R16_UINT frame-id companion INDIVIDUALLY (stale or off-screen
+// taps drop out and the remaining weights renormalise), so a valid texel next to a never-written or
+// stale one is still usable and a stale one can never leak in through the filter footprint. Returns
+// false when no tap is valid -- the caller then uses the raw current sample exactly as before.
+bool fetchCloudHistoryBilinear(vec2 prevPixelF, uint frameIdx, out vec4 history)
+{
+  const vec2 base = floor(prevPixelF);
+  const vec2 f    = prevPixelF - base;
+  const int2 baseTexel = int2(base);
+  const int2 resolution = int2(cb.camera.resolution);
+
+  // Age check (relocated from the old inline read, fork — 2026-05-13 origin): reject any tap whose
+  // stored frame-id doesn't match the immediately previous frame. Sentinel 0xFFFF ("never written",
+  // cleared at allocation) collides harmlessly with startup and the once-per-65536-frames wrap.
+  const uint expectedPrevFrameId = (frameIdx - 1u) & 0xFFFFu;
+
+  const float weights[4] = {
+    (1.0f - f.x) * (1.0f - f.y), f.x * (1.0f - f.y),
+    (1.0f - f.x) * f.y,          f.x * f.y };
+  const int2 offsets[4] = { int2(0, 0), int2(1, 0), int2(0, 1), int2(1, 1) };
+
+  vec4 sum = vec4(0.0f);
+  float weightSum = 0.0f;
+  [unroll]
+  for (uint i = 0u; i < 4u; ++i)
+  {
+    const int2 texel = baseTexel + offsets[i];
+    if (any(texel < int2(0, 0)) || any(texel >= resolution))
+    {
+      continue;
+    }
+    const uint historyFrameId = CompositeCloudHistoryFrameIdPrev[texel];
+    if ((historyFrameId != expectedPrevFrameId) || (historyFrameId == 0xFFFFu))
+    {
+      continue;
+    }
+    sum       += CompositeCloudHistoryPrev[texel] * weights[i];
+    weightSum += weights[i];
+  }
+
+  if (weightSum < 1e-3f)
+  {
+    history = vec4(0.0f);
+    return false;
+  }
+  history = sum / weightSum;
+  return true;
+}
+
 // Composites the Nubis Cubed cloud render RT (m_cloudRenderRT / m_cloudDepthRT, written this frame
 // by RtxAtmosphere::dispatchCloudScreenPass, called right after dispatchPathTracing) over BOTH sky
 // and geometry. Previously (pre-Stage-4a) this only ran on sky-miss pixels, because it lived inside
@@ -866,10 +964,38 @@ vec2 cloudReprojectionMotionVectorPixels(uint2 pixelCoordinate, float depthKm, A
 // the deck genuinely has cloud in front of it along this ray, and the whole point of this stage is to
 // fog it exactly as the sky is fogged, rather than leaving it (and any foliage on it) crisp.
 //
-// backgroundAlpha / particleLayerOutput (fork — 2026-09-05, ghosting follow-up): the alpha-blend
-// surface's coverage (applyVolumetricLighting's backgroundAlpha) and the DLSS-RR transparency layer,
-// needed by the alpha-blend in-scatter weighting and the ray-reconstruction routing respectively --
-// see the two composite blocks at the end of this function.
+// backgroundAlpha (fork — 2026-09-05, ghosting follow-up): the alpha-blend surface's coverage
+// (applyVolumetricLighting's backgroundAlpha), needed by the alpha-blend in-scatter weighting --
+// see the alpha-blend composite block at the end of this function.
+//
+// ---- Temporal EMA rectification (fork — 2026-09-06) ----
+// rtx.atmosphere.cloudHistoryWeight = 0 removed the reported cloud ghosting entirely, measured
+// in-game, so the EMA below is the mechanism. A full read of the reprojection path found no fault
+// in it: the rotation term is bit-identical to the engine's own calcMotionVectorForRayMiss and to
+// what the pre-Stage-4b evalSkyRadiance smoother was fed (the user ran that at 0.85); the parallax
+// term is identically zero on this target (static anchor, non-translating view matrix); the cloud
+// RT is a pure function of the camera basis (no geometry input since e7298993f); the history
+// ping-pong, its extent, the frame-id age check and the composite/raygen camera constants all
+// agree. What the old smoother lacked, and this one inherited, is the other half of every
+// production temporal filter: it trusted its reprojected history UNCONDITIONALLY. Any per-frame
+// disagreement between where the history was fetched from and what the current frame actually
+// holds -- from a reprojection error this reading did not find, or from anything else -- was blended
+// in at full weight and decayed only over ~1/(1-w) frames. That is what a trail IS.
+//
+// The smoother is therefore made correct by construction rather than by hunting further: the
+// reprojected history is fetched bilinearly with per-tap age validation (see
+// fetchCloudHistoryBilinear) and then CLIPPED to the current frame's 3x3 neighbourhood box (mean
+// +- cloudHistoryClampGamma * stddev, per channel, opacity included) before the blend. With a correct
+// reprojection the history already sits inside that box and the clip is a no-op to jitter-noise
+// level; with an incorrect one the history can deviate from the current frame by at most the local
+// spread, so a heavy smear is structurally impossible at ANY history weight. Where Stage 6 later
+// lowers sample counts, the noisier current frame widens the box and admits more history --
+// exactly where the smoothing is wanted. The clamp is a CompositeArgs knob
+// (rtx.atmosphere.cloudHistoryClampGamma; 0 restores the unrectified blend for A/B, never for use).
+//
+// This is principled, not a proof of the root cause: it bounds the artefact class regardless of
+// which link produced the disagreement. Debug view 883 now reports the reprojected-history vs
+// current-frame error directly, so the question can be settled in-game.
 void applyCloudComposite(
   uint2 pixelCoordinate,
   bool primaryMiss,
@@ -878,7 +1004,6 @@ void applyCloudComposite(
   float backgroundAlpha,
   inout vec3 radianceOutput,
   inout vec3 alphaBlendOutput,
-  inout vec4 particleLayerOutput,
   bool alphaBlendSurfaceValid,
   float alphaBlendHitDistance)
 {
@@ -888,23 +1013,16 @@ void applyCloudComposite(
     return;
   }
 
-  const vec4 cloudRT = sampleCloudRenderRT(pixelCoordinate, args);
-  // Same alpha-convention flip evalSkyRadiance always applied: the RT stores TRANSMITTANCE, the
-  // premultiplied-over composite below wants OPACITY.
-  vec4 currentCloud = vec4(cloudRT.rgb, 1.0f - cloudRT.a);
-
   const vec2 cloudDepthKm = sampleCloudDepthKm(pixelCoordinate, args);
   const float entryKm = cloudDepthKm.x;
   const float meanKm  = cloudDepthKm.y;
   const float kmPerWorldUnit = 1.0f / max(args.worldUnitsPerKm, 1e-6f);
 
-  // "The march found no span at all" is a property of the view ray, not of geometry, so it is safe
-  // to apply before the EMA -- unlike the occlusion gate, which is deliberately deferred until
-  // after it (see below).
-  if (entryKm < 0.0f)
-  {
-    currentCloud = vec4(0.0f);
-  }
+  // The "no span along this ray" zeroing lives inside loadCurrentCloudOpacity now, for the reason
+  // given on that function: it is a property of the view ray, not of geometry, so it belongs in
+  // the smoothed signal -- unlike the occlusion gate, which is deliberately deferred until after the
+  // EMA (see below).
+  const vec4 currentCloud = loadCurrentCloudOpacity(pixelCoordinate, args);
 
   // NOTE: the geometry occlusion gate does NOT belong here (fork — 2026-09-05, Stage 4b fix).
   // It used to multiply currentCloud by cloudDepthVisibility() at this point, before the temporal
@@ -916,41 +1034,59 @@ void applyCloudComposite(
   // The gate now runs after the EMA, where it carries no history, exactly as the alpha-blended
   // path below always did.
 
-  // ---- Temporal EMA (relocated from evalSkyRadiance; now parallax-aware -- see
-  // cloudReprojectionMotionVectorPixels). Reprojects into the SAME cloud-history ping-pong pair
-  // evalSkyRadiance used to own (RtxAtmosphere owns the actual swap; composite reads whichever pair
-  // RtxAtmosphere::bindResources already resolved as Prev/Curr for this frame, during the G-buffer
-  // pass's common-bindings setup -- composite must not swap again). ----
+  // ---- Temporal EMA (relocated from evalSkyRadiance; parallax-aware -- see
+  // cloudReprojectionMotionVectorPixels; rectified 2026-09-06 -- see the function header).
+  // Reprojects into the SAME cloud-history ping-pong pair evalSkyRadiance used to own (RtxAtmosphere
+  // owns the actual swap; composite reads whichever pair RtxAtmosphere::bindResources already
+  // resolved as Prev/Curr for this frame, during the G-buffer pass's common-bindings setup --
+  // composite must not swap again). ----
   vec4 smoothedCloud = currentCloud;
   if (all(cb.camera.resolution > uint2(0u, 0u)))
   {
     const vec2 motionVectorPixels = cloudReprojectionMotionVectorPixels(
       pixelCoordinate, max(meanKm, 0.05f), args);
     const vec2 prevPixelF = vec2(pixelCoordinate) + motionVectorPixels;
-    const int2 prevPixel = int2(floor(prevPixelF + 0.5f));
 
-    const bool reprojValid = all(prevPixel >= int2(0, 0))
-                          && all(prevPixel < int2(cb.camera.resolution));
-
-    bool historyValid = false;
     vec4 history = vec4(0.0f);
-    if (reprojValid)
-    {
-      history = CompositeCloudHistoryPrev[prevPixel];
+    bool historyValid = fetchCloudHistoryBilinear(prevPixelF, frameIdx, history);
 
-      // Age check: reject history whose stored frame-id doesn't match the immediately previous
-      // frame (companion R16_UINT ping-pong; catches stale history at pixels that were
-      // foreground-occluded last frame). Sentinel 0xFFFF collides harmlessly with startup and the
-      // once-per-65536-frames wrap.
-      const uint historyFrameId = CompositeCloudHistoryFrameIdPrev[prevPixel];
-      const uint expectedPrevFrameId = (frameIdx - 1u) & 0xFFFFu;
-      const bool ageValid = (historyFrameId == expectedPrevFrameId) && (historyFrameId != 0xFFFFu);
-
-      historyValid = ageValid && ((history.a > 0.001f) || (currentCloud.a < 0.001f));
-    }
+    // Alpha gate (legacy, kept): "cloud appears where the history had none" restarts from the raw
+    // current sample so a deck edge sweeping INTO a pixel responds instantly instead of fading up
+    // over ~1/(1-w) frames. The opposite direction (history has cloud, current has none) is left to
+    // the clip below, which pulls such a history into the near-zero neighbourhood box -- the old
+    // unconditional 0.85-per-frame fade-out is exactly the asymmetry that read as a trail.
+    historyValid = historyValid && ((history.a > 0.001f) || (currentCloud.a < 0.001f));
 
     if (historyValid)
     {
+      // Neighbourhood clip (fork — 2026-09-06, EMA rectification): first two moments of the
+      // current-frame cloud over the 3x3 footprint, clamped to the screen at the border. Per
+      // channel, opacity included, all through loadCurrentCloudOpacity so the box is built from
+      // the same quantity the centre sample is.
+      const float clampGamma = cb.cloudHistoryClampGamma;
+      if (clampGamma > 0.0f)
+      {
+        const int2 resolution = int2(cb.camera.resolution);
+        vec4 m1 = vec4(0.0f);
+        vec4 m2 = vec4(0.0f);
+        [unroll]
+        for (int dy = -1; dy <= 1; ++dy)
+        {
+          [unroll]
+          for (int dx = -1; dx <= 1; ++dx)
+          {
+            const int2 neighbour = clamp(int2(pixelCoordinate) + int2(dx, dy), int2(0, 0), resolution - int2(1, 1));
+            const vec4 v = loadCurrentCloudOpacity(uint2(neighbour), args);
+            m1 += v;
+            m2 += v * v;
+          }
+        }
+        m1 *= (1.0f / 9.0f);
+        m2 *= (1.0f / 9.0f);
+        const vec4 sigma = sqrt(max(m2 - m1 * m1, vec4(0.0f)));
+        history = clipCloudHistoryToAABB(m1 - clampGamma * sigma, m1 + clampGamma * sigma, history);
+      }
+
       // Anchor-cut history rejection (fork — 2026-09-05): reuses the SAME signal Stage 2 built for
       // exactly this purpose rather than inventing a second one. RtxAtmosphere::getAtmosphereArgs
       // already zeroes args.cloudHistoryWeight for one frame when m_cloudAnchorCutThisFrame fires
@@ -981,43 +1117,23 @@ void applyCloudComposite(
     opaqueVisibility = cloudDepthVisibility(entryKm, meanKm, surfaceKm);
   }
 
-  // Ray-reconstruction routing (fork — 2026-09-05, ghosting follow-up; design register item 10).
-  // radianceOutput ends up in the composite output DLSS-RR denoises, and RR reprojects that signal
-  // with the pixel's PRIMARY motion vector, which on a geometry hit is the surface's own. The cloud
-  // in-scatter composited onto that surface is not attached to the surface -- under translation it
-  // is screen-static, and under rotation it follows the rotation-only cloud reprojection above, not
-  // the surface's parallax -- so RR drags it along with the surface every frame and its history
-  // never agrees with the current frame: a bright cloud smear trailing any moving geometry (a
-  // Pip-Boy swinging up, terrain sliding past while walking), the artefact the design register
-  // anticipated for DLSS one stage after the EMA. The additive term is therefore routed into the RR
-  // transparency layer (NGX pInTransparencyLayer -- the same premultiplied layer secondary/PSR
-  // radiance and alpha-blended particles already use, composited by RR OVER its denoised output
-  // without that output's temporal history; DxvkRayReconstruction::particleBufferMode), and only the
-  // multiplicative transmittance stays in the denoised signal. That term is screen-static too, but a
-  // darkening dragged with a surface reads as a soft shadow rather than a bright trail, and
-  // demodulateAttenuation's 0.3 alpha floor makes a fully layer-based over impossible for dense cloud
-  // without leaking 30% of the surface through it -- so the split is deliberate, not partial. Like
-  // every other particle-layer term, the routed in-scatter is not touched by applyFog (see the
-  // disabled particle-layer fog line there). Sky pixels keep the full over in radianceOutput: their
-  // MV is rotation-only (calcMotionVectorForRayMiss), which IS the cloud's own motion, and this
-  // preserves "sky pixels unchanged" against the pre-4b path. With cb.outputParticleLayer == 0 (no RR,
-  // or particleBufferMode None) or rtx.atmosphere.cloudCompositeRRTransparencyLayer off, this is the
-  // plain premultiplied over -- identical to the removed evalSkyRadiance operation, just relocated.
-  const bool routeToTransparencyLayer =
-    (cb.outputParticleLayer != 0u) && (cb.cloudCompositeRRTransparencyLayer != 0u);
-
-  const float opaqueTransmittance = 1.0f - smoothedCloud.a * opaqueVisibility;
-  const vec3  opaqueInScatter     = smoothedCloud.rgb * opaqueVisibility;
-  if (routeToTransparencyLayer && !primaryMiss)
-  {
-    radianceOutput *= opaqueTransmittance;
-    particleLayerOutput.xyz += opaqueInScatter;
-  }
-  else
-  {
-    // On a sky pixel opaqueVisibility is 1.0 and this is exactly the pre-4b operation.
-    radianceOutput = radianceOutput * opaqueTransmittance + opaqueInScatter;
-  }
+  // Premultiplied over -- identical operation to the removed evalSkyRadiance code, just relocated.
+  // On a sky pixel opaqueVisibility is 1.0 and this is exactly that operation.
+  //
+  // The DLSS-RR transparency-layer routing 794ffd716 added here (in-scatter into the NGX particle
+  // layer, transmittance left multiplicative, behind rtx.atmosphere.cloudCompositeRRTransparencyLayer)
+  // was removed 2026-09-06 (fork). Its premise -- RR reprojecting the cloud with the surface's
+  // motion vector as THE cause of the reported smear -- is contradicted by the in-game measurement
+  // that cloudHistoryWeight = 0 removes the smear entirely with that routing enabled: an RR-side
+  // mechanism would not depend on this pass's history weight. With the premise gone, the routing
+  // was a split composite (half the term in the denoised signal, half outside it) carried on no
+  // evidence of benefit; upstream's own screen-static fog (applyFog) goes into radianceOutput the
+  // same way this does. The two incidental fixes from that commit stay: the unjittered reprojection
+  // direction (cloudReprojectionMotionVectorPixels) and the alpha-blend coverage weighting below.
+  // If an RR-only artefact ever shows at cloudHistoryWeight = 0, that commit is the reference for
+  // restoring the toggle.
+  radianceOutput = radianceOutput * (1.0f - smoothedCloud.a * opaqueVisibility)
+                 + smoothedCloud.rgb * opaqueVisibility;
 
   // ---- Alpha-blended (foliage / particle) surfaces ----
   // Depth-ratio rule (fork — 2026-09-05): the same cloudDepthVisibility gate as the opaque path,
@@ -1043,18 +1159,7 @@ void applyCloudComposite(
     // The transmittance needs no such factor; it multiplies a value that already carries it.
     const float alphaTransmittance = 1.0f - smoothedCloud.a * alphaVisibility;
     const vec3  alphaInScatter     = smoothedCloud.rgb * alphaVisibility * (1.0f - backgroundAlpha);
-    if (routeToTransparencyLayer)
-    {
-      // Same RR reasoning as the opaque block: the alpha-blend radiance is part of the signal RR
-      // denoises and reprojects with the primary motion vector, so its cloud in-scatter goes to the
-      // transparency layer as well, transmittance stays multiplicative.
-      alphaBlendOutput *= alphaTransmittance;
-      particleLayerOutput.xyz += alphaInScatter;
-    }
-    else
-    {
-      alphaBlendOutput = alphaBlendOutput * alphaTransmittance + alphaInScatter;
-    }
+    alphaBlendOutput = alphaBlendOutput * alphaTransmittance + alphaInScatter;
   }
 }
 
@@ -1248,12 +1353,13 @@ vec4 compositeResult(
   // zero contribution) + sharedRadiance (the cloudless sky/atmosphere/star/moon radiance
   // geometry_resolver.slangh wrote) + volumetrics; for a geometry hit it is the denoised primary
   // radiance with aerial perspective already folded in.
-  // backgroundAlpha and particleLayerOutput (fork — 2026-09-05, ghosting follow-up): the alpha-blend
-  // coverage the in-scatter must be weighted by, and the DLSS-RR transparency layer the geometry
-  // in-scatter is routed into -- see applyCloudComposite's two composite blocks.
+  // backgroundAlpha (fork — 2026-09-05, ghosting follow-up): the alpha-blend coverage the
+  // in-scatter must be weighted by -- see applyCloudComposite's alpha-blend composite block. The
+  // particleLayerOutput argument 794ffd716 added (DLSS-RR transparency-layer routing) was removed
+  // 2026-09-06 with that routing; see the note above the opaque composite in applyCloudComposite.
   applyCloudComposite(
     pixelCoordinate, primaryMiss, viewDistance, cb.frameIdx, backgroundAlpha,
-    radianceOutput, alphaBlendOutput, particleLayerOutput, alphaBlendSurfaceValid, alphaBlendHitDistance);
+    radianceOutput, alphaBlendOutput, alphaBlendSurfaceValid, alphaBlendHitDistance);
 
   // Add sky radiance
   applySkyContribution(pixelCoordinate, primaryRayDirections, primaryMiss, radianceScale, volumeAttenuation, radianceOutput);

@@ -81,6 +81,13 @@
 // because this pass has its own descriptor set.
 #define DEBUG_VIEW_BINDING_CLOUD_HISTORY_FRAME_ID_PREV_INPUT                                45
 
+// Fork: cloud-history COLOUR ping-pong, PREVIOUS slot only (RGBA16F premultiplied cloud radiance +
+// opacity; 2026-09-06, EMA rectification). Read-only companion to the frame-id slot above so
+// DEBUG_VIEW_CLOUD_REPROJECTION (883) can show the REAL reprojected-history vs current-frame error
+// -- the quantity the composite's neighbourhood clip bounds -- instead of a current-frame proxy.
+// Extends the contiguous fork-owned cloud-debug block to 39-46.
+#define DEBUG_VIEW_BINDING_CLOUD_HISTORY_PREV_INPUT                                         46
+
 // Slot 38 was DEBUG_VIEW_BINDING_PRIMARY_CLOUD_SHADOW_FACTOR_INPUT (fork
 // screen-space cloud-shadow texture, debug view 878). Removed 2026-06-19 with
 // the screen-space cloud-shadow system; number left reserved (no descriptor

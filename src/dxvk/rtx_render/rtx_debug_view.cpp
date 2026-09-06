@@ -285,26 +285,27 @@ namespace dxvk {
                                 "read heavily fogged in the final composite); black = surface not\n"
                                 "fogged (no cloud in front of it along this ray, or a genuine miss)."},
         {DEBUG_VIEW_CLOUD_REPROJECTION, "Atmosphere: Cloud Reprojection (World-Space Stage 4b)",
-                                "Fork diagnostic (world-space cloud migration, Stage 4b, 2026-09-05).\n"
-                                "Recomputes the SAME rotation + translation-parallax reprojection\n"
-                                "composite.comp.slang's applyCloudComposite performs, from current-frame\n"
-                                "sources only (this pass's own G-buffer + AtmosphereCloudDepth reads -\n"
-                                "the depth companion is point-sampled, matching enums 880/884's\n"
-                                "silhouette-safety reasoning).\n"
-                                "R: magnitude of the translation-parallax correction ALONE, in pixels,\n"
-                                "saturated over 0-4 px. This equals (parallax-reprojected pixel -\n"
-                                "rotation-only pixel) by construction. Strafing under the deck should\n"
-                                "light this channel up broadly if the parallax term is doing real work;\n"
-                                "near-zero everywhere with the camera translating under a nearby cloud\n"
-                                "would indicate the correction is not engaging.\n"
+                                "Fork diagnostic (world-space cloud migration, Stage 4b, 2026-09-05;\n"
+                                "reworked 2026-09-06, EMA rectification). Recomputes the SAME\n"
+                                "rotation + translation-parallax reprojection composite.comp.slang's\n"
+                                "applyCloudComposite performs, then compares the REAL reprojected\n"
+                                "history (previous ping-pong slot, bilinear, per-tap age-validated)\n"
+                                "against this frame's raw cloud at the same pixel.\n"
+                                "R: reprojection error -- max over rgb of |history - current| relative\n"
+                                "   to the larger of the two, and |opacity difference|; 0..1. With a\n"
+                                "   correct motion vector this is jitter noise everywhere (dim, even);\n"
+                                "   a wrong one lights up deck edges along the direction of camera\n"
+                                "   motion. This is the quantity the composite's neighbourhood clip\n"
+                                "   bounds, i.e. what a trail is made of.\n"
                                 "G: history-rejection reason, a 4-level step -\n"
-                                "  0.00 = would accept history\n"
+                                "  0.00 = history accepted\n"
                                 "  0.33 = no cloud along this ray (nothing to reject)\n"
-                                "  0.66 = anchor cut this frame (RtxAtmosphere::m_cloudAnchorCutThisFrame\n"
-                                "         forced cloudHistoryWeight to 0 - teleport / cell transition /\n"
-                                "         camera-world-override toggle)\n"
-                                "  1.00 = stale age (CompositeCloudHistoryFrameIdPrev doesn't match this\n"
-                                "         frame - 1) or the reprojected pixel fell off-screen"},
+                                "  0.66 = history weight is 0 this frame (anchor cut, or the knob at 0)\n"
+                                "  1.00 = no valid history tap (stale age or off-screen)\n"
+                                "B: |rotation + parallax motion vector| in pixels / 8 (saturated). Pan\n"
+                                "   the camera: black while the deck visibly moves means no motion\n"
+                                "   vector is being produced at all; lit with R still dim means the\n"
+                                "   reprojection is right."},
         {DEBUG_VIEW_CASCADE_LEVEL, "Terrain: Cascade Level"},
 
         {DEBUG_VIEW_VIRTUAL_HIT_DISTANCE, "Virtual Hit Distance"},
@@ -772,6 +773,7 @@ namespace dxvk {
         TEXTURE3D(DEBUG_VIEW_BINDING_CLOUD_NVDF_SDF_INPUT)
         TEXTURE2D(DEBUG_VIEW_BINDING_CLOUD_DEPTH_RT_INPUT)
         TEXTURE2D(DEBUG_VIEW_BINDING_CLOUD_HISTORY_FRAME_ID_PREV_INPUT)
+        TEXTURE2D(DEBUG_VIEW_BINDING_CLOUD_HISTORY_PREV_INPUT)
 
         RW_TEXTURE2D(DEBUG_VIEW_BINDING_ACCUMULATED_DEBUG_VIEW_INPUT_OUTPUT)
 
@@ -1611,6 +1613,16 @@ namespace dxvk {
       const Resources::Resource& cloudHistoryFrameIdPrev = atmosphere.getPreviousCloudHistoryFrameId();
       if (cloudHistoryFrameIdPrev.isValid()) {
         ctx->bindResourceView(DEBUG_VIEW_BINDING_CLOUD_HISTORY_FRAME_ID_PREV_INPUT, cloudHistoryFrameIdPrev.view, nullptr);
+      }
+    }
+    // Fork: cloud-history colour, previous slot (2026-09-06, EMA rectification). This pass runs
+    // after composite on the SAME resolved ping-pong pair, so this is exactly the history
+    // applyCloudComposite reprojected this frame -- DEBUG_VIEW_CLOUD_REPROJECTION (883) compares it
+    // against the current raw cloud RT.
+    {
+      const auto& cloudHistoryPrev = atmosphere.getPreviousCloudHistory();
+      if (cloudHistoryPrev.isValid()) {
+        ctx->bindResourceView(DEBUG_VIEW_BINDING_CLOUD_HISTORY_PREV_INPUT, cloudHistoryPrev.view, nullptr);
       }
     }
 
