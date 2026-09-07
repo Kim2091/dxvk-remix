@@ -1970,7 +1970,10 @@ void RtxAtmosphere::setAerialPerspectiveCamera(const RtCamera& camera) {
 
   // Note the bake subtracts cameraPosition straight back off, so only the basis actually drives the
   // volume; the position is carried for completeness.
-  m_apCameraPosition = camera.getPosition(/*freecam=*/false);
+  // freecam=true to match the basis on the next three lines (fork -- 2026-09-06, open issue #6);
+  // no-op unless the free camera is enabled. Was false, which oriented this volume to the free
+  // camera while positioning it at the player.
+  m_apCameraPosition = camera.getPosition(/*freecam=*/true);
   m_apCameraForward = camera.getDirection(/*freecam=*/true);
   m_apCameraRight = camera.getRight(/*freecam=*/true) * tanHalfFovX;
   m_apCameraUp = camera.getUp(/*freecam=*/true) * tanHalfFovY;
@@ -2989,11 +2992,14 @@ AtmosphereArgs RtxAtmosphere::updateFrame(RtxContext& ctx,
     const Vector3 rawWorldUnits        = camera.getPosition(/*freecam=*/false);
     const Vector3 rawWorldUnitsFreecam = camera.getPosition(/*freecam=*/true);
     // Both freecam variants are recorded, not just the one the rest of this function uses, because
-    // the existing code below is itself inconsistent about which it wants: the render basis just
-    // above takes the camera's ORIENTATION with freecam=true, but the POSITION pushed to
-    // setCloudShadowCameraPosition further down has always used freecam=false. That mismatch is a
-    // known bug for a later stage to fix — recorded here, not fixed, so the fix has a measured
-    // before/after instead of a guess.
+    // the two readings can differ, and both are worth seeing in the debug view. The basis/position
+    // mismatch they were recorded to expose is FIXED as of 2026-09-06 (open issue #6): the render
+    // basis just above takes the camera's ORIENTATION with freecam=true while the POSITION resolved
+    // below used freecam=false, so with the free camera flying the clouds were anchored to the
+    // player's body and oriented to the detached camera. resolvedRawWorldUnits now follows the
+    // basis. This is a no-op unless the free camera is actually enabled -- getViewToWorld returns
+    // the freecam matrix only when (freecam && isFreeCameraEnabled()), so the two readings are the
+    // same object in normal play (rtx_camera.cpp:276-280).
 
     // Anchor source selection (fork — 2026-09-05, world-space cloud migration Stage 2).
     // rtx.atmosphere.useCameraWorldOverride + cameraWorldOverride let the game integration (the
@@ -3007,7 +3013,7 @@ AtmosphereArgs RtxAtmosphere::updateFrame(RtxContext& ctx,
     const bool useOverride = RtxAtmosphere::useCameraWorldOverride();
     const Vector3 resolvedRawWorldUnits = useOverride
       ? RtxAtmosphere::cameraWorldOverride()
-      : rawWorldUnits;
+      : rawWorldUnitsFreecam;
     const CloudAnchor::Source resolvedSource = useOverride
       ? CloudAnchor::Source::CameraWorldOverride
       : CloudAnchor::Source::CameraViewMatrix;
