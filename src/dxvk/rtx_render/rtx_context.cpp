@@ -1482,6 +1482,9 @@ namespace dxvk {
     getDenoiseArgs(primaryDirectNrdArgs, primaryIndirectNrdArgs, secondaryNrdArgs);
 
     constants.primaryDirectMissLinearViewZ = primaryDirectNrdArgs.missLinearViewZ;
+    // Same sentinel to the cloud pass, which tests it to tell a sky ray from a surface hit but has no
+    // binding for NRD constants (fork -- 2026-09-06). Set here rather than duplicated as a literal.
+    getCommonObjects()->metaAtmosphere().setMissLinearViewZ(primaryDirectNrdArgs.missLinearViewZ);
 
     constants.wboitEnergyLossCompensation = RtxOptions::wboitEnergyLossCompensation();
     constants.wboitDepthWeightTuning = RtxOptions::wboitDepthWeightTuning();

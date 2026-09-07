@@ -195,4 +195,4 @@ Texture2D<float4> AtmosphereCloudSecondaryLut;
 // that function's header comment for why the clamp needs the G-buffer to exist first). No
 // consumer yet -- wired here so Stage 4b's depth-aware composite needs no further plumbing.
 layout(binding = BINDING_ATMOSPHERE_CLOUD_DEPTH_RT)
-Texture2D<float2> AtmosphereCloudDepth;
+Texture2D<float4> AtmosphereCloudDepth;

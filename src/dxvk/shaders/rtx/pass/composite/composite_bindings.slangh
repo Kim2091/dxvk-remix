@@ -118,7 +118,7 @@ Texture2D<float4> CompositeCloudRender;
 layout(binding = COMPOSITE_ATMOSPHERE_CLOUD_RENDER_SAMPLER)
 SamplerState CompositeCloudRenderSampler;
 layout(binding = COMPOSITE_ATMOSPHERE_CLOUD_DEPTH_INPUT)
-Texture2D<float2> CompositeCloudDepth;
+Texture2D<float4> CompositeCloudDepth;
 
 // Cloud temporal-history ping-pong (fork — 2026-09-05, Stage 4b). Same pair of RGBA16F + R16_UINT
 // ping-pong resources previously bound (at different slots) to the common ray-tracing bindings for

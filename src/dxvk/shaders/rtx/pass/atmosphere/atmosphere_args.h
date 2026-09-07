@@ -512,7 +512,11 @@ struct AtmosphereArgs {
   // moonlight respectively. 0 disables the LOD. Rides the former padRetired6
   // slot — CB layout unchanged (16-byte-row discipline preserved).
   float cloudLightingLodThreshold;
-  float padRetired7;
+  // NRD miss sentinel for PrimaryLinearViewZ, pushed from the same source NRD itself uses (fork --
+  // 2026-09-06). The cloud pass has no binding for NRD constants, so a sky-miss test there would
+  // otherwise need the 500001.0f literal duplicated in shader code where nothing keeps it in step.
+  // Rides the former padRetired7 slot -- CB layout unchanged.
+  float cloudMissLinearViewZ;
   uint  padRetired8;
   float cloudAerialHazePerKm;      // Aerial-perspective HAZE on cloud radiance (1/km). Dims distant
                                    // cloud samples toward atmospheric color. Visual softness control.

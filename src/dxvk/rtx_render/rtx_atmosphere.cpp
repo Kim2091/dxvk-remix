@@ -1307,7 +1307,7 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
   args.padRetired4 = 0u;
   args.padRetired5 = 0.0f;
   args.cloudLightingLodThreshold = RtxAtmosphere::cloudLightingLodThreshold();
-  args.padRetired7 = 0.0f;
+  args.cloudMissLinearViewZ = m_missLinearViewZ;
   args.padRetired8 = 0u;
   args.padRetired9 = 0.0f;
   // padRetired10 is NOT in this list (fork — 2026-09-05, world-space cloud migration Stage 2): it
@@ -2432,7 +2432,7 @@ void RtxAtmosphere::ensureCloudRenderRT(Rc<DxvkContext> ctx,
     ctx,
     "Atmosphere Cloud Depth RT",
     extent3D,
-    VK_FORMAT_R32G32_SFLOAT,
+    VK_FORMAT_R32G32B32A32_SFLOAT,
     1,                          // numLayers
     VK_IMAGE_TYPE_2D,
     VK_IMAGE_VIEW_TYPE_2D,

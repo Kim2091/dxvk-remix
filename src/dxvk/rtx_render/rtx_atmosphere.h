@@ -224,6 +224,11 @@ public:
   // The measurement half of the scale; cloudWorldUnitsPerKm divides it by cloudWorldCompression.
   static float resolveUnitsPerMeter();
 
+  // NRD sky-miss sentinel for PrimaryLinearViewZ, pushed once per frame from rtx_context where
+  // NRD constants are built, and forwarded to the cloud pass through AtmosphereArgs (fork --
+  // 2026-09-06). That pass has no binding for NRD constants of its own.
+  void setMissLinearViewZ(float v) { m_missLinearViewZ = v; }
+
   // Deprecated-option migrations (fork -- 2026-09-06, units/altitude redesign). Each fires when
   // any config layer sets the retired key, moves the value into its replacement, then clears the
   // old key from stronger layers so a re-save drops it. See rtx_atmosphere.cpp for the transforms.
@@ -1472,6 +1477,7 @@ private:
   Resources::Resource m_cloudNvdfJfa[2];
   Resources::Resource m_cloudNvdfSdf[2];
   uint32_t            m_cloudNvdfSdfFront = 0;
+  float    m_missLinearViewZ       { 1e9f };
   Resources::Resource m_cloudDetailNoise3D;
   Resources::Resource m_cloudRenderRT;
   // Depth companion (fork — 2026-09-05, world-space cloud migration Stage 4a): allocated/resized

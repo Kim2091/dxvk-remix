@@ -720,7 +720,12 @@ vec4 sampleCloudRenderRT(uint2 pixelCoordinate, AtmosphereArgs args)
 // SampleLevel: averaging two different surfaces' depths across a silhouette is meaningless (the same
 // reasoning cloud_render.comp.slang's own PrimaryLinearViewZ read and debug views 880/884 already
 // follow -- see their comments). (-1, 0) is the "no cloud entered" sentinel.
-vec2 sampleCloudDepthKm(uint2 pixelCoordinate, AtmosphereArgs args)
+// Returns (entryKm, meanKm, surfaceKm, surfaceVisibility). Nearest-texel by construction, which for
+// the two geometry-locked channels is the CORRECT filter rather than a limitation: bilinear across a
+// silhouette would blend a visibility measured against the mountain with one measured against the
+// sky behind it, and produce a halo along exactly the edge this data exists to get right. The cloud
+// colour itself is still filtered bilinearly, which is safe because it is view-only.
+vec4 sampleCloudDepthKm(uint2 pixelCoordinate, AtmosphereArgs args)
 {
   if (args.cloudRenderFullDimX != 0u && args.cloudRenderFullDimY != 0u)
   {
@@ -1093,9 +1098,14 @@ void applyCloudComposite(
     return;
   }
 
-  const vec2 cloudDepthKm = sampleCloudDepthKm(pixelCoordinate, args);
+  const vec4 cloudDepthKm = sampleCloudDepthKm(pixelCoordinate, args);
   const float entryKm = cloudDepthKm.x;
   const float meanKm  = cloudDepthKm.y;
+  // Measured in the march: the fraction of this ray's cloud opacity lying in front of the surface
+  // (fork -- 2026-09-06). Replaces estimating that fraction from (entry, mean, alpha), which cannot
+  // distinguish thin wisps in front of a mountain from a dense bank behind it and so let cloud show
+  // through geometry.
+  const float measuredSurfaceVisibility = cloudDepthKm.w;
   const float kmPerWorldUnit = 1.0f / max(args.worldUnitsPerKm, 1e-6f);
 
   // The "no span along this ray" zeroing lives inside loadCurrentCloudOpacity now, for the reason
@@ -1193,8 +1203,7 @@ void applyCloudComposite(
   float opaqueVisibility = 1.0f;
   if (!primaryMiss)
   {
-    const float surfaceKm = viewDistance * kmPerWorldUnit;
-    opaqueVisibility = cloudDepthVisibility(entryKm, meanKm, surfaceKm, smoothedCloud.a);
+    opaqueVisibility = (entryKm < 0.0f) ? 0.0f : measuredSurfaceVisibility;
   }
   // PSR pixels already carry cloud from the secondary LUT along the reflected ray; adding the
   // primary ray's cloud on top is the "double cloud in water reflections" artefact. Zeroed here

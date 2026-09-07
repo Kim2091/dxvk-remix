@@ -138,8 +138,12 @@ Texture3D<float4> AtmosphereCloudDetailNoise3D;
 layout(binding = 15)
 Texture2D<float> PrimaryLinearViewZ;
 
-layout(binding = 16, rg32f)
-RWTexture2D<float2> cloudDepthOutput;
+// Widened to four channels (fork -- 2026-09-06, measured occlusion prefix): z = the distance of the
+// full-res surface this texel stands for, w = the fraction of the ray's cloud opacity in front of
+// it. z is what lets the composite pick a depth-consistent neighbour when the cloud pass runs below
+// full resolution, instead of bilinear-blending a visibility across a silhouette.
+layout(binding = 16, rgba32f)
+RWTexture2D<float4> cloudDepthOutput;
 
 // Include the helper library AFTER the texture globals are declared so the
 // ATMOSPHERE_AVAILABLE-gated helper bodies resolve to our local declarations.
@@ -182,7 +186,10 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
     // Depth companion (fork — 2026-09-05, Stage 4a): (-1, 0) is the same "no entry / no cloud"
     // sentinel pair marchCloudLayers reports when it finds nothing -- written here too so every
     // texel of BOTH render targets is defined every frame, matching cloudRenderOutput's coverage.
-    cloudDepthOutput[pixelCoord] = vec2(-1.0f, 0.0f);
+    // Visibility 1, not 0: there is no cloud to occlude, and scaling nothing by one is still
+    // nothing. Zero here would be a different kind of "no cloud" from the one loadCurrentCloudOpacity
+    // already applies, for no benefit.
+    cloudDepthOutput[pixelCoord] = vec4(-1.0f, 0.0f, kNoSurfaceKm, 1.0f);
     return;
   }
 
@@ -259,17 +266,43 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
   // Both clamps are 0/no-op: the full reachable span is marched for every pixel, sky or geometry
   // alike, so this target stays a pure function of view direction and is therefore safe to smooth
   // temporally. See the no-clamp rationale above.
+  // ===== Distance to the surface the primary ray hit =====
+  // Read here, used ONLY to measure the occlusion prefix (fork -- 2026-09-06). This does not clamp
+  // the march: the render target stays a full-span function of view direction, which is the
+  // invariant the temporal EMA in the composite depends on and the reason the Stage 4a clamp was
+  // removed. What geometry now affects is a single scalar the composite applies AFTER the EMA,
+  // exactly where the occlusion ramp it replaces was already applied.
+  float tSurfaceKm = kNoSurfaceKm;
+  {
+    uint2 depthDim;
+    PrimaryLinearViewZ.GetDimensions(depthDim.x, depthDim.y);
+    // Mapped through uv rather than assuming a shared grid, so this stays correct when the cloud
+    // pass runs at a reduced resolution.
+    const int2 depthCoord = clamp(int2(uv * vec2(depthDim)), int2(0), int2(depthDim) - int2(1));
+    const float linearViewZ = PrimaryLinearViewZ[depthCoord];
+    // Sky rays carry NRD's miss sentinel. It arrives through the CB rather than as a literal so it
+    // cannot drift from the value NRD actually uses (this pass has no binding for NRD's own CB).
+    if (linearViewZ < args.cloudMissLinearViewZ)
+    {
+      // Linear view Z is measured along the camera forward axis; the march needs slant range.
+      const float cosToForward = max(dot(viewDirYUp, normalize(args.cloudRenderForwardYUp)), 1e-3f);
+      tSurfaceKm = (abs(linearViewZ) / cosToForward) / max(args.worldUnitsPerKm, 1e-6f);
+    }
+  }
+
   vec3 accumColor = vec3(0.0f);
   float viewTransmittance = 1.0f;
   float entryDistanceKm;
   float meanCloudDepthKm;
+  float surfaceVisibility;
 
   marchCloudLayers(viewDirYUp, jitter, jitterStatic,
                    /*tMinClamp=*/0.0f,
                    /*tMaxClamp=*/0.0f,
                    args.cloudViewSamples, ctx, args,
                    accumColor, viewTransmittance,
-                   entryDistanceKm, meanCloudDepthKm);
+                   entryDistanceKm, meanCloudDepthKm,
+                   tSurfaceKm, surfaceVisibility);
 
   // Output is premultiplied: rgb = accumulated cloud radiance,
   // a = view-ray cloud transmittance.
@@ -278,5 +311,5 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
   // Depth companion (fork — 2026-09-05, world-space cloud migration Stage 4a): r = entry distance,
   // g = transmittance-weighted mean cloud depth, both km. Written unconditionally so every texel is
   // defined every frame, matching cloudRenderOutput's coverage above. No consumer yet -- Stage 4b.
-  cloudDepthOutput[pixelCoord] = vec2(entryDistanceKm, meanCloudDepthKm);
+  cloudDepthOutput[pixelCoord] = vec4(entryDistanceKm, meanCloudDepthKm, tSurfaceKm, surfaceVisibility);
 }

@@ -121,7 +121,7 @@ Texture3D<float> DebugViewCloudNvdfSdf;
 // km, g = transmittance-weighted mean cloud depth km). Visualized by DEBUG_VIEW_CLOUD_DEPTH (881)
 // and consumed (point-sampled only) by DEBUG_VIEW_CLOUD_REPROJECTION (883).
 [[vk::binding(DEBUG_VIEW_BINDING_CLOUD_DEPTH_RT_INPUT)]]
-Texture2D<float2> DebugViewCloudDepthRT;
+Texture2D<float4> DebugViewCloudDepthRT;
 
 // Fork: cloud-history frame-id ping-pong, PREVIOUS slot only (world-space cloud migration Stage 4b,
 // 2026-09-05). Read-only here — used by DEBUG_VIEW_CLOUD_REPROJECTION (883) to show the REAL
@@ -903,7 +903,7 @@ vec4 loadInput(inout RNG randomState, ivec2 threadId)
       // legend.
       uint2 cloudDepthDim;
       DebugViewCloudDepthRT.GetDimensions(cloudDepthDim.x, cloudDepthDim.y);
-      const vec2 depthKm = DebugViewCloudDepthRT[cloudNativeTexel(threadId, cloudDepthDim)];
+      const vec2 depthKm = DebugViewCloudDepthRT[cloudNativeTexel(threadId, cloudDepthDim)].xy;
       const float entryKm = depthKm.x;
       const float meanKm = depthKm.y;
 
@@ -942,7 +942,7 @@ vec4 loadInput(inout RNG randomState, ivec2 threadId)
       // right" -- the one question the ghosting investigation needed answered in-game.
       uint2 cloudDepthDim;
       DebugViewCloudDepthRT.GetDimensions(cloudDepthDim.x, cloudDepthDim.y);
-      const vec2 depthKm = DebugViewCloudDepthRT[cloudNativeTexel(threadId, cloudDepthDim)];
+      const vec2 depthKm = DebugViewCloudDepthRT[cloudNativeTexel(threadId, cloudDepthDim)].xy;
       const float entryKm = depthKm.x;
       const float meanKm = depthKm.y;
 
