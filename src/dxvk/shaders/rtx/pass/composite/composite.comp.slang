@@ -698,17 +698,65 @@ void applyAerialPerspective(
 // used) -- this content is screen-space, never spherical, so clamping is simpler and no less
 // correct; the half-texel inset is kept anyway so the sampled uv range matches the removed code's
 // exactly.
-vec4 sampleCloudRenderRT(uint2 pixelCoordinate, AtmosphereArgs args)
+// DEPTH-AWARE at reduced resolution (fork -- 2026-09-07). Plain bilinear stopped being valid the
+// moment the march was clamped at the primary surface: a cloud texel now describes the cloud in
+// front of ONE surface, so blending a texel clamped at a mountain with one clamped at the sky
+// behind it produces a value that describes neither. That is the edge aliasing that appeared on
+// every silhouette as soon as cloudRenderResolutionScale dropped below 1.
+//
+// Each of the four taps keeps its bilinear weight only if the surface it was clamped against
+// matches this pixel's, on the same relative tolerance the history validation uses. All four
+// rejected means every neighbour saw a different surface -- a thin sliver of geometry, typically --
+// and the nearest match in depth is taken rather than a blend of wrong answers.
+//
+// At scale 1 the fast path below is exact and this never runs.
+vec4 sampleCloudRenderRT(uint2 pixelCoordinate, AtmosphereArgs args, float surfaceKm)
 {
   if (args.cloudRenderFullDimX != 0u && args.cloudRenderFullDimY != 0u)
   {
-    vec2 uv = (vec2(pixelCoordinate) + 0.5f)
-            / vec2(float(args.cloudRenderFullDimX), float(args.cloudRenderFullDimY));
     uint2 rtDim;
     CompositeCloudRender.GetDimensions(rtDim.x, rtDim.y);
-    vec2 halfTexel = 0.5f / vec2(rtDim);
-    uv = clamp(uv, halfTexel, vec2(1.0f) - halfTexel);
-    return CompositeCloudRender.SampleLevel(CompositeCloudRenderSampler, uv, 0.0f);
+
+    const vec2 uv = (vec2(pixelCoordinate) + 0.5f)
+                  / vec2(float(args.cloudRenderFullDimX), float(args.cloudRenderFullDimY));
+    const vec2 texelF = uv * vec2(rtDim) - 0.5f;
+    const vec2 base   = floor(texelF);
+    const vec2 f      = texelF - base;
+    const int2 baseTexel = int2(base);
+    const int2 maxTexel  = int2(rtDim) - int2(1);
+
+    const float weights[4] = {
+      (1.0f - f.x) * (1.0f - f.y), f.x * (1.0f - f.y),
+      (1.0f - f.x) * f.y,          f.x * f.y };
+    const int2 offsets[4] = { int2(0, 0), int2(1, 0), int2(0, 1), int2(1, 1) };
+
+    vec4 sum = vec4(0.0f);
+    float weightSum = 0.0f;
+    vec4 nearestValue = vec4(0.0f, 0.0f, 0.0f, 1.0f);
+    float nearestDelta = 1e30f;
+
+    [unroll]
+    for (uint i = 0u; i < 4u; ++i)
+    {
+      const int2 texel = clamp(baseTexel + offsets[i], int2(0, 0), maxTexel);
+      const vec4 value = CompositeCloudRender.Load(int3(texel, 0));
+      const float tapSurfaceKm = CompositeCloudDepth.Load(int3(texel, 0)).z;
+
+      const float delta = abs(tapSurfaceKm - surfaceKm);
+      if (delta < nearestDelta)
+      {
+        nearestDelta = delta;
+        nearestValue = value;
+      }
+
+      if (delta <= cb.cloudHistoryDepthTolerance * max(max(tapSurfaceKm, surfaceKm), 1e-3f))
+      {
+        sum       += value * weights[i];
+        weightSum += weights[i];
+      }
+    }
+
+    return (weightSum > 1e-3f) ? (sum / weightSum) : nearestValue;
   }
   return CompositeCloudRender.Load(int3(pixelCoordinate, 0));
 }
@@ -957,9 +1005,9 @@ vec2 cloudReprojectionMotionVectorPixels(uint2 pixelCoordinate, float depthKm, A
 // the one definition of "the cloud along pixel p this frame": the 3x3 neighbourhood statistics and
 // the centre sample in applyCloudComposite both go through it, so the clamp box and the value being
 // clamped agree by construction.
-vec4 loadCurrentCloudOpacity(uint2 pixelCoordinate, AtmosphereArgs args)
+vec4 loadCurrentCloudOpacity(uint2 pixelCoordinate, AtmosphereArgs args, float surfaceKm)
 {
-  const vec4 cloudRT = sampleCloudRenderRT(pixelCoordinate, args);
+  const vec4 cloudRT = sampleCloudRenderRT(pixelCoordinate, args, surfaceKm);
   const float entryKm = sampleCloudDepthKm(pixelCoordinate, args).x;
   return (entryKm < 0.0f) ? vec4(0.0f) : vec4(cloudRT.rgb, 1.0f - cloudRT.a);
 }
@@ -1128,11 +1176,20 @@ void applyCloudComposite(
   const float meanKm  = cloudDepthKm.y;
   const float kmPerWorldUnit = 1.0f / max(args.worldUnitsPerKm, 1e-6f);
 
+  // The surface distance this pixel's cloud was integrated against. Needed before the cloud is even
+  // read, because at reduced cloud resolution the upsample has to know which of its four candidate
+  // texels describe THIS pixel's surface (fork -- 2026-09-07). Sky uses a fixed far depth rather
+  // than a sentinel so sky-vs-sky compares equal under the ordinary relative test while
+  // sky-vs-surface is rejected, with no special case anywhere. 60000 km is f16-representable and
+  // beyond any reachable slant range.
+  const float kCloudSkyDepthKm = 60000.0f;
+  const float currentSurfaceKm = primaryMiss ? kCloudSkyDepthKm : (viewDistance * kmPerWorldUnit);
+
   // The "no span along this ray" zeroing lives inside loadCurrentCloudOpacity now, for the reason
   // given on that function: it is a property of the view ray, not of geometry, so it belongs in
   // the smoothed signal -- unlike the occlusion gate, which is deliberately deferred until after the
   // EMA (see below).
-  const vec4 currentCloud = loadCurrentCloudOpacity(pixelCoordinate, args);
+  const vec4 currentCloud = loadCurrentCloudOpacity(pixelCoordinate, args, currentSurfaceKm);
 
   // NOTE: the geometry occlusion gate does NOT belong here (fork — 2026-09-05, Stage 4b fix).
   // It used to multiply currentCloud by cloudDepthVisibility() at this point, before the temporal
@@ -1155,9 +1212,6 @@ void applyCloudComposite(
   // sky-vs-sky compares equal under the ordinary relative test while sky-vs-surface is rejected --
   // no special case, and no way for a surface tap to be blended into a sky pixel across a
   // silhouette. 60000 km is f16-representable and beyond any reachable slant range.
-  const float kCloudSkyDepthKm = 60000.0f;
-  const float currentSurfaceKm = primaryMiss ? kCloudSkyDepthKm : (viewDistance * kmPerWorldUnit);
-
   vec4 smoothedCloud = currentCloud;
   if (all(cb.camera.resolution > uint2(0u, 0u)))
   {
@@ -1194,7 +1248,10 @@ void applyCloudComposite(
           for (int dx = -1; dx <= 1; ++dx)
           {
             const int2 neighbour = clamp(int2(pixelCoordinate) + int2(dx, dy), int2(0, 0), resolution - int2(1, 1));
-            const vec4 v = loadCurrentCloudOpacity(uint2(neighbour), args);
+            // This pixel's surface, not the neighbour's: the box exists to bound the cloud that
+            // could legitimately appear at THIS pixel's depth, so a neighbour describing a different
+            // surface should not widen it.
+            const vec4 v = loadCurrentCloudOpacity(uint2(neighbour), args, currentSurfaceKm);
             m1 += v;
             m2 += v * v;
           }
