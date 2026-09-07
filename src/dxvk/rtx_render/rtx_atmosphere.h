@@ -779,6 +779,15 @@ public:
     // same way at ~5 m/s over a body that never changes. They are now the magnitudes of two physical
     // motions whose directions come from the wind: rise, and downwind shear that grows with height.
     // Neither touches the body SDF, so neither invalidates the NVDF bake.
+    // Beyond this distance the march stops animating its per-sample jitter (fork -- 2026-09-07).
+    // Nubis freezes it past 250 m because the voxel clouds there had no temporal filter; we have
+    // the composite EMA and DLSS-RR, both of which need per-frame noise to average. A frozen hash
+    // instead makes the sampling error a fixed pattern that survives both filters as speckle.
+    RTX_OPTION_ARGS("rtx.atmosphere", float, nubis3JitterAnimateKm, 1.0e9f,
+               "Distance in km beyond which cloud march jitter stops animating. Effectively infinite "
+               "by default, so jitter animates everywhere and the temporal filters can resolve it. "
+               "Lower it only when running with no temporal accumulation at all.",
+               args.minValue = 0.0f);
     RTX_OPTION("rtx.atmosphere", float, cloudEvolutionSpeed, 0.002f,
                "Convective rise speed of cloud detail, in km/s. Billows and erosion cutouts drift "
                "upward through each cloud, which is what makes a cumulus read as building rather "

@@ -1317,7 +1317,17 @@ void marchCloudSlab(vec3   viewDirYUp,
   // viewTransmittance already low — raise Max Cloud Samples if far horizon
   // clouds visibly thin.
   const float kAdaptiveRefDistKm = 12.0f;  // adaptive == cloudViewStepKm here
-  const float kJitterAnimateKm   = 0.25f;  // Nubis: animated hash < 250 m
+  // Animated jitter everywhere by default (fork -- 2026-09-07). This was 0.25 km, following the
+  // paper's choice to freeze the hash beyond 250 m -- but Decima froze it because their voxel
+  // clouds had NO temporal filter at that range (pp.182-185). We have two: the composite's EMA and
+  // DLSS-RR. With a frozen per-pixel hash every sample of a deck that starts at 800 m used the same
+  // offset every frame, so the EMA converged to the sampling error instead of averaging it away and
+  // RR saw a temporally stable high-frequency pattern and faithfully preserved it. That is the
+  // speckle in thin and mid-tone cloud -- worst exactly where hard gates (the density-skip and the
+  // wisp cut) flip against a step much larger than the detail they sample, and absent in saturated
+  // cores where nothing flips. Animating it turns that fixed error into per-frame noise, which is
+  // the one thing a temporal filter can actually remove.
+  const float kJitterAnimateKm   = args.nubis3JitterAnimateKm;
   float adaptiveCeilKm = max(4.0f * args.cloudViewStepKm, args.nubis3AdaptiveStepKm);
   uint  iterCap = max(uint(args.cloudViewSamplesMax), sampleCount);
   float t = tEntry;

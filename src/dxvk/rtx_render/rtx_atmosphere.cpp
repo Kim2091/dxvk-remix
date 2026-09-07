@@ -1054,7 +1054,7 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
     args.nubis3ShapeVarietyKm     = std::min(std::max(RtxAtmosphere::nubis3ShapeVarietyKm(), 0.0f), 1.5f);
     // Near-field live sun taps (fork — 2026-07-17). Live; view march + secondary
     // cloud LUT only (the voxel grids keep their full-path bake).
-    args.padRetired12             = 0.0f;
+    args.nubis3JitterAnimateKm    = std::max(RtxAtmosphere::nubis3JitterAnimateKm(), 0.0f);
     // √-adaptive march step floor (fork — detail round 2026-07-16). Live;
     // affects the view march + secondary cloud LUT, so it stays in the LUT
     // cache keys (same class as nvdfStepScale / cloudViewStepKm).

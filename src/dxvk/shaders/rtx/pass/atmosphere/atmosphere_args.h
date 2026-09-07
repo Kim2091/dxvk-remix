@@ -324,10 +324,10 @@ struct AtmosphereArgs {
 
   float cloudCoverageSpread;       // [0,1] amplitude of coverage variation around mean.
   float cloudCoverageNoiseScale;   // Region size frequency for coverage noise (independent of type).
-  float padRetired12;              // retired 2026-07-30: nubis3SunNearFieldKm (near-field live
-                                   // sun-occlusion range). The live path was removed once the
-                                   // de-jittered D_sun bake reproduced the look; see
-                                   // docs/fork-touchpoints.md.
+  // Distance (km) beyond which the march's per-sample jitter stops being animated (fork --
+  // 2026-09-07). Rides the slot retired 2026-07-30 from nubis3SunNearFieldKm; CB layout unchanged.
+  // Large by default: freezing it is only correct without a temporal filter.
+  float nubis3JitterAnimateKm;
   float cloudMsScale;              // Multi-scatter sigma_ms master multiplier (1.0 = paper baseline)
 
   float cloudAmbientShadowStrength; // [0..1] D_sun-keyed attenuation of the cloud AMBIENT term
