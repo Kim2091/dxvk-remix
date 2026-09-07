@@ -946,10 +946,16 @@ vec2 cloudReprojectionMotionVectorPixels(uint2 pixelCoordinate, float depthKm, A
 // Current-frame cloud sample at `pixelCoordinate` in the composite's OPACITY convention (fork —
 // 2026-09-06, EMA rectification). The RT stores TRANSMITTANCE in .a; the premultiplied-over
 // composite and the history both want opacity, so the flip evalSkyRadiance always applied happens
-// here, once. Zeroed when the march found no slab span along this ray at all (depth companion entry
-// sentinel < 0, cloud_render.comp.slang) -- the entry distance is the GEOMETRIC slab entry
-// (cloud_march_common.slangh, marchCloudSlab), a property of the view ray alone and never of the
-// per-frame jitter or of geometry, so it is safe to bake into the signal the EMA smooths. This is
+// here, once. Zeroed when the march found no cloud along this ray at all (depth companion entry
+// sentinel < 0, cloud_render.comp.slang).
+//
+// CORRECTION (fork -- 2026-09-06): this comment used to claim the entry distance is the GEOMETRIC
+// slab entry, "a property of the view ray alone and never of the per-frame jitter". That stopped
+// being true at cc8198b1c, which redefined entry as the first sample carrying real density -- which
+// does move with the jitter. It is still free of GEOMETRY dependence, which is the property that
+// matters for baking it into the EMA's input, and the zeroing it gates coincides with alpha ~ 0, so
+// the signal is unchanged either way. The same gate was removed from the OPAQUE path, where it was
+// not harmless: see the note at opaqueVisibility below. This is
 // the one definition of "the cloud along pixel p this frame": the 3x3 neighbourhood statistics and
 // the centre sample in applyCloudComposite both go through it, so the clamp box and the value being
 // clamped agree by construction.
@@ -1203,7 +1209,13 @@ void applyCloudComposite(
   float opaqueVisibility = 1.0f;
   if (!primaryMiss)
   {
-    opaqueVisibility = (entryKm < 0.0f) ? 0.0f : measuredSurfaceVisibility;
+    // No entryKm gate here (fork -- 2026-09-06). entryKm became jitter-dependent when it was
+    // redefined as the first density hit, so in thin cloud the march finds material on some frames
+    // and not others -- gating on it made geometry pixels flip between 0 and the real visibility
+    // while the sky pixel beside them showed steady smoothed cloud, which is flicker along exactly
+    // the contact line. The gate is also redundant: with no cloud found, surfaceVisibility is
+    // already 1 and the smoothed signal it scales is ~0, so the product is the same either way.
+    opaqueVisibility = measuredSurfaceVisibility;
   }
   // PSR pixels already carry cloud from the secondary LUT along the reflected ray; adding the
   // primary ray's cloud on top is the "double cloud in water reflections" artefact. Zeroed here
