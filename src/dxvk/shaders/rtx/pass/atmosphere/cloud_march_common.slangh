@@ -1063,8 +1063,20 @@ bool integrateCloudSample(float tSampleKm,
 // Piece-2 marching (rendering the deck's far underside when looking down through a gap in the near
 // side) is explicitly NOT this function's job yet — Stage 5 owns it; this ports the reference's
 // single-piece selection exactly as it stands, matching that stage's stated deferral.
+// spanPiece selects which of the up-to-two slab crossings along this ray to return (fork --
+// 2026-09-06, fly-through polish). Piece 0 is the near crossing, piece 1 the far one, and piece 1
+// exists only when the eye is ABOVE the deck base looking down through it: the ray then crosses the
+// shell twice, once on the way down and once on the far side of the planet-facing gap.
+//
+// Only piece 0 was ever marched, which cost two things. The deck's far underside simply did not
+// render when looking down through a gap -- the geometry was there, nothing sampled it. And the
+// span was discontinuous in eye radius: descending through the base shell switched from "near
+// crossing only" to "far crossing only" with nothing bridging them, which is the branch
+// discontinuity the old dead-zone ring came from. Marching both pieces closes the gap from both
+// sides -- as the eye sinks to the base, piece 0 shrinks to nothing while piece 1 becomes exactly
+// the span the below-base branch returns.
 bool cloudSlabSpan(vec3 rayDirYUp, vec3 planetCenter, float planetRadiusKm,
-                   float slabAltitudeKm, float slabThicknessKm,
+                   float slabAltitudeKm, float slabThicknessKm, int spanPiece,
                    out float tEntry, out float tExit) {
   tEntry = 0.0f;
   tExit  = -1.0f;
@@ -1081,16 +1093,26 @@ bool cloudSlabSpan(vec3 rayDirYUp, vec3 planetCenter, float planetRadiusKm,
                                         t0base, t1base);
 
   if (!hitsBase || t1base <= 0.0f) {
-    // Base shell missed entirely, or wholly behind us: the full top-shell chord is slab.
+    // Base shell missed entirely, or wholly behind us: the full top-shell chord is slab, and there
+    // is no second crossing.
+    if (spanPiece != 0) return false;
     tEntry = max(t0top, 0.0f);
     tExit  = t1top;
   } else if (t0base > 0.0f) {
-    // Base shell ahead of the eye, so the eye is outside/above it: march the NEAR span only. This
-    // is the case that makes looking down through the deck from above it render at all.
-    tEntry = max(t0top, 0.0f);
-    tExit  = t0base;
+    // Base shell ahead of the eye, so the eye is outside/above it and the ray crosses the shell
+    // twice: down through the near side, then out through the far side.
+    if (spanPiece == 0) {
+      tEntry = max(t0top, 0.0f);
+      tExit  = t0base;
+    } else {
+      // The far crossing -- the deck's underside seen through a gap. This is the piece that used
+      // not to be marched at all.
+      tEntry = max(t1base, 0.0f);
+      tExit  = t1top;
+    }
   } else {
-    // Eye at or below the base shell - the far span. The legacy ground-level path.
+    // Eye at or below the base shell - one crossing only, the legacy ground-level path.
+    if (spanPiece != 0) return false;
     tEntry = max(t1base, 0.0f);
     tExit  = t1top;
   }
@@ -1115,6 +1137,9 @@ void marchCloudSlab(vec3   viewDirYUp,
                     float  slabNoiseSeedOffset,
                     float  tMinClamp,
                     float  tMaxClamp,
+                    // Which slab crossing to march; see cloudSlabSpan. Callers march piece 0, then
+                    // piece 1, so accumulation stays front-to-back across both.
+                    int    spanPiece,
                     uint   sampleCount,
                     CloudShadeContext ctx,
                     AtmosphereArgs args,
@@ -1138,7 +1163,7 @@ void marchCloudSlab(vec3   viewDirYUp,
   // comment for why — this is what lets cloud_render drop the below-horizon early-out).
   float tEntry, tExit;
   if (!cloudSlabSpan(viewDirYUp, ctx.planetCenterKm, ctx.planetRadiusKm,
-                     slabAltitudeKm, slabThicknessKm, tEntry, tExit)) return;
+                     slabAltitudeKm, slabThicknessKm, spanPiece, tEntry, tExit)) return;
 
   tEntry = max(tEntry, tMinClamp);
   if (tMaxClamp > 0.0f) {
@@ -1372,8 +1397,10 @@ void marchEchoDeck(vec3   viewDirYUp,
   // Slab intersection via the shared helper (fork — 2026-09-05, world-space cloud migration
   // Stage 1) — see cloudSlabSpan's comment and marchCloudSlab's identical swap above.
   float tEntry, tExit;
+  // Piece 0 only: the echo deck is a deliberately cheap single-crossing approximation, and its
+  // underside is thin cirrus rather than the primary deck's visible floor.
   if (!cloudSlabSpan(viewDirYUp, ctx.planetCenterKm, ctx.planetRadiusKm,
-                     slabAltitudeKm, slabThicknessKm, tEntry, tExit)) return;
+                     slabAltitudeKm, slabThicknessKm, /*spanPiece=*/0, tEntry, tExit)) return;
   tEntry = max(tEntry, tMinClamp);
   if (tMaxClamp > 0.0f) {
     tExit = min(tExit, tMaxClamp);
@@ -1599,15 +1626,22 @@ void marchCloudLayers(vec3  viewDirYUp,
   float sumWeightedDistKm = 0.0f;
   float sumWeight = 0.0f;
 
-  marchCloudSlab(viewDirYUp, pixelJitter, pixelJitterStatic,
-                 args.cloudAltitude, args.cloudThickness,
-                 args.cloudTypeMean, args.cloudCoverageMean,
-                 /*slabDensityScale=*/1.0f,
-                 /*slabNoiseSeedOffset=*/0.0f,
-                 tMinClamp, tMaxClamp,
-                 sampleCount, ctx, args,
-                 accumColor, viewTransmittance,
-                 entryDistanceKm, sumWeightedDistKm, sumWeight);
+  // Both slab crossings, near then far, so accumulation stays front-to-back (fork -- 2026-09-06,
+  // fly-through polish). The second call returns immediately unless the eye is above the deck base
+  // looking down through it, which is the only configuration with two crossings -- so this costs a
+  // span test per pixel in every other case, and renders the deck's far underside in that one.
+  for (int spanPiece = 0; spanPiece < 2; ++spanPiece) {
+    marchCloudSlab(viewDirYUp, pixelJitter, pixelJitterStatic,
+                   args.cloudAltitude, args.cloudThickness,
+                   args.cloudTypeMean, args.cloudCoverageMean,
+                   /*slabDensityScale=*/1.0f,
+                   /*slabNoiseSeedOffset=*/0.0f,
+                   tMinClamp, tMaxClamp,
+                   spanPiece,
+                   sampleCount, ctx, args,
+                   accumColor, viewTransmittance,
+                   entryDistanceKm, sumWeightedDistKm, sumWeight);
+  }
 
   // Layer 2 echo deck — same slab model at a gapped altitude, marched cheaply.
   // Reads its own coverage/type spread via an args copy so the shared density
