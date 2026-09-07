@@ -540,7 +540,13 @@ struct AtmosphereArgs {
                                       // pad_cloudSunsetAmbient0 slot; CB layout unchanged.
 
   // ----- Cloud-edge / halo tuning (fork — 2026-06-13). Exposed live in ImGui. -----
-  float padRetired9;                  // retired: legacy view coverage-gate softness.
+  // Unit wind direction in the Y-up XZ plane (fork -- 2026-09-07). The detail drift and the base
+  // shear follow the wind rather than the two hardcoded azimuths they used before, so the shader
+  // needs the direction itself, not just the integrated offset. Rides the slot retired from the
+  // legacy view coverage-gate softness; CB layout unchanged. Changes only under weather drift, but
+  // it still must be zeroed in normalizeForSkyLutCache or the sky LUT cascade re-bakes on every
+  // wind rotation.
+  float cloudWindDirUnitX;
   float cloudEdgeAmbientFade;         // Density at which a thin sample's (horizon-tinted) ambient
                                       // reaches full strength [0..~0.5]. Below it the ambient fades
                                       // toward 0 so the soft skirt doesn't read as grey-brown haze.
@@ -549,7 +555,7 @@ struct AtmosphereArgs {
   // sun term where it was added to the froxel SH in volume_integrator.slangh.
   // That injection was removed on 2026-06-28 (it double-counted the sun, which
   // is already sampled by the volume NEE loop), leaving this with no consumer.
-  float padRetired11;
+  float cloudWindDirUnitZ;            // see cloudWindDirUnitX
 
   // ----- Artistic sunset color controls (fork — 2026-06-14) -----
   // Counteract the desaturation introduced when sunset reddening moved onto the

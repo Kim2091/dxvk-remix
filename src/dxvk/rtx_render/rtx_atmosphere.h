@@ -774,21 +774,26 @@ public:
     RTX_OPTION("rtx.atmosphere", Vector3, cloudColor, Vector3(0.89f, 0.92f, 1.0f), "Base cloud color (albedo).");
     RTX_OPTION("rtx.atmosphere", float, cloudWindSpeed, 0.02f, "Cloud drift speed in km/s. Clouds scroll with this velocity.");
     RTX_OPTION("rtx.atmosphere", float, cloudWindDirection, 45.0f, "Cloud wind direction in degrees (0 = +X, 90 = +Z).");
-    RTX_OPTION("rtx.atmosphere", float, cloudEvolutionSpeed, 0.0015f,
-               "Cloud field-evolution (morph) speed in km/s. Slowly scrolls the base 3D noise "
-               "sample position through the volume — dominated by a vertical scroll through the "
-               "decorrelated, tile-wrapping Y axis — so cloud formations form and dissolve in "
-               "place instead of translating rigidly with the wind. Decorrelated from wind, so it "
-               "also breaks the wind tile-repeat. 0 = field frozen (legacy rigid behavior).");
-    RTX_OPTION("rtx.atmosphere", float, cloudBoilSpeed, 0.004f,
-               "Cloud edge-boil speed in km/s. Scrolls the high-frequency edge-detail tap "
-               "independently of the base shape so cauliflower billows churn and rebuild at the "
-               "silhouette. Only has effect when cloudDetailStrength > 0. 0 = edges frozen.");
+    // Detail motion (fork -- 2026-09-07, reworked). These two used to scroll the detail field along
+    // two hardcoded directions unrelated to the wind, which made every cloud's surface slide the
+    // same way at ~5 m/s over a body that never changes. They are now the magnitudes of two physical
+    // motions whose directions come from the wind: rise, and downwind shear that grows with height.
+    // Neither touches the body SDF, so neither invalidates the NVDF bake.
+    RTX_OPTION("rtx.atmosphere", float, cloudEvolutionSpeed, 0.002f,
+               "Convective rise speed of cloud detail, in km/s. Billows and erosion cutouts drift "
+               "upward through each cloud, which is what makes a cumulus read as building rather "
+               "than as a static shape with noise sliding over it. Does not move the cloud bodies "
+               "themselves. 0 = detail frozen vertically.");
+    RTX_OPTION("rtx.atmosphere", float, cloudBoilSpeed, 0.002f,
+               "Downwind shear speed of cloud detail, in km/s. Applied along the wind direction and "
+               "scaled by height within the deck, so cloud tops stream downwind while their bases "
+               "stay put. 0 = no shear.");
+    // cloudEvolutionVerticalBias retired 2026-09-07: it split one scroll between a vertical and a
+    // fixed diagonal component. Rise and shear are now separate options with physical directions,
+    // so the split has nothing left to control. Declaration kept, unread, so existing configs load.
     RTX_OPTION("rtx.atmosphere", float, cloudEvolutionVerticalBias, 0.8f,
-               "Fraction of the cloud field-evolution scroll directed along the volume's vertical "
-               "(Y) axis [0..1]. Higher = more in-place morphing (clouds form/dissolve); lower = "
-               "more lateral sliding. The remainder is split into a fixed diagonal X/Z drift for "
-               "decorrelation.");
+               "*DEPRECATED* no longer read. Cloud detail motion is now rise (cloudEvolutionSpeed) "
+               "plus downwind shear (cloudBoilSpeed), each with its own physical direction.");
     RTX_OPTION("rtx.atmosphere", float, cloudShadowStrength, 1.0f,
                "How strongly overcast clouds dim ground and atmosphere lighting [0..1]. "
                "1.0 = full physical voxel-grid shadow contribution from cloudVoxelShadowsEnable; "

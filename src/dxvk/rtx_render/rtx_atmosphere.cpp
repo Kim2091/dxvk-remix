@@ -362,6 +362,11 @@ namespace {
     args.cloudEvolutionOffsetY       = 0.0f;
     args.cloudEvolutionOffsetZ       = 0.0f;
     args.cloudBoilPhase              = 0.0f;
+    // Animated in direction as well as magnitude since 2026-09-07: the detail drift follows the
+    // wind, so a weather preset that rotates the wind would otherwise re-bake the whole sky LUT
+    // cascade every frame it drifts.
+    args.cloudWindDirUnitX           = 0.0f;
+    args.cloudWindDirUnitZ           = 0.0f;
     args.cloudRenderFrameIdx         = 0u;
     args.cloudRenderForwardYUp       = vec3(0.0f, 0.0f, 0.0f);
     args.cloudRenderRightYUp         = vec3(0.0f, 0.0f, 0.0f);
@@ -1309,14 +1314,20 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
   args.cloudLightingLodThreshold = RtxAtmosphere::cloudLightingLodThreshold();
   args.cloudMissLinearViewZ = m_missLinearViewZ;
   args.padRetired8 = 0u;
-  args.padRetired9 = 0.0f;
+  {
+    // Wind direction as a unit vector, for the detail drift and base shear (fork -- 2026-09-07).
+    const auto* wxWind = m_weatherOverride;
+    const float windDirDeg = wxWind ? wxWind->cloudWindDirection : RtxAtmosphere::cloudWindDirection();
+    const float windRad = windDirDeg * dxvk::kDegreesToRadians;
+    args.cloudWindDirUnitX = std::cos(windRad);
+    args.cloudWindDirUnitZ = std::sin(windRad);
+  }
   // padRetired10 is NOT in this list (fork — 2026-09-05, world-space cloud migration Stage 2): it
   // is no longer a pad. It carries args.cameraAltitudeKm, assigned above alongside
   // args.cameraWorldPosYUpKm (see the seaLevelWorldKm / altitudeScale / viewAltitudeKm calibration
   // block). Zeroing it here — as this line used to, and as archaeology commit 30d20a8f5 warns its
   // own author fell into — would silently pin the eye back to sea level every frame and make this
   // entire migration stage do nothing, with no compile error to catch it.
-  args.padRetired11 = 0.0f;
 
   return args;
 }
@@ -2486,17 +2497,24 @@ void RtxAtmosphere::advanceCloudMotion(float dt) {
   m_cloudAdvectOffset.x += std::cos(windAngle) * windSpeed * dt;
   m_cloudAdvectOffset.y += std::sin(windAngle) * windSpeed * dt;
 
-  // Field-evolution morph — Y-dominant scroll through the volume (in-place
-  // morphing) with the XZ remainder split diagonally for lateral decorrelation.
-  const float evoSpeed = RtxAtmosphere::cloudEvolutionSpeed();  // km/s
-  const float vBias    = std::min(std::max(RtxAtmosphere::cloudEvolutionVerticalBias(), 0.0f), 1.0f);
-  const float lateral  = (1.0f - vBias) * 0.70710678f;
-  m_cloudEvolutionOffset.y += vBias   * evoSpeed * dt;
-  m_cloudEvolutionOffset.x += lateral * evoSpeed * dt;
-  m_cloudEvolutionOffset.z += lateral * evoSpeed * dt;
+  // Detail-field drift (fork -- 2026-09-07, reworked). Two magnitudes now, both expanded along
+  // PHYSICAL directions in the shader rather than the two hardcoded azimuths this used to feed:
+  //
+  //   .y = convective rise      -- straight up, everywhere, at every height
+  //   .x = downwind shear       -- along the wind, scaled by height fraction in the shader, so
+  //                               cloud tops stream downwind while bases stay put
+  //
+  // Previously .xyz was a diagonal scroll and cloudBoilPhase a third fixed direction, which summed
+  // to every cloud's detail sliding one way at ~5 m/s regardless of the wind setting. Direction now
+  // comes from cloudWindDirUnitX/Z; only these scalars are integrated here.
+  const float evoSpeed = RtxAtmosphere::cloudEvolutionSpeed();   // km/s, convective rise
+  const float shearSpeed = RtxAtmosphere::cloudBoilSpeed();      // km/s, downwind top shear
+  m_cloudEvolutionOffset.y += evoSpeed * dt;
+  m_cloudEvolutionOffset.x += shearSpeed * dt;
+  m_cloudEvolutionOffset.z = 0.0f;  // retired: the diagonal lateral component
 
-  // Edge boil — single scalar phase expanded along a fixed direction in the shader.
-  m_cloudBoilPhase += RtxAtmosphere::cloudBoilSpeed() * dt;  // km/s integrated
+  // cloudBoilPhase retired 2026-09-07 -- the edge boil it drove is now the rise/shear pair above.
+  m_cloudBoilPhase = 0.0f;
 }
 
 // Lightning strike scheduler (fork — 2026-07-14). Called exactly once per

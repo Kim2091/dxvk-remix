@@ -143,9 +143,12 @@ float sampleCloudDensityNubis3(vec3 worldPosKm,
   sdfKmOut     = 100.0f;  // matches the resolve pass's "empty air" sentinel
   sdfStepKmOut = 0.0f;
 
-  // 1. Wind translation (same convention as the legacy sampler).
+  // 1. Wind translation. SUBTRACTED (fork -- 2026-09-07): density(x) = field(x - offset) advects the
+  // field ALONG the wind direction. Adding it, as this did, advected the clouds along -windDirection
+  // while rtx_precipitation.cpp:357-359 drives rain along +windDirection -- so rain and clouds drifted
+  // in opposite directions. The paper's own sampler subtracts (Nubis Cubed p.97, p.121).
   vec3 windOffset = vec3(args.cloudWindOffset.x, 0.0f, args.cloudWindOffset.y);
-  vec3 perturbed  = worldPosKm + windOffset;
+  vec3 perturbed  = worldPosKm - windOffset;
 
   // 2. NVDF texcoord. XZ tile-wraps at cloudNoiseTileKm (the bake domain);
   //    the vertical axis clamps to the half-texel band so the REPEAT sampler
@@ -218,16 +221,37 @@ float sampleCloudDensityNubis3(vec3 worldPosKm,
     return 0.0f;
   }
 
-  // 6. Up-rez (Nubis p.125): animated wispy/billowy composite. Boil +
-  //    evolution + base shear all displace only the detail tap (see the
-  //    animation note in the header).
-  const vec3 kBoilDir = vec3(0.6092f, 0.7109f, 0.3517f);  // legacy edge-boil direction
-  vec3 boilPos = perturbed
-               + args.cloudBoilPhase * kBoilDir
-               + vec3(args.cloudEvolutionOffsetX, args.cloudEvolutionOffsetY, args.cloudEvolutionOffsetZ);
-  const vec2 kShearDir = vec2(0.8f, -0.6f);  // legacy base-shear azimuth
-  boilPos += vec3(kShearDir.x, 0.0f, kShearDir.y)
-           * ((1.0f - heightFraction) * args.cloudDetailBaseShearKm);
+  // 6. Up-rez (Nubis p.125): animated wispy/billowy composite. The detail tap is the ONLY thing that
+  //    moves relative to the body -- the body SDF changes only on an NVDF re-bake -- so what this
+  //    displacement looks like IS what the cloud animation looks like.
+  //
+  // Rewritten (fork -- 2026-09-07). It used to scroll along two hardcoded directions:
+  // kBoilDir (0.61, 0.71, 0.35) and a kShearDir azimuth of (0.8, -0.6), neither related to the wind.
+  // At the old defaults that slid every cloud's erosion, micro-relief and silhouette lobes at about
+  // 5 m/s toward azimuth 31 degrees, 52 degrees above horizontal, no matter which way the wind was
+  // set -- identical on every cloud in the sky, over bodies that never changed. That common fate is
+  // the "noise crawling over a frozen sculpture" read the user reported as fake.
+  //
+  // Now the displacement is physical in direction: convective RISE straight up everywhere, plus a
+  // horizontal component ALONG THE WIND that scales with height, so tops stream downwind while bases
+  // stay put -- the shear a real deck has. Both magnitudes are integrated CPU-side; only the
+  // direction comes from the wind, so this is still pure sample-time arithmetic with no extra taps
+  // and no effect on the NVDF bake key.
+  const vec3 kWindDirYUp = vec3(args.cloudWindDirUnitX, 0.0f, args.cloudWindDirUnitZ);
+  const vec3 driftUnit = vec3(0.0f, args.cloudEvolutionOffsetY, 0.0f)
+                       + kWindDirYUp * (args.cloudEvolutionOffsetX * heightFraction);
+  // Base shear keeps its (1 - heightFraction) profile but follows the wind instead of a fixed
+  // azimuth, so the wisps under a cloud trail the same way the top does.
+  const vec3 baseShear = kWindDirYUp * ((1.0f - heightFraction) * args.cloudDetailBaseShearKm);
+
+  // Per-octave rates (fork -- 2026-09-07). Turbulence evolves faster at smaller scales (eddy
+  // turnover time grows with eddy size), but every octave here shared one position and so migrated
+  // in lockstep -- body-scale lobes sliding exactly as fast as 100 m billows, which reads as one
+  // rigid texture rather than a field with structure. The mid tap carries the +-0.55 km silhouette
+  // displacement, so slowing it most is also what stops cloud OUTLINES from visibly travelling.
+  vec3 boilPos     = perturbed + driftUnit + baseShear;          // base taps
+  vec3 boilPosMid  = perturbed + driftUnit * 0.2f + baseShear;   // silhouette lobes: near-stationary
+  vec3 boilPosFine = perturbed + driftUnit * 1.8f + baseShear;   // fine billows: churn fastest
   // Two-scale de-tile (fork — 2026-07-16). The detail volume repeats every
   // cloudNoiseTileKm / cloudDetailScale (~2.8 km at defaults) and this tap
   // is NOT hex-de-tiled (the hex lattice covers the SDF/placement taps
@@ -297,7 +321,7 @@ float sampleCloudDensityNubis3(vec3 worldPosKm,
   //     exactly that band, ~11 of them per surface approach at the default
   //     50 m adaptive step. Nothing above this point needs the base taps.
   vec4 noiseMid = detailNoise.SampleLevel(cloudSampler,
-      frac(boilPos * (detailFreq * 0.193f) + vec3(0.71f, 0.29f, 0.53f)), 0);
+      frac(boilPosMid * (detailFreq * 0.193f) + vec3(0.71f, 0.29f, 0.53f)), 0);
   float wobbleMid = lerp(noiseMid.r - 0.5f,
                          noiseMid.b * 0.3f - 0.15f,
                          typeShaped);
@@ -470,7 +494,7 @@ float sampleCloudDensityNubis3(vec3 worldPosKm,
   if (args.nubis3FineDetailStrength > 0.0f && cameraDistKm < 9.0f) {
     float fineFade = saturate(1.0f - (cameraDistKm - 3.0f) / 6.0f);
     vec4 noiseFine = detailNoise.SampleLevel(cloudSampler,
-        frac(boilPos * (detailFreq * 2.11f) + vec3(0.17f, 0.83f, 0.47f)), 0);
+        frac(boilPosFine * (detailFreq * 2.11f) + vec3(0.17f, 0.83f, 0.47f)), 0);
     float fineWispy     = lerp(noiseFine.r, noiseFine.g, 0.5f);
     float fineBillowy   = lerp(noiseFine.b, noiseFine.a, 0.5f) * 0.3f;
     float fineComposite = lerp(fineWispy, fineBillowy, typeShaped);
