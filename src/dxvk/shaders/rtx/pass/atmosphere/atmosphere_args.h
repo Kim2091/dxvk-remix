@@ -523,7 +523,13 @@ struct AtmosphereArgs {
   // otherwise need the 500001.0f literal duplicated in shader code where nothing keeps it in step.
   // Rides the former padRetired7 slot -- CB layout unchanged.
   float cloudMissLinearViewZ;
-  uint  padRetired8;
+  // Gain on the MULTIPLE-SCATTERING body lobe (fork -- 2026-09-07). The paper says the MS term is
+  // "scaled by a phase" and never states the normalisation; using HG2's raw 1/(4pi) inside a convex
+  // blend made the sun term dimmer than the sky ambient beside it, which is why the clouds read
+  // flat and sky-lit. This is that missing normalisation: calibrate so a noon sunlit face reads
+  // ~5-8x the zenith sky texel and the shadow side ~1x. Rides the former padRetired8 slot (a uint;
+  // same 4 bytes) -- CB layout unchanged.
+  float cloudMsBodyGain;
   float cloudAerialHazePerKm;      // Aerial-perspective HAZE on cloud radiance (1/km). Dims distant
                                    // cloud samples toward atmospheric color. Visual softness control.
 
@@ -592,8 +598,10 @@ struct AtmosphereArgs {
   // convex blend (phase integral 1) — the fix for lit clouds out-brightening
   // the physical sky LUT. Consumed by evalNubisCubedSampleCore. Both reuse the
   // former pad_artistic1/2 slots; CB layout unchanged.
-  float cloudEnergyConserve;  // [0,1] 0 = legacy additive look (A/B), 1 = energy-conserving convex blend
-  float cloudMsLobeWeight;    // [0,1] convex weight: forward single-scatter lobe (1-w) vs multi-scatter body fill (w)
+  float padRetired13;         // RETIRED 2026-09-07: cloudEnergyConserve. The dual-lobe convex
+                              // blend it drove is gone -- single scatter and multiple scatter are
+                              // separate terms now, not two shares of one phase. NOT CPU-written.
+  float padRetired14;         // RETIRED 2026-09-07: cloudMsLobeWeight (that blend's weight).
 
   // ----- Layer-2 echo-deck step budget (fork — 2026-06-21) -----
   // The echo deck is marched far more cheaply than layer 1; these are its own

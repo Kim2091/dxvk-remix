@@ -195,8 +195,9 @@ struct CloudShadeContext {
   // ---- Frame-constant ----
   vec3  sunDirYUp;
   vec3  sunRadiance;
-  vec3  skyRadianceWarm;     // Sun-direction sky LUT sample (warm at sunset).
-  vec3  skyRadianceCool;     // Anti-sun-horizon sky LUT sample (cool at sunset).
+  vec3  skyRadianceWarm;     // Cosine-weighted mean of the SUN-SIDE sky hemisphere
+                             // (warm forward-scatter side at sunset), aureole excluded.
+  vec3  skyRadianceCool;     // Same for the ANTI-SUN hemisphere (cool side at sunset).
                              // Per-sample blend happens in evalNubisCubedSampleCore.
   vec3  skyRadianceZenith;   // Overhead sky LUT sample — the sky-dome underside
                              // fill (bright daytime, dim at sunset). Used by
@@ -223,8 +224,6 @@ struct CloudShadeContext {
   float ambientShadowAmt;    // saturate(cloudAmbientShadowStrength).
   float sunsetFactor;        // sunset ambient ramp; 0 above cloudSunsetAmbientRampHighSun,
                              // where the cool-blend exp() is dead (every midday frame).
-  float lobeWeightA;         // 1 - msLobeS * msLobeW
-  float lobeWeightB;         // 1 - msLobeS * (1 - msLobeW)
   bool  moonActive;          // any combined moon coefficient above threshold.
 
   // ---- Ray-constant (cloudShadeContextBeginRay) ----
@@ -338,20 +337,37 @@ NubisCubedLighting evalNubisCubedSampleCore(
   float HG1 = ctx.hg1;  // hgPhaseNubis(cosTheta, cloudPhaseG1) — ray-constant
   float HG2 = ctx.hg2;  // hgPhaseNubis(cosTheta, cloudPhaseG2) — ray-constant
 
-  // Energy-conserving dual-lobe blend (fork — 2026-06-19). Convex blend of
-  // the single-scatter forward lobe A (silver lining) and the multi-scatter
-  // body fill B, so the in-scatter phase integrates to exactly 1 and the
-  // silver lining can't out-brighten the physical sky LUT it composites
-  // against. cloudMsLobeWeight = w sets the forward/body balance;
-  // cloudEnergyConserve = s lerps from the legacy additive sum (s=0,
-  // byte-identical old look for an in-game A/B) to the conserving blend.
+  // Direct sun radiance = single scatter + multiple scatter (fork -- 2026-09-07).
+  //
+  // WHAT WAS HERE: a CONVEX blend, (A*wA + B*wB), whose weights made the two
+  // Henyey-Greenstein lobes sum to a phase integral of exactly 1. That is the
+  // right instinct for two competing PHASE LOBES of one scattering event, and
+  // the wrong model for what these two terms actually are. A is single scatter
+  // -- Beer-Lambert transmittance times a forward phase. B is the paper's
+  // MULTIPLE-scattering term (p.30-31: the dimensional profile used as a
+  // probability field, attenuated by a second Beer-Lambert, then "scaled by a
+  // phase"). Multiply-scattered energy is not a SHARE of the single-scatter
+  // phase; it is a separate and much larger amount of light that reached the
+  // sample by many paths through the body. Forcing it into a convex blend with
+  // HG2's 1/(4pi) normalisation left a lit cloud face at roughly
+  // 0.5 * 0.044 * E per unit density -- dimmer than the sky ambient sitting
+  // right next to it -- so sunlit tops and shadow sides came out nearly the
+  // same brightness. That, not the density field, is why the clouds read
+  // sky-lit and flat.
+  //
+  // NOW: A carries weight 1 (single scatter is a full term, not a fraction) and
+  // B leaves the blend entirely, scaled by cloudMsBodyGain -- the normalisation
+  // the paper leaves unspecified ("scaled by a phase", magnitude unstated).
+  // Calibrate the gain so a noon sunlit face reads roughly 5-8x the zenith sky
+  // texel beside it and the shadow side reads about 1x. cloudEnergyConserve and
+  // cloudMsLobeWeight are retired with this change: they existed only to tame
+  // the un-gained lobes.
   float A = T_primary * HG1;
   // Micro-AO on the multi-scatter body lobe only: the body fill is the
   // diffuse-ish term where local relief shading reads as detail; the forward
   // lobe A stays pure so silver linings are unaffected.
-  float B = M * HG2 * microAo;
-  // Both convex-blend weights are frame-constant -> ctx.lobeWeightA / lobeWeightB.
-  float L_direct = (A * ctx.lobeWeightA + B * ctx.lobeWeightB) * powder;
+  float B = M * HG2 * microAo * args.cloudMsBodyGain;
+  float L_direct = (A + B) * powder;
 
   // === Ambient scattering (paper p. 142) ===
   // Per-sample warm/cool ambient blend (fork — 2026-05-21). Warm color is
@@ -394,10 +410,17 @@ NubisCubedLighting evalNubisCubedSampleCore(
 
   // Sky-dome fill (fork — 2026-06-19, clouds-reflect-sky coupling). The
   // underside is ALSO lit by the open sky around and below the cloud, which
-  // the water OVERHEAD does not block — deliberately bypasses verticalLight.
+  // the water OVERHEAD does not block — so it bypasses most of verticalLight.
+  // Not all of it (fork -- 2026-09-07): a base under a thick core still sees
+  // less of the dome than one under a thin spot, it just sees more than the
+  // top-down term does. With cloudUndersideLightSigma raised to a paper-scale
+  // value the top-down term finally goes dark under cores, and a fully
+  // unattenuated dome fill would only paint that darkening flat again, so this
+  // takes verticalLight at half strength.
   // Reads the zenith sky color: bright daytime dome lifts undersides, dim
   // sunset zenith fades it naturally. cloudSkyAmbientFill scales; 0 = legacy.
-  vec3 domeFill = ambient_shape * args.cloudSkyAmbientFill * ctx.skyRadianceZenith;
+  vec3 domeFill = ambient_shape * args.cloudSkyAmbientFill * ctx.skyRadianceZenith
+                * (1.0f - 0.5f * (1.0f - verticalLight));
 
   NubisCubedLighting result;
   result.direct  = L_direct * ctx.sunRadiance;
@@ -420,12 +443,11 @@ CloudShadeContext buildCloudShadeContext(AtmosphereArgs args) {
   // (from the sky-view LUT) reads orange, producing a per-pixel hue mismatch
   // that varies with cloudPhaseG2 -- the bug the C6.4 diagnosis caught.
   //
-  // skyRadiance: sampled from the sky-view LUT at the sun direction (clamped
-  // to a hair above horizon so we don't return zero at exactly-on-horizon sun).
-  // Deliberate deviation from page-142's "zenith ambient" -- zenith at sunset
-  // is bluer than horizon, so sampling there would tint sunset cumulus bulk
-  // blue. Sampling at the sun direction gives the actual warm-orange forward-
-  // scatter atmosphere color matching the paper's pp. 122/132/171-173 renders.
+  // skyRadiance: a cosine-weighted mean of the sky DOME, split into sun-side
+  // (warm) and anti-sun (cool) halves -- see the hemispheric ambient block
+  // below. This used to be a single sky-view LUT texel taken AT THE SUN
+  // DIRECTION, which is the solar aureole: the brightest texel in the sky, and
+  // the same value for every cloud sample in the frame.
   vec3 sunDirYUp = normalize(args.sunDirection);
   vec3 airTrans = getAtmosphericTransmittanceForDir(sunDirYUp, args);
   // Day/night gate on ALL of the cloud's daytime (sun-derived) lighting —
@@ -459,39 +481,89 @@ CloudShadeContext buildCloudShadeContext(AtmosphereArgs args) {
   float dayFactor = smoothstep(-0.05f, 0.20f, sunDirYUp.y);
   vec3 sunRadiance = args.sunIlluminance * airTrans * dayFactor;
 
-  vec3 sunDirForAmbient = sunDirYUp;
-  sunDirForAmbient.y = max(sunDirForAmbient.y, 0.05f);
-  sunDirForAmbient = normalize(sunDirForAmbient);
-  vec3 skyRadianceWarm = sampleSkyAmbientForVolume(sunDirForAmbient, args,
-                                                    AtmosphereSkyViewLut,
-                                                    AtmosphereCloudSkyTransmittanceLut,
-                                                    AtmosphereSkyViewSampler) * dayFactor;
+  // ===== Hemispheric sky ambient (fork -- 2026-09-07) =====
+  //
+  // WHAT WAS HERE: skyRadianceWarm was ONE sky-view LUT texel, sampled AT THE
+  // SUN DIRECTION, and skyRadianceCool one texel at the anti-sun horizon. The
+  // sun texel is the solar aureole -- the brightest sample available anywhere
+  // in the sky -- and it is identical for every cloud sample in the frame. So
+  // the ambient term, which is supposed to be the soft fill that varies over a
+  // cloud's surface, was instead the flattest and brightest possible choice.
+  // The paper is explicit that ambient is "light energy coming from the sky and
+  // neighbouring clouds" (Nubis Cubed p.29); it never samples the sun texel,
+  // and neither did Nubis 2015/2017, which used a zenith/horizon gradient.
+  //
+  // NOW: a cosine-weighted mean of the sky dome, still split into two halves so
+  // the per-sample warm/cool sunset blend downstream has two real colors to
+  // interpolate between -- sun-side (forward-scatter warm) and anti-sun (cool).
+  // 16 azimuth bins x 2 elevation rings (20 and 55 degrees), each bin assigned
+  // to a half by its azimuth relative to the sun. Any tap within 30 degrees of
+  // the sun is dropped, so the aureole cannot dominate the mean it is meant to
+  // be one small part of. Weight = cos(zenith) = dir.y, the irradiance weight.
+  //
+  // COST: 32 sky-view LUT taps per pixel, at the SAME 32 UVs for every pixel in
+  // the frame -- so after the first wave they are texture-cache hits, and the
+  // real cost is sampler issue rate rather than bandwidth. Both LUTs are tiny.
+  // If it ever needs trimming, kAmbientAzimuths is the one knob.
+  const float kAureoleCos      = 0.866f;  // 30 degrees around the sun
+  const uint  kAmbientAzimuths = 16u;
 
-  // Anti-sun horizon sample for the per-sample warm/cool blend (fork —
-  // 2026-05-21). Mirrors the sun-direction sample's small y-lift to keep
-  // the lookup above sampleSkyAmbientForVolume's below-horizon zero-clamp.
-  // At sunset, this picks up the deep teal / Belt-of-Venus pink band on the
-  // opposite side of the sky; at midday, the cloudSunsetAmbientRampHighSun
-  // smoothstep inside evalNubisCubedSampleCore rolls the contribution to zero
-  // so this sample never reaches the composite.
-  vec3 antiSunDir = vec3(-sunDirYUp.x, 0.05f, -sunDirYUp.z);
-  antiSunDir = normalize(antiSunDir);
-  // Same dayFactor gate as the warm sample (issue #33): fades the daytime
-  // sky-ambient out at night so it can't keep tinting clouds below the horizon.
-  vec3 skyRadianceCool = sampleSkyAmbientForVolume(antiSunDir, args,
-                                                    AtmosphereSkyViewLut,
-                                                    AtmosphereCloudSkyTransmittanceLut,
-                                                    AtmosphereSkyViewSampler) * dayFactor;
+  // Azimuth frame anchored on the sun so the warm/cool split is sun-relative.
+  vec3 sunH = vec3(sunDirYUp.x, 0.0f, sunDirYUp.z);
+  float sunHLen = length(sunH);
+  sunH = (sunHLen > 1e-4f) ? (sunH / sunHLen) : vec3(1.0f, 0.0f, 0.0f);
+  vec3 sunT = vec3(-sunH.z, 0.0f, sunH.x);
+
+  vec3  warmSum = vec3(0.0f);
+  float warmW   = 0.0f;
+  vec3  coolSum = vec3(0.0f);
+  float coolW   = 0.0f;
+  [unroll] for (uint ei = 0u; ei < 2u; ++ei) {
+    float elevSin = (ei == 0u) ? 0.342020f : 0.819152f;  // sin(20deg), sin(55deg)
+    float elevCos = (ei == 0u) ? 0.939693f : 0.573576f;  // cos(20deg), cos(55deg)
+    // Inner loop left ROLLED on purpose: 16 inlined copies of the LUT lookup's
+    // asin/atan2/sqrt would be a lot of instruction cache for a uniform loop
+    // that every lane walks identically.
+    for (uint ai = 0u; ai < kAmbientAzimuths; ++ai) {
+      float phi = (float(ai) + 0.5f) * (2.0f * kPi / float(kAmbientAzimuths)) - kPi;
+      float cosPhi = cos(phi);
+      // Unit by construction: elevCos^2 + elevSin^2 == 1 and the horizontal
+      // part is a unit combination of the orthonormal sunH / sunT.
+      vec3 dir = elevCos * (cosPhi * sunH + sin(phi) * sunT)
+               + vec3(0.0f, elevSin, 0.0f);
+      if (dot(dir, sunDirYUp) > kAureoleCos) {
+        continue;  // aureole -- excluded from the ambient mean
+      }
+      vec3 r = sampleSkyAmbientForVolume(dir, args,
+                                         AtmosphereSkyViewLut,
+                                         AtmosphereCloudSkyTransmittanceLut,
+                                         AtmosphereSkyViewSampler);
+      if (cosPhi > 0.0f) {
+        warmSum += r * elevSin;
+        warmW   += elevSin;
+      } else {
+        coolSum += r * elevSin;
+        coolW   += elevSin;
+      }
+    }
+  }
 
   // Overhead (zenith) sky sample for the sky-dome underside fill (fork —
   // 2026-06-19, clouds-reflect-sky). This is the bright daytime sky that lights
-  // cloud bottoms from below/around — the term the warm/cool sun-direction
-  // samples above deliberately omit. Dim at sunset, so it self-fades and lets
-  // the warm samples carry the look. Same dayFactor gate as the others.
-  vec3 skyRadianceZenith = sampleSkyAmbientForVolume(vec3(0.0f, 1.0f, 0.0f), args,
-                                                    AtmosphereSkyViewLut,
-                                                    AtmosphereCloudSkyTransmittanceLut,
-                                                    AtmosphereSkyViewSampler) * dayFactor;
+  // cloud bottoms from below/around. Dim at sunset, so it self-fades. It also
+  // stands in for either half-mean in the degenerate case where every tap on
+  // that side fell inside the aureole (only reachable with an absurd aureole
+  // angle, but the guard costs nothing and keeps a divide-by-zero impossible).
+  vec3 zenithRaw = sampleSkyAmbientForVolume(vec3(0.0f, 1.0f, 0.0f), args,
+                                             AtmosphereSkyViewLut,
+                                             AtmosphereCloudSkyTransmittanceLut,
+                                             AtmosphereSkyViewSampler);
+
+  // dayFactor gate on all three (issue #33): fades the daytime sky-ambient out
+  // at night so it cannot keep tinting clouds once the sun is below the horizon.
+  vec3 skyRadianceWarm   = ((warmW > 1e-4f) ? (warmSum / warmW) : zenithRaw) * dayFactor;
+  vec3 skyRadianceCool   = ((coolW > 1e-4f) ? (coolSum / coolW) : zenithRaw) * dayFactor;
+  vec3 skyRadianceZenith = zenithRaw * dayFactor;
 
   // ===== Per-pixel moon-lighting precompute =====
   // The Nubis Cubed sun equations don't model moonlight, so without this block
@@ -659,11 +731,6 @@ CloudShadeContext buildCloudShadeContext(AtmosphereArgs args) {
   ctx.microAoScale     = kMicroAoGain * args.cloudMicroAoStrength;
   ctx.ambientShadowAmt = saturate(args.cloudAmbientShadowStrength);
   ctx.sunsetFactor     = 1.0f - smoothstep(0.0f, args.cloudSunsetAmbientRampHighSun, sunDirYUp.y);
-
-  float msLobeS   = saturate(args.cloudEnergyConserve);
-  float msLobeW   = saturate(args.cloudMsLobeWeight);
-  ctx.lobeWeightA = 1.0f - msLobeS * msLobeW;
-  ctx.lobeWeightB = 1.0f - msLobeS * (1.0f - msLobeW);
 
   ctx.moonActive = any((combinedMoonDiffuseCoeff + combinedMoonPhaseAmt) > vec3(0.001f));
 

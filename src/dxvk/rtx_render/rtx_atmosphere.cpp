@@ -1062,6 +1062,11 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
     // cache keys (same class as nvdfStepScale / cloudViewStepKm).
     args.nubis3AdaptiveStepKm    = std::min(std::max(RtxAtmosphere::nubis3AdaptiveStepKm(), 0.0f), 0.2f);
     args.cloudMsScale = RtxAtmosphere::cloudMsScale();
+    // Multiple-scattering body-lobe gain (fork — 2026-09-07). Same class as
+    // cloudMsScale: a live look knob that feeds the shared evaluator, so dragging
+    // it re-bakes the LUT cascade exactly as cloudMsScale already does. Deliberately
+    // NOT zeroed in normalizeForSkyLutCache — that only zeroes cloudHistoryWeight.
+    args.cloudMsBodyGain = std::min(std::max(RtxAtmosphere::cloudMsBodyGain(), 0.0f), 32.0f);
     // Dramatic-shading pass (fork — 2026-07-14). Lives in the former
     // pad_cloudMultiScatterStrength slot; CB layout unchanged.
     args.cloudAmbientShadowStrength = RtxAtmosphere::cloudAmbientShadowStrength();
@@ -1102,8 +1107,8 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
   {
     args.cloudPhaseG1         = RtxAtmosphere::cloudPhaseG1();
     args.cloudPhaseG2         = RtxAtmosphere::cloudPhaseG2();
-    args.cloudEnergyConserve  = RtxAtmosphere::cloudEnergyConserve();
-    args.cloudMsLobeWeight    = RtxAtmosphere::cloudMsLobeWeight();
+    // cloudEnergyConserve / cloudMsLobeWeight retired 2026-09-07 with the dual-lobe
+    // convex blend; their CB slots are padRetired13 / padRetired14 and stay unwritten.
     args.cloudMsSunDotMax     = RtxAtmosphere::cloudMsSunDotMax();
     args.cloudMsSigmaShallow  = RtxAtmosphere::cloudMsSigmaShallow();
     args.cloudMsSigmaDeep     = RtxAtmosphere::cloudMsSigmaDeep();
@@ -1316,7 +1321,6 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
   args.nubis3ShapeVarietyWavelengthKm = RtxAtmosphere::nubis3ShapeVarietyWavelengthKm();
   args.cloudLightingLodThreshold = RtxAtmosphere::cloudLightingLodThreshold();
   args.cloudMissLinearViewZ = m_missLinearViewZ;
-  args.padRetired8 = 0u;
   {
     // Wind direction as a unit vector, for the detail drift and base shear (fork -- 2026-09-07).
     const auto* wxWind = m_weatherOverride;

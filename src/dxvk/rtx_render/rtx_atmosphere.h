@@ -844,7 +844,21 @@ public:
                "1.0 = paper baseline. sigma_ms is an EXTINCTION on the body lobe "
                "(exp(-sigma_ms * D_sun)), so higher = darker shadowed bulk / more "
                "shading contrast, lower = brighter, flatter body fill. (Doc fixed "
-               "2026-07-14; the old text had the direction inverted.)");
+               "2026-07-14; the old text had the direction inverted.) NOTE 2026-09-07: "
+               "cloudMsSigmaShallow / Deep now carry the paper's values converted into "
+               "this renderer's per-km units (3.0 / 0.6), so this master multiplier "
+               "belongs at 1. Confs carrying the old compensating value of 12 must be "
+               "reset or the body lobe goes black.");
+    RTX_OPTION("rtx.atmosphere", float, cloudMsBodyGain, 8.0f,
+               "Gain on the multiple-scattering body lobe [0..32]. The paper says the "
+               "MS term is 'scaled by a phase' and never gives the normalisation; using "
+               "the raw 1/(4pi) Henyey-Greenstein value inside a convex blend with the "
+               "single-scatter lobe left a sunlit cloud face DIMMER than the sky ambient "
+               "beside it, which is what made the clouds read flat and sky-lit. This is "
+               "that missing normalisation. Calibrate at noon: a sunlit face should read "
+               "roughly 5-8x the zenith sky texel next to it, and the shadow side about "
+               "1x. Higher = more sun-vs-shadow contrast and a brighter body. "
+               "Applies live.");
 
     RTX_OPTION("rtx.atmosphere", float, cloudTypeMean, 1.0f,
                "Mean cloud type across the sky [0,1]: 0=stratus, 0.5=stratocumulus, 1=cumulus.");
@@ -1034,7 +1048,7 @@ public:
                "default spacing out to ~6 km of cloud span; lower costs "
                "less but lets some banding back in at the far horizon. "
                "32 = legacy cost ceiling. Applies live.");
-    RTX_OPTION("rtx.atmosphere", float, cloudUndersideLightSigma, 0.2f,
+    RTX_OPTION("rtx.atmosphere", float, cloudUndersideLightSigma, 1.5f,
                "Extinction of the light filtering down through each cloud, "
                "per km of overlying water [0..0.5]. Drives the analytic "
                "per-column underside light field: brightness varies "
@@ -1109,7 +1123,7 @@ public:
                "Lightning flash color (linear RGB), shared by the in-cloud "
                "glow and the scene flash. Default is a cool blue-white.");
 
-    RTX_OPTION("rtx.atmosphere", float, cloudEdgeAmbientFade, 0.15f,
+    RTX_OPTION("rtx.atmosphere", float, cloudEdgeAmbientFade, 0.05f,
                "Thin-edge ambient fade [0..0.5]. Sub-threshold skirt samples are "
                "ambient-dominated, and the ambient is sampled at the horizon (a "
                "dirty grey-brown), so the soft fringe can read as discolored "
@@ -1136,7 +1150,7 @@ public:
                "the actual sky color; naturally fades at sunset (the overhead "
                "sky is dim then). Higher = brighter, more sky-colored bases; "
                "0 = off (legacy, undersides ignore the open sky). Applies live.");
-    RTX_OPTION("rtx.atmosphere", float, cloudAmbientShadowStrength, 1.0f,
+    RTX_OPTION("rtx.atmosphere", float, cloudAmbientShadowStrength, 0.5f,
                "Dramatic shading [0..1]: how much the sky-ambient fill is "
                "attenuated by sun-shadow depth inside the cloud. The ambient "
                "term otherwise refloods sun-shadowed bulk with bright daytime "
@@ -1174,22 +1188,25 @@ public:
                "Primary HG asymmetry; strong forward-scatter, drives silver lining at backlit edges.");
     RTX_OPTION("rtx.atmosphere", float, cloudPhaseG2, 0.3f,
                "Secondary HG asymmetry; mild forward-scatter, drives broader in-scatter envelope.");
-    // Legacy dual-lobe summed two full-amplitude lobes (phase integral up to 2x), brighter than the sky LUT.
-    // cloudEnergyConserve lerps toward a convex blend integrating to 1; cloudMsLobeWeight is the blend weight.
-    RTX_OPTION("rtx.atmosphere", float, cloudEnergyConserve, 1.0f,
-               "[0,1] Energy conservation of the cloud direct lighting. 0 = legacy additive "
-               "dual-lobe (phase integral up to 2, brighter-than-sky look). 1 = convex blend "
-               "(phase integral 1, energy-conserving). Set 0 to A/B against the old look.");
-    RTX_OPTION("rtx.atmosphere", float, cloudMsLobeWeight, 0.5f,
-               "[0,1] Convex weight between the forward single-scatter lobe (silver lining, "
-               "weight 1-w) and the broader multi-scatter body fill (weight w) when "
-               "cloudEnergyConserve > 0. Higher = flatter/softer body, dimmer silver lining.");
+    // RETIRED 2026-09-07: cloudEnergyConserve / cloudMsLobeWeight. They forced the
+    // single-scatter and multiple-scatter terms into a convex blend so the two HG lobes
+    // integrated to 1. Those are not two shares of one phase -- one is single scatter,
+    // the other is a multiply-scattered probability field -- and the blend is what made
+    // the sun term dimmer than the sky. See cloudMsBodyGain. CB slots: padRetired13/14.
     RTX_OPTION("rtx.atmosphere", float, cloudMsSunDotMax, 0.9f,
                "Nubis Cubed sigma_ms remap upper bound on sun_dot. Lower = wider 'shallow extinction' zone.");
-    RTX_OPTION("rtx.atmosphere", float, cloudMsSigmaShallow, 0.25f,
-               "Nubis Cubed sigma_ms value at cloud surface / shallow penetration.");
-    RTX_OPTION("rtx.atmosphere", float, cloudMsSigmaDeep, 0.05f,
-               "Nubis Cubed sigma_ms value deep inside cloud (sdf <= -cloudMsSdfDepth).");
+    // sigma_ms units (fork -- 2026-09-07). The paper's 0.25 / 0.05 are in ITS units, where
+    // transmittance is exp(-summed_density) with no extinction coefficient and its light march
+    // steps ~16-26 m per unit of summed density -- an implied sigma_ext of 40-60 /km. Ours is
+    // cloudDensity = 4 /km, so the paper's tau converts to 0.25 * (40..60)/4 = 2.5..3.75 here.
+    // The old defaults were the paper's raw numbers, ~12x too weak, and confs compensated with
+    // cloudMsScale = 12. These are the converted values, so cloudMsScale belongs back at 1.
+    RTX_OPTION("rtx.atmosphere", float, cloudMsSigmaShallow, 3.0f,
+               "Nubis Cubed sigma_ms value at cloud surface / shallow penetration, in this "
+               "renderer's per-km-of-density units (paper 0.25 in its own units).");
+    RTX_OPTION("rtx.atmosphere", float, cloudMsSigmaDeep, 0.6f,
+               "Nubis Cubed sigma_ms value deep inside cloud (sdf <= -cloudMsSdfDepth), in this "
+               "renderer's per-km-of-density units (paper 0.05 in its own units).");
     RTX_OPTION("rtx.atmosphere", float, cloudMsSdfDepth, 128.0f,
                "Nubis Cubed SDF depth in meters at which sigma_ms saturates to deep value.");
 

@@ -1413,7 +1413,16 @@ void RtxAtmosphere::showImguiSettings(WeatherBlender* blender) {
             "Extinction scale on the multi-scatter body lobe. 1.0 = Nubis "
             "Cubed paper baseline; HIGHER = darker sun-shadowed bulk (more "
             "shading contrast), LOWER = brighter, flatter body fill. (Tooltip "
-            "direction fixed 2026-07-14.)");
+            "direction fixed 2026-07-14.) Keep at 1: the sigma_ms defaults now "
+            "carry the paper's values in this renderer's units.");
+        RemixGui::DragFloat("Body Gain", &RtxAtmosphere::cloudMsBodyGainObject(),
+                            0.25f, 0.0f, 32.0f, "%.2f", sliderFlags);
+        RemixGui::SetTooltipToLastWidgetOnHover(
+            "Brightness of the multiple-scattering body lobe -- the term that "
+            "makes a sunlit cloud face brighter than the sky behind it. "
+            "Calibrate at noon: a sunlit face should read about 5-8x the sky "
+            "right next to it, the shadow side about 1x. Too low and the clouds "
+            "go flat and sky-lit; too high and they blow out white.");
         dragFloatWithWeatherOverride(
             "Ground Shadow", &RtxAtmosphere::cloudShadowStrengthObject(),
             WEATHER_OVERRIDE_PTR(cloudShadowStrength),
