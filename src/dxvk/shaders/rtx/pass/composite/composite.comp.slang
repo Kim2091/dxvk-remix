@@ -762,14 +762,56 @@ vec2 sampleCloudDepthKm(uint2 pixelCoordinate, AtmosphereArgs args)
 // 50 m. The eye-inside-the-deck case the old floor also covered is handled by the redefinition
 // itself: with the eye in cloud the first density hit is ~0 and the centroid is well inside the
 // deck, so the span is large, not small.
-float cloudDepthVisibility(float entryKm, float meanKm, float surfaceKm)
+// Beer-Lambert rather than a straight line (fork -- 2026-09-06, occlusion naturalness). The ramp
+// used to be linear in depth: saturate((surface - entry) / (mean - entry)). Cloud does not attenuate
+// linearly, it attenuates exponentially, and the difference is exactly the hard flat-looking edge
+// where terrain cuts through the deck -- a linear ramp crosses the whole 0..1 range at a constant
+// rate no matter how dense the cloud is, so the transition reads as a straight-edged wipe instead of
+// a fog that thickens with distance.
+//
+// The cloud is modelled as uniform extinction over the span it actually occupies. Everything needed
+// is already in the depth companion and the render target, so this costs no new storage, no march
+// clamp, and no geometry dependence in the smoothed signal:
+//
+//   span   ~ 2 * (mean - entry)      the weighted centroid sits mid-span for uniform density
+//   sigma  = -log(1 - alpha) / span  total optical depth spread over that span
+//   front  = 1 - exp(-sigma * (surface - entry))
+//   result = front / alpha           the fraction of the cloud lying in front of the surface
+//
+// Exact at both ends -- 0 when the surface is at the cloud's near edge, and 1 when it is at the far
+// edge, where sigma * span is the total optical depth by construction -- so it is continuous with
+// the early-outs and needs no feather constant at all. Dense cloud now saturates early (a wall a
+// short way into thick cloud is already heavily fogged, which is what standing in fog looks like)
+// while thin cloud stays nearly linear, which is what the old ramp approximated for every density.
+float cloudDepthVisibility(float entryKm, float meanKm, float surfaceKm, float cloudAlpha)
 {
   if (entryKm < 0.0f)
   {
     return 0.0f;
   }
-  const float featherKm = max(meanKm - entryKm, 1e-3f);  // 1 m: divide guard only, not a look knob
-  return saturate((surfaceKm - entryKm) / featherKm);
+
+  const float depthKm = surfaceKm - entryKm;
+  if (depthKm <= 0.0f)
+  {
+    return 0.0f;  // surface nearer than any cloud on this ray
+  }
+
+  // Uniform-density estimate of the cloud's full extent along the ray.
+  const float spanKm = 2.0f * max(meanKm - entryKm, 1e-4f);
+  if (depthKm >= spanKm)
+  {
+    return 1.0f;  // surface past the far edge: all of the cloud is in front of it
+  }
+
+  // Below this the cloud contributes nothing worth shaping, and the divides below lose precision.
+  if (cloudAlpha < 1e-4f)
+  {
+    return saturate(depthKm / spanKm);
+  }
+
+  const float totalOpticalDepth = -log(max(1.0f - cloudAlpha, 1e-4f));
+  const float frontAlpha = 1.0f - exp(-totalOpticalDepth * depthKm / spanKm);
+  return saturate(frontAlpha / cloudAlpha);
 }
 
 // Rotation-only screen motion vector for the cloud's own pixel, in pixels. Deliberate duplicate of
@@ -1132,7 +1174,7 @@ void applyCloudComposite(
   if (!primaryMiss)
   {
     const float surfaceKm = viewDistance * kmPerWorldUnit;
-    opaqueVisibility = cloudDepthVisibility(entryKm, meanKm, surfaceKm);
+    opaqueVisibility = cloudDepthVisibility(entryKm, meanKm, surfaceKm, smoothedCloud.a);
   }
   // PSR pixels already carry cloud from the secondary LUT along the reflected ray; adding the
   // primary ray's cloud on top is the "double cloud in water reflections" artefact. Zeroed here
@@ -1172,7 +1214,7 @@ void applyCloudComposite(
   if (alphaBlendSurfaceValid && entryKm >= 0.0f && !performedPSR)
   {
     const float alphaSurfaceKm = alphaBlendHitDistance * kmPerWorldUnit;
-    const float alphaVisibility = cloudDepthVisibility(entryKm, meanKm, alphaSurfaceKm);
+    const float alphaVisibility = cloudDepthVisibility(entryKm, meanKm, alphaSurfaceKm, smoothedCloud.a);
 
     // alphaBlendOutput is PREMULTIPLIED by the surface's own coverage: applyVolumetricLighting scales
     // it by (1 - backgroundAlpha) before returning it, and finalOutput adds it to radianceOutput *
