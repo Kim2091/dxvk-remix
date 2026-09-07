@@ -3011,8 +3011,21 @@ AtmosphereArgs RtxAtmosphere::updateFrame(RtxContext& ctx,
     // matrix nor an explicit push is available — that is a separate, gated decision this stage does
     // not make.
     const bool useOverride = RtxAtmosphere::useCameraWorldOverride();
+    // Free-camera displacement in raw game units, zero unless the free camera is enabled (both
+    // readings are then the same matrix). Remix builds the free camera's transform itself rather
+    // than reading it from the game, so this delta is a REAL position change even on an engine
+    // whose own camera translation never reaches the view matrix -- which is the entire situation
+    // on Gamebryo, where getPosition() is permanently (0,0,0).
+    const Vector3 freecamOffsetWorldUnits = rawWorldUnitsFreecam - rawWorldUnits;
+    // Adding it to the override is what makes the free camera able to fly INTO the deck (fork --
+    // 2026-09-06, open issue #6 follow-up). cameraWorldOverride is a static config constant: with
+    // it enabled the anchor never moved no matter how the free camera flew, so the clouds sat at a
+    // fixed distance forever and were unreachable. The override supplies where the player is; the
+    // free camera offset supplies where the viewer has flown relative to them. A game integration
+    // that pushes a per-frame override still works unchanged -- the offset is zero when the free
+    // camera is off, so this only ever adds motion that would otherwise be dropped on the floor.
     const Vector3 resolvedRawWorldUnits = useOverride
-      ? RtxAtmosphere::cameraWorldOverride()
+      ? RtxAtmosphere::cameraWorldOverride() + freecamOffsetWorldUnits
       : rawWorldUnitsFreecam;
     const CloudAnchor::Source resolvedSource = useOverride
       ? CloudAnchor::Source::CameraWorldOverride
