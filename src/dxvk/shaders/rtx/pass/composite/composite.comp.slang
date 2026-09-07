@@ -796,21 +796,41 @@ float cloudDepthVisibility(float entryKm, float meanKm, float surfaceKm, float c
     return 0.0f;  // surface nearer than any cloud on this ray
   }
 
-  // Uniform-density estimate of the cloud's full extent along the ray.
-  const float spanKm = 2.0f * max(meanKm - entryKm, 1e-4f);
+  // Recovering the span from the mean needs care: meanKm is a TRANSMITTANCE-WEIGHTED centroid, not
+  // a geometric midpoint. The weights are the per-step opacity increments, so as the cloud thickens
+  // the far half contributes almost nothing and the centroid is dragged toward the near edge --
+  // mu -> 1/sigma rather than S/2. Assuming S = 2*mu (which this function did briefly) therefore
+  // UNDER-estimates the span, and by the largest factor exactly where it hurts: with the eye inside
+  // a dense deck it overestimates sigma ~2.4x at alpha 0.99 and ~3.5x at 0.999, over-fogging every
+  // near surface. For a uniform medium the relation inverts exactly:
+  //
+  //   tau = -ln(1 - alpha)                       total optical depth
+  //   mu  = S * (alpha - tau(1-alpha)) / (tau*alpha)
+  //   =>  S = mu * g(alpha),  g = tau*alpha / (alpha - tau(1-alpha))
+  //
+  // g runs from 2 in the optically thin limit to ~7 at alpha 0.999.
+  const float muKm = max(meanKm - entryKm, 1e-4f);
+
+  // Thin cloud: nothing to shape, and the g denominator below cancels to tau^2/2.
+  if (cloudAlpha < 1e-4f)
+  {
+    return saturate(depthKm / (2.0f * muKm));
+  }
+
+  const float tau = -log(max(1.0f - cloudAlpha, 1e-6f));
+  // Series below tau ~ 0.3 (g -> 2(1 + tau/6), within 0.2% there): the exact denominator is a
+  // difference of two nearly equal numbers in that regime and loses most of its significant bits.
+  const float g = (tau < 0.3f)
+    ? 2.0f * (1.0f + tau * (1.0f / 6.0f))
+    : tau * cloudAlpha / max(cloudAlpha - tau * (1.0f - cloudAlpha), 1e-6f);
+  const float spanKm = muKm * g;
+
   if (depthKm >= spanKm)
   {
     return 1.0f;  // surface past the far edge: all of the cloud is in front of it
   }
 
-  // Below this the cloud contributes nothing worth shaping, and the divides below lose precision.
-  if (cloudAlpha < 1e-4f)
-  {
-    return saturate(depthKm / spanKm);
-  }
-
-  const float totalOpticalDepth = -log(max(1.0f - cloudAlpha, 1e-4f));
-  const float frontAlpha = 1.0f - exp(-totalOpticalDepth * depthKm / spanKm);
+  const float frontAlpha = 1.0f - exp(-tau * depthKm / spanKm);
   return saturate(frontAlpha / cloudAlpha);
 }
 
