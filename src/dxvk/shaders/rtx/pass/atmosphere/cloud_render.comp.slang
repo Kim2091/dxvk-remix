@@ -294,8 +294,6 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
   float viewTransmittance = 1.0f;
   float entryDistanceKm;
   float meanCloudDepthKm;
-  float surfaceVisibility;
-
   // Clamped at the primary surface (fork -- 2026-09-07). This restores the one line Stage 4a had
   // and e7298993f removed, and it is what makes cloud-vs-geometry occlusion EXACT rather than
   // estimated: the pass integrates [0, tSurface], so what it reports IS the cloud in front of the
@@ -317,8 +315,7 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
                    /*tMaxClamp=*/tSurfaceKm,
                    args.cloudViewSamples, ctx, args,
                    accumColor, viewTransmittance,
-                   entryDistanceKm, meanCloudDepthKm,
-                   tSurfaceKm, surfaceVisibility);
+                   entryDistanceKm, meanCloudDepthKm);
 
   // Output is premultiplied: rgb = accumulated cloud radiance,
   // a = view-ray cloud transmittance.
@@ -327,5 +324,8 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
   // Depth companion (fork — 2026-09-05, world-space cloud migration Stage 4a): r = entry distance,
   // g = transmittance-weighted mean cloud depth, both km. Written unconditionally so every texel is
   // defined every frame, matching cloudRenderOutput's coverage above. No consumer yet -- Stage 4b.
-  cloudDepthOutput[pixelCoord] = vec4(entryDistanceKm, meanCloudDepthKm, tSurfaceKm, surfaceVisibility);
+  // .z is the surface distance this texel was clamped at -- kept because a depth-aware upsample
+  // needs it once the cloud pass runs below full resolution, and it is the natural thing to inspect
+  // when the clamp misbehaves. .w retired with the measured-prefix experiment.
+  cloudDepthOutput[pixelCoord] = vec4(entryDistanceKm, meanCloudDepthKm, tSurfaceKm, 0.0f);
 }

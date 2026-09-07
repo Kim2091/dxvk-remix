@@ -133,7 +133,7 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
   // 4a): only cloud_render.comp.slang's screen pass writes a depth companion RT. Signature-only
   // change to marchCloudLayers -- same pattern Stage 1 used when it added tMin/tMaxClamp to
   // marchEchoDeck: no render delta for this bake.
-  float unusedEntryDistanceKm, unusedMeanCloudDepthKm, unusedSurfaceVisibility;
+  float unusedEntryDistanceKm, unusedMeanCloudDepthKm;
   // The LUT bake's jitter is already frame-constant, so the adaptive march's
   // near (animated) and far (static) hashes are the same value here.
   marchCloudLayers(viewDirYUp, jitter, jitter,
@@ -141,9 +141,7 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
                    /*tMaxClamp=*/0.0f,
                    args.cloudViewSamples, ctx, args,
                    accumColor, viewTransmittance,
-                   unusedEntryDistanceKm, unusedMeanCloudDepthKm,
-                   // The secondary LUT is a directional bake with no primary surface behind it.
-                   /*tSurfaceKm=*/kNoSurfaceKm, unusedSurfaceVisibility);
+                   unusedEntryDistanceKm, unusedMeanCloudDepthKm);
 
   cloudSecondaryLutOutput[pixelCoord] = vec4(accumColor, viewTransmittance);
 }

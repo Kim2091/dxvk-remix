@@ -1148,15 +1148,6 @@ bool cloudSlabSpan(vec3 rayDirYUp, vec3 planetCenter, float planetRadiusKm,
 // rather than branching leaves the prefix equal to the full transmittance, i.e. visibility 1.
 static const float kNoSurfaceKm = 1e9f;
 
-void accumulateSurfacePrefix(float segStartKm, float segLenKm, float surfaceKm,
-                             float stepFactor, inout float transmittanceToSurface) {
-  if (surfaceKm <= segStartKm) {
-    return;  // this segment lies entirely behind the surface
-  }
-  const float frac = saturate((surfaceKm - segStartKm) / max(segLenKm, 1e-6f));
-  transmittanceToSurface *= (frac >= 1.0f) ? stepFactor : pow(max(stepFactor, 1e-8f), frac);
-}
-
 void marchCloudSlab(vec3   viewDirYUp,
                     float  pixelJitter,
                     float  pixelJitterStatic,
@@ -1186,12 +1177,7 @@ void marchCloudSlab(vec3   viewDirYUp,
                     // one combined mean-depth estimate.
                     inout float entryDistanceKm,
                     inout float sumWeightedDistKm,
-                    inout float sumWeight,
-                    // Distance along this ray of the surface the primary ray hit, or kNoSurfaceKm
-                    // for a sky ray, and the transmittance accumulated up to it. See
-                    // accumulateSurfacePrefix.
-                    float tSurfaceKm,
-                    inout float transmittanceToSurface) {
+                    inout float sumWeight) {
   // Slab intersection (fork — 2026-09-05, world-space cloud migration Stage 1). Was inline
   // ray-sphere tests against the base + top shells of the curvature-adjusted cloud planet, taking
   // the far root of each unconditionally; now cloudSlabSpan, which shares the one planet centre and
@@ -1274,7 +1260,6 @@ void marchCloudSlab(vec3   viewDirYUp,
       float t = tEntry + stepLen * (float(i) + pixelJitter);
       float rayFrac = (float(i) + pixelJitter) / float(effSampleCount);
       float sdfStepKm;
-      const float transmittanceBeforeStep = viewTransmittance;
       bool sampled = integrateCloudSample(t, stepLen, rayFrac, viewDirYUp,
                                           slabAltitudeKm, slabThicknessKm,
                                           slabTypeMean, slabCoverageMean,
@@ -1283,10 +1268,6 @@ void marchCloudSlab(vec3   viewDirYUp,
                                           coverageNoiseEntry, coverageNoiseExit,
                                           ctx, args, accumColor, viewTransmittance,
                                           sdfStepKm, sumWeightedDistKm, sumWeight, entryDistanceKm);
-      // The segment is [tEntry + stepLen*i, +stepLen]; `t` is the jittered sample inside it.
-      accumulateSurfacePrefix(tEntry + stepLen * float(i), stepLen, tSurfaceKm,
-                              viewTransmittance / max(transmittanceBeforeStep, 1e-8f),
-                              transmittanceToSurface);
       // SDF empty-space skip (fork — Nubis3 conversion Phase C). The sampler
       // reported a guaranteed-empty radius around this sample (min hex tap,
       // coverage- and wobble-conservative); jump the loop index so the next
@@ -1357,7 +1338,6 @@ void marchCloudSlab(vec3   viewDirYUp,
     float hash    = t < kJitterAnimateKm ? pixelJitter : pixelJitterStatic;
     float tSample = t + hash * stepKm;
     float rayFrac = saturate((tSample - tEntry) / (tExit - tEntry));
-    const float transmittanceBeforeStep = viewTransmittance;
     integrateCloudSample(tSample, stepKm, rayFrac, viewDirYUp,
                          slabAltitudeKm, slabThicknessKm,
                          slabTypeMean, slabCoverageMean,
@@ -1366,9 +1346,6 @@ void marchCloudSlab(vec3   viewDirYUp,
                          coverageNoiseEntry, coverageNoiseExit,
                          ctx, args, accumColor, viewTransmittance,
                          sdfStepKm, sumWeightedDistKm, sumWeight, entryDistanceKm);
-    accumulateSurfacePrefix(t, stepKm, tSurfaceKm,
-                            viewTransmittance / max(transmittanceBeforeStep, 1e-8f),
-                            transmittanceToSurface);
     t += stepKm;
   }
 
@@ -1438,9 +1415,7 @@ void marchEchoDeck(vec3   viewDirYUp,
                    // its perfectly real layer-2 cloud zeroed by loadCurrentCloudOpacity.
                    inout float sumWeightedDistKm,
                    inout float sumWeight,
-                   inout float entryDistanceKm,
-                   float tSurfaceKm,
-                   inout float transmittanceToSurface) {
+                   inout float entryDistanceKm) {
   // Slab intersection via the shared helper (fork — 2026-09-05, world-space cloud migration
   // Stage 1) — see cloudSlabSpan's comment and marchCloudSlab's identical swap above.
   float tEntry, tExit;
@@ -1622,13 +1597,7 @@ void marchEchoDeck(vec3   viewDirYUp,
     }
     sumWeightedDistKm += t * sampleWeight;
     sumWeight         += sampleWeight;
-    // Layer 2 contributes to the surface prefix on the same terms as layer 1. It marches second but
-    // can lie NEARER along a downward ray, which is exactly why the prefix is accumulated as a
-    // product rather than in march order.
-    const float stepFactor = mix(1.0f, stepTransmittance, aerialT_fade);
-    accumulateSurfacePrefix(tEntry + stepLen * float(i), stepLen, tSurfaceKm,
-                            stepFactor, transmittanceToSurface);
-    viewTransmittance *= stepFactor;
+    viewTransmittance *= mix(1.0f, stepTransmittance, aerialT_fade);
   }
 }
 
@@ -1663,13 +1632,7 @@ void marchCloudLayers(vec3  viewDirYUp,
                       // consumes these; cloud_secondary_lut.comp.slang passes throwaway locals --
                       // see that file's call site.
                       out float entryDistanceKm,
-                      out float meanCloudDepthKm,
-                      // Distance to the surface the primary ray hit (kNoSurfaceKm for a sky ray),
-                      // and the fraction of this ray's cloud opacity lying in front of it -- the
-                      // measured answer to the question the composite's occlusion ramp could only
-                      // estimate. See accumulateSurfacePrefix.
-                      float tSurfaceKm,
-                      out float surfaceVisibility) {
+                      out float meanCloudDepthKm) {
   // Per-ray shading precompute (fork — 2026-07-30, perf). Fills the
   // view-direction-dependent half of the context ONCE, replacing the same work
   // repeated at every march sample. Both layers share it: every term here is
@@ -1689,10 +1652,6 @@ void marchCloudLayers(vec3  viewDirYUp,
   // fly-through polish). The second call returns immediately unless the eye is above the deck base
   // looking down through it, which is the only configuration with two crossings -- so this costs a
   // span test per pixel in every other case, and renders the deck's far underside in that one.
-  // Transmittance measured up to the surface. Starts fully transparent and is attenuated by every
-  // segment in front of the surface, across both layers and both span pieces.
-  float transmittanceToSurface = 1.0f;
-
   for (int spanPiece = 0; spanPiece < 2; ++spanPiece) {
     marchCloudSlab(viewDirYUp, pixelJitter, pixelJitterStatic,
                    args.cloudAltitude, args.cloudThickness,
@@ -1703,8 +1662,7 @@ void marchCloudLayers(vec3  viewDirYUp,
                    spanPiece,
                    sampleCount, ctx, args,
                    accumColor, viewTransmittance,
-                   entryDistanceKm, sumWeightedDistKm, sumWeight,
-                   tSurfaceKm, transmittanceToSurface);
+                   entryDistanceKm, sumWeightedDistKm, sumWeight);
   }
 
   // Layer 2 echo deck — same slab model at a gapped altitude, marched cheaply.
@@ -1756,8 +1714,7 @@ void marchCloudLayers(vec3  viewDirYUp,
                   tMinClamp, tMaxClamp,
                   ctx, args2,
                   accumColor, viewTransmittance,
-                  sumWeightedDistKm, sumWeight, entryDistanceKm,
-                  tSurfaceKm, transmittanceToSurface);
+                  sumWeightedDistKm, sumWeight, entryDistanceKm);
   }
 
   // Finalize the depth companion (fork — 2026-09-05, Stage 4a): both layers have now contributed
@@ -1766,15 +1723,4 @@ void marchCloudLayers(vec3  viewDirYUp,
   // missed, or every sample density-gated out) -- meanCloudDepthKm is meaningless there, so it
   // reports the "no cloud" sentinel instead of dividing by (near) zero.
   meanCloudDepthKm = (sumWeight > 1e-6f) ? (sumWeightedDistKm / sumWeight) : 0.0f;
-
-  // Measured occlusion (fork -- 2026-09-06). The fraction of this ray's cloud OPACITY that lies in
-  // front of the surface, taken from the two transmittances the march just produced rather than
-  // estimated from (entry, mean, alpha) in the composite. Opacity, not transmittance, because the
-  // composite scales a premultiplied cloud colour whose weight is alpha.
-  //
-  // A ray with no cloud at all divides 0/0; report full visibility there, matching the sky case --
-  // scaling nothing by 1 is still nothing, and it keeps the value continuous as cloud thins out.
-  const float alphaFull  = 1.0f - viewTransmittance;
-  const float alphaFront = 1.0f - transmittanceToSurface;
-  surfaceVisibility = (alphaFull > 1e-5f) ? saturate(alphaFront / alphaFull) : 1.0f;
 }
