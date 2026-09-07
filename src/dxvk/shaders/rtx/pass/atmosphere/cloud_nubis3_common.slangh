@@ -129,6 +129,12 @@ float sampleCloudDensityNubis3(vec3 worldPosKm,
                                float coverageLocal,
                                float densityScale,
                                float cameraDistKm,
+                               // Angular size of one output pixel, radians (fork -- 2026-09-07).
+                               // With cameraDistKm this gives the world footprint a sample covers,
+                               // which picks the detail volume's mip level. 0 = no LOD (level 0
+                               // everywhere): what every camera-independent caller passes, so the
+                               // D_sun / D_ambient grid bakes stay a pure function of the field.
+                               float pixelAngleRad,
                                AtmosphereArgs args,
                                Texture3D<float> nvdfSdf,
                                Texture3D<float4> detailNoise,
@@ -287,6 +293,56 @@ float sampleCloudDensityNubis3(vec3 worldPosKm,
   // wobble in the detail field late in a session.
   float detailFreq = args.cloudDetailScale / args.cloudNoiseTileKm;
 
+  // Distance LOD on the detail volume (Nubis Cubed p.101, which mips this same
+  // volume and picks the level from view distance; fork -- 2026-09-07).
+  //
+  // The problem this solves: the volume's content runs 31-167 m at the live
+  // cloudDetailScale, while the sqrt-adaptive march steps 25-100 m. Point-sampling
+  // structure at or below the sampling rate does not resolve it, it aliases -- and
+  // the temporal EMA then converges the aliasing into exactly the fine grain the
+  // detail work keeps trying to remove. Dropping to a level whose texels match the
+  // footprint is both the correct answer and the CHEAPER one: the fetches hit
+  // smaller, better-cached levels.
+  //
+  // TWO sampling rates decide the footprint, and the LARGER one wins:
+  //
+  //   * the pixel: cameraDistKm * pixelAngleRad, the world width one output pixel
+  //     covers at this sample. Matters at low cloud render resolution or wide FOV.
+  //   * the MARCH STEP: the spacing between consecutive samples ALONG the ray. At
+  //     the shipping settings this is the bigger of the two by roughly 10x at any
+  //     distance a cloud is actually seen from -- 29 m at 1 km and 64 m at 5 km
+  //     against a 5 m pixel -- so a pixel-only LOD would sit at level 0 out past
+  //     8 km and the chain would never engage at all. The ray direction is where
+  //     this renderer undersamples, and it is what the grain comes from.
+  //
+  // Mirrors marchCloudSlab's sqrt-adaptive step
+  //   clamp(cloudViewStepKm * sqrt(t / 12 km), nubis3AdaptiveStepKm, 4 * cloudViewStepKm)
+  // and MUST stay in lockstep with it (cloud_march_common.slangh, kAdaptiveRefDistKm).
+  // Gated on pixelAngleRad > 0, which is the screen pass's own marker: every other
+  // caller -- the coarse optical-depth taps, the D_sun / D_ambient grid bakes -- is
+  // camera-independent by contract and stays on level 0.
+  //
+  // A level-L texel of a 128^3 volume sampled at frequency f spans (2^L)/(128*f) km,
+  // so the level whose texel matches the footprint is log2(footprint * f * 128).
+  // Clamped at 0 (never magnify past level 0) and at the top of the chain.
+  const float kDetailMipMax = 7.0f;  // kCloudDetailNoise3DMipLevels - 1
+  float footprintKm = max(cameraDistKm, 0.0f) * max(pixelAngleRad, 0.0f);
+  if (pixelAngleRad > 0.0f && args.cloudViewStepKm > 0.001f) {
+    float marchStepKm = args.cloudViewStepKm;
+    if (args.nubis3AdaptiveStepKm > 1e-4f) {
+      const float kAdaptiveRefDistKm = 12.0f;
+      marchStepKm = clamp(args.cloudViewStepKm * sqrt(max(cameraDistKm, 0.0f) / kAdaptiveRefDistKm),
+                          args.nubis3AdaptiveStepKm,
+                          max(4.0f * args.cloudViewStepKm, args.nubis3AdaptiveStepKm));
+    }
+    footprintKm = max(footprintKm, marchStepKm);
+  }
+  float lodDetail   = clamp(log2(max(1.0f, footprintKm * detailFreq * 128.0f)),
+                            0.0f, kDetailMipMax);
+  // The de-tile tap runs at 0.531x, so its texels are 1/0.531 larger -- log2 of that
+  // is 0.913 levels lower for the same footprint.
+  float lodDetailB  = max(lodDetail - 0.913f, 0.0f);
+
   // Altitude-keyed erosion character (GT7's coverage x altitude octave
   // weights, pp.236-237, approximated with the slab height fraction — fork,
   // detail round 2026-07-16). Real cumulus erodes WISPY at the base (shear /
@@ -336,8 +392,11 @@ float sampleCloudDensityNubis3(vec3 worldPosKm,
   // The 6.0 is the baker's low-frequency cycle count (cloud_detail_noise_baker.comp.slang:85), so
   // nubis3ShapeVarietyWavelengthKm is the coarsest lobe's true wavelength in km.
   const float midFreq = 1.0f / (6.0f * max(args.nubis3ShapeVarietyWavelengthKm, 0.05f));
+  // Own texel size, so its own LOD -- this tap is ~14x coarser than the base taps and
+  // stays at level 0 until far past the distance where they start dropping.
+  float lodMid = clamp(log2(max(1.0f, footprintKm * midFreq * 128.0f)), 0.0f, kDetailMipMax);
   vec4 noiseMid = detailNoise.SampleLevel(cloudSampler,
-      frac(boilPosMid * midFreq + vec3(0.71f, 0.29f, 0.53f)), 0);
+      frac(boilPosMid * midFreq + vec3(0.71f, 0.29f, 0.53f)), lodMid);
 
   // FORM FROM LOBES (fork -- 2026-09-07). This is now the ONE displacement of
   // the cloud iso-surface, and it is deliberately TYPE-INDEPENDENT: only the
@@ -380,7 +439,7 @@ float sampleCloudDensityNubis3(vec3 worldPosKm,
   profileOut = profile;
 
   // Two-scale de-tile base taps (see the step-6 header note above).
-  vec4 noiseA = detailNoise.SampleLevel(cloudSampler, frac(boilPos * detailFreq), 0);
+  vec4 noiseA = detailNoise.SampleLevel(cloudSampler, frac(boilPos * detailFreq), lodDetail);
   vec4 noise;
   if (coarseOd) {
     // De-tile blend dropped for optical-depth taps: noiseA is already mean-0.5 by
@@ -389,7 +448,7 @@ float sampleCloudDensityNubis3(vec3 worldPosKm,
     noise = noiseA;
   } else {
     vec4 noiseB = detailNoise.SampleLevel(cloudSampler,
-        frac(boilPos * (detailFreq * 0.531f) + vec3(0.37f, 0.61f, 0.13f)), 0);
+        frac(boilPos * (detailFreq * 0.531f) + vec3(0.37f, 0.61f, 0.13f)), lodDetailB);
     const vec4 kChannelMean = vec4(0.5f, 0.5f, 0.5f, 0.5f);
     noise = saturate(kChannelMean + (lerp(noiseA, noiseB, 0.4f) - kChannelMean) * 1.35f);
   }
@@ -542,7 +601,8 @@ float sampleCloudDensityNubis3(vec3 worldPosKm,
   float sdfUnused;
   float sdfStepUnused;
   return sampleCloudDensityNubis3(worldPosKm, heightFraction, typeLocal, coverageLocal,
-                                  densityScale, 1e6f, args, nvdfSdf, detailNoise, cloudSampler,
+                                  densityScale, 1e6f, /*pixelAngleRad=*/0.0f,
+                                  args, nvdfSdf, detailNoise, cloudSampler,
                                   /*coarseOd=*/false,
                                   profileUnused, detailUnused, sdfUnused, sdfStepUnused);
 }
@@ -565,7 +625,8 @@ float sampleCloudDensityNubis3Coarse(vec3 worldPosKm,
   float sdfUnused;
   float sdfStepUnused;
   return sampleCloudDensityNubis3(worldPosKm, heightFraction, typeLocal, coverageLocal,
-                                  densityScale, 1e6f, args, nvdfSdf, detailNoise, cloudSampler,
+                                  densityScale, 1e6f, /*pixelAngleRad=*/0.0f,
+                                  args, nvdfSdf, detailNoise, cloudSampler,
                                   /*coarseOd=*/true,
                                   profileUnused, detailUnused, sdfUnused, sdfStepUnused);
 }

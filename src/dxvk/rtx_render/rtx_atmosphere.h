@@ -1507,6 +1507,11 @@ private:
 
   // Keep in lockstep with kDetailVolumeSize in cloud_detail_noise_baker.comp.slang.
   static constexpr uint32_t kCloudDetailNoise3DSize = 128;
+  // Full chain, 128^3 down to 1^3 (fork -- 2026-09-07). Nubis Cubed p.101 mips this
+  // volume and picks the level from view distance; without a chain, 31-167 m erosion
+  // content is point-sampled by a 25-100 m march and aliases. Costs 1/7 of the base
+  // volume's 8 MB and is baked once, next to level 0.
+  static constexpr uint32_t kCloudDetailNoise3DMipLevels = 8;
 
   static constexpr uint32_t kCloudSecondaryLutWidth  = 256;
   // 128 -> 256 (fork — 2026-09-05, world-space cloud migration Stage 2). cloudDomeDirToUv /
@@ -1538,6 +1543,11 @@ private:
   uint32_t            m_cloudNvdfSdfFront = 0;
   float    m_missLinearViewZ       { 1e9f };
   Resources::Resource m_cloudDetailNoise3D;
+  // One single-level STORAGE view per mip of m_cloudDetailNoise3D. The resource's own
+  // .view spans all levels and is the SAMPLED view the marches read; a storage
+  // descriptor must name exactly one level, so the bake and the mip chain bind these
+  // instead. Same split RtxMipmap::createResource uses for the 2D secondary LUT.
+  std::vector<Rc<DxvkImageView>> m_cloudDetailNoise3DMipViews;
   Resources::Resource m_cloudRenderRT;
   // Depth companion (fork — 2026-09-05, world-space cloud migration Stage 4a): allocated/resized
   // in lockstep with m_cloudRenderRT by ensureCloudRenderRT, same extent. See getCloudDepthRT's

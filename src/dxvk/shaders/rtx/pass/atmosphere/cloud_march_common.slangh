@@ -225,6 +225,11 @@ struct CloudShadeContext {
   float sunsetFactor;        // sunset ambient ramp; 0 above cloudSunsetAmbientRampHighSun,
                              // where the cool-blend exp() is dead (every midday frame).
   bool  moonActive;          // any combined moon coefficient above threshold.
+  // Angular size of one output pixel, radians (fork -- 2026-09-07). Picks the detail
+  // volume's mip level together with the sample's camera distance. The screen pass
+  // fills it from its own output resolution and FOV; buildCloudShadeContext leaves it
+  // at 0, which means "no LOD" -- the value every camera-independent consumer wants.
+  float pixelAngleRad;
 
   // ---- Ray-constant (cloudShadeContextBeginRay) ----
   float sunCosTheta;         // dot(viewDirYUp, sunDirYUp)
@@ -734,6 +739,12 @@ CloudShadeContext buildCloudShadeContext(AtmosphereArgs args) {
 
   ctx.moonActive = any((combinedMoonDiffuseCoeff + combinedMoonPhaseAmt) > vec3(0.001f));
 
+  // No detail LOD by default (fork -- 2026-09-07). Every consumer of this context
+  // except the screen pass is camera-independent by design -- the secondary dome LUT
+  // and the voxel-grid bakes must stay a pure function of the field -- so the screen
+  // pass sets this itself right after building the context and nobody else touches it.
+  ctx.pixelAngleRad = 0.0f;
+
   // Ray-constant fields stay zeroed until cloudShadeContextBeginRay runs.
   ctx.sunCosTheta  = 0.0f;
   ctx.sunFrac      = 0.0f;
@@ -911,7 +922,7 @@ bool integrateCloudSample(float tSampleKm,
   float nubisProfile;
   float nubisSdfKm;
   float density = sampleCloudDensityNubis3(samplePos, hf, typeLocal, coverageLocal,
-                                           slabDensityScale, tSampleKm, args,
+                                           slabDensityScale, tSampleKm, ctx.pixelAngleRad, args,
                                            AtmosphereCloudNvdfSdf, AtmosphereCloudDetailNoise3D,
                                            AtmosphereCloudNoise3DSampler,
                                            /*coarseOd=*/false,
@@ -1582,7 +1593,11 @@ void marchEchoDeck(vec3   viewDirYUp,
     float nubisSdfStepKm;
     float density = sampleCloudDensityNubis3(samplePos + fieldOffsetKm, hf, typeLocal,
                                              coverageLocal, slabDensityScale,
-                                             /*cameraDistKm=*/t, args,
+                                             // Secondary dome LUT: no distance LOD (ctx.pixelAngleRad
+                                             // is 0 here). Its texels cover ~24 mrad, so a footprint
+                                             // derived from them would LOD far harder than the screen
+                                             // pass and desync the sky's cloud color from the clouds.
+                                             /*cameraDistKm=*/t, ctx.pixelAngleRad, args,
                                              AtmosphereCloudNvdfSdf, AtmosphereCloudDetailNoise3D,
                                              AtmosphereCloudNoise3DSampler,
                                              /*coarseOd=*/false,

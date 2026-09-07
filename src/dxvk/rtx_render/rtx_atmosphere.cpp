@@ -50,6 +50,7 @@
 #include <rtx_shaders/cloud_nvdf_jfa.h>
 #include <rtx_shaders/cloud_nvdf_resolve.h>
 #include <rtx_shaders/cloud_detail_noise_baker.h>
+#include <rtx_shaders/cloud_detail_noise_mip.h>
 #include "rtx/pass/atmosphere/cloud_nvdf.h"
 #include "../../util/util_once.h"  // ONCE() — one-shot warn when the scene TLAS is unavailable
 #include <cmath>
@@ -245,6 +246,19 @@ namespace dxvk {
       END_PARAMETER()
     };
     PREWARM_SHADER_PIPELINE(CloudDetailNoiseBakerShader);
+
+    // 2x2x2 box downsample, one level per dispatch (fork -- 2026-09-07). Both
+    // levels are storage images of the same 3D volume; see the shader for why
+    // box and not Gaussian.
+    class CloudDetailNoiseMipShader : public ManagedShader {
+      SHADER_SOURCE(CloudDetailNoiseMipShader, VK_SHADER_STAGE_COMPUTE_BIT, cloud_detail_noise_mip)
+
+      BEGIN_PARAMETER()
+        RW_TEXTURE3D(0)
+        RW_TEXTURE3D(1)
+      END_PARAMETER()
+    };
+    PREWARM_SHADER_PIPELINE(CloudDetailNoiseMipShader);
   }
 
 RtxAtmosphere::RtxAtmosphere(DxvkDevice* device)
@@ -1547,8 +1561,32 @@ void RtxAtmosphere::createLutResources(Rc<DxvkContext> ctx) {
     0, // imageCreateFlags
     VK_IMAGE_USAGE_STORAGE_BIT, // extraUsageFlags
     VkClearColorValue{}, // clearValue
-    1 // mipLevels
+    kCloudDetailNoise3DMipLevels // mipLevels (fork -- 2026-09-07, distance LOD)
   );
+
+  // Per-level STORAGE views (fork -- 2026-09-07). The resource's own .view spans all
+  // 8 levels, which is what the marches sample; a storage descriptor must name
+  // exactly one level, so the bake writes level 0 and the box-filter chain reads
+  // level N-1 / writes level N through these. Same split as RtxMipmap::createResource,
+  // which this cannot reuse because that helper is 2D-only.
+  {
+    DxvkImageViewCreateInfo mipViewInfo;
+    mipViewInfo.type      = VK_IMAGE_VIEW_TYPE_3D;
+    mipViewInfo.usage     = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+    mipViewInfo.aspect    = VK_IMAGE_ASPECT_COLOR_BIT;
+    mipViewInfo.format    = VK_FORMAT_R8G8B8A8_UNORM;
+    mipViewInfo.minLayer  = 0;
+    mipViewInfo.numLayers = 1;
+    mipViewInfo.numLevels = 1;
+
+    m_cloudDetailNoise3DMipViews.clear();
+    m_cloudDetailNoise3DMipViews.reserve(kCloudDetailNoise3DMipLevels);
+    for (uint32_t level = 0; level < kCloudDetailNoise3DMipLevels; ++level) {
+      mipViewInfo.minLevel = level;
+      m_cloudDetailNoise3DMipViews.push_back(
+        ctx->getDevice()->createImageView(m_cloudDetailNoise3D.image, mipViewInfo));
+    }
+  }
 
   // Fork (2026-06-10, perf): secondary-ray cloud LUT (256x256 RGBA16F, 512 KB — was 256x128 /
   // 256 KB before Stage 2's full-sphere mapping below doubled the height). Written every frame by
@@ -2212,7 +2250,8 @@ void RtxAtmosphere::dispatchCloudDetailNoiseBake(Rc<DxvkContext> ctx) {
   ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_constantsBuffer);
 
   ctx->bindResourceBuffer(0, DxvkBufferSlice(m_constantsBuffer, 0, m_constantsBuffer->info().size));
-  ctx->bindResourceView(1, m_cloudDetailNoise3D.view, nullptr);
+  // Level 0 only: .view now spans the whole mip chain and cannot be a storage image.
+  ctx->bindResourceView(1, m_cloudDetailNoise3DMipViews[0], nullptr);
 
   ctx->getCommandList()->trackResource<DxvkAccess::Write>(m_cloudDetailNoise3D.image);
 
@@ -2221,6 +2260,29 @@ void RtxAtmosphere::dispatchCloudDetailNoiseBake(Rc<DxvkContext> ctx) {
   // Shader declares [numthreads(8, 8, 8)].
   const uint32_t groups = (kCloudDetailNoise3DSize + 7u) / 8u;
   ctx->dispatch(groups, groups, groups);
+
+  // Mip chain (fork -- 2026-09-07, Nubis Cubed p.101). 2x2x2 box per level, one
+  // dispatch each, with a write->read barrier between them because every level
+  // reads the one this pass just wrote. Baked once at init alongside level 0, so
+  // the cost is irrelevant; what it buys is that the sampler can drop to a level
+  // whose texels are the size of a march step instead of point-sampling content
+  // finer than the step and feeding the aliasing to the temporal EMA.
+  for (uint32_t level = 1; level < kCloudDetailNoise3DMipLevels; ++level) {
+    ctx->emitMemoryBarrier(0,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      VK_ACCESS_SHADER_WRITE_BIT,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      VK_ACCESS_SHADER_READ_BIT);
+
+    ctx->bindResourceView(0, m_cloudDetailNoise3DMipViews[level - 1], nullptr);
+    ctx->bindResourceView(1, m_cloudDetailNoise3DMipViews[level], nullptr);
+    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, CloudDetailNoiseMipShader::getShader());
+
+    // Shader declares [numthreads(4, 4, 4)].
+    const uint32_t levelSize = kCloudDetailNoise3DSize >> level;
+    const uint32_t levelGroups = (levelSize + 3u) / 4u;
+    ctx->dispatch(levelGroups, levelGroups, levelGroups);
+  }
 }
 
 void RtxAtmosphere::dispatchCloudNvdfOccupancy(Rc<DxvkContext> ctx) {
@@ -2697,10 +2759,20 @@ void RtxAtmosphere::dispatchCloudRender(Rc<DxvkContext> ctx, const Resources::Ra
   // Linear/REPEAT sampler for the Nubis3 volume + voxel grid taps. REPEAT
   // matches the frac()-tile-wrap convention used everywhere else in the
   // cloud math (cloudVoxelWorldToUVW and the Nubis3 sampler).
+  //
+  // Detail-volume LOD (fork -- 2026-09-07). Only the detail volume has mips, and
+  // this sampler is what decides whether the SampleLevel() LOD the density sampler
+  // computes is honoured at all: a zero-initialized DxvkSamplerCreateInfo has
+  // mipmapLodMax = 0, which silently clamps EVERY lookup back to level 0. Raising it
+  // is not optional, it is the half of the change that makes the chain reachable.
+  // LINEAR mipmapMode so a fractional LOD blends between levels instead of popping
+  // across a distance band; the single-mip textures sharing this sampler are
+  // unaffected (Vulkan clamps to the view's level count).
   DxvkSamplerCreateInfo samplerInfo = {};
   samplerInfo.magFilter    = VK_FILTER_LINEAR;
   samplerInfo.minFilter    = VK_FILTER_LINEAR;
-  samplerInfo.mipmapMode   = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+  samplerInfo.mipmapMode   = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+  samplerInfo.mipmapLodMax = float(kCloudDetailNoise3DMipLevels - 1);
   samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
   samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
   samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
@@ -2780,11 +2852,13 @@ void RtxAtmosphere::dispatchCloudSecondaryLut(Rc<DxvkContext> ctx) {
   ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_constantsBuffer);
 
   // Samplers mirror dispatchCloudRender: linear/REPEAT for the noise + voxel
-  // grids, linear/CLAMP for the sky-view + height LUTs.
+  // grids, linear/CLAMP for the sky-view + height LUTs. Including the detail
+  // volume's mip range — see the LOD note in dispatchCloudRender.
   DxvkSamplerCreateInfo samplerInfo = {};
   samplerInfo.magFilter    = VK_FILTER_LINEAR;
   samplerInfo.minFilter    = VK_FILTER_LINEAR;
-  samplerInfo.mipmapMode   = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+  samplerInfo.mipmapMode   = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+  samplerInfo.mipmapLodMax = float(kCloudDetailNoise3DMipLevels - 1);
   samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
   samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
   samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;

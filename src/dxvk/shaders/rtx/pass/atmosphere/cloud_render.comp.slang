@@ -258,6 +258,15 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
   // extracted verbatim into buildCloudShadeContext.
   CloudShadeContext ctx = buildCloudShadeContext(args);
 
+  // Angular size of one output pixel (fork -- 2026-09-07), for the detail volume's
+  // distance LOD. cloudRenderUpYUp is already pre-multiplied CPU-side by
+  // tan(halfFovY), so it spans HALF the vertical view frustum at unit forward
+  // distance: 2*|up| / outputDim.y radians per pixel row. This is the pass's OWN
+  // output resolution, so it tracks cloudRenderResolutionScale automatically -- a
+  // half-res cloud pass gets twice the footprint and one more mip level, which is
+  // exactly right.
+  ctx.pixelAngleRad = 2.0f * length(args.cloudRenderUpYUp) / float(max(outputDim.y, 1u));
+
   // ===== View-ray raymarch, both layers (cloud_march_common.slangh) =====
   // evalNubisCubedSampleCore inside marchCloudSlab uses sigma = args.cloudDensity
   // (no doubling — Nubis Cubed equations take raw cloudDensity as extinction).
