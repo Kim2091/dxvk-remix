@@ -1041,17 +1041,19 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
     if (m_cloudAnchorCutThisFrame) {
       args.cloudHistoryWeight = 0.0f;
     }
-    // Interior density texture + edge wisp cut (fork — 2026-07-16). Live;
-    // both feed the shared sampler, so the D_sun/D_ambient bakes track them
-    // automatically.
-    args.nubis3InteriorTexture   = std::min(std::max(RtxAtmosphere::nubis3InteriorTexture(), 0.0f), 1.0f);
+    // Edge wisp cut (fork — 2026-07-16). Live; feeds the shared sampler, so the
+    // D_sun/D_ambient bakes track it automatically.
     args.nubis3EdgeErosion       = std::min(std::max(RtxAtmosphere::nubis3EdgeErosion(), 0.0f), 3.0f);
-    // Fine-frequency detail band (fork — detail round follow-up 2026-07-16).
-    // Live; distance-gated in-shader, so bakes stay camera-independent.
-    args.nubis3FineDetailStrength = std::min(std::max(RtxAtmosphere::nubis3FineDetailStrength(), 0.0f), 2.0f);
-    // Mid-band shape-variety displacement (fork — 2026-07-17). Live; shared
-    // sampler, so the OD bakes and grids track the reshaped bodies.
-    args.nubis3ShapeVarietyKm     = std::min(std::max(RtxAtmosphere::nubis3ShapeVarietyKm(), 0.0f), 1.5f);
+    // Body-lobe displacement bands (fork — 2026-09-07, "form from lobes, texture
+    // from erosion"). Live; shared sampler, so the OD bakes and grids track the
+    // reshaped bodies. The coarse band's clamp went 1.5 -> 2.0 now that it is the
+    // ONLY level-set displacement left. nubis3InteriorTexture and
+    // nubis3FineDetailStrength were retired with the sampler rewrite; their CB
+    // slots are padRetired11 / padRetired12 and are deliberately NOT written
+    // (AtmosphereArgs is value-initialized, so they stay a deterministic 0 and
+    // never perturb the LUT / voxel-grid cache keys).
+    args.nubis3ShapeVarietyKm     = std::min(std::max(RtxAtmosphere::nubis3ShapeVarietyKm(), 0.0f), 2.0f);
+    args.nubis3LobeFineKm         = std::min(std::max(RtxAtmosphere::nubis3LobeFineKm(), 0.0f), 1.0f);
     // Near-field live sun taps (fork — 2026-07-17). Live; view march + secondary
     // cloud LUT only (the voxel grids keep their full-path bake).
     args.nubis3JitterAnimateKm    = std::max(RtxAtmosphere::nubis3JitterAnimateKm(), 0.0f);
@@ -1086,11 +1088,12 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
     // atmosphere_args.h:149.
     args.cloudVoxelGridExtentKm    = RtxAtmosphere::cloudNoiseTileKm();
     args.cloudVoxelGridVerticalKm  = args.cloudThickness;
-    // Bottom darkening + additive edge detail (fork — 2026-06-10). Live in the
-    // former pad_cloudVoxel0..2 slots so the CB layout is unchanged.
+    // Bottom darkening + sky ambient fill (fork — 2026-06-10). Live in the
+    // former pad_cloudVoxel0..2 slots so the CB layout is unchanged. The third
+    // of those slots carried cloudDetailStrength, retired 2026-09-07; it now
+    // carries nubis3LobeFineKm, assigned with the other lobe band above.
     args.cloudBottomDarkening       = wx ? wx->cloudBottomDarkening : RtxAtmosphere::cloudBottomDarkening();
     args.cloudSkyAmbientFill        = RtxAtmosphere::cloudSkyAmbientFill();
-    args.cloudDetailStrength        = RtxAtmosphere::cloudDetailStrength();
   }
 
   // Nubis Cubed 2023 lighting params (fork — 2026-05-12, C4). Sourced from

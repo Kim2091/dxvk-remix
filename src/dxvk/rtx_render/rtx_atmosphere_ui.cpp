@@ -1307,16 +1307,26 @@ void RtxAtmosphere::showImguiSettings(WeatherBlender* blender) {
       // nubis3SharpenStrength (nubis3SunNearFieldKm was RETIRED
       // 2026-07-30 along with the live near-field sun path),
       // nvdfStepScale, nubis3AdaptiveStepKm, nvdfNominalCoverage.
-      // (Interior Texture / HF Detail / Fine Detail were demoted earlier
-      // the same day — ship-at-0 / unreachable-in-normal-play.)
+      // (HF Detail was demoted earlier the same day; Interior Texture and
+      // Fine Detail were RETIRED outright by the 2026-09-07 sampler rewrite.)
       if (ImGui::TreeNode("Shape")) {
         RemixGui::DragFloat("Shape Variety", &RtxAtmosphere::nubis3ShapeVarietyKmObject(),
-                            0.01f, 0.0f, 1.5f, "%.2f km", sliderFlags);
+                            0.01f, 0.0f, 2.0f, "%.2f km", sliderFlags);
         RemixGui::SetTooltipToLastWidgetOnHover(
-            "Mid-frequency (~2.4 km) push/pull of the whole body surface — "
+            "Push/pull of the whole body surface at the Shape Variety "
+            "Wavelength and its two finer octaves (~2.4 / 1.2 / 0.6 km) — "
             "lobes, notches and full splits that break round singular "
-            "blobs into varied cloud clusters (the GT7 mid-band role). "
+            "blobs into varied cloud clusters. This is the ONLY thing that "
+            "shapes a cloud's outline; erosion below only carves inward. "
             "Live, no rebake. Higher costs some empty-space-skip perf.");
+        RemixGui::DragFloat("Lobe Detail", &RtxAtmosphere::nubis3LobeFineKmObject(),
+                            0.01f, 0.0f, 1.0f, "%.2f km", sliderFlags);
+        RemixGui::SetTooltipToLastWidgetOnHover(
+            "Knuckles ON the Shape Variety lobes: the same shape tap's "
+            "high-frequency octaves (~0.9 / 0.45 km) with their own "
+            "amplitude. Keep Shape Variety + this well under the wavelength "
+            "driving them — a surface displaced by more than its own "
+            "wavelength fragments into grain instead of bulging.");
         RemixGui::DragFloat("Lighting LOD", &RtxAtmosphere::cloudLightingLodThresholdObject(),
                             0.002f, 0.0f, 0.25f, "%.3f", sliderFlags);
         RemixGui::SetTooltipToLastWidgetOnHover(

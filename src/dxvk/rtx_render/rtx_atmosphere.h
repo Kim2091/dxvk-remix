@@ -904,18 +904,22 @@ public:
                "level-set offset small; re-bakes amortized only when the "
                "drift crosses a step). Nonzero pins the bake nominal for "
                "debugging or look-tuning.");
-    RTX_OPTION("rtx.atmosphere", float, nvdfProfileDepthKm, 0.6f,
+    RTX_OPTION("rtx.atmosphere", float, nvdfProfileDepthKm, 0.15f,
                "Nubis3: depth into the cloud body (km) over which the "
                "dimensional profile ramps 0 -> 1 [0.1..3]. Small = dense "
                "hard-shelled clouds; large = soft translucent-edged bodies. "
-               "Applies live.");
+               "The paper's own surface band is ~100-130 m (it remaps the "
+               "body SDF over [-128, 0] m), and everything outside the ramp "
+               "is a solid core; at 0.6+ on a 1.75 km slab the WHOLE body is "
+               "ramp, so density is noise-shaped everywhere and the clouds "
+               "read flat and sky-lit. Applies live.");
     RTX_OPTION("rtx.atmosphere", float, nvdfCoverageOffsetKm, 0.2f,
                "Nubis3: km of iso-surface (level-set) shift per unit of "
                "coverage delta from the baked nominal [0..4]. Higher = "
                "coverage changes grow/shrink clouds more aggressively "
                "(bodies merge sooner at high coverage). Applies live with "
                "zero rebakes.");
-    RTX_OPTION("rtx.atmosphere", float, nubis3ErosionStrength, 0.42f,
+    RTX_OPTION("rtx.atmosphere", float, nubis3ErosionStrength, 1.0f,
                "Nubis3: scale on the wispy/billowy noise composite that "
                "erodes the dimensional profile [0..2]. 0 = smooth un-eroded "
                "bodies (pure SDF blobs); 1 = paper-faithful erosion; higher "
@@ -946,14 +950,25 @@ public:
                "smoother lobes; smaller breaks the silhouette into finer, wispier structure. "
                "Independent of Detail Scale, which controls surface texture instead.",
                args.minValue = 0.05f, args.maxValue = 20.0f);
-    RTX_OPTION("rtx.atmosphere", float, nubis3ShapeVarietyKm, 1.11f,
-               "Nubis3: mid-frequency SHAPE displacement amplitude in km "
-               "[0..1.5] (the GT7 mid-band role). Pushes/pulls the body "
-               "iso-surface by up to half this at ~2.4 km wavelengths — "
-               "lobes, notches and full splits that turn round singular "
-               "blobs into varied cloud clusters. Whole-body reshaping, "
-               "not edge detail; coverage-neutral on average. 0 = off. "
-               "Applies live, no rebake.");
+    RTX_OPTION("rtx.atmosphere", float, nubis3ShapeVarietyKm, 1.0f,
+               "Nubis3: body-lobe displacement amplitude in km [0..2]. "
+               "Pushes/pulls the body iso-surface by up to half this at the "
+               "Shape Variety Wavelength and its two finer octaves (2.4 / "
+               "1.2 / 0.6 km by default) — the lobes, notches and full "
+               "splits that turn round singular blobs into varied cloud "
+               "clusters. Billowy channels only, so the outline stays "
+               "cauliflower-shaped at every cloud type. Whole-body "
+               "reshaping, not edge detail; coverage-neutral on average. "
+               "0 = off. Applies live, no rebake.");
+    RTX_OPTION("rtx.atmosphere", float, nubis3LobeFineKm, 0.25f,
+               "Nubis3: fine lobe amplitude in km [0..1]. The same shape tap "
+               "as Shape Variety, but its high-frequency octaves (~0.9 / "
+               "0.45 km) — the knuckles ON the big lobes. Separate from "
+               "Shape Variety so the two bands balance independently. Keep "
+               "the total (Shape Variety + this) well under the wavelength "
+               "of the band that drives it: a level set displaced by more "
+               "than its own wavelength fragments into grain instead of "
+               "bulging. Applies live, no rebake.");
     RTX_OPTION("rtx.atmosphere", float, cloudLightingLodThreshold, 0.0f,
                "Nubis3: contribution-weighted lighting LOD [0..0.25]. A march "
                "sample's contribution weight is view transmittance x aerial "
@@ -970,28 +985,21 @@ public:
                "contributing almost nothing to the pixel. Raise until edges "
                "or crevice contrast visibly soften, then back off. "
                "0 = disabled (every sample fully refined). Applies live.");
-    RTX_OPTION("rtx.atmosphere", float, nubis3FineDetailStrength, 0.0f,
-               "Nubis3: fine-frequency detail band [0..2] (GT7-style third "
-               "noise band). A third tap of the detail volume at 2.11x "
-               "(content ~220..41 m) feeds the micro-AO relief shading and "
-               "the edge wisp cut for clouds within ~9 km — fine cauliflower "
-               "granulation on lit faces and scalloped wisp edges, the grain "
-               "the sqrt-adaptive march can resolve but the base texture "
-               "tops out above. 0 = off. Applies live.");
-    RTX_OPTION("rtx.atmosphere", float, nubis3EdgeErosion, 2.28f,
+    // RETIRED 2026-09-07: nubis3FineDetailStrength (fine-frequency third
+    // detail band) and nubis3InteriorTexture (interior density modulation).
+    // Both shipped at 0. The fine band injected 33-220 m content into a march
+    // whose step is 25-100 m, which aliases rather than resolves (Step 3 LODs
+    // the detail volume DOWN to the step instead); the interior texture only
+    // did anything while nvdfProfileDepthKm was deep enough that "interior"
+    // meant most of the body. Their CB slots are padRetired11 / padRetired12.
+    RTX_OPTION("rtx.atmosphere", float, nubis3EdgeErosion, 0.6f,
                "Nubis3: edge wisp cut [0..3]. Extra erosion shaped by the "
                "wispy noise channel, concentrated at the silhouette and "
                "fading by mid-shell — cuts trailing wisp shapes out of cloud "
                "edges while billowy cores keep rounded cauliflower edges. "
-               "0 = uniform erosion only. Applies live.");
-    RTX_OPTION("rtx.atmosphere", float, nubis3InteriorTexture, 0.0f,
-               "Nubis3: interior density texture strength [0..1]. Modulates "
-               "the density INSIDE the body by the raw detail noise (the "
-               "stand-in for Nubis3's authored per-voxel Density Scale NVDF "
-               "and iw3xo's multiplicative self-gate), so lit cloud faces "
-               "show billow-scale light variation instead of saturating to "
-               "a flat white mass. 0 = flat interiors (old behavior). "
-               "Applies live.");
+               "Gated by (1 - cloud type), so it only acts where the type "
+               "field is wispy: with the altitude swing that means cloud "
+               "BASES, not tops. 0 = uniform erosion only. Applies live.");
     RTX_OPTION("rtx.atmosphere", float, nvdfStepScale, 0.95f,
                "Nubis3 Phase C: safety factor on the SDF empty-space skip in "
                "the cloud march [0..0.95]. In empty air the march jumps "
@@ -1037,12 +1045,14 @@ public:
                "the sun-elevation fade are set by Bottom Darkening. Applies "
                "live.");
 
-    RTX_OPTION("rtx.atmosphere", float, cloudDetailStrength, 0.0f,
-               "Edge detail strength [0..1]. Grows high-frequency "
-               "cauliflower billows OUTWARD from cloud EDGES while leaving dense "
-               "cores solid. 0 = off (smooth legacy silhouettes). Note: the "
-               "added billows thicken the silhouette band slightly, so high "
-               "values read as marginally higher coverage.");
+    // RETIRED 2026-09-07: cloudDetailStrength. It scaled a level-set wobble
+    // driven by the BASE detail taps, whose wavelengths ride cloudDetailScale
+    // (167..31 m at the live 12) while the displacement was +-72 m. Displacing
+    // a level set by more than its own driving wavelength fragments it, and
+    // that fragmentation was the "powdery" read. Form now comes from the
+    // step-6d lobe band alone (Shape Variety / Lobe Detail); the base taps
+    // keep their erosion and micro-AO-relief roles. Its CB slot is now
+    // nubis3LobeFineKm.
     RTX_OPTION("rtx.atmosphere", float, cloudDetailScale, 4.3f,
                "Edge-detail noise frequency as a multiple of the base cloud "
                "noise frequency (cloudNoiseTileKm). Higher = finer edge "

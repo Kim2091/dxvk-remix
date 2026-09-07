@@ -248,12 +248,12 @@ struct AtmosphereArgs {
                                           // tiled volume (periodicity destroyed at the source), 0 = legacy
                                           // single periodic tap. Reuses the former padCloudLook0 slot;
                                           // CB layout unchanged.
-  float nubis3FineDetailStrength;         // Fine-frequency band strength [0..2] (fork —
-                                          // detail round follow-up 2026-07-16): third
-                                          // incommensurate detail tap (~177..33 m) folded
-                                          // into erosion + interior within ~8 km. 0 = off.
-                                          // First reuse of the retired legacy pads (was
-                                          // padRetired1 / cloudNoiseBaseFreqScale).
+  float padRetired11;                     // RETIRED 2026-09-07: nubis3FineDetailStrength (the
+                                          // fine-frequency third detail band). It shipped at 0
+                                          // and injected content below the march step, which
+                                          // aliases instead of resolving -- see the sampler's
+                                          // step 7a. Was padRetired1 / cloudNoiseBaseFreqScale
+                                          // before that. NOT written by the CPU side.
   float cloudSkyBleedStrength;            // [0,1+] strength of cloud-color inscatter bled into the
                                           // visible sky (sky reflects clouds; sampled from the smooth
                                           // secondary dome LUT). 0 = off. Reuses the former
@@ -392,9 +392,12 @@ struct AtmosphereArgs {
                                     // open sky from below/around, bypassing bottom-darkening; bright by
                                     // day, fades at sunset). Reuses the former cloudBottomDarkeningHeight
                                     // slot (was pad_cloudVoxel1); CB layout unchanged.
-  float cloudDetailStrength;        // Silhouette wobble amplitude: how strongly the detail field
-                                    // displaces the cloud silhouette (0 = off). Scaled by
-                                    // kWobbleKmPerDetailStrength in cloud_nubis3_common.slangh.
+  float nubis3LobeFineKm;           // Fine lobe band amplitude in km (fork -- 2026-09-07): the
+                                    // HIGH-frequency alligator octaves of the shape tap
+                                    // (~0.9/0.45 km) displace the body iso-surface by +-0.5x
+                                    // this, putting knuckles on the nubis3ShapeVarietyKm lobes.
+                                    // Rides the slot retired from cloudDetailStrength (the
+                                    // base-tap silhouette wobble); CB layout unchanged.
 
   // ----- Nubis Cubed 2023 lighting params (fork — 2026-05-12, C4) -----
   // Consumed by cloud_render.comp.slang via evalNubisCubedSampleCore.
@@ -660,13 +663,13 @@ struct AtmosphereArgs {
                              // but more visible per-frame jitter for DLSS to
                              // chew on. Zeroed in normalizeForSkyLutCache
                              // (composite-only — never feeds a bake).
-  float nubis3InteriorTexture;  // [0..1] strength of the interior density
-                                // modulation by the raw detail channels
-                                // (Nubis3 Density-Scale-NVDF / iw3xo
-                                // self-gate stand-in — see the sampler's
-                                // step 8). 0 = flat saturated interiors
-                                // (pre-2026-07-16 behavior). Rides the
-                                // former padReserve0 slot.
+  float padRetired12;           // RETIRED 2026-09-07: nubis3InteriorTexture (interior
+                                // density modulation by the raw detail channels). It
+                                // shipped at 0 and only mattered while the profile ramp
+                                // was deep enough that "interior" meant most of the body
+                                // -- see the sampler's step 8. Was padReserve0 before
+                                // that. NOT written by the CPU side (AtmosphereArgs is
+                                // value-initialized, so it stays a deterministic 0).
   float nubis3EdgeErosion;      // [0..3] edge wisp cut: additional erosion
                                 // shaped by the WISPY channel, concentrated
                                 // in the outer shell (x(1-profile)^2) — deep

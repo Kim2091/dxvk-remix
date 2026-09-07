@@ -111,12 +111,12 @@ float valueErosion(float value, float erosion) {
 //     detail volume's repeat when a cloud face is viewed flat-on. Using noiseA
 //     directly keeps the mean EXACT (every channel is bake-normalized to 0.5) and
 //     restores full variance, so no re-expansion is needed.
-// Deliberately NOT dropped, despite both being tempting: the step-6d mid tap (its
-// shape-variety displacement is ±0.55 km of level-set motion at the shipping
-// setting — it CREATES the lobes whose self-shadowing the near-field refinement
-// exists to capture, so removing it would systematically un-shadow exactly the
-// target structure) and the page-123 sharpen pow (nubis3SharpenStrength defaults
-// to 1, so the exponent is part of the density definition, not a flourish).
+// Deliberately NOT dropped, despite both being tempting: the step-6d shape tap (it
+// is the ONLY level-set displacement left -- +-0.625 km of it at the shipping
+// defaults -- so it CREATES the lobes whose self-shadowing the near-field
+// refinement exists to capture, and removing it would systematically un-shadow
+// exactly the target structure) and the page-123 sharpen pow (nubis3SharpenStrength
+// defaults to 1, so the exponent is part of the density definition, not a flourish).
 //
 // This flag is uniform per call site, so each inlined copy specializes and the
 // untaken branch is dead-code-eliminated. The D_sun / D_ambient BAKES must never
@@ -199,22 +199,34 @@ float sampleCloudDensityNubis3(vec3 worldPosKm,
   float sdfLive  = sdfKm - offsetKm;
   sdfKmOut = sdfLive;
 
-  // 5. Silhouette wobble amplitude (anti-blobby pass — see step 6c). Rides the
-  //    cloudDetailStrength knob: its legacy additive-edge-detail role is gone,
-  //    but this keeps the SAME semantic ("how strongly the detail field moves
-  //    the silhouette"). The conservative early-out keeps the empty-air fast
-  //    path: a sample can only become cloud if the wobble's maximum outward
-  //    excursion (+0.5 signal x amplitude) could reach it.
-  const float kWobbleKmPerDetailStrength = 0.6f;
-  float wobbleKm = max(args.cloudDetailStrength, 0.0f) * kWobbleKmPerDetailStrength;
+  // 5. Level-set displacement budget. FORM COMES FROM THE LOBE BAND ONLY
+  //    (fork -- 2026-09-07, "form from lobes, texture from erosion"): the only
+  //    thing that displaces the cloud iso-surface is the step-6d shape tap's
+  //    two billowy octave stacks, with amplitudes nubis3ShapeVarietyKm
+  //    (2.4/1.2/0.6 km content) and nubis3LobeFineKm (0.9/0.45 km). Both
+  //    signals are bounded to [-0.5, 0.5] by the bake-time mean normalization,
+  //    so the maximum outward excursion is exactly half their summed amplitude.
+  //
+  //    What was here before: a SECOND level-set wobble, driven by the BASE
+  //    detail taps and scaled by cloudDetailStrength. Those taps ride
+  //    cloudDetailScale, so at the live 12 their wavelengths are 167/83/42 m
+  //    (lo) and 62/31 m (hi) while the displacement was +-72 m -- an
+  //    amplitude-to-wavelength ratio of 0.43 to 2.3. A level set displaced by
+  //    more than its own driving wavelength does not bulge, it FRAGMENTS: the
+  //    surface tore into 60-170 m blobs and holes across the whole skirt, and
+  //    that granular fragmentation is what read as "powdery". No amount of
+  //    erosion tuning could fix it because it was never erosion. Every lobe
+  //    band below sits at 9-21% of its own wavelength, which bulges.
+  //
+  //    The conservative early-out keeps the empty-air fast path: a sample can
+  //    only become cloud if the lobe field's maximum outward excursion reaches
+  //    it.
+  float maxOutwardKm = 0.5f * (args.nubis3ShapeVarietyKm + args.nubis3LobeFineKm);
 
   // Phase C stepping bound: guaranteed-empty radius around this sample =
-  // min-tap distance, minus the live coverage offset, minus the maximum
-  // outward pull of BOTH level-set displacements (+0.5 signal x amplitude
-  // each: the silhouette wobble and the step-6e shape-variety band). Valid
-  // on every return path — the early-out below is exactly where the march
-  // wants to skip.
-  float maxOutwardKm = 0.5f * (wobbleKm + args.nubis3ShapeVarietyKm);
+  // min-tap distance, minus the live coverage offset, minus that maximum
+  // outward pull. Valid on every return path -- the early-out below is exactly
+  // where the march wants to skip.
   sdfStepKmOut = sdfMinKm - offsetKm - maxOutwardKm;
 
   if (sdfLive >= maxOutwardKm) {
@@ -251,7 +263,6 @@ float sampleCloudDensityNubis3(vec3 worldPosKm,
   // displacement, so slowing it most is also what stops cloud OUTLINES from visibly travelling.
   vec3 boilPos     = perturbed + driftUnit + baseShear;          // base taps
   vec3 boilPosMid  = perturbed + driftUnit * 0.2f + baseShear;   // silhouette lobes: near-stationary
-  vec3 boilPosFine = perturbed + driftUnit * 1.8f + baseShear;   // fine billows: churn fastest
   // Two-scale de-tile (fork — 2026-07-16). The detail volume repeats every
   // cloudNoiseTileKm / cloudDetailScale (~2.8 km at defaults) and this tap
   // is NOT hex-de-tiled (the hex lattice covers the SDF/placement taps
@@ -276,22 +287,17 @@ float sampleCloudDensityNubis3(vec3 worldPosKm,
   // wobble in the detail field late in a session.
   float detailFreq = args.cloudDetailScale / args.cloudNoiseTileKm;
 
-  // Frequency blends key on a PROVISIONAL (pre-wobble) profile — the wobble
-  // itself is built from these channels, so the final profile isn't known yet.
-  // Outside the un-wobbled surface this is 0 -> pure low-frequency channels,
-  // which is exactly what Nubis wants at the silhouette anyway.
-  float profileProv = saturate(-sdfLive / max(args.nvdfProfileDepthKm, 1e-3f));
-
   // Altitude-keyed erosion character (GT7's coverage x altitude octave
   // weights, pp.236-237, approximated with the slab height fraction — fork,
   // detail round 2026-07-16). Real cumulus erodes WISPY at the base (shear /
   // evaporation strands) and BILLOWY at the top (convective lobes); keyed on
   // type alone, bases and tops read identically "sprinkled". Shift the
   // wispy<->billowy blend by ±kAltTypeSwing/2 across the low->high band.
-  // Applies to every character consumer below (erosion composite, HF fold,
-  // silhouette wobble + mid lobes, interior texture) so the whole look
-  // tracks; the D_sun/D_ambient bake integrands call this same sampler, so
-  // the grids follow automatically.
+  // Applies to every EROSION-side character consumer below (the composite, the
+  // HF fold, the edge wisp cut's type gate, the micro-AO relief signal) so the
+  // whole surface look tracks; the D_sun/D_ambient bake integrands call this
+  // same sampler, so the grids follow automatically. The step-6d lobe band is
+  // deliberately NOT keyed on it -- see the note there.
   const float kAltTypeSwing = 0.5f;
   float typeShaped = saturate(saturate(typeLocal)
                               + (smoothstep(0.1f, 0.8f, heightFraction) - 0.5f) * kAltTypeSwing);
@@ -302,15 +308,14 @@ float sampleCloudDensityNubis3(vec3 worldPosKm,
   //     octave was EMPTY, and GT7's rule is that exactly this too-wide gap
   //     between shape and detail scales is what reads as synthetic (worst
   //     flat-on at the deck base). Their fix, verbatim: reuse the same
-  //     texture rescaled to fill the gap, zero new memory. A third tap at
-  //     0.193x the base frequency puts the LOW channels at ~2.4 km — pure
-  //     km-scale lobes (this tap's high channels would only duplicate
-  //     already-covered scales, so the low channels alone feed the signal;
-  //     both are mean-0.5 by the bake normalization, so the sum stays
-  //     zero-mean). The 60/40 blend keeps the combined signal in
-  //     [-0.5, 0.5], preserving the step-5 early-out bound and the
-  //     conservative sdfStepKmOut excursion term. This tap repeats every
-  //     ~14.5 km — beyond the noise tile itself — so it needs no de-tiling.
+  //     texture rescaled to fill the gap, zero new memory. Both octave stacks
+  //     of this tap are used now: the LOW channel (b) at ~2.4/1.2/0.6 km for
+  //     the body lobes and the HIGH channel (a) at ~0.9/0.45 km for the
+  //     knuckles on them; both are mean-0.5 by the bake normalization, so the
+  //     sum stays zero-mean and the step-5 early-out bound holds exactly.
+  //     This tap repeats every 6 x nubis3ShapeVarietyWavelengthKm (~14.4 km
+  //     at the default) -- beyond the noise tile itself -- so it needs no
+  //     de-tiling.
   //
   //     TAP ORDER (fork — 2026-07-30, perf): this tap moved AHEAD of the
   //     two-scale base taps below so the surface gate can run on it alone.
@@ -333,25 +338,46 @@ float sampleCloudDensityNubis3(vec3 worldPosKm,
   const float midFreq = 1.0f / (6.0f * max(args.nubis3ShapeVarietyWavelengthKm, 0.05f));
   vec4 noiseMid = detailNoise.SampleLevel(cloudSampler,
       frac(boilPosMid * midFreq + vec3(0.71f, 0.29f, 0.53f)), 0);
-  float wobbleMid = lerp(noiseMid.r - 0.5f,
-                         noiseMid.b * 0.3f - 0.15f,
-                         typeShaped);
 
-  // Conservative surface gate on the mid tap alone. The final displacement is
-  //   sdfLive -= (0.6*w_n + 0.4*w_m) * wobbleKm + w_m * shapeVarietyKm
-  // with w_n (the step-6c base-tap wobble) bounded to [-0.5, 0.5] by
-  // construction, so its maximum outward pull is 0.3*wobbleKm. Anything still
-  // outside the surface by more than that after the mid terms is guaranteed
-  // empty for ANY value of w_n — skip the base taps entirely. At the shipping
-  // default cloudDetailStrength = 0 (wobbleKm = 0) this IS the exact step-7
-  // gate; above zero it stays strictly conservative, so the density this
-  // function returns is unchanged either way.
-  float sdfAfterMid = sdfLive - 0.4f * wobbleMid * wobbleKm
-                    - wobbleMid * args.nubis3ShapeVarietyKm;
-  if (sdfAfterMid >= 0.3f * wobbleKm) {
-    sdfKmOut = sdfAfterMid;
+  // FORM FROM LOBES (fork -- 2026-09-07). This is now the ONE displacement of
+  // the cloud iso-surface, and it is deliberately TYPE-INDEPENDENT: only the
+  // BILLOWY (straight alligator) channels move the outline, at every cloud
+  // type. The paper's model is that body form is AUTHORED and erosion only
+  // ever carves INWARD (Nubis Cubed p.123) -- nothing in it pushes the level
+  // set outward -- so whatever we synthesise in place of an authored body has
+  // to behave like a body, not like erosion. Alligator noise is
+  // max-minus-runner-up: zero along the creases where two features contest,
+  // peaking at feature centres, so after the bake's mean-0.5 recentring
+  // (b - 0.5) is mildly negative over most of its area with strong positive
+  // peaks. Subtracting it from the SDF therefore grows one-sided convex
+  // bulges separated by creases -- cauliflower -- instead of the stringy
+  // outline the previous version produced by routing the WISPY web channel
+  // into the outline at up to 60% weight wherever type was low.
+  //
+  //   b: the low-frequency stack, 2.4 / 1.2 / 0.6 km at the default
+  //      wavelength -- body-scale lobes and the splits between clusters.
+  //   a: the high-frequency stack of the SAME tap, 0.9 / 0.45 km -- the
+  //      knuckles on those lobes. Its own amplitude (nubis3LobeFineKm) so the
+  //      two bands balance independently.
+  //
+  // Amplitude-to-wavelength stays in the bulging regime at the shipping
+  // defaults: 21% for the coarsest b octave, 9-12% for every finer one.
+  float lobeKm = (noiseMid.b - 0.5f) * args.nubis3ShapeVarietyKm
+               + (noiseMid.a - 0.5f) * args.nubis3LobeFineKm;
+  sdfLive -= lobeKm;
+  sdfKmOut = sdfLive;
+
+  // 7. The Nubis profile gate on the DISPLACED surface: outside it there is
+  //    nothing to erode. EXACT rather than conservative now -- the lobe band
+  //    is the only level-set displacement left and it is fully known here --
+  //    so it doubles as the base-tap early-out, and the profile the erosion
+  //    frequency blends key on is the REAL one instead of the pre-displacement
+  //    provisional they used to have to settle for.
+  if (sdfLive >= 0.0f) {
     return 0.0f;
   }
+  float profile = saturate(-sdfLive / max(args.nvdfProfileDepthKm, 1e-3f));
+  profileOut = profile;
 
   // Two-scale de-tile base taps (see the step-6 header note above).
   vec4 noiseA = detailNoise.SampleLevel(cloudSampler, frac(boilPos * detailFreq), 0);
@@ -369,10 +395,10 @@ float sampleCloudDensityNubis3(vec3 worldPosKm,
   }
 
   // Wispy: low->high frequency over the profile (fine filaments deeper in).
-  float wispyNoise = lerp(noise.r, noise.g, profileProv);
+  float wispyNoise = lerp(noise.r, noise.g, profile);
   // Billowy: rounded lobes at the edges, finer bubbles toward the core; the
   // 0.3 scale keeps billowy erosion mild (Nubis p.125 verbatim).
-  float billowyTypeGradient = pow(profileProv, 0.25f);
+  float billowyTypeGradient = pow(profile, 0.25f);
   float billowyNoise = lerp(noise.b * 0.3f, noise.a * 0.3f, billowyTypeGradient);
   float noiseComposite = lerp(wispyNoise, billowyNoise, typeShaped);
 
@@ -401,131 +427,35 @@ float sampleCloudDensityNubis3(vec3 worldPosKm,
     noiseComposite   = lerp(hhfNoise, noiseComposite, blender);
   }
 
-  // 6c. ZERO-MEAN silhouette wobble (anti-blobby pass — fork 2026-07-16).
-  //     ValueErosion alone can only carve INWARD from the smooth SDF surface,
-  //     so bodies read as convex blobs with eaten edges. Displacing the live
-  //     SDF by the mean-centered detail signal moves the iso-surface BOTH
-  //     ways: knuckles grow outward past the base silhouette, crevices carve
-  //     in — the same mechanism as the legacy rev-4 threshold wobble (the
-  //     validated anti-blobby lever), driven by the same knob. The centering
-  //     constants (0.5 / 0.15-after-0.3-scale) are EXACT since the bake-time
-  //     mean normalization (detail round 2026-07-16) — before it the signal
-  //     pushed wispy silhouettes outward ~+0.22 and billowy inward ~-0.10 —
-  //     so the wobble adds no net coverage shift and no micro-AO bias.
-  //     detailSigned reuses this signal: the field that grows a billow is
-  //     the field that shades it (coherent relief).
+  // 6c. MICRO-AO RELIEF SIGNAL (fork 2026-07-16; demoted from a level-set
+  //     displacement to a shading-only signal 2026-09-07). This used to be a
+  //     SECOND displacement of the iso-surface -- see the step-5 note for why
+  //     that tore the surface apart. What survives is its other consumer:
+  //     detailSigned, the zero-mean excursion the march turns into micro-AO
+  //     (bright knuckles, dark crevices) on the lobes the step-6d band
+  //     actually builds. Keeping the relief signal on the BASE taps is the
+  //     whole point of the split -- form from the lobe band, texture from the
+  //     erosion band -- and it costs nothing extra, because these taps are
+  //     already fetched for the erosion composite.
   //
-  //     Spectrum (rev 2): the first attempt keyed the wobble on the PROFILE-
-  //     blended channels — at the silhouette (profile ~ 0) that collapses to
-  //     the pure low-frequency channels and the displacement reads as gentle
-  //     undulation, not cauliflower. A FIXED half-mix of the high-frequency
-  //     channels keeps the signal's range and zero mean while giving the
-  //     silhouette multi-scale relief.
-  const float kWobbleHiMix = 0.5f;
-  float wispyWobble   = lerp(noise.r, noise.g, kWobbleHiMix) - 0.5f;
-  float billowyWobble = lerp(noise.b, noise.a, kWobbleHiMix) * 0.3f - 0.15f;
-  float wobbleSignal  = lerp(wispyWobble, billowyWobble, typeShaped);
+  //     A FIXED half-mix of the high-frequency channels (rather than the
+  //     profile-keyed blend the composite uses) keeps the signal's range and
+  //     zero mean while giving the silhouette multi-scale relief. The
+  //     centering constants (0.5, and 0.15 after the 0.3 scale) are EXACT
+  //     since the bake-time mean normalization, so the relief adds no shading
+  //     bias.
+  const float kReliefHiMix = 0.5f;
+  float wispyRelief   = lerp(noise.r, noise.g, kReliefHiMix) - 0.5f;
+  float billowyRelief = lerp(noise.b, noise.a, kReliefHiMix) * 0.3f - 0.15f;
+  detailSigned = lerp(wispyRelief, billowyRelief, typeShaped);
 
-  // 6d's mid tap + wobbleMid now run ABOVE, ahead of the base taps, so the
-  // surface gate can skip them (fork — 2026-07-30, perf). Only the blend is
-  // left here, in its original position and order.
-  wobbleSignal = wobbleSignal * 0.6f + wobbleMid * 0.4f;
-
-  // 6e. SHAPE VARIETY (fork — 2026-07-17, user direction from the GT7
-  //     low-vs-mid comparison: "we want it to actually change the SHAPE of
-  //     all of the clouds ... instead of nice round singular blobs with
-  //     edge detail"). The mid band gets its OWN level-set displacement
-  //     with structural amplitude, on top of the (edge-scaled) wobble mix:
-  //     ±0.5·nubis3ShapeVarietyKm of iso-surface push/pull at the 2.4 km
-  //     (+octaves 1.2/0.6 km) wavelengths. At the default 0.5 km that is
-  //     deep enough to carve lobes into — and fully split — km-scale
-  //     bodies where the field dips, turning round singles into varied
-  //     clusters (GT7's mid-frequency role). Level-set displacement moves
-  //     the WHOLE body surface (all depths), not just the silhouette
-  //     skirt; zero-mean signal → coverage-neutral on average; the step-5
-  //     bound and early-out already budget the extra excursion. Live knob,
-  //     no rebake; world-anchored (evolution/boil offsets animate it with
-  //     the rest of the detail field).
-  detailSigned = wobbleSignal;
-  sdfLive -= wobbleSignal * wobbleKm + wobbleMid * args.nubis3ShapeVarietyKm;
-  sdfKmOut = sdfLive;
-
-  // 7. The Nubis profile gate on the WOBBLED surface: outside it there is
-  //    nothing to erode.
-  if (sdfLive >= 0.0f) {
-    return 0.0f;
-  }
-  float profile = saturate(-sdfLive / max(args.nvdfProfileDepthKm, 1e-3f));
-  profileOut = profile;
-
-  // 7a. FINE-frequency band (fork — detail round follow-up 2026-07-16; the
-  //     GT7 pp.228-230 third band, prompted by "you might need another
-  //     higher-frequency noise texture"). The detail volume's finest content
-  //     is ~87 m, but the sqrt-adaptive march resolves 25-30 m steps near
-  //     the camera — the TEXTURE is now the detail ceiling within a few km.
-  //     A third incommensurate tap of the same volume at 2.63x pushes
-  //     content to ~177..33 m and folds into the erosion composite (here)
-  //     and the interior texture (step 8) — the two consumers where fine
-  //     grain reads as crisp cauliflower rather than silhouette shimmer.
-  //     Distance-gated: full inside ~2 km, gone by 8 km (sub-pixel there,
-  //     it would only feed noise into the temporal EMA); the gate also
-  //     keeps the OD bakes camera-independent for free (bake taps pass
-  //     cameraDistKm = 1e6). All channels are mean-0.5 by the bake
-  //     normalization and the fold is a mean-matched lerp, so coverage is
-  //     unchanged. Erosion/interior only — no wobble term — so the step-5
-  //     early-out and the conservative step bound are untouched. Placed
-  //     after the step-7 gate so gated-out samples never pay the tap.
-  // Rev 3 (same night, Fable-audit findings — "the fine detail slider isn't
-  // doing anything"): rev 1 routed the band through DENSITY-side consumers,
-  // which the audit showed is structurally muted twice over: (a) the
-  // erosion composite multiplies by nubis3ErosionStrength (validated conf
-  // runs 0.04 → ≤ ±1.4% density peak), and (b) zero-mean density
-  // modulation BELOW the mean free path (1/cloudDensity ≈ 556 m at conf)
-  // averages out along the view ray before it changes transmittance —
-  // 33-177 m features cannot read as density no matter the amplitude. What
-  // IS visible in this renderer at fine scales is the micro-AO relief
-  // shading (detailSigned → ±27-45% swing on the body lobe + ambient at
-  // defaults). Rev 3 therefore routes the band into:
-  //   1. detailSigned (the micro-AO relief signal) at 0.6·fineMix — fine
-  //      cauliflower granulation on lit/ambient faces, ~±12% shading at
-  //      slider 1. Lighting-only: no coverage, silhouette, step-bound, or
-  //      bake change (bake taps still pass cameraDistKm = 1e6). Slider 0
-  //      is an exact no-op.
-  //   2. The step-7b edge wisp cut's wispy signal (the conf's active edge
-  //      lever) — ±25-57 m fine scalloping of the wisp cutout boundary.
-  //   3. The erosion composite + interior fold stay for configs that run
-  //      real erosion strengths.
-  // Gate rev 3: tap ratio 2.63 → 2.11 (content ~220..41 m — the march's
-  // sqrt-adaptive step resolves ≥82 m past 2 km, so more of the injected
-  // spectrum is genuinely resolvable) and fade full < 3 km → zero at 9 km,
-  // matching the 177-220 m Nyquist horizon (~9.4 km) and keeping full
-  // strength on the 2.6-6 km slant range where the deck is actually viewed.
-  float fineMix = 0.0f;
-  float fineInteriorNoise = 0.5f;
-  if (args.nubis3FineDetailStrength > 0.0f && cameraDistKm < 9.0f) {
-    float fineFade = saturate(1.0f - (cameraDistKm - 3.0f) / 6.0f);
-    vec4 noiseFine = detailNoise.SampleLevel(cloudSampler,
-        frac(boilPosFine * (detailFreq * 2.11f) + vec3(0.17f, 0.83f, 0.47f)), 0);
-    float fineWispy     = lerp(noiseFine.r, noiseFine.g, 0.5f);
-    float fineBillowy   = lerp(noiseFine.b, noiseFine.a, 0.5f) * 0.3f;
-    float fineComposite = lerp(fineWispy, fineBillowy, typeShaped);
-    fineMix = saturate(args.nubis3FineDetailStrength * 0.35f) * fineFade;
-    noiseComposite = lerp(noiseComposite, fineComposite, fineMix);
-    // Feeds ONLY the step-7b edge wisp cut below (noiseComposite already
-    // carries its own fold; wispyNoise's step-6 use happened above).
-    wispyNoise = lerp(wispyNoise, fineWispy, fineMix);
-    // Micro-AO relief fold — the rev-3 visibility fix. Same per-channel
-    // zero-mean centering as the wobble (wispy −0.5, billowy −0.15 after
-    // its 0.3 scale); substitution keeps the relief signal's range, so the
-    // AO clamp math is unchanged and silver linings stay exempt (lobe A
-    // never sees detailSigned).
-    float fineSigned = lerp(fineWispy - 0.5f, fineBillowy - 0.15f, typeShaped);
-    detailSigned = lerp(detailSigned, fineSigned, saturate(0.6f * fineMix));
-    fineInteriorNoise = lerp(lerp(noiseFine.r, noiseFine.g, 0.5f),
-                             lerp(noiseFine.b, noiseFine.a, 0.5f),
-                             typeShaped);
-  }
-
+  // 7a. RETIRED (fork -- 2026-09-07): the fine-frequency third band
+  //     (nubis3FineDetailStrength). It shipped at 0, and its premise --
+  //     inject 33-220 m content -- runs the wrong way for a march whose step
+  //     is 25-100 m: that content sits at or below the sampling rate, so it
+  //     aliases rather than resolves, and the temporal EMA converges the
+  //     aliasing into fine grain. Step 3 goes the other way and LODs the
+  //     existing detail volume DOWN to the step size instead.
   float erosion = noiseComposite * max(args.nubis3ErosionStrength, 0.0f);
 
   // 7b. Edge wisp cut (fork — 2026-07-16, user feedback "erosion should cut
@@ -565,47 +495,13 @@ float sampleCloudDensityNubis3(vec3 worldPosKm,
     density = pow(density, exponent);
   }
 
-  // 8. INTERIOR TEXTURE (fork — 2026-07-16, the missing core feature both
-  //    reference looks share). ValueErosion saturates to a CONSTANT 1.0
-  //    deeper than profileDepth, so every cloud face beyond the thin
-  //    silhouette skirt rendered as a flat white mass — the "blobby" read
-  //    that survived every knob. Both references keep density proportional
-  //    to the noise field EVERYWHERE inside the body: iw3xo multiplies its
-  //    razor gate by the raw FBM value (`dens *= smoothstep(...)` on dens
-  //    itself), and Nubis3 multiplies by its authored per-voxel Density
-  //    Scale NVDF. We have no authored data, so the type-blended raw detail
-  //    channels stand in: sun/ambient transmittance now varies at billow
-  //    scale across the whole visible shell, which is what makes lit faces
-  //    read as cauliflower instead of cotton. Range [0.25, 1.75] around an
-  //    EXACTLY density-neutral mean of 1.0 (bake-time mean normalization,
-  //    detail round 2026-07-16 — before it, this factor hid a large density
-  //    cut on billowy cores and over-densified wispy interiors); the final
-  //    saturate clamps the top.
-  if (args.nubis3InteriorTexture > 0.0f) {
-    float interiorNoise = lerp(lerp(noise.r, noise.g, 0.5f),
-                               lerp(noise.b, noise.a, 0.5f),
-                               typeShaped);
-    // Mid-band fold (fork — 2026-07-17, GT7 mid-frequency follow-up): the
-    // step-6d 2.4 km tap also modulates INTERIOR density, so shape-variety
-    // lobes differ in optical thickness — brighter thin lobes against
-    // denser neighbors — instead of only in outline. Unlike the fine band
-    // (below the ~0.56 km mean free path, where zero-mean density
-    // modulation averages out along the ray — the rev-3 lesson), 2.4 km
-    // structure survives to transmittance. Keyed to the Shape Variety knob
-    // so ONE lever owns the whole mid band; mean-matched lerp of mean-0.5
-    // channels keeps the factor density-neutral. Shared sampler → the
-    // D_sun/D_ambient bakes and the near-field live sun taps track it.
-    float midMix = 0.35f * saturate(args.nubis3ShapeVarietyKm * 2.0f);
-    interiorNoise = lerp(interiorNoise,
-                         lerp(noiseMid.r, noiseMid.b, typeShaped),
-                         midMix);
-    // Fine-band fold (step 7a): near-to-mid range interiors pick up the
-    // ~33-177 m grain — small billows on lit faces. Mean-matched lerp
-    // (both signals are mean 0.5), so the factor stays density-neutral.
-    interiorNoise = lerp(interiorNoise, fineInteriorNoise, 0.5f * fineMix);
-    density *= lerp(1.0f, 0.25f + 1.5f * interiorNoise,
-                    saturate(args.nubis3InteriorTexture));
-  }
+  // 8. RETIRED (fork -- 2026-09-07): the interior density texture
+  //    (nubis3InteriorTexture). It shipped at 0, and it existed to break up
+  //    flat saturated interiors back when nvdfProfileDepthKm was deep enough
+  //    that "interior" meant most of the body. With the profile ramp back at
+  //    the paper's ~150 m skin the interior is a genuine solid core, and
+  //    zero-mean density modulation below the mean free path averages out
+  //    along the view ray before it can change transmittance anyway.
 
   // 9. Near-camera density soften (Nubis p.125 — the companion half of the
   //    HF-details branch, ported 2026-07-16 after the fly-through look
