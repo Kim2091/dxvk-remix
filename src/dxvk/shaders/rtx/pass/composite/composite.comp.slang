@@ -1016,7 +1016,14 @@ void applyCloudComposite(
   inout vec3 radianceOutput,
   inout vec3 alphaBlendOutput,
   bool alphaBlendSurfaceValid,
-  float alphaBlendHitDistance)
+  float alphaBlendHitDistance,
+  // True where the primary ray was replaced by a specular bounce (mirror, water surface). Such a
+  // pixel already received cloud along its REFLECTED direction from the secondary LUT during path
+  // tracing, so compositing the primary ray's cloud over it too would apply cloud twice (fork --
+  // 2026-09-06, open issue #3). Only the application is suppressed, not the march or the temporal
+  // history below: the history is a screen-space signal and a pixel that is PSR this frame may not
+  // be next frame, so it still needs a valid entry to reproject from.
+  bool performedPSR)
 {
   AtmosphereArgs args = cb.atmosphereArgs;
   if (args.cloudRenderRTEnable == 0u)
@@ -1127,6 +1134,13 @@ void applyCloudComposite(
     const float surfaceKm = viewDistance * kmPerWorldUnit;
     opaqueVisibility = cloudDepthVisibility(entryKm, meanKm, surfaceKm);
   }
+  // PSR pixels already carry cloud from the secondary LUT along the reflected ray; adding the
+  // primary ray's cloud on top is the "double cloud in water reflections" artefact. Zeroed here
+  // rather than early-returning above so the temporal history is still written for this pixel.
+  if (performedPSR)
+  {
+    opaqueVisibility = 0.0f;
+  }
 
   // Premultiplied over -- identical operation to the removed evalSkyRadiance code, just relocated.
   // On a sky pixel opaqueVisibility is 1.0 and this is exactly that operation.
@@ -1155,7 +1169,7 @@ void applyCloudComposite(
   // proportional blend. Foliage sitting on the same ground the opaque composite above just fogged
   // will read alphaSurfaceKm ~= surfaceKm and so end up fogged the same amount -- the specific "crisp
   // foliage in a foggy scene" artefact this item exists to avoid.
-  if (alphaBlendSurfaceValid && entryKm >= 0.0f)
+  if (alphaBlendSurfaceValid && entryKm >= 0.0f && !performedPSR)
   {
     const float alphaSurfaceKm = alphaBlendHitDistance * kmPerWorldUnit;
     const float alphaVisibility = cloudDepthVisibility(entryKm, meanKm, alphaSurfaceKm);
@@ -1370,7 +1384,8 @@ vec4 compositeResult(
   // 2026-09-06 with that routing; see the note above the opaque composite in applyCloudComposite.
   applyCloudComposite(
     pixelCoordinate, primaryMiss, viewDistance, cb.frameIdx, backgroundAlpha,
-    radianceOutput, alphaBlendOutput, alphaBlendSurfaceValid, alphaBlendHitDistance);
+    radianceOutput, alphaBlendOutput, alphaBlendSurfaceValid, alphaBlendHitDistance,
+    geometryFlags.performedAnyPSR());
 
   // Add sky radiance
   applySkyContribution(pixelCoordinate, primaryRayDirections, primaryMiss, radianceScale, volumeAttenuation, radianceOutput);
