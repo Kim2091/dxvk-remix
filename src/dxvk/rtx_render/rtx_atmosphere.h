@@ -938,6 +938,14 @@ public:
                "high-frequency noise into the erosion composite close to the "
                "camera for fly-through crispness. 1 = the paper's 10% max "
                "mix at the nearest range; 0 = off. Applies live.");
+    // Wavelength of the coarsest shape-variety lobe, in km (fork -- 2026-09-07). This used to be
+    // derived from cloudDetailScale, which tied the SIZE of a cloud outline to a surface-texture
+    // knob: raising detail scale shrank the lobes and tore the silhouette into smoke-like strands.
+    RTX_OPTION_ARGS("rtx.atmosphere", float, nubis3ShapeVarietyWavelengthKm, 2.4f,
+               "Wavelength in km of the largest bumps in a cloud's outline. Larger gives broader, "
+               "smoother lobes; smaller breaks the silhouette into finer, wispier structure. "
+               "Independent of Detail Scale, which controls surface texture instead.",
+               args.minValue = 0.05f, args.maxValue = 20.0f);
     RTX_OPTION("rtx.atmosphere", float, nubis3ShapeVarietyKm, 1.11f,
                "Nubis3: mid-frequency SHAPE displacement amplitude in km "
                "[0..1.5] (the GT7 mid-band role). Pushes/pulls the body "

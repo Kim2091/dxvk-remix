@@ -320,8 +320,19 @@ float sampleCloudDensityNubis3(vec3 worldPosKm,
   //     result away — and the SDF sphere-trace deliberately parks samples in
   //     exactly that band, ~11 of them per surface approach at the default
   //     50 m adaptive step. Nothing above this point needs the base taps.
+  // Absolute wavelength, NOT a fraction of detailFreq (fork -- 2026-09-07). This tap drives the
+  // km-scale silhouette lobes, and deriving its frequency from cloudDetailScale silently tied the
+  // size of a cloud's outline to a knob that is supposed to control surface texture. Raising
+  // cloudDetailScale from 4.3 to 12 shrank the lobes 2.8x -- the low channel's three octaves went
+  // from 2.41/1.20/0.60 km to 0.86/0.43/0.22 km -- while the displacement amplitude stayed put, so
+  // what had been a 12%-of-wavelength smooth bulge became 34% (and over 100% of the finest octave)
+  // and tore the level set into 200-400 m fingers. That is the "long stringy wisps, almost like
+  // smoke" read, and it appeared from a config change that never touched the shape-variety slider.
+  // The 6.0 is the baker's low-frequency cycle count (cloud_detail_noise_baker.comp.slang:85), so
+  // nubis3ShapeVarietyWavelengthKm is the coarsest lobe's true wavelength in km.
+  const float midFreq = 1.0f / (6.0f * max(args.nubis3ShapeVarietyWavelengthKm, 0.05f));
   vec4 noiseMid = detailNoise.SampleLevel(cloudSampler,
-      frac(boilPosMid * (detailFreq * 0.193f) + vec3(0.71f, 0.29f, 0.53f)), 0);
+      frac(boilPosMid * midFreq + vec3(0.71f, 0.29f, 0.53f)), 0);
   float wobbleMid = lerp(noiseMid.r - 0.5f,
                          noiseMid.b * 0.3f - 0.15f,
                          typeShaped);
@@ -533,7 +544,14 @@ float sampleCloudDensityNubis3(vec3 worldPosKm,
   //     billowy cores keep rounded cauliflower edges at any cloud type.
   if (args.nubis3EdgeErosion > 0.0f) {
     float edgeBand = saturate(1.0f - profile);
-    erosion += pow(wispyNoise, 2.0f) * args.nubis3EdgeErosion * edgeBand * 1.5f;
+    // Type-gated (fork -- 2026-09-07), which is what this block's own header always claimed it was.
+    // Ungated, it hard-zeroed the outer shell of EVERY body regardless of cloud type, so billowy
+    // cumulus tops were strand-cut exactly like stratus wisps -- and once cloudDetailScale rose, the
+    // wispy channel driving it carried 62-167 m content instead of 174-465 m, so the strands got
+    // fine enough to read as smoke. Bases keep their wisps (typeShaped is low there by the altitude
+    // swing); tops keep their form.
+    erosion += pow(wispyNoise, 2.0f) * args.nubis3EdgeErosion * edgeBand * 1.5f
+             * (1.0f - typeShaped);
   }
 
   float density = valueErosion(profile, erosion);

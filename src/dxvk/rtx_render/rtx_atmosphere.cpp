@@ -1310,7 +1310,7 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
   // zero-filled reserve pads, free for Phase D growth.
   args.padRetired0 = 0u;
   args.padRetired4 = 0u;
-  args.padRetired5 = 0.0f;
+  args.nubis3ShapeVarietyWavelengthKm = RtxAtmosphere::nubis3ShapeVarietyWavelengthKm();
   args.cloudLightingLodThreshold = RtxAtmosphere::cloudLightingLodThreshold();
   args.cloudMissLinearViewZ = m_missLinearViewZ;
   args.padRetired8 = 0u;

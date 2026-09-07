@@ -710,13 +710,23 @@ void applyAerialPerspective(
 // and the nearest match in depth is taken rather than a blend of wrong answers.
 //
 // At scale 1 the fast path below is exact and this never runs.
+// The distance the cloud pass and this pass both use to mean "this ray hit nothing". Hoisted to file
+// scope 2026-09-07: the upsample below compares tap depths against it, and having two different sky
+// values in two places is precisely what broke it.
+static const float kCloudSkyDepthKm = 60000.0f;
+
 vec4 sampleCloudRenderRT(uint2 pixelCoordinate, AtmosphereArgs args, float surfaceKm)
 {
-  if (args.cloudRenderFullDimX != 0u && args.cloudRenderFullDimY != 0u)
-  {
-    uint2 rtDim;
-    CompositeCloudRender.GetDimensions(rtDim.x, rtDim.y);
+  uint2 rtDim;
+  CompositeCloudRender.GetDimensions(rtDim.x, rtDim.y);
 
+  // Gate on an actual RESOLUTION MISMATCH, not on the dims being non-zero (fork -- 2026-09-07).
+  // m_cloudRenderFullExtent is assigned unconditionally in rtx_atmosphere.cpp, so cloudRenderFullDimX
+  // is never 0 and this whole path was running at native resolution, where it is not merely
+  // unnecessary but wrong: it replaced an exact 1:1 Load with a four-tap depth-filtered blend. At
+  // matched resolution the Load below is the correct and cheapest answer.
+  if (rtDim.x != args.cloudRenderFullDimX || rtDim.y != args.cloudRenderFullDimY)
+  {
     const vec2 uv = (vec2(pixelCoordinate) + 0.5f)
                   / vec2(float(args.cloudRenderFullDimX), float(args.cloudRenderFullDimY));
     const vec2 texelF = uv * vec2(rtDim) - 0.5f;
@@ -740,7 +750,14 @@ vec4 sampleCloudRenderRT(uint2 pixelCoordinate, AtmosphereArgs args, float surfa
     {
       const int2 texel = clamp(baseTexel + offsets[i], int2(0, 0), maxTexel);
       const vec4 value = CompositeCloudRender.Load(int3(texel, 0));
-      const float tapSurfaceKm = CompositeCloudDepth.Load(int3(texel, 0)).z;
+      // Clamped to the shared sky depth (fork -- 2026-09-07). The cloud pass stores its own sky
+      // sentinel, kNoSurfaceKm = 1e9, while this pass calls sky kCloudSkyDepthKm = 60000. Comparing
+      // the two directly made EVERY sky tap fail the relative test, so sky pixels fell through to
+      // the nearest-depth fallback -- and next to a ridge or a branch the nearest tap in depth is
+      // the GEOMETRY texel, whose cloud is clamped to nothing. Those pixels got opacity 0 and drew
+      // raw cloudless sky, brighter than both the overcast around them and the geometry: the white
+      // outline traced along every silhouette.
+      const float tapSurfaceKm = min(CompositeCloudDepth.Load(int3(texel, 0)).z, kCloudSkyDepthKm);
 
       const float delta = abs(tapSurfaceKm - surfaceKm);
       if (delta < nearestDelta)
@@ -1182,7 +1199,6 @@ void applyCloudComposite(
   // than a sentinel so sky-vs-sky compares equal under the ordinary relative test while
   // sky-vs-surface is rejected, with no special case anywhere. 60000 km is f16-representable and
   // beyond any reachable slant range.
-  const float kCloudSkyDepthKm = 60000.0f;
   const float currentSurfaceKm = primaryMiss ? kCloudSkyDepthKm : (viewDistance * kmPerWorldUnit);
 
   // The "no span along this ray" zeroing lives inside loadCurrentCloudOpacity now, for the reason

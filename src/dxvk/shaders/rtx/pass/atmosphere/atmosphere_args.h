@@ -502,7 +502,10 @@ struct AtmosphereArgs {
   float cloudLayer2TypeMean;       // [0,1] mean cloud type for layer 2 (defaults to a cirrus-shaped 0.0)
   float cloudLayer2CoverageMean;   // [0,1] mean coverage for layer 2 (defaults sparse)
   float cloudLayer2DensityScale;   // Per-step density multiplier for layer 2 (cirrus is optically thin)
-  float padRetired5;               // retired: legacy vertical noise stretch.
+  // Wavelength (km) of the coarsest shape-variety lobe -- the km-scale bumps in a cloud's outline
+  // (fork -- 2026-09-07). Absolute, so it no longer rides on cloudDetailScale. Rides the slot
+  // retired from the legacy vertical noise stretch; CB layout unchanged.
+  float nubis3ShapeVarietyWavelengthKm;
 
   // ----- (former Worley carve params — retired with the legacy 256^3 bake) -----
   // Contribution-weighted lighting LOD threshold (fork — 2026-07-30, perf).
