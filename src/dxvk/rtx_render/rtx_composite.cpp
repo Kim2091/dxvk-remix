@@ -517,6 +517,7 @@ namespace dxvk {
     // composite_args.h's doc comment on the field and applyCloudComposite in composite.comp.slang.
     // Composite-only like cloudHistoryWeight; never reaches AtmosphereArgs or a LUT cache key.
     compositeArgs.cloudHistoryClampGamma = std::max(RtxAtmosphere::cloudHistoryClampGamma(), 0.0f);
+    compositeArgs.cloudHistoryDepthTolerance = std::max(RtxAtmosphere::cloudHistoryDepthTolerance(), 0.0f);
     compositeArgs.outputParticleLayer = ctx->useRayReconstruction() && rayReconstruction.useParticleBuffer();
     compositeArgs.outputSecondarySignalToParticleLayer = ctx->useRayReconstruction() && rayReconstruction.preprocessSecondarySignal();
     compositeArgs.enableDemodulateAttenuation = ctx->useRayReconstruction() && rayReconstruction.demodulateAttenuation();

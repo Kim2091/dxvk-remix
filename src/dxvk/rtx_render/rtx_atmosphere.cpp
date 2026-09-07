@@ -2892,16 +2892,20 @@ void RtxAtmosphere::ensureCloudHistoryResources(Rc<DxvkContext> ctx, const VkExt
     );
   }
 
-  // R16_UINT companion ping-pong (fork — 2026-05-13). Holds the frame index
-  // (mod 0x10000) at which each pixel of the color ping-pong was last
-  // refreshed by the sky-miss path. Cleared to 0xFFFF "never written" so the
+  // R32_UINT companion ping-pong (fork — 2026-05-13; widened from R16_UINT 2026-09-07). Low 16 bits
+  // hold the frame index (mod 0x10000) at which each pixel of the color ping-pong was last
+  // refreshed; the high 16 hold, as an f16, the primary surface distance in km that the stored cloud
+  // value was integrated against. The cloud signal is clamped at the surface, so a history tap is
+  // only comparable when it was computed against roughly the same surface -- see
+  // fetchCloudHistoryBilinear. Cleared to 0xFFFFFFFF, whose low half is the 0xFFFF "never written"
+  // sentinel the age check already recognised, so
   // shader's age check rejects history at pixels that have never been
   // written by the smoother (including foreground-occluded ones whose color
   // slot retains pre-occlusion radiance). Drives the disocclusion fix for
   // the bright-trail ghosting under the 2026-05-13 Nubis Cubed work — see
   // atmosphere_sky.slangh's age-channel comment block for the mechanism.
   VkClearColorValue frameIdClearValue{};
-  frameIdClearValue.uint32[0] = 0xFFFFu;
+  frameIdClearValue.uint32[0] = 0xFFFFFFFFu;
   for (uint32_t i = 0u; i < 2u; ++i) {
     const char* frameIdNames[2] = {
       "Atmosphere Cloud History Frame ID 0",
@@ -2911,7 +2915,7 @@ void RtxAtmosphere::ensureCloudHistoryResources(Rc<DxvkContext> ctx, const VkExt
       ctx,
       frameIdNames[i],
       extent,
-      VK_FORMAT_R16_UINT,
+      VK_FORMAT_R32_UINT,
       1, // numLayers
       VK_IMAGE_TYPE_2D,
       VK_IMAGE_VIEW_TYPE_2D,

@@ -134,9 +134,10 @@ struct CompositeArgs {
   // the one place a translation signal for that correction can come from. See
   // applyCloudComposite / cloudParallaxMotionVectorPixels in composite.comp.slang.
   vec3 cloudAnchorDeltaYUpKm;
-  // Retired 2026-09-06 (fork): was cloudCompositeRRTransparencyLayer, 794ffd716's DLSS-RR
-  // transparency-layer routing of cloud-on-geometry in-scatter, removed with its premise -- see the
-  // note above the opaque composite in applyCloudComposite (composite.comp.slang). Slot kept so the
-  // CB layout is unchanged.
-  uint pad2;
+  // Relative tolerance for the cloud history's per-tap depth validation (fork -- 2026-09-07). Rides
+  // the slot retired on 2026-09-06 from cloudCompositeRRTransparencyLayer (794ffd716's DLSS-RR
+  // transparency-layer routing, removed with its premise); CB layout unchanged. A history tap is
+  // rejected when its stored surface distance differs from this pixel's by more than this fraction
+  // of the larger of the two. See fetchCloudHistoryBilinear.
+  float cloudHistoryDepthTolerance;
 };

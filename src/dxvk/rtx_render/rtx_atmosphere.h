@@ -1194,6 +1194,16 @@ public:
     // Cloud temporal-EMA neighbourhood clip (fork — 2026-09-06, EMA rectification). Composite-only,
     // like cloudHistoryWeight: it reaches the shader through CompositeArgs, never AtmosphereArgs, so
     // it is invisible to every bake and LUT cache key by construction.
+    // Per-tap depth validation for the cloud temporal history (fork -- 2026-09-07). The cloud
+    // signal is integrated up to the primary surface, so a history tap is only comparable when it
+    // was computed against roughly the same surface distance. Relative, because the acceptable
+    // disagreement at 20 km is not the acceptable disagreement at 200 m. Raise it if moving edges
+    // sparkle (more history accepted), lower it if they trail (more rejected).
+    RTX_OPTION_ARGS("rtx.atmosphere", float, cloudHistoryDepthTolerance, 0.1f,
+               "How far a cached cloud sample's surface distance may differ from the current pixel's "
+               "before it is discarded, as a fraction of the larger of the two. Lower rejects more "
+               "history: sharper behind moving objects, noisier at their edges.",
+               args.minValue = 0.0f, args.maxValue = 1.0f);
     RTX_OPTION("rtx.atmosphere", float, cloudHistoryClampGamma, 1.25f,
                "Neighbourhood clip strength of the cloud temporal smoother [0..4]. The "
                "reprojected history is clipped to mean +- gamma * stddev of the current "

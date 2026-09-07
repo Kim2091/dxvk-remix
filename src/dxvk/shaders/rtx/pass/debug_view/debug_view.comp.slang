@@ -1012,7 +1012,8 @@ vec4 loadInput(inout RNG randomState, ivec2 threadId)
           {
             continue;
           }
-          const uint historyFrameId = DebugViewCloudHistoryFrameIdPrev[texel];
+          // Low 16 bits only: the high half carries the packed surface distance since 2026-09-07 (fork).
+          const uint historyFrameId = DebugViewCloudHistoryFrameIdPrev[texel] & 0xFFFFu;
           if ((historyFrameId != expectedPrevFrameId) || (historyFrameId == 0xFFFFu))
           {
             continue;

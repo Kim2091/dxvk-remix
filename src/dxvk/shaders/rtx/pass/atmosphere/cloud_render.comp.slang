@@ -296,9 +296,25 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
   float meanCloudDepthKm;
   float surfaceVisibility;
 
+  // Clamped at the primary surface (fork -- 2026-09-07). This restores the one line Stage 4a had
+  // and e7298993f removed, and it is what makes cloud-vs-geometry occlusion EXACT rather than
+  // estimated: the pass integrates [0, tSurface], so what it reports IS the cloud in front of the
+  // surface. Every scalar-correction attempt before this failed because the in-scatter term
+  // C_full * (alphaFront/alphaFull) assumes radiance per unit opacity is constant along the ray;
+  // inside the deck it is not (near samples are shadowed interior, far ones lit edges), so the far
+  // cloud's colour and pattern leaked onto the surface.
+  //
+  // Why this is safe now when it ghosted before: e7298993f blamed the clamp, but the actual defect
+  // was that the temporal history had no way to notice the depth under a pixel had changed. The
+  // design this migration follows always specified BOTH halves (docs/world-space-clouds-design.md
+  // 4.4-B with 4.7) -- Stage 4a shipped only the clamp. The other half, per-tap depth validation in
+  // fetchCloudHistoryBilinear, lands with this change. Rotation reprojection stays exact for a
+  // clamped value, because under rotation with static geometry the surface depth along a world
+  // direction is invariant; what changes it is moving objects and translation parallax, and the
+  // depth test is precisely what rejects the former.
   marchCloudLayers(viewDirYUp, jitter, jitterStatic,
                    /*tMinClamp=*/0.0f,
-                   /*tMaxClamp=*/0.0f,
+                   /*tMaxClamp=*/tSurfaceKm,
                    args.cloudViewSamples, ctx, args,
                    accumColor, viewTransmittance,
                    entryDistanceKm, meanCloudDepthKm,

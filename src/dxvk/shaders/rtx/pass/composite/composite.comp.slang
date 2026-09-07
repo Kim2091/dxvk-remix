@@ -995,7 +995,19 @@ vec4 clipCloudHistoryToAABB(vec4 aabbMin, vec4 aabbMax, vec4 history)
 // taps drop out and the remaining weights renormalise), so a valid texel next to a never-written or
 // stale one is still usable and a stale one can never leak in through the filter footprint. Returns
 // false when no tap is valid -- the caller then uses the raw current sample exactly as before.
-bool fetchCloudHistoryBilinear(vec2 prevPixelF, uint frameIdx, out vec4 history)
+// Depth-validated as well as age-validated (fork -- 2026-09-07). This is the half of the design
+// (docs/world-space-clouds-design.md 4.4-B / 4.7) that Stage 4a never shipped, and its absence --
+// not the depth clamp it was blamed on -- is what made e7298993f's ghosting inevitable. The cloud
+// signal is now integrated up to the primary surface, so a tap is only comparable if it was
+// computed against roughly the SAME surface distance; a tap from a frame when the Pip-Boy was not
+// yet covering this pixel describes a different integral entirely, and blending it in is exactly
+// the smear that was observed. Rejected per tap, alongside the age test, so a partially-valid
+// bilinear footprint degrades to its valid taps instead of being thrown away whole.
+//
+// The stored depth rides the high 16 bits of the frame-id companion as an f16, which is why that
+// target widened to R32_UINT. Sky carries kCloudSkyDepthKm rather than a sentinel so that sky-vs-sky
+// compares equal and sky-vs-surface is rejected by the ordinary relative test, with no special case.
+bool fetchCloudHistoryBilinear(vec2 prevPixelF, uint frameIdx, float currentSurfaceKm, out vec4 history)
 {
   const vec2 base = floor(prevPixelF);
   const vec2 f    = prevPixelF - base;
@@ -1022,8 +1034,17 @@ bool fetchCloudHistoryBilinear(vec2 prevPixelF, uint frameIdx, out vec4 history)
     {
       continue;
     }
-    const uint historyFrameId = CompositeCloudHistoryFrameIdPrev[texel];
+    const uint packed = CompositeCloudHistoryFrameIdPrev[texel];
+    const uint historyFrameId = packed & 0xFFFFu;
     if ((historyFrameId != expectedPrevFrameId) || (historyFrameId == 0xFFFFu))
+    {
+      continue;
+    }
+    // Relative tolerance, not absolute: the acceptable disagreement at 20 km is not the acceptable
+    // disagreement at 200 m, and the quantity being compared spans that whole range.
+    const float historySurfaceKm = f16tof32(packed >> 16);
+    if (abs(historySurfaceKm - currentSurfaceKm)
+        > cb.cloudHistoryDepthTolerance * max(max(historySurfaceKm, currentSurfaceKm), 1e-3f))
     {
       continue;
     }
@@ -1136,6 +1157,14 @@ void applyCloudComposite(
   // owns the actual swap; composite reads whichever pair RtxAtmosphere::bindResources already
   // resolved as Prev/Curr for this frame, during the G-buffer pass's common-bindings setup --
   // composite must not swap again). ----
+  // The surface distance this frame's cloud value was integrated against, and the key the history
+  // is validated on (fork -- 2026-09-07). Sky uses a fixed far depth rather than a sentinel so that
+  // sky-vs-sky compares equal under the ordinary relative test while sky-vs-surface is rejected --
+  // no special case, and no way for a surface tap to be blended into a sky pixel across a
+  // silhouette. 60000 km is f16-representable and beyond any reachable slant range.
+  const float kCloudSkyDepthKm = 60000.0f;
+  const float currentSurfaceKm = primaryMiss ? kCloudSkyDepthKm : (viewDistance * kmPerWorldUnit);
+
   vec4 smoothedCloud = currentCloud;
   if (all(cb.camera.resolution > uint2(0u, 0u)))
   {
@@ -1144,7 +1173,7 @@ void applyCloudComposite(
     const vec2 prevPixelF = vec2(pixelCoordinate) + motionVectorPixels;
 
     vec4 history = vec4(0.0f);
-    bool historyValid = fetchCloudHistoryBilinear(prevPixelF, frameIdx, history);
+    bool historyValid = fetchCloudHistoryBilinear(prevPixelF, frameIdx, currentSurfaceKm, history);
 
     // Alpha gate (legacy, kept): "cloud appears where the history had none" restarts from the raw
     // current sample so a deck edge sweeping INTO a pixel responds instantly instead of fading up
@@ -1198,7 +1227,11 @@ void applyCloudComposite(
     }
 
     CompositeCloudHistoryCurr[pixelCoordinate] = smoothedCloud;
-    CompositeCloudHistoryFrameIdCurr[pixelCoordinate] = frameIdx & 0xFFFFu;
+    // Frame id in the low half, the surface distance this value was integrated against as an f16 in
+    // the high half (fork -- 2026-09-07). Clamped below f16's finite range so the pack cannot
+    // produce inf and compare unequal to itself next frame.
+    CompositeCloudHistoryFrameIdCurr[pixelCoordinate] =
+      (frameIdx & 0xFFFFu) | (f32tof16(min(currentSurfaceKm, 65000.0f)) << 16);
   }
 
   // ---- Opaque geometry: occlusion applied HERE, after the EMA (fork — 2026-09-05, Stage 4b fix).
@@ -1206,17 +1239,12 @@ void applyCloudComposite(
   // it sits in FRONT of the resolved surface is a per-frame property of this frame's depth buffer
   // and must never enter the history. Same shape as the alpha-blend path below, which was already
   // gating after the EMA (though see the (1 - backgroundAlpha) note there).
+  // 1.0 on every pixel now (fork -- 2026-09-07). The cloud pass marches [0, tSurface], so the value
+  // arriving here is ALREADY only the cloud in front of the surface -- there is nothing left to
+  // scale down, and any scaling would double-count the occlusion. Every previous form of this
+  // variable (linear ramp, Beer-Lambert, measured opacity prefix) existed to estimate a quantity the
+  // march can simply compute, and each failed on the in-scatter colour term.
   float opaqueVisibility = 1.0f;
-  if (!primaryMiss)
-  {
-    // No entryKm gate here (fork -- 2026-09-06). entryKm became jitter-dependent when it was
-    // redefined as the first density hit, so in thin cloud the march finds material on some frames
-    // and not others -- gating on it made geometry pixels flip between 0 and the real visibility
-    // while the sky pixel beside them showed steady smoothed cloud, which is flicker along exactly
-    // the contact line. The gate is also redundant: with no cloud found, surfaceVisibility is
-    // already 1 and the smoothed signal it scales is ~0, so the product is the same either way.
-    opaqueVisibility = measuredSurfaceVisibility;
-  }
   // PSR pixels already carry cloud from the secondary LUT along the reflected ray; adding the
   // primary ray's cloud on top is the "double cloud in water reflections" artefact. Zeroed here
   // rather than early-returning above so the temporal history is still written for this pixel.
