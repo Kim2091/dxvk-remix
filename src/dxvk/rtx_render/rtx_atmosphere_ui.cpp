@@ -737,6 +737,20 @@ void RtxAtmosphere::showImguiSettings(WeatherBlender* blender) {
               "it calibrates the Range, Near Fade and Scene Shadow Range controls below. Unlike the "
               "clouds, aerial perspective ignores Cloud World Compression - haze stays physical.");
 
+          RemixGui::DragFloat("Cloud In-Scatter",
+                              &RtxAtmosphere::cloudAerialInScatterStrengthObject(),
+                              0.01f, 0.0f, 1.0f, "%.2f", sliderFlags);
+          RemixGui::SetTooltipToLastWidgetOnHover(
+              "How much of this volume's in-scattered air light the clouds receive, sampled at the "
+              "cloud's own mean depth. 1 = the whole column between the camera and the cloud; 0 = "
+              "off, which is what the clouds got before 2026-09-08 - this volume skipped every sky "
+              "pixel, and sky pixels are where the clouds are.\n\n"
+              "This is the half of aerial perspective the clouds were missing. Clouds > Distance > "
+              "Distance Haze only ever multiplies cloud radiance DOWN with nothing added back, so "
+              "distant cloud dimmed toward black rather than toward the colour of the air in front "
+              "of it. That term still does its job; this supplies the light it was subtracting "
+              "toward. It cannot brighten cloud past the sky behind it.");
+
           RemixGui::DragFloat("Range", &RtxAtmosphere::aerialPerspectiveDepthRangeMetersObject(),
                               100.0f, 100.0f, 200000.0f, "%.0f m", sliderFlags);
           RemixGui::SetTooltipToLastWidgetOnHover(
@@ -1265,12 +1279,22 @@ void RtxAtmosphere::showImguiSettings(WeatherBlender* blender) {
             "model, vertical cloud shape comes from the baked bodies - this "
             "styles how they are carved, it no longer re-profiles "
             "stratus -> cumulus.)");
+        // Slider max 4 -> 8 (fork -- 2026-09-07, smoke fix). Extinction is cloudDensity x profile^0.6
+        // per km and nothing else, and in a 1.5 km deck at a 1 km profile depth NO sample reaches
+        // profile 1 -- so with this pinned at 4 the only opacity lever left was Profile Depth, which
+        // the live conf had dragged down to make the deck cover the sky, and which at the same time
+        // made the lobe strands opaque enough to read as smoke. A half-height column goes 65% -> 88%
+        // opaque at zenith between 4 and 8. The default is unchanged. Past ~6 the 100-400 m far
+        // steps carry an optical depth per step near 1, which the animated jitter and the composite
+        // EMA absorb but do not hide entirely.
         dragFloatWithWeatherOverride(
             "Density", &RtxAtmosphere::cloudDensityObject(),
             WEATHER_OVERRIDE_PTR(cloudDensity),
-            0.05f, 0.0f, 4.0f, "%.2f", sliderFlags);
+            0.05f, 0.0f, 8.0f, "%.2f", sliderFlags);
         RemixGui::SetTooltipToLastWidgetOnHover(
-            "Cloud opacity. Higher = thicker / darker clouds.");
+            "Cloud opacity (extinction per km of full-density cloud). Higher = thicker / darker "
+            "clouds. This, not Profile Depth, is the lever for making the deck cover the sky; "
+            "above ~6 the far march steps get coarse enough to show faint banding at the horizon.");
         // Lower bound 0.5 -> 0.05 km and finer step (fork — 2026-09-05, world-space cloud
         // migration): this range was authored against the uncorrected unit scale, where
         // worldUnitsPerKm came from rtx.sceneScale (10000 units/km on FNV). With
@@ -1313,10 +1337,24 @@ void RtxAtmosphere::showImguiSettings(WeatherBlender* blender) {
         RemixGui::DragFloat("Shape Variety", &RtxAtmosphere::nubis3ShapeVarietyKmObject(),
                             0.01f, 0.0f, 1.5f, "%.2f km", sliderFlags);
         RemixGui::SetTooltipToLastWidgetOnHover(
-            "Mid-frequency (~2.4 km) push/pull of the whole body surface — "
+            "Mid-frequency (Lobe Wavelength) push/pull of the whole body surface — "
             "lobes, notches and full splits that break round singular "
             "blobs into varied cloud clusters (the GT7 mid-band role). "
-            "Live, no rebake. Higher costs some empty-space-skip perf.");
+            "Live, no rebake. Higher costs some empty-space-skip perf. "
+            "The effective value is capped at 0.65 x Lobe Wavelength.");
+        // Lobe Wavelength (fork -- 2026-09-07, smoke fix): the size of the shape-variety lobes,
+        // which used to be a hidden function of Detail Scale. Surfaced next to the amplitude it
+        // pairs with because the two only make sense together (see the cap in the tooltip).
+        RemixGui::DragFloat("Lobe Wavelength", &RtxAtmosphere::nubis3ShapeVarietyWavelengthKmObject(),
+                            0.05f, 0.5f, 6.0f, "%.2f km", sliderFlags);
+        RemixGui::SetTooltipToLastWidgetOnHover(
+            "Size of the shape-variety lobes: the wavelength of the largest "
+            "bumps in a cloud's outline. Independent of Detail Scale, which "
+            "controls surface texture only. Shape Variety is capped at 0.65 x "
+            "this, so shrinking the lobes also shallows them — a displacement "
+            "deeper than about a third of its own wavelength tears the surface "
+            "into strands instead of bulging it. Below ~2 km the lobe pattern "
+            "repeats inside the 12 km noise tile.");
         RemixGui::DragFloat("Lighting LOD", &RtxAtmosphere::cloudLightingLodThresholdObject(),
                             0.002f, 0.0f, 0.25f, "%.3f", sliderFlags);
         RemixGui::SetTooltipToLastWidgetOnHover(
@@ -1357,6 +1395,20 @@ void RtxAtmosphere::showImguiSettings(WeatherBlender* blender) {
             "Depth into the body over which the dimensional profile ramps "
             "0 -> 1. Small = hard-shelled dense clouds; large = soft "
             "translucent edges.");
+        // Lighting Depth (fork -- 2026-09-08, painted-shading fix): the ramp the LIGHTING reads,
+        // split from the density ramp above. Sits under Profile Depth because it is the same ramp
+        // on a second depth, and the A/B that motivated it was a Profile Depth A/B (0.10 solid but
+        // painted vs 0.50 rich but ghostly).
+        RemixGui::DragFloat("Lighting Depth", &RtxAtmosphere::nvdfLightingProfileDepthKmObject(),
+                            0.02f, 0.0f, 3.0f, "%.2f km", sliderFlags);
+        RemixGui::SetTooltipToLastWidgetOnHover(
+            "Depth over which the LIGHTING profile ramps 0 -> 1: the term that "
+            "fades the multi-scatter body light in and the sky ambient out with "
+            "depth. 0 = same as Profile Depth (the old behaviour). Set it deeper "
+            "than Profile Depth to keep solid hard-edged bodies while the "
+            "shading inside them keeps a continuous gradient instead of going "
+            "flat past the skin. Lighting only: silhouettes, density and the "
+            "shadow grids do not change.");
         ImGui::TreePop();
       }
 

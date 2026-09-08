@@ -394,6 +394,10 @@ namespace {
     // Composite-only, read after every bake has run, so it must not key the LUT cascade.
     args.aerialPerspectiveNearFadeStart = 0.0f;
     args.aerialPerspectiveNearFadeEnd = 0.0f;
+    // Composite-only as well (fork -- 2026-09-08): the cloud's share of this volume's in-scatter is
+    // applied in applyCloudComposite, long after every bake has run. Leaving it in the key would
+    // re-bake the whole LUT cascade on a slider drag for nothing.
+    args.cloudAerialInScatterStrength = 0.0f;
     args.cameraPosition              = vec3(0.0f, 0.0f, 0.0f);
     args.cameraForward               = vec3(0.0f, 0.0f, 0.0f);
     args.cameraRight                 = vec3(0.0f, 0.0f, 0.0f);
@@ -1020,6 +1024,16 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
     }
     // Nubis3 density model (fork — Nubis3 conversion Phase B).
     args.nvdfProfileDepthKm    = std::max(RtxAtmosphere::nvdfProfileDepthKm(), 0.05f);
+    // Lighting profile depth (fork -- 2026-09-08, painted-shading fix; see the RTX_OPTION). The 0
+    // default resolves to the density depth HERE, not in the shader, so the sampler's profileOut
+    // divide sees the very float nvdfProfileDepthKm was just clamped to and the render is
+    // bit-identical at the default; a shader-side "if zero" would be one more branch in the
+    // sampler for nothing. Same 0.05 floor as the density depth, for the same divide.
+    {
+      const float lightingDepthKm = RtxAtmosphere::nvdfLightingProfileDepthKm();
+      args.nvdfLightingProfileDepthKm = lightingDepthKm > 0.0f ? std::max(lightingDepthKm, 0.05f)
+                                                              : args.nvdfProfileDepthKm;
+    }
     args.nvdfCoverageOffsetKm  = std::max(RtxAtmosphere::nvdfCoverageOffsetKm(), 0.0f);
     args.nubis3ErosionStrength = std::max(RtxAtmosphere::nubis3ErosionStrength(), 0.0f);
     args.nubis3SharpenStrength = std::min(std::max(RtxAtmosphere::nubis3SharpenStrength(), 0.0f), 1.0f);
@@ -1051,7 +1065,25 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
     args.nubis3FineDetailStrength = std::min(std::max(RtxAtmosphere::nubis3FineDetailStrength(), 0.0f), 2.0f);
     // Mid-band shape-variety displacement (fork — 2026-07-17). Live; shared
     // sampler, so the OD bakes and grids track the reshaped bodies.
-    args.nubis3ShapeVarietyKm     = std::min(std::max(RtxAtmosphere::nubis3ShapeVarietyKm(), 0.0f), 1.5f);
+    // Lobe wavelength stated absolutely (fork -- 2026-09-07, smoke fix; see the RTX_OPTION). Filled
+    // here, ahead of the amplitude, because the amplitude is capped against it.
+    args.nubis3ShapeVarietyWavelengthKm = std::max(RtxAtmosphere::nubis3ShapeVarietyWavelengthKm(), 0.05f);
+    // Amplitude guard (fork -- 2026-09-07, smoke fix). A level set displaced by a noise field only
+    // BULGES while the displacement gradient stays below the SDF's own unit gradient; past that the
+    // iso-surface folds, crosses a line several times, and pinches off into detached sheets and
+    // strands. The worst case is the wispy channel at the deck base: the type spread takes
+    // typeShaped to ~0.48 there, the channel's centred range is [-0.5, +0.28], and its vertical
+    // wavelength is HALF the nominal (the baker's kWispSqueeze), so peak-to-peak displacement is
+    // ~0.4 x amplitude against half this wavelength. For a sinusoid the fold starts at
+    // pk-pk = wavelength / pi. 0.65 x wavelength does not touch the validated 1.11 km / 2.41 km
+    // default (cap 1.57 km; worst-case gradient ~1.2 there, ~1.7 at the cap) but makes the
+    // 1.5 km / 0.86 km state the live conf reached through cloudDetailScale 12 -- gradient ~4.4,
+    // four times past the fold -- unreachable through this knob. CPU-side, so the shader's
+    // conservative step bound (maxOutwardKm) and the interior-texture mid mix see the same number.
+    constexpr float kLobeMaxAmplitudePerWavelength = 0.65f;
+    const float lobeAmplitudeCapKm = kLobeMaxAmplitudePerWavelength * args.nubis3ShapeVarietyWavelengthKm;
+    args.nubis3ShapeVarietyKm     = std::min(std::min(std::max(RtxAtmosphere::nubis3ShapeVarietyKm(), 0.0f), 1.5f),
+                                             lobeAmplitudeCapKm);
     // Near-field live sun taps (fork — 2026-07-17). Live; view march + secondary
     // cloud LUT only (the voxel grids keep their full-path bake).
     args.nubis3JitterAnimateKm    = std::max(RtxAtmosphere::nubis3JitterAnimateKm(), 0.0f);
@@ -1231,6 +1263,11 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
     // stay tied to the real measurement.
     const float worldUnitsPerMeter = resolveUnitsPerMeter();
     args.aerialPerspectiveWorldUnitsPerKm = 1000.0f * worldUnitsPerMeter;
+    // Cloud share of this volume's in-scatter (fork -- 2026-09-08, cloud aerial-perspective fix).
+    // Lives in the aerial block because it is read by the composite alongside the rest of it and is
+    // zeroed with it in normalizeForSkyLutCache; no bake reads it.
+    args.cloudAerialInScatterStrength =
+      std::min(std::max(RtxAtmosphere::cloudAerialInScatterStrength(), 0.0f), 1.0f);
     args.aerialPerspectiveLutSize = RtxAtmosphere::aerialPerspective()
       ? static_cast<uint32_t>(std::max(RtxAtmosphere::aerialPerspectiveLutResolution(), 1))
       : 0u;
@@ -1310,10 +1347,12 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
   // zero-filled reserve pads, free for Phase D growth.
   args.padRetired0 = 0u;
   args.padRetired4 = 0u;
-  args.padRetired5 = 0.0f;
+  // padRetired5 now carries nubis3ShapeVarietyWavelengthKm (fork -- 2026-09-07), assigned in the
+  // Nubis3 block above next to the amplitude it caps. Do not zero it here.
   args.cloudLightingLodThreshold = RtxAtmosphere::cloudLightingLodThreshold();
   args.cloudMissLinearViewZ = m_missLinearViewZ;
-  args.padRetired8 = 0u;
+  // padRetired8 now carries nvdfLightingProfileDepthKm (fork -- 2026-09-08), assigned in the Nubis3
+  // block above next to the density depth it defaults to. Do not zero it here.
   {
     // Wind direction as a unit vector, for the detail drift and base shear (fork -- 2026-09-07).
     const auto* wxWind = m_weatherOverride;

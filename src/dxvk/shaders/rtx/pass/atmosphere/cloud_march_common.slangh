@@ -248,7 +248,10 @@ struct NubisCubedLighting {
 // Nubis Cubed 2023 per-sample lighting evaluator CORE (pages 137, 142).
 // Modeling inputs are parameters:
 //   dim_profile — [0,1] outside->inside gradient. Legacy: the vertical-
-//     profile proxy; Nubis3: the real NVDF dimensional profile.
+//     profile proxy; Nubis3: the NVDF dimensional profile on its OWN depth
+//     (nvdfLightingProfileDepthKm, fork 2026-09-08) — deliberately not the
+//     density ramp, whose depth is set for solidity and, shared, pinned M at
+//     1 and ambient_shape at 0 past the skin. See the sampler's step 7.
 //   cloud_sdf   — signed distance in METERS, negative inside, expected
 //     within [-cloudMsSdfDepth*4, 0]. Legacy: the slab/density proxy;
 //     Nubis3: the live (coverage-offset) NVDF distance.
@@ -1148,6 +1151,46 @@ bool cloudSlabSpan(vec3 rayDirYUp, vec3 planetCenter, float planetRadiusKm,
 // rather than branching leaves the prefix equal to the full transmittance, i.e. visibility 1.
 static const float kNoSurfaceKm = 1e9f;
 
+// Transmittance-limit exit for every view march loop (Nubis p.174) -- AND the scale the reported
+// transmittance is expressed on (fork -- 2026-09-08, disc leak; see the rescale at the bottom of
+// marchCloudLayers).
+//
+// The loops stop once viewTransmittance falls below this and composite what they have, so the
+// background still shows through a cloud they already declared opaque, at up to 1% of its
+// radiance. Against the sky (~1 radiance unit) that is invisible: ~0.01 added to a cloud. The sun
+// is not a disc drawn anywhere in this renderer, though -- it is the Mie aureole the sky-view LUT
+// bakes at mieAnisotropy 0.97 (hgPhase peaks at 174x isotropic), a blob of order 20-50 radiance
+// units near the sun, brighter and redder the lower it sits. 1% of that is 0.2-0.5, some 4-10x the
+// radiance of a dark overcast deck (~0.05), so it reads as a sun disc rendered ON TOP of cloud the
+// march had already found opaque; the moon disc leaks the same way against the night deck. The
+// composite honours the premultiplied (rgb, T) convention exactly -- the leak is the early-out,
+// not the composite. Physically a 1.5 km deck at sigma 6.7 passes exp(-10) ~ 5e-5, not 1e-2.
+//
+// The cure is to report transmittance on the scale whose ZERO is this threshold (marchCloudLayers,
+// once per ray). A ray that took the early exit was below the threshold by the test's own
+// definition, so it reports exactly 0 and leaks nothing -- everywhere on screen, at every view
+// angle, for one multiply-add per ray.
+//
+// Two rejected alternatives, both tried on 2026-09-08, and the reason the shift is the shape the
+// fix has to take: what the eye sees is T x background, so ANY rule that removes the leak on one
+// side of a boundary and keeps it on the other draws that boundary in the sky at up to 1% of an
+// HDR background -- several times the cloud's own radiance.
+//   * Tightening the threshold toward the sun (a smoothstep on the view-sun angle, 0.01 outside
+//     ~16 degrees, 1e-4 inside ~8) drew a literal circle centred on the sun: a large, smooth,
+//     near-black disc over dawn cloud, with the unaffected horizon-fade glow still burning at its
+//     centre. Reported by the user. No cloud shape explains a circle in the sky, which is what
+//     made it far worse than the leak it removed.
+//   * Zeroing T at the break moves that same edge onto the T = threshold contour, which follows
+//     cloud shape in general but, near a low sun, is a near-horizontal line at the elevation where
+//     the aerial fade stops dominating -- a hard cut through the glow.
+// The shift has no boundary at all: it is continuous and monotone in T, exact at T = 1, and
+// reaches 0 exactly where the march stops being able to tell the difference.
+//
+// The honest alternative, marching every opaque ray down to 1e-4 instead, is ~12 more steps at the
+// ~0.4 optical depths an interior step carries -- 15-20% on the pass, to refine pixels that are
+// already opaque, by at most 1% of the background.
+static const float kCloudExitTransmittance = 0.01f;
+
 void marchCloudSlab(vec3   viewDirYUp,
                     float  pixelJitter,
                     float  pixelJitterStatic,
@@ -1255,7 +1298,7 @@ void marchCloudSlab(vec3   viewDirYUp,
   if (!adaptiveMarch) {
     // ---- Fixed-length lattice march (legacy stepping, bit-identical) ----
     for (uint i = 0u; i < effSampleCount; ++i) {
-      if (viewTransmittance < 0.01f) break;  // early-exit (free perf win)
+      if (viewTransmittance < kCloudExitTransmittance) break;  // early-exit (free perf win)
 
       float t = tEntry + stepLen * (float(i) + pixelJitter);
       float rayFrac = (float(i) + pixelJitter) / float(effSampleCount);
@@ -1332,15 +1375,50 @@ void marchCloudSlab(vec3   viewDirYUp,
   uint  iterCap = max(uint(args.cloudViewSamplesMax), sampleCount);
   float t = tEntry;
   float sdfStepKm = 0.0f;  // previous sample's conservative empty radius
+  // Far end of the previous sample's guaranteed-empty interval, as a distance along the ray
+  // (fork -- 2026-09-08, sphere-trace overshoot fix; see the skip below). tEntry = "nothing
+  // proven yet", so the first iteration takes the adaptive step exactly as before.
+  float tEmptyUntilKm = tEntry;
   for (uint iter = 0u; iter < iterCap && t < tExit; ++iter) {
-    if (viewTransmittance < 0.01f) break;  // transmittance-limit exit (p.174)
+    if (viewTransmittance < kCloudExitTransmittance) break;  // transmittance-limit exit (p.174)
 
     float stepKm = clamp(args.cloudViewStepKm * sqrt(t * (1.0f / kAdaptiveRefDistKm)),
                          args.nubis3AdaptiveStepKm, adaptiveCeilKm);
     if (args.nvdfStepScale > 0.0f) {
       // Inside cloud the conservative empty radius goes <= 0 and max() hands
       // control to the adaptive step — exactly the reference's hybrid.
-      stepKm = max(stepKm, sdfStepKm * args.nvdfStepScale);
+      //
+      // Anchored to the CURSOR, not to the sample (fork -- 2026-09-08, sphere-trace overshoot
+      // fix). The empty radius r is measured at tSample = t + hash * step and licenses
+      // [tSample - r, tSample + r]. Until now the skip was `sdfStepKm * nvdfStepScale` applied
+      // from the cursor t + step, which sits (1 - hash) * step BEYOND the point r was measured
+      // from -- so the next sample could land up to step * (1 - hash) - 0.05 r past the
+      // guaranteed-empty boundary. For a km-scale approach skip that is hundreds of metres to a
+      // kilometre INSIDE the body: the sphere trace did not converge on the surface, it
+      // overshot it, by an amount that depended on the jitter and on how long the last empty
+      // stretch was. The lattice march never had this problem (its skip advances the sample
+      // index, so it is sample-anchored by construction); the hybrid loop decoupled the cursor
+      // from the sample on 2026-07-16 and inherited it. Three consequences, all worst at high
+      // extinction: the first in-cloud sample sat at a random depth of 0-500+ m with a Beer
+      // segment of up to the whole skip (1-2 km, i.e. 7-13 optical depths at cloudDensity 6.7),
+      // so one interior-shaded sample decided the pixel and the lit skin was never sampled --
+      // faces approached across long empty stretches (undersides seen from below, tower sides
+      // across gaps) rendered dark and flat; the overshoot depth followed the sphere-trace's
+      // own cell structure, so its shading error had spatial contours -- the onion-shell
+      // banding nvdfStepScale's tooltip already warned about; and the animated jitter turned
+      // the per-frame depth lottery into speckle the EMA could only partly average
+      // (565c09ef3's "density-skip flipping against a step much larger than the detail it
+      // samples" is this mechanism seen from the other side).
+      //
+      // The safe advance from the cursor is (tSample + r) - (t + step) = r - step * (1 - hash),
+      // carried across iterations as tEmptyUntilKm. With it the cursor advances 95% of its
+      // remaining distance to the proven boundary each iteration -- the textbook sphere trace,
+      // independent of the jitter -- and still reaches the adaptive floor in 2-3 iterations from
+      // km range, so empty air costs the same as before; what changes is that the trace now
+      // stops AT the bounding surface and the first in-cloud samples come from the adaptive
+      // stepping through the displacement band, where they belong. Inside cloud r <= 0 keeps
+      // this negative and the adaptive step wins, as before.
+      stepKm = max(stepKm, (tEmptyUntilKm - t) * args.nvdfStepScale);
     }
     stepKm = min(stepKm, tExit - t);  // final-segment Beer length stays exact
     if (stepKm <= 1e-5f) break;       // FP guard: t += denormal would stall
@@ -1356,6 +1434,9 @@ void marchCloudSlab(vec3   viewDirYUp,
                          coverageNoiseEntry, coverageNoiseExit,
                          ctx, args, accumColor, viewTransmittance,
                          sdfStepKm, sumWeightedDistKm, sumWeight, entryDistanceKm);
+    // The interval this sample proved empty, in ray distance; the next iteration skips to it
+    // from wherever its cursor is (see above).
+    tEmptyUntilKm = tSample + sdfStepKm;
     t += stepKm;
   }
 
@@ -1496,7 +1577,7 @@ void marchEchoDeck(vec3   viewDirYUp,
   vec3 fieldOffsetKm = vec3(31.7f, 0.0f, -17.3f) * slabNoiseSeedOffset;
 
   for (uint i = 0u; i < effSampleCount; ++i) {
-    if (viewTransmittance < 0.01f) break;
+    if (viewTransmittance < kCloudExitTransmittance) break;  // same exit as layer 1
 
     float t = tEntry + stepLen * (float(i) + pixelJitter);
     vec3 samplePos = args.cameraWorldPosYUpKm + viewDirYUp * t;
@@ -1679,7 +1760,7 @@ void marchCloudLayers(vec3  viewDirYUp,
   // Reads its own coverage/type spread via an args copy so the shared density
   // sampler applies the deck's variation; its mean/density/seed come through
   // marchEchoDeck's slab params directly.
-  if (args.cloudLayer2Enable != 0u && viewTransmittance > 0.01f) {
+  if (args.cloudLayer2Enable != 0u && viewTransmittance > kCloudExitTransmittance) {
     AtmosphereArgs args2 = args;
     // Deck coverage spread is forced to 0: the spread amplified the single-
     // octave Worley coverage lattice into a fine tiled/stippled texture at the
@@ -1726,6 +1807,33 @@ void marchCloudLayers(vec3  viewDirYUp,
                   accumColor, viewTransmittance,
                   sumWeightedDistKm, sumWeight, entryDistanceKm);
   }
+
+  // Report transmittance on the scale whose zero is the march's own exit threshold (fork --
+  // 2026-09-08, disc leak; the full reasoning, and the two rejected alternatives, are at
+  // kCloudExitTransmittance).
+  //
+  //   T' = max(0, (T - e) / (1 - e)),   C' = C / (1 - e),   e = kCloudExitTransmittance
+  //
+  // Every ray that broke on the transmittance limit was below e when it broke, so it lands at
+  // exactly 0: no background reaches a pixel the march called opaque, at any view angle. Every
+  // other ray moves continuously with it -- T' is monotone in T and exactly 1 at T = 1 -- so the
+  // threshold draws no contour anywhere, which is the whole point.
+  //
+  // The radiance takes the SAME factor, which is what makes this "the same cloud, 1% more opaque"
+  // rather than a 1%-of-background darkening. The energy the shift takes out of the background is
+  // (T - T') x Lbar, where Lbar = accumColor / (1 - T) is the mean cloud radiance the march has
+  // already measured; substituting T - T' = e(1 - T)/(1 - e) collapses that to exactly
+  // C x e/(1 - e), i.e. C' = C/(1 - e). So the pair stays a valid premultiplied (radiance,
+  // transmittance) description of a cloud, and the composite stays exact in the thin limit instead
+  // of running 1% dark. Both are ~1% effects on cloud that is not near-opaque, and invisible
+  // there; the leak they remove is 4-10x the cloud's own radiance on the pixels that ARE.
+  //
+  // Here rather than in the loops: once per ray, after BOTH slab crossings and the echo deck have
+  // contributed (transmittance is multiplicative, so a per-loop shift would compound), and both
+  // callers -- the screen pass and the secondary-LUT bake -- inherit it identically.
+  const float kExitRescale = 1.0f / (1.0f - kCloudExitTransmittance);
+  accumColor        *= kExitRescale;
+  viewTransmittance  = max(0.0f, (viewTransmittance - kCloudExitTransmittance) * kExitRescale);
 
   // Finalize the depth companion (fork — 2026-09-05, Stage 4a): both layers have now contributed
   // whatever weight they found, so this is the one point where the running sums become a mean.

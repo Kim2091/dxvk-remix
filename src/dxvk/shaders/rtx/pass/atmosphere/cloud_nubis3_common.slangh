@@ -60,10 +60,12 @@ float valueErosion(float value, float erosion) {
 // Nubis3 density sampler.
 //
 // Out params (the lighting signals the Nubis3 evaluator core consumes):
-//   profileOut   — the dimensional profile [0,1] (0 at the live iso-surface,
-//                  1 at profileDepth into the body). Replaces the legacy
-//                  sampleDimProfile proxy AND (via pow(1-profile, 0.5)) the
-//                  ambient shape.
+//   profileOut   — the LIGHTING dimensional profile [0,1] (0 at the live
+//                  iso-surface, 1 at nvdfLightingProfileDepthKm into the
+//                  body). Replaces the legacy sampleDimProfile proxy AND (via
+//                  pow(1-profile, 0.5)) the ambient shape. Since 2026-09-08 it
+//                  ramps over its own depth, not the density ramp's
+//                  (nvdfProfileDepthKm) — see step 7 for why.
 //   detailSigned — zero-mean-ish erosion-field excursion at this sample, for
 //                  the billow micro-AO (same consumer as the legacy signal).
 //   sdfKmOut     — the LIVE (coverage-offset) signed distance in km. Negative
@@ -303,14 +305,18 @@ float sampleCloudDensityNubis3(vec3 worldPosKm,
   //     between shape and detail scales is what reads as synthetic (worst
   //     flat-on at the deck base). Their fix, verbatim: reuse the same
   //     texture rescaled to fill the gap, zero new memory. A third tap at
-  //     0.193x the base frequency puts the LOW channels at ~2.4 km — pure
+  //     an absolute nubis3ShapeVarietyWavelengthKm (2.4 km default; it was
+  //     0.193x the base frequency until 2026-09-07 — see the tap below)
+  //     puts the LOW channels at ~2.4 km — pure
   //     km-scale lobes (this tap's high channels would only duplicate
   //     already-covered scales, so the low channels alone feed the signal;
   //     both are mean-0.5 by the bake normalization, so the sum stays
   //     zero-mean). The 60/40 blend keeps the combined signal in
   //     [-0.5, 0.5], preserving the step-5 early-out bound and the
   //     conservative sdfStepKmOut excursion term. This tap repeats every
-  //     ~14.5 km — beyond the noise tile itself — so it needs no de-tiling.
+  //     6x the lobe wavelength (~14.4 km at the default) — beyond the noise
+  //     tile itself — so it needs no de-tiling; wavelengths under 2 km put
+  //     the repeat inside the 12 km tile.
   //
   //     TAP ORDER (fork — 2026-07-30, perf): this tap moved AHEAD of the
   //     two-scale base taps below so the surface gate can run on it alone.
@@ -320,8 +326,31 @@ float sampleCloudDensityNubis3(vec3 worldPosKm,
   //     result away — and the SDF sphere-trace deliberately parks samples in
   //     exactly that band, ~11 of them per surface approach at the default
   //     50 m adaptive step. Nothing above this point needs the base taps.
+  // Absolute wavelength, NOT a fraction of detailFreq (fork -- 2026-09-07, smoke fix). At
+  // 0.193 x detailFreq the lobe wavelength was cloudNoiseTileKm / (cloudDetailScale x 0.193 x 6):
+  // 2.41 km at the 4.3 default but 0.86 km at cloudDetailScale 12 -- and that is the horizontal
+  // figure; the wispy channel's vertical wavelength is HALF it again (the baker's kWispSqueeze), so
+  // 0.43 km. The displacement amplitude did not shrink with it. At the live conf (amplitude 1.5 km
+  // after its clamp; cloudTypeMean 1 with the default 0.54 spread, so typeShaped reaches ~0.48 at
+  // the deck base) the wispy channel alone moved the underside by [-0.39, +0.22] km and the
+  // billowy channel by [-0.04, +0.11] km: ~0.6 km peak-to-peak against a 0.43 km vertical
+  // wavelength. A level set displaced by more than about a third of its driving wavelength
+  // (pk-pk = lambda / pi is where a sinusoidal displacement's gradient reaches the SDF's own unit
+  // gradient) stops bulging and folds: the iso-surface crosses a vertical line several times and
+  // pinches off into hanging sheets and web strands. Those strands ARE the "long stringy wisps,
+  // almost like smoke" under the deck, and they are geometric, not erosion -- the conf runs both
+  // erosion knobs at 0 and the base-tap wobble at its default 0, so this tap is the only
+  // sub-kilometre structure in the density field at all. nvdfProfileDepthKm then only decides
+  // whether the strands are visible (a 300 m strand is ~32% opaque at a 1 km profile depth, ~70%
+  // at 0.15 km, at cloudDensity 4), which is exactly the "low profile depth = smoke, high profile
+  // depth = no coverage" bind. Stated absolutely, the lobes stay at the scale the amplitude was
+  // tuned for whatever the surface-texture frequency does. The 6.0 is the baker's low-frequency
+  // cycle count (cloud_detail_noise_baker.comp.slang:85), so nubis3ShapeVarietyWavelengthKm is
+  // the coarsest lobe's true horizontal wavelength in km. At its 2.4 default and cloudDetailScale
+  // 4.3 this is the old frequency to within 0.4%.
+  const float midFreq = 1.0f / (6.0f * max(args.nubis3ShapeVarietyWavelengthKm, 0.05f));
   vec4 noiseMid = detailNoise.SampleLevel(cloudSampler,
-      frac(boilPosMid * (detailFreq * 0.193f) + vec3(0.71f, 0.29f, 0.53f)), 0);
+      frac(boilPosMid * midFreq + vec3(0.71f, 0.29f, 0.53f)), 0);
   float wobbleMid = lerp(noiseMid.r - 0.5f,
                          noiseMid.b * 0.3f - 0.15f,
                          typeShaped);
@@ -445,7 +474,22 @@ float sampleCloudDensityNubis3(vec3 worldPosKm,
     return 0.0f;
   }
   float profile = saturate(-sdfLive / max(args.nvdfProfileDepthKm, 1e-3f));
-  profileOut = profile;
+  // The LIGHTING profile gets its own depth (fork -- 2026-09-08, painted-shading fix). profileOut
+  // is the dim_profile the evaluator feeds into the multi-scatter body term and, inverted, the
+  // ambient shape. Until now it was `profile` itself, so the depth that made a deck solid (a
+  // shallow ramp: 0.10 km is 0.42 optical depths at cloudDensity 6.7) also pinned M at 1 and the
+  // ambient at 0 through everything past the skin -- 66% of the light a face returns, none of it
+  // carrying a spatial shading term; a 0.50 km ramp had the gradient (M 0.15..0.89, ambient
+  // 0..0.92 across the visible shell) but passed 54% of the light through a 300 m chord. Same
+  // sdfLive, same ramp shape, a different depth. Everything density-side stays on `profile`: the
+  // erosion frequency blends keyed on profileProv above, the wisp cut's edgeBand, valueErosion and
+  // the sharpen all decide WHERE material is and must agree with the ramp valueErosion carves
+  // (keyed on a deeper ramp, the blends would hand the carve band the low-frequency channels only
+  // and the "fine filaments deeper in" would sit past the surface). The CPU resolves the option's
+  // 0 default to nvdfProfileDepthKm itself, so this divide is bit-identical to the old
+  // `profileOut = profile` until the user moves it. OD / bake callers discard profileOut, so the
+  // D_sun / D_ambient grids never see it.
+  profileOut = saturate(-sdfLive / max(args.nvdfLightingProfileDepthKm, 1e-3f));
 
   // 7a. FINE-frequency band (fork — detail round follow-up 2026-07-16; the
   //     GT7 pp.228-230 third band, prompted by "you might need another

@@ -909,6 +909,34 @@ public:
                "dimensional profile ramps 0 -> 1 [0.1..3]. Small = dense "
                "hard-shelled clouds; large = soft translucent-edged bodies. "
                "Applies live.");
+    // Lighting profile depth (fork -- 2026-09-08, painted-shading fix). nvdfProfileDepthKm did
+    // double duty: it set the density ramp AND was handed to the lighting evaluator as dim_profile,
+    // which drives the multi-scatter body term (M = dim_profile * exp(-sigma_ms * D_sun) *
+    // verticalLight) and, inverted, the ambient shape (pow(1 - dim_profile, 0.5)). Those two wants
+    // pull opposite ways. At the live 1.5 km deck (cloudDensity 6.7, sharpen exponent 0.6) a
+    // 0.10 km ramp is 0.42 optical depths thick, so bodies are solid (a 300 m chord passes 22% of
+    // the light, 600 m passes 3%) -- but 66% of the light a face returns then comes from samples
+    // at profile 1, where M is a constant and the ambient is exactly zero; the only shading left
+    // is the km-scale underside gradient and the 128 m micro-AO skin, which is the "painted" read.
+    // A 0.50 km ramp spreads M over 0.15..0.89 and the ambient over 0..0.92 across the visible
+    // shell (the rich interior gradient), but that ramp is 2.1 optical depths deep, so a 300 m
+    // chord passes 54% and 600 m passes 16% -- the airbrushed, no-silhouette read. Nothing else in
+    // the evaluator can stand in for the profile on a lit face: exp(-sigma_ms * D_sun) spans
+    // 0.92..1.0 there, micro-AO lives in the outer cloudMsSdfDepth (128 m) only, and
+    // verticalLight is a pure top-to-base gradient that both settings already have. Splitting the
+    // ramp gives density a shallow depth and lighting a deep one: at 0.10 / 0.50 the shell keeps
+    // its 0.42-OD skin while M spans 0.08..0.70 and the ambient 0.49..0.96, with 4.7% of the light
+    // from a saturated sample instead of 66%. Density, erosion, the wisp cut and the D_sun /
+    // D_ambient bakes never read this; it is a lighting-only input, live, no rebake.
+    RTX_OPTION_ARGS("rtx.atmosphere", float, nvdfLightingProfileDepthKm, 0.0f,
+               "Nubis3: depth into the cloud body (km) over which the LIGHTING profile ramps "
+               "0 -> 1 [0..3] -- the term that fades the multi-scatter body light in and the sky "
+               "ambient out with depth. 0 = follow nvdfProfileDepthKm (the density ramp), the "
+               "previous behaviour. Set it deeper than nvdfProfileDepthKm to keep hard, solid "
+               "bodies while the shading inside them keeps a continuous gradient instead of "
+               "going flat past the skin. Lighting only: density, silhouettes and the shadow "
+               "grids are unchanged. Applies live.",
+               args.minValue = 0.0f, args.maxValue = 3.0f);
     RTX_OPTION("rtx.atmosphere", float, nvdfCoverageOffsetKm, 0.2f,
                "Nubis3: km of iso-surface (level-set) shift per unit of "
                "coverage delta from the baked nominal [0..4]. Higher = "
@@ -938,14 +966,34 @@ public:
                "high-frequency noise into the erosion composite close to the "
                "camera for fly-through crispness. 1 = the paper's 10% max "
                "mix at the nearest range; 0 = off. Applies live.");
+    // Wavelength of the coarsest shape-variety lobe, in km (fork -- 2026-09-07, smoke fix). Until
+    // now the mid tap ran at 0.193 x the detail frequency, i.e. this wavelength was
+    // cloudNoiseTileKm / (cloudDetailScale x 0.193 x 6): 2.41 km at the 4.3 default, 0.86 km at
+    // cloudDetailScale 12 (0.43 km vertically for the wispy channel, whose vertical cycle count the
+    // baker doubles). The displacement amplitude (nubis3ShapeVarietyKm) did not shrink with it, so
+    // raising Detail Scale for finer surface texture silently pushed the level-set displacement from
+    // a bulge into a tear -- the "long stringy wisps, almost like smoke" under the deck. Stated
+    // absolutely, the outline scale means what it says regardless of Detail Scale. 2.4 reproduces
+    // the default-config wavelength to within 0.4%, so it is render-identical where it was right.
+    RTX_OPTION_ARGS("rtx.atmosphere", float, nubis3ShapeVarietyWavelengthKm, 2.4f,
+               "Wavelength in km of the largest bumps in a cloud's outline (the shape-variety "
+               "lobes). Larger = broader, smoother lobes; smaller = finer structure. Independent "
+               "of cloudDetailScale, which controls surface texture only. The lobe amplitude "
+               "(nubis3ShapeVarietyKm) is capped at 0.65 x this so the displacement stays in the "
+               "regime where it bulges the surface rather than tearing it into strands.",
+               args.minValue = 0.05f, args.maxValue = 20.0f);
     RTX_OPTION("rtx.atmosphere", float, nubis3ShapeVarietyKm, 1.11f,
                "Nubis3: mid-frequency SHAPE displacement amplitude in km "
                "[0..1.5] (the GT7 mid-band role). Pushes/pulls the body "
-               "iso-surface by up to half this at ~2.4 km wavelengths — "
+               "iso-surface by up to half this at the "
+               "nubis3ShapeVarietyWavelengthKm wavelength (2.4 km default) — "
                "lobes, notches and full splits that turn round singular "
                "blobs into varied cloud clusters. Whole-body reshaping, "
                "not edge detail; coverage-neutral on average. 0 = off. "
-               "Applies live, no rebake.");
+               "Applies live, no rebake. The effective value is capped at "
+               "0.65 x the lobe wavelength (2026-09-07): past that the "
+               "displacement tears the surface into strands instead of "
+               "bulging it.");
     RTX_OPTION("rtx.atmosphere", float, cloudLightingLodThreshold, 0.0f,
                "Nubis3: contribution-weighted lighting LOD [0..0.25]. A march "
                "sample's contribution weight is view transmittance x aerial "
@@ -1151,6 +1199,21 @@ public:
                "stop piling up extinction so horizon-grazing rays don't form "
                "a solid white wall. Does NOT affect cloud appearance close to "
                "camera. 0 = no fade (legacy white-wall behavior). Default 0.05.");
+
+    RTX_OPTION_ARGS("rtx.atmosphere", float, cloudAerialInScatterStrength, 1.0f,
+               "How much of the aerial perspective volume's in-scattered air light the clouds receive, "
+               "sampled at the cloud's own transmittance-weighted mean depth. 1 = the whole column the "
+               "volume integrated between the camera and the cloud; 0 = off (the pre-2026-09-08 "
+               "behaviour, where the clouds reached that volume not at all).\n"
+               "This is the half of aerial perspective the clouds were missing. Distance Haze "
+               "(cloudAerialHazePerKm) only ever multiplied cloud radiance DOWN, with nothing added "
+               "back, so distant cloud dimmed toward black instead of toward the colour of the air in "
+               "front of it - the opposite of what haze does. That extinction term is left alone and "
+               "still does its job; this supplies the light it was subtracting toward.\n"
+               "Requires rtx.atmosphere.aerialPerspective. Inert when that volume is off, since there "
+               "is then nothing baked to read. Cannot brighten cloud past the sky behind it: the "
+               "volume covers a strict sub-segment of the sky's own column with a tamer forward lobe.",
+               args.minValue = 0.0f, args.maxValue = 1.0f);
 
     RTX_OPTION("rtx.atmosphere", float, cloudPhaseG1, 0.8f,
                "Primary HG asymmetry; strong forward-scatter, drives silver lining at backlit edges.");

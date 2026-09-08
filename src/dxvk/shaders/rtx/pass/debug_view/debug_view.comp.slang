@@ -992,6 +992,11 @@ vec4 loadInput(inout RNG randomState, ivec2 threadId)
 
         // ---- bilinear, per-tap age-validated history fetch (duplicate of composite.comp.slang's
         // fetchCloudHistoryBilinear; same texel-index-space convention) ----
+        // Deliberately still BILINEAR after that function widened to Catmull-Rom (fork --
+        // 2026-09-08, temporal smear fix): this view measures the reprojected COORDINATE, and a
+        // bilinear read is the sharpest honest probe of it -- a wider reconstruction would blend
+        // some of the coordinate error away and flatter the very thing being measured. The
+        // depth half of the per-tap validation is likewise omitted here, as it always was.
         const vec2 prevPixelF = vec2(threadId) + totalMV;
         const vec2 base = floor(prevPixelF);
         const vec2 f = prevPixelF - base;

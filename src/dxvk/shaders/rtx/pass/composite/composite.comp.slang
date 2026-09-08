@@ -709,14 +709,34 @@ void applyAerialPerspective(
 // rejected means every neighbour saw a different surface -- a thin sliver of geometry, typically --
 // and the nearest match in depth is taken rather than a blend of wrong answers.
 //
-// At scale 1 the fast path below is exact and this never runs.
+// At scale 1 the exact Load path below is taken and this never runs -- true since 2026-09-08,
+// when the gate became an actual resolution comparison (see the gate comment inside).
+//
+// The distance both this pass and the cloud pass mean by "this ray hit nothing" (fork --
+// 2026-09-08, silhouette outline fix). Hoisted to file scope from applyCloudComposite because the
+// upsample below compares tap depths against it, and the cloud pass stores a DIFFERENT sky value
+// (kNoSurfaceKm = 1e9, cloud_march_common.slangh) -- see the clamp at the tap read. Sky uses a
+// fixed far depth rather than a sentinel so sky-vs-sky compares equal under the ordinary relative
+// test while sky-vs-surface is rejected, with no special case anywhere. 60000 km is
+// f16-representable (the history companion packs it) and beyond any reachable slant range.
+static const float kCloudSkyDepthKm = 60000.0f;
+
 vec4 sampleCloudRenderRT(uint2 pixelCoordinate, AtmosphereArgs args, float surfaceKm)
 {
-  if (args.cloudRenderFullDimX != 0u && args.cloudRenderFullDimY != 0u)
-  {
-    uint2 rtDim;
-    CompositeCloudRender.GetDimensions(rtDim.x, rtDim.y);
+  uint2 rtDim;
+  CompositeCloudRender.GetDimensions(rtDim.x, rtDim.y);
 
+  // Gate on a RESOLUTION MISMATCH, not on the dims being non-zero (fork -- 2026-09-08, silhouette
+  // outline fix; the audit branch found the same defect independently, 4aaeb6ec6).
+  // ensureCloudRenderRT assigns m_cloudRenderFullExtent unconditionally, so cloudRenderFullDimX is
+  // never 0 once the RT exists and this path ran at native resolution too -- where it replaced an
+  // exact 1:1 Load with a four-tap depth-validated fallback that, for sky, could not pass its own
+  // depth test (see the tap read below). At matched resolution the Load is both the correct
+  // answer and the cheapest one: ~20 texture loads per pixel instead of ~90 across the 3x3
+  // neighbourhood statistics. The non-zero test stays as the divide guard it always was.
+  if (args.cloudRenderFullDimX != 0u && args.cloudRenderFullDimY != 0u
+      && (rtDim.x != args.cloudRenderFullDimX || rtDim.y != args.cloudRenderFullDimY))
+  {
     const vec2 uv = (vec2(pixelCoordinate) + 0.5f)
                   / vec2(float(args.cloudRenderFullDimX), float(args.cloudRenderFullDimY));
     const vec2 texelF = uv * vec2(rtDim) - 0.5f;
@@ -740,7 +760,17 @@ vec4 sampleCloudRenderRT(uint2 pixelCoordinate, AtmosphereArgs args, float surfa
     {
       const int2 texel = clamp(baseTexel + offsets[i], int2(0, 0), maxTexel);
       const vec4 value = CompositeCloudRender.Load(int3(texel, 0));
-      const float tapSurfaceKm = CompositeCloudDepth.Load(int3(texel, 0)).z;
+      // Clamped to the shared sky depth (fork -- 2026-09-08, silhouette outline fix). The cloud
+      // pass writes sky as kNoSurfaceKm = 1e9; this pass calls sky kCloudSkyDepthKm = 60000.
+      // Compared raw, EVERY sky tap failed the relative test (|1e9 - 6e4| > 0.1 * 1e9), so every
+      // sky pixel fell through to the nearest-depth fallback -- and next to a ridge the tap nearest
+      // in depth to 60000 is the GEOMETRY texel (|3 - 60000| < |1e9 - 60000|), whose march was
+      // clamped at that ridge and holds no cloud. Those sky pixels took opacity 0 and drew raw
+      // cloudless sky. With an overcast deck darker than the sky behind it, that is a bright
+      // one-texel outline on the sky side of every silhouette (the +x / +y / +xy taps of the
+      // bilinear footprint), tracing ridgelines exactly. At native resolution the gate above now
+      // keeps this path from running at all; the clamp is what makes it right below native.
+      const float tapSurfaceKm = min(CompositeCloudDepth.Load(int3(texel, 0)).z, kCloudSkyDepthKm);
 
       const float delta = abs(tapSurfaceKm - surfaceKm);
       if (delta < nearestDelta)
@@ -1027,8 +1057,60 @@ vec4 clipCloudHistoryToAABB(vec4 aabbMin, vec4 aabbMax, vec4 history)
   return (maxUnit > 1.0f) ? (center + offset / maxUnit) : history;
 }
 
-// Bilinear, per-tap age-validated fetch of the reprojected cloud history (fork — 2026-09-06, EMA
-// rectification). Replaces the nearest-texel floor(prevPixelF + 0.5f) read the smoother has used
+// Catmull-Rom (cubic Hermite with tangents taken from the neighbouring taps) weights for a sample
+// at phase `f` in [0, 1) across the four taps at -1, 0, +1, +2 (fork -- 2026-09-08, temporal smear
+// fix; see fetchCloudHistoryBilinear's second header block for why the reconstruction widened).
+// The four weights sum to 1 at every phase, and BOTH outer weights vanish at f == 0 and f == 1 --
+// as do the inner ones the bilinear kernel drops there -- which is what lets the caller skip taps
+// on their weight alone instead of branching on the motion vector.
+vec4 cloudHistoryCatmullRomWeights(float f)
+{
+  const float f2 = f * f;
+  const float f3 = f2 * f;
+  return vec4(
+    -0.5f * f3 +        f2 - 0.5f * f,
+     1.5f * f3 - 2.5f * f2            + 1.0f,
+    -1.5f * f3 + 2.0f * f2 + 0.5f * f,
+     0.5f * f3 - 0.5f * f2);
+}
+
+// One age- and depth-validated history tap. Split out of the fetch below (fork -- 2026-09-08) so
+// the bilinear footprint and the wider Catmull-Rom footprint validate on exactly the same rule --
+// there is no second opinion about what makes a tap usable, only about how many are consulted.
+bool loadValidatedCloudHistoryTap(
+  int2 texel, uint expectedPrevFrameId, float currentSurfaceKm, out vec4 value)
+{
+  value = vec4(0.0f);
+
+  if (any(texel < int2(0, 0)) || any(texel >= int2(cb.camera.resolution)))
+  {
+    return false;
+  }
+
+  const uint packed = CompositeCloudHistoryFrameIdPrev[texel];
+  const uint historyFrameId = packed & 0xFFFFu;
+  if ((historyFrameId != expectedPrevFrameId) || (historyFrameId == 0xFFFFu))
+  {
+    return false;
+  }
+
+  // Relative tolerance, not absolute: the acceptable disagreement at 20 km is not the acceptable
+  // disagreement at 200 m, and the quantity being compared spans that whole range.
+  const float historySurfaceKm = f16tof32(packed >> 16);
+  if (abs(historySurfaceKm - currentSurfaceKm)
+      > cb.cloudHistoryDepthTolerance * max(max(historySurfaceKm, currentSurfaceKm), 1e-3f))
+  {
+    return false;
+  }
+
+  value = CompositeCloudHistoryPrev[texel];
+  return true;
+}
+
+// Per-tap validated fetch of the reprojected cloud history: Catmull-Rom across a uniformly valid
+// 4x4 footprint, the validated bilinear below it otherwise (fork — 2026-09-06, EMA
+// rectification; reconstruction widened 2026-09-08 -- see the last block of this header).
+// The bilinear half, still the fallback and still what defines the base texel, replaces the nearest-texel floor(prevPixelF + 0.5f) read the smoother has used
 // since it lived in evalSkyRadiance. `prevPixelF` is in texel-INDEX space (integer == texel), so
 // the four taps are floor(prevPixelF) and its +1 neighbours weighted by frac(prevPixelF) -- the same
 // convention the old round() read used, just not quantised. Nearest-texel fetch quantised any
@@ -1053,57 +1135,118 @@ vec4 clipCloudHistoryToAABB(vec4 aabbMin, vec4 aabbMax, vec4 history)
 // The stored depth rides the high 16 bits of the frame-id companion as an f16, which is why that
 // target widened to R32_UINT. Sky carries kCloudSkyDepthKm rather than a sentinel so that sky-vs-sky
 // compares equal and sky-vs-surface is rejected by the ordinary relative test, with no special case.
+//
+// ---- The reconstruction widened to Catmull-Rom (fork -- 2026-09-08, temporal smear fix) ----
+// Reported symptom: turning the camera smears the sky, a static camera is clean, and the smear
+// clears over about a second; cloudHistoryWeight = 0 removes it, measured in-game. The 2026-09-06
+// block above answered the same bisection by bounding how far the history may sit from the current
+// frame, and that bound is real -- but it is a bound on DISPLACEMENT, and what was left is a loss
+// of BANDWIDTH, which the clip is structurally blind to because a resampling-blurred history is
+// approximately the neighbourhood mean, i.e. the exact centre of the clip box.
+//
+// The mechanism is the EMA feeding on its own resampled output. At a static camera the motion
+// vector is exactly zero, f == 0, and the four taps collapse to one texel: the fetch is a copy and
+// nothing is lost, which is why a static camera has always been clean. The moment the camera turns,
+// every frame convolves the WHOLE accumulated history with the bilinear kernel again, so with
+// H = (1-w)C + w*B*H the steady state is H = C * (1-w) / (1 - w * B(xi)), where B is the kernel's
+// response at spatial frequency xi. At w = 0.85 and half-a-texel-per-frame motion that is 70% of
+// true contrast at an 8-texel period, 38% at 4 texels and 15% at 2 -- and it recovers as w^n once
+// B returns to 1, i.e. ~20 frames, which at this scene's frame rate is the "about a second". A
+// directional loss of mid-frequency contrast that exists only while moving IS the reported smear.
+// None of the three rejectors can see it: the age test passes because every pixel writes history
+// every frame, the depth test is a no-op on sky (both sides carry kCloudSkyDepthKm), and the clip
+// is centred on the very value the blur produces. Nothing is wrong with the reprojected COORDINATE
+// -- rotation reprojection really is exact on this target -- only with what is reconstructed there.
+//
+// So the fetch keeps its coordinate, its validation and its fallback, and changes its kernel:
+// separable Catmull-Rom over the 4x4 footprint around the same base texel. Its response is flat to
+// fourth order rather than second (B goes 0.92 -> 0.99 at an 8-texel period, 0.71 -> 0.88 at 4),
+// which is what breaks the compounding: the same steady state becomes 95% and 60% of true contrast
+// instead of 70% and 38%. The history WEIGHT and the clamp are untouched, so the smoothing the user
+// tuned is exactly the smoothing they keep -- this recovers detail the filter was throwing away,
+// rather than admitting less history.
+//
+// Every consulted tap must validate or the fetch falls back to the validated bilinear above, which
+// is today's behaviour verbatim: silhouettes, disocclusions and screen borders take the narrow
+// kernel and its renormalisation, and the wide kernel only ever runs across a uniformly valid
+// footprint -- open sky and deck interior, which is precisely where the smear lives. Cost is paid
+// per non-zero weight, so a static camera pays one tap and a pure yaw pays one row of four.
 bool fetchCloudHistoryBilinear(vec2 prevPixelF, uint frameIdx, float currentSurfaceKm, out vec4 history)
 {
   const vec2 base = floor(prevPixelF);
   const vec2 f    = prevPixelF - base;
   const int2 baseTexel = int2(base);
-  const int2 resolution = int2(cb.camera.resolution);
 
   // Age check (relocated from the old inline read, fork — 2026-05-13 origin): reject any tap whose
   // stored frame-id doesn't match the immediately previous frame. Sentinel 0xFFFF ("never written",
   // cleared at allocation) collides harmlessly with startup and the once-per-65536-frames wrap.
   const uint expectedPrevFrameId = (frameIdx - 1u) & 0xFFFFu;
 
-  const float weights[4] = {
-    (1.0f - f.x) * (1.0f - f.y), f.x * (1.0f - f.y),
-    (1.0f - f.x) * f.y,          f.x * f.y };
-  const int2 offsets[4] = { int2(0, 0), int2(1, 0), int2(0, 1), int2(1, 1) };
+  // Both kernels are evaluated in one 4x4 sweep. A tap is loaded only if its Catmull-Rom weight is
+  // non-zero, and a tap that is not loaded cannot veto: at phase 0 on an axis the outer pair and
+  // the +1 tap all vanish, so a STATIC camera reads the single texel it always read, at the cost it
+  // always cost, and a pure yaw (f.y == 0) pays for one row rather than four.
+  const vec4 wxPacked = cloudHistoryCatmullRomWeights(f.x);
+  const vec4 wyPacked = cloudHistoryCatmullRomWeights(f.y);
+  const float wx[4] = { wxPacked.x, wxPacked.y, wxPacked.z, wxPacked.w };
+  const float wy[4] = { wyPacked.x, wyPacked.y, wyPacked.z, wyPacked.w };
 
-  vec4 sum = vec4(0.0f);
-  float weightSum = 0.0f;
+  vec4  catmullRomSum = vec4(0.0f);
+  bool  catmullRomValid = true;
+  vec4  bilinearSum = vec4(0.0f);
+  float bilinearWeightSum = 0.0f;
+
   [unroll]
-  for (uint i = 0u; i < 4u; ++i)
+  for (int dy = -1; dy <= 2; ++dy)
   {
-    const int2 texel = baseTexel + offsets[i];
-    if (any(texel < int2(0, 0)) || any(texel >= resolution))
+    [unroll]
+    for (int dx = -1; dx <= 2; ++dx)
     {
-      continue;
+      const float weightCatmullRom = wx[dx + 1] * wy[dy + 1];
+      if (abs(weightCatmullRom) < 1e-6f)
+      {
+        continue;
+      }
+
+      vec4 tap;
+      if (!loadValidatedCloudHistoryTap(
+            baseTexel + int2(dx, dy), expectedPrevFrameId, currentSurfaceKm, tap))
+      {
+        catmullRomValid = false;
+        continue;
+      }
+
+      catmullRomSum += tap * weightCatmullRom;
+
+      // The inner 2x2 is the bilinear footprint. Its weights vanish at exactly the phases where the
+      // Catmull-Rom weights above do, so the skip is safe for this accumulation too.
+      if ((dx >= 0) && (dx <= 1) && (dy >= 0) && (dy <= 1))
+      {
+        const float weightBilinear = ((dx == 0) ? (1.0f - f.x) : f.x)
+                                   * ((dy == 0) ? (1.0f - f.y) : f.y);
+        bilinearSum       += tap * weightBilinear;
+        bilinearWeightSum += weightBilinear;
+      }
     }
-    const uint packed = CompositeCloudHistoryFrameIdPrev[texel];
-    const uint historyFrameId = packed & 0xFFFFu;
-    if ((historyFrameId != expectedPrevFrameId) || (historyFrameId == 0xFFFFu))
-    {
-      continue;
-    }
-    // Relative tolerance, not absolute: the acceptable disagreement at 20 km is not the acceptable
-    // disagreement at 200 m, and the quantity being compared spans that whole range.
-    const float historySurfaceKm = f16tof32(packed >> 16);
-    if (abs(historySurfaceKm - currentSurfaceKm)
-        > cb.cloudHistoryDepthTolerance * max(max(historySurfaceKm, currentSurfaceKm), 1e-3f))
-    {
-      continue;
-    }
-    sum       += CompositeCloudHistoryPrev[texel] * weights[i];
-    weightSum += weights[i];
   }
 
-  if (weightSum < 1e-3f)
+  if (catmullRomValid)
+  {
+    // Clamped non-negative: the cubic's outer lobes are negative, so strong local contrast can ring
+    // the reconstruction below zero, and neither premultiplied radiance nor opacity means anything
+    // there. The overshoot on the other side is deliberately left to the 3x3 neighbourhood clip in
+    // applyCloudComposite -- ringing is a large, local excursion from the current-frame mean, which
+    // is the one artefact class that clip IS shaped to catch.
+    history = max(catmullRomSum, vec4(0.0f));
+    return true;
+  }
+
+  if (bilinearWeightSum < 1e-3f)
   {
     history = vec4(0.0f);
     return false;
   }
-  history = sum / weightSum;
+  history = bilinearSum / bilinearWeightSum;
   return true;
 }
 
@@ -1147,6 +1290,15 @@ bool fetchCloudHistoryBilinear(vec2 prevPixelF, uint frameIdx, float currentSurf
 // This is principled, not a proof of the root cause: it bounds the artefact class regardless of
 // which link produced the disagreement. Debug view 883 now reports the reprojected-history vs
 // current-frame error directly, so the question can be settled in-game.
+//
+// CORRECTION (fork -- 2026-09-08): "a heavy smear is structurally impossible at ANY history
+// weight" was too strong, and the same bisection came back. The clip bounds how far the history
+// may sit FROM the current frame's local mean; it cannot see a history that has been low-passed
+// TOWARD that mean, because such a value sits at the box's CENTRE. That is what the plain
+// bilinear history fetch was doing to itself on every frame the camera moved -- the defect is in
+// the reconstruction filter's bandwidth, not in the reprojected coordinate, which really is
+// exact on this target. Fixed in fetchCloudHistoryBilinear (Catmull-Rom over a uniformly valid
+// footprint); the clip is unchanged and now doubles as the guard on that kernel's ringing.
 void applyCloudComposite(
   uint2 pixelCoordinate,
   bool primaryMiss,
@@ -1181,8 +1333,8 @@ void applyCloudComposite(
   // texels describe THIS pixel's surface (fork -- 2026-09-07). Sky uses a fixed far depth rather
   // than a sentinel so sky-vs-sky compares equal under the ordinary relative test while
   // sky-vs-surface is rejected, with no special case anywhere. 60000 km is f16-representable and
-  // beyond any reachable slant range.
-  const float kCloudSkyDepthKm = 60000.0f;
+  // beyond any reachable slant range. kCloudSkyDepthKm itself moved to file scope above
+  // sampleCloudRenderRT (2026-09-08), which compares tap depths against it.
   const float currentSurfaceKm = primaryMiss ? kCloudSkyDepthKm : (viewDistance * kmPerWorldUnit);
 
   // The "no span along this ray" zeroing lives inside loadCurrentCloudOpacity now, for the reason
@@ -1301,6 +1453,64 @@ void applyCloudComposite(
   if (performedPSR)
   {
     opaqueVisibility = 0.0f;
+  }
+
+  // ---- Aerial perspective on the cloud (fork -- 2026-09-08) ----
+  //
+  // The clouds never reached the real aerial-perspective volume. applyAerialPerspective returns
+  // early on primaryMiss -- which is every sky pixel, i.e. exactly where the clouds are -- and it
+  // runs BEFORE this function, so even on a geometry hit the cloud composited afterwards was
+  // untouched by it. The only distance term the cloud had was the march's cloudAerialHazePerKm,
+  // which multiplies each sample's radiance by exp(-k * t) and adds NOTHING back: distant cloud
+  // dims toward BLACK rather than toward the colour of the air in front of it, which is the
+  // opposite of what aerial perspective does. (Its sibling cloudAerialFadePerKm fades cloud ALPHA
+  // instead -- a separate horizon-wall control with a different job. Neither is changed here.)
+  //
+  // What is supplied here is the missing half: the in-scattered air light between the camera and
+  // the cloud, read from the SAME volume the geometry uses, at meanCloudDepthKm -- the
+  // transmittance-weighted mean distance the march already writes into the depth companion for
+  // exactly this kind of consumer. Weighted by the cloud's own coverage, because the rest of the
+  // pixel is sky and the sky already carries its whole column.
+  //
+  // The extinction half is deliberately NOT taken from the volume: exp(-cloudAerialHazePerKm * t)
+  // already plays that role in the march, and applying both would dim distant cloud twice and
+  // rescale a tuned config underneath itself. Substituting one for the other is a look change and
+  // a retune, not a bug fix.
+  //
+  // Bounded by construction, which is what makes it safe to leave on: this volume integrates a
+  // strict sub-segment of the sky's own column with a tamer forward lobe
+  // (aerialPerspectiveMieAnisotropyMax), so the light it can add is always less than the sky
+  // radiance the cloud sits against. It cannot build a horizon wall brighter than the sky behind it.
+  //
+  // Placed after the history write on purpose: this is a per-frame, view-distance term with no
+  // business inside a temporal signal -- the same argument that keeps the occlusion gate out of it.
+  // Placed before both composites so the opaque and alpha-blend paths see the same hazed cloud.
+  if (args.aerialPerspectiveLutSize != 0u &&
+      args.cloudAerialInScatterStrength > 0.0f &&
+      meanKm > 0.0f &&
+      smoothedCloud.a > 0.0f)
+  {
+    // meanKm is in the CLOUD's kilometres and this volume is addressed in world units, converting
+    // with its own aerialPerspectiveWorldUnitsPerKm. Going through world units is what keeps the
+    // two in agreement when rtx.atmosphere.cloudWorldCompression is not 1: the cloud is wherever it
+    // sits in the world, and that is the column the haze has to be integrated over.
+    const float cloudDistanceWorld = meanKm * args.worldUnitsPerKm;
+    const vec2 cloudScreenUV = cameraPixelCoordinateToScreenUV(cb.camera, ivec2(pixelCoordinate));
+    const vec3 cloudUvw = aerialPerspectiveScreenUvToUvw(cloudScreenUV, cloudDistanceWorld, args);
+    // Same two guards applyAerialPerspective uses: inside the volumetrics grid's own range there is
+    // nothing left for this volume to add, and the near fade holds it off the near field entirely.
+    // Both are essentially always satisfied at cloud distance; they are here so the cloud path
+    // cannot behave differently from the geometry path where they are not.
+    const float cloudNearFade = aerialPerspectiveNearFade(cloudDistanceWorld, args);
+
+    if (cloudUvw.z > 0.0f && cloudNearFade > 0.0f)
+    {
+      const vec4 cloudAerial = sampleAerialPerspectiveLut(
+        AtmosphereAerialPerspectiveLut, AtmosphereAerialPerspectiveSampler, cloudUvw, args);
+
+      smoothedCloud.rgb += max(cloudAerial.rgb, vec3(0.0f))
+                         * (cloudNearFade * args.cloudAerialInScatterStrength * smoothedCloud.a);
+    }
   }
 
   // Premultiplied over -- identical operation to the removed evalSkyRadiance code, just relocated.

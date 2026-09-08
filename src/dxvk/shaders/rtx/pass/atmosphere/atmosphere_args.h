@@ -502,7 +502,12 @@ struct AtmosphereArgs {
   float cloudLayer2TypeMean;       // [0,1] mean cloud type for layer 2 (defaults to a cirrus-shaped 0.0)
   float cloudLayer2CoverageMean;   // [0,1] mean coverage for layer 2 (defaults sparse)
   float cloudLayer2DensityScale;   // Per-step density multiplier for layer 2 (cirrus is optically thin)
-  float padRetired5;               // retired: legacy vertical noise stretch.
+  // Wavelength (km) of the coarsest shape-variety lobe -- the km-scale bumps in a cloud's outline
+  // (fork -- 2026-09-07, smoke fix). Absolute, so it no longer rides on cloudDetailScale: deriving
+  // it from the detail frequency let a surface-texture knob shrink the lobes under a fixed
+  // displacement amplitude until the level set tore into strands. Rides the slot retired from the
+  // legacy vertical noise stretch; CB layout unchanged.
+  float nubis3ShapeVarietyWavelengthKm;
 
   // ----- (former Worley carve params — retired with the legacy 256^3 bake) -----
   // Contribution-weighted lighting LOD threshold (fork — 2026-07-30, perf).
@@ -517,7 +522,17 @@ struct AtmosphereArgs {
   // otherwise need the 500001.0f literal duplicated in shader code where nothing keeps it in step.
   // Rides the former padRetired7 slot -- CB layout unchanged.
   float cloudMissLinearViewZ;
-  uint  padRetired8;
+  // Depth (km) over which the LIGHTING profile ramps 0 -> 1 (fork -- 2026-09-08, painted-shading
+  // fix). This is the dim_profile the Nubis3 evaluator feeds into the multi-scatter body term
+  // (M = dim_profile * exp(-sigma_ms * D_sun) * verticalLight) and, inverted, the ambient shape
+  // (pow(1 - dim_profile, 0.5)). Until now it was nvdfProfileDepthKm, the same ramp that sets
+  // density, so a hard-shelled deck (a shallow density ramp) had M pinned at 1 and the ambient at
+  // 0 through everything past the skin -- two-thirds of the light a face returns came from samples
+  // with no spatial shading term left. Filled CPU-side: the option's 0 default resolves to
+  // nvdfProfileDepthKm itself, so the sampler's divide is bit-identical until the user moves it.
+  // Density, erosion and the D_sun / D_ambient bakes never read this. Rides the padRetired8 slot
+  // (uint -> float, same 4 bytes); CB layout unchanged.
+  float nvdfLightingProfileDepthKm;
   float cloudAerialHazePerKm;      // Aerial-perspective HAZE on cloud radiance (1/km). Dims distant
                                    // cloud samples toward atmospheric color. Visual softness control.
 
@@ -780,5 +795,18 @@ struct AtmosphereArgs {
   // cloud and sky units still use rtx.sceneScale, while this conversion calibrates only the
   // camera-fitted geometry haze volume.
   float aerialPerspectiveWorldUnitsPerKm;
-  float padAerial8;
+  // Strength of the aerial-perspective LUT's IN-SCATTER applied to the cloud RT at its own mean
+  // depth (fork -- 2026-09-08, cloud aerial-perspective fix). 0 = off, 1 = the full column the
+  // volume integrated. Rides the padAerial8 slot; CB layout unchanged.
+  //
+  // Until this existed the clouds never reached this volume at all: applyAerialPerspective returns
+  // early on primaryMiss -- every sky pixel, which is where the clouds are -- and it runs BEFORE
+  // applyCloudComposite, so even on a geometry hit the cloud composited afterwards was untouched.
+  // All the march had was cloudAerialHazePerKm, which multiplies sample radiance by exp(-k*t) and
+  // adds nothing back, i.e. it dims distant cloud toward BLACK rather than toward the colour of the
+  // air in front of it. This supplies the missing in-scatter half; the extinction half stays with
+  // cloudAerialHazePerKm so a tuned config is not re-scaled underneath itself. Read only by
+  // composite.comp.slang -- no bake touches it, so normalizeForSkyLutCache zeroes it with the rest
+  // of this block.
+  float cloudAerialInScatterStrength;
 };
