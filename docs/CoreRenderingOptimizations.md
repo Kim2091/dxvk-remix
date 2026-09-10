@@ -126,3 +126,37 @@ Remove-Item Env:VK_INSTANCE_LAYERS
 ```
 
 Final logs in `_Comp64Release/core-render-validation/`: `tlas-final-results.txt`, `build-final-results.txt`, `tlas-final-validation-results.txt`, `build-final-validation-results.txt`, and the corresponding validation/error logs. Earlier files without `final` were exploratory and are superseded.
+
+## Follow-up: BLAS bucket cache capture — 2026-09-10
+
+Removed the linear search through `m_blasPool` when capturing each bucket's assigned BLAS. `createBlasBuffersAndInstances` already assigns the exact pooled object pointer, and the pool retains ownership throughout capture. Constructing `Rc<PooledBlas>` directly acquires the same owning reference as copying the matching pool entry. Null assignments remain null. Pool collection does not occur between assignment and capture.
+
+This changes CPU bookkeeping only: geometry selection, GPU commands, rendering features, and resource lifetimes remain the same. Capture now takes constant work per bucket instead of scanning up to the entire pool.
+
+Standalone probe `scripts-common/benchmark_blas_cache_capture.cpp` uses Remix's actual `Rc` implementation. Identity, null, duplicate-reference, and destruction checks passed. The optimized release build passed; log: `_Comp64Release/core-render-capture-build.txt`.
+
+The CPU benchmark captures 64 bucket references distributed across each pool, including identical reference-release work in both versions. It alternates baseline/candidate order, discards four warmup batches, and reports the upper median of 20 batches of 500 captures. Final timing ran after the compiler finished:
+
+| Pool objects | Previous scan, µs per 64 buckets | Direct capture, µs per 64 buckets |
+| --- | ---: | ---: |
+| 16 | 0.578 | 0.560 |
+| 256 | 3.263 | 0.566 |
+| 4,096 | 30.121 | 0.554 |
+| 16,384 | 122.393 | 0.554 |
+
+These are isolated cache-capture costs, not whole-frame or GPU improvements. Actual savings depend on pool size, assigned object positions, and how many buckets need new cache records. Unchanged buckets that reuse existing records do not incur this capture work. No game deployment or FPS measurement was performed.
+
+In the MSVC PowerShell environment initialized above:
+
+```powershell
+cl /nologo /std:c++17 /O2 /EHsc scripts-common/benchmark_blas_cache_capture.cpp /Fe:_Comp64Release/core-render-validation/benchmark_blas_cache_capture.exe /Fo:_Comp64Release/core-render-validation/benchmark_blas_cache_capture.obj
+.\_Comp64Release\core-render-validation\benchmark_blas_cache_capture.exe
+```
+
+Final output: `_Comp64Release/core-render-validation/cache-capture-final-results.txt`.
+
+### Visibility experiment withheld
+
+An experimental early material rejection in `handleVisibilityVertex` avoided geometry reconstruction for unsupported material types and thick translucent surfaces. An instrumented probe comparing the original and first candidate function bodies passed 65,536 control-flow/output cases, including signed zero, NaN, clipping, viewmodels, and visibility modes. Geometry/material helpers were mocked, so this was not full scene validation.
+
+Actual direct-lighting ray-query pipeline statistics on the RTX 5080 Laptop GPU showed shared memory increasing from 6.5 KiB to 12 KiB. Shortening the material's live range reduced this to 9 KiB, still above baseline; register count remained 255. Without representative game timings, this tradeoff is not established as a speedup. The visibility shader was restored to its committed baseline and the experiment is not included in the runtime. Exploratory probes and statistics remain under `_Comp64Release/visibility-validation/`.

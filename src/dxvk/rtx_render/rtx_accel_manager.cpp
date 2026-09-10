@@ -1086,15 +1086,8 @@ namespace dxvk {
         cached.isUnordered = bucket->usesUnorderedApproximations;
         cached.hasSssInstances = bucket->hasSssInstances;
 
-        // Capture the assigned BLAS (stored on bucket by createBlasBuffersAndInstances)
-        if (bucket->assignedBlas) {
-          for (auto& pooledBlas : m_blasPool) {
-            if (pooledBlas.ptr() == bucket->assignedBlas) {
-              cached.assignedBlas = pooledBlas;
-              break;
-            }
-          }
-        }
+        // The pool owns this object throughout cache capture; acquire the same reference directly.
+        cached.assignedBlas = Rc<PooledBlas>(bucket->assignedBlas);
 
         // Build TLAS instance template (surface offset will be adjusted when restored)
         cached.tlasInstance = {};
