@@ -180,6 +180,8 @@ cl /nologo /std:c++17 /O2 /EHsc /I include/vulkan/include scripts-common/benchma
 
 ### NRC synchronization remains a profiling target
 
+The completed [execution-path research](NrcExecutionPathResearch.md) refines this initial hypothesis: the intervening NEE dispatch can already flush indirect counter tracking. An extra counter-copy barrier is not established on every NRC frame. The report also identifies an NRC-specific NEE shader variant as a contained next experiment.
+
 NRC uses raw pre-training and pre-resolve Vulkan barriers alongside DXVK's pending barrier tracker. The four-byte training-counter copy between SDK query/training and resolve can flush that tracker; buffer accesses contribute to a global memory barrier, and NRC buffer metadata uses `ALL_COMMANDS` as its stage mask. This is a plausible synchronization cost, not a demonstrated redundant barrier or measured GPU bottleneck.
 
 An unconditional move of the counter copy after resolve was withheld: the local SDK contract in `submodules/nrc/Include/NrcVk.h` explicitly lists counters among SDK `Resolve` outputs. The optional SDK/debug resolve paths can therefore change what the delayed readback observes. The default custom resolve does not bind the counter, but a conditional reorder still needs validation of SDK write visibility and the emitted DXVK barriers.
