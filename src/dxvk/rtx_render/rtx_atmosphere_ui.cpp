@@ -805,10 +805,16 @@ void RtxAtmosphere::showImguiSettings(WeatherBlender* blender) {
                              &RtxAtmosphere::aerialPerspectiveSceneShadowObject());
           RemixGui::SetTooltipToLastWidgetOnHover(
   "Trace the scene for sun occlusion of the air column this volume integrates.\n\n"
-              "Off by default. This volume is applied only to pixels that hit geometry, so any shadowing of the column is clipped exactly to the occluder's silhouette - one pixel to the side the ray reaches sky, gets no aerial perspective, and so gets no darkening. It reads as the object's outline stamped on the haze rather than a shadow cast through it, and no resolution or sample count changes that.\n\n"
+              "This volume is applied only to pixels that hit geometry, so any shadowing of the column is clipped exactly to the occluder's silhouette - one pixel to the side the ray reaches sky, gets no aerial perspective, and so gets no darkening. It reads as the object's outline stamped on the haze rather than a shadow cast through it, and no resolution or sample count changes that.\n\n"
               "Shadow shafts belong to the global volumetrics grid, which integrates for every pixel including sky misses and so carries shadows across silhouettes without a seam. This volume begins where rtx.volumetrics.froxelMaxDistanceMeters ends, so widening that range hands more of the shadowed near field to the system that resolves it correctly.");
 
           if (RtxAtmosphere::aerialPerspectiveSceneShadow()) {
+            RemixGui::Checkbox("Separate Visibility Pass (Experimental)",
+                               &RtxAtmosphere::aerialPerspectiveSeparateVisibilityObject());
+            RemixGui::SetTooltipToLastWidgetOnHover(
+                "Preserves the sun samples and sky probes while evaluating visibility in a separate pass. "
+                "Uses an additional 4.5 MiB at the default resolution. Performance depends on the GPU and scene; "
+                "disable to use the original combined pass.");
             RemixGui::DragFloat("Shadow Range",
                                 &RtxAtmosphere::aerialPerspectiveSceneShadowRangeMetersObject(),
                                 10.0f, 0.0f, 100000.0f, "%.0f m", sliderFlags);

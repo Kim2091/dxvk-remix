@@ -431,6 +431,10 @@ public:
                "with DISTANCE, and the exponential slice distribution already gives every slice the same relative "
                "depth resolution - so it needs far less than the screen axes do. Cost is linear in this value.",
                args.minValue = 4, args.maxValue = 128);
+    RTX_OPTION("rtx.atmosphere", bool, aerialPerspectiveSeparateVisibility, false,
+               "Compute aerial perspective scene visibility in a separate pass using the same sun samples and sky probes. "
+               "May improve GPU scheduling at the cost of an extra visibility volume and dispatch. "
+               "Disabled by default until performance and image parity are verified on the target GPU.");
     RTX_OPTION("rtx.atmosphere", bool, aerialPerspectiveSceneShadow, true,
                "Trace the scene for sun occlusion of the air column the aerial perspective volume integrates.\n"
                "The volume covers the air BETWEEN the camera and a surface. Untraced, it treats that air as fully "
@@ -449,7 +453,7 @@ public:
                "including sky misses and therefore carries its shadows across silhouettes without a seam. The two "
                "systems already meet: this volume begins where rtx.volumetrics.froxelMaxDistanceMeters ends, so "
                "widening that range hands more of the shadowed near field to the system that resolves it correctly.\n"
-               "Costs roughly a shadow ray per froxel step within aerialPerspectiveSceneShadowRangeMeters.");
+               "Costs up to six sun rays and six sky rays per depth interval within aerialPerspectiveSceneShadowRangeMeters.");
     RTX_OPTION_ARGS("rtx.atmosphere", int, aerialPerspectiveSceneShadowDebug, 0,
                "Diagnostic for aerialPerspectiveSceneShadow. Every way that feature can silently fail - the "
                "constant not reaching the bake, the TLAS descriptor never binding, the rays missing the "
@@ -1509,10 +1513,6 @@ private:
   static constexpr uint32_t kMultiscatteringLutSize = 32;
   static constexpr uint32_t kSkyViewLutWidth = 512;
   static constexpr uint32_t kSkyViewLutHeight = 256;
-  // Paper Section 5.4 uses 32^3 over the frustum, which is plenty for an effect this low frequency.
-  // Keep in lockstep with the [numthreads(4,4,4)] dispatch in aerial_perspective_lut.comp.slang.
-  // Aerial perspective volume dimensions are runtime options, so the resource is (re)created
-  // through this rather than pinned at initialize().
   void createAerialPerspectiveLut(Rc<DxvkContext> ctx, uint32_t sizeXY, uint32_t sizeZ);
   // Keep in lockstep with kLutWidth/kLutHeight in cloud_sky_transmittance_lut.comp.slang.
   static constexpr uint32_t kCloudSkyTransmittanceLutWidth = 32;
@@ -1556,6 +1556,8 @@ private:
   Resources::Resource m_multiscatteringLut;
   Resources::Resource m_skyViewLut;
   Resources::Resource m_aerialPerspectiveLut;
+  Resources::Resource m_aerialPerspectiveVisibility;
+  Rc<DxvkSampler> m_aerialPerspectiveSampler;
   Resources::Resource m_cloudSkyTransmittanceLut;
   Resources::Resource m_cloudDSun;
   Resources::Resource m_cloudDAmbient;

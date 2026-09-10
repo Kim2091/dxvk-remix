@@ -2294,7 +2294,7 @@ float sampleCloudGroundShadow_OptionB_explicit(vec3 worldPos, vec3 sunDir,
 interface IAtmosphereSunOccluder {
   // Fraction of the sun reaching the point `distanceKm` along the marched ray (same origin,
   // direction and units the march itself uses). 1 when no scene geometry occludes it.
-  float sunVisibility(float distanceKm);
+  float sunVisibility(float distanceKm, uint sampleIndex);
   float skyVisibility(float distanceKm);
 };
 
@@ -2356,6 +2356,23 @@ AtmosphereInScatterRay prepareAtmosphereInScatterRay(
   return ray;
 }
 
+// NV-DXVK start: Share quadrature positions with the separate visibility pass.
+struct AtmosphereInScatterStep {
+  float distance;
+  float length;
+};
+
+AtmosphereInScatterStep getAtmosphereInScatterStep(int index, float invSamples, float t0, float span,
+                                                  inout float start) {
+  const float end = atmosphereStepFraction(float(index + 1) * invSamples);
+  AtmosphereInScatterStep step;
+  step.distance = t0 + (start + (end - start) * 0.5f) * span;
+  step.length = (end - start) * span;
+  start = end;
+  return step;
+}
+// NV-DXVK end
+
 // Returns segment in-scatter and RGB transmittance without ground bounce or moon lighting.
 // Ray origin/direction and segment bounds use the atmosphere's Y-up kilometre frame.
 vec3 evalAtmosphereInScatterSegment<TSunOccluder : IAtmosphereSunOccluder>(
@@ -2398,10 +2415,9 @@ vec3 evalAtmosphereInScatterSegment<TSunOccluder : IAtmosphereSunOccluder>(
   float segmentStart = 0.0f;
 
   for (int i = 0; i < actualSamples; ++i) {
-    const float segmentEnd = atmosphereStepFraction(float(i + 1) * invSamples);
-    const float dt = (segmentEnd - segmentStart) * span;
-    const float t = t0 + (segmentStart + (segmentEnd - segmentStart) * 0.5f) * span;
-    segmentStart = segmentEnd;
+    const AtmosphereInScatterStep step = getAtmosphereInScatterStep(i, invSamples, t0, span, segmentStart);
+    const float dt = step.length;
+    const float t = step.distance;
 
     if (dt <= 0.0f) {
       continue;
@@ -2418,7 +2434,7 @@ vec3 evalAtmosphereInScatterSegment<TSunOccluder : IAtmosphereSunOccluder>(
     float sceneSunVisibility = 1.0f;
     // A zero solar term stays zero under either production or inverted scene visibility.
     if (any(sunShadowing != vec3(0.0f))) {
-      sceneSunVisibility = sunOccluder.sunVisibility(t);
+      sceneSunVisibility = sunOccluder.sunVisibility(t, uint(i));
     }
     // Keep medium coefficients out of the live state carried through ray traversal.
     const float altitude = clamp(

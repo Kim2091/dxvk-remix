@@ -40,6 +40,9 @@
 #include <rtx_shaders/multiscattering_lut.h>
 #include <rtx_shaders/sky_view_lut.h>
 #include <rtx_shaders/aerial_perspective_lut.h>
+#include <rtx_shaders/aerial_perspective_visibility.h>
+#include <rtx_shaders/aerial_perspective_integrate.h>
+#include <rtx_shaders/aerial_perspective_unshadowed.h>
 #include <rtx_shaders/cloud_sky_transmittance_lut.h>
 #include <rtx_shaders/cloud_sun_density_grid.h>
 #include <rtx_shaders/cloud_ambient_density_grid.h>
@@ -107,6 +110,46 @@ namespace dxvk {
       END_PARAMETER()
     };
     PREWARM_SHADER_PIPELINE(AerialPerspectiveLutShader);
+
+    class AerialPerspectiveVisibilityShader : public ManagedShader {
+      SHADER_SOURCE(AerialPerspectiveVisibilityShader, VK_SHADER_STAGE_COMPUTE_BIT, aerial_perspective_visibility)
+
+      BEGIN_PARAMETER()
+        CONSTANT_BUFFER(0)
+        TEXTURE2D(1)
+        SAMPLER(3)
+        ACCELERATION_STRUCTURE(5)
+        RW_TEXTURE3D(6)
+      END_PARAMETER()
+    };
+    PREWARM_SHADER_PIPELINE(AerialPerspectiveVisibilityShader);
+
+    class AerialPerspectiveIntegrateShader : public ManagedShader {
+      SHADER_SOURCE(AerialPerspectiveIntegrateShader, VK_SHADER_STAGE_COMPUTE_BIT, aerial_perspective_integrate)
+
+      BEGIN_PARAMETER()
+        CONSTANT_BUFFER(0)
+        TEXTURE2D(1)
+        TEXTURE2D(2)
+        SAMPLER(3)
+        RW_TEXTURE3D(4)
+        TEXTURE3D(6)
+      END_PARAMETER()
+    };
+    PREWARM_SHADER_PIPELINE(AerialPerspectiveIntegrateShader);
+
+    class AerialPerspectiveUnshadowedShader : public ManagedShader {
+      SHADER_SOURCE(AerialPerspectiveUnshadowedShader, VK_SHADER_STAGE_COMPUTE_BIT, aerial_perspective_unshadowed)
+
+      BEGIN_PARAMETER()
+        CONSTANT_BUFFER(0)
+        TEXTURE2D(1)
+        TEXTURE2D(2)
+        SAMPLER(3)
+        RW_TEXTURE3D(4)
+      END_PARAMETER()
+    };
+    PREWARM_SHADER_PIPELINE(AerialPerspectiveUnshadowedShader);
 
     class CloudSkyTransmittanceLutShader : public ManagedShader {
       SHADER_SOURCE(CloudSkyTransmittanceLutShader, VK_SHADER_STAGE_COMPUTE_BIT, cloud_sky_transmittance_lut)
@@ -1791,7 +1834,9 @@ void RtxAtmosphere::computeLuts(Rc<DxvkContext> ctx) {
   // the parameter-driven bakes above ran. It reads the transmittance and multiscattering LUTs; when
   // those were re-baked this frame the barriers above already order the writes ahead of this read,
   // and when they were not, the writes completed in an earlier frame.
-  if (RtxAtmosphere::aerialPerspective()) {
+  // The composite is the only AP consumer and bypasses it under dome lighting.
+  if (RtxAtmosphere::aerialPerspective()
+      && !ctx->getCommonObjects()->getSceneManager().getLightManager().getDomeLightArgs().active) {
     dispatchAerialPerspectiveLut(ctx);
 
     ctx->emitMemoryBarrier(0,
@@ -2092,27 +2137,58 @@ void RtxAtmosphere::dispatchAerialPerspectiveLut(Rc<DxvkContext> ctx) {
   ctx->bindResourceView(AERIAL_PERSPECTIVE_LUT_TRANSMITTANCE_INPUT, m_transmittanceLut.view, nullptr);
   ctx->bindResourceView(AERIAL_PERSPECTIVE_LUT_MULTISCATTERING_INPUT, m_multiscatteringLut.view, nullptr);
 
-  DxvkSamplerCreateInfo samplerInfo = {};
-  samplerInfo.magFilter = VK_FILTER_LINEAR;
-  samplerInfo.minFilter = VK_FILTER_LINEAR;
-  samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-  samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-  samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-  samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-  Rc<DxvkSampler> linearSampler = m_device->createSampler(samplerInfo);
-  ctx->bindResourceSampler(AERIAL_PERSPECTIVE_LUT_SAMPLER, linearSampler);
+  if (m_aerialPerspectiveSampler.ptr() == nullptr) {
+    DxvkSamplerCreateInfo samplerInfo = {};
+    samplerInfo.magFilter = VK_FILTER_LINEAR;
+    samplerInfo.minFilter = VK_FILTER_LINEAR;
+    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    m_aerialPerspectiveSampler = m_device->createSampler(samplerInfo);
+  }
+  ctx->bindResourceSampler(AERIAL_PERSPECTIVE_LUT_SAMPLER, m_aerialPerspectiveSampler);
   ctx->bindResourceView(AERIAL_PERSPECTIVE_LUT_OUTPUT, m_aerialPerspectiveLut.view, nullptr);
 
   ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_transmittanceLut.image);
   ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_multiscatteringLut.image);
   ctx->getCommandList()->trackResource<DxvkAccess::Write>(m_aerialPerspectiveLut.image);
 
-  ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, AerialPerspectiveLutShader::getShader());
-
-  // One thread per screen column; the shader walks that column's depth slices itself, so the
-  // dispatch is 2D over the volume's face rather than 3D over its froxels.
+  const bool traceScene = (args.aerialPerspectiveSceneShadowMode == 1u
+    || args.aerialPerspectiveSceneShadowMode == 3u) && args.aerialPerspectiveSceneShadowRange > 0.0f;
+  const bool separateVisibility = traceScene && aerialPerspectiveSeparateVisibility();
   const uint32_t groups = (lutSizeXY + 7) / 8;
-  ctx->dispatch(groups, groups, 1);
+  if (separateVisibility) {
+    if (!m_aerialPerspectiveVisibility.isValid()
+        || m_aerialPerspectiveVisibility.image->info().extent.width != lutSizeXY
+        || m_aerialPerspectiveVisibility.image->info().extent.depth != lutSizeZ) {
+      m_aerialPerspectiveVisibility = Resources::createImageResource(
+        ctx, "Atmosphere Aerial Perspective Visibility", { lutSizeXY, lutSizeXY, lutSizeZ },
+        VK_FORMAT_R32_UINT, 1, VK_IMAGE_TYPE_3D, VK_IMAGE_VIEW_TYPE_3D, 0,
+        VK_IMAGE_USAGE_STORAGE_BIT, VkClearColorValue{}, 1);
+    }
+    ctx->bindResourceView(AERIAL_PERSPECTIVE_LUT_VISIBILITY, m_aerialPerspectiveVisibility.view, nullptr);
+    ctx->getCommandList()->trackResource<DxvkAccess::Write>(m_aerialPerspectiveVisibility.image);
+    {
+      ScopedGpuProfileZone(ctx, "Atmosphere Aerial Perspective Visibility");
+      ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, AerialPerspectiveVisibilityShader::getShader());
+      ctx->dispatch(groups, groups, 1);
+    }
+    ctx->emitMemoryBarrier(0, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+    ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_aerialPerspectiveVisibility.image);
+  } else {
+    ctx->bindResourceView(AERIAL_PERSPECTIVE_LUT_VISIBILITY, nullptr, nullptr);
+    m_aerialPerspectiveVisibility = {};
+  }
+
+  {
+    ScopedGpuProfileZone(ctx, "Atmosphere Aerial Perspective Integration");
+    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, separateVisibility
+      ? AerialPerspectiveIntegrateShader::getShader()
+      : traceScene ? AerialPerspectiveLutShader::getShader() : AerialPerspectiveUnshadowedShader::getShader());
+    ctx->dispatch(groups, groups, 1);
+  }
 }
 
 void RtxAtmosphere::dispatchCloudSkyTransmittanceLut(Rc<DxvkContext> ctx) {

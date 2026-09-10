@@ -20,6 +20,17 @@
 * DEALINGS IN THE SOFTWARE.
 */
 
+// NV-DXVK start: Compile tracing separately from cached and unshadowed integration.
+//!variant aerial_perspective_lut.comp
+//!variant aerial_perspective_visibility.comp
+//!>       AP_VISIBILITY_PASS
+//!variant aerial_perspective_integrate.comp
+//!>       AP_CACHED_VISIBILITY
+//!variant aerial_perspective_unshadowed.comp
+//!>       AP_UNSHADOWED
+//!end-variants
+// NV-DXVK end
+
 // Aerial perspective volume bake (Hillaire EGSR 2020, Section 5.4).
 //
 // See the block comment above evalAtmosphereInScatterSegment in atmosphere_common.slangh for what
@@ -44,9 +55,44 @@ Texture2D<float4> multiscatteringLutInput;
 layout(binding = AERIAL_PERSPECTIVE_LUT_SAMPLER)
 SamplerState lutSampler;
 
+// NV-DXVK start: Visibility is an integer mask, never filtered or temporally reused.
+#if defined(AP_VISIBILITY_PASS)
+layout(binding = AERIAL_PERSPECTIVE_LUT_VISIBILITY, r32ui)
+RWTexture3D<uint> aerialPerspectiveVisibilityOutput;
+#else
 layout(binding = AERIAL_PERSPECTIVE_LUT_OUTPUT, rgba16f)
 RWTexture3D<float4> aerialPerspectiveLutOutput;
+#endif
 
+#if defined(AP_CACHED_VISIBILITY)
+layout(binding = AERIAL_PERSPECTIVE_LUT_VISIBILITY)
+Texture3D<uint> aerialPerspectiveVisibilityInput;
+
+struct SceneSunOccluder : IAtmosphereSunOccluder {
+  uint visibility;
+
+  float skyVisibility(float distanceKm) {
+    return float(visibility >> 6u) / 6.0f;
+  }
+
+  float sunVisibility(float distanceKm, uint sampleIndex) {
+    return float((visibility >> sampleIndex) & 1u);
+  }
+};
+#elif defined(AP_UNSHADOWED)
+struct SceneSunOccluder : IAtmosphereSunOccluder {
+  uint mode;
+  float maxTraceDistance;
+
+  float skyVisibility(float distanceKm) {
+    return mode == 2u ? 0.0f : 1.0f;
+  }
+
+  float sunVisibility(float distanceKm, uint sampleIndex) {
+    return mode == 2u && maxTraceDistance > 0.0f ? 0.0f : 1.0f;
+  }
+};
+#else
 layout(binding = AERIAL_PERSPECTIVE_LUT_ACCELERATION_STRUCTURE)
 RaytracingAccelerationStructure sceneTlas;
 
@@ -159,7 +205,7 @@ struct SceneSunOccluder : IAtmosphereSunOccluder {
     return float(unoccluded) / float(kProbeCount);
   }
 
-  float sunVisibility(float distanceKm) {
+  float sunVisibility(float distanceKm, uint sampleIndex) {
     if (mode == 0u || !(maxTraceDistance > 0.0f)) {
       return 1.0f;
     }
@@ -189,6 +235,8 @@ struct SceneSunOccluder : IAtmosphereSunOccluder {
     return sunOccluded ? 0.0f : 1.0f;
   }
 };
+#endif
+// NV-DXVK end
 
 // Sub-steps per slice. Each slice spans a fixed FRACTION of its own distance under the exponential
 // distribution, so a constant count here buys constant relative accuracy the whole way out.
@@ -221,9 +269,15 @@ void main(uint3 threadId : SV_DispatchThreadID) {
   const vec3 rayVectorWorld = aerialPerspectiveViewRayDirection(uv, args);
   const float forwardToRayLength = length(rayVectorWorld);
   if (!(forwardToRayLength > 0.0f)) {
+#if defined(AP_VISIBILITY_PASS)
+    for (uint emptySlice = 0u; emptySlice < depthSlices; ++emptySlice) {
+      aerialPerspectiveVisibilityOutput[uint3(threadId.xy, emptySlice)] = 0u;
+    }
+#else
     for (uint emptySlice = 0u; emptySlice < depthSlices; ++emptySlice) {
       aerialPerspectiveLutOutput[uint3(threadId.xy, emptySlice)] = float4(0.0f, 0.0f, 0.0f, 1.0f);
     }
+#endif
     return;
   }
 
@@ -243,6 +297,7 @@ void main(uint3 threadId : SV_DispatchThreadID) {
   // The march runs in the atmosphere's Y-up km frame, but the scene TLAS is in world space, so the
   // occluder carries the same ray expressed in world units alongside the world-space sun direction.
   SceneSunOccluder sunOccluder;
+#if !defined(AP_CACHED_VISIBILITY) && !defined(AP_UNSHADOWED)
   sunOccluder.worldOrigin = args.cameraPosition;
   sunOccluder.worldDirection = rayDirWorld;
   sunOccluder.worldSunDirection = normalize(
@@ -252,9 +307,51 @@ void main(uint3 threadId : SV_DispatchThreadID) {
   sunOccluder.worldUpDirection = normalize(
     atmosphereYUpToWorld(vec3(0.0f, 1.0f, 0.0f), args.isZUp != 0, args.flipUpAxis != 0));
   sunOccluder.worldUnitsPerKm = args.aerialPerspectiveWorldUnitsPerKm;
+#endif
+#if !defined(AP_CACHED_VISIBILITY)
   sunOccluder.maxTraceDistance = args.aerialPerspectiveSceneShadowRange;
   sunOccluder.mode = args.aerialPerspectiveSceneShadowMode;
+#endif
 
+#if defined(AP_VISIBILITY_PASS)
+  // Preserve the same loop-carried depth arithmetic as the fused reference.
+  float segmentStartKm = aerialPerspectiveSliceNearDistance(args) * forwardToRayLength * kmPerWorldUnit;
+  for (uint slice = 0u; slice < depthSlices; ++slice) {
+    const float w = (float(slice) + 0.5f) / float(depthSlices);
+    const float segmentEndKm = aerialPerspectiveSliceToForwardDistance(w, args) * forwardToRayLength * kmPerWorldUnit;
+    const float t0 = max(atmosphereRay.nearDistance, segmentStartKm);
+    const float t1 = segmentEndKm > 0.0f ? min(atmosphereRay.farDistance, segmentEndKm) : atmosphereRay.farDistance;
+    uint visibility = 63u | (6u << 6u);
+    const float skyDistanceKm = (segmentStartKm + segmentEndKm) * 0.5f;
+    const bool beyondSceneRange = t0 * args.worldUnitsPerKm > sunOccluder.maxTraceDistance
+      && skyDistanceKm * args.worldUnitsPerKm > sunOccluder.maxTraceDistance;
+    if (segmentEndKm > segmentStartKm && t1 > t0 && !beyondSceneRange) {
+      if (args.multiScatterStrength != 0.0f) {
+        const float skyVisibility = sunOccluder.skyVisibility((segmentStartKm + segmentEndKm) * 0.5f);
+        visibility = 63u | (uint(round(skyVisibility * 6.0f)) << 6u);
+      }
+      float stepStart = 0.0f;
+      for (int i = 0; i < kStepsPerSlice; ++i) {
+        const AtmosphereInScatterStep step = getAtmosphereInScatterStep(
+          i, 1.0f / float(kStepsPerSlice), t0, t1 - t0, stepStart);
+        if (step.length <= 0.0f) {
+          continue;
+        }
+        const vec3 sunShadowing = evalSunShadowingClampedToSurface(
+          rayOrigin + rayDir * step.distance, sunDir, transmittanceLutInput, lutSampler, args);
+        if (any(sunShadowing != vec3(0.0f))) {
+          if (sunOccluder.sunVisibility(step.distance, uint(i)) == 0.0f) {
+            visibility &= ~(1u << uint(i));
+          }
+        }
+      }
+    }
+    aerialPerspectiveVisibilityOutput[uint3(threadId.xy, slice)] = visibility;
+    if (segmentEndKm > segmentStartKm) {
+      segmentStartKm = segmentEndKm;
+    }
+  }
+#else
   // Running totals from the near bound out to the slice currently being written. Everything nearer
   // than that bound belongs to the global volumetrics froxel grid.
   vec3 inScatter = vec3(0.0f);
@@ -269,6 +366,9 @@ void main(uint3 threadId : SV_DispatchThreadID) {
       aerialPerspectiveSliceToForwardDistance(w, args) * forwardToRayLength * kmPerWorldUnit;
 
     if (segmentEndKm > segmentStartKm) {
+#if defined(AP_CACHED_VISIBILITY)
+      sunOccluder.visibility = aerialPerspectiveVisibilityInput.Load(int4(threadId.xy, slice, 0));
+#endif
       // Compose this segment onto the running totals. Both terms are along the same ray, so the
       // segment's in-scatter arrives at the camera through the transmittance already accumulated
       // in front of it, and the two transmittances simply multiply.
@@ -292,4 +392,5 @@ void main(uint3 threadId : SV_DispatchThreadID) {
     aerialPerspectiveLutOutput[uint3(threadId.xy, slice)] =
       float4(inScatter, saturate(meanTransmittance));
   }
+#endif
 }
