@@ -160,3 +160,30 @@ Final output: `_Comp64Release/core-render-validation/cache-capture-final-results
 An experimental early material rejection in `handleVisibilityVertex` avoided geometry reconstruction for unsupported material types and thick translucent surfaces. An instrumented probe comparing the original and first candidate function bodies passed 65,536 control-flow/output cases, including signed zero, NaN, clipping, viewmodels, and visibility modes. Geometry/material helpers were mocked, so this was not full scene validation.
 
 Actual direct-lighting ray-query pipeline statistics on the RTX 5080 Laptop GPU showed shared memory increasing from 6.5 KiB to 12 KiB. Shortening the material's live range reduced this to 9 KiB, still above baseline; register count remained 255. Without representative game timings, this tradeoff is not established as a speedup. The visibility shader was restored to its committed baseline and the experiment is not included in the runtime. Exploratory probes and statistics remain under `_Comp64Release/visibility-validation/`.
+
+## Follow-up: shared binding path and NRC handoff — 2026-09-10
+
+The NRC-focused audit found repeated driver object creation in the common resource-binding path. `RtxContext::bindCommonRayTracingResources` calls `RtxAtmosphere::bindResources`, which created a cloud-noise sampler and sky-view sampler on every invocation. This path is shared by GBuffer, direct/indirect integration, NEE and RTXDI passes; it is not specific to ReSTIR GI. The number of executed calls depends on the enabled passes, so the number of source call sites is not a per-frame measurement.
+
+Both samplers are now lazily retained as `Rc<DxvkSampler>` members of the device-owned atmosphere subsystem. After the first call, these two sites issue no sampler creation calls. Existing bindings and command-list lifetime tracking still run. Every sampler creation setting is unchanged, including the cloud sampler's implicit zero maximum LOD and the sky sampler's unlimited maximum LOD. These are texture sampler object lifetimes; no importance-sampling algorithm or shader has changed.
+
+Validation includes a source comparison of both complete configuration blocks, a release build, and a standalone Vulkan driver probe (`scripts-common/benchmark_common_samplers.cpp`). The probe creates the two exact Vulkan configurations, retaining 64 pairs per batch before destruction. It discards four warmup batches and takes the median of 20 measured batches. It measures driver creation/destruction only, excluding Remix object allocation, hashing, binding, GPU use, and delayed command-list retirement. Vulkan validation accepted all 3,072 sampler creations with no messages. This is not a game FPS or image comparison.
+
+With the release build finished and validation disabled, the RTX 5080 Laptop GPU's driver measured **0.397 µs per created/destroyed pair** (batch range 0.389–0.873 µs). This is a small CPU saving, not evidence that object creation is the major rendering bottleneck. Build log: `_Comp64Release/core-render-common-binding-build.txt`; probe logs: `_Comp64Release/core-render-validation/common-sampler-final-results.txt`, `common-sampler-validation-results.txt`, and empty error/validation logs. No game deployment was performed.
+
+Reproduce from the MSVC PowerShell environment initialized above:
+
+```powershell
+cl /nologo /std:c++17 /O2 /EHsc /I include/vulkan/include scripts-common/benchmark_common_samplers.cpp /Fe:_Comp64Release/core-render-validation/benchmark_common_samplers.exe /Fo:_Comp64Release/core-render-validation/benchmark_common_samplers.obj /link /LIBPATH:C:/VulkanSDK/1.4.357.0/Lib vulkan-1.lib
+.\_Comp64Release\core-render-validation\benchmark_common_samplers.exe
+```
+
+### NRC synchronization remains a profiling target
+
+NRC uses raw pre-training and pre-resolve Vulkan barriers alongside DXVK's pending barrier tracker. The four-byte training-counter copy between SDK query/training and resolve can flush that tracker; buffer accesses contribute to a global memory barrier, and NRC buffer metadata uses `ALL_COMMANDS` as its stage mask. This is a plausible synchronization cost, not a demonstrated redundant barrier or measured GPU bottleneck.
+
+An unconditional move of the counter copy after resolve was withheld: the local SDK contract in `submodules/nrc/Include/NrcVk.h` explicitly lists counters among SDK `Resolve` outputs. The optional SDK/debug resolve paths can therefore change what the delayed readback observes. The default custom resolve does not bind the counter, but a conditional reorder still needs validation of SDK write visibility and the emitted DXVK barriers.
+
+Next profiling should cover indirect integration, SDK query/training, counter transfer, and custom/SDK resolve separately, recording stage/access masks as well as GPU timestamps. Preserve the frames-in-flight counter ring, adaptive training, debug modes, and ray-query/trace-ray variants. Do not remove synchronization solely because two barrier mechanisms coexist.
+
+Repeated common bindings also cause CPU reference-count and tracking work, but driver descriptor updates are batched at dispatch. Pass-specific changes often already require a new descriptor set; eliminating repeated setters does not automatically eliminate that update. Sparse preparation fusion remains an opt-in optimization because sparse rendering defaults off in this checkout.

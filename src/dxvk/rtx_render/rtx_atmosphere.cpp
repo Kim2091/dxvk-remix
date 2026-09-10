@@ -3356,7 +3356,7 @@ void RtxAtmosphere::bindResources(RtxContext& ctx) {
   // allocated and swapped in updateFrame -- only these dead bindings are gone.
 
   // REPEAT wrapping matches the shader's frac-based tilable texcoords.
-  {
+  if (m_cloudNoiseSampler.ptr() == nullptr) {
     DxvkSamplerCreateInfo samplerInfo = {};
     samplerInfo.magFilter    = VK_FILTER_LINEAR;
     samplerInfo.minFilter    = VK_FILTER_LINEAR;
@@ -3364,13 +3364,13 @@ void RtxAtmosphere::bindResources(RtxContext& ctx) {
     samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    Rc<DxvkSampler> cloudNoiseSampler = ctx.getDevice()->createSampler(samplerInfo);
-    ctx.bindResourceSampler(BINDING_ATMOSPHERE_CLOUD_NOISE_SAMPLER, cloudNoiseSampler);
+    m_cloudNoiseSampler = m_device->createSampler(samplerInfo);
   }
+  ctx.bindResourceSampler(BINDING_ATMOSPHERE_CLOUD_NOISE_SAMPLER, m_cloudNoiseSampler);
 
   // REPEAT-U for azimuth wraparound; CLAMP-V prevents pole rows mixing into
   // zenith/nadir. The secondary cloud LUT is mipmapped.
-  {
+  if (m_skyViewSampler.ptr() == nullptr) {
     DxvkSamplerCreateInfo samplerInfo = {};
     samplerInfo.magFilter    = VK_FILTER_LINEAR;
     samplerInfo.minFilter    = VK_FILTER_LINEAR;
@@ -3379,9 +3379,9 @@ void RtxAtmosphere::bindResources(RtxContext& ctx) {
     samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     samplerInfo.mipmapLodMax = VK_LOD_CLAMP_NONE;
-    Rc<DxvkSampler> skyViewSampler = ctx.getDevice()->createSampler(samplerInfo);
-    ctx.bindResourceSampler(BINDING_ATMOSPHERE_SKY_VIEW_SAMPLER, skyViewSampler);
+    m_skyViewSampler = m_device->createSampler(samplerInfo);
   }
+  ctx.bindResourceSampler(BINDING_ATMOSPHERE_SKY_VIEW_SAMPLER, m_skyViewSampler);
 }
 
 namespace {

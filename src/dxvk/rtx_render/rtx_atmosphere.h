@@ -1558,6 +1558,8 @@ private:
   Resources::Resource m_aerialPerspectiveLut;
   Resources::Resource m_aerialPerspectiveVisibility;
   Rc<DxvkSampler> m_aerialPerspectiveSampler;
+  Rc<DxvkSampler> m_cloudNoiseSampler;
+  Rc<DxvkSampler> m_skyViewSampler;
   Resources::Resource m_cloudSkyTransmittanceLut;
   Resources::Resource m_cloudDSun;
   Resources::Resource m_cloudDAmbient;
