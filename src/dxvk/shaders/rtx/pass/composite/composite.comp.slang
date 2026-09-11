@@ -38,7 +38,7 @@
 
 #include "rtx/algorithm/volume_composite_helpers.slangh"
 #include "rtx/algorithm/accumulate.slangh"
-#include "rtx/pass/atmosphere/atmosphere_common.slangh"
+#include "rtx/pass/atmosphere/aerial_perspective_camera.slangh"
 // NV-DXVK start: Use the active camera projection for Numos clouds.
 #include "rtx/pass/atmosphere/cloud_camera.slangh"
 // NV-DXVK end
@@ -648,7 +648,7 @@ void applyAerialPerspective(
   // miss path left behind), which is why it is replaced rather than clamped.
   const vec3 uvw = primaryMiss
     ? vec3(screenUV, 1.0f)
-    : aerialPerspectiveScreenUvToUvw(screenUV, viewDistance, cb.atmosphereArgs);
+    : aerialPerspectiveScreenUvToUvw(screenUV, viewDistance, cb.camera, cb.atmosphereArgs);
 
   // Atmospheric term: primary hits only.
   //
@@ -1432,7 +1432,7 @@ void applyCloudComposite(
     // sits in the world, and that is the column the haze has to be integrated over.
     const float cloudDistanceWorld = meanKm * args.worldUnitsPerKm;
     const vec2 cloudScreenUV = cameraPixelCoordinateToScreenUV(cb.camera, ivec2(pixelCoordinate));
-    const vec3 cloudUvw = aerialPerspectiveScreenUvToUvw(cloudScreenUV, cloudDistanceWorld, args);
+    const vec3 cloudUvw = aerialPerspectiveScreenUvToUvw(cloudScreenUV, cloudDistanceWorld, cb.camera, args);
     // Same two guards applyAerialPerspective uses: inside the volumetrics grid's own range there is
     // nothing left for this volume to add, and the near fade holds it off the near field entirely.
     // Both are essentially always satisfied at cloud distance; they are here so the cloud path

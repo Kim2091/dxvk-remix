@@ -114,6 +114,7 @@ namespace dxvk {
         STRUCTURED_BUFFER(7)
         STRUCTURED_BUFFER(8)
         RW_TEXTURE3D(9)
+        CONSTANT_BUFFER(AERIAL_PERSPECTIVE_LUT_CAMERA)
       END_PARAMETER()
     };
     PREWARM_SHADER_PIPELINE(AerialPerspectiveLutShader);
@@ -129,6 +130,7 @@ namespace dxvk {
         RW_TEXTURE3D(6)
         STRUCTURED_BUFFER(7)
         STRUCTURED_BUFFER(8)
+        CONSTANT_BUFFER(AERIAL_PERSPECTIVE_LUT_CAMERA)
       END_PARAMETER()
     };
     PREWARM_SHADER_PIPELINE(AerialPerspectiveVisibilityShader);
@@ -146,6 +148,7 @@ namespace dxvk {
         STRUCTURED_BUFFER(7)
         STRUCTURED_BUFFER(8)
         RW_TEXTURE3D(9)
+        CONSTANT_BUFFER(AERIAL_PERSPECTIVE_LUT_CAMERA)
       END_PARAMETER()
     };
     PREWARM_SHADER_PIPELINE(AerialPerspectiveIntegrateShader);
@@ -162,6 +165,7 @@ namespace dxvk {
         STRUCTURED_BUFFER(7)
         STRUCTURED_BUFFER(8)
         RW_TEXTURE3D(9)
+        CONSTANT_BUFFER(AERIAL_PERSPECTIVE_LUT_CAMERA)
       END_PARAMETER()
     };
     PREWARM_SHADER_PIPELINE(AerialPerspectiveUnshadowedShader);
@@ -173,6 +177,7 @@ namespace dxvk {
         CONSTANT_BUFFER(0)
         STRUCTURED_BUFFER(1)
         RW_STRUCTURED_BUFFER(2)
+        CONSTANT_BUFFER(AERIAL_PERSPECTIVE_LIGHT_CULL_CAMERA)
       END_PARAMETER()
     };
     PREWARM_SHADER_PIPELINE(AerialPerspectiveLightCullShader);
@@ -327,7 +332,7 @@ RtxAtmosphere::RtxAtmosphere(DxvkDevice* device)
   info.size = sizeof(AtmosphereArgs);
   m_constantsBuffer = device->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXBuffer, "Atmosphere constants buffer");
   info.size = sizeof(Camera);
-  m_cloudCameraBuffer = device->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXBuffer, "Cloud camera constants buffer");
+  m_cameraBuffer = device->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXBuffer, "Atmosphere camera constants buffer");
 }
 
 RtxAtmosphere::~RtxAtmosphere() {
@@ -476,9 +481,6 @@ namespace {
     args.aerialPerspectiveLocalLightIntensity = 0.0f;
     args.aerialPerspectiveLocalLightShadowRange = 0.0f;
     args.cameraPosition              = vec3(0.0f, 0.0f, 0.0f);
-    args.cameraForward               = vec3(0.0f, 0.0f, 0.0f);
-    args.cameraRight                 = vec3(0.0f, 0.0f, 0.0f);
-    args.cameraUp                    = vec3(0.0f, 0.0f, 0.0f);
     args.skyIndirectRadianceScale    = 0.0f;
     args.lightningStrikePosKm        = vec3(0.0f, 0.0f, 0.0f);
     args.lightningFlashIntensity     = 0.0f;
@@ -1292,8 +1294,7 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
     args.cloudUndersideLightSigma = wx ? wx->cloudUndersideLightSigma : RtxAtmosphere::cloudUndersideLightSigma();
   }
 
-  // Aerial perspective. The camera basis is filled in per frame by
-  // fillAerialPerspectiveArgs(); only the camera-independent scalars are set here.
+  // Camera matrices are uploaded separately; these parameters describe the medium and depth range.
   {
     // Keep the legacy scene-scale conversion until a game supplies a dedicated calibration. Scene
     // scale drives several unrelated systems and is not a reliable measurement of the world space
@@ -1353,9 +1354,6 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
     args.isZUp = RtxOptions::zUp() ? 1u : 0u;
     args.flipUpAxis = RtxAtmosphere::flipUpAxis() ? 1u : 0u;
     args.cameraPosition = m_apCameraPosition;
-    args.cameraForward = m_apCameraForward;
-    args.cameraRight = m_apCameraRight;
-    args.cameraUp = m_apCameraUp;
 
     // Hand off to the global volumetrics froxel grid: everything nearer than its range is already
     // integrated there, so the atmospheric march starts past it rather than double counting.
@@ -2086,24 +2084,29 @@ void RtxAtmosphere::dispatchSkyViewLut(Rc<DxvkContext> ctx) {
 }
 
 void RtxAtmosphere::setAerialPerspectiveCamera(const RtCamera& camera) {
-  // Frustum half extents at unit forward distance, so a ray built from this basis always has a
-  // forward component of exactly one and the slice index maps linearly to forward distance.
-  //
-  // Kept in world space rather than the atmosphere's Y-up km frame: the composite pass reconstructs
-  // the same basis from a screen UV, and the bake swaps to Y-up itself once it has a direction.
-  // freecam=true matches the active camera used by the cloud screen pass.
-  const float tanHalfFovY = std::tan(camera.getFov() * 0.5f);
-  const float tanHalfFovX = tanHalfFovY * camera.getAspectRatio();
-
-  // Note the bake subtracts cameraPosition straight back off, so only the basis actually drives the
-  // volume; the position is carried for completeness.
-  // freecam=true to match the basis on the next three lines (fork -- 2026-09-06, open issue #6);
-  // no-op unless the free camera is enabled. Was false, which oriented this volume to the free
-  // camera while positioning it at the player.
   m_apCameraPosition = camera.getPosition(/*freecam=*/true);
-  m_apCameraForward = camera.getDirection(/*freecam=*/true);
-  m_apCameraRight = camera.getRight(/*freecam=*/true) * tanHalfFovX;
-  m_apCameraUp = camera.getUp(/*freecam=*/true) * tanHalfFovY;
+  m_apCameraForward = normalize(camera.getDirection(/*freecam=*/true));
+
+  // Match the shader's inverse projection, including signed axes and off-center frusta.
+  const Matrix4 projectionToView { camera.getProjectionToView() };
+  const Matrix4 viewToWorld { camera.getViewToWorld(/*freecam=*/true) };
+  const Vector2 corners[] = {
+    Vector2(-1.0f, -1.0f), Vector2(1.0f, -1.0f), Vector2(1.0f, 1.0f), Vector2(-1.0f, 1.0f)
+  };
+  Vector3 rays[4];
+  for (uint32_t i = 0; i < 4; ++i) {
+    const Vector4 view = projectionToView * Vector4(corners[i].x, corners[i].y, 1.0f, 1.0f);
+    rays[i] = normalize((viewToWorld * Vector4(view.x, view.y, view.z, 0.0f)).xyz());
+  }
+  const Vector3 centerRay = rays[0] + rays[1] + rays[2] + rays[3];
+  for (uint32_t i = 0; i < 4; ++i) {
+    const Vector3 normal = cross(rays[i], rays[(i + 1) % 4]);
+    const float normalLength = length(normal);
+    m_apFrustumPlanes[i] = normalLength > 1e-6f ? normal / normalLength : Vector3(0.0f);
+    if (dot(m_apFrustumPlanes[i], centerRay) < 0.0f) {
+      m_apFrustumPlanes[i] = -m_apFrustumPlanes[i];
+    }
+  }
 }
 
 namespace {
@@ -2202,17 +2205,6 @@ void RtxAtmosphere::buildAerialPerspectiveLights(Rc<DxvkContext> ctx) {
   const float maxInfluence =
     std::max(RtxAtmosphere::aerialPerspectiveDepthRangeMeters() * worldUnitsPerMeter, 1.0f);
 
-  // View frustum of the volume, in the same pre-scaled basis the bake builds its rays from: the
-  // stored right/up carry the half extents at unit forward distance, which is exactly the tangent of
-  // each half angle.
-  const float tanHalfFovX = std::max(length(m_apCameraRight), 1e-6f);
-  const float tanHalfFovY = std::max(length(m_apCameraUp), 1e-6f);
-  const Vector3 rightUnit = m_apCameraRight / tanHalfFovX;
-  const Vector3 upUnit = m_apCameraUp / tanHalfFovY;
-  const Vector3 forwardUnit = m_apCameraForward;
-  const float invRightPlaneNorm = 1.0f / std::sqrt(1.0f + tanHalfFovX * tanHalfFovX);
-  const float invUpPlaneNorm = 1.0f / std::sqrt(1.0f + tanHalfFovY * tanHalfFovY);
-
   struct RankedLight {
     AerialPerspectiveLight light;
     float score;
@@ -2251,17 +2243,16 @@ void RtxAtmosphere::buildAerialPerspectiveLights(Rc<DxvkContext> ctx) {
     // cull pass a per-cluster test. Planes rather than a bounding sphere here because the frustum is
     // long and narrow and a sphere around it would reject almost nothing.
     const Vector3 relative = position - m_apCameraPosition;
-    const float forward = dot(relative, forwardUnit);
-    const float lateralX = dot(relative, rightUnit);
-    const float lateralY = dot(relative, upUnit);
+    const float forward = dot(relative, m_apCameraForward);
 
     if (forward + influenceRadius < 0.0f || forward - influenceRadius > maxInfluence) {
       continue;
     }
-    if ((std::abs(lateralX) - tanHalfFovX * forward) * invRightPlaneNorm > influenceRadius) {
-      continue;
+    bool outsideFrustum = false;
+    for (const Vector3& plane : m_apFrustumPlanes) {
+      outsideFrustum |= dot(relative, plane) < -influenceRadius;
     }
-    if ((std::abs(lateralY) - tanHalfFovY * forward) * invUpPlaneNorm > influenceRadius) {
+    if (outsideFrustum) {
       continue;
     }
 
@@ -2386,6 +2377,8 @@ void RtxAtmosphere::dispatchAerialPerspectiveLightCull(Rc<DxvkContext> ctx) {
   ctx->updateBuffer(m_constantsBuffer, 0, sizeof(AtmosphereArgs), &args);
   ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_constantsBuffer);
 
+  ctx->bindResourceBuffer(AERIAL_PERSPECTIVE_LIGHT_CULL_CAMERA,
+    DxvkBufferSlice(m_cameraBuffer, 0, m_cameraBuffer->info().size));
   ctx->bindResourceBuffer(AERIAL_PERSPECTIVE_LIGHT_CULL_ATMOSPHERE_ARGS,
     DxvkBufferSlice(m_constantsBuffer, 0, m_constantsBuffer->info().size));
   ctx->bindResourceBuffer(AERIAL_PERSPECTIVE_LIGHT_CULL_LIGHTS,
@@ -2485,6 +2478,8 @@ void RtxAtmosphere::dispatchAerialPerspectiveLut(Rc<DxvkContext> ctx) {
   ctx->updateBuffer(m_constantsBuffer, 0, sizeof(AtmosphereArgs), &args);
   ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_constantsBuffer);
 
+  ctx->bindResourceBuffer(AERIAL_PERSPECTIVE_LUT_CAMERA,
+    DxvkBufferSlice(m_cameraBuffer, 0, m_cameraBuffer->info().size));
   ctx->bindResourceBuffer(AERIAL_PERSPECTIVE_LUT_ATMOSPHERE_ARGS, DxvkBufferSlice(m_constantsBuffer, 0, m_constantsBuffer->info().size));
   ctx->bindResourceView(AERIAL_PERSPECTIVE_LUT_TRANSMITTANCE_INPUT, m_transmittanceLut.view, nullptr);
   ctx->bindResourceView(AERIAL_PERSPECTIVE_LUT_MULTISCATTERING_INPUT, m_multiscatteringLut.view, nullptr);
@@ -3217,11 +3212,6 @@ void RtxAtmosphere::dispatchCloudRender(Rc<DxvkContext> ctx, const Resources::Ra
   ctx->updateBuffer(m_constantsBuffer, 0, sizeof(AtmosphereArgs), &args);
   ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_constantsBuffer);
 
-  // Match the primary-ray and composite camera, including the active free camera.
-  const Camera camera = ctx->getCommonObjects()->getSceneManager().getCamera().getShaderConstants();
-  ctx->updateBuffer(m_cloudCameraBuffer, 0, sizeof(Camera), &camera);
-  ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_cloudCameraBuffer);
-
   // Linear/REPEAT sampler for the Nubis3 volume + voxel grid taps. REPEAT
   // matches the frac()-tile-wrap convention used everywhere else in the
   // cloud math (cloudVoxelWorldToUVW and the Nubis3 sampler).
@@ -3271,7 +3261,7 @@ void RtxAtmosphere::dispatchCloudRender(Rc<DxvkContext> ctx, const Resources::Ra
   // not share numbering with the common ray-tracing bindings.
   ctx->bindResourceView(15, rtOutput.m_primaryLinearViewZ.view, nullptr);
   ctx->bindResourceView(16, m_cloudDepthRT.view, nullptr);
-  ctx->bindResourceBuffer(17, DxvkBufferSlice(m_cloudCameraBuffer, 0, m_cloudCameraBuffer->info().size));
+  ctx->bindResourceBuffer(17, DxvkBufferSlice(m_cameraBuffer, 0, m_cameraBuffer->info().size));
 
   ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_cloudDSun.image);
   ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_cloudDAmbient.image);
@@ -3697,6 +3687,9 @@ AtmosphereArgs RtxAtmosphere::updateFrame(RtxContext& ctx,
 
   // Aerial perspective is fitted to this frame's frustum; push before any getAtmosphereArgs read.
   setAerialPerspectiveCamera(camera);
+  const Camera shaderCamera = camera.getShaderConstants();
+  ctx.updateBuffer(m_cameraBuffer, 0, sizeof(Camera), &shaderCamera);
+  ctx.getCommandList()->trackResource<DxvkAccess::Read>(m_cameraBuffer);
 
   // Placement uses this frame's camera position and the active weather snapshot.
   advanceLightning(deltaTimeSeconds);

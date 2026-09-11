@@ -39,7 +39,7 @@
 // Camera-fitted, so unlike the transmittance / multiscattering / sky-view bakes this rebuilds every
 // frame, with six integration steps and six sky probes per depth slice in each screen column.
 
-#include "rtx/pass/atmosphere/atmosphere_common.slangh"
+#include "rtx/pass/atmosphere/aerial_perspective_camera.slangh"
 #include "rtx/pass/atmosphere/aerial_perspective_lights.slangh"
 #include "rtx/pass/atmosphere/aerial_perspective_lut_binding_indices.h"
 #include "rtx/pass/instance_definitions.h"   // OBJECT_MASK_OPAQUE (sun occlusion trace)
@@ -62,6 +62,11 @@ static const uint kLightVisibilityShift = 9u;
 
 layout(binding = AERIAL_PERSPECTIVE_LUT_ATMOSPHERE_ARGS)
 ConstantBuffer<AtmosphereArgs> atmosphereArgs;
+
+// NV-DXVK start: Shared active camera for the AP bake and light clusters.
+layout(binding = AERIAL_PERSPECTIVE_LUT_CAMERA)
+ConstantBuffer<Camera> atmosphereCamera;
+// NV-DXVK end
 
 // Compact scene lights and the per-cluster index lists the cull pass wrote. Both are bound in every
 // variant: the cull pass leaves every cluster count at zero when the feature is off, which is the
@@ -407,10 +412,8 @@ void main(uint3 threadId : SV_DispatchThreadID) {
 
   const vec2 uv = (vec2(threadId.xy) + 0.5f) / float(size);
 
-  // The basis is pre-scaled by the frustum half extents at unit forward distance, so this vector's
-  // forward component is exactly one and its length converts a slice's forward distance into a
-  // distance along the ray.
-  const vec3 rayVectorWorld = aerialPerspectiveViewRayDirection(uv, args);
+  // The exact active projection supplies both the world ray and the view-depth conversion.
+  const vec3 rayVectorWorld = aerialPerspectiveViewRayDirection(uv, atmosphereCamera);
   const float forwardToRayLength = length(rayVectorWorld);
   if (!(forwardToRayLength > 0.0f)) {
 #if defined(AP_VISIBILITY_PASS)

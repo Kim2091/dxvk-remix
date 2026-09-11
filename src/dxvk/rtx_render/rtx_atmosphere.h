@@ -90,9 +90,7 @@ public:
   // local lights are off, so consumers bind it unconditionally and test the light count instead.
   Resources::Resource getAerialPerspectiveLocalLut() const { return m_aerialPerspectiveLocalLut; }
 
-  // Cache the camera frustum basis the aerial perspective volume is fitted to. Same push-then-read
-  // shape as setCloudShadowCameraPosition: call once per frame before computeLuts, since the const
-  // getAtmosphereArgs() runs many times per frame and cannot derive this itself.
+  // Cache the active camera origin and frustum planes for the CPU scene-light prefilter.
   void setAerialPerspectiveCamera(const RtCamera& camera);
 
   // 2D R16F baked per frame; attenuates sky-view radiance by cloud coverage per hemisphere direction.
@@ -1710,14 +1708,10 @@ private:
   float    m_timeOfDayHours             { 12.0f };
   float    m_lastAuthoredTimeOfDayHours { -1.0f };
 
-  // Aerial perspective camera basis, in world units. Right/Up are pre-scaled by the frustum half
-  // extents at unit forward distance. Pushed by setAerialPerspectiveCamera(), read by
-  // getAtmosphereArgs(). Defaults form a degenerate basis, which the shader tolerates (the volume
-  // simply collapses to the camera position) until the first push lands.
-  Vector3  m_apCameraPosition      { 0.0f, 0.0f, 0.0f };
-  Vector3  m_apCameraForward       { 0.0f, 0.0f, 1.0f };
-  Vector3  m_apCameraRight         { 1.0f, 0.0f, 0.0f };
-  Vector3  m_apCameraUp            { 0.0f, 1.0f, 0.0f };
+  // CPU light prefilter; shader rays use the shared active-camera constants buffer.
+  Vector3 m_apCameraPosition { 0.0f, 0.0f, 0.0f };
+  Vector3 m_apCameraForward { 0.0f, 0.0f, 1.0f };
+  Vector3 m_apFrustumPlanes[4] {};
 
   // Integrated once per frame by advanceCloudMotion(); read by getAtmosphereArgs().
   Vector2  m_cloudAdvectOffset     { 0.0f, 0.0f };
@@ -1743,7 +1737,7 @@ private:
   uint32_t            m_cloudHistoryLastFrameId = UINT32_MAX;
 
   Rc<DxvkBuffer> m_constantsBuffer;
-  Rc<DxvkBuffer> m_cloudCameraBuffer;
+  Rc<DxvkBuffer> m_cameraBuffer;
 
   AtmosphereArgs m_cachedArgs;
   // Per-LUT cache keys: normalizes out fields each bake doesn't read so moving sun/stars

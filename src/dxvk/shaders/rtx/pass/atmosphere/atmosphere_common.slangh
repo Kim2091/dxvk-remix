@@ -514,9 +514,18 @@ vec3 evalAtmosphereRadiance(
   
   // Clamp to valid range
   t0 = max(0.0f, t0);
-  if (hitsPlanet && tPlanet0 > 0.0f) {
-    t1 = tPlanet0;  // Stop at planet surface
+  // NV-DXVK start: Continue the sky behind terrain instead of drawing a virtual ground disc.
+  // Extend surface-density haze below the datum; grazing rays keep the atmosphere-shell endpoint.
+  const bool entersGround = hitsPlanet && tPlanet1 > 0.0f
+    && dot(rayDir, rayOrigin - planetCenter) < 0.0f;
+  if (entersGround) {
+    const float groundDistance = max(tPlanet0, 0.0f);
+    const vec3 groundNormal = normalize(rayOrigin + rayDir * groundDistance - planetCenter);
+    const float incidence = max(-dot(rayDir, groundNormal), 1e-4f);
+    const float hazeDepth = min(args.atmosphereThickness, args.planetRadius * 0.5f) / incidence;
+    t1 = min(t1, groundDistance + hazeDepth);
   }
+  // NV-DXVK end
   
   if (t1 <= t0) {
     return vec3(0.0f);
@@ -677,49 +686,6 @@ vec3 evalAtmosphereRadiance(
     
     L += contribution;
     transmittance *= sampleTransmittance;
-  }
-
-  // Ground radiance for rays that terminate on the planet (fork — 2026-09-05, world-space cloud
-  // migration Stage 1; ported verbatim from archaeology commit 30d20a8f5). Hillaire EGSR 2020's
-  // RenderSkyRayMarching does exactly this when its tGround is positive: shade the hit point as a
-  // Lambertian surface lit by the attenuated sun, and carry it back to the eye through the
-  // transmittance the march just accumulated.
-  //
-  //   L += T(eye -> ground) * albedo/pi * sunIlluminance * T(ground -> sun) * NdotL
-  //
-  // kGroundAlbedo is deliberately the SAME constant the multiscattering LUT bakes its ground bounce
-  // with (multiscattering_lut.comp.slang) - the two model the same surface, and letting them
-  // disagree would make the sky brighter than the ground it is supposedly bouncing off.
-  //
-  // Note what is NOT here: a skylight term. In shadow, or with the sun down, this ground goes to
-  // black and only the in-scattered haze in front of it remains, which is what distant unlit terrain
-  // genuinely looks like. The haze is doing the visible work at horizon distances anyway, so the
-  // lower hemisphere reads as terrain receding into air rather than as a painted band.
-  //
-  // hitsPlanet / tPlanet0 now actually fire (fork — 2026-09-05, world-space cloud migration Stage
-  // 2): getEyeRadius(args) carries a real cameraAltitudeKm term and planetCenter above is
-  // getPlanetCenter(args), so a ray aimed below the horizon meets the planet at a genuine
-  // tPlanet0 > 0 with real margin, instead of the near-zero margin Stage 1 described (eye welded
-  // exactly to the ground sphere, getEyeRadius(args) == args.planetRadius). This is the second
-  // half of the "flat dark disc" fix alongside evalSunShadowingClampedToSurface above — that one
-  // keeps below-horizon shadow sampling sane while the eye still sat on the surface; this one is
-  // what actually gives the below-horizon hemisphere a lit ground to terminate on now that the
-  // eye has somewhere to look down FROM.
-  if (hitsPlanet && tPlanet0 > 0.0f) {
-    const vec3 groundPos    = rayOrigin + rayDir * tPlanet0;
-    const vec3 groundNormal = normalize(groundPos - planetCenter);
-    const vec3 sunDirN      = normalize(sunDir);
-    const float NdotL       = max(dot(groundNormal, sunDirN), 0.0f);
-    if (NdotL > 0.0f) {
-      const vec3 sunTransmittanceToGround =
-        evalSunShadowing(groundPos, sunDirN, transmittanceLut, transmittanceLutSampler, args);
-      const vec3 groundRadiance = (kGroundAlbedo / kPi) * args.sunIlluminance
-                                * sunTransmittanceToGround * NdotL;
-      const vec3 groundContribution = transmittance * groundRadiance;
-      if (!any(isnan(groundContribution)) && !any(isinf(groundContribution))) {
-        L += groundContribution;
-      }
-    }
   }
 
   // Final sanitization: replace any NaN/Inf with zero
@@ -2322,12 +2288,9 @@ AtmosphereInScatterRay prepareAtmosphereInScatterRay(
 
   ray.nearDistance = max(0.0f, t0);
 
-  // Stop at the planet surface, then at the caller's far bound.
-  float tPlanet0, tPlanet1;
-  const bool hitsPlanet = intersectSphere(rayOrigin, rayDir, planetCenter, args.planetRadius, tPlanet0, tPlanet1);
-  if (hitsPlanet && tPlanet0 > 0.0f) {
-    t1 = min(t1, tPlanet0);
-  }
+  // NV-DXVK start: The datum is not terrain; scene depth bounds this finite volume.
+  // Density and sunlight remain clamped to the surface below the atmospheric datum.
+  // NV-DXVK end
   ray.farDistance = t1;
 
   const float cosTheta = dot(rayDir, sunDir);
@@ -2443,8 +2406,10 @@ vec3 evalAtmosphereInScatterSegment<TSunOccluder : IAtmosphereSunOccluder, TLoca
     // below stands in for every higher order, which reaches a shadowed sample from all directions
     // and so must survive the occlusion that kills the directional term. That is also what keeps a
     // shaded interior reading as softly hazy rather than snapping to black.
-    const vec3 sunShadowing = evalSunShadowing(
+    // NV-DXVK start: Match the sky bake and the cached visibility pass below the datum.
+    const vec3 sunShadowing = evalSunShadowingClampedToSurface(
       samplePos, sunDir, transmittanceLut, transmittanceLutSampler, args);
+    // NV-DXVK end
     float sceneSunVisibility = 1.0f;
     // A zero solar term stays zero under either production or inverted scene visibility.
     if (any(sunShadowing != vec3(0.0f))) {
@@ -2528,15 +2493,6 @@ vec3 evalAtmosphereInScatterSegment<TSunOccluder : IAtmosphereSunOccluder, TLoca
   return L;
 }
 
-// The volume is fitted to the camera frustum: uv spans the screen and w indexes depth.
-// cameraRight and cameraUp are pre-scaled by the frustum half extents at unit forward distance, so
-// the direction below always has a forward component of exactly one.
-vec3 aerialPerspectiveViewRayDirection(vec2 screenUv, AtmosphereArgs args) {
-  // Screen UV has its origin at the top left, so v grows downward while cameraUp points upward.
-  const vec2 ndc = vec2(screenUv.x * 2.0f - 1.0f, 1.0f - screenUv.y * 2.0f);
-  return args.cameraForward + args.cameraRight * ndc.x + args.cameraUp * ndc.y;
-}
-
 // Depth slices are distributed exponentially over [near, depthRange], which gives every slice the
 // same RELATIVE depth resolution: each is a fixed percentage further out than the last. With 32
 // slices from 20 m to 32 km that is ~26% per slice, so the step is ~6 m at 25 m and ~250 m at 1 km
@@ -2582,19 +2538,6 @@ float aerialPerspectiveForwardDistanceToSlice(float forwardDistance, AtmosphereA
   const float far = aerialPerspectiveSliceFarDistance(args);
 
   return saturate(log(max(forwardDistance, near) / near) / log(far / near));
-}
-
-// Screen UV plus a distance along the view ray to a volume UVW. The bake walks a whole column at a
-// time and needs only a direction and a slice distance, so this is the one direction of the mapping
-// that survives; the uvw-to-world-position form it used to pair with went with the per-froxel bake.
-vec3 aerialPerspectiveScreenUvToUvw(vec2 screenUv, float viewRayDistance, AtmosphereArgs args) {
-  const vec3 direction = aerialPerspectiveViewRayDirection(screenUv, args);
-  const float directionLength = max(length(direction), 1e-6f);
-
-  // Convert the distance along the view ray into a forward (slice) distance.
-  const float forwardDistance = viewRayDistance / directionLength;
-
-  return vec3(screenUv, aerialPerspectiveForwardDistanceToSlice(forwardDistance, args));
 }
 
 // Fraction of this volume's contribution a surface at `viewRayDistance` is allowed to receive.

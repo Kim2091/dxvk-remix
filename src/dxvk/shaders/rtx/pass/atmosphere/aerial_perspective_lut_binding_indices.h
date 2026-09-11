@@ -14,3 +14,6 @@
 #define AERIAL_PERSPECTIVE_LUT_LIGHT_CLUSTERS         8
 #define AERIAL_PERSPECTIVE_LUT_LOCAL_OUTPUT           9
 // NV-DXVK end
+// NV-DXVK start: Match sky/cloud camera projection.
+#define AERIAL_PERSPECTIVE_LUT_CAMERA 10
+// NV-DXVK end

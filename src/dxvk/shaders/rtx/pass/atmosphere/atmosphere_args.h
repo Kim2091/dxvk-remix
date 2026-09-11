@@ -707,20 +707,15 @@ struct AtmosphereArgs {
   float aerialPerspectiveStartDistance;
   uint isZUp;  // Non-zero when the game world is Z-up rather than the atmosphere's internal Y-up
 
-  // Camera basis in world units. cameraRight / cameraUp are pre-scaled by the frustum half extents
-  // at unit forward distance, so a ray built from them always has a forward component of exactly
-  // one and the slice index maps directly to forward distance.
+  // World-space origin for scene light and shadow queries. Rays use the active Camera buffer.
   vec3 cameraPosition;
   float padAerial0;
 
-  vec3 cameraForward;
-  float padAerial1;
-
-  vec3 cameraRight;
-  float padAerial2;
-
-  vec3 cameraUp;
-  float padAerial3;
+  // NV-DXVK start: Retain the shared layout after replacing the approximate camera basis.
+  vec4 padAerialCamera0;
+  vec4 padAerialCamera1;
+  vec4 padAerialCamera2;
+  // NV-DXVK end
 
   // Upper bound on the Mie anisotropy this volume's march may use; see
   // aerialPerspectiveMieAnisotropyMax in rtx_atmosphere.h for why the volume needs a tamer lobe

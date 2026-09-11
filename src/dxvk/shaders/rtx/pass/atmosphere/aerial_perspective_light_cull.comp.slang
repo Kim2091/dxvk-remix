@@ -36,12 +36,17 @@
 // anyway (see aerialPerspectiveLightInScatter). Over-inclusion here costs a rejected iteration;
 // under-inclusion would pop a light out of the fog, so the conservative direction is the cheap one.
 
-#include "rtx/pass/atmosphere/atmosphere_common.slangh"
+#include "rtx/pass/atmosphere/aerial_perspective_camera.slangh"
 #include "rtx/pass/atmosphere/aerial_perspective_lights.slangh"
 #include "rtx/pass/atmosphere/aerial_perspective_light_cull_binding_indices.h"
 
 layout(binding = AERIAL_PERSPECTIVE_LIGHT_CULL_ATMOSPHERE_ARGS)
 ConstantBuffer<AtmosphereArgs> atmosphereArgs;
+
+// NV-DXVK start: Shared active camera for the AP bake and light clusters.
+layout(binding = AERIAL_PERSPECTIVE_LIGHT_CULL_CAMERA)
+ConstantBuffer<Camera> atmosphereCamera;
+// NV-DXVK end
 
 layout(binding = AERIAL_PERSPECTIVE_LIGHT_CULL_LIGHTS)
 StructuredBuffer<AerialPerspectiveLight> aerialPerspectiveLights;
@@ -102,7 +107,7 @@ void main(uint3 threadId : SV_DispatchThreadID) {
       (corner & 2u) != 0u ? uvMax.y : uvMin.y);
     const float forward = (corner & 4u) != 0u ? farForward : nearForward;
 
-    corners[corner] = aerialPerspectiveViewRayDirection(uv, args) * forward;
+    corners[corner] = aerialPerspectiveViewRayDirection(uv, atmosphereCamera) * forward;
   }
 
   vec3 center = vec3(0.0f);
