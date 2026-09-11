@@ -58,6 +58,7 @@
 #include <rtx_shaders/cloud_detail_noise_baker.h>
 #include "rtx/pass/atmosphere/cloud_nvdf.h"
 #include "../../util/util_once.h"  // ONCE() — one-shot warn when the scene TLAS is unavailable
+#include "../../util/util_env.h"
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -318,6 +319,7 @@ namespace dxvk {
 
 RtxAtmosphere::RtxAtmosphere(DxvkDevice* device)
   : CommonDeviceObject(device) {
+  m_traceCloudPlacement = env::getEnvVar("RTX_NUMOS_TRACE_PLACEMENT") == "1";
   DxvkBufferCreateInfo info;
   info.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
   info.stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
@@ -3169,6 +3171,40 @@ void RtxAtmosphere::dispatchCloudScreenPass(RtxContext& ctx, const Resources::Ra
   dispatchCloudRender(&ctx, rtOutput);
 }
 
+void RtxAtmosphere::traceCloudPlacement(const AtmosphereArgs& args) {
+  if (!m_traceCloudPlacement) {
+    m_cloudPlacementTraceFrame = 0;
+    return;
+  }
+  if (m_cloudPlacementTraceFrame++ % 120 != 0) {
+    return;
+  }
+
+  const auto& camera = m_device->getCommon()->getSceneManager().getCamera();
+  const Vector3 activePosition = camera.getPosition(/*freecam=*/true);
+  const auto& anchor = m_cloudAnchor;
+  Logger::info(str::format(
+    "[Numos placement] frame=", m_cloudRenderFrameIdx,
+    " cameraValid=", camera.isValid(m_cloudRenderFrameIdx),
+    " freecam=", RtCamera::isFreeCameraEnabled(),
+    " source=", static_cast<uint32_t>(anchor.source),
+    " raw=(", anchor.rawWorldUnits.x, ",", anchor.rawWorldUnits.y, ",", anchor.rawWorldUnits.z, ")",
+    " active=(", activePosition.x, ",", activePosition.y, ",", activePosition.z, ")",
+    " resolved=(", anchor.resolvedRawWorldUnits.x, ",", anchor.resolvedRawWorldUnits.y, ",", anchor.resolvedRawWorldUnits.z, ")",
+    " shaderKm=(", args.cameraWorldPosYUpKm.x, ",", args.cameraWorldPosYUpKm.y, ",", args.cameraWorldPosYUpKm.z, ")",
+    " groundUnits=", RtxAtmosphere::groundLevelWorldUnits(),
+    " groundKm=", m_groundLevelYUpKm,
+    " cameraAltitudeM=", args.cameraAltitudeKm * 1000.0f,
+    " cloudBaseM=", args.cloudAltitude * 1000.0f,
+    " cloudDepthM=", args.cloudThickness * 1000.0f,
+    " baseFromCameraM=", (args.cloudAltitude - args.cameraAltitudeKm) * 1000.0f,
+    " topFromCameraM=", (args.cloudAltitude + args.cloudThickness - args.cameraAltitudeKm) * 1000.0f,
+    " unitsPerKm=", args.worldUnitsPerKm,
+    " planetRadiusKm=", args.planetRadius,
+    " zUp=", args.isZUp, " flipUp=", args.flipUpAxis,
+    " cloudEnabled=", args.cloudEnabled, " coverage=", args.cloudCoverageMean));
+}
+
 void RtxAtmosphere::dispatchCloudRender(Rc<DxvkContext> ctx, const Resources::RaytracingOutput& rtOutput) {
   ScopedGpuProfileZone(ctx, "Atmosphere Cloud Render (Nubis Cubed)");
 
@@ -3177,6 +3213,7 @@ void RtxAtmosphere::dispatchCloudRender(Rc<DxvkContext> ctx, const Resources::Ra
   }
 
   AtmosphereArgs args = getAtmosphereArgs();
+  traceCloudPlacement(args);
   ctx->updateBuffer(m_constantsBuffer, 0, sizeof(AtmosphereArgs), &args);
   ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_constantsBuffer);
 

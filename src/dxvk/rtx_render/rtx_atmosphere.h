@@ -1520,6 +1520,10 @@ public:
                "knobs with layer 1 (phase, multi-scatter, detail, etc.).");
 
 private:
+  void traceCloudPlacement(const AtmosphereArgs& args);
+  bool m_traceCloudPlacement = false;
+  uint32_t m_cloudPlacementTraceFrame = 0;
+
   struct ChromaticityUiState {
     Vector3 chromaticity { 1.0f, 1.0f, 1.0f };
     float magnitude = 0.0f;

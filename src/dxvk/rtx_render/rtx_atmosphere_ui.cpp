@@ -1327,17 +1327,21 @@ void RtxAtmosphere::showImguiSettings(WeatherBlender* blender) {
             "height above the ground. Stand somewhere the game treats as ground level before "
             "clicking. Unlike the old sea-level datum this stays correct if you change the scale.");
 
-        // Recomputes getAtmosphereArgs()'s calibration formula directly from the datum options and
-        // Derived Position above, rather than calling getAtmosphereArgs() itself just for a
-        // display value — same pattern Resolved Scale above uses for cloudWorldUnitsPerKm().
-        const float derivedCameraAltitudeKm =
-            (anchor.posYUpKm.y - RtxAtmosphere::seaLevelWorldKm()) * RtxAtmosphere::altitudeScale()
-            + RtxAtmosphere::viewAltitudeKm();
-        ImGui::Text("Camera Altitude (km)        %10.3f", derivedCameraAltitudeKm);
+        const AtmosphereArgs placement = getAtmosphereArgs();
+        ImGui::Text("Camera Altitude (m)         %10.1f", placement.cameraAltitudeKm * 1000.0f);
         RemixGui::SetTooltipToLastWidgetOnHover(
-            "(Derived Position.y - Sea Level) * Altitude Scale + View Altitude — the calibrated "
-            "value that reaches AtmosphereArgs::cameraAltitudeKm this frame. Feeds getEyeRadius "
-            "(atmosphere_common.slangh): the eye sits at planetRadius + this value.");
+            "The calibrated camera altitude supplied to the renderer, after Ground Level and "
+            "the active unit scale and up-axis conversion.");
+        ImGui::Text("Cloud base / top from camera: %+.1f / %+.1f m",
+                    (placement.cloudAltitude - placement.cameraAltitudeKm) * 1000.0f,
+                    (placement.cloudAltitude + placement.cloudThickness - placement.cameraAltitudeKm) * 1000.0f);
+        RemixGui::SetTooltipToLastWidgetOnHover(
+            "Layer boundaries relative to the camera, including the active weather depth. "
+            "Positive values are above the camera; negative values are below it.");
+        ImGui::Checkbox("Log Cloud Placement", &m_traceCloudPlacement);
+        RemixGui::SetTooltipToLastWidgetOnHover(
+            "Write camera, altitude, layer bounds and scale to remix-dxvk.log every 120 cloud "
+            "frames. Enable while reproducing placement problems. This does not change rendering.");
 
         ImGui::Separator();
 
