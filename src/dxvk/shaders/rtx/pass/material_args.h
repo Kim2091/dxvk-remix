@@ -42,12 +42,10 @@ struct OpaqueMaterialArgs {
   uint enableThinFilmOverride = 0;
   // Note: This thickness value is normalized on 0-1, predivided by the thinFilmMaxThickness on the CPU.
   float thinFilmNormalizedThicknessOverride = 0.0;
-  // Note: Scale applied to the dielectric portion of the base reflectivity (f0). 1.0 keeps the physically
-  // derived 0.04 dielectric reflectivity, 0.0 removes the dielectric specular lobe entirely.
-  float specularLevel = 1.f;
-  // Note: The Fresnel reflectivity to reach at grazing angles (f90). 1.0 is the standard Schlick behavior
-  // (everything turns white at grazing angles), lower values suppress that grazing whitening.
-  float fresnelGrazing = 1.f;
+  // NV-DXVK start: Legacy Fresnel controls reuse the existing constant-buffer padding.
+  float legacySpecularLevel = 1.f;
+  float legacyFresnelGrazing = 1.f;
+  // NV-DXVK end
 };
 
 struct TranslucentMaterialArgs {
@@ -104,17 +102,6 @@ struct OpaqueMaterialOptions {
 
   // Overrides
 
-  RTX_OPTION("rtx.opaqueMaterial", float, specularLevel, 1.0f,
-             "A scale factor applied to the dielectric base reflectivity (f0) of every opaque material.\n"
-             "1.0 keeps the physically derived dielectric reflectivity (0.04), 0.0 removes the dielectric specular lobe entirely.\n"
-             "Metallic surfaces derive f0 from their albedo and are therefore unaffected by this option.\n"
-             "Useful for toning down the specular response of legacy (non-replaced) materials which have no authored specular data.");
-  RTX_OPTION("rtx.opaqueMaterial", float, fresnelGrazing, 1.0f,
-             "The Fresnel reflectivity opaque materials converge to at grazing angles (commonly called f90).\n"
-             "1.0 is the standard Schlick approximation where every surface becomes a perfect white mirror at grazing angles.\n"
-             "Lowering this suppresses the white sheen legacy (non-replaced) materials pick up at glancing angles, and 0.0 removes the grazing highlight completely.\n"
-             "This is the artist 'specular shadowing' control described in \"Crash Course in BRDF Implementation\"; it is not physically based, so values below 1.0 will darken grazing reflections.");
-
   RTX_OPTION("rtx.opaqueMaterial", bool, ignoreAlphaChannelOverride, false, "A flag to ignore the alpha channel of the colormap on the opaque material. Should only be used for debugging or development.");
   RTX_OPTION("rtx.opaqueMaterial", bool, enableThinFilmOverride, false, "A flag to force the thin-film layer on the opaque material to be enabled. Should only be used for debugging or development.");
   RTX_OPTION("rtx.opaqueMaterial", float, thinFilmThicknessOverride, 0.0f,
@@ -139,8 +126,6 @@ public:
     args.enableThinFilmOverride = enableThinFilmOverride();
     // Note: GPU expects the thin film thickness override to be normalized on the maximum range.
     args.thinFilmNormalizedThicknessOverride = std::clamp(thinFilmThicknessOverride() / OPAQUE_SURFACE_MATERIAL_THIN_FILM_MAX_THICKNESS, 0.0f, 1.0f);
-    args.specularLevel = std::clamp(specularLevel(), 0.0f, 1.0f);
-    args.fresnelGrazing = std::clamp(fresnelGrazing(), 0.0f, 1.0f);
   }
 };
 

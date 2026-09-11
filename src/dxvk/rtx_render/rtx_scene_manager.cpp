@@ -846,7 +846,7 @@ namespace dxvk {
     }
 
     // Standard legacy material conversion
-    return input.getMaterialData().as<OpaqueMaterialData>();
+    return MaterialData::fromLegacy(input.getMaterialData());
   }
 
   void SceneManager::createEffectLight(Rc<DxvkContext> ctx, const DrawCallState& input, const RtInstance* instance) {
@@ -1750,7 +1750,8 @@ namespace dxvk {
         samplerFeedbackStamp,
         secondaryTextureIndex,
         albedoTextureIsSrgb, emissiveTextureIsSrgb,
-        opaqueMaterialData.getSkyLitParticle()
+        opaqueMaterialData.getSkyLitParticle(),
+        renderMaterialData.usesLegacyDefaults()
       };
 
       accumulateOpaqueMaterialAggregates(opaqueSurfaceMaterial);

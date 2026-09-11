@@ -499,6 +499,14 @@ struct RtSurface {
 
 struct LegacyMaterialDefaults {
   friend class ImGUI;
+  RTX_OPTION("rtx.legacyMaterial", float, specularLevel, 1.0f,
+             "Scales dielectric base reflectivity (f0) on non-replaced legacy materials [0,1]. "
+             "1 keeps the standard 0.04 reflectivity; 0 removes the normal-incidence dielectric reflection. "
+             "Grazing reflections are controlled separately by Fresnel Grazing. Fully metallic surfaces are unaffected.");
+  RTX_OPTION("rtx.legacyMaterial", float, fresnelGrazing, 1.0f,
+             "Grazing-angle Fresnel reflectivity (f90) for non-replaced legacy materials [0,1]. "
+             "1 keeps standard Schlick Fresnel; lower values reduce the white sheen at glancing angles. "
+             "Replacement materials retain their standard Fresnel response.");
   RTX_OPTION_ARGS("rtx.legacyMaterial", float, anisotropy, 0.f,
                   "The default roughness anisotropy to use for non-replaced \"legacy\" materials. "
                   "Should be in the range -1 to 1, where 0 is isotropic.",
@@ -592,7 +600,7 @@ struct RtOpaqueSurfaceMaterial {
     uint16_t samplerFeedbackStamp,
     uint32_t secondaryTextureIndex = 0,
     bool albedoTextureIsSrgb = false, bool emissiveTextureIsSrgb = false,
-    bool skyLitParticle = false
+    bool skyLitParticle = false, bool usesLegacyDefaults = false
   ) :
     m_albedoOpacityTextureIndex{ albedoOpacityTextureIndex }, m_secondaryTextureIndex{secondaryTextureIndex}, m_normalTextureIndex{ normalTextureIndex },
     m_tangentTextureIndex { tangentTextureIndex }, m_heightTextureIndex { heightTextureIndex }, m_roughnessTextureIndex{ roughnessTextureIndex },
@@ -606,7 +614,7 @@ struct RtOpaqueSurfaceMaterial {
     m_displaceOut{ displaceOut }, m_subsurfaceMaterialIndex(subsurfaceMaterialIndex), m_isRaytracedRenderTarget(isRaytracedRenderTarget),
     m_isHairCard(isHairCard), m_samplerFeedbackStamp{ samplerFeedbackStamp },
     m_albedoTextureIsSrgb{ albedoTextureIsSrgb }, m_emissiveTextureIsSrgb{ emissiveTextureIsSrgb },
-    m_skyLitParticle{ skyLitParticle }
+    m_skyLitParticle{ skyLitParticle }, m_usesLegacyDefaults{ usesLegacyDefaults }
   {
     updateCachedData();
     updateCachedHash();
@@ -656,6 +664,10 @@ struct RtOpaqueSurfaceMaterial {
     // term in the resolver's opacity lighting approximation - see shared_constants.h.
     if (m_skyLitParticle) {
       flags |= OPAQUE_SURFACE_MATERIAL_FLAG_SKY_LIT_PARTICLE;
+    }
+
+    if (m_usesLegacyDefaults) {
+      flags |= OPAQUE_SURFACE_MATERIAL_FLAG_USE_LEGACY_DEFAULTS;
     }
 
     float displaceIn = m_displaceIn * getDisplacementInFactor();
@@ -866,6 +878,7 @@ private:
       uint32_t albedoTextureIsSrgb;       // NOTE: uint32_t to avoid padding
       uint32_t emissiveTextureIsSrgb;     // NOTE: uint32_t to avoid padding
       uint32_t skyLitParticle;            // NOTE: uint32_t to avoid padding
+      uint32_t usesLegacyDefaults;
       // NOTE: There must be NO padding between members, as the struct is used for hashing
     };
     static_assert(alignof(HashStruct) == 4 && sizeof(HashStruct) % 4 == 0);
@@ -899,6 +912,7 @@ private:
       m_albedoTextureIsSrgb,
       m_emissiveTextureIsSrgb,
       m_skyLitParticle,
+      m_usesLegacyDefaults,
     };
     m_cachedHash = XXH3_64bits(&hashData, sizeof(hashData));
   }
@@ -956,6 +970,7 @@ private:
 
   // Fork (2026-07-26): sky-ambient term in the resolver's particle lighting approximation.
   bool m_skyLitParticle;
+  bool m_usesLegacyDefaults;
 
   uint16_t m_samplerFeedbackStamp;
 
@@ -1906,6 +1921,17 @@ private:
 struct MaterialData {
   bool m_ignored = false;
 
+  static MaterialData fromLegacy(const LegacyMaterialData& legacyMaterial);
+
+  bool usesLegacyDefaults() const {
+    return m_usesLegacyDefaults;
+  }
+
+private:
+  bool m_usesLegacyDefaults = false;
+
+public:
+
   using MaterialVariant = std::variant<
     OpaqueMaterialData,
     TranslucentMaterialData,
@@ -1943,7 +1969,9 @@ struct MaterialData {
   }
 
   XXH64_hash_t getHash() const {
-    return std::visit([](auto const& mat) { return mat.getHash(); }, m_data);
+    const XXH64_hash_t hash = std::visit([](auto const& mat) { return mat.getHash(); }, m_data);
+    // Identical authored parameters must not merge legacy and replacement materials in the cache.
+    return m_usesLegacyDefaults ? XXH64(&m_usesLegacyDefaults, sizeof(m_usesLegacyDefaults), hash) : hash;
   }
 
   const Rc<DxvkSampler>& getSamplerOverride() const {

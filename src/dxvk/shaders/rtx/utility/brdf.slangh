@@ -60,6 +60,7 @@ vec3 calcBaseReflectivity(vec3 albedo, float metallic, float opacity)
   return mix(materialBaseReflectivityDielectric, albedo, metallic) * opacity;
 }
 
+// NV-DXVK start: Legacy specular level.
 // Same as above, but with a scale applied to the dielectric portion of the base reflectivity (a "specular level" control).
 // Note: Only the dielectric term is scaled - a full conductor's reflectivity is its albedo and has no artistic ambiguity,
 // so scaling it would just darken metals rather than adjust their specular level.
@@ -67,6 +68,8 @@ vec3 calcBaseReflectivity(vec3 albedo, float metallic, float opacity, float spec
 {
   return mix(materialBaseReflectivityDielectric * specularLevel, albedo, metallic) * opacity;
 }
+
+// NV-DXVK end
 
 // Calculates the standard (mathematically linear) roughness from a perceptual (perceptually linear) roughness value.
 // [Burley 2012, "Physically-Based Shading at Disney"]
@@ -223,6 +226,7 @@ vec3 evalOpaqueSchlickFresnel(vec3 baseReflectivity,
   return baseReflectivity + (vec3(1.0f) - baseReflectivity) * invClampPow5(outputDirectionDotMicrofacetNormal);
 }
 
+// NV-DXVK start: Explicit grazing reflectivity.
 // Fresnel (F): Schlick Approximation with an explicit grazing angle reflectivity (f90)
 // [Schlick 1994, "An Inexpensive BRDF Model for Physically-Based Rendering"]
 // Note: This is the "specular shadowing" variant referenced in the comment above - the standard Schlick Fresnel always
@@ -235,6 +239,8 @@ vec3 evalOpaqueSchlickFresnel(vec3 baseReflectivity,
 {
   return baseReflectivity + (vec3(grazingReflectivity) - baseReflectivity) * invClampPow5(outputDirectionDotMicrofacetNormal);
 }
+
+// NV-DXVK end
 
 // Fresnel (F): Schlick Approximation
 // [Schlick 1994, "An Inexpensive BRDF Model for Physically-Based Rendering"]

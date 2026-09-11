@@ -212,9 +212,15 @@ void main(int2 thread_id : SV_DispatchThreadID)
     float roughWeight = 1.0 - surface.opaqueSurfaceMaterialInteraction.isotropicRoughness;
     const float normalDotOutputDirection = dot(surface.opaqueSurfaceMaterialInteraction.shadingNormal, surface.minimalRayInteraction.viewDirection);
     const float albedoLuminance = calcBt709Luminance(surface.opaqueSurfaceMaterialInteraction.albedo);
-    const vec3 fresnel = evalOpaqueSchlickFresnel(surface.opaqueSurfaceMaterialInteraction.baseReflectivity, normalDotOutputDirection, cb.opaqueMaterialArgs.fresnelGrazing);
+    // NV-DXVK start: Material-scoped Fresnel controls.
+    const vec3 fresnel = evalOpaqueSchlickFresnel(
+      surface.opaqueSurfaceMaterialInteraction.baseReflectivity, normalDotOutputDirection,
+      opaqueSurfaceMaterialInteractionGetFresnelGrazing(surface.opaqueSurfaceMaterialInteraction));
     const float fresnelLuminance = calcBt709Luminance(fresnel);
-    float specularWeight = fresnelLuminance / (fresnelLuminance + albedoLuminance);
+    const float totalLuminance = fresnelLuminance + albedoLuminance;
+    // Both Fresnel controls can be zero on a black legacy material.
+    float specularWeight = totalLuminance > 0.0f ? fresnelLuminance / totalLuminance : 0.0f;
+    // NV-DXVK end
     reflectionWeight = specularWeight * roughWeight;
   }
 

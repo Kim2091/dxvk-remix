@@ -797,11 +797,10 @@ namespace dxvk {
         RemixGui::DragFloat("Metallic", &LegacyMaterialDefaults::metallicConstantObject(), 0.01f, 0.0f, 1.f, "%.3f", sliderFlags);
         RemixGui::DragFloat("Anisotropy", &LegacyMaterialDefaults::anisotropyObject(), 0.01f, -1.0f, 1.f, "%.3f", sliderFlags);
 
-        // Note: These two live on the opaque material rather than the legacy material defaults (they apply to the shared
-        // BRDF rather than to the per-material constants), but they are surfaced here because legacy materials - which carry
-        // no authored specular data - are what they exist to tame.
-        RemixGui::SliderFloat("Specular Level", &OpaqueMaterialOptions::specularLevelObject(), 0.0f, 1.f, "%.3f", sliderFlags);
-        RemixGui::SliderFloat("Fresnel Grazing (f90)", &OpaqueMaterialOptions::fresnelGrazingObject(), 0.0f, 1.f, "%.3f", sliderFlags);
+        // NV-DXVK start: Fresnel defaults apply only to legacy materials.
+        RemixGui::SliderFloat("Specular Level", &LegacyMaterialDefaults::specularLevelObject(), 0.0f, 1.f, "%.3f", sliderFlags);
+        RemixGui::SliderFloat("Fresnel Grazing (f90)", &LegacyMaterialDefaults::fresnelGrazingObject(), 0.0f, 1.f, "%.3f", sliderFlags);
+        // NV-DXVK end
 
         ImGui::Unindent();
       }
