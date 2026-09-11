@@ -1520,6 +1520,9 @@ public:
                "knobs with layer 1 (phase, multi-scatter, detail, etc.).");
 
 private:
+  float getCameraAltitudeKm() const;
+  float getCloudThicknessKm() const;
+
   struct ChromaticityUiState {
     Vector3 chromaticity { 1.0f, 1.0f, 1.0f };
     float magnitude = 0.0f;

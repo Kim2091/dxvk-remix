@@ -1327,17 +1327,10 @@ void RtxAtmosphere::showImguiSettings(WeatherBlender* blender) {
             "height above the ground. Stand somewhere the game treats as ground level before "
             "clicking. Unlike the old sea-level datum this stays correct if you change the scale.");
 
-        // Recomputes getAtmosphereArgs()'s calibration formula directly from the datum options and
-        // Derived Position above, rather than calling getAtmosphereArgs() itself just for a
-        // display value — same pattern Resolved Scale above uses for cloudWorldUnitsPerKm().
-        const float derivedCameraAltitudeKm =
-            (anchor.posYUpKm.y - RtxAtmosphere::seaLevelWorldKm()) * RtxAtmosphere::altitudeScale()
-            + RtxAtmosphere::viewAltitudeKm();
-        ImGui::Text("Camera Altitude (km)        %10.3f", derivedCameraAltitudeKm);
+        ImGui::Text("Camera Altitude (m)         %10.1f", getCameraAltitudeKm() * 1000.0f);
         RemixGui::SetTooltipToLastWidgetOnHover(
-            "(Derived Position.y - Sea Level) * Altitude Scale + View Altitude — the calibrated "
-            "value that reaches AtmosphereArgs::cameraAltitudeKm this frame. Feeds getEyeRadius "
-            "(atmosphere_common.slangh): the eye sits at planetRadius + this value.");
+            "Camera height above Ground Level, using the same up axis and unit scale as the "
+            "renderer. Zero is the planet surface; negative values put the camera below it.");
 
         ImGui::Separator();
 
@@ -1389,26 +1382,38 @@ void RtxAtmosphere::showImguiSettings(WeatherBlender* blender) {
             "Cloud opacity (extinction per km of full-density cloud). Higher = thicker / darker "
             "clouds. This, not Profile Depth, is the lever for making the deck cover the sky; "
             "above ~6 the far march steps get coarse enough to show faint banding at the horizon.");
-        // Lower bound 0.5 -> 0.05 km and finer step (fork — 2026-09-05, world-space cloud
-        // migration): this range was authored against the uncorrected unit scale, where
-        // worldUnitsPerKm came from rtx.sceneScale (10000 units/km on FNV). With
-        // rtx.atmosphere.cloudScale set to the real Gamebryo figure (~0.704 -> 70400 units/km)
-        // the world converts to ~7x fewer km, so a deck at a given ALTITUDE IN KM sits ~7x
-        // higher relative to the terrain. Reproducing the pre-correction look needs roughly
-        // 0.8 / 7.04 = 0.11 km, which the old 0.5 km floor made unreachable -- the slider
-        // bottomed out with the clouds still far too high.
-        // Metres, not km (fork -- 2026-09-06, units/altitude redesign). "0.05 km" for a 50 m
-        // feature was the readability problem; the CB fields keep their km meaning and are filled
-        // by dividing by 1000. Rule the panel follows: heights are metres, sizes stay kilometres.
         RemixGui::DragFloat("Altitude", &RtxAtmosphere::cloudBaseHeightMetersObject(),
-                            10.0f, 50.0f, 12000.0f, "%.0f m", sliderFlags);
+                            10.0f, -12000.0f, 12000.0f, "%.0f m", sliderFlags);
         RemixGui::SetTooltipToLastWidgetOnHover(
-            "Height of the cloud deck's underside above the ground datum, in metres.");
+            "Height of the cloud layer's lower boundary above Ground Level, in metres. "
+            "Negative values let the layer straddle the ground. Cloud shapes can begin above "
+            "this boundary; use Center Layer at Camera to place the camera within the layer.");
         RemixGui::DragFloat("Depth", &RtxAtmosphere::cloudDepthMetersObject(),
                             50.0f, 100.0f, 8000.0f, "%.0f m", sliderFlags);
         RemixGui::SetTooltipToLastWidgetOnHover(
             "Vertical depth of the cloud deck in metres. While a weather preset is active the "
             "preset supplies this value instead.");
+        const float cameraAltitudeMeters = getCameraAltitudeKm() * 1000.0f;
+        const float effectiveDepthMeters = getCloudThicknessKm() * 1000.0f;
+        const float baseFromCameraMeters = RtxAtmosphere::cloudBaseHeightMeters() - cameraAltitudeMeters;
+        ImGui::Text("Layer relative to camera: base %+.0f m, top %+.0f m",
+                    baseFromCameraMeters, baseFromCameraMeters + effectiveDepthMeters);
+        RemixGui::SetTooltipToLastWidgetOnHover(
+            "Positive heights are above the camera, negative heights below it. Includes the "
+            "active weather preset's depth. These are layer bounds; coverage and shape determine "
+            "where cloud bodies occur within them.");
+        if (ImGui::Button("Center Layer at Camera")) {
+          RtxAtmosphere::cloudBaseHeightMetersObject().setDeferred(
+            cameraAltitudeMeters - effectiveDepthMeters * 0.5f);
+        }
+        RemixGui::SetTooltipToLastWidgetOnHover(
+            "Move the layer's midpoint to the camera's current altitude once, using the active "
+            "weather depth. It stays anchored as you move. Coverage can still leave a gap here; "
+            "increase Coverage to fill more of the layer.");
+        if (cameraAltitudeMeters < 0.0f) {
+          ImGui::TextWrapped("Camera is below Ground Level. Use Set to Here in World Space "
+                             "to put the ground at the camera before placing low clouds.");
+        }
         colorEdit3WithWeatherOverride(
             "Color", &RtxAtmosphere::cloudColorObject(),
             WEATHER_OVERRIDE_PTR(cloudColor));
@@ -1704,10 +1709,10 @@ void RtxAtmosphere::showImguiSettings(WeatherBlender* blender) {
             "from layer 1 only.");
         ImGui::BeginDisabled(!layer2On);
         RemixGui::DragFloat("Layer 2 Altitude", &RtxAtmosphere::cloudLayer2BaseHeightMetersObject(),
-                            50.0f, 500.0f, 20000.0f, "%.0f m", sliderFlags);
+                            50.0f, -20000.0f, 20000.0f, "%.0f m", sliderFlags);
         RemixGui::SetTooltipToLastWidgetOnHover(
-            "Height of the second deck's underside above the ground datum, in metres. The default "
-            "targets the cirrus band.");
+            "Height of the second layer's lower boundary above Ground Level, in metres. "
+            "Negative values let it straddle the ground. The default targets the cirrus band.");
         RemixGui::DragFloat("Layer 2 Depth", &RtxAtmosphere::cloudLayer2DepthMetersObject(),
                             50.0f, 50.0f, 6000.0f, "%.0f m", sliderFlags);
         RemixGui::SetTooltipToLastWidgetOnHover(
