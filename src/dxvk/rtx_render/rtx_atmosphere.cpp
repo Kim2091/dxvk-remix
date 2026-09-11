@@ -872,15 +872,6 @@ float RtxAtmosphere::cloudWorldUnitsPerKm() {
   return std::max(1000.0f * resolveUnitsPerMeter() / compression, 1e-3f);
 }
 
-float RtxAtmosphere::getCameraAltitudeKm() const {
-  return m_cameraWorldPosYUpKm.y - m_groundLevelYUpKm;
-}
-
-float RtxAtmosphere::getCloudThicknessKm() const {
-  return m_weatherOverride ? m_weatherOverride->cloudThickness
-                           : RtxAtmosphere::cloudDepthMeters() * 0.001f;
-}
-
 AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
   AtmosphereArgs args = {};
 
@@ -1081,7 +1072,7 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
 
   // Cloud volumetric / appearance enhancements
   {
-    args.cloudThickness = getCloudThicknessKm();
+    args.cloudThickness = wx ? wx->cloudThickness : RtxAtmosphere::cloudDepthMeters() * 0.001f;
     args.cloudLayer2TypeSpread = RtxAtmosphere::cloudLayer2TypeSpread();
     args.cloudViewSamples = RtxAtmosphere::cloudViewSamples();
     // rtx.atmosphere.cloudCurvature retired 2026-09-05 (world-space cloud migration Stage 1) — see
@@ -1306,7 +1297,7 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
     // scale, and a post-offset that is algebraically just another datum shift. m_groundLevelYUpKm
     // is groundLevelWorldUnits carried into this same Y-up km frame by updateFrame, so the datum is
     // now stored in raw engine units and cannot silently move when the unit scale changes.
-    args.cameraAltitudeKm = getCameraAltitudeKm();
+    args.cameraAltitudeKm = m_cameraWorldPosYUpKm.y - m_groundLevelYUpKm;
     // The world-anchored cloud-density field (computeCloudHeightFractionC, via
     // getPlanetCenterWorldKm) must measure height against the SAME calibrated altitude the shell
     // geometry (getEyeRadius / getPlanetCenter) uses. Leaving the raw, uncalibrated Y here would

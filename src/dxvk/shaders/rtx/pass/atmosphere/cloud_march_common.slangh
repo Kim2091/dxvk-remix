@@ -1087,12 +1087,6 @@ bool cloudSlabSpan(vec3 rayDirYUp, vec3 planetCenter, float planetRadiusKm,
   const float baseRadius = planetRadiusKm + slabAltitudeKm;
   const float topRadius  = planetRadiusKm + slabAltitudeKm + slabThicknessKm;
 
-  // NV-DXVK start: Reject invalid shells when authoring below-ground cloud bases.
-  if (planetRadiusKm <= 0.0f || baseRadius <= 0.0f || topRadius <= baseRadius) {
-    return false;
-  }
-  // NV-DXVK end
-
   float t0top, t1top;
   if (!intersectSphere(vec3(0.0f), rayDirYUp, planetCenter, topRadius, t0top, t1top)) return false;
   if (t1top <= 0.0f) return false;
@@ -1126,13 +1120,11 @@ bool cloudSlabSpan(vec3 rayDirYUp, vec3 planetCenter, float planetRadiusKm,
     tExit  = t1top;
   }
 
-  // NV-DXVK start: Clip inward rays even when the camera is on or below the ground.
   float tPlanet0, tPlanet1;
   if (intersectSphere(vec3(0.0f), rayDirYUp, planetCenter, planetRadiusKm, tPlanet0, tPlanet1)
-      && tPlanet1 > 0.0f) {
-    tExit = min(tExit, max(tPlanet0, 0.0f));
+      && tPlanet0 > 0.0f) {
+    tExit = min(tExit, tPlanet0);
   }
-  // NV-DXVK end
 
   return tExit > tEntry && tExit > 0.0f;
 }
