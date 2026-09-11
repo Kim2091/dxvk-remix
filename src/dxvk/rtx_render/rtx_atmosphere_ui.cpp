@@ -1048,6 +1048,17 @@ void RtxAtmosphere::showImguiSettings(WeatherBlender* blender) {
             "an inch engine. 0 inherits it from the global Scene Unit Scale. Shared with the aerial "
             "perspective so both agree about the size of the world. To change how large the "
             "cloudscape reads, use Cloud World Compression instead of skewing this.");
+        RemixGui::DragFloat("Aerial Perspective Compression",
+                            &RtxAtmosphere::aerialPerspectiveWorldCompressionObject(),
+                            0.05f, 0.1f, 100.0f, "%.2f", sliderFlags);
+        RemixGui::SetTooltipToLastWidgetOnHover(
+            "Makes haze read as though the world were larger than it is modelled, without touching "
+            "clouds, sky or global volumetrics. 1 is physically correct. Raise it on a map built "
+            "smaller than the region it depicts, where correct haze looks far too thin because the "
+            "far ridge is 300 m away rather than the 3 km it stands for. Replaces the retired "
+            "independent aerial perspective scale - the measurement above stays shared with the "
+            "clouds so the two can never disagree about the size of the world.");
+
         RemixGui::DragFloat("Cloud World Compression", &RtxAtmosphere::cloudWorldCompressionObject(),
                             0.05f, 0.1f, 50.0f, "%.2f", sliderFlags);
         RemixGui::SetTooltipToLastWidgetOnHover(

@@ -339,6 +339,19 @@ public:
                "cloudscape reads as far too high and too large -- roughly 7 for Fallout: New Vegas. Affects "
                "clouds only; the aerial perspective stays physical.",
                args.minValue = 0.1f);
+    RTX_OPTION_ARGS("rtx.atmosphere", float, aerialPerspectiveWorldCompression, 1.0f,
+               "Shrinks the aerial perspective's sense of distance by this factor, so haze reads as though the "
+               "world were larger than it is modelled. 1 means the volume's metres are real metres, which is "
+               "physically correct and the right default. This is the aerial perspective's sibling of Cloud "
+               "World Compression, and it exists for the same reason: a map is often built smaller than the "
+               "region it depicts, and on such a map physically correct haze reads as far too thin because the "
+               "far mountain is only 300 m away rather than the 3 km it represents.\n"
+               "Replaces the old independent rtx.atmosphere.aerialPerspectiveScale. That knob answered 'how big "
+               "is a game unit' a second time and could silently disagree with the clouds about the size of the "
+               "world; this one leaves the measurement (Units Per Metre) shared and single, and expresses the "
+               "difference as the artistic choice it actually is. Affects the aerial perspective only - clouds, "
+               "sky and global volumetrics are untouched.",
+               args.minValue = 0.1f);
     // Raw engine units, deliberately NOT km: km-valued datums are relative to the scale in force when
     // they were captured, so re-scaling silently moved the ground out from under the deck. This is
     // read in the engine's own up axis before toYUp, so it is exactly the number the calibration log

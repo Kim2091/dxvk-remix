@@ -1304,8 +1304,13 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
     // traces back to a config. Deliberately NOT divided by cloudWorldCompression: compression is an
     // artistic choice about how large the cloudscape reads, whereas haze is physical and should
     // stay tied to the real measurement.
+    // The measurement stays shared and single; the difference between "how big the world is" and
+    // "how far the haze should read" is expressed as compression, exactly as it is for the clouds
+    // (fork -- 2026-09-10, restoring the independent aerial calibration the retired
+    // aerialPerspectiveScale used to provide, without reintroducing a second measurement).
     const float worldUnitsPerMeter = resolveUnitsPerMeter();
-    args.aerialPerspectiveWorldUnitsPerKm = 1000.0f * worldUnitsPerMeter;
+    const float aerialCompression = std::max(RtxAtmosphere::aerialPerspectiveWorldCompression(), 0.1f);
+    args.aerialPerspectiveWorldUnitsPerKm = 1000.0f * worldUnitsPerMeter / aerialCompression;
     // Cloud share of this volume's in-scatter (fork -- 2026-09-08, cloud aerial-perspective fix).
     // Lives in the aerial block because it is read by the composite alongside the rest of it and is
     // zeroed with it in normalizeForSkyLutCache; no bake reads it.
