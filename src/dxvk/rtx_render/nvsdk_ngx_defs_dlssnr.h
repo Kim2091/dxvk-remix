@@ -36,11 +36,33 @@
 // DLSSNR.Available / NeedsUpdatedDriver / MinDriverVersion* / FeatureInitResult capability
 // family - the snippet exposes no availability parameters of its own, which is why
 // NGXNeuralUpliftContext probes the feature by trying to create it instead of querying.
-// DLSSNR.GlobalToneStrength exists only in sl.dlss_nr.dll: it is a Streamline plugin option,
-// not an NGX parameter, and is not settable on this path.
+// DLSSNR.GlobalToneStrength is a slightly different case: it is absent from nvngx_dlssnr.dll
+// but sl.dlss_nr.dll writes it into the NGX parameter block alongside Intensity, Style and the
+// other real controls, so it is a genuine name in the Streamline-to-NGX contract rather than a
+// plugin-local option. Setting it is harmless; the 310.8 snippet simply never reads it back, so
+// it is left undefined here to keep this file to parameters that do something.
 
 // Self-contained on purpose: only parameter-name strings and one enum, so this pulls in no
 // NGX header and stays usable from both the x86_64 and arm64 SDK include paths.
+//
+// TYPES MATTER MORE THAN NAMES HERE. NGX stores a value under the type it was written with, so a
+// parameter set as unsigned and read back as int yields the default with no error anywhere. The
+// type annotation on each parameter below is the getter the snippet actually calls, read out of
+// its parameter-marshalling routine (nvngx_dlssnr.dll 310.8 @ 0x18001a060-0x18001abd0):
+//
+//   resources           Get(void**)      - the NVSDK_NGX_Resource_VK*, not a VkImage
+//   every *Subrect*     Get(int*)        - signed, including the Width/Height members
+//   Width / Height      Get(unsigned*)   - creation-time only, and unsigned unlike the subrects
+//   Hint.Render.Preset  Get(int*)
+//   Style               Get(unsigned*)   - the one unsigned among the effect controls
+//   Enabled, Reset, DepthInverted, UseAutoMask, UICorrection
+//                       Get(int*)
+//   MVecScaleX/Y, Intensity, LocalToneStrength, LocalStructureStrength,
+//   SkinStructureStrength, ScalingRatio
+//                       Get(float*)
+//
+// Every one of these is optional: the snippet pre-seeds a default, calls Get, and keeps the
+// default when the result masks to 0xBAD00000. Nothing here has to be set for evaluation to run.
 
 // The NVSDK_NGX_Feature enum value for DLSS-NR. Confirmed as 18 (0x12) by disassembly: the
 // snippet materialises it in NVSDK_NGX_VULKAN_GetFeatureRequirements and in its own
@@ -65,6 +87,24 @@
 #define NVSDK_NGX_Parameter_DLSSNR_DepthInverted        "DLSSNR.DepthInverted"
 #define NVSDK_NGX_Parameter_DLSSNR_ScalingRatio         "DLSSNR.ScalingRatio"
 
+// ScalingRatio is read but cannot currently change anything, which is why nothing below feeds it
+// and why PerfQualityValue is not set either. Two independent reasons, both from the binary:
+//
+//  - The evaluate path seeds its ratio slot with 1.0f, calls Get(DLSSNR.ScalingRatio), and then
+//    stores 1.0f over the result regardless (@0x180017fe2 and @0x180018006). Whatever is set,
+//    the network runs at output resolution.
+//  - The only code that would derive a ratio from PerfQualityValue is ComputeScalingRatioCommon,
+//    and it has no callers inside the snippet - it is reachable only if the host fetches the
+//    DLSSNRComputeScalingRatioCallback parameter and calls it. Even then it returns 1.0f for
+//    every tier it accepts, and rejects NVSDK_NGX_PerfQuality_Value_UltraPerformance (3) with
+//    "unsupported PerfQualityValue".
+//
+// So DLSS-NR has no quality tiers in this build: it is always 1:1. If a later snippet starts
+// honouring the ratio, PerfQualityValue has to be set as unsigned before creation, and the two
+// callback names below are how the host would drive it.
+#define NVSDK_NGX_ComputeScalingRatioCallback_DLSSNR    "DLSSNRComputeScalingRatioCallback"
+#define NVSDK_NGX_GetStatsCallback_DLSSNR               "DLSSNRGetStatsCallback"
+
 // --- Per-evaluation inputs / outputs ----------------------------------------------------
 #define NVSDK_NGX_Parameter_DLSSNR_Color                "DLSSNR.Color"
 #define NVSDK_NGX_Parameter_DLSSNR_Output               "DLSSNR.Output"
@@ -84,6 +124,11 @@
 #define NVSDK_NGX_Parameter_DLSSNR_UICorrection         "DLSSNR.UICorrection"
 #define NVSDK_NGX_Parameter_DLSSNR_Backbuffer           "DLSSNR.Backbuffer"
 #define NVSDK_NGX_Parameter_DLSSNR_ControlMask          "DLSSNR.ControlMask"
+
+// A fifth optional input, read in the same sweep as the others and with the same subrect family.
+// Unbound here: the path tracer presents an undistorted image, and the snippet treats a missing
+// resource as "no distortion" rather than as an error.
+#define NVSDK_NGX_Parameter_DLSSNR_BidirectionalDistortionField "DLSSNR.BidirectionalDistortionField"
 
 // --- Effect controls --------------------------------------------------------------------
 #define NVSDK_NGX_Parameter_DLSSNR_Style                    "DLSSNR.Style"
@@ -114,8 +159,45 @@
 #define NVSDK_NGX_Parameter_DLSSNR_DepthSubrectWidth    "DLSSNR.DepthSubrectWidth"
 #define NVSDK_NGX_Parameter_DLSSNR_DepthSubrectHeight   "DLSSNR.DepthSubrectHeight"
 
+// The optional inputs carry subrects too, on exactly the same naming pattern. None of them are
+// fed here because none of those inputs are bound, but they are defined so that binding one
+// later is a matter of setting its rect rather than rediscovering the spelling: the snippet
+// defaults an unset subrect to zero, and a zero-sized rect on a bound resource is the
+// "Invalid ... rect configuration" path that skips the whole evaluation.
+#define NVSDK_NGX_Parameter_DLSSNR_UISubrectBaseX       "DLSSNR.UISubrectBaseX"
+#define NVSDK_NGX_Parameter_DLSSNR_UISubrectBaseY       "DLSSNR.UISubrectBaseY"
+#define NVSDK_NGX_Parameter_DLSSNR_UISubrectWidth       "DLSSNR.UISubrectWidth"
+#define NVSDK_NGX_Parameter_DLSSNR_UISubrectHeight      "DLSSNR.UISubrectHeight"
+
+#define NVSDK_NGX_Parameter_DLSSNR_UIAlphaSubrectBaseX  "DLSSNR.UIAlphaSubrectBaseX"
+#define NVSDK_NGX_Parameter_DLSSNR_UIAlphaSubrectBaseY  "DLSSNR.UIAlphaSubrectBaseY"
+#define NVSDK_NGX_Parameter_DLSSNR_UIAlphaSubrectWidth  "DLSSNR.UIAlphaSubrectWidth"
+#define NVSDK_NGX_Parameter_DLSSNR_UIAlphaSubrectHeight "DLSSNR.UIAlphaSubrectHeight"
+
+#define NVSDK_NGX_Parameter_DLSSNR_ControlMaskSubrectBaseX  "DLSSNR.ControlMaskSubrectBaseX"
+#define NVSDK_NGX_Parameter_DLSSNR_ControlMaskSubrectBaseY  "DLSSNR.ControlMaskSubrectBaseY"
+#define NVSDK_NGX_Parameter_DLSSNR_ControlMaskSubrectWidth  "DLSSNR.ControlMaskSubrectWidth"
+#define NVSDK_NGX_Parameter_DLSSNR_ControlMaskSubrectHeight "DLSSNR.ControlMaskSubrectHeight"
+
+#define NVSDK_NGX_Parameter_DLSSNR_BackbufferSubrectBaseX   "DLSSNR.BackbufferSubrectBaseX"
+#define NVSDK_NGX_Parameter_DLSSNR_BackbufferSubrectBaseY   "DLSSNR.BackbufferSubrectBaseY"
+#define NVSDK_NGX_Parameter_DLSSNR_BackbufferSubrectWidth   "DLSSNR.BackbufferSubrectWidth"
+#define NVSDK_NGX_Parameter_DLSSNR_BackbufferSubrectHeight  "DLSSNR.BackbufferSubrectHeight"
+
+#define NVSDK_NGX_Parameter_DLSSNR_BidirectionalDistortionFieldSubrectBaseX  "DLSSNR.BidirectionalDistortionFieldSubrectBaseX"
+#define NVSDK_NGX_Parameter_DLSSNR_BidirectionalDistortionFieldSubrectBaseY  "DLSSNR.BidirectionalDistortionFieldSubrectBaseY"
+#define NVSDK_NGX_Parameter_DLSSNR_BidirectionalDistortionFieldSubrectWidth  "DLSSNR.BidirectionalDistortionFieldSubrectWidth"
+#define NVSDK_NGX_Parameter_DLSSNR_BidirectionalDistortionFieldSubrectHeight "DLSSNR.BidirectionalDistortionFieldSubrectHeight"
+
 // Model selection hint, passed at feature creation. Default (0) leaves the choice to the
-// snippet; 1-7 select a specific shipped model.
+// snippet; 1-7 ask for a specific shipped model.
+//
+// How many of those actually exist depends on the DLL, not on this enum: the snippet resolves
+// the value through CG2RFindWeightByPreset against the weight descriptors compiled into that
+// build. Asking for one it does not have is not an error - it logs "preset %d is not available
+// in this DLL build; falling back to shipping default preset %d" and creates the feature anyway,
+// so a value out of range costs a log line and the default network. Distinct from DLSSNR.Style
+// (0-2), which picks a look within the chosen network rather than the network itself.
 typedef enum NVSDK_NGX_DLSSNR_Hint_Render_Preset {
   NVSDK_NGX_DLSSNR_Hint_Render_Preset_Default = 0,
   NVSDK_NGX_DLSSNR_Hint_Render_Preset_1       = 1,
