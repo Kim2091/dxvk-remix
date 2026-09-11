@@ -524,6 +524,7 @@ namespace dxvk {
 
     m_cameraManager.onFrameEnd();
     m_instanceManager.onFrameEnd();
+    m_drawCallCache.resetStats();
     m_previousFrameSceneAvailable = raytracedThisFrame && RtxOptions::enablePreviousTLAS();
 
     m_bufferCache.clear();
@@ -1358,7 +1359,18 @@ namespace dxvk {
 
     ObjectCacheState result = ObjectCacheState::kInvalid;
     BlasEntry* pBlas = nullptr;
-    if (m_drawCallCache.get(drawCallState, &pBlas) == DrawCallCache::CacheState::kExisted) {
+
+    // An instance that survived from a previous frame already knows which BlasEntry it was linked
+    // to, so offer it to the cache as a hint. When the geometry is unchanged this skips the bucket
+    // scan, which is O(entries in bucket) and therefore O(n^2) per frame across n instances that
+    // share one mesh template (crowds, foliage, projectiles). Instances marked for GC are excluded
+    // because their linked BLAS may already have been freed.
+    BlasEntry* const blasHint =
+        (existingInstance != nullptr && !existingInstance->isMarkedForGC())
+            ? existingInstance->getBlas()
+            : nullptr;
+
+    if (m_drawCallCache.get(drawCallState, &pBlas, blasHint) == DrawCallCache::CacheState::kExisted) {
       result = onSceneObjectUpdated(ctx, drawCallState, pBlas);
     } else {
       result = onSceneObjectAdded(ctx, drawCallState, pBlas);

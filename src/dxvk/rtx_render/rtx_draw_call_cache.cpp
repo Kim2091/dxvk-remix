@@ -46,9 +46,29 @@ DrawCallCache::DrawCallCache(DxvkDevice* device) : CommonDeviceObject(device) {
 }
 DrawCallCache::~DrawCallCache() {}
 
-DrawCallCache::CacheState DrawCallCache::get(const DrawCallState& drawCall, BlasEntry** out) {
+DrawCallCache::CacheState DrawCallCache::get(const DrawCallState& drawCall, BlasEntry** out, BlasEntry* hint) {
+  ++m_stats.lookups;
+
   // First, find the right bucket:
   const XXH64_hash_t hash = drawCall.getGeometryData().getHashForRule<rules::TopologicalHash>();
+
+  // Fast path: this draw call was already linked to a BlasEntry on a previous frame. Both the
+  // single-entry and the multi-entry paths below return immediately on an exactMatch, so when the
+  // hint exact-matches we would arrive at the same answer after walking the bucket. Bucket identity
+  // is verified first so that a topology change (LOD swap, mesh replacement, procedural remesh)
+  // falls through to the full lookup and is allowed to allocate a *new* entry - which
+  // onSceneObjectUpdated depends on to avoid asserting on KBuildBVH.
+  //
+  // The hint is only ever a BlasEntry a live instance is still linked to, and garbageCollection()
+  // refuses to erase an entry that has linked instances, so it cannot dangle here.
+  if (hint != nullptr &&
+      hint->input.getGeometryData().getHashForRule<rules::TopologicalHash>() == hash &&
+      exactMatch(drawCall, *hint)) {
+    ++m_stats.hintHits;
+    *out = hint;
+    return CacheState::kExisted;
+  }
+
   auto range = m_entries.equal_range(hash);
   if (range.first == m_entries.end()) {
     // New bucket
@@ -83,11 +103,14 @@ DrawCallCache::CacheState DrawCallCache::get(const DrawCallState& drawCall, Blas
 
   // Bucket has multiple BlasEntries
 
+  ++m_stats.multiEntryLookups;
+
   float bestScore = std::numeric_limits<float>::min();
   Matrix4 newTransform = drawCall.getTransformData().objectToWorld;
   const Vector3 newWorldPosition = drawCall.getGeometryData().boundingBox.getTransformedCentroid(newTransform);
 
   for (auto bucketIter = range.first; bucketIter != range.second; bucketIter++) {
+    ++m_stats.scanIterations;
     BlasEntry& blas  = bucketIter->second;
     if (exactMatch(drawCall, blas)) {
       *out = &blas;

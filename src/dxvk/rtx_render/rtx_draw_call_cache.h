@@ -54,16 +54,33 @@ public:
   explicit DrawCallCache(DxvkDevice* device);
   ~DrawCallCache();
 
-  CacheState get(const DrawCallState& drawCall, BlasEntry** out);
+  // `hint` is an optional BlasEntry this draw call was linked to on a previous frame. When it is
+  // still a valid match for the incoming draw call, the bucket scan below is skipped entirely.
+  // Passing nullptr (or a stale hint) is always safe: the full lookup runs instead.
+  CacheState get(const DrawCallState& drawCall, BlasEntry** out, BlasEntry* hint = nullptr);
 
   MultimapType& getEntries() {return m_entries;}
 
   void clear() {
     m_entries.clear();
   }
-  
+
+  // Diagnostic counters for the lookup path. `scanIterations` divided by `lookups` gives the
+  // average bucket walk per draw call, which is what decides whether the hint path is worth
+  // anything in a given scene. Reset once per frame from SceneManager::onFrameEnd.
+  struct Stats {
+    uint32_t lookups = 0;
+    uint32_t hintHits = 0;
+    uint32_t multiEntryLookups = 0;
+    uint32_t scanIterations = 0;
+  };
+
+  const Stats& getStats() const { return m_stats; }
+  void resetStats() { m_stats = Stats(); }
+
 private:
   MultimapType m_entries;
+  Stats m_stats;
 
   BlasEntry* allocateEntry(XXH64_hash_t hash, const DrawCallState& drawCall);
 };
