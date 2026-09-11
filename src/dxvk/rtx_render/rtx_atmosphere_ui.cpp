@@ -842,6 +842,83 @@ void RtxAtmosphere::showImguiSettings(WeatherBlender* blender) {
                 "screen that stays uniformly lit means the rays are hitting nothing.");
           }
 
+          ImGui::Separator();
+
+          RemixGui::Checkbox("Local Lights",
+                             &RtxAtmosphere::aerialPerspectiveLocalLightsObject());
+          RemixGui::SetTooltipToLastWidgetOnHover(
+              "Scatter ordinary scene lights - lamps, torches, muzzle flashes, headlights - through "
+              "this volume, alongside the sun and sky it already carries.\n\n"
+              "This is what makes the volume a general participating medium rather than an "
+              "outdoor-daytime one. Without it the air is lit by the atmosphere alone: an interior "
+              "reads as unlit haze and a light in fog throws no glow at all, and that job belongs "
+              "instead to the global volumetrics froxel grid, which resolves it per froxel with "
+              "ReSTIR and a shadow ray each.\n\n"
+              "Lights are culled into this volume's own froxel grid once per frame and the survivors "
+              "evaluated analytically along the march the bake is already doing, which is why it "
+              "covers the same ground for a fraction of the cost - and why turning this on is what "
+              "lets rtx.volumetrics.enable be turned off. Scenes with no positional lights in range "
+              "pay nothing.");
+
+          if (RtxAtmosphere::aerialPerspectiveLocalLights()) {
+            RemixGui::DragFloat("Local Light Intensity",
+                                &RtxAtmosphere::aerialPerspectiveLocalLightIntensityObject(),
+                                0.05f, 0.0f, 100.0f, "%.2f", sliderFlags);
+            RemixGui::SetTooltipToLastWidgetOnHover(
+                "Gain on the local light contribution alone. 1.0 is physical: a light's radiance "
+                "enters the medium at face value and leaves scaled by the air's own scattering "
+                "coefficient. Raise it when a game's lights are authored dimmer than the air density "
+                "that reads correctly for distant haze - the usual reason a lamp shows no glow.");
+
+            RemixGui::Checkbox("Local Light Shadows",
+                               &RtxAtmosphere::aerialPerspectiveLocalLightShadowsObject());
+            RemixGui::SetTooltipToLastWidgetOnHover(
+                "Trace the scene for occlusion of local lights.\n\n"
+                "Without it a lamp lights the fog on both sides of the wall it stands behind, which "
+                "is the most obvious way volumetric lighting reads as fake - and unlike the sun's "
+                "halo no phase cap softens it, because a local light's brightest air is the air "
+                "nearest it rather than the air pointing at it. With it, a light through a doorway "
+                "or a window throws a real shaft.\n\n"
+                "One ray per light per depth slice, and it stops at the emitter rather than running "
+                "to the shadow range, so it is far cheaper than the sun's equivalent. Only clusters "
+                "that actually contain a light trace anything.");
+
+            if (RtxAtmosphere::aerialPerspectiveLocalLightShadows()) {
+              RemixGui::DragFloat("Local Light Shadow Range",
+                                  &RtxAtmosphere::aerialPerspectiveLocalLightShadowRangeMetersObject(),
+                                  5.0f, 0.0f, 100000.0f, "%.0f m", sliderFlags);
+              RemixGui::SetTooltipToLastWidgetOnHover(
+                  "How far from the camera local lights may be shadowed. Slices past this treat "
+                  "their lights as unoccluded, which costs nothing and is rarely visible: a light "
+                  "reaching that far is either bright enough that its shaft is lost in the haze or "
+                  "far enough that the volume cannot resolve the shaft anyway.");
+            }
+
+            RemixGui::DragFloat("Local Light Cutoff",
+                                &RtxAtmosphere::aerialPerspectiveLocalLightCutoffObject(),
+                                0.0005f, 0.0f, 1.0f, "%.4f", sliderFlags);
+            RemixGui::SetTooltipToLastWidgetOnHover(
+                "In-scattered radiance below which a light is considered not to reach a point, used "
+                "to size each light's cull radius from its own power.\n\n"
+                "This is what keeps the cost proportional to local light DENSITY rather than to the "
+                "scene's light count: a torch is culled after a few metres while a floodlight "
+                "survives to a hundred, instead of every light paying for the brightest one's range. "
+                "Lower it if bright lights visibly stop affecting the fog at a fixed radius; raise "
+                "it to spend less.");
+
+            RemixGui::DragInt("Local Light Budget",
+                              &RtxAtmosphere::aerialPerspectiveLocalLightMaxCountObject(),
+                              1.0f, 0, 4096, "%d", sliderFlags);
+            RemixGui::SetTooltipToLastWidgetOnHover(
+                "Upper bound on how many scene lights may be submitted to the volume in a frame. "
+                "Lights are ranked by the peak in-scatter they can produce anywhere in the view "
+                "frustum and the brightest survive, so raising this adds progressively dimmer "
+                "lights. The cull pass costs linearly in it; the march does not, since a cluster "
+                "still holds at most sixteen of them.");
+          }
+
+          ImGui::Separator();
+
           RemixGui::DragFloat("Forward Scatter Cap",
                               &RtxAtmosphere::aerialPerspectiveMieAnisotropyMaxObject(),
                               0.01f, -1.0f, 1.0f, "%.2f", sliderFlags);

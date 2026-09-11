@@ -809,4 +809,26 @@ struct AtmosphereArgs {
   // composite.comp.slang -- no bake touches it, so normalizeForSkyLutCache zeroes it with the rest
   // of this block.
   float cloudAerialInScatterStrength;
+  // ----- Local light in-scatter -----
+  // Lights in the compact AerialPerspectiveLight buffer the cull pass and the march read. Zero
+  // disables the whole local-light path, which is the state whenever the feature is off, no
+  // positional light is in range, or the light buffer failed to allocate - so every consumer needs
+  // only this one test rather than its own enable flag.
+  uint aerialPerspectiveLocalLightCount;
+
+  // Width and height of the cull cluster grid, in tiles. Derived from the LUT resolution and
+  // AERIAL_PERSPECTIVE_LIGHT_TILE_SIZE on the CPU side rather than recomputed per thread, because
+  // the cull dispatch, the march and the buffer allocation must all agree on it exactly or the
+  // march reads another cluster's list.
+  uint aerialPerspectiveLocalLightTilesXY;
+
+  // Artistic gain on the local-light term alone. The atmospheric term is physical and has its own
+  // controls; this one exists because a game's light radiances are whatever its authors made them,
+  // and the density of air that reads correctly for distant haze rarely reads correctly for a lamp.
+  float aerialPerspectiveLocalLightIntensity;
+
+  // How far from the camera, in world units, local lights may be shadowed against the scene. Zero
+  // means no local-light shadow rays at all, which leaves lights glowing through walls but costs
+  // nothing - the same trade the sun term makes past aerialPerspectiveSceneShadowRange.
+  float aerialPerspectiveLocalLightShadowRange;
 };

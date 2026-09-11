@@ -129,6 +129,7 @@ namespace dxvk {
         SAMPLER2D(COMPOSITE_SKY_LIGHT_TEXTURE)
         TEXTURE3D(COMPOSITE_ATMOSPHERE_AERIAL_PERSPECTIVE_INPUT)
         SAMPLER(COMPOSITE_ATMOSPHERE_AERIAL_PERSPECTIVE_SAMPLER)
+        TEXTURE3D(COMPOSITE_ATMOSPHERE_AERIAL_PERSPECTIVE_LOCAL_INPUT)
 
         // Cloud composite (fork — 2026-09-05, world-space cloud migration Stage 4b). See
         // applyCloudComposite in composite.comp.slang / the doc comment on these slots in
@@ -416,6 +417,7 @@ namespace dxvk {
     RtxAtmosphere& atmosphere = ctx->getCommonObjects()->metaAtmosphere();
     {
       const Resources::Resource aerialPerspectiveLut = atmosphere.getAerialPerspectiveLut();
+      const Resources::Resource aerialPerspectiveLocalLut = atmosphere.getAerialPerspectiveLocalLut();
       const bool aerialPerspectiveActive = RtxOptions::skyMode() == SkyMode::Numos
         && RtxAtmosphere::aerialPerspective()
         && aerialPerspectiveLut.isValid();
@@ -423,6 +425,12 @@ namespace dxvk {
       ctx->bindResourceSampler(COMPOSITE_ATMOSPHERE_AERIAL_PERSPECTIVE_SAMPLER, linearSampler);
       ctx->bindResourceView(COMPOSITE_ATMOSPHERE_AERIAL_PERSPECTIVE_INPUT,
         aerialPerspectiveActive ? aerialPerspectiveLut.view : nullptr, nullptr);
+      // Local light volume, gated identically. The shader reaches it only when
+      // aerialPerspectiveLocalLightCount is non-zero, which the atmosphere zeroes whenever this
+      // volume has not been baked.
+      ctx->bindResourceView(COMPOSITE_ATMOSPHERE_AERIAL_PERSPECTIVE_LOCAL_INPUT,
+        aerialPerspectiveActive && aerialPerspectiveLocalLut.isValid()
+          ? aerialPerspectiveLocalLut.view : nullptr, nullptr);
     }
 
     // Cloud composite (fork — 2026-09-05, world-space cloud migration Stage 4b). Binds the SAME

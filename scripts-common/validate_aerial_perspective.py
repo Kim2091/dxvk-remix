@@ -45,13 +45,19 @@ def main():
                         default=root / "external/spirv_tools/spirv-val.exe")
     args = parser.parse_args()
     shader_dir = args.build / "src/dxvk/rtx_shaders"
+    # Bindings 7 (lights) and 8 (cull clusters) are present in every bake variant: the local-light
+    # term is evaluated in all of them and only its VISIBILITY differs by variant. Binding 9 is the
+    # local-light output volume, which the visibility pass alone does not write.
     contracts = {
-        "aerial_perspective_lut": (True, {0, 1, 2, 3, 4, 5}),
-        "aerial_perspective_visibility": (True, {0, 1, 3, 5, 6}),
-        "aerial_perspective_integrate": (False, {0, 1, 2, 3, 4, 6}),
-        "aerial_perspective_unshadowed": (False, {0, 1, 2, 3, 4}),
+        "aerial_perspective_lut": (True, {0, 1, 2, 3, 4, 5, 7, 8, 9}, (8, 8, 1)),
+        "aerial_perspective_visibility": (True, {0, 1, 3, 5, 6, 7, 8}, (8, 8, 1)),
+        "aerial_perspective_integrate": (False, {0, 1, 2, 3, 4, 6, 7, 8, 9}, (8, 8, 1)),
+        "aerial_perspective_unshadowed": (False, {0, 1, 2, 3, 4, 7, 8, 9}, (8, 8, 1)),
+        # The cull pass must NOT carry the ray-query capability: it does no tracing, and picking one
+        # up would mean an include had dragged a trace into a pass dispatched over every cluster.
+        "aerial_perspective_light_cull": (False, {0, 1, 2}, (4, 4, 4)),
     }
-    for name, (ray_queries, expected_bindings) in contracts.items():
+    for name, (ray_queries, expected_bindings, expected_local_size) in contracts.items():
         path = shader_dir / f"{name}.spv"
         subprocess.run([str(args.spirv_val), "--target-env", "vulkan1.2",
                         "--scalar-block-layout", str(path)], check=True)
@@ -60,7 +66,7 @@ def main():
             raise ValueError(f"{name}: unexpected ray-query capability {capabilities}")
         if bindings != expected_bindings:
             raise ValueError(f"{name}: unexpected descriptor bindings {bindings}")
-        if local_size != (8, 8, 1):
+        if local_size != expected_local_size:
             raise ValueError(f"{name}: dispatch mismatch, local size {local_size}")
         print(f"PASS {name}: SPIR-V, descriptors, workgroup size, ray-query isolation")
 

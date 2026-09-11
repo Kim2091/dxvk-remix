@@ -616,9 +616,10 @@ void applySkyContribution(
 // extinction and in-scatter between the camera and the shaded surface, which is what makes distant
 // geometry hazy and desaturated.
 //
-// Skipped on primary misses: those directions carry the sky, whose radiance already integrates the
-// whole atmospheric column. PSR pixels use their camera-to-mirror distance, so a reflection is
-// correctly attenuated by the air in front of the mirror.
+// The atmospheric half is skipped on primary misses: those directions carry the sky, whose radiance
+// already integrates the whole atmospheric column. The local-light half is not, because the sky
+// carries no scene lights - see the two blocks below. PSR pixels use their camera-to-mirror
+// distance, so a reflection is correctly attenuated by the air in front of the mirror.
 //
 // The volume covers only the segment past the global volumetrics froxel grid, so its in-scatter is
 // attenuated by that grid's transmittance. Strictly the near in-scatter already in radianceOutput
@@ -632,45 +633,77 @@ void applyAerialPerspective(
   inout vec3 radianceOutput)
 {
   if (cb.atmosphereArgs.aerialPerspectiveLutSize == 0 ||
-      cb.domeLightArgs.active ||
-      primaryMiss ||
-      viewDistance <= 0.0f)
+      cb.domeLightArgs.active)
   {
     return;
   }
 
   const vec2 screenUV = cameraPixelCoordinateToScreenUV(cb.camera, ivec2(pixelCoordinate));
-  const vec3 uvw = aerialPerspectiveScreenUvToUvw(screenUV, viewDistance, cb.atmosphereArgs);
 
-  // Surface at or inside the volume's near bound: the whole camera-to-surface segment belongs to the
-  // global volumetrics froxel grid, which has already integrated it. The volume's first slice sits
-  // at that bound, so without this the nearest slice would be applied on top - a second helping of
-  // in-scatter over exactly the range that is already accounted for.
-  if (uvw.z <= 0.0f)
+  // A primary miss has no surface to stop the column at, so it reads the volume's far bound - the
+  // whole depth of air in that direction. viewDistance is not meaningful there (it is whatever the
+  // miss path left behind), which is why it is replaced rather than clamped.
+  const vec3 uvw = primaryMiss
+    ? vec3(screenUV, 1.0f)
+    : aerialPerspectiveScreenUvToUvw(screenUV, viewDistance, cb.atmosphereArgs);
+
+  // Atmospheric term: primary hits only.
+  //
+  // A primary miss carries the sky, whose radiance already integrates the whole atmospheric column,
+  // so applying this volume's version of it there would be a second helping of the same air. That
+  // exclusion is also what clips the sun's scene shadowing to an occluder's screen-space
+  // silhouette - the known limitation documented on aerialPerspectiveSceneShadow.
+  //
+  // Surfaces at or inside the volume's near bound (uvw.z <= 0) are skipped for the same reason at
+  // the other end: that whole segment belongs to the global volumetrics froxel grid, which has
+  // already integrated it.
+  if (!primaryMiss && viewDistance > 0.0f && uvw.z > 0.0f)
   {
-    return;
+    // Near-field exclusion, modelled on how fog holds off until fogStart. Driven by this pixel's own
+    // view distance, so unlike the volume it gates it carries no neighbourhood term and cannot bleed
+    // across a silhouette - see aerialPerspectiveNearFade.
+    const float nearFade = aerialPerspectiveNearFade(viewDistance, cb.atmosphereArgs);
+
+    if (nearFade > 0.0f)
+    {
+      const vec4 aerialPerspective = sampleAerialPerspectiveLut(
+        AtmosphereAerialPerspectiveLut, AtmosphereAerialPerspectiveSampler, uvw, cb.atmosphereArgs);
+
+      const vec3 inScatter = max(aerialPerspective.rgb, vec3(0.0f)) * volumeAttenuation * nearFade;
+
+      // Fade toward the identity transform, not toward zero: at nearFade 0 this has to leave the
+      // surface exactly as it found it, which means a transmittance of one rather than a black
+      // multiply.
+      const float transmittance = lerp(1.0f, saturate(aerialPerspective.a), nearFade);
+
+      radianceOutput = radianceOutput * transmittance + inScatter;
+    }
   }
 
-  // Near-field exclusion, modelled on how fog holds off until fogStart. Driven by this pixel's own
-  // view distance, so unlike the volume it gates it carries no neighbourhood term and cannot bleed
-  // across a silhouette - see aerialPerspectiveNearFade.
-  const float nearFade = aerialPerspectiveNearFade(viewDistance, cb.atmosphereArgs);
-
-  if (nearFade <= 0.0f)
+  // Scene lights in the air between the camera and this pixel.
+  //
+  // Applied on primary misses as well as hits, which is the one thing the atmospheric term above
+  // structurally cannot do: nothing in the sky contains a lamp, so there is no double count to
+  // avoid. A shaft thrown by a street light therefore keeps going past the roof edge and across the
+  // sky behind it, the way the global volumetrics froxel grid draws it, instead of being stamped
+  // off at the silhouette.
+  //
+  // No near fade either. That fade exists to stop a coarse sun-shadow grid painting haloes on
+  // interior walls; a light two metres away is the entire point of this term, and fading it out
+  // over the first fifty metres would remove every case it was added for.
+  //
+  // Added AFTER the transform above rather than before it. The bake already attenuates each sample
+  // by the column in front of it, so folding this into the multiply would charge the far
+  // transmittance a second time - and most visibly on the near lights, which have the least air in
+  // front of them and would lose the most to it.
+  if (cb.atmosphereArgs.aerialPerspectiveLocalLightCount != 0)
   {
-    return;
+    const vec3 localInScatter = max(sampleAerialPerspectiveLut(
+      AtmosphereAerialPerspectiveLocalLut, AtmosphereAerialPerspectiveSampler,
+      uvw, cb.atmosphereArgs).rgb, vec3(0.0f));
+
+    radianceOutput += localInScatter * volumeAttenuation;
   }
-
-  const vec4 aerialPerspective = sampleAerialPerspectiveLut(
-    AtmosphereAerialPerspectiveLut, AtmosphereAerialPerspectiveSampler, uvw, cb.atmosphereArgs);
-
-  const vec3 inScatter = max(aerialPerspective.rgb, vec3(0.0f)) * volumeAttenuation * nearFade;
-
-  // Fade toward the identity transform, not toward zero: at nearFade 0 this has to leave the surface
-  // exactly as it found it, which means a transmittance of one rather than a black multiply.
-  const float transmittance = lerp(1.0f, saturate(aerialPerspective.a), nearFade);
-
-  radianceOutput = radianceOutput * transmittance + inScatter;
 }
 
 // ============================================================================
@@ -1457,10 +1490,12 @@ void applyCloudComposite(
 
   // ---- Aerial perspective on the cloud (fork -- 2026-09-08) ----
   //
-  // The clouds never reached the real aerial-perspective volume. applyAerialPerspective returns
-  // early on primaryMiss -- which is every sky pixel, i.e. exactly where the clouds are -- and it
-  // runs BEFORE this function, so even on a geometry hit the cloud composited afterwards was
-  // untouched by it. The only distance term the cloud had was the march's cloudAerialHazePerKm,
+  // The clouds never reached the real aerial-perspective volume. applyAerialPerspective skips its
+  // ATMOSPHERIC half on primaryMiss -- which is every sky pixel, i.e. exactly where the clouds are
+  // -- and it runs BEFORE this function, so even on a geometry hit the cloud composited afterwards
+  // was untouched by it. (That function's local-light half does now run on sky pixels, but it
+  // carries only scene lights and so has nothing to say about the air in front of a cloud; this
+  // block remains the only route by which the atmospheric column reaches one.) The only distance term the cloud had was the march's cloudAerialHazePerKm,
   // which multiplies each sample's radiance by exp(-k * t) and adds NOTHING back: distant cloud
   // dims toward BLACK rather than toward the colour of the air in front of it, which is the
   // opposite of what aerial perspective does. (Its sibling cloudAerialFadePerKm fades cloud ALPHA

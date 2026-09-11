@@ -36,6 +36,8 @@
 #include "rtx/pass/atmosphere/multiscattering_lut_binding_indices.h"
 #include "rtx/pass/atmosphere/sky_view_lut_binding_indices.h"
 #include "rtx/pass/atmosphere/aerial_perspective_lut_binding_indices.h"
+#include "rtx/pass/atmosphere/aerial_perspective_light_cull_binding_indices.h"
+#include "rtx/pass/atmosphere/aerial_perspective_light.h"
 #include <rtx_shaders/transmittance_lut.h>
 #include <rtx_shaders/multiscattering_lut.h>
 #include <rtx_shaders/sky_view_lut.h>
@@ -43,6 +45,7 @@
 #include <rtx_shaders/aerial_perspective_visibility.h>
 #include <rtx_shaders/aerial_perspective_integrate.h>
 #include <rtx_shaders/aerial_perspective_unshadowed.h>
+#include <rtx_shaders/aerial_perspective_light_cull.h>
 #include <rtx_shaders/cloud_sky_transmittance_lut.h>
 #include <rtx_shaders/cloud_sun_density_grid.h>
 #include <rtx_shaders/cloud_ambient_density_grid.h>
@@ -107,6 +110,9 @@ namespace dxvk {
         SAMPLER(3)
         RW_TEXTURE3D(4)
         ACCELERATION_STRUCTURE(5)
+        STRUCTURED_BUFFER(7)
+        STRUCTURED_BUFFER(8)
+        RW_TEXTURE3D(9)
       END_PARAMETER()
     };
     PREWARM_SHADER_PIPELINE(AerialPerspectiveLutShader);
@@ -120,6 +126,8 @@ namespace dxvk {
         SAMPLER(3)
         ACCELERATION_STRUCTURE(5)
         RW_TEXTURE3D(6)
+        STRUCTURED_BUFFER(7)
+        STRUCTURED_BUFFER(8)
       END_PARAMETER()
     };
     PREWARM_SHADER_PIPELINE(AerialPerspectiveVisibilityShader);
@@ -134,6 +142,9 @@ namespace dxvk {
         SAMPLER(3)
         RW_TEXTURE3D(4)
         TEXTURE3D(6)
+        STRUCTURED_BUFFER(7)
+        STRUCTURED_BUFFER(8)
+        RW_TEXTURE3D(9)
       END_PARAMETER()
     };
     PREWARM_SHADER_PIPELINE(AerialPerspectiveIntegrateShader);
@@ -147,9 +158,23 @@ namespace dxvk {
         TEXTURE2D(2)
         SAMPLER(3)
         RW_TEXTURE3D(4)
+        STRUCTURED_BUFFER(7)
+        STRUCTURED_BUFFER(8)
+        RW_TEXTURE3D(9)
       END_PARAMETER()
     };
     PREWARM_SHADER_PIPELINE(AerialPerspectiveUnshadowedShader);
+
+    class AerialPerspectiveLightCullShader : public ManagedShader {
+      SHADER_SOURCE(AerialPerspectiveLightCullShader, VK_SHADER_STAGE_COMPUTE_BIT, aerial_perspective_light_cull)
+
+      BEGIN_PARAMETER()
+        CONSTANT_BUFFER(0)
+        STRUCTURED_BUFFER(1)
+        RW_STRUCTURED_BUFFER(2)
+      END_PARAMETER()
+    };
+    PREWARM_SHADER_PIPELINE(AerialPerspectiveLightCullShader);
 
     class CloudSkyTransmittanceLutShader : public ManagedShader {
       SHADER_SOURCE(CloudSkyTransmittanceLutShader, VK_SHADER_STAGE_COMPUTE_BIT, cloud_sky_transmittance_lut)
@@ -441,6 +466,13 @@ namespace {
     // applied in applyCloudComposite, long after every bake has run. Leaving it in the key would
     // re-bake the whole LUT cascade on a slider drag for nothing.
     args.cloudAerialInScatterStrength = 0.0f;
+    // Local lights change every frame a lamp moves or a muzzle flashes. Leaving any of this in the
+    // key would re-bake the whole transmittance / multiscattering / sky-view cascade on every one of
+    // them - the same class of bug the starRotation note below records.
+    args.aerialPerspectiveLocalLightCount = 0u;
+    args.aerialPerspectiveLocalLightTilesXY = 0u;
+    args.aerialPerspectiveLocalLightIntensity = 0.0f;
+    args.aerialPerspectiveLocalLightShadowRange = 0.0f;
     args.cameraPosition              = vec3(0.0f, 0.0f, 0.0f);
     args.cameraForward               = vec3(0.0f, 0.0f, 0.0f);
     args.cameraRight                 = vec3(0.0f, 0.0f, 0.0f);
@@ -1371,6 +1403,26 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
     args.aerialPerspectiveStartDistance = std::max(
       volumetricsHandoffWorldUnits,
       kMinNearDistanceMeters * worldUnitsPerMeter);
+
+    // Local lights. The count is the single gate on the whole path - the cull pass, the march and
+    // the composite all test it and nothing else - so it is zeroed whenever the feature is off,
+    // whenever the gather found nothing in range, and whenever aerial perspective itself is off.
+    // buildAerialPerspectiveLights owns m_aerialPerspectiveLightCount and runs before every consumer
+    // of these args.
+    const bool localLightsActive = RtxAtmosphere::aerialPerspective()
+      && RtxAtmosphere::aerialPerspectiveLocalLights()
+      && m_aerialPerspectiveLightCount > 0u
+      && m_aerialPerspectiveLightTilesXY > 0u;
+
+    args.aerialPerspectiveLocalLightCount = localLightsActive ? m_aerialPerspectiveLightCount : 0u;
+    args.aerialPerspectiveLocalLightTilesXY = m_aerialPerspectiveLightTilesXY;
+    args.aerialPerspectiveLocalLightIntensity =
+      std::max(RtxAtmosphere::aerialPerspectiveLocalLightIntensity(), 0.0f);
+    // Zero is the shader's no-shadow-rays state, so the toggle collapses into the range rather than
+    // needing a flag of its own.
+    args.aerialPerspectiveLocalLightShadowRange = RtxAtmosphere::aerialPerspectiveLocalLightShadows()
+      ? std::max(RtxAtmosphere::aerialPerspectiveLocalLightShadowRangeMeters(), 0.0f) * worldUnitsPerMeter
+      : 0.0f;
   }
 
   // Cloud Height LUT + two-layer cloud map (slides 1 + 3 lift, fork — 2026-05-15).
@@ -1842,6 +1894,12 @@ void RtxAtmosphere::computeLuts(Rc<DxvkContext> ctx) {
   // The composite is the only AP consumer and bypasses it under dome lighting.
   if (RtxAtmosphere::aerialPerspective()
       && !ctx->getCommonObjects()->getSceneManager().getLightManager().getDomeLightArgs().active) {
+    // Local lights first: the gather sets the light count that getAtmosphereArgs publishes, and both
+    // the cull pass and the bake read that count out of the constant buffer. Running the bake before
+    // them would bake with the previous frame's cluster lists against this frame's camera.
+    buildAerialPerspectiveLights(ctx);
+    dispatchAerialPerspectiveLightCull(ctx);
+
     dispatchAerialPerspectiveLut(ctx);
 
     ctx->emitMemoryBarrier(0,
@@ -2079,6 +2137,306 @@ void RtxAtmosphere::setAerialPerspectiveCamera(const RtCamera& camera) {
   m_apCameraUp = camera.getUp(/*freecam=*/true) * tanHalfFovY;
 }
 
+namespace {
+  // Reduce one scene light to the sphere the volume integrates it as, or report that it has no
+  // business being there. See AerialPerspectiveLight in aerial_perspective_light.h for why every
+  // emitter becomes a sphere.
+  //
+  // `equivalentRadius` is matched on AREA, not on extent: a volume point has no normal, so all that
+  // survives of an emitter's shape is the solid angle it subtends, and sqrt(area / pi) is the sphere
+  // radius that reproduces it in the far field.
+  bool describeAerialPerspectiveLight(
+    const RtLight& light, Vector3& position, Vector3& radiance, float& equivalentRadius,
+    const RtLightShaping*& shaping) {
+    shaping = nullptr;
+
+    switch (light.getType()) {
+    case RtLightType::Sphere: {
+      const RtSphereLight& sphere = light.getSphereLight();
+      position = sphere.getPosition();
+      radiance = sphere.getRadiance() * sphere.getVolumetricRadianceScale();
+      equivalentRadius = sphere.getRadius();
+      shaping = &sphere.getShaping();
+      return true;
+    }
+    case RtLightType::Rect: {
+      const RtRectLight& rect = light.getRectLight();
+      const Vector2 dimensions = rect.getDimensions();
+      position = rect.getPosition();
+      radiance = rect.getRadiance() * rect.getVolumetricRadianceScale();
+      equivalentRadius = std::sqrt(std::max(dimensions.x * dimensions.y, 0.0f) / kPi);
+      shaping = &rect.getShaping();
+      return true;
+    }
+    case RtLightType::Disk: {
+      const RtDiskLight& disk = light.getDiskLight();
+      const Vector2 halfDimensions = disk.getHalfDimensions();
+      position = disk.getPosition();
+      radiance = disk.getRadiance() * disk.getVolumetricRadianceScale();
+      // Area of the ellipse is pi * a * b, so the area-matched sphere radius is just sqrt(a * b).
+      equivalentRadius = std::sqrt(std::max(halfDimensions.x * halfDimensions.y, 0.0f));
+      shaping = &disk.getShaping();
+      return true;
+    }
+    case RtLightType::Cylinder: {
+      const RtCylinderLight& cylinder = light.getCylinderLight();
+      position = cylinder.getPosition();
+      radiance = cylinder.getRadiance() * cylinder.getVolumetricRadianceScale();
+      // Lateral area 2 * pi * r * h, so the area-matched radius is sqrt(2 * r * h).
+      equivalentRadius = std::sqrt(
+        std::max(2.0f * cylinder.getRadius() * cylinder.getAxisLength(), 0.0f));
+      return true;
+    }
+    case RtLightType::Distant:
+      // Deliberately skipped. The sun and moons are injected as distant lights by syncDistantLights
+      // and the volume already integrates them through the atmospheric term - with the transmittance
+      // LUT, the multiscattering LUT and the cloud shadow that path carries, none of which this
+      // analytic form has. Treating them as local lights as well would light the air twice, the same
+      // double count issue #35 found in the froxel grid.
+      return false;
+    default:
+      return false;
+    }
+  }
+}
+
+// Gather the frame's positional lights into the compact form the volume's march reads.
+//
+// Runs on the CPU rather than as a GPU decode of the packed light buffer because that decode lives
+// behind rtx/concept/light, whose include chain reaches cb-dependent headers; an atmosphere pass has
+// no RaytraceArgs bound. Doing it here also lets the ranking and the frustum reject happen before
+// anything is uploaded, so the cull pass below iterates the lights that can matter rather than every
+// light in the level.
+void RtxAtmosphere::buildAerialPerspectiveLights(Rc<DxvkContext> ctx) {
+  m_aerialPerspectiveLightCount = 0u;
+
+  const int maxLightCount = RtxAtmosphere::aerialPerspectiveLocalLightMaxCount();
+
+  if (!RtxAtmosphere::aerialPerspective()
+      || !RtxAtmosphere::aerialPerspectiveLocalLights()
+      || maxLightCount <= 0) {
+    return;
+  }
+
+  const std::vector<RtLight*>& sceneLights =
+    ctx->getCommonObjects()->getSceneManager().getLightManager().getLinearizedLights();
+
+  if (sceneLights.empty()) {
+    return;
+  }
+
+  // resolveUnitsPerMeter, not the global scene scale: the whole aerial perspective block is sized
+  // in these units (see the aerialPerspectiveDepthRange / SceneShadowRange fills), and on a game
+  // like New Vegas the two differ by the better part of a thousand.
+  const float worldUnitsPerMeter = resolveUnitsPerMeter();
+  const float cutoff = std::max(RtxAtmosphere::aerialPerspectiveLocalLightCutoff(), 1e-6f);
+  const float maxInfluence =
+    std::max(RtxAtmosphere::aerialPerspectiveDepthRangeMeters() * worldUnitsPerMeter, 1.0f);
+
+  // View frustum of the volume, in the same pre-scaled basis the bake builds its rays from: the
+  // stored right/up carry the half extents at unit forward distance, which is exactly the tangent of
+  // each half angle.
+  const float tanHalfFovX = std::max(length(m_apCameraRight), 1e-6f);
+  const float tanHalfFovY = std::max(length(m_apCameraUp), 1e-6f);
+  const Vector3 rightUnit = m_apCameraRight / tanHalfFovX;
+  const Vector3 upUnit = m_apCameraUp / tanHalfFovY;
+  const Vector3 forwardUnit = m_apCameraForward;
+  const float invRightPlaneNorm = 1.0f / std::sqrt(1.0f + tanHalfFovX * tanHalfFovX);
+  const float invUpPlaneNorm = 1.0f / std::sqrt(1.0f + tanHalfFovY * tanHalfFovY);
+
+  struct RankedLight {
+    AerialPerspectiveLight light;
+    float score;
+  };
+
+  std::vector<RankedLight> ranked;
+  ranked.reserve(std::min<size_t>(sceneLights.size(), static_cast<size_t>(maxLightCount) * 2u));
+
+  for (const RtLight* sceneLight : sceneLights) {
+    if (sceneLight == nullptr) {
+      continue;
+    }
+
+    Vector3 position;
+    Vector3 radiance;
+    float equivalentRadius = 0.0f;
+    const RtLightShaping* shaping = nullptr;
+
+    if (!describeAerialPerspectiveLight(*sceneLight, position, radiance, equivalentRadius, shaping)) {
+      continue;
+    }
+
+    const float peakRadiance = std::max(std::max(radiance.x, radiance.y), radiance.z);
+    if (!(peakRadiance > 0.0f) || !(equivalentRadius > 0.0f)) {
+      continue;
+    }
+
+    // Distance at which this light's incident radiance falls to the cutoff, from the emitter's own
+    // solid angle (pi * r^2 / d^2 in the far field). A torch is then culled after a few metres while
+    // a floodlight survives to a hundred, which is what keeps the march's cost set by local light
+    // density rather than by the scene's light count.
+    const float influenceRadius = std::min(
+      equivalentRadius * std::sqrt(kPi * peakRadiance / cutoff), maxInfluence);
+
+    // Reject anything whose influence sphere cannot touch the volume at all, before it costs the
+    // cull pass a per-cluster test. Planes rather than a bounding sphere here because the frustum is
+    // long and narrow and a sphere around it would reject almost nothing.
+    const Vector3 relative = position - m_apCameraPosition;
+    const float forward = dot(relative, forwardUnit);
+    const float lateralX = dot(relative, rightUnit);
+    const float lateralY = dot(relative, upUnit);
+
+    if (forward + influenceRadius < 0.0f || forward - influenceRadius > maxInfluence) {
+      continue;
+    }
+    if ((std::abs(lateralX) - tanHalfFovX * forward) * invRightPlaneNorm > influenceRadius) {
+      continue;
+    }
+    if ((std::abs(lateralY) - tanHalfFovY * forward) * invUpPlaneNorm > influenceRadius) {
+      continue;
+    }
+
+    AerialPerspectiveLight entry = {};
+    entry.position = { position.x, position.y, position.z };
+    entry.influenceRadius = influenceRadius;
+    entry.radiance = { radiance.x, radiance.y, radiance.z };
+    entry.equivalentRadius = equivalentRadius;
+
+    if (shaping != nullptr && shaping->getEnabled()) {
+      const Vector3 axis = shaping->getDirection();
+      entry.coneAxis = { axis.x, axis.y, axis.z };
+      entry.cosConeAngle = shaping->getCosConeAngle();
+      entry.coneSoftness = shaping->getConeSoftness();
+      entry.focusExponent = shaping->getFocusExponent();
+    } else {
+      // A zero axis is the shader's unshaped marker; see aerialPerspectiveLightShaping.
+      entry.coneAxis = { 0.0f, 0.0f, 0.0f };
+      entry.cosConeAngle = 0.0f;
+      entry.coneSoftness = 0.0f;
+      entry.focusExponent = 0.0f;
+    }
+
+    // Rank by the incident radiance the light delivers at the nearest point of its own reach to the
+    // camera, which stands in for how much of the screen it can affect. A light whose influence
+    // sphere contains the camera scores its full peak and so always survives the cap.
+    const float distanceToCamera = length(relative);
+    const float clearance = std::max(distanceToCamera - influenceRadius, 0.0f);
+    const float score = peakRadiance * equivalentRadius * equivalentRadius
+      / std::max(clearance * clearance, equivalentRadius * equivalentRadius);
+
+    ranked.push_back({ entry, score });
+  }
+
+  if (ranked.empty()) {
+    return;
+  }
+
+  const size_t keep = std::min(ranked.size(), static_cast<size_t>(maxLightCount));
+
+  // Partial sort, not a full one: everything past the cap is discarded, and the cull pass relies
+  // only on the KEPT prefix being ordered so an overflowing cluster drops its dimmest lights.
+  std::partial_sort(
+    ranked.begin(), ranked.begin() + keep, ranked.end(),
+    [](const RankedLight& a, const RankedLight& b) { return a.score > b.score; });
+
+  std::vector<AerialPerspectiveLight> packed;
+  packed.reserve(keep);
+  for (size_t i = 0; i < keep; ++i) {
+    packed.push_back(ranked[i].light);
+  }
+
+  // Grow-only. The count moves every frame as lights come and go, and reallocating whenever it
+  // shrinks would orphan a buffer that a command list in flight still references.
+  if (m_aerialPerspectiveLightBuffer == nullptr || m_aerialPerspectiveLightCapacity < keep) {
+    const uint32_t capacity = std::max(static_cast<uint32_t>(keep), 64u);
+
+    DxvkBufferCreateInfo info = {};
+    info.size = sizeof(AerialPerspectiveLight) * capacity;
+    info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    info.access = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+
+    m_aerialPerspectiveLightBuffer = m_device->createBuffer(
+      info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXBuffer,
+      "Atmosphere Aerial Perspective Lights");
+    m_aerialPerspectiveLightCapacity = capacity;
+  }
+
+  ctx->updateBuffer(
+    m_aerialPerspectiveLightBuffer, 0, sizeof(AerialPerspectiveLight) * keep, packed.data());
+  ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_aerialPerspectiveLightBuffer);
+
+  m_aerialPerspectiveLightCount = static_cast<uint32_t>(keep);
+}
+
+// Bin this frame's lights into the volume's own froxel grid, coarsened to the bake's thread group.
+//
+// Runs after buildAerialPerspectiveLights and before the bake, and writes every cluster's count
+// unconditionally - including the zeroes - so the bake never reads a stale list from a frame when
+// the grid was a different size or the feature was off.
+void RtxAtmosphere::dispatchAerialPerspectiveLightCull(Rc<DxvkContext> ctx) {
+  // Nothing to bin. Skipping leaves whatever the last populated frame wrote in the cluster buffer,
+  // which is safe because the count buildAerialPerspectiveLights just zeroed is the single gate the
+  // bake tests before it reads a single cluster - and it is the only way to avoid dispatching this
+  // pass every frame in the overwhelmingly common case of a scene with no lights in range.
+  if (m_aerialPerspectiveLightCount == 0u || m_aerialPerspectiveLightBuffer == nullptr) {
+    m_aerialPerspectiveLightTilesXY = 0u;
+    return;
+  }
+
+  const uint32_t lutSizeXY =
+    static_cast<uint32_t>(std::max(RtxAtmosphere::aerialPerspectiveLutResolution(), 1));
+  const uint32_t lutSizeZ =
+    static_cast<uint32_t>(std::max(RtxAtmosphere::aerialPerspectiveLutDepthSlices(), 1));
+
+  m_aerialPerspectiveLightTilesXY =
+    (lutSizeXY + AERIAL_PERSPECTIVE_LIGHT_TILE_SIZE - 1u) / AERIAL_PERSPECTIVE_LIGHT_TILE_SIZE;
+
+  const uint32_t clusterCount =
+    m_aerialPerspectiveLightTilesXY * m_aerialPerspectiveLightTilesXY * lutSizeZ;
+  const uint32_t requiredUints = clusterCount * AERIAL_PERSPECTIVE_LIGHT_CLUSTER_STRIDE;
+
+  if (m_aerialPerspectiveLightClusterBuffer == nullptr
+      || m_aerialPerspectiveLightClusterCapacity < requiredUints) {
+    DxvkBufferCreateInfo info = {};
+    info.size = sizeof(uint32_t) * requiredUints;
+    info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    info.access =
+      VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+
+    m_aerialPerspectiveLightClusterBuffer = m_device->createBuffer(
+      info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXBuffer,
+      "Atmosphere Aerial Perspective Light Clusters");
+    m_aerialPerspectiveLightClusterCapacity = requiredUints;
+  }
+
+  ScopedGpuProfileZone(ctx, "Atmosphere Aerial Perspective Light Cull");
+
+  AtmosphereArgs args = getAtmosphereArgs();
+  ctx->updateBuffer(m_constantsBuffer, 0, sizeof(AtmosphereArgs), &args);
+  ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_constantsBuffer);
+
+  ctx->bindResourceBuffer(AERIAL_PERSPECTIVE_LIGHT_CULL_ATMOSPHERE_ARGS,
+    DxvkBufferSlice(m_constantsBuffer, 0, m_constantsBuffer->info().size));
+  ctx->bindResourceBuffer(AERIAL_PERSPECTIVE_LIGHT_CULL_LIGHTS,
+    DxvkBufferSlice(m_aerialPerspectiveLightBuffer));
+  ctx->bindResourceBuffer(AERIAL_PERSPECTIVE_LIGHT_CULL_CLUSTERS,
+    DxvkBufferSlice(m_aerialPerspectiveLightClusterBuffer));
+  ctx->getCommandList()->trackResource<DxvkAccess::Write>(m_aerialPerspectiveLightClusterBuffer);
+
+  ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, AerialPerspectiveLightCullShader::getShader());
+  ctx->dispatch(
+    (m_aerialPerspectiveLightTilesXY + 3u) / 4u,
+    (m_aerialPerspectiveLightTilesXY + 3u) / 4u,
+    (lutSizeZ + 3u) / 4u);
+
+  ctx->emitMemoryBarrier(0,
+    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+  ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_aerialPerspectiveLightClusterBuffer);
+}
+
 // In-scatter toward the camera in RGB, mean transmittance in A. Camera-frustum-fitted, so it is
 // rebuilt every frame rather than on parameter change; consumed by the composite to haze geometry.
 void RtxAtmosphere::createAerialPerspectiveLut(Rc<DxvkContext> ctx, uint32_t sizeXY, uint32_t sizeZ) {
@@ -2086,6 +2444,25 @@ void RtxAtmosphere::createAerialPerspectiveLut(Rc<DxvkContext> ctx, uint32_t siz
   m_aerialPerspectiveLut = Resources::createImageResource(
     ctx,
     "Atmosphere Aerial Perspective LUT",
+    aerialPerspectiveExtent,
+    VK_FORMAT_R16G16B16A16_SFLOAT,
+    1, // numLayers
+    VK_IMAGE_TYPE_3D,
+    VK_IMAGE_VIEW_TYPE_3D,
+    0, // imageCreateFlags
+    VK_IMAGE_USAGE_STORAGE_BIT, // extraUsageFlags
+    VkClearColorValue{}, // clearValue
+    1 // mipLevels
+  );
+
+  // Companion volume for scene-light in-scatter, same extent and format so the composite can sample
+  // both with one UVW and one sampler. Allocated unconditionally rather than on the local-light
+  // toggle: the bake writes it every frame it runs, so a volume that only existed while the feature
+  // was on would have to be created mid-frame on the enable, and the composite would have to carry a
+  // null binding path for the frame before that.
+  m_aerialPerspectiveLocalLut = Resources::createImageResource(
+    ctx,
+    "Atmosphere Aerial Perspective Local Light LUT",
     aerialPerspectiveExtent,
     VK_FORMAT_R16G16B16A16_SFLOAT,
     1, // numLayers
@@ -2108,6 +2485,7 @@ void RtxAtmosphere::dispatchAerialPerspectiveLut(Rc<DxvkContext> ctx) {
     static_cast<uint32_t>(std::max(RtxAtmosphere::aerialPerspectiveLutDepthSlices(), 1));
 
   if (!m_aerialPerspectiveLut.isValid()
+      || !m_aerialPerspectiveLocalLut.isValid()
       || m_aerialPerspectiveLut.image->info().extent.width != lutSizeXY
       || m_aerialPerspectiveLut.image->info().extent.depth != lutSizeZ) {
     createAerialPerspectiveLut(ctx, lutSizeXY, lutSizeZ);
@@ -2154,10 +2532,29 @@ void RtxAtmosphere::dispatchAerialPerspectiveLut(Rc<DxvkContext> ctx) {
   }
   ctx->bindResourceSampler(AERIAL_PERSPECTIVE_LUT_SAMPLER, m_aerialPerspectiveSampler);
   ctx->bindResourceView(AERIAL_PERSPECTIVE_LUT_OUTPUT, m_aerialPerspectiveLut.view, nullptr);
+  ctx->bindResourceView(AERIAL_PERSPECTIVE_LUT_LOCAL_OUTPUT, m_aerialPerspectiveLocalLut.view, nullptr);
+
+  // Both light buffers are bound whether or not any light survived the gather: the bake's
+  // aerialPerspectiveLocalLightCount test is what disables the path, and a descriptor left unbound
+  // while the shader still declares it is a validation error rather than a no-op. The fallbacks
+  // below cover the first frames of a scene, before either buffer has been allocated.
+  ctx->bindResourceBuffer(AERIAL_PERSPECTIVE_LUT_LIGHTS,
+    m_aerialPerspectiveLightBuffer != nullptr
+      ? DxvkBufferSlice(m_aerialPerspectiveLightBuffer) : DxvkBufferSlice());
+  ctx->bindResourceBuffer(AERIAL_PERSPECTIVE_LUT_LIGHT_CLUSTERS,
+    m_aerialPerspectiveLightClusterBuffer != nullptr
+      ? DxvkBufferSlice(m_aerialPerspectiveLightClusterBuffer) : DxvkBufferSlice());
 
   ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_transmittanceLut.image);
   ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_multiscatteringLut.image);
   ctx->getCommandList()->trackResource<DxvkAccess::Write>(m_aerialPerspectiveLut.image);
+  ctx->getCommandList()->trackResource<DxvkAccess::Write>(m_aerialPerspectiveLocalLut.image);
+  if (m_aerialPerspectiveLightBuffer != nullptr) {
+    ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_aerialPerspectiveLightBuffer);
+  }
+  if (m_aerialPerspectiveLightClusterBuffer != nullptr) {
+    ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_aerialPerspectiveLightClusterBuffer);
+  }
 
   const bool traceScene = (args.aerialPerspectiveSceneShadowMode == 1u
     || args.aerialPerspectiveSceneShadowMode == 3u) && args.aerialPerspectiveSceneShadowRange > 0.0f;

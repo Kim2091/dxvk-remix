@@ -84,6 +84,12 @@ public:
   // transmittance in A. Rebuilt every frame because it is fitted to the frustum.
   Resources::Resource getAerialPerspectiveLut() const { return m_aerialPerspectiveLut; }
 
+  // Companion volume holding the in-scatter from ordinary scene lights through the same froxels.
+  // Separate from the atmospheric volume above because the composite applies the two to different
+  // pixels - see applyAerialPerspective. Always allocated alongside it, and left all-zero when
+  // local lights are off, so consumers bind it unconditionally and test the light count instead.
+  Resources::Resource getAerialPerspectiveLocalLut() const { return m_aerialPerspectiveLocalLut; }
+
   // Cache the camera frustum basis the aerial perspective volume is fitted to. Same push-then-read
   // shape as setCloudShadowCameraPosition: call once per frame before computeLuts, since the const
   // getAtmosphereArgs() runs many times per frame and cannot derive this itself.
@@ -444,6 +450,55 @@ public:
                "with DISTANCE, and the exponential slice distribution already gives every slice the same relative "
                "depth resolution - so it needs far less than the screen axes do. Cost is linear in this value.",
                args.minValue = 4, args.maxValue = 128);
+    RTX_OPTION("rtx.atmosphere", bool, aerialPerspectiveLocalLights, true,
+               "Scatter ordinary scene lights - lamps, torches, muzzle flashes, headlights - through the aerial "
+               "perspective volume, alongside the sun and sky it already carries.\n"
+               "This is what makes the volume a general participating medium rather than an outdoor-daytime one. "
+               "Without it the air is lit by the atmosphere alone, so an interior reads as unlit haze and a light "
+               "in fog throws no glow at all; that job currently belongs to the global volumetrics froxel grid, "
+               "which resolves it per froxel with ReSTIR and a shadow ray each. This path instead culls lights into "
+               "the volume's own froxel grid once per frame and evaluates the survivors analytically along the "
+               "march the bake is already doing, which is why it can cover the same ground for a fraction of the "
+               "cost - and why turning this on is what lets rtx.volumetrics.enable be turned off.\n"
+               "Costs one cull dispatch over a coarse cluster grid, plus a handful of analytic light evaluations "
+               "per march step in the clusters that actually contain lights. Scenes with no positional lights in "
+               "range pay nothing.");
+    RTX_OPTION_ARGS("rtx.atmosphere", float, aerialPerspectiveLocalLightIntensity, 1.0f,
+               "Gain on the local light contribution to the aerial perspective volume.\n"
+               "1.0 is physical: a light's radiance enters the medium at face value and leaves scaled by the air's "
+               "own scattering coefficient. Raise it when a game's lights are authored dimmer than the air density "
+               "that reads correctly for distant haze, which is the usual reason a lamp shows no visible glow.",
+               args.minValue = 0.0f, args.maxValue = 100.0f);
+    RTX_OPTION("rtx.atmosphere", bool, aerialPerspectiveLocalLightShadows, true,
+               "Trace the scene for occlusion of local lights in the aerial perspective volume.\n"
+               "Without it a lamp lights the fog on both sides of the wall it stands behind, which is the most "
+               "obvious way volumetric lighting reads as fake - and unlike the sun's halo no phase cap softens it, "
+               "because a local light's brightest air is the air nearest it rather than the air pointing at it. "
+               "With it, a light through a doorway or a window throws a real shaft.\n"
+               "One ray per light per depth slice, and the ray stops at the emitter rather than running to the "
+               "shadow range, so it is far cheaper than the sun's equivalent. Only clusters that actually contain "
+               "a light trace anything.");
+    RTX_OPTION_ARGS("rtx.atmosphere", float, aerialPerspectiveLocalLightShadowRangeMeters, 300.0f,
+               "How far from the camera, in meters, local lights may be shadowed against the scene. Slices past "
+               "this treat their lights as unoccluded, which costs nothing and is rarely visible: a light whose "
+               "influence reaches that far is either bright enough that its shaft is lost in the haze or far enough "
+               "that the volume cannot resolve the shaft anyway. Lower it to spend fewer rays.",
+               args.minValue = 0.0f);
+    RTX_OPTION_ARGS("rtx.atmosphere", int, aerialPerspectiveLocalLightMaxCount, 256,
+               "Upper bound on how many scene lights may be submitted to the aerial perspective volume in a frame.\n"
+               "Lights are ranked by the peak in-scatter they can produce anywhere in the view frustum and the "
+               "brightest survive, so raising this adds progressively dimmer lights. The cost of the cull pass is "
+               "linear in it; the cost of the march is not, since a cluster still holds at most "
+               "AERIAL_PERSPECTIVE_MAX_LIGHTS_PER_CLUSTER of them.",
+               args.minValue = 0, args.maxValue = 4096);
+    RTX_OPTION_ARGS("rtx.atmosphere", float, aerialPerspectiveLocalLightCutoff, 0.002f,
+               "In-scattered radiance below which a light is considered not to reach a point, used to size each "
+               "light's cull radius from its own power.\n"
+               "This is what keeps the cost proportional to local light DENSITY rather than to the scene's light "
+               "count: a torch is culled after a few metres while a floodlight survives to a hundred, instead of "
+               "every light paying for the brightest one's range. Lower it if bright lights visibly stop affecting "
+               "the fog at a fixed radius; raise it to spend less.",
+               args.minValue = 0.0f);
     RTX_OPTION("rtx.atmosphere", bool, aerialPerspectiveSeparateVisibility, false,
                "Compute aerial perspective scene visibility in a separate pass using the same sun samples and sky probes. "
                "May improve GPU scheduling at the cost of an extra visibility volume and dispatch. "
@@ -1497,6 +1552,11 @@ private:
   void dispatchMultiscatteringLut(Rc<DxvkContext> ctx);
   void dispatchSkyViewLut(Rc<DxvkContext> ctx);
   void dispatchAerialPerspectiveLut(Rc<DxvkContext> ctx);  // per-frame; camera-fitted
+  // Per-frame local light pipeline for the aerial perspective volume: gather the frame's positional
+  // lights into the compact GPU form, then cull them into the volume's own cluster grid. Both run
+  // immediately before the bake reads them.
+  void buildAerialPerspectiveLights(Rc<DxvkContext> ctx);
+  void dispatchAerialPerspectiveLightCull(Rc<DxvkContext> ctx);
   // Baked at init + on cloudCellSizeKm / cloudNoiseTileKm change.
   void dispatchCloudPlacementMapBake(Rc<DxvkContext> ctx);
   bool needsCloudPlacementRebake() const;
@@ -1569,8 +1629,19 @@ private:
   Resources::Resource m_multiscatteringLut;
   Resources::Resource m_skyViewLut;
   Resources::Resource m_aerialPerspectiveLut;
+  Resources::Resource m_aerialPerspectiveLocalLut;
   Resources::Resource m_aerialPerspectiveVisibility;
   Rc<DxvkSampler> m_aerialPerspectiveSampler;
+
+  // Compact scene lights for this frame, and the per-cluster index lists the cull pass builds from
+  // them. Both are grown on demand and never shrunk: the counts move every frame as lights come and
+  // go, and a reallocation mid-frame would orphan a buffer a command list still references.
+  Rc<DxvkBuffer> m_aerialPerspectiveLightBuffer;
+  Rc<DxvkBuffer> m_aerialPerspectiveLightClusterBuffer;
+  uint32_t m_aerialPerspectiveLightCapacity = 0u;
+  uint32_t m_aerialPerspectiveLightCount = 0u;
+  uint32_t m_aerialPerspectiveLightClusterCapacity = 0u;
+  uint32_t m_aerialPerspectiveLightTilesXY = 0u;
   Rc<DxvkSampler> m_cloudNoiseSampler;
   Rc<DxvkSampler> m_skyViewSampler;
   Resources::Resource m_cloudSkyTransmittanceLut;

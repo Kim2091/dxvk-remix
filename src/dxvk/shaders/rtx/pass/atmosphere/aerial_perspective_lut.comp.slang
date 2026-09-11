@@ -40,11 +40,38 @@
 // frame, with six integration steps and six sky probes per depth slice in each screen column.
 
 #include "rtx/pass/atmosphere/atmosphere_common.slangh"
+#include "rtx/pass/atmosphere/aerial_perspective_lights.slangh"
 #include "rtx/pass/atmosphere/aerial_perspective_lut_binding_indices.h"
 #include "rtx/pass/instance_definitions.h"   // OBJECT_MASK_OPAQUE (sun occlusion trace)
 
+// Layout of the per-slice visibility word, which the separate-visibility path bakes once and the
+// integration pass then reads instead of re-tracing. One word per froxel, so every bit here is a ray
+// the integration does not pay for twice.
+//
+//   bits  0..5   one per sun sub-step of the slice (kStepsPerSlice)
+//   bits  6..8   sky probes reaching the slice midpoint, 0..6
+//   bits  9..24  one per local light slot in this froxel's cull cluster
+//   bits 25..31  free
+//
+// The light field is what sets AERIAL_PERSPECTIVE_MAX_LIGHTS_PER_CLUSTER at sixteen: raising it
+// past that needs a second word, not just a bigger constant.
+static const uint kSunVisibilityMask = 0x3Fu;
+static const uint kSkyVisibilityShift = 6u;
+static const uint kSkyVisibilityMask = 0x7u;
+static const uint kLightVisibilityShift = 9u;
+
 layout(binding = AERIAL_PERSPECTIVE_LUT_ATMOSPHERE_ARGS)
 ConstantBuffer<AtmosphereArgs> atmosphereArgs;
+
+// Compact scene lights and the per-cluster index lists the cull pass wrote. Both are bound in every
+// variant: the cull pass leaves every cluster count at zero when the feature is off, which is the
+// same state the march sees when no light is in range, so there is no separate enable to thread
+// through four shader variants.
+layout(binding = AERIAL_PERSPECTIVE_LUT_LIGHTS)
+StructuredBuffer<AerialPerspectiveLight> aerialPerspectiveLights;
+
+layout(binding = AERIAL_PERSPECTIVE_LUT_LIGHT_CLUSTERS)
+StructuredBuffer<uint> aerialPerspectiveLightClusters;
 
 layout(binding = AERIAL_PERSPECTIVE_LUT_TRANSMITTANCE_INPUT)
 Texture2D<float4> transmittanceLutInput;
@@ -62,6 +89,16 @@ RWTexture3D<uint> aerialPerspectiveVisibilityOutput;
 #else
 layout(binding = AERIAL_PERSPECTIVE_LUT_OUTPUT, rgba16f)
 RWTexture3D<float4> aerialPerspectiveLutOutput;
+
+// Scene-light in-scatter, kept in its own volume rather than added to the one above.
+//
+// The sky-view LUT already contains the atmospheric column, so the composite must NOT apply this
+// volume's atmospheric term on a primary miss - which is exactly why the sun's scene shadowing
+// stops at an occluder's silhouette instead of continuing across the sky behind it. The sky
+// contains no lamp, though, so this term has no such conflict and the composite applies it
+// everywhere, sky pixels included. That is what lets a local light's shaft cross a silhouette.
+layout(binding = AERIAL_PERSPECTIVE_LUT_LOCAL_OUTPUT, rgba16f)
+RWTexture3D<float4> aerialPerspectiveLocalLutOutput;
 #endif
 
 #if defined(AP_CACHED_VISIBILITY)
@@ -72,7 +109,7 @@ struct SceneSunOccluder : IAtmosphereSunOccluder {
   uint visibility;
 
   float skyVisibility(float distanceKm) {
-    return float(visibility >> 6u) / 6.0f;
+    return float((visibility >> kSkyVisibilityShift) & kSkyVisibilityMask) / 6.0f;
   }
 
   float sunVisibility(float distanceKm, uint sampleIndex) {
@@ -236,6 +273,113 @@ struct SceneSunOccluder : IAtmosphereSunOccluder {
   }
 };
 #endif
+
+// Scene lights reaching the column this thread marches, read from the cull cluster covering the
+// thread's screen tile and the slice being integrated.
+//
+// Visibility is resolved once per SLICE rather than once per sub-step, unlike the sun's. The sun
+// needs the finer grain because its occluder is usually the very surface the column ends on, so the
+// near sub-steps are shadowed and the far ones are not and a single answer for the slice would be
+// wrong at both ends. A local light's occluder is somewhere off to the side instead, and the slices
+// that hold local lights at all are the near ones - metres thick under the exponential
+// distribution, which is finer than the grid can express anyway. Six times fewer rays for an error
+// the volume cannot resolve is the right trade here and the wrong one there.
+struct SceneLocalLights : IAtmosphereLocalLights {
+  vec3 worldOrigin;         // Camera position, world units
+  vec3 worldDirection;      // Normalized marched ray in world space
+  float worldUnitsPerKm;
+  float intensity;
+  float mieAnisotropy;      // Already capped by aerialPerspectiveMieAnisotropyMax
+  uint clusterOffset;       // Start of this slice's cluster record in the cull buffer
+  uint count;               // Lights in that record
+  uint visibility;          // Bit i set when light slot i is unoccluded for this slice
+
+  bool active() {
+    return count > 0u;
+  }
+
+  vec3 inScatter(float distanceKm, AtmosphereMedium medium, uint sampleIndex) {
+    const vec3 worldPosition = worldOrigin + worldDirection * (distanceKm * worldUnitsPerKm);
+
+    vec3 total = vec3(0.0f);
+    for (uint slot = 0u; slot < count; ++slot) {
+      if ((visibility & (1u << slot)) == 0u) {
+        continue;
+      }
+
+      const uint lightIndex = aerialPerspectiveLightClusters[clusterOffset + 1u + slot];
+      total += aerialPerspectiveLightInScatter(
+        aerialPerspectiveLights[lightIndex], worldPosition, worldDirection, medium, mieAnisotropy);
+    }
+
+    return total * intensity;
+  }
+};
+
+#if !defined(AP_CACHED_VISIBILITY) && !defined(AP_UNSHADOWED)
+// One shadow ray per light in the cluster, cast from the slice midpoint.
+//
+// Without it a lamp lights the fog on both sides of the wall it is standing behind, which is the
+// single most obvious way volumetric lighting reads as fake - and unlike the sun's halo, no phase
+// cap softens it, because a local light's brightest air is the air nearest it rather than the air
+// pointing at it. The ray is short (it stops at the emitter) so it is far cheaper than the sun's,
+// which runs to the shadow range every time.
+//
+// Same mask and flag policy as the sun trace above: OBJECT_MASK_OPAQUE takes alpha-tested geometry
+// with the solid world, and FORCE_OPAQUE keeps clip-planed instances occluding rather than being
+// traced straight through. See the block comment on SceneSunOccluder for why CULL_NON_OPAQUE would
+// silently disable the whole thing.
+uint traceLocalLightVisibility(
+  vec3 worldOrigin, vec3 worldDirection, float sliceDistanceWorld,
+  uint clusterOffset, uint count, float shadowRange
+) {
+  // All visible is the correct answer for an empty cluster and the correct fallback past the range.
+  const uint allVisible = (1u << count) - 1u;
+
+  if (count == 0u || !(shadowRange > 0.0f) || sliceDistanceWorld > shadowRange) {
+    return allVisible;
+  }
+
+  const vec3 samplePosition = worldOrigin + worldDirection * sliceDistanceWorld;
+
+  uint visibility = allVisible;
+  for (uint slot = 0u; slot < count; ++slot) {
+    const uint lightIndex = aerialPerspectiveLightClusters[clusterOffset + 1u + slot];
+    const AerialPerspectiveLight light = aerialPerspectiveLights[lightIndex];
+
+    const vec3 toLight = light.position - samplePosition;
+    const float distanceToLight = length(toLight);
+    if (!(distanceToLight > 0.0f)) {
+      continue;
+    }
+
+    RayDesc ray;
+    ray.Origin = samplePosition;
+    ray.Direction = toLight / distanceToLight;
+    ray.TMin = 0.0f;
+    // Stop at the emitter's own surface. A Remix light usually sits inside the mesh that represents
+    // it - a bulb inside its fixture, a flame inside its brazier - so a ray run all the way to the
+    // light centre finds that mesh and reports every light in the scene as fully occluded.
+    ray.TMax = max(distanceToLight - max(light.equivalentRadius, 0.0f), 0.0f) * 0.999f;
+
+    if (!(ray.TMax > 0.0f)) {
+      continue;
+    }
+
+    static const uint kRayFlags = RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH
+      | RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES;
+    RayQuery<kRayFlags> query;
+    query.TraceRayInline(sceneTlas, kRayFlags, OBJECT_MASK_OPAQUE, ray);
+    query.Proceed();
+
+    if (query.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
+      visibility &= ~(1u << slot);
+    }
+  }
+
+  return visibility;
+}
+#endif
 // NV-DXVK end
 
 // Sub-steps per slice. Each slice spans a fixed FRACTION of its own distance under the exponential
@@ -276,6 +420,7 @@ void main(uint3 threadId : SV_DispatchThreadID) {
 #else
     for (uint emptySlice = 0u; emptySlice < depthSlices; ++emptySlice) {
       aerialPerspectiveLutOutput[uint3(threadId.xy, emptySlice)] = float4(0.0f, 0.0f, 0.0f, 1.0f);
+      aerialPerspectiveLocalLutOutput[uint3(threadId.xy, emptySlice)] = float4(0.0f, 0.0f, 0.0f, 0.0f);
     }
 #endif
     return;
@@ -313,6 +458,24 @@ void main(uint3 threadId : SV_DispatchThreadID) {
   sunOccluder.mode = args.aerialPerspectiveSceneShadowMode;
 #endif
 
+  // Local lights come from the cull cluster covering this thread's screen tile. The tile size is the
+  // thread group size, so every thread in a group resolves the same cluster column and the buffer
+  // reads below are uniform across it.
+  const uint2 lightTile = threadId.xy / AERIAL_PERSPECTIVE_LIGHT_TILE_SIZE;
+  const uint lightTilesXY = args.aerialPerspectiveLocalLightTilesXY;
+  const bool localLightsPossible =
+    args.aerialPerspectiveLocalLightCount > 0u && lightTilesXY > 0u;
+
+  SceneLocalLights localLights;
+  localLights.worldOrigin = args.cameraPosition;
+  localLights.worldDirection = rayDirWorld;
+  localLights.worldUnitsPerKm = args.aerialPerspectiveWorldUnitsPerKm;
+  localLights.intensity = args.aerialPerspectiveLocalLightIntensity;
+  localLights.mieAnisotropy = min(args.mieAnisotropy, args.aerialPerspectiveMieAnisotropyMax);
+  localLights.clusterOffset = 0u;
+  localLights.count = 0u;
+  localLights.visibility = 0u;
+
 #if defined(AP_VISIBILITY_PASS)
   // Preserve the same loop-carried depth arithmetic as the fused reference.
   float segmentStartKm = aerialPerspectiveSliceNearDistance(args) * forwardToRayLength * kmPerWorldUnit;
@@ -321,14 +484,36 @@ void main(uint3 threadId : SV_DispatchThreadID) {
     const float segmentEndKm = aerialPerspectiveSliceToForwardDistance(w, args) * forwardToRayLength * kmPerWorldUnit;
     const float t0 = max(atmosphereRay.nearDistance, segmentStartKm);
     const float t1 = segmentEndKm > 0.0f ? min(atmosphereRay.farDistance, segmentEndKm) : atmosphereRay.farDistance;
-    uint visibility = 63u | (6u << 6u);
+    uint visibility = kSunVisibilityMask | (6u << kSkyVisibilityShift);
+
+    // Local light visibility for this slice, traced here so the integration pass does not have to.
+    // Unconditional on the sun's shadow range: the two are separate budgets, and a local light is
+    // usually well inside a range sized for terrain-scale sun occluders anyway.
+    if (localLightsPossible) {
+      const uint clusterOffset =
+        aerialPerspectiveLightClusterOffset(lightTile, slice, lightTilesXY);
+      const uint clusterCount = aerialPerspectiveLightClusters[clusterOffset];
+      const float sliceMidDistanceWorld =
+        (segmentStartKm + segmentEndKm) * 0.5f * args.aerialPerspectiveWorldUnitsPerKm;
+
+      const uint lightVisibility = traceLocalLightVisibility(
+        args.cameraPosition, rayDirWorld, sliceMidDistanceWorld,
+        clusterOffset, clusterCount, args.aerialPerspectiveLocalLightShadowRange);
+
+      visibility |= lightVisibility << kLightVisibilityShift;
+    }
+
     const float skyDistanceKm = (segmentStartKm + segmentEndKm) * 0.5f;
     const bool beyondSceneRange = t0 * args.worldUnitsPerKm > sunOccluder.maxTraceDistance
       && skyDistanceKm * args.worldUnitsPerKm > sunOccluder.maxTraceDistance;
     if (segmentEndKm > segmentStartKm && t1 > t0 && !beyondSceneRange) {
       if (args.multiScatterStrength != 0.0f) {
         const float skyVisibility = sunOccluder.skyVisibility((segmentStartKm + segmentEndKm) * 0.5f);
-        visibility = 63u | (uint(round(skyVisibility * 6.0f)) << 6u);
+        // Replace the sky field only. Rewriting the whole word here, as this once did, is safe as
+        // long as the sun bits are still all-set at this point - but it would silently drop the
+        // local light bits traced above.
+        visibility = (visibility & ~(kSkyVisibilityMask << kSkyVisibilityShift))
+          | (uint(round(skyVisibility * 6.0f)) << kSkyVisibilityShift);
       }
       float stepStart = 0.0f;
       for (int i = 0; i < kStepsPerSlice; ++i) {
@@ -355,6 +540,7 @@ void main(uint3 threadId : SV_DispatchThreadID) {
   // Running totals from the near bound out to the slice currently being written. Everything nearer
   // than that bound belongs to the global volumetrics froxel grid.
   vec3 inScatter = vec3(0.0f);
+  vec3 localInScatter = vec3(0.0f);
   vec3 transmittance = vec3(1.0f);
 
   float segmentStartKm =
@@ -367,19 +553,45 @@ void main(uint3 threadId : SV_DispatchThreadID) {
 
     if (segmentEndKm > segmentStartKm) {
 #if defined(AP_CACHED_VISIBILITY)
-      sunOccluder.visibility = aerialPerspectiveVisibilityInput.Load(int4(threadId.xy, slice, 0));
+      const uint cachedVisibility = aerialPerspectiveVisibilityInput.Load(int4(threadId.xy, slice, 0));
+      sunOccluder.visibility = cachedVisibility;
 #endif
+
+      // Bind this slice's cull cluster to the light evaluator, and resolve how much of it each
+      // light can see. Which of the three routes runs is fixed at compile time by the variant: the
+      // fused bake traces here, the split bake reads what its visibility pass already traced, and
+      // the untraced bake leaves every light unshadowed.
+      if (localLightsPossible) {
+        localLights.clusterOffset =
+          aerialPerspectiveLightClusterOffset(lightTile, slice, lightTilesXY);
+        localLights.count = aerialPerspectiveLightClusters[localLights.clusterOffset];
+
+#if defined(AP_CACHED_VISIBILITY)
+        localLights.visibility = cachedVisibility >> kLightVisibilityShift;
+#elif defined(AP_UNSHADOWED)
+        localLights.visibility = 0xFFFFu;
+#else
+        localLights.visibility = traceLocalLightVisibility(
+          args.cameraPosition, rayDirWorld,
+          (segmentStartKm + segmentEndKm) * 0.5f * args.aerialPerspectiveWorldUnitsPerKm,
+          localLights.clusterOffset, localLights.count,
+          args.aerialPerspectiveLocalLightShadowRange);
+#endif
+      }
+
       // Compose this segment onto the running totals. Both terms are along the same ray, so the
       // segment's in-scatter arrives at the camera through the transmittance already accumulated
       // in front of it, and the two transmittances simply multiply.
       vec3 segmentTransmittance = vec3(1.0f);
+      vec3 segmentLocalInScatter = vec3(0.0f);
       const vec3 segmentInScatter = evalAtmosphereInScatterSegment(
         rayOrigin, rayDir, sunDir, args,
         transmittanceLutInput, lutSampler, multiscatteringLutInput,
-        kStepsPerSlice, segmentStartKm, segmentEndKm, atmosphereRay, sunOccluder,
-        segmentTransmittance);
+        kStepsPerSlice, segmentStartKm, segmentEndKm, atmosphereRay, sunOccluder, localLights,
+        segmentTransmittance, segmentLocalInScatter);
 
       inScatter += transmittance * segmentInScatter;
+      localInScatter += transmittance * segmentLocalInScatter;
       transmittance *= segmentTransmittance;
 
       segmentStartKm = segmentEndKm;
@@ -391,6 +603,13 @@ void main(uint3 threadId : SV_DispatchThreadID) {
 
     aerialPerspectiveLutOutput[uint3(threadId.xy, slice)] =
       float4(inScatter, saturate(meanTransmittance));
+
+    // No transmittance channel of its own: the extinction along the column is a property of the
+    // medium, not of what lit it, so the composite reads it from the atmospheric volume above and
+    // applies it once. Storing it twice would let the two disagree under filtering and attenuate
+    // the scene by the product.
+    aerialPerspectiveLocalLutOutput[uint3(threadId.xy, slice)] =
+      float4(localInScatter, 0.0f);
   }
 #endif
 }

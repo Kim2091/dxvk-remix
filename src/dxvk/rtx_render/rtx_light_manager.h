@@ -112,6 +112,11 @@ public:
   const Rc<DxvkBuffer> getPreviousLightBuffer() const { return m_previousLightBuffer.ptr() ? m_previousLightBuffer : m_lightBuffer; }
   const Rc<DxvkBuffer> getLightMappingBuffer() const { return m_lightMappingBuffer; }
   const uint32_t getActiveCount() const { return m_currentActiveLightCount; }
+  // This frame's lights in the order they were packed for the GPU, rebuilt by prepareSceneData.
+  // Consumers that need light PROPERTIES rather than light indices read this rather than decoding
+  // the packed buffer: the shader-side decode lives behind rtx/concept/light, whose include chain
+  // reaches cb-dependent headers that standalone compute passes have no constant buffer for.
+  const std::vector<RtLight*>& getLinearizedLights() const { return m_linearizedLights; }
   const DomeLightArgs& getDomeLightArgs();
 
   void clear();

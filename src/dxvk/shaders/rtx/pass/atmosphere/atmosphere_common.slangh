@@ -2298,6 +2298,42 @@ interface IAtmosphereSunOccluder {
   float skyVisibility(float distanceKm);
 };
 
+// Scene lights that are not the sun, evaluated at a point on the marched ray.
+//
+// Behind an interface for the same reason the sun occluder is: the light list, the cull clusters and
+// the acceleration structure are bindings that only the aerial perspective bake has, while this
+// header is included by a dozen passes that have none of them. A caller with no local lights passes
+// the trivial implementation and the whole term folds away at compile time.
+interface IAtmosphereLocalLights {
+  // In-scattered radiance toward the camera at `distanceKm` along the march, already phase-weighted
+  // and multiplied by the medium's scattering coefficients - so the caller treats the result exactly
+  // as it treats the sun's single-scatter term, and the two share one analytic integration.
+  //
+  // The ray is not passed in. Scene lights live in world space while the march runs in the
+  // atmosphere's Y-up kilometre frame, so an implementation needs the world-space ray it was built
+  // with, not the one the caller is holding; handing over the wrong one would put every phase angle
+  // in the wrong frame while still producing a plausible-looking image.
+  //
+  // `sampleIndex` is the sub-step within the segment, which implementations that cache their
+  // visibility rays key on.
+  vec3 inScatter(float distanceKm, AtmosphereMedium medium, uint sampleIndex);
+
+  // False when this march carries no local lights at all, so the per-step call can be skipped
+  // outright rather than entered and rejected.
+  bool active();
+};
+
+// The no-local-lights implementation, for every caller that has no light bindings.
+struct AtmosphereNoLocalLights : IAtmosphereLocalLights {
+  vec3 inScatter(float distanceKm, AtmosphereMedium medium, uint sampleIndex) {
+    return vec3(0.0f);
+  }
+
+  bool active() {
+    return false;
+  }
+};
+
 struct AtmosphereInScatterRay {
   vec3 planetCenter;
   float nearDistance;
@@ -2375,7 +2411,19 @@ AtmosphereInScatterStep getAtmosphereInScatterStep(int index, float invSamples, 
 
 // Returns segment in-scatter and RGB transmittance without ground bounce or moon lighting.
 // Ray origin/direction and segment bounds use the atmosphere's Y-up kilometre frame.
-vec3 evalAtmosphereInScatterSegment<TSunOccluder : IAtmosphereSunOccluder>(
+//
+// The local-light term rides the same march but leaves by its own output, never folded into the
+// return value. Two reasons, and both are structural rather than tidiness:
+//
+//   * The sky already contains the atmospheric term. On a primary miss the sky-view LUT integrates
+//     the whole column itself, so adding this volume's atmospheric in-scatter on top double counts
+//     it - which is why the composite returns early on those pixels. The sky contains no lamp,
+//     though, so the local-light term is exactly the part that MAY be applied there, and that is
+//     what lets a shaft cross a silhouette instead of stopping at it.
+//   * They want different near-field treatment. The atmospheric term is held off by a near fade to
+//     keep a coarse shadow grid from painting haloes on interior walls; a lamp two metres away is
+//     the whole point of the local term and must not be faded out with it.
+vec3 evalAtmosphereInScatterSegment<TSunOccluder : IAtmosphereSunOccluder, TLocalLights : IAtmosphereLocalLights>(
   vec3 rayOrigin,
   vec3 rayDir,
   vec3 sunDir,
@@ -2388,9 +2436,12 @@ vec3 evalAtmosphereInScatterSegment<TSunOccluder : IAtmosphereSunOccluder>(
   float maxDistance,
   AtmosphereInScatterRay ray,
   TSunOccluder sunOccluder,
-  out vec3 outTransmittance
+  TLocalLights localLights,
+  out vec3 outTransmittance,
+  out vec3 outLocalInScatter
 ) {
   outTransmittance = vec3(1.0f);
+  outLocalInScatter = vec3(0.0f);
   const float t0 = max(ray.nearDistance, startDistance);
   const float t1 = maxDistance > 0.0f ? min(ray.farDistance, maxDistance) : ray.farDistance;
   if (t1 <= t0) {
@@ -2411,6 +2462,8 @@ vec3 evalAtmosphereInScatterSegment<TSunOccluder : IAtmosphereSunOccluder>(
   }
 
   vec3 L = vec3(0.0f);
+  vec3 localL = vec3(0.0f);
+  const bool localLightsActive = localLights.active();
   vec3 transmittance = vec3(1.0f);
   float segmentStart = 0.0f;
 
@@ -2476,10 +2529,35 @@ vec3 evalAtmosphereInScatterSegment<TSunOccluder : IAtmosphereSunOccluder>(
     }
 
     L += contribution;
+
+    // Scene lights, through the same quadrature and the same running transmittance. Kept inside
+    // this loop rather than given a march of its own because the transmittance in front of a sample
+    // is what both terms must be attenuated by, and re-deriving it in a second pass would cost a
+    // full duplicate of the medium evaluation to arrive at the identical number.
+    //
+    // No sunIlluminance factor: a scene light's radiance is already absolute, where the atmospheric
+    // terms above are per-unit-illuminance responses that the sun's own brightness scales.
+    if (localLightsActive) {
+      const vec3 localScattered = max(localLights.inScatter(t, medium, uint(i)), vec3(0.0f));
+      const vec3 localIntegScatt =
+        (localScattered - localScattered * sampleTransmittance) / clampedExtinction;
+      const vec3 localContribution = transmittance * localIntegScatt;
+
+      if (!any(isnan(localContribution)) && !any(isinf(localContribution))) {
+        localL += localContribution;
+      }
+    }
+
     transmittance *= sampleTransmittance;
   }
 
   outTransmittance = transmittance;
+
+  localL = max(localL, vec3(0.0f));
+  if (any(isnan(localL)) || any(isinf(localL))) {
+    localL = vec3(0.0f);
+  }
+  outLocalInScatter = localL;
 
   L = max(L, vec3(0.0f));
   if (any(isnan(L)) || any(isinf(L))) {

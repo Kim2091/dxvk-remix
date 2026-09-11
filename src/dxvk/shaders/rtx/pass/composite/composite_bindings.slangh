@@ -134,6 +134,12 @@ layout(binding = COMPOSITE_ATMOSPHERE_CLOUD_HISTORY_FRAME_ID_PREV_INPUT)
 Texture2D<uint> CompositeCloudHistoryFrameIdPrev;
 layout(binding = COMPOSITE_ATMOSPHERE_CLOUD_HISTORY_FRAME_ID_CURR_OUTPUT)
 RWTexture2D<uint> CompositeCloudHistoryFrameIdCurr;
+// Scene-light in-scatter through the same volume, in its own texture. Split from the atmospheric
+// term above because the two are applied to different pixels: the sky already contains the
+// atmospheric column, so that one is a primary-hit term only, while nothing in the sky contains a
+// lamp and this one is applied everywhere.
+layout(binding = COMPOSITE_ATMOSPHERE_AERIAL_PERSPECTIVE_LOCAL_INPUT)
+Texture3D<float4> AtmosphereAerialPerspectiveLocalLut;
 
 layout(binding = COMPOSITE_ACTIVE_PIXEL_MASK_INPUT)
 Texture2D<uint> SparseRenderingActivePixelMask;
