@@ -1312,14 +1312,16 @@ namespace dxvk
   void NGXNeuralUpliftContext::releaseNGXFeature() {
     ScopedCpuProfileZone();
 
-    if (m_feature) {
-      // Always the snippet's own release: the handle came from the snippet's CreateFeature1 and
-      // the driver core knows nothing about it.
-      if (m_pfnReleaseFeature) {
-        m_pfnReleaseFeature(m_feature);
+    // Always the snippet's own release: the handles came from the snippet's CreateFeature1 and
+    // the driver core knows nothing about them.
+    if (m_pfnReleaseFeature) {
+      for (NVSDK_NGX_Handle* feature : m_features) {
+        if (feature) {
+          m_pfnReleaseFeature(feature);
+        }
       }
-      m_feature = nullptr;
     }
+    m_features.clear();
 
     m_initialized = false;
   }
@@ -1330,6 +1332,7 @@ namespace dxvk
     bool depthInverted,
     NVSDK_NGX_DLSSNR_Hint_Render_Preset preset,
     uint32_t featureId,
+    uint32_t passCount,
     NVSDK_NGX_PerfQuality_Value perfQuality) {
     ScopedCpuProfileZone();
 
@@ -1337,7 +1340,7 @@ namespace dxvk
       return;
     }
 
-    if (m_feature) {
+    if (!m_features.empty()) {
       renderContext->getDevice()->waitForIdle();
       releaseNGXFeature();
     }
@@ -1365,30 +1368,43 @@ namespace dxvk
 
     VkCommandBuffer vkCommandBuffer = renderContext->getCommandList()->getCmdBuffer(DxvkCmdBuffer::ExecBuffer);
 
-    const NVSDK_NGX_Result result = m_pfnCreateFeature1(
-      m_device->handle(),
-      vkCommandBuffer,
-      static_cast<NVSDK_NGX_Feature>(featureId),
-      m_parameters,
-      &m_feature);
+    // One CreateFeature1 call per pass - see the comment on initialize() in the header for why
+    // this is a set of independent handles rather than one handle reused passCount times. Every
+    // handle is created identically (same width/height/preset/depth-inversion): they only ever
+    // differ in the temporal history each accumulates once dispatch() starts feeding them.
+    m_features.reserve(passCount);
+    for (uint32_t i = 0; i < passCount; ++i) {
+      NVSDK_NGX_Handle* feature = nullptr;
+      const NVSDK_NGX_Result result = m_pfnCreateFeature1(
+        m_device->handle(),
+        vkCommandBuffer,
+        static_cast<NVSDK_NGX_Feature>(featureId),
+        m_parameters,
+        &feature);
 
-    if (NVSDK_NGX_FAILED(result)) {
-      Logger::warn(str::format("[DLSS-NR] Failed to create the Neural Uplift feature (id ", featureId,
-                               "): ", resultToString(result)));
-      m_feature = nullptr;
-      return;
+      if (NVSDK_NGX_FAILED(result)) {
+        Logger::warn(str::format("[DLSS-NR] Failed to create the Neural Uplift feature (id ", featureId,
+                                 ") for pass ", i, ": ", resultToString(result)));
+        // All-or-nothing: a partial set of handles cannot serve dispatch()'s pass loop, and
+        // leaving it half-built would leak the ones that did succeed.
+        releaseNGXFeature();
+        return;
+      }
+
+      m_features.push_back(feature);
     }
 
     m_initialized = true;
-    Logger::info(str::format("[DLSS-NR] Created the Neural Uplift feature (id ", featureId, ", preset ",
-                             static_cast<uint32_t>(preset), ") at ", outputSize[0], "x", outputSize[1]));
+    Logger::info(str::format("[DLSS-NR] Created ", passCount, " Neural Uplift feature(s) (id ", featureId,
+                             ", preset ", static_cast<uint32_t>(preset), ") at ", outputSize[0], "x", outputSize[1]));
   }
 
   NVSDK_NGX_Result NGXNeuralUpliftContext::evaluate(
     Rc<DxvkContext> renderContext,
     const NGXBuffers& buffers,
-    const NGXSettings& settings) const {
-    if (!isNeuralUpliftInitialized()) {
+    const NGXSettings& settings,
+    uint32_t passIndex) const {
+    if (!isNeuralUpliftInitialized() || passIndex >= m_features.size()) {
       return NVSDK_NGX_Result_FAIL_NotInitialized;
     }
 
@@ -1474,7 +1490,7 @@ namespace dxvk
     // chain, and UI a game draws into the scene is pulled out by rtx.deferredUiTextures.
     m_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_UICorrection, 0);
 
-    const NVSDK_NGX_Result result = m_pfnEvaluateFeature(vkCommandBuffer, m_feature, m_parameters, nullptr);
+    const NVSDK_NGX_Result result = m_pfnEvaluateFeature(vkCommandBuffer, m_features[passIndex], m_parameters, nullptr);
 
     if (NVSDK_NGX_FAILED(result)) {
       ONCE(Logger::err(str::format("[DLSS-NR] EvaluateFeature failed: ", resultToString(result))));

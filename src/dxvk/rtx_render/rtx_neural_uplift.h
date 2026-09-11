@@ -33,6 +33,11 @@ namespace dxvk {
   // higher to the last one, so offering more would present three duplicates of style 2.
   constexpr int kNeuralUpliftMaxStyle = 2;
 
+  // Upper bound on rtx.neuralUplift.passCount. Matches the limit RenoDX exposes; the snippet has
+  // no opinion on it, since chaining evaluations is a host-side idea rather than a feature of the
+  // snippet, and each extra pass costs a full evaluation.
+  constexpr int kNeuralUpliftMaxPassCount = 10;
+
   class DxvkDevice;
   class DxvkContext;
   class DxvkBarrierSet;
@@ -160,6 +165,22 @@ namespace dxvk {
                     args.environment = "RTX_NEURAL_UPLIFT_AUTO_MASK",
                     args.flags = RtxOptionFlags::UserSetting);
 
+    RTX_OPTION_ARGS("rtx.neuralUplift", int, passCount, 1,
+                    "How many Neural Uplift evaluations to run back to back on one frame, 1-10. Each pass after\n"
+                    "the first consumes the previous pass's output, so the effect stacks; the staging copy is\n"
+                    "re-taken between passes but the frame is only read in and written out once.\n"
+                    "Each pass gets its own NGX feature handle and therefore its own temporal history (see\n"
+                    "NGXNeuralUpliftContext::initialize) rather than sharing one: a single shared handle was\n"
+                    "tried first and reruns with a stacked enhancement level frame over frame, because the last\n"
+                    "pass of one frame is what the first pass of the next frame would otherwise reproject from.\n"
+                    "With independent handles pass k's history is always \"this same pass, last frame\", so it\n"
+                    "gets real, stable temporal accumulation like a single pass does - at the cost of roughly\n"
+                    "passCount times the VRAM for history/scratch, since that is now one set per pass rather\n"
+                    "than one shared set. Changing this count recreates the whole set of handles, because there\n"
+                    "is no such thing as resizing one, and that resets the temporal history along with it.",
+                    args.environment = "RTX_NEURAL_UPLIFT_PASS_COUNT",
+                    args.flags = RtxOptionFlags::UserSetting);
+
     RTX_OPTION_ARGS("rtx.neuralUplift", bool, useLinearDepth, false,
                     "Feeds the primary linear view Z instead of the primary depth buffer. Off by default so the pass\n"
                     "sees the same depth DLSS is given, which is the closest thing to a known-good input for an NGX\n"
@@ -210,7 +231,7 @@ namespace dxvk {
     void onDeactivation() override;
 
   private:
-    void initializeFeature(Rc<DxvkContext> ctx, const VkExtent3D& outputExtent);
+    void initializeFeature(Rc<DxvkContext> ctx, const VkExtent3D& outputExtent, int passCount);
 
     // Selects the depth resource the current options ask for, or null when it does not exist.
     const Resources::Resource* selectDepth(const Resources::RaytracingOutput& rtOutput) const;
@@ -231,6 +252,10 @@ namespace dxvk {
     int m_createdFeatureId = -1;
     bool m_createdDepthInverted = false;
     VkExtent3D m_createdExtent = { 0, 0, 0 };
+    // How many NGX handles NGXNeuralUpliftContext currently holds - one per pass, see its
+    // initialize(). A passCount change needs the same rebuild as a resolution change: the set of
+    // handles has to grow or shrink, and there is no such thing as resizing one in place.
+    int m_createdPassCount = 0;
     // Applied at snippet load time rather than feature creation, so a change to it drops the
     // context rather than just the feature.
     bool m_createdBypassCallerCheck = true;

@@ -30,6 +30,7 @@
 #include "../../../external/ngx_sdk_dldn_arm64/include/nvsdk_ngx_defs_dlssd.h"
 #endif
 #include <memory>
+#include <vector>
 #include "../util/rc/util_rc_ptr.h"
 #include "nvsdk_ngx_defs_dlssnr.h"
 #include "rtx_semaphore.h"
@@ -422,18 +423,34 @@ namespace dxvk {
 
     // featureId: the NVSDK_NGX_Feature value the snippet is registered under. NVIDIA has not
     // published it, so it is threaded through from an rtx option - see kNgxFeatureDlssNrDefault.
+    //
+    // passCount creates that many independent feature handles rather than one. Each NGX handle
+    // owns its own temporal history inside the snippet (nvngx_dlssnr.dll's cg2r.cpp keeps that
+    // state per-feature - see CG2R_CreatePrevOutput / CG2R_ResetTemporalHistoryOnControlChange,
+    // both reached through a "this" pointer that travels with the handle, not a module global).
+    // A single shared handle looked plausible - RenoDX's renodx-dlss.addon64 also keeps only one
+    // active handle per (width, height, performance, preset), per its retained-feature cache at
+    // 0x18005eb50 - but that cache is for reuse across a *settings change*, not for running several
+    // chained passes at once, and one shared handle for N chained passes is provably wrong: the
+    // last pass of frame N writes an N-times-enhanced image into the one history slot, and frame
+    // N+1's pass 1 reads that back and blends it with the unenhanced current frame, so the
+    // enhancement compounds across frames without bound (visible as passes "repeatedly
+    // accumulating" and, once it saturates, flicker). N independent handles give pass k a history
+    // that is always "this same pass, last frame" - a stable enhancement depth - which is what
+    // dispatch()'s reset logic now assumes.
     void initialize(
       Rc<DxvkContext> renderContext,
       uint32_t outputSize[2],
       bool depthInverted,
       NVSDK_NGX_DLSSNR_Hint_Render_Preset preset,
       uint32_t featureId,
+      uint32_t passCount,
       NVSDK_NGX_PerfQuality_Value perfQuality = NVSDK_NGX_PerfQuality_Value_DLAA);
 
     void releaseNGXFeature() override;
 
     bool isNeuralUpliftInitialized() const {
-      return m_initialized && m_feature != nullptr;
+      return m_initialized && !m_features.empty();
     }
 
     // False when nvngx_dlssnr.dll could not be found or did not export what is needed; the
@@ -451,7 +468,11 @@ namespace dxvk {
     // temporal history where the previous one put it, which the caller has to know about (see
     // DxvkNeuralUplift::m_forceHistoryReset). The defensive early-outs report
     // FAIL_NotInitialized / FAIL_MissingInput, so NVSDK_NGX_FAILED covers them too.
-    NVSDK_NGX_Result evaluate(Rc<DxvkContext> renderContext, const NGXBuffers& buffers, const NGXSettings& settings) const;
+    //
+    // passIndex selects which of the passCount handles created by initialize() this call
+    // evaluates - see the comment there for why there is more than one.
+    NVSDK_NGX_Result evaluate(Rc<DxvkContext> renderContext, const NGXBuffers& buffers, const NGXSettings& settings,
+                              uint32_t passIndex) const;
 
   public:
     // note: ctor is public due to make_unique/unique_ptr --- use NGXContext::createNeuralUpliftContext instead
@@ -466,7 +487,9 @@ namespace dxvk {
   private:
     bool m_initialized = false;
     bool m_snippetInitialized = false;
-    NVSDK_NGX_Handle* m_feature = nullptr;
+    // One handle per pass - see the comment on initialize(). Sized to the passCount initialize()
+    // was last called with; releaseNGXFeature() empties it.
+    std::vector<NVSDK_NGX_Handle*> m_features;
     // The loaded nvngx_dlssnr.dll. Spelled void* rather than HMODULE because this header reaches
     // most of the renderer through dxvk_objects.h, and typing it properly drags in windows.h.
     void* m_module = nullptr;

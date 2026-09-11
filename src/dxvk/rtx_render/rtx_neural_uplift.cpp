@@ -99,7 +99,7 @@ namespace dxvk {
     return depth->image != nullptr ? depth : nullptr;
   }
 
-  void DxvkNeuralUplift::initializeFeature(Rc<DxvkContext> ctx, const VkExtent3D& outputExtent) {
+  void DxvkNeuralUplift::initializeFeature(Rc<DxvkContext> ctx, const VkExtent3D& outputExtent, int passCount) {
     // Recorded BEFORE the attempt can fail. These fields are what dispatch() diffs against to
     // decide whether to rebuild, so recording them only on success would leave a failed attempt
     // looking like a pending settings change and retry it every frame - each retry a waitForIdle.
@@ -108,6 +108,7 @@ namespace dxvk {
     m_createdDepthInverted = effectiveDepthInverted();
     m_createdExtent = outputExtent;
     m_createdBypassCallerCheck = bypassCallerCheck();
+    m_createdPassCount = passCount;
 
     if (!m_context && !m_contextCreationAttempted) {
       m_contextCreationAttempted = true;
@@ -139,6 +140,7 @@ namespace dxvk {
       m_createdDepthInverted,
       static_cast<NVSDK_NGX_DLSSNR_Hint_Render_Preset>(clampedPreset),
       static_cast<uint32_t>(featureId()),
+      static_cast<uint32_t>(passCount),
       // DLAA: the pass is resolution-preserving, so there is no quality tier to pick.
       NVSDK_NGX_PerfQuality_Value_DLAA);
 
@@ -146,6 +148,8 @@ namespace dxvk {
       m_initCount++;
       m_statusReason = "active";
       // A feature this new has no history behind it, whatever the frame thinks about continuity.
+      // True for every pass equally now that each owns its own handle, which is exactly why this
+      // single flag is still enough - see the reset comment in the pass loop below.
       m_forceHistoryReset = true;
     } else {
       m_statusReason = "feature creation failed";
@@ -196,6 +200,13 @@ namespace dxvk {
 
     const VkExtent3D outputExtent = inOutColor.image->info().extent;
 
+    // Each pass after the first re-reads what the previous one wrote, so the whole copy/evaluate
+    // sequence repeats; only the frame-level read-in and write-out happen once. Computed before the
+    // recreate check below because the feature set now has one NGX handle per pass (see
+    // NGXNeuralUpliftContext::initialize), so a passCount change has to rebuild it exactly like a
+    // resolution or preset change does - there is no way to grow or shrink that set in place.
+    const int passes = std::clamp(passCount(), 1, kNeuralUpliftMaxPassCount);
+
     // bypassCallerCheck is applied when the snippet is loaded, not when the feature is created, so
     // changing it has to drop the whole context and load again.
     if (m_createdBypassCallerCheck != bypassCallerCheck() && m_contextCreationAttempted) {
@@ -208,10 +219,11 @@ namespace dxvk {
       || (m_createdFeatureId != featureId())
       || (m_createdDepthInverted != effectiveDepthInverted())
       || (m_createdExtent.width != outputExtent.width)
-      || (m_createdExtent.height != outputExtent.height);
+      || (m_createdExtent.height != outputExtent.height)
+      || (m_createdPassCount != passes);
 
     if (m_recreate) {
-      initializeFeature(ctx, outputExtent);
+      initializeFeature(ctx, outputExtent, passes);
       m_recreate = false;
     }
 
@@ -233,48 +245,35 @@ namespace dxvk {
         inOutColor.image->info().format);
     }
 
-    barriers.accessImage(
-      inOutColor.image,
-      inOutColor.view->imageSubresources(),
-      inOutColor.image->info().layout,
-      inOutColor.image->info().stages,
-      inOutColor.image->info().access,
-      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-      VK_PIPELINE_STAGE_TRANSFER_BIT,
-      VK_ACCESS_TRANSFER_READ_BIT);
+    NGXNeuralUpliftContext::NGXBuffers buffers;
+    buffers.pInColor = &m_intermediateColor;
+    buffers.pInOutput = &inOutColor;
+    buffers.pInDepth = depth;
+    buffers.pInMotionVectors = motionVectors;
 
-    barriers.accessImage(
-      m_intermediateColor.image,
-      m_intermediateColor.view->imageSubresources(),
-      m_intermediateColor.image->info().layout,
-      m_intermediateColor.image->info().stages,
-      m_intermediateColor.image->info().access,
-      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-      VK_PIPELINE_STAGE_TRANSFER_BIT,
-      VK_ACCESS_TRANSFER_WRITE_BIT);
+    NGXNeuralUpliftContext::NGXSettings settings;
+    // Clamped here rather than left to the snippet, which silently pins anything above 2 to 2 - so
+    // an out-of-range value would otherwise read in the UI as a style that is not applied.
+    settings.style = static_cast<uint32_t>(std::clamp(style(), 0, kNeuralUpliftMaxStyle));
+    settings.intensity = intensity();
+    settings.styleStrength = std::clamp(styleStrength(), 0.0f, 1.0f);
+    settings.localStructureStrength = localStructureStrength();
+    // Passed through unclamped: -1 is a meaningful sentinel, not an out-of-range value.
+    settings.skinStructureStrength = skinStructureStrength();
+    settings.autoMask = autoMask();
+    settings.depthInverted = m_createdDepthInverted;
+    // A zero scale is not "no motion vectors", it is a motion field that says nothing moved, which
+    // is worse than either alternative: the snippet still reprojects, and does it through a history
+    // that never lines up with the frame. The option can arrive at 0 from a config file or an
+    // environment variable as well as the UI, so it is caught here rather than only being made
+    // unreachable in the panel.
+    const float sanitizedMotionVectorScale = motionVectorScale() != 0.0f ? motionVectorScale() : 1.0f;
+    settings.motionVectorScale[0] = sanitizedMotionVectorScale;
+    settings.motionVectorScale[1] = sanitizedMotionVectorScale;
 
-    barriers.recordCommands(ctx->getCommandList());
-
-    const VkImageSubresourceLayers copyLayers = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-    ctx->copyImage(
-      m_intermediateColor.image, copyLayers, { 0, 0, 0 },
-      inOutColor.image, copyLayers, { 0, 0, 0 },
-      outputExtent);
-
-    // NGX reads and writes through its own descriptors, so the barriers below only have to put
-    // each image in the layout and access scope the snippet compute work expects. The staging
-    // image is handled separately from the read-only inputs because the copy above just left it in
-    // TRANSFER_DST_OPTIMAL, not in its steady-state layout.
-    barriers.accessImage(
-      m_intermediateColor.image,
-      m_intermediateColor.view->imageSubresources(),
-      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-      VK_PIPELINE_STAGE_TRANSFER_BIT,
-      VK_ACCESS_TRANSFER_WRITE_BIT,
-      m_intermediateColor.image->info().layout,
-      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-      VK_ACCESS_SHADER_READ_BIT);
-
+    // Hoisted out of the loop: these only ever move from their steady state into SHADER_READ, so
+    // re-issuing the transition on a later pass would describe a source state they are no longer
+    // in. They stay readable for every pass.
     const Resources::Resource* readOnlyInputs[] = { motionVectors, depth };
 
     for (const Resources::Resource* input : readOnlyInputs) {
@@ -293,63 +292,127 @@ namespace dxvk {
         VK_ACCESS_SHADER_READ_BIT);
     }
 
-    barriers.accessImage(
-      inOutColor.image,
-      inOutColor.view->imageSubresources(),
-      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-      VK_PIPELINE_STAGE_TRANSFER_BIT,
-      VK_ACCESS_TRANSFER_READ_BIT,
-      inOutColor.image->info().layout,
-      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-      VK_ACCESS_SHADER_WRITE_BIT);
+    bool evaluated = false;
 
-    barriers.recordCommands(ctx->getCommandList());
+    for (int pass = 0; pass < passes; ++pass) {
+      // Forcing a reset on every pass past the first was an earlier, unvalidated fix for a real
+      // problem: with a single shared NGX handle, pass 2's history holds this frame's pass 1 - an
+      // image that has not moved - while the motion vectors describe a whole frame of movement, so
+      // reprojecting through them again pulls history off the geometry. It did not work. Reading
+      // both RenoDX (renodx-dlss.addon64, which keeps its retained-feature cache keyed only on
+      // width/height/performance/preset - never a pass index, so it is not a source of a
+      // per-pass-handle precedent either way) and the snippet itself (nvngx_dlssnr.dll's cg2r.cpp,
+      // where CG2R_CreatePrevOutput/CG2R_ResetTemporalHistoryOnControlChange hang off a per-feature
+      // "this", not a module global) confirmed the history lives on the NGX handle, not the
+      // evaluate call - Reset only changes how that one call blends against it, it does not stop
+      // the call's output from becoming the new history for whoever reads that handle next. So a
+      // single shared handle across N passes means the *last* pass of frame X always seeds frame
+      // X+1's first read, at whatever enhancement depth N passes produced - the stack compounds
+      // frame over frame without bound, which reads as passes "repeatedly accumulating" and, once
+      // it saturates, flicker. Passes now each get an independent handle (see
+      // NGXNeuralUpliftContext::initialize), so pass k's history is always "this same pass, last
+      // frame" - a stable depth - and the original single-pass rule generalises to every pass
+      // unchanged: reset only on a real discontinuity, never because of where the pass sits in the
+      // chain.
+      settings.resetAccumulation = resetHistory || m_forceHistoryReset;
 
-    NGXNeuralUpliftContext::NGXBuffers buffers;
-    buffers.pInColor = &m_intermediateColor;
-    buffers.pInOutput = &inOutColor;
-    buffers.pInDepth = depth;
-    buffers.pInMotionVectors = motionVectors;
+      barriers.accessImage(
+        inOutColor.image,
+        inOutColor.view->imageSubresources(),
+        inOutColor.image->info().layout,
+        inOutColor.image->info().stages,
+        inOutColor.image->info().access,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_ACCESS_TRANSFER_READ_BIT);
 
-    NGXNeuralUpliftContext::NGXSettings settings;
-    // Clamped here rather than left to the snippet, which silently pins anything above 2 to 2 - so
-    // an out-of-range value would otherwise read in the UI as a style that is not applied.
-    settings.style = static_cast<uint32_t>(std::clamp(style(), 0, kNeuralUpliftMaxStyle));
-    settings.intensity = intensity();
-    settings.styleStrength = std::clamp(styleStrength(), 0.0f, 1.0f);
-    settings.localStructureStrength = localStructureStrength();
-    // Passed through unclamped: -1 is a meaningful sentinel, not an out-of-range value.
-    settings.skinStructureStrength = skinStructureStrength();
-    settings.autoMask = autoMask();
-    settings.resetAccumulation = resetHistory || m_forceHistoryReset;
-    settings.depthInverted = m_createdDepthInverted;
-    // A zero scale is not "no motion vectors", it is a motion field that says nothing moved, which
-    // is worse than either alternative: the snippet still reprojects, and does it through a history
-    // that never lines up with the frame. The option can arrive at 0 from a config file or an
-    // environment variable as well as the UI, so it is caught here rather than only being made
-    // unreachable in the panel.
-    const float sanitizedMotionVectorScale = motionVectorScale() != 0.0f ? motionVectorScale() : 1.0f;
-    settings.motionVectorScale[0] = sanitizedMotionVectorScale;
-    settings.motionVectorScale[1] = sanitizedMotionVectorScale;
+      // On a later pass the staging copy is coming back from the previous evaluation reading it,
+      // not from its steady state. The source scope has to say so, or the copy below is free to
+      // overwrite it while the snippet is still sampling the pass before.
+      const VkPipelineStageFlags stagingSrcStages = (pass == 0)
+        ? m_intermediateColor.image->info().stages
+        : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+      const VkAccessFlags stagingSrcAccess = (pass == 0)
+        ? m_intermediateColor.image->info().access
+        : VK_ACCESS_SHADER_READ_BIT;
 
-    const NVSDK_NGX_Result evaluateResult = m_context->evaluate(ctx, buffers, settings);
-    const bool evaluated = NVSDK_NGX_SUCCEED(evaluateResult);
+      barriers.accessImage(
+        m_intermediateColor.image,
+        m_intermediateColor.view->imageSubresources(),
+        m_intermediateColor.image->info().layout,
+        stagingSrcStages,
+        stagingSrcAccess,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_ACCESS_TRANSFER_WRITE_BIT);
+
+      barriers.recordCommands(ctx->getCommandList());
+
+      const VkImageSubresourceLayers copyLayers = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+      ctx->copyImage(
+        m_intermediateColor.image, copyLayers, { 0, 0, 0 },
+        inOutColor.image, copyLayers, { 0, 0, 0 },
+        outputExtent);
+
+      // NGX reads and writes through its own descriptors, so the barriers below only have to put
+      // each image in the layout and access scope the snippet compute work expects. The staging
+      // image is handled separately from the read-only inputs because the copy above just left it in
+      // TRANSFER_DST_OPTIMAL, not in its steady-state layout.
+      barriers.accessImage(
+        m_intermediateColor.image,
+        m_intermediateColor.view->imageSubresources(),
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_ACCESS_TRANSFER_WRITE_BIT,
+        m_intermediateColor.image->info().layout,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_ACCESS_SHADER_READ_BIT);
+
+      barriers.accessImage(
+        inOutColor.image,
+        inOutColor.view->imageSubresources(),
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_ACCESS_TRANSFER_READ_BIT,
+        inOutColor.image->info().layout,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_ACCESS_SHADER_WRITE_BIT);
+
+      barriers.recordCommands(ctx->getCommandList());
+
+      // pass selects which of the `passes` handles created above this call lands on - see the
+      // comment on the loop above for why each pass has its own.
+      const NVSDK_NGX_Result evaluateResult = m_context->evaluate(ctx, buffers, settings, static_cast<uint32_t>(pass));
+      evaluated = NVSDK_NGX_SUCCEED(evaluateResult);
+
+      barriers.accessImage(
+        inOutColor.image,
+        inOutColor.view->imageSubresources(),
+        inOutColor.image->info().layout,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_ACCESS_SHADER_WRITE_BIT,
+        inOutColor.image->info().layout,
+        inOutColor.image->info().stages,
+        inOutColor.image->info().access);
+
+      barriers.recordCommands(ctx->getCommandList());
+
+      // A failed pass leaves the output holding whatever the last good pass wrote, so there is no
+      // point spending the remaining passes on it.
+      if (!evaluated) {
+        break;
+      }
+    }
 
     // A rejected evaluation left the snippet history where the previous one put it, so the next
     // frame would reproject across the gap. Held until an evaluation actually succeeds.
+    //
+    // One flag covers every pass's handle, not just the one that failed: on a mid-chain failure the
+    // passes before it did advance their own history validly, so this resets a few handles that did
+    // not strictly need it, but distinguishing "this pass's handle is fine, that one's is not" needs
+    // a per-pass flag for a failure mode expected to be rare, and getting that wrong the other way
+    // (calling a handle continuous when it is not) is the actual bug this pass exists to avoid.
     m_forceHistoryReset = !evaluated;
-
-    barriers.accessImage(
-      inOutColor.image,
-      inOutColor.view->imageSubresources(),
-      inOutColor.image->info().layout,
-      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-      VK_ACCESS_SHADER_WRITE_BIT,
-      inOutColor.image->info().layout,
-      inOutColor.image->info().stages,
-      inOutColor.image->info().access);
-
-    barriers.recordCommands(ctx->getCommandList());
 
     // The staging copy is the only resource this pass owns, so it is the only one that can be
     // destroyed while the snippet's work still references it - releaseTargetResource() on
@@ -397,47 +460,71 @@ namespace dxvk {
 
     ImGui::Indent();
 
-    RemixGui::DragInt("Style", &styleObject(), 1.0f, 0, kNeuralUpliftMaxStyle, "%d");
+    // The labels below follow RenoDX rather than the names the snippet uses internally, because
+    // RenoDX is where most people have met these controls and its vocabulary is what they will
+    // search for. Where the two disagree the snippet's own name is kept in the tooltip, since it
+    // is the accurate one: NVIDIA's debug output calls these localTone, localStructure and
+    // intensity, and "Model" here is DLSSNR.Style, not the network chosen by Network Preset
+    // further down.
+    RemixGui::Combo("Model", &styleObject(), "Model A\0Model B\0Model C\0");
     if (ImGui::IsItemHovered()) {
-      ImGui::SetTooltip("0 is neutral; 1 and 2 apply different baked structure/tone biases.\n"
-                        "The snippet only ships these three - higher values are clamped to 2.");
+      ImGui::SetTooltip("DLSSNR.Style. Model A is neutral; B and C apply different baked structure/tone\n"
+                        "biases. These are conditioning inputs to one network, not three networks -\n"
+                        "the network itself is chosen by Network Preset under Inputs / Bring-up.\n"
+                        "Values above 2 are clamped to 2 by the snippet.");
     }
 
-    RemixGui::DragFloat("Style Strength", &styleStrengthObject(), 0.01f, 0.0f, 1.0f, "%.2f");
+    RemixGui::DragFloat("Local Tone Intensity", &styleStrengthObject(), 0.01f, 0.0f, 1.0f, "%.2f");
     if (ImGui::IsItemHovered()) {
-      ImGui::SetTooltip("How far the selected style is blended in from neutral. 0 makes it a no-op.\n"
-                        "This is the parameter NVIDIA named DLSSNR.LocalToneStrength, which is a style\n"
-                        "blend weight rather than the tone control its name suggests.");
+      ImGui::SetTooltip("DLSSNR.LocalToneStrength. Despite the name this is not a tone control: it is\n"
+                        "how far the selected Model is blended in from neutral, and 0 makes any Model\n"
+                        "a no-op. The snippet clamps it to 0-1.");
     }
 
-    RemixGui::DragFloat("Intensity", &intensityObject(), 0.01f, 0.0f, 1.0f, "%.2f");
+    RemixGui::DragFloat("Overall Intensity", &intensityObject(), 0.01f, 0.0f, 1.0f, "%.2f");
     if (ImGui::IsItemHovered()) {
-      ImGui::SetTooltip("Blend of the enhanced image against the original. Below 1 the snippet keeps\n"
-                        "an extra copy of the input to blend against, so it also costs slightly more.");
+      ImGui::SetTooltip("DLSSNR.Intensity. Blend of the enhanced image against the original. Below 1 the\n"
+                        "snippet keeps an extra copy of the input to blend against, so it also costs\n"
+                        "slightly more.");
     }
 
-    RemixGui::Checkbox("Auto Mask", &autoMaskObject());
+    RemixGui::Checkbox("Character Mask", &autoMaskObject());
     if (ImGui::IsItemHovered()) {
-      ImGui::SetTooltip("Lets the snippet decide per pixel where to apply the effect. The two structure\n"
+      ImGui::SetTooltip("DLSSNR.UseAutoMask. Lets the snippet decide per pixel where to apply the effect,\n"
+                        "which is what separates characters from the rest of the scene. The two structure\n"
                         "strengths below are applied through this mask, so turning it off disables them.");
     }
 
     ImGui::BeginDisabled(!autoMask());
-    RemixGui::DragFloat("Local Structure Strength", &localStructureStrengthObject(), 0.01f, 0.0f, 2.0f, "%.2f");
+    RemixGui::DragFloat("Structure Intensity", &localStructureStrengthObject(), 0.01f, 0.0f, 2.0f, "%.2f");
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip("DLSSNR.LocalStructureStrength. Local detail enhancement.");
+    }
     RemixGui::DragFloat("Skin Structure Strength", &skinStructureStrengthObject(), 0.01f, -1.0f, 2.0f, "%.2f");
     if (ImGui::IsItemHovered()) {
-      ImGui::SetTooltip("-1 means: use Local Structure Strength for skin too. That is the default, and is\n"
-                        "not the same as 0, which explicitly disables structure enhancement on skin.");
+      ImGui::SetTooltip("DLSSNR.SkinStructureStrength. -1 means: use Structure Intensity for skin too.\n"
+                        "That is the default, and is not the same as 0, which explicitly disables\n"
+                        "structure enhancement on skin.");
     }
     ImGui::EndDisabled();
 
+    RemixGui::DragInt("Pass Count", &passCountObject(), 1.0f, 1, kNeuralUpliftMaxPassCount, "%d");
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip("Runs the pass this many times over, each one enhancing what the last produced.\n"
+                        "Costs a full evaluation per pass. Passes after the first run without temporal\n"
+                        "history, so they sharpen spatially rather than accumulating across frames.\n"
+                        "Changing this resets the history.");
+    }
+
     if (ImGui::CollapsingHeader("Inputs / Bring-up")) {
       ImGui::Indent();
-      RemixGui::DragInt("Model Preset (inert in 310.8)", &presetObject(), 1.0f, 0, 7, "%d");
+      RemixGui::DragInt("Network Preset (inert in 310.8)", &presetObject(), 1.0f, 0, 7, "%d");
       if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Selects nothing in the current snippet: it ships one set of weights and falls\n"
-                          "back to them for every value. Changing it still recreates the feature and\n"
-                          "resets the temporal history, which is the only difference you will see.");
+        ImGui::SetTooltip("DLSSNR.Hint.Render.Preset - the network selector, distinct from Model above.\n"
+                          "Selects nothing in the current snippet: it ships one set of weights and falls\n"
+                          "back to them for every value, logging the fallback. Changing it still recreates\n"
+                          "the feature and resets the temporal history, which is the only difference you\n"
+                          "will see.");
       }
       RemixGui::Checkbox("Use Linear View Z Depth", &useLinearDepthObject());
       if (ImGui::IsItemHovered()) {
