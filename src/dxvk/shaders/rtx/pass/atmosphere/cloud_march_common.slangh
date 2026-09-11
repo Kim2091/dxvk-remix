@@ -211,8 +211,8 @@ struct CloudShadeContext {
   // migration Stage 1; ported from archaeology commit 30d20a8f5). Replaces cloudRadiusKm, which
   // cached cloudPlanetRadius(args)'s exp() — gone with the fake cloud planet (see its retirement in
   // atmosphere_common.slangh), so there is nothing left to hoist, only frames to keep straight.
-  vec3  planetCenterKm;      // getPlanetCenter(args): CAMERA-relative. Shell/planet intersections.
-  vec3  planetCenterWorldKm; // getPlanetCenterWorldKm(args): WORLD-anchored. Height fractions,
+  vec3  planetCenterKm;      // getCloudPlanetCenter(args): CAMERA-relative. Shell/planet intersections.
+  vec3  planetCenterWorldKm; // getCloudPlanetCenterWorldKm(args): WORLD-anchored. Height fractions,
                              // which travel with the world-anchored density fields.
   float planetRadiusKm;      // args.planetRadius. The atmosphere's radius, not a cloud-only one.
   float darkenStrength;      // Underside-light darkening amount. ZERO through the
@@ -651,8 +651,8 @@ CloudShadeContext buildCloudShadeContext(AtmosphereArgs args) {
   // replaces, so the shaded result is unchanged. ----
   // One-planet geometry (fork — 2026-09-05, world-space cloud migration Stage 1): both frames the
   // march needs, computed once per frame instead of re-derived per call site.
-  ctx.planetCenterKm      = getPlanetCenter(args);
-  ctx.planetCenterWorldKm = getPlanetCenterWorldKm(args);
+  ctx.planetCenterKm      = getCloudPlanetCenter(args);
+  ctx.planetCenterWorldKm = getCloudPlanetCenterWorldKm(args);
   ctx.planetRadiusKm      = args.planetRadius;
 
   const float kUndersideSunFadeElev = 0.35f;
@@ -810,7 +810,7 @@ bool integrateCloudSample(float tSampleKm,
 
   // World-anchored sample position (Y-up km). The slab intersection in the
   // caller runs with ray origin = vec3(0) and planet center = ctx.planetCenterKm
-  // (getPlanetCenter(args) — fork, world-space cloud migration Stage 1, 2026-09-05; was
+  // (getCloudPlanetCenter(args) — fork, world-space cloud migration Stage 1, 2026-09-05; was
   // (0, -cloudR, 0) under the retired cloud-only radius), so tSampleKm is measured along the view
   // ray from the camera. Adding
   // cameraWorldPosYUpKm anchors the sample's WORLD position to the player's

@@ -364,6 +364,12 @@ public:
     // ===== Cloud placement, in metres (fork -- 2026-09-06, units/altitude redesign) =====
     // Heights are metres, sizes stay kilometres. A 50 m feature spelled "0.05 km" was the readability
     // problem these fix; the CB fields keep their km meaning and are filled by dividing by 1000.
+    RTX_OPTION("rtx.atmosphere", float, cloudVerticalOffsetWorldUnits, 0.0f,
+               "Vertical translation of the whole cloud field in game world units. Positive raises it; "
+               "negative lowers it along the configured up axis. Changes cloud placement without changing "
+               "body size, the atmosphere's ground level, or aerial perspective. Center Layer at Player "
+               "sets this once to place the primary layer around the player. Re-center after changing "
+               "cloud compression or layer depth.");
     RTX_OPTION("rtx.atmosphere", float, cloudBaseHeightMeters, 1300.0f,
                "Height of the cloud deck's underside above the ground datum, in metres.");
     RTX_OPTION("rtx.atmosphere", float, cloudDepthMeters, 2000.0f,
@@ -1520,7 +1526,7 @@ public:
                "knobs with layer 1 (phase, multi-scatter, detail, etc.).");
 
 private:
-  bool getCloudGroundLevelAtPlayer(float& groundLevel) const;
+  bool getCloudOffsetAtPlayer(float& offsetWorldUnits) const;
   void traceCloudPlacement(const AtmosphereArgs& args);
   bool m_traceCloudPlacement = false;
   uint32_t m_cloudPlacementTraceFrame = 0;

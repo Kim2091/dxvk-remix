@@ -504,8 +504,8 @@ void main(uint3 threadId : SV_DispatchThreadID) {
     }
 
     const float skyDistanceKm = (segmentStartKm + segmentEndKm) * 0.5f;
-    const bool beyondSceneRange = t0 * args.worldUnitsPerKm > sunOccluder.maxTraceDistance
-      && skyDistanceKm * args.worldUnitsPerKm > sunOccluder.maxTraceDistance;
+    const bool beyondSceneRange = t0 * args.aerialPerspectiveWorldUnitsPerKm > sunOccluder.maxTraceDistance
+      && skyDistanceKm * args.aerialPerspectiveWorldUnitsPerKm > sunOccluder.maxTraceDistance;
     if (segmentEndKm > segmentStartKm && t1 > t0 && !beyondSceneRange) {
       if (args.multiScatterStrength != 0.0f) {
         const float skyVisibility = sunOccluder.skyVisibility((segmentStartKm + segmentEndKm) * 0.5f);

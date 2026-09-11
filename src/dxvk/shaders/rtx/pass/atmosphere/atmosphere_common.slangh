@@ -232,47 +232,22 @@ float intersectSphereNearest(vec3 origin, vec3 direction, vec3 center, float rad
   return t0 < 0.0f ? t1 : t0;
 }
 
-// Distance from the camera-frame origin (the eye) to the planet centre - the eye's radius.
-// One planet: clouds, atmosphere, ground and horizon all measure against this (fork —
-// 2026-09-05, world-space cloud migration Stage 1/2; ported from archaeology commit 30d20a8f5).
-//
-// Stage 1 returned args.planetRadius ALONE, because AtmosphereArgs had no cameraAltitudeKm field
-// yet (adding one was a CB-layout change reserved for this stage — see the CRITICAL note on
-// atmosphere_args.h's cameraAltitudeKm field, which repurposes the retired padRetired10 slot rather
-// than growing the struct). Stage 2 adds the term back: the eye now sits at a real altitude above
-// the surface instead of welded to it, which is what lets a ray aimed below the horizon actually
-// hit the planet at a positive distance (see the ground-radiance block in evalAtmosphereRadiance)
-// and what gives the sky-view LUT bake genuine altitude parallax (see its reconciliation with this
-// function in evalAtmosphereRadiance's doc comment below).
+// Sky and aerial perspective measure altitude in physical atmosphere kilometres.
 float getEyeRadius(AtmosphereArgs args) {
   return args.planetRadius + args.cameraAltitudeKm;
 }
 
-// Planet centre for the atmosphere's internal Y-up frame, whose origin sits AT THE CAMERA.
-//
-// The frame is camera-relative and re-centred every frame: the planet's centre is always directly
-// below the eye. That is deliberate, not an approximation of a globe. The game world is a flat
-// plane, so a sphere pinned under the WORLD ORIGIN would sink that plane by d^2/2R as the player
-// walked away from it - 52 m at 10 km on a 6371 km planet, and proportionally worse on a smaller
-// one (this is precisely the bug this stage fixes — see getPlanetCenterWorldKm below). Re-centring
-// under the camera makes curvature say the thing it should: distant things fall away from WHERE
-// YOU ARE, invariantly under travel.
-//
-// getEyeRadius(args) now carries a real cameraAltitudeKm term (fork — 2026-09-05, world-space
-// cloud migration Stage 2), so the eye recedes from the surface as the camera climbs instead of
-// staying welded to it — this is now the single place callers ask, instead of each re-deriving
-// vec3(0, -radius, 0) with whichever radius they happened to be holding (see cloudPlanetRadius's
-// retirement below for the two-sphere bug that caused).
 vec3 getPlanetCenter(AtmosphereArgs args) {
   return vec3(0.0f, -getEyeRadius(args), 0.0f);
 }
 
-// The same centre expressed in the WORLD-anchored Y-up km frame that the cloud density fields use
-// (args.cameraWorldPosYUpKm + rayOffset). Geometry and density must be measured against the same
-// centre; see computeCloudHeightFractionC for what went wrong when they were not (fork —
-// 2026-09-05, world-space cloud migration Stage 1; ported from archaeology commit 30d20a8f5).
-vec3 getPlanetCenterWorldKm(AtmosphereArgs args) {
-  return args.cameraWorldPosYUpKm - vec3(0.0f, getEyeRadius(args), 0.0f);
+// Cloud shell intersections and density share the same translated, compressed model frame.
+vec3 getCloudPlanetCenter(AtmosphereArgs args) {
+  return vec3(0.0f, -(args.planetRadius + args.cameraWorldPosYUpKm.y), 0.0f);
+}
+
+vec3 getCloudPlanetCenterWorldKm(AtmosphereArgs args) {
+  return args.cameraWorldPosYUpKm + getCloudPlanetCenter(args);
 }
 
 // Shadowing of the atmosphere by the planet itself — the Vis term of the paper's Equation 4.
@@ -785,22 +760,8 @@ vec3 evalAtmosphereRadiance(
 // the cloud_render compute pass and the secondary dome LUT bake (the per-ray
 // analytical sky-pass render that once also used them was removed 2026-06-19).
 
-// cloudPlanetRadius() RETIRED (fork — 2026-09-05, world-space cloud migration Stage 1).
-//
-// It returned planetRadius * exp(-cloudCurvature * 5), floored at 100 km: at the pinned
-// cloudCurvature of 0.38 that put the clouds on a ~953 km sphere while the atmosphere kept using
-// the real 6371 km one. Two planets in one image, with two different horizons (~50 km vs ~160 km) —
-// this file's own comment conceded the split: "Atmospheric scattering math still uses the real
-// planet radius, only cloud sphere intersections are affected." That is precisely the bug this
-// migration exists to remove; see getPlanetCenter / getPlanetCenterWorldKm above.
-//
-// Clouds now intersect getPlanetCenter(args) at args.planetRadius, the same sphere the atmosphere
-// marches and the same one the ground terminates on. Curvature is no longer a dial that fakes a
-// look; it is whatever the planet's radius implies. planetRadius is the single exposed knob — turn
-// it down and the deck, the haze, the horizon distance and the horizon dip all curve together,
-// because they are finally the same sphere. rtx.atmosphere.cloudCurvature is retired in lockstep
-// (see rtx_atmosphere.h) and args.cloudCurvature is no longer read anywhere in shader code — the CB
-// field itself stays in place (atmosphere_args.h has no spare rows; see the CRITICAL note there).
+// Cloud distances and radii are model kilometres. Only worldUnitsPerKm converts them to the
+// scene; cloud compression and placement must never change the physical atmosphere's eye radius.
 
 // Cloud slab height fraction. hf=0 at the slab base (slabAltitudeKm above sea level), hf=1 at the
 // slab top (slabAltitudeKm + slabThicknessKm). Saturates outside the slab (fork — 2026-09-05,
@@ -809,7 +770,7 @@ vec3 evalAtmosphereRadiance(
 //
 // samplePos is WORLD-anchored (args.cameraWorldPosYUpKm + rayOffset) because the density fields it
 // accompanies are world-anchored, which is what gives the volume its parallax. planetCenterWorldKm
-// is therefore world-anchored too — see getPlanetCenterWorldKm, the point directly below the CAMERA
+// is therefore world-anchored too — see getCloudPlanetCenterWorldKm, the point directly below the CAMERA
 // at the eye's radius.
 //
 // Both being in the same frame is the whole point. The predecessor, computeCloudHeightFractionR,
@@ -829,7 +790,7 @@ float computeCloudHeightFractionC(vec3 samplePos, vec3 planetCenterWorldKm, floa
 
 float computeCloudHeightFraction(vec3 samplePos, AtmosphereArgs args,
                                   float slabAltitudeKm, float slabThicknessKm) {
-  return computeCloudHeightFractionC(samplePos, getPlanetCenterWorldKm(args), args.planetRadius,
+  return computeCloudHeightFractionC(samplePos, getCloudPlanetCenterWorldKm(args), args.planetRadius,
                                      slabAltitudeKm, slabThicknessKm);
 }
 
@@ -899,7 +860,7 @@ bool intersectCloudLayer(vec3 rayDir, AtmosphereArgs args, out float t, out vec3
   // Looking below the horizon: no cloud layer hit above us.
   if (rayDir.y <= 0.001f) return false;
 
-  vec3 planetCenter = getPlanetCenter(args);
+  vec3 planetCenter = getCloudPlanetCenter(args);
   float cloudSphereRadius = args.planetRadius + args.cloudAltitude;
 
   float t0, t1;
@@ -1962,7 +1923,7 @@ vec3 cloudVoxelWorldToUVW(vec3 worldPosKm, AtmosphereArgs args, bool isZUp) {
   // forward and inverse must agree exactly, and the inverse below places voxel centres ON the
   // shell. A flat forward against a spherical inverse would reintroduce precisely the
   // bake/sample mismatch this stage removes.
-  float v = computeCloudHeightFractionC(posYUp, getPlanetCenterWorldKm(args), args.planetRadius,
+  float v = computeCloudHeightFractionC(posYUp, getCloudPlanetCenterWorldKm(args), args.planetRadius,
                                         args.cloudAltitude, args.cloudVoxelGridVerticalKm);
 
   return vec3(u, v, w);
@@ -1990,7 +1951,7 @@ vec3 cloudVoxelUVWToWorld(vec3 uvw, AtmosphereArgs args) {
   // gives p.y = c.y + sqrt((R + alt)^2 - (p.x - c.x)^2 - (p.z - c.z)^2), taking the root above the
   // planet centre. The max() guards the degenerate case of a horizontal offset so large it cannot
   // reach the shell at all, which the grid extent makes unreachable in practice.
-  const vec3  centerKm = getPlanetCenterWorldKm(args);
+  const vec3  centerKm = getCloudPlanetCenterWorldKm(args);
   const float altKm    = args.cloudAltitude + uvw.y * args.cloudVoxelGridVerticalKm;
   const float shellR   = args.planetRadius + altKm;
   const float dx = x - centerKm.x;

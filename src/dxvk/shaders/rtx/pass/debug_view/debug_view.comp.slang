@@ -740,7 +740,7 @@ vec4 loadInput(inout RNG randomState, ivec2 threadId)
         // doc comment. baseRadius/topRadius are built from planetRadius directly (matching
         // cloudSlabSpan's own parameter, ctx.planetRadiusKm == args.planetRadius), not from the eye
         // radius, so the two agree only because they're the same value in THIS stage.
-        const vec3 planetCenter = getPlanetCenter(cb.atmosphereArgs);
+        const vec3 planetCenter = getCloudPlanetCenter(cb.atmosphereArgs);
         const float planetRadiusKm = cb.atmosphereArgs.planetRadius;
         const float baseRadius = planetRadiusKm + cb.atmosphereArgs.cloudAltitude;
         const float topRadius  = planetRadiusKm + cb.atmosphereArgs.cloudAltitude

@@ -1282,32 +1282,11 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
     // 2026-06-11, column-shaping rework); CB layout unchanged.
     args.cloudColumnFeather = RtxAtmosphere::cloudColumnFeather();
     args.cameraWorldPosYUpKm = m_cameraWorldPosYUpKm;
-    // Calibrate the game's arbitrary vertical world coordinate to a physical altitude, in km (fork
-    // — 2026-09-05, world-space cloud migration Stage 2; ported from archaeology commit
-    // 30d20a8f5). m_cameraWorldPosYUpKm.y is the resolved CloudAnchor's raw Y-up height — nothing
-    // says that reads as "sea level" at 0 on an arbitrary game's map (FNV's exterior worldspace
-    // does not). seaLevelWorldKm is the datum the game integration measures once (see the ONCE
-    // calibration log in updateFrame — it prints exactly the raw value to copy in here),
-    // altitudeScale rescales a vertical world unit that does not match rtx.sceneScale, and
-    // viewAltitudeKm is an artistic post-offset applied after both (the old Numos "altitude" knob,
-    // retired 2026-07-17 for feeding a field nothing read — this is what restores it a purpose).
-    // Adding viewAltitudeKm directly to the raw coordinate, skipping the datum/scale correction,
-    // was the earlier archaeology attempt's mistake: a nonzero local map origin could still place
-    // the eye below the planet or far above the cloud deck.
-    // Simplified to one subtraction (fork -- 2026-09-06, units/altitude redesign). Was
-    // (h - seaLevelWorldKm) * altitudeScale + viewAltitudeKm, i.e. a datum in km, a vertical-only
-    // scale, and a post-offset that is algebraically just another datum shift. m_groundLevelYUpKm
-    // is groundLevelWorldUnits carried into this same Y-up km frame by updateFrame, so the datum is
-    // now stored in raw engine units and cannot silently move when the unit scale changes.
-    args.cameraAltitudeKm = m_cameraWorldPosYUpKm.y - m_groundLevelYUpKm;
-    // The world-anchored cloud-density field (computeCloudHeightFractionC, via
-    // getPlanetCenterWorldKm) must measure height against the SAME calibrated altitude the shell
-    // geometry (getEyeRadius / getPlanetCenter) uses. Leaving the raw, uncalibrated Y here would
-    // make density and intersection geometry disagree by exactly the datum/scale correction above
-    // — reproducing a sky-only cloud deck (density says "inside the slab", geometry says "the slab
-    // is somewhere else entirely") even when the march's ray segment through the shell is
-    // otherwise perfectly valid.
-    args.cameraWorldPosYUpKm.y = args.cameraAltitudeKm;
+    // Clouds use compressed model kilometres; sky and haze use physical camera altitude.
+    const float cloudHeightKm = m_cameraWorldPosYUpKm.y - m_groundLevelYUpKm;
+    args.cameraAltitudeKm = cloudHeightKm * args.worldUnitsPerKm / (1000.0f * resolveUnitsPerMeter());
+    args.cameraWorldPosYUpKm.y = cloudHeightKm
+      - RtxAtmosphere::cloudVerticalOffsetWorldUnits() / args.worldUnitsPerKm;
     // Per-column downwelling-light sigma riding the former pad_c6_1 slot
     // (fork — 2026-06-12, column-shaping rev 3); CB layout unchanged.
     args.cloudUndersideLightSigma = wx ? wx->cloudUndersideLightSigma : RtxAtmosphere::cloudUndersideLightSigma();
@@ -3171,7 +3150,7 @@ void RtxAtmosphere::dispatchCloudScreenPass(RtxContext& ctx, const Resources::Ra
   dispatchCloudRender(&ctx, rtOutput);
 }
 
-bool RtxAtmosphere::getCloudGroundLevelAtPlayer(float& groundLevel) const {
+bool RtxAtmosphere::getCloudOffsetAtPlayer(float& offsetWorldUnits) const {
   const AtmosphereArgs args = getAtmosphereArgs();
   // ImGui consumes the last cloud snapshot; the live camera may already belong to another frame.
   if (!m_cloudAnchorHasFirstSample || args.cloudAltitude < 0.0f || args.cloudThickness <= 0.0f) {
@@ -3185,8 +3164,9 @@ bool RtxAtmosphere::getCloudGroundLevelAtPlayer(float& groundLevel) const {
   const float upSign = RtxAtmosphere::flipUpAxis() ? -1.0f : 1.0f;
   const float layerMidpointKm = args.cloudAltitude + 0.5f * args.cloudThickness;
   // Move the datum instead of pushing the cloud shell below the planet surface.
-  groundLevel = playerHeight - upSign * layerMidpointKm * args.worldUnitsPerKm;
-  return std::isfinite(groundLevel);
+  offsetWorldUnits = upSign * (playerHeight - RtxAtmosphere::groundLevelWorldUnits())
+    - layerMidpointKm * args.worldUnitsPerKm;
+  return std::isfinite(offsetWorldUnits);
 }
 
 void RtxAtmosphere::traceCloudPlacement(const AtmosphereArgs& args) {
@@ -3213,10 +3193,12 @@ void RtxAtmosphere::traceCloudPlacement(const AtmosphereArgs& args) {
     " groundUnits=", RtxAtmosphere::groundLevelWorldUnits(),
     " groundKm=", m_groundLevelYUpKm,
     " cameraAltitudeM=", args.cameraAltitudeKm * 1000.0f,
+    " cloudCameraAltitudeM=", args.cameraWorldPosYUpKm.y * 1000.0f,
+    " cloudOffsetUnits=", RtxAtmosphere::cloudVerticalOffsetWorldUnits(),
     " cloudBaseM=", args.cloudAltitude * 1000.0f,
     " cloudDepthM=", args.cloudThickness * 1000.0f,
-    " baseFromCameraM=", (args.cloudAltitude - args.cameraAltitudeKm) * 1000.0f,
-    " topFromCameraM=", (args.cloudAltitude + args.cloudThickness - args.cameraAltitudeKm) * 1000.0f,
+    " baseFromCameraM=", (args.cloudAltitude - args.cameraWorldPosYUpKm.y) * 1000.0f,
+    " topFromCameraM=", (args.cloudAltitude + args.cloudThickness - args.cameraWorldPosYUpKm.y) * 1000.0f,
     " unitsPerKm=", args.worldUnitsPerKm,
     " planetRadiusKm=", args.planetRadius,
     " zUp=", args.isZUp, " flipUp=", args.flipUpAxis,
@@ -4048,10 +4030,10 @@ void RtxAtmosphere::syncDistantLights(LightManager& lm, const AtmosphereArgs& ar
         // anchor was always ~0 (FNV's RtCamera::getPosition() never moved), so this subtraction was
         // a no-op; now that useCameraWorldOverride can supply a real, far-from-origin position,
         // skipping it would place the point light `anchor` kilometres from the flash the cloud march
-        // actually renders. Only xz: args.cameraWorldPosYUpKm.y is cameraAltitudeKm (a calibrated
-        // altitude, not an anchor offset), and strikeY was never anchored to it in the first place.
+        // actually renders. Subtract the cloud-frame camera on every axis so a vertical
+        // layer offset moves the scene flash together with the cloud volume.
         const Vector3 posKmYUp(args.lightningStrikePosKm.x - args.cameraWorldPosYUpKm.x,
-                               args.lightningStrikePosKm.y,
+                               args.lightningStrikePosKm.y - args.cameraWorldPosYUpKm.y,
                                args.lightningStrikePosKm.z - args.cameraWorldPosYUpKm.z);
         posWorld = toWorld(posKmYUp) * args.worldUnitsPerKm;
       }

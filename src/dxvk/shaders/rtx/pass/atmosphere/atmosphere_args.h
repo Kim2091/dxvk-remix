@@ -81,20 +81,8 @@ struct AtmosphereArgs {
 
   uint skyViewLutHeight;
   float ozoneLayerWidth;  // Half-width of the ozone tent profile (km); the paper's 30 km tent = 15
-  // Camera altitude above sea level, in km, in the atmosphere's Y-up frame (fork — 2026-09-05,
-  // world-space cloud migration Stage 2). RESTORES the meaning this slot was originally retired
-  // under ("viewAltitude — never read by any pass"): getEyeRadius (atmosphere_common.slangh) now
-  // adds this to args.planetRadius, so the sky-view bake, the atmosphere march, and the cloud
-  // shells all place the eye at a real altitude instead of welding it to the planet's surface.
-  // Unquantized here — this is the calibrated Y-up camera height (see
-  // RtxAtmosphere::seaLevelWorldKm / altitudeScale / viewAltitudeKm in rtx_atmosphere.h). The LUT
-  // cache keys quantize their OWN copy (skyViewAltitudeRebakeGranularityKm) so climbing re-bakes
-  // the sky-view LUT once per step instead of every frame — see normalizeForSkyViewLutKey.
-  //
-  // CRITICAL: rtx_atmosphere.cpp used to zero this field every frame in the padRetired10 block
-  // (`args.padRetired10 = 0.0f;`). That line is GONE — leaving it in place, or re-adding a
-  // symmetrical one for this name, silently pins the eye back to sea level and this entire stage
-  // does nothing (this is exactly the trap archaeology commit 30d20a8f5 fell into).
+  // Physical camera altitude above the atmosphere ground datum, unaffected by cloud compression
+  // or vertical placement. Cloud geometry uses cameraWorldPosYUpKm.y in its own model frame.
   float cameraAltitudeKm;
   float multiScatterPhysicalStrength;  // 0 = pure analytical (artistic, preset-faithful), 1 = pure LUT-based hemisphere integration (physical)
 

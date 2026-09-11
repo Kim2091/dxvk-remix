@@ -1313,36 +1313,46 @@ void RtxAtmosphere::showImguiSettings(WeatherBlender* blender) {
             "height above the ground. Stand somewhere the game treats as ground level before "
             "clicking. Unlike the old sea-level datum this stays correct if you change the scale.");
 
-        float cloudGroundLevel = 0.0f;
-        const bool canPlaceLayer = getCloudGroundLevelAtPlayer(cloudGroundLevel);
+        RemixGui::DragFloat("Cloud Vertical Offset (world units)",
+                            &RtxAtmosphere::cloudVerticalOffsetWorldUnitsObject(),
+                            10.0f, -100000000.0f, 100000000.0f, "%.1f", sliderFlags);
+        RemixGui::SetTooltipToLastWidgetOnHover(
+            "Moves the whole cloud field vertically without changing cloud size or atmospheric ground level. "
+            "Positive raises it; negative lowers it. Use this to bring large clouds down into the level.");
+
+        float cloudOffset = 0.0f;
+        const bool canPlaceLayer = getCloudOffsetAtPlayer(cloudOffset);
         ImGui::BeginDisabled(!canPlaceLayer);
         if (ImGui::Button("Center Layer at Player")) {
-          RemixGui::CheckRtxOptionPopups(&RtxAtmosphere::groundLevelWorldUnitsObject());
-          RtxAtmosphere::groundLevelWorldUnitsObject().setDeferred(cloudGroundLevel);
+          RemixGui::CheckRtxOptionPopups(&RtxAtmosphere::cloudVerticalOffsetWorldUnitsObject());
+          RtxAtmosphere::cloudVerticalOffsetWorldUnitsObject().setDeferred(cloudOffset);
         }
         ImGui::EndDisabled();
         RemixGui::SetTooltipToLastWidgetOnHover(
-            "Moves Ground Level once so the primary cloud layer's midpoint is at the last rendered "
-            "player position, including while freecam is active. This changes the atmosphere's altitude datum; "
-            "the layer stays fixed as you move. Clear gaps can remain between cloud bodies.");
+            "Moves the cloud field once so the primary layer's midpoint is at the last rendered player "
+            "position, including while freecam is active. Preserves cloud size and atmospheric ground level. "
+            "The layer stays fixed as you move. Re-center after changing compression or depth. "
+            "Clear gaps can remain between cloud bodies.");
         if (!canPlaceLayer) {
           ImGui::TextDisabled("Requires a rendered player position and a valid cloud layer.");
         }
 
         const AtmosphereArgs placement = getAtmosphereArgs();
-        ImGui::Text("Camera Altitude (m)         %10.1f", placement.cameraAltitudeKm * 1000.0f);
+        ImGui::Text("Atmosphere Camera Altitude (m): %.1f", placement.cameraAltitudeKm * 1000.0f);
         RemixGui::SetTooltipToLastWidgetOnHover(
-            "The calibrated camera altitude supplied to the renderer, after Ground Level and "
-            "the active unit scale and up-axis conversion.");
+            "Physical camera altitude above Ground Level. Cloud compression and vertical offset do not change it.");
+        ImGui::Text("Cloud Frame Camera Altitude (m): %.1f", placement.cameraWorldPosYUpKm.y * 1000.0f);
+        RemixGui::SetTooltipToLastWidgetOnHover(
+            "Camera height in the cloud model, after compression and the cloud-only vertical offset.");
         ImGui::Text("Cloud base / top from camera: %+.1f / %+.1f m",
-                    (placement.cloudAltitude - placement.cameraAltitudeKm) * 1000.0f,
-                    (placement.cloudAltitude + placement.cloudThickness - placement.cameraAltitudeKm) * 1000.0f);
+                    (placement.cloudAltitude - placement.cameraWorldPosYUpKm.y) * 1000.0f,
+                    (placement.cloudAltitude + placement.cloudThickness - placement.cameraWorldPosYUpKm.y) * 1000.0f);
         RemixGui::SetTooltipToLastWidgetOnHover(
             "Layer boundaries relative to the camera, including the active weather depth. "
             "Positive values are above the camera; negative values are below it.");
         ImGui::Text("Cloud base / top from camera: %+.1f / %+.1f world units",
-                    (placement.cloudAltitude - placement.cameraAltitudeKm) * placement.worldUnitsPerKm,
-                    (placement.cloudAltitude + placement.cloudThickness - placement.cameraAltitudeKm) * placement.worldUnitsPerKm);
+                    (placement.cloudAltitude - placement.cameraWorldPosYUpKm.y) * placement.worldUnitsPerKm,
+                    (placement.cloudAltitude + placement.cloudThickness - placement.cameraWorldPosYUpKm.y) * placement.worldUnitsPerKm);
         ImGui::Text("Layer depth in game: %.1f world units", placement.cloudThickness * placement.worldUnitsPerKm);
         RemixGui::SetTooltipToLastWidgetOnHover(
             "The cloud layer's actual size after scale and compression. Lowering Altitude moves "
