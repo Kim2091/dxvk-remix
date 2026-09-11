@@ -42,15 +42,11 @@
  *       machined flat).
  *   A — unused (1.0).
  *
- * The map tiles at cloudNoiseTileKm — the SAME period as the 3D noise
- * volume — so the runtime's hex de-tiling lattice (computeCloudHexTile)
- * applies to both with the same per-cell offsets: a cloud cluster and the
- * 3D noise that textures it travel together across lattice cells.
+ * The map tiles at cloudNoiseTileKm. The body bake consumes it in this
+ * periodic domain; the live SDF sampler applies world-space de-tiling.
  *
  * All lattices are wrapped to integer periods so the map tiles seamlessly.
- * The cluster cell count derives from cloudCellSizeKm (rounded to an
- * integer cells-per-tile); re-baked live when cloudCellSizeKm or
- * cloudNoiseTileKm changes via RtxAtmosphere::needsCloudPlacementRebake.
+ * Adjacent integer lattices are smoothly blended as cloudCellSizeKm changes.
  *
  * Dispatch: 64x64 thread groups, 8x8 threads each -> 512x512 texels.
  */
@@ -66,17 +62,12 @@ RWTexture2D<float4> cloudPlacementMapOutput;
 // Must match RtxAtmosphere::kCloudPlacementMapSize.
 static const float kPlacementMapSize = 512.0f;
 
-// Design mean of the R-channel cluster field. The runtime hex-blend
-// (formerly sampleCloudPlacement in atmosphere_common.slangh) anchors its
-// variance-preserving blend on this value — keep both sites in lockstep
-// with any retune of the field construction below.
-// (Shared constant kCloudPlacementFieldMean lives in atmosphere_common.slangh.)
-
 // ---------------------------------------------------------------------------
-// Periodic 2D value noise + FBM. hash31 (atmosphere_common.slangh) hashes the
+// Periodic 2D value noise + FBM. cloudLatticeHash hashes the
 // wrapped integer lattice so the pattern tiles exactly at `period` cells.
 // Returns [0,1], mean ~0.5.
 // ---------------------------------------------------------------------------
+// NV-DXVK start: Continuous periodic cloud placement with decorrelated lattice seeds.
 float valueNoise2DPeriodic(vec2 p, float period, float seed) {
   vec2 cell = floor(p);
   vec2 f = p - cell;
@@ -88,10 +79,10 @@ float valueNoise2DPeriodic(vec2 p, float period, float seed) {
   vec2 c01 = (cell + vec2(0.0f, 1.0f)); c01 -= period * floor(c01 / period);
   vec2 c11 = (cell + vec2(1.0f, 1.0f)); c11 -= period * floor(c11 / period);
 
-  float v00 = hash31(vec3(c00, seed));
-  float v10 = hash31(vec3(c10, seed));
-  float v01 = hash31(vec3(c01, seed));
-  float v11 = hash31(vec3(c11, seed));
+  float v00 = cloudLatticeHash(c00, seed);
+  float v10 = cloudLatticeHash(c10, seed);
+  float v01 = cloudLatticeHash(c01, seed);
+  float v11 = cloudLatticeHash(c11, seed);
 
   return mix(mix(v00, v10, f.x), mix(v01, v11, f.x), f.y);
 }
@@ -125,13 +116,25 @@ float worleyNoise2DPeriodic(vec2 p, float period, float seed) {
       vec2 neighbor = vec2(float(x), float(y));
       vec2 wrapped = cell + neighbor;
       wrapped -= period * floor(wrapped / period);
-      vec2 featurePoint = vec2(hash31(vec3(wrapped, seed)),
-                               hash31(vec3(wrapped, seed + 31.7f)));
+      vec2 featurePoint = vec2(cloudLatticeHash(wrapped, seed),
+                               cloudLatticeHash(wrapped, seed + 31.7f));
       vec2 diff = neighbor + featurePoint - f;
       minDist = min(minDist, dot(diff, diff));
     }
   }
   return saturate(sqrt(minDist));
+}
+
+float clusterFieldAt(vec2 uv, float cells) {
+  float w = worleyNoise2DPeriodic(uv * cells, cells, 11.3f);
+  float clusterCore = 1.0f - w;
+  float shapeFbm = fbm2DPeriodic(uv * cells, 3, cells, 53.1f);
+  return saturate(0.5f + (clusterCore - 0.45f) * 0.95f + (shapeFbm - 0.5f) * 0.65f);
+}
+
+float topJitterAt(vec2 uv, float cells) {
+  float cellsJ = max(round(cells * 0.5f), 2.0f);
+  return fbm2DPeriodic(uv * cellsJ, 2, cellsJ, 71.9f);
 }
 
 [shader("compute")]
@@ -145,33 +148,24 @@ void main(uint3 threadId : SV_DispatchThreadID) {
 
   vec2 uv = (vec2(threadId.xy) + 0.5f) / kPlacementMapSize;
 
-  // Integer cells-per-tile so the Worley lattice wraps seamlessly at the
-  // tile boundary. cloudCellSizeKm is the user-facing knob ("average cloud
-  // cluster footprint"); the rounding means the EFFECTIVE cell size snaps
-  // to tileKm / round(tileKm / cellSizeKm).
-  float cells = clamp(round(args.cloudNoiseTileKm / max(args.cloudCellSizeKm, 0.25f)),
-                      3.0f, 32.0f);
+  // Each endpoint is periodic; blending adjacent integer periods preserves
+  // the tile seam while making the authored cell-size control continuous.
+  float cellsRaw = args.cloudNoiseTileKm / max(args.cloudCellSizeKm, 0.25f);
+  float cells = clamp(cellsRaw, 1.0f, 32.0f);
+  float cellsLo = floor(cells);
+  float cellsHi = min(cellsLo + 1.0f, 32.0f);
+  float cellsBlend = smoothstep(0.0f, 1.0f, cells - cellsLo);
 
-  // R — cluster field. Worley cell cores carry the clusters; an FBM at
-  // sub-cluster scale roughens the radial falloff so silhouettes read as
-  // organic cloud banks rather than circular stamps. The post-saturation
-  // mean of this construction is ~0.60 (Monte-Carlo) — recorded as
-  // kCloudPlacementFieldMean in atmosphere_common.slangh for the
-  // variance-preserving hex blend; keep both in lockstep on retune.
-  float w = worleyNoise2DPeriodic(uv * cells, cells, 11.3f);
-  float clusterCore = 1.0f - w;  // 1 at cluster cores, 0 at boundaries
-  float shapeFbm = fbm2DPeriodic(uv * cells, 3, cells, 53.1f);
-  float F = saturate(0.5f + (clusterCore - 0.45f) * 0.95f + (shapeFbm - 0.5f) * 0.65f);
+  float FLo = clusterFieldAt(uv, cellsLo);
+  float FHi = clusterFieldAt(uv, cellsHi);
+  float F = mix(FLo, FHi, cellsBlend);
 
-  // G — top-height jitter. Smooth FBM near cluster frequency, decorrelated
-  // seed: neighboring clusters get visibly different tower heights but the
-  // field stays continuous (no per-cell plateau seams).
-  float cellsJ = max(round(cells * 0.5f), 2.0f);
-  float J = fbm2DPeriodic(uv * cellsJ, 2, cellsJ, 71.9f);
+  float JLo = topJitterAt(uv, cellsLo);
+  float JHi = topJitterAt(uv, cellsHi);
+  float J = mix(JLo, JHi, cellsBlend);
 
-  // B — base lift. Low frequency (3 cycles per tile): the deck's ceiling
-  // undulates over multi-km scales.
   float baseLift = fbm2DPeriodic(uv * 3.0f, 2, 3.0f, 113.7f);
 
   cloudPlacementMapOutput[threadId.xy] = vec4(F, J, baseLift, 1.0f);
 }
+// NV-DXVK end

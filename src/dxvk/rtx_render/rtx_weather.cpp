@@ -915,6 +915,7 @@ namespace dxvk { namespace {
 namespace dxvk {
 
   WeatherBlender::WeatherBlender() {
+    m_inputBlendSeconds = blendDurationSeconds();
   }
 
   WeatherBlender::~WeatherBlender() {
@@ -1033,9 +1034,9 @@ namespace dxvk {
     constexpr int kPresetCountUI = static_cast<int>(IM_ARRAYSIZE(kPresetNamesUI));
 
     ImGui::Combo("Target Preset", &m_uiSelectedPresetIndex, kPresetNamesUI, kPresetCountUI);
-    ImGui::SliderFloat("Blend Duration (sec)", &m_uiBlendDuration, 0.0f, 600.0f, "%.1f");
+    RemixGui::SliderFloat("Blend Duration (sec)", &blendDurationSecondsObject(), 0.0f, 600.0f, "%.1f");
     if (ImGui::Button("Apply Preset")) {
-      setBlendSeconds(m_uiBlendDuration);
+      setBlendSeconds(blendDurationSeconds());
       const char* targetName = (m_uiSelectedPresetIndex == 0) ? "" : kPresetNamesUI[m_uiSelectedPresetIndex];
       setTargetPreset(targetName);
     }

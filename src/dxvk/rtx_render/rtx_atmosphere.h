@@ -933,13 +933,9 @@ public:
                "World-space tile period (km) for the prebaked 3D cloud noise texture. "
                "Smaller = more visible repetition; larger = lower-frequency cloud detail. "
                "Default 12.0; viable range 6-24. Re-bakes the cloud noise volume live on change.");
-    // Stochastic triangle-lattice randomization (Heitz & Neyret 2018) destroys the tile period while preserving statistics.
     RTX_OPTION("rtx.atmosphere", bool, cloudHexTilingEnable, true,
-               "Stochastically randomize the cloud noise tiling on a "
-               "triangle lattice so the 12 km texture repeat can never "
-               "show, with statistics-preserving blending (the cloud look "
-               "is unchanged). Disable for the legacy periodic field "
-               "(visible repetition at the tile period).");
+               "Reduce repeated cloud patterns using world-anchored random offsets, rotations "
+               "and reflections with continuous blending. Disable for the periodic source field.");
 
     // Per-column model: derives per-cloud base/top from a baked placement map and re-keys all vertical shaping
     // on each cloud's own normalized height, fixing the old "stacked disconnected puffs" read.
@@ -947,8 +943,7 @@ public:
                "Average cloud-cluster footprint in km [0.5..6] for the "
                "placement map bake. Smaller = many small clouds; larger = "
                "fewer, broader banks. Re-bakes the placement map live on "
-               "change (the effective value snaps so an integer number of "
-               "clusters fits the noise tile).");
+               "change, smoothly blending adjacent periodic cluster scales.");
     RTX_OPTION("rtx.atmosphere", float, cloudColumnTopVariation, 0.45f,
                "Per-cloud tower-height jitter [0..1]. 0 = all cloud tops at "
                "one altitude (flat deck); higher = a varied skyline. "
@@ -967,11 +962,10 @@ public:
                "[0.05..1]. Narrow = crisp solid-cored clouds; wide = soft "
                "wispy transitions. Applies live.");
     RTX_OPTION("rtx.atmosphere", float, nvdfNominalCoverage, 0.0f,
-               "Coverage the cloud-body SDF (NVDF) bakes at [0 or 0.25..1]. "
-               "0 = auto: track the live weather coverage quantized to 0.25 "
-               "steps (recommended — keeps the sample-time coverage "
-               "level-set offset small; re-bakes amortized only when the "
-               "drift crosses a step). Nonzero pins the bake nominal for "
+               "Coverage the cloud-body SDF (NVDF) bakes at [0..1]. "
+               "0 = auto: track live weather coverage continuously; changes "
+               "start an amortized re-bake while the front field remains "
+               "published. Nonzero pins the bake nominal for "
                "debugging or look-tuning.");
     RTX_OPTION("rtx.atmosphere", float, nvdfProfileDepthKm, 0.7f,
                "Nubis3: depth into the cloud body (km) over which the "
@@ -1660,6 +1654,11 @@ private:
   Resources::Resource m_cloudNvdfJfa[2];
   Resources::Resource m_cloudNvdfSdf[2];
   uint32_t            m_cloudNvdfSdfFront = 0;
+  // The front SDF's nominal coverage is published metadata. Keep it stable while
+  // the back SDF is being rebuilt, then update it in the same step as the swap.
+  float               m_nvdfPublishedNominalCoverage = 0.25f;
+  AtmosphereArgs      m_nvdfPendingArgs = {};
+  bool                m_nvdfNominalCoverageValid = false;
   float    m_missLinearViewZ       { 1e9f };
   Resources::Resource m_cloudDetailNoise3D;
   Resources::Resource m_cloudRenderRT;

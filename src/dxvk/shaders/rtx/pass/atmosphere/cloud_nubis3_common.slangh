@@ -86,7 +86,7 @@ float valueErosion(float value, float erosion) {
 //
 // Coverage: the NVDF was baked at args.nvdfNominalCoverage; the live
 // coverageLocal shifts the iso-level at SAMPLE time, so weather-driven
-// coverage grows/shrinks/merges bodies with zero rebakes.
+// coverage grows/shrinks/merges bodies between amortized body rebakes.
 //
 // Animation: wind translates the whole field (sample offset). The body SDF
 // itself only changes on (amortized) rebakes; the LIVE motion comes from the
@@ -95,20 +95,16 @@ float valueErosion(float value, float erosion) {
 // applied evolution to the base noise instead; here the erosion field is the
 // only animated shape input, so it takes both offsets.)
 //
-// Hex de-tiling: the same CloudHexTile lattice offsets the legacy placement +
-// noise taps use are applied to the NVDF tap, so the SDF de-tiles in lockstep
-// with everything else. Blend-zone taps use a plain normalized weighted
-// average — valid for a SMOOTH field like a distance field (the variance-
-// preserving re-expansion the noise blend needs would amplify, not preserve,
-// an SDF). NOTE for Phase C: a blended distance is NOT metric — stepping must
-// use min(taps) with a safety factor, not this blend.
+// Hex de-tiling applies distance-preserving transforms per lattice vertex.
+// All three taps contribute continuously; empty-space steps also stop at the
+// triangle boundary before a different vertex can enter the blend.
 // ---------------------------------------------------------------------------
 // coarseOd (fork — 2026-07-30, perf): the LIVE optical-depth taps only. A 2-tap
 // shadow integral over 3 km cannot see two of the sampler's features, so they are
 // dropped for those callers:
 //   * the hex 3-tap blend zone — it exists to hide the texture repeat's seams, and
 //     a seam cannot be seen inside an optical depth. Forced to the dominant-vertex
-//     tap, which the fast path already uses over ~70% of the plane.
+//     tap; full view and grid-bake calls retain the continuous three-tap blend.
 //   * the two-scale de-tile second tap (noiseB) — same reasoning: it hides the
 //     detail volume's repeat when a cloud face is viewed flat-on. Using noiseA
 //     directly keeps the mean EXACT (every channel is bake-normalized to 0.5) and
@@ -160,39 +156,28 @@ float sampleCloudDensityNubis3(vec3 worldPosKm,
                      frac(perturbed.z / args.cloudNoiseTileKm));
   float v = clamp(heightFraction, kHalfTexelV, 1.0f - kHalfTexelV);
 
-  // 3. SDF tap, hex-de-tiled (dominant-vertex fast path covers ~70% of area).
-  //    sdfMinKm tracks the MINIMUM of the taps actually blended — the only
-  //    metrically-valid distance bound for Phase C stepping (the weighted
-  //    blend is not a distance). In the fast path the rendered field IS the
-  //    single dominant tap, so its distance is the right bound there.
-  // The per-tap frac() on the horizontal coords is dropped (fork — 2026-07-30,
-  // perf): tileUV is ALREADY fracced above and the hex offsets are in [0,1), so
-  // these operands are bounded to [0,2) and the sampler's REPEAT address mode
-  // wraps them identically. Safe precisely BECAUSE the range is small — see the
-  // note at the detail taps below, where the operand is unbounded and the frac
-  // is load-bearing.
+  // NV-DXVK start: Continuous stochastic SDF blend with isometric tile transforms.
   float sdfKm;
   float sdfMinKm;
+  float tileBoundaryKm = 100.0f;
   if (args.cloudHexTilingEnable > 0.5f) {
-    CloudHexTile hex = computeCloudHexTile(vec2(perturbed.x, perturbed.z), args);
-    if (hex.w1 > 0.95f || coarseOd) {
-      sdfKm = nvdfSdf.SampleLevel(cloudSampler,
-          vec3(tileUV.x + hex.off1.x, v, tileUV.y + hex.off1.y), 0).r;
-      sdfMinKm = sdfKm;
+    CloudHexTile hex = computeCloudHexTile(perturbed.xz, args);
+    float s1 = nvdfSdf.SampleLevel(cloudSampler, vec3(hex.uv1.x, v, hex.uv1.y), 0).r;
+    if (coarseOd) {
+      sdfKm = s1;
+      sdfMinKm = s1;
     } else {
-      float s1 = nvdfSdf.SampleLevel(cloudSampler,
-          vec3(tileUV.x + hex.off1.x, v, tileUV.y + hex.off1.y), 0).r;
-      float s2 = nvdfSdf.SampleLevel(cloudSampler,
-          vec3(tileUV.x + hex.off2.x, v, tileUV.y + hex.off2.y), 0).r;
-      float s3 = nvdfSdf.SampleLevel(cloudSampler,
-          vec3(tileUV.x + hex.off3.x, v, tileUV.y + hex.off3.y), 0).r;
+      float s2 = nvdfSdf.SampleLevel(cloudSampler, vec3(hex.uv2.x, v, hex.uv2.y), 0).r;
+      float s3 = nvdfSdf.SampleLevel(cloudSampler, vec3(hex.uv3.x, v, hex.uv3.y), 0).r;
       sdfKm = hex.w1 * s1 + hex.w2 * s2 + hex.w3 * s3;
       sdfMinKm = min(s1, min(s2, s3));
     }
+    tileBoundaryKm = hex.boundaryKm;
   } else {
     sdfKm = nvdfSdf.SampleLevel(cloudSampler, vec3(tileUV.x, v, tileUV.y), 0).r;
     sdfMinKm = sdfKm;
   }
+  // NV-DXVK end
 
   // 4. Coverage as a live level-set offset: coverage above the baked nominal
   //    pushes the iso-surface outward (bodies grow/merge), below shrinks them
@@ -217,7 +202,9 @@ float sampleCloudDensityNubis3(vec3 worldPosKm,
   // on every return path — the early-out below is exactly where the march
   // wants to skip.
   float maxOutwardKm = 0.5f * (wobbleKm + args.nubis3ShapeVarietyKm);
-  sdfStepKmOut = sdfMinKm - offsetKm - maxOutwardKm;
+  // NV-DXVK start: Never skip into an unsampled lattice triangle.
+  sdfStepKmOut = min(sdfMinKm - offsetKm - maxOutwardKm, tileBoundaryKm);
+  // NV-DXVK end
 
   if (sdfLive >= maxOutwardKm) {
     return 0.0f;
@@ -313,10 +300,8 @@ float sampleCloudDensityNubis3(vec3 worldPosKm,
   //     both are mean-0.5 by the bake normalization, so the sum stays
   //     zero-mean). The 60/40 blend keeps the combined signal in
   //     [-0.5, 0.5], preserving the step-5 early-out bound and the
-  //     conservative sdfStepKmOut excursion term. This tap repeats every
-  //     6x the lobe wavelength (~14.4 km at the default) — beyond the noise
-  //     tile itself — so it needs no de-tiling; wavelengths under 2 km put
-  //     the repeat inside the 12 km tile.
+  //     conservative sdfStepKmOut excursion term. Two incommensurate scales
+  //     remove the outline noise's repeat across a wide cloudscape.
   //
   //     TAP ORDER (fork — 2026-07-30, perf): this tap moved AHEAD of the
   //     two-scale base taps below so the surface gate can run on it alone.
@@ -349,8 +334,14 @@ float sampleCloudDensityNubis3(vec3 worldPosKm,
   // the coarsest lobe's true horizontal wavelength in km. At its 2.4 default and cloudDetailScale
   // 4.3 this is the old frequency to within 0.4%.
   const float midFreq = 1.0f / (6.0f * max(args.nubis3ShapeVarietyWavelengthKm, 0.05f));
-  vec4 noiseMid = detailNoise.SampleLevel(cloudSampler,
+  // NV-DXVK start: Break the outline noise's repeat as well as the body tile.
+  vec4 noiseMidA = detailNoise.SampleLevel(cloudSampler,
       frac(boilPosMid * midFreq + vec3(0.71f, 0.29f, 0.53f)), 0);
+  vec4 noiseMidB = detailNoise.SampleLevel(cloudSampler,
+      frac(vec3(boilPosMid.z, boilPosMid.y, -boilPosMid.x) * (midFreq * 0.7548777f)
+           + vec3(0.17f, 0.83f, 0.41f)), 0);
+  vec4 noiseMid = saturate(0.5f + (lerp(noiseMidA, noiseMidB, 0.4f) - 0.5f) * 1.3867505f);
+  // NV-DXVK end
   float wobbleMid = lerp(noiseMid.r - 0.5f,
                          noiseMid.b * 0.3f - 0.15f,
                          typeShaped);

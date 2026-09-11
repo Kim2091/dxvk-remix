@@ -1607,48 +1607,43 @@ float worleyFbm3DPeriodic(vec3 p, int octaves, float seed, vec3 basePeriod) {
   return value;
 }
 
-// ===========================================================================
-// Stochastic hex-tiling of the cloud noise volume (fork — 2026-06-11,
-// de-tile rework stage A).
-//
-// Root-cause fix for the periodic repeat of the prebaked volume: the
-// horizontal plane is partitioned into an equilateral-triangle lattice
-// (~1.6 tiles per edge) and each lattice vertex carries a random
-// texture-space XZ offset.
-// A sample blends the volume taps of its triangle's three vertices with
-// barycentric weights using Heitz & Neyret 2018's variance-preserving
-// operator:
-//
-//   G = mean + sum(w_i * (x_i - mean)) / sqrt(sum(w_i^2))
-//
-// which keeps the blended field's mean and variance equal to the source
-// field's (a plain weighted average would crush variance in blend zones and
-// soften the coverage gate there). Because every cell samples the SAME
-// volume at a random translation, the spectrum/histogram of the field is
-// essentially unchanged — the look is preserved — but the tiling period is
-// destroyed: two world positions one tile apart land in different cells
-// with decorrelated offsets.
-//
-// Weights are sharpened (pow 4, renormalized) so triangle interiors collapse
-// to a single dominant vertex — the samplers take a 1-tap fast path there
-// (w1 > 0.95, ~70% of area) and only blend 3 taps near triangle edges.
-//
-// Lattice scale is a GOLDEN-RATIO multiple of the tile period: an integer
-// multiple would re-introduce banding (the lattice itself would repeat in
-// phase with the texture), and phi is the "most irrational" choice, so
-// lattice-vs-tile resonance is minimized at every tile value.
-//
-// This replaced the former anti-tile domain warp (a horizontal sample
-// displacement that hid the repeat), which was removed once de-tiling was
-// validated in-game. See the cloud-detile-rework plan notes.
-// ===========================================================================
+// NV-DXVK start: World-anchored stochastic cloud sampling.
+// Separate coordinate mixing prevents mirrored lattice IDs from sharing an offset.
+float cloudLatticeHash(vec2 cell, float seed) {
+  uint n = uint(int(cell.x)) * 0x9e3779b9u
+         + uint(int(cell.y)) * 0x85ebca6bu + uint(seed * 3571.0f) * 0xc2b2ae35u;
+  n ^= n >> 16u;
+  n *= 0x7feb352du;
+  n ^= n >> 15u;
+  n *= 0x846ca68bu;
+  n ^= n >> 16u;
+  return float(n >> 8u) * (1.0f / 16777216.0f);
+}
+
+vec2 cloudTileUv(vec2 tileUv, vec2 vertex) {
+  uint orientation = uint(cloudLatticeHash(vertex, 37.1f) * 8.0f);
+  // Square symmetries preserve distances and periodic wrap continuity.
+  if ((orientation & 1u) != 0u) {
+    tileUv = tileUv.yx;
+  }
+  if ((orientation & 2u) != 0u) {
+    tileUv.x = -tileUv.x;
+  }
+  if ((orientation & 4u) != 0u) {
+    tileUv.y = -tileUv.y;
+  }
+  return frac(tileUv + vec2(cloudLatticeHash(vertex, 7.31f), cloudLatticeHash(vertex, 19.77f)));
+}
+
 struct CloudHexTile {
-  float w1, w2, w3;        // sharpened, normalized blend weights (w1 largest)
-  vec2  off1, off2, off3;  // per-vertex random texture-space XZ offsets
+  float w1, w2, w3;
+  vec2 uv1, uv2, uv3;
+  float boundaryKm;
 };
 
 CloudHexTile computeCloudHexTile(vec2 hzKm, AtmosphereArgs args) {
-  const float kHexLatticeTiles = 1.618034f;  // golden ratio — see header
+  // Randomize before a full source tile repeats within a dominant patch.
+  const float kHexLatticeTiles = 0.8f;
   float latticeKm = max(args.cloudNoiseTileKm * kHexLatticeTiles, 1e-3f);
   vec2 uv = hzKm / latticeKm;
 
@@ -1673,9 +1668,9 @@ CloudHexTile computeCloudHexTile(vec2 hzKm, AtmosphereArgs args) {
     v3 = baseId + vec2(0.0f, 1.0f);
   }
 
-  // Sharpen: pow-4 + renormalize. Narrows blend zones to ~edge bands so the
-  // 1-tap fast path covers most of the plane, and reduces the ghosting that
-  // wide 3-way blends of a non-Gaussian field would show.
+  float boundaryKm = min(w.x, min(w.y, w.z)) * latticeKm * 0.8660254f;
+
+  // Narrow blends preserve individual silhouettes without a discontinuous tap cutoff.
   w = w * w;
   w = w * w;
   w /= (w.x + w.y + w.z);
@@ -1688,14 +1683,15 @@ CloudHexTile computeCloudHexTile(vec2 hzKm, AtmosphereArgs args) {
 
   CloudHexTile hex;
   hex.w1 = w.x; hex.w2 = w.y; hex.w3 = w.z;
-  // Per-vertex random translation of the tiling, in texture-space units.
-  // Lattice ids are integers, so hash31's int-truncation never collides
-  // neighboring vertices. Two decorrelated seeds give the two channels.
-  hex.off1 = vec2(hash31(vec3(v1, 7.31f)), hash31(vec3(v1, 19.77f)));
-  hex.off2 = vec2(hash31(vec3(v2, 7.31f)), hash31(vec3(v2, 19.77f)));
-  hex.off3 = vec2(hash31(vec3(v3, 7.31f)), hash31(vec3(v3, 19.77f)));
+  vec2 tileUv = frac(hzKm / max(args.cloudNoiseTileKm, 1e-3f));
+  hex.uv1 = cloudTileUv(tileUv, v1);
+  hex.uv2 = cloudTileUv(tileUv, v2);
+  hex.uv3 = cloudTileUv(tileUv, v3);
+  // A new tap may enter across a triangle edge; its distance is not sampled yet.
+  hex.boundaryKm = max(boundaryKm, 0.0f);
   return hex;
 }
+// NV-DXVK end
 
 // Mean of the Worley-carved bake — shared anchor for the hex blend and the
 // vertical-coherence re-expansion (which already used 0.4; keep in lockstep

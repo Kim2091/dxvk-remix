@@ -335,6 +335,14 @@ RtxAtmosphere::RtxAtmosphere(DxvkDevice* device)
   m_cameraBuffer = device->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXBuffer, "Atmosphere camera constants buffer");
 }
 
+namespace {
+  float computeCloudNvdfNominalCoverage(float cloudCoverageMean) {
+    const float pinned = RtxAtmosphere::nvdfNominalCoverage();
+    const float autoNominal = std::min(std::max(cloudCoverageMean, 0.0f), 1.0f);
+    return pinned > 0.0f ? pinned : autoNominal;
+  }
+}
+
 RtxAtmosphere::~RtxAtmosphere() {
 }
 
@@ -1091,16 +1099,12 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
     args.cloudCoverageSpread = wx ? wx->cloudCoverageSpread : RtxAtmosphere::cloudCoverageSpread();
     args.cloudCoverageNoiseScale = wx ? wx->cloudCoverageNoiseScale : RtxAtmosphere::cloudCoverageNoiseScale();
     // Nubis3 Phase A: nominal coverage the NVDF body SDF bakes at. Auto mode
-    // (option 0) tracks the live weather coverage quantized to 0.25 steps —
-    // the sample-time coverage level-set offset then stays small, and the
-    // NVDF dirty key fires an amortized re-bake only when the drift crosses a
-    // step. A nonzero option pins the bake nominal (debug / look-tuning).
-    {
-      const float pinned = RtxAtmosphere::nvdfNominalCoverage();
-      const float autoNominal =
-          std::min(std::max(std::round(args.cloudCoverageMean / 0.25f) * 0.25f, 0.25f), 1.0f);
-      args.nvdfNominalCoverage = pinned > 0.0f ? pinned : autoNominal;
-    }
+    // (option 0) tracks the live weather coverage continuously. The front SDF
+    // remains published while an amortized bake catches up; a nonzero option
+    // pins the bake nominal (debug / look-tuning).
+    args.nvdfNominalCoverage = m_nvdfNominalCoverageValid
+        ? m_nvdfPublishedNominalCoverage
+        : computeCloudNvdfNominalCoverage(args.cloudCoverageMean);
     // Nubis3 density model (fork — Nubis3 conversion Phase B).
     args.nvdfProfileDepthKm    = std::max(RtxAtmosphere::nvdfProfileDepthKm(), 0.05f);
     // Lighting profile depth (fork -- 2026-09-08, painted-shading fix; see the RTX_OPTION). The 0
@@ -1468,6 +1472,9 @@ void RtxAtmosphere::cacheCloudPlacementBakeInputs() {
 }
 
 void RtxAtmosphere::createLutResources(Rc<DxvkContext> ctx) {
+  // Resource recreation invalidates the published front-field metadata.
+  m_cloudNvdfSdfFront = 0u;
+  m_nvdfNominalCoverageValid = false;
   // Create transmittance LUT (stores atmospheric transmittance)
   VkExtent3D transmittanceExtent = { kTransmittanceLutWidth, kTransmittanceLutHeight, 1 };
   m_transmittanceLut = Resources::createImageResource(
@@ -2700,7 +2707,7 @@ void RtxAtmosphere::dispatchCloudDetailNoiseBake(Rc<DxvkContext> ctx) {
 void RtxAtmosphere::dispatchCloudNvdfOccupancy(Rc<DxvkContext> ctx) {
   ScopedGpuProfileZone(ctx, "Atmosphere Cloud NVDF Occupancy");
 
-  AtmosphereArgs args = getAtmosphereArgs();
+  const AtmosphereArgs& args = m_nvdfPendingArgs;
   ctx->updateBuffer(m_constantsBuffer, 0, sizeof(AtmosphereArgs), &args);
   ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_constantsBuffer);
 
@@ -2733,7 +2740,7 @@ void RtxAtmosphere::dispatchCloudNvdfJfaPass(Rc<DxvkContext> ctx, uint32_t mode,
                                              uint32_t srcIdx, uint32_t dstIdx) {
   ScopedGpuProfileZone(ctx, mode == 0u ? "Atmosphere Cloud NVDF JFA Seed" : "Atmosphere Cloud NVDF JFA Jump");
 
-  AtmosphereArgs args = getAtmosphereArgs();
+  const AtmosphereArgs& args = m_nvdfPendingArgs;
   ctx->updateBuffer(m_constantsBuffer, 0, sizeof(AtmosphereArgs), &args);
   ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_constantsBuffer);
 
@@ -2759,7 +2766,7 @@ void RtxAtmosphere::dispatchCloudNvdfJfaPass(Rc<DxvkContext> ctx, uint32_t mode,
 void RtxAtmosphere::dispatchCloudNvdfResolve(Rc<DxvkContext> ctx, uint32_t seedsIdx) {
   ScopedGpuProfileZone(ctx, "Atmosphere Cloud NVDF Resolve");
 
-  AtmosphereArgs args = getAtmosphereArgs();
+  const AtmosphereArgs& args = m_nvdfPendingArgs;
   ctx->updateBuffer(m_constantsBuffer, 0, sizeof(AtmosphereArgs), &args);
   ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_constantsBuffer);
 
@@ -2783,6 +2790,9 @@ void RtxAtmosphere::runCloudNvdfBakeFull(Rc<DxvkContext> ctx) {
   // ahead of the occupancy pass's placement read.
   nvdfBarrier(ctx);
 
+  const AtmosphereArgs currentArgs = getAtmosphereArgs();
+  m_nvdfPendingArgs = currentArgs;
+  m_nvdfPendingArgs.nvdfNominalCoverage = computeCloudNvdfNominalCoverage(currentArgs.cloudCoverageMean);
   dispatchCloudNvdfOccupancy(ctx);
   nvdfBarrier(ctx);
 
@@ -2798,6 +2808,9 @@ void RtxAtmosphere::runCloudNvdfBakeFull(Rc<DxvkContext> ctx) {
   dispatchCloudNvdfResolve(ctx, kCloudNvdfJumpPassCount % 2u);
   nvdfBarrier(ctx);
   m_cloudNvdfSdfFront = 1u - m_cloudNvdfSdfFront;
+  m_nvdfPublishedNominalCoverage = m_nvdfPendingArgs.nvdfNominalCoverage;
+  m_nvdfNominalCoverageValid = true;
+  memset(&m_cachedVoxelGridKey, 0, sizeof(m_cachedVoxelGridKey));
 
   // Any interrupted amortized re-bake is superseded by this full chain.
   m_nvdfBakeActive = false;
@@ -2813,6 +2826,9 @@ void RtxAtmosphere::stepCloudNvdfBake(Rc<DxvkContext> ctx) {
     // over the following frames. Snapshot the key at START — if an input
     // changes again mid-bake, this bake completes with the field it started
     // from and the stale key immediately starts a follow-up bake.
+    const AtmosphereArgs currentArgs = getAtmosphereArgs();
+    m_nvdfPendingArgs = currentArgs;
+    m_nvdfPendingArgs.nvdfNominalCoverage = computeCloudNvdfNominalCoverage(currentArgs.cloudCoverageMean);
     cacheCloudNvdfBakeInputs();
     dispatchCloudNvdfOccupancy(ctx);
     nvdfBarrier(ctx);
@@ -2835,6 +2851,9 @@ void RtxAtmosphere::stepCloudNvdfBake(Rc<DxvkContext> ctx) {
     dispatchCloudNvdfResolve(ctx, kCloudNvdfJumpPassCount % 2u);
     nvdfBarrier(ctx);
     m_cloudNvdfSdfFront = 1u - m_cloudNvdfSdfFront;
+    m_nvdfPublishedNominalCoverage = m_nvdfPendingArgs.nvdfNominalCoverage;
+    m_nvdfNominalCoverageValid = true;
+    memset(&m_cachedVoxelGridKey, 0, sizeof(m_cachedVoxelGridKey));
     m_nvdfBakeActive = false;
     m_nvdfJumpIdx    = 0;
   }
@@ -2842,6 +2861,7 @@ void RtxAtmosphere::stepCloudNvdfBake(Rc<DxvkContext> ctx) {
 
 bool RtxAtmosphere::needsCloudNvdfRebake() const {
   AtmosphereArgs args = getAtmosphereArgs();
+  const float desiredNominalCoverage = computeCloudNvdfNominalCoverage(args.cloudCoverageMean);
   const float thicknessQ = std::round(args.cloudThickness / 0.25f) * 0.25f;
   return m_cachedNvdfKey.cellSizeKm      != RtxAtmosphere::cloudCellSizeKm()
       || m_cachedNvdfKey.tileKm          != RtxAtmosphere::cloudNoiseTileKm()
@@ -2849,19 +2869,19 @@ bool RtxAtmosphere::needsCloudNvdfRebake() const {
       || m_cachedNvdfKey.columnTopShape  != RtxAtmosphere::cloudColumnTopShape()
       || m_cachedNvdfKey.columnTopVar    != RtxAtmosphere::cloudColumnTopVariation()
       || m_cachedNvdfKey.columnBaseVar   != RtxAtmosphere::cloudColumnBaseVariation()
-      || m_cachedNvdfKey.nominalCoverage != args.nvdfNominalCoverage
+      || std::abs(m_cachedNvdfKey.nominalCoverage - desiredNominalCoverage) > 1e-4f
       || m_cachedNvdfKey.thicknessQ      != thicknessQ
       || m_cachedNvdfKey.bodyErosion     != args.nvdfBodyErosionStrength;
 }
 
 void RtxAtmosphere::cacheCloudNvdfBakeInputs() {
-  AtmosphereArgs args = getAtmosphereArgs();
-  m_cachedNvdfKey.cellSizeKm      = RtxAtmosphere::cloudCellSizeKm();
-  m_cachedNvdfKey.tileKm          = RtxAtmosphere::cloudNoiseTileKm();
-  m_cachedNvdfKey.columnFeather   = RtxAtmosphere::cloudColumnFeather();
-  m_cachedNvdfKey.columnTopShape  = RtxAtmosphere::cloudColumnTopShape();
-  m_cachedNvdfKey.columnTopVar    = RtxAtmosphere::cloudColumnTopVariation();
-  m_cachedNvdfKey.columnBaseVar   = RtxAtmosphere::cloudColumnBaseVariation();
+  const AtmosphereArgs& args = m_nvdfPendingArgs;
+  m_cachedNvdfKey.cellSizeKm      = args.cloudCellSizeKm;
+  m_cachedNvdfKey.tileKm          = args.cloudNoiseTileKm;
+  m_cachedNvdfKey.columnFeather   = args.cloudColumnFeather;
+  m_cachedNvdfKey.columnTopShape  = args.cloudColumnTopShape;
+  m_cachedNvdfKey.columnTopVar    = args.cloudColumnTopVariation;
+  m_cachedNvdfKey.columnBaseVar   = args.cloudColumnBaseVariation;
   m_cachedNvdfKey.nominalCoverage = args.nvdfNominalCoverage;
   m_cachedNvdfKey.thicknessQ      = std::round(args.cloudThickness / 0.25f) * 0.25f;
   m_cachedNvdfKey.bodyErosion     = args.nvdfBodyErosionStrength;

@@ -969,6 +969,9 @@ namespace dxvk {
     WeatherBlender();
     ~WeatherBlender();
 
+    RTX_OPTION("rtx.weather", float, blendDurationSeconds, 30.0f,
+               "Default ImGui weather preset transition duration in seconds [0,600].");
+
     void update(float deltaTimeSeconds);
     void showImguiSettings();
     void renderEditorWindow();  // no-op while closed; call once per frame
@@ -1029,7 +1032,6 @@ namespace dxvk {
 
     // Per-scene UI/runtime bookkeeping belongs to the blender, not process-global statics.
     int   m_uiSelectedPresetIndex = 0;
-    float m_uiBlendDuration = 30.0f;
     int   m_uiEditPresetIndex = 0;
     char  m_uiFilter[64] = {};
     int   m_uiAppliedPinIndex = -1;
