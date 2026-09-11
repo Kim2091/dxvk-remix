@@ -1137,20 +1137,14 @@ void RtxAtmosphere::showImguiSettings(WeatherBlender* blender) {
             "clouds so the two can never disagree about the size of the world.");
 
         RemixGui::DragFloat("Cloud World Compression", &RtxAtmosphere::cloudWorldCompressionObject(),
-                            0.05f, 0.1f, 50.0f, "%.2f", sliderFlags);
+                            0.1f, 0.1f, 10000.0f, "%.2f", sliderFlags);
         RemixGui::SetTooltipToLastWidgetOnHover(
             "Shrinks the whole cloudscape by this factor - deck height, depth, cell and tile size, "
             "wind and anchor distances together. 1 means the cloud system's metres are real metres. "
             "Larger values suit a map built smaller than the region it depicts, where a physically "
             "correct cloudscape reads far too high and too large. Around 7 for Fallout: New Vegas. "
             "Clouds only; the aerial perspective stays physical.");
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Game units per centimetre used only by the cloud world-space anchor conversion "
-            "(cloudWorldUnitsPerKm). 0 inherits the global Scene Unit Scale (rtx.sceneScale) for "
-            "legacy behaviour. Set a positive value once you have measured game units per cm for "
-            "THIS game specifically — rtx.sceneScale drives several unrelated systems and is not a "
-            "reliable measurement of the space clouds actually occupy. Changing this does not "
-            "affect the sky, aerial perspective, or global volumetrics.");
+
 
         ImGui::Separator();
 
@@ -1208,28 +1202,21 @@ void RtxAtmosphere::showImguiSettings(WeatherBlender* blender) {
         ImGui::Text("Raw Position (freecam)      %10.2f, %10.2f, %10.2f",
                     anchor.rawWorldUnitsFreecam.x, anchor.rawWorldUnitsFreecam.y, anchor.rawWorldUnitsFreecam.z);
         RemixGui::SetTooltipToLastWidgetOnHover(
-            "camera.getPosition(freecam=true), in raw game units. Shown beside the non-freecam "
-            "reading above because the two can disagree: the cloud render basis takes its "
-            "ORIENTATION with freecam=true, while the position pushed to the cloud shadow lookup "
-            "uses freecam=false. That mismatch is a known bug left for a later migration stage to "
-            "fix — recorded here, not fixed, so the fix has a measured before/after instead of a "
-            "guess.");
+            "Active viewer position in game units. Clouds use this position when Camera View Matrix "
+            "is the anchor source; freecam movement also offsets an explicit camera override.");
 
         ImGui::Text("Resolved Position            %10.2f, %10.2f, %10.2f",
                     anchor.resolvedRawWorldUnits.x, anchor.resolvedRawWorldUnits.y, anchor.resolvedRawWorldUnits.z);
         RemixGui::SetTooltipToLastWidgetOnHover(
-            "The raw units ACTUALLY behind Derived Position below this frame (fork — 2026-09-05, "
-            "world-space cloud migration Stage 2): equal to Raw Position (no freecam) when Anchor "
-            "Source is Camera View Matrix, or to Camera World Override verbatim when it is Camera "
-            "World Override. This is what setCloudShadowCameraPosition actually received.");
+            "The active viewer position used by the clouds, in game units. An explicit camera "
+            "override supplies the player position plus the freecam displacement.");
 
         ImGui::Text("Derived Position (Y-up, km) %10.3f, %10.3f, %10.3f",
                     anchor.posYUpKm.x, anchor.posYUpKm.y, anchor.posYUpKm.z);
         RemixGui::SetTooltipToLastWidgetOnHover(
-            "Resolved Position above, converted into the atmosphere's Y-up frame and into "
-            "cloud-space kilometres via Cloud Scene Unit Scale above (cloudWorldUnitsPerKm) — "
-            "deliberately NOT the aerial-perspective or legacy Scene Unit Scale conversion. This is "
-            "what actually reaches AtmosphereArgs::cameraWorldPosYUpKm today.");
+            "Resolved Position converted to Y-up cloud kilometres using Units Per Metre and Cloud "
+            "World Compression. This readout is before subtracting Ground Level; Camera Altitude "
+            "below includes that calibration.");
 
         const float deltaKmMagnitude = length(anchor.deltaKm);
         ImGui::Text("|Delta| This Frame (km)     %10.5f", deltaKmMagnitude);
@@ -1239,13 +1226,12 @@ void RtxAtmosphere::showImguiSettings(WeatherBlender* blender) {
             "pattern Cumulative Rotation / Ever Moved below are actually watching for.");
 
         const float resolvedScale = RtxAtmosphere::cloudWorldUnitsPerKm();
-        const bool cloudScaleOverridesSceneScale = RtxAtmosphere::cloudScale() > 0.0f;
-        ImGui::Text("Resolved Scale (units/km)   %12.1f  [%s]", resolvedScale,
-                    cloudScaleOverridesSceneScale ? "Cloud Scene Unit Scale" : "inherited Scene Unit Scale");
+        ImGui::Text("Resolved Units Per Metre      %10.3f  [%s]", RtxAtmosphere::resolveUnitsPerMeter(),
+                    RtxAtmosphere::unitsPerMeter() > 0.0f ? "configured" : "inherited Scene Unit Scale");
+        ImGui::Text("Cloud Scale (units/km)        %10.3f", resolvedScale);
         RemixGui::SetTooltipToLastWidgetOnHover(
-            "cloudWorldUnitsPerKm(): 100000 * (Cloud Scene Unit Scale if positive, else "
-            "rtx.sceneScale), clamped away from zero. This is the divisor behind Derived Position "
-            "above; the bracket names which of the two is currently in effect.");
+            "1000 times Resolved Units Per Metre divided by Cloud World Compression. A smaller "
+            "number makes the cloud volume smaller and nearer in the game world.");
 
         ImGui::Separator();
 
@@ -1327,6 +1313,19 @@ void RtxAtmosphere::showImguiSettings(WeatherBlender* blender) {
             "height above the ground. Stand somewhere the game treats as ground level before "
             "clicking. Unlike the old sea-level datum this stays correct if you change the scale.");
 
+        float cloudGroundLevel = 0.0f;
+        const bool canPlaceLayer = getCloudGroundLevelAtPlayer(cloudGroundLevel);
+        ImGui::BeginDisabled(!canPlaceLayer);
+        if (ImGui::Button("Center Layer at Player")) {
+          RemixGui::CheckRtxOptionPopups(&RtxAtmosphere::groundLevelWorldUnitsObject());
+          RtxAtmosphere::groundLevelWorldUnitsObject().setDeferred(cloudGroundLevel);
+        }
+        ImGui::EndDisabled();
+        RemixGui::SetTooltipToLastWidgetOnHover(
+            "Moves Ground Level once so the primary cloud layer's midpoint is at the player, "
+            "including while freecam is active. This changes the atmosphere's altitude datum; "
+            "the layer stays fixed as you move. Clear gaps can remain between cloud bodies.");
+
         const AtmosphereArgs placement = getAtmosphereArgs();
         ImGui::Text("Camera Altitude (m)         %10.1f", placement.cameraAltitudeKm * 1000.0f);
         RemixGui::SetTooltipToLastWidgetOnHover(
@@ -1338,6 +1337,14 @@ void RtxAtmosphere::showImguiSettings(WeatherBlender* blender) {
         RemixGui::SetTooltipToLastWidgetOnHover(
             "Layer boundaries relative to the camera, including the active weather depth. "
             "Positive values are above the camera; negative values are below it.");
+        ImGui::Text("Cloud base / top from camera: %+.1f / %+.1f world units",
+                    (placement.cloudAltitude - placement.cameraAltitudeKm) * placement.worldUnitsPerKm,
+                    (placement.cloudAltitude + placement.cloudThickness - placement.cameraAltitudeKm) * placement.worldUnitsPerKm);
+        ImGui::Text("Layer depth in game: %.1f world units", placement.cloudThickness * placement.worldUnitsPerKm);
+        RemixGui::SetTooltipToLastWidgetOnHover(
+            "The cloud layer's actual size after scale and compression. Lowering Altitude moves "
+            "the base; it does not shrink the bodies. Increase Cloud World Compression to fit "
+            "the whole volume into a smaller area of the level.");
         ImGui::Checkbox("Log Cloud Placement", &m_traceCloudPlacement);
         RemixGui::SetTooltipToLastWidgetOnHover(
             "Write camera, altitude, layer bounds and scale to remix-dxvk.log every 120 cloud "

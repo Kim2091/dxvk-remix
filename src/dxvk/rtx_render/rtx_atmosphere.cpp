@@ -3171,6 +3171,24 @@ void RtxAtmosphere::dispatchCloudScreenPass(RtxContext& ctx, const Resources::Ra
   dispatchCloudRender(&ctx, rtOutput);
 }
 
+bool RtxAtmosphere::getCloudGroundLevelAtPlayer(float& groundLevel) const {
+  const auto& camera = m_device->getCommon()->getSceneManager().getCamera();
+  const AtmosphereArgs args = getAtmosphereArgs();
+  if (!camera.isValid(m_cloudRenderFrameIdx) || args.cloudAltitude < 0.0f || args.cloudThickness <= 0.0f) {
+    return false;
+  }
+
+  // Capture the player position, even while the active viewer is a detached free camera.
+  const Vector3 player = RtxAtmosphere::useCameraWorldOverride()
+    ? RtxAtmosphere::cameraWorldOverride() : camera.getPosition(/*freecam=*/false);
+  const float playerHeight = RtxOptions::zUp() ? player.z : player.y;
+  const float upSign = RtxAtmosphere::flipUpAxis() ? -1.0f : 1.0f;
+  const float layerMidpointKm = args.cloudAltitude + 0.5f * args.cloudThickness;
+  // Move the datum instead of pushing the cloud shell below the planet surface.
+  groundLevel = playerHeight - upSign * layerMidpointKm * args.worldUnitsPerKm;
+  return std::isfinite(groundLevel);
+}
+
 void RtxAtmosphere::traceCloudPlacement(const AtmosphereArgs& args) {
   if (!m_traceCloudPlacement) {
     m_cloudPlacementTraceFrame = 0;

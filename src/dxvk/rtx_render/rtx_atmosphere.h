@@ -1520,6 +1520,7 @@ public:
                "knobs with layer 1 (phase, multi-scatter, detail, etc.).");
 
 private:
+  bool getCloudGroundLevelAtPlayer(float& groundLevel) const;
   void traceCloudPlacement(const AtmosphereArgs& args);
   bool m_traceCloudPlacement = false;
   uint32_t m_cloudPlacementTraceFrame = 0;
