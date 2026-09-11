@@ -123,13 +123,6 @@ public:
   // Recreates the cloud render RT on resize; cheap when extent is unchanged.
   void ensureCloudRenderRT(Rc<DxvkContext> ctx, const VkExtent2D& downscaleExtent);
 
-  // Push per-frame camera basis for cloud_render.comp.slang view-ray reconstruction.
-  // Must be called before computeLuts. Right/Up are pre-scaled by tan(halfFovX/Y) so the shader does a weighted sum.
-  void setCloudRenderCameraBasis(const Vector3& forwardYUp,
-                                  const Vector3& rightYUp,
-                                  const Vector3& upYUp,
-                                  uint32_t frameIdx);
-
   // Push camera world position (Y-up km) for the D_sun voxel grid shadow lookup. Must be called before computeLuts.
   void setCloudShadowCameraPosition(const Vector3& cameraWorldPosYUpKm);
 
@@ -1664,9 +1657,6 @@ private:
   RtxMipmap::Resource m_cloudSecondaryLut;
   Resources::Resource m_cloudPlacementMap;
 
-  Vector3  m_cloudRenderForwardYUp { 0.0f, 0.0f, 1.0f };
-  Vector3  m_cloudRenderRightYUp   { 1.0f, 0.0f, 0.0f };
-  Vector3  m_cloudRenderUpYUp      { 0.0f, 1.0f, 0.0f };
   uint32_t m_cloudRenderFrameIdx   { 0u };
   Vector3  m_cameraWorldPosYUpKm   { 0.0f, 0.0f, 0.0f };
   // groundLevelWorldUnits resolved into the same Y-up km frame as m_cameraWorldPosYUpKm, computed
@@ -1736,6 +1726,7 @@ private:
   uint32_t            m_cloudHistoryLastFrameId = UINT32_MAX;
 
   Rc<DxvkBuffer> m_constantsBuffer;
+  Rc<DxvkBuffer> m_cloudCameraBuffer;
 
   AtmosphereArgs m_cachedArgs;
   // Per-LUT cache keys: normalizes out fields each bake doesn't read so moving sun/stars

@@ -410,24 +410,17 @@ struct AtmosphereArgs {
                                    // cloudNoiseTileKm frequency. Reuses the former pad_nubisCubed0
                                    // slot, so the constant-buffer layout is unchanged.
 
-  // ----- Cloud render camera basis (fork — 2026-05-12, C4) -----
-  // Pre-computed Y-up basis vectors (camera at origin). Per-pixel view direction
-  // is reconstructed in cloud_render.comp.slang as:
-  //   viewDirYUp = normalize(forward + ndc.x * rightScaled + ndc.y * upScaled)
-  // The `Right` and `Up` vectors are pre-multiplied by tan(halfFovX/Y) so the
-  // shader doesn't need fov/aspect knowledge. All in Y-up world (cloud math
-  // convention — camera at origin).
-  // The three scalars riding the camera-basis vec3 padding below belong to
-  // the column-shaping rework (fork — 2026-06-11); they reuse the former
-  // pad_cr0..2 slots so the CB layout is unchanged.
-  vec3  cloudRenderForwardYUp;
+// NV-DXVK start: Use the active camera projection for Numos clouds.
+  // Reserved former camera-basis slots retain the shared constant-buffer layout.
+  vec3  pad_cloudCamera0;
   float cloudColumnTopVariation;   // [0,1] per-cloud tower-height jitter amount (0 = uniform tops)
 
-  vec3  cloudRenderRightYUp;       // Pre-scaled by tan(halfFovX) * aspectRatio
+  vec3  pad_cloudCamera1;
   float cloudColumnTopShape;       // Exponent mapping column presence -> top height (lower = taller edges)
 
-  vec3  cloudRenderUpYUp;          // Pre-scaled by tan(halfFovY)
+  vec3  pad_cloudCamera2;
   float cloudColumnBaseVariation;  // [0,~0.4] max local cloud-base lift as a fraction of the slab
+// NV-DXVK end
 
   // ----- Nubis Cubed sky-miss composite gate (fork — 2026-05-12, C5) -----
   // When 1, the primary-ray branch in evalSkyRadiance reads the prerendered

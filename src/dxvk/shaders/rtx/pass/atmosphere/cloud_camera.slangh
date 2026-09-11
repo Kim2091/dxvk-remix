@@ -1,0 +1,48 @@
+/*
+* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+// NV-DXVK start: Use the active camera projection for Numos clouds.
+#pragma once
+
+#include "rtx/concept/camera/camera.slangh"
+#include "rtx/pass/atmosphere/atmosphere_common.slangh"
+
+// The cloud target and history both use unjittered pixel-centre rays.
+vec2 cloudReprojectionMotionVectorPixels(Camera camera, uint2 pixelCoordinate, float depthKm,
+                                        vec3 anchorDeltaYUpKm, AtmosphereArgs args)
+{
+  const CameraDirections ray = cameraPixelCoordinateToDirection(camera, ivec2(pixelCoordinate), /*jitter=*/ false);
+  const vec3 anchorDeltaWorldKm = atmosphereYUpToWorld(anchorDeltaYUpKm, args.isZUp != 0u, args.flipUpAxis != 0);
+  const vec3 previousRelativePositionKm = ray.worldDirection * max(depthKm, 0.05f) + anchorDeltaWorldKm;
+
+  // The resolved anchor supplies translation even in camera-relative games. w=0 avoids applying
+  // matrix translation a second time, while preserving the previous rotation and full projection.
+  const vec4 previousClip = mul(camera.prevWorldToProjection, vec4(previousRelativePositionKm, 0.0f));
+  if (!all(isfinite(previousClip)) || previousClip.w <= 1e-6f)
+  {
+    // An off-screen coordinate rejects history for points behind the previous camera.
+    return vec2(camera.resolution) * 2.0f;
+  }
+
+  const vec2 currentNDC = cameraPixelCoordinateToNDC(camera, ivec2(pixelCoordinate));
+  return (previousClip.xy / previousClip.w - currentNDC) * vec2(0.5f, -0.5f) * vec2(camera.resolution);
+}
+// NV-DXVK end

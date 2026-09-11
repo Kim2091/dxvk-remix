@@ -39,6 +39,9 @@
 #include "rtx/algorithm/volume_composite_helpers.slangh"
 #include "rtx/algorithm/accumulate.slangh"
 #include "rtx/pass/atmosphere/atmosphere_common.slangh"
+// NV-DXVK start: Use the active camera projection for Numos clouds.
+#include "rtx/pass/atmosphere/cloud_camera.slangh"
+// NV-DXVK end
 #include "rtx/pass/sparse_rendering/sparse_rendering.slangh"
 #include "rtx/pass/sparse_rendering/compact_active_pixels.slangh"
 
@@ -948,110 +951,6 @@ float cloudDepthVisibility(float entryKm, float meanKm, float surfaceKm, float c
   return saturate(frontAlpha / cloudAlpha);
 }
 
-// Rotation-only screen motion vector for the cloud's own pixel, in pixels. Deliberate duplicate of
-// geometry_resolver.slangh's calcMotionVectorForRayMiss rather than a shared call: that function
-// also drives the general-purpose PrimaryScreenSpaceMotionVector / DLSSRR outputs (unrelated to
-// clouds) and must not be touched by this migration. Exact same math, parameterized on an explicit
-// world direction instead of re-deriving one from pixelCoordinate, since the caller already has
-// primaryRayDirections.worldDirection on hand.
-// On this Gamebryo target the view matrix carries no translation (RtCamera::getPosition() is
-// permanently (0,0,0), measured), so the camera sits at the world origin and the w = 0 direction
-// reprojection here is EXACTLY the w = 1 position reprojection a geometry motion vector would do for
-// a point at any finite cloud depth: after the perspective divide the two differ only in clip z
-// (fork — 2026-09-06, EMA rectification; settles the "miss MV is wrong for a finite deck" question
-// for this target -- wrong in principle, moot in practice. A translating camera is what the
-// parallax term below exists for).
-vec2 cloudRotationMotionVectorPixels(vec3 currentWorldDirection, uint2 pixelCoordinate)
-{
-  vec4 prevNDC = mul(cb.camera.prevWorldToProjection, vec4(currentWorldDirection, 0.0f));
-  prevNDC /= prevNDC.w;
-  const vec2 ndc = cameraPixelCoordinateToNDC(cb.camera, ivec2(pixelCoordinate));
-  const vec2 motionVectorNDC = prevNDC.xy - ndc.xy;
-  return motionVectorNDC * vec2(0.5, -0.5) * vec2(cb.camera.resolution);
-}
-
-// Translation parallax correction (fork — 2026-09-05). calcMotionVectorForRayMiss / the rotation-only
-// term above treats the ray as a pure direction (w=0), exact for content at infinite distance but
-// wrong for the cloud layer, which now carries real depth (AtmosphereCloudDepth). On the
-// Gamebryo-family engine this migration targets, cb.camera.prevWorldToProjection's translation is
-// permanently zero (RtCamera::getPosition() reads a rotation-only D3D view matrix -- see
-// RtxAtmosphere::updateFrame's anchor-resolution block), so there is no way to recover camera
-// translation from the projection matrices at all, at any depth. The separate cloud-anchor system
-// (Stage 2) is the only source of a real translation signal on this target; this is its first
-// shader-side consumer (cb.cloudAnchorDeltaYUpKm, populated CPU-side from
-// RtxAtmosphere::getCloudAnchor().deltaKm -- see composite_args.h).
-//
-// Approximation, linearized around the current view ray: a world point P = cameraPos + viewDirYUp *
-// depthKm stays fixed when the camera moves; only the component of this frame's camera motion
-// PERPENDICULAR to the ray shifts P's apparent screen position (the parallel component only changes
-// depth, not where it lands). The cloud-render camera basis vectors (cloudRenderRightYUp /
-// UpYUp, pre-scaled by tan(halfFovX)*aspect / tan(halfFovY) -- see RtxAtmosphere::
-// setCloudRenderCameraBasis) are exactly the vectors cloud_render.comp.slang itself uses to build a
-// per-pixel viewDirYUp from NDC; inverting that construction to first order near the current ray
-// converts the perpendicular world-space shift into an NDC delta. viewAxisCosine converts the
-// EUCLIDEAN depthKm (the march's own "distance along the ray" convention -- see
-// marchCloudSlab/marchCloudLayers) into the forward-axis (view-space) distance the NDC mapping is
-// actually defined against, the same conversion cloud_render.comp.slang's own depth clamp already
-// performs in the opposite direction.
-//
-// This is a per-pixel-local linearization (exact at screen center, mildly approximate toward wide-
-// FOV edges where viewDirYUp diverges from the central forward axis) and ignores second-order
-// rotation/translation coupling -- acceptable for a soft, depth-uncertain background layer, and
-// materially better than the pure-rotation term alone for the case that actually regressed:
-// strafing under the deck with the view direction roughly fixed.
-vec2 cloudParallaxMotionVectorPixels(vec3 viewDirYUp, float depthKm, AtmosphereArgs args)
-{
-  const vec3 deltaKm = cb.cloudAnchorDeltaYUpKm;  // this frame's camera motion, Y-up km (cur - prev)
-
-  // Strip the along-ray component -- it changes depth, not screen position.
-  const vec3 deltaPerp = deltaKm - viewDirYUp * dot(deltaKm, viewDirYUp);
-
-  const vec3 rightAxis = args.cloudRenderRightYUp;  // pre-scaled by tan(halfFovX) * aspect
-  const vec3 upAxis    = args.cloudRenderUpYUp;     // pre-scaled by tan(halfFovY)
-  const float rightLenSq = max(dot(rightAxis, rightAxis), 1e-9f);
-  const float upLenSq    = max(dot(upAxis, upAxis), 1e-9f);
-
-  const float viewAxisCosine = max(abs(dot(viewDirYUp, normalize(args.cloudRenderForwardYUp))), 1e-3f);
-  const float zForwardKm = max(depthKm, 0.05f) * viewAxisCosine;
-
-  vec2 ndcDelta;
-  ndcDelta.x = dot(deltaPerp, rightAxis) / (zForwardKm * rightLenSq);
-  ndcDelta.y = dot(deltaPerp, upAxis)    / (zForwardKm * upLenSq);
-
-  // Same NDC -> pixel convention as the rotation-only term (y flip, half-resolution scale).
-  return ndcDelta * vec2(0.5, -0.5) * vec2(cb.camera.resolution);
-}
-
-// Combined reprojection motion vector for the cloud history: rotation (reliable on this target) plus
-// the translation parallax correction above (the signal the rotation-only term structurally cannot
-// carry). `depthKm` should be the pixel's own mean cloud depth (already floored by the caller).
-//
-// UNJITTERED direction, deliberately (fork — 2026-09-05, ghosting follow-up). The cloud RT is marched
-// from pixel-centre rays (cloud_render.comp.slang builds its own NDC from pixelCoord + 0.5, no
-// jitter) and the history it feeds is indexed by pixel, so the quantity being reprojected is "the
-// cloud along the UNJITTERED direction of pixel p". The rest of composite reconstructs
-// primaryRayDirections WITH the DLSS jitter (cameraPixelCoordinateToDirection's two-argument overload
-// defaults to jitter = true), which is right for everything that has to line up with the path
-// tracer's jittered primary rays and wrong here: projecting a jittered direction through
-// prevWorldToProjection and differencing against the unjittered NDC of cameraPixelCoordinateToNDC
-// leaves the per-frame jitter (Halton 2/3, up to +-0.5 px at render resolution) baked into the motion
-// vector, and floor(x + 0.5) then rounds the history fetch to the wrong neighbour on roughly half of
-// all frames -- a permanent ~1 px wobble of the reprojected history under DLSS, i.e. a spatial blur of
-// the smoothed deck, not a trail. calcMotionVectorForRayMiss, which this duplicates, passes
-// jitter = false for exactly this reason; the Stage 4b port reused composite's jittered directions.
-vec2 cloudReprojectionMotionVectorPixels(uint2 pixelCoordinate, float depthKm, AtmosphereArgs args)
-{
-  const CameraDirections cloudRayDirections =
-    cameraPixelCoordinateToDirection(cb.camera, ivec2(pixelCoordinate), /*jitter=*/ false);
-
-  const vec3 viewDirYUp = normalize(worldToAtmosphereYUp(
-    cloudRayDirections.worldDirection, args.isZUp != 0u, args.flipUpAxis != 0));
-
-  const vec2 rotationMV = cloudRotationMotionVectorPixels(cloudRayDirections.worldDirection, pixelCoordinate);
-  const vec2 parallaxMV = cloudParallaxMotionVectorPixels(viewDirYUp, depthKm, args);
-  return rotationMV + parallaxMV;
-}
-
 // Current-frame cloud sample at `pixelCoordinate` in the composite's OPACITY convention (fork —
 // 2026-09-06, EMA rectification). The RT stores TRANSMITTANCE in .a; the premultiplied-over
 // composite and the history both want opacity, so the flip evalSkyRadiance always applied happens
@@ -1400,8 +1299,10 @@ void applyCloudComposite(
   vec4 smoothedCloud = currentCloud;
   if (all(cb.camera.resolution > uint2(0u, 0u)))
   {
+// NV-DXVK start: Use the active camera projection for Numos clouds.
     const vec2 motionVectorPixels = cloudReprojectionMotionVectorPixels(
-      pixelCoordinate, max(meanKm, 0.05f), args);
+      cb.camera, pixelCoordinate, meanKm, cb.cloudAnchorDeltaYUpKm, args);
+// NV-DXVK end
     const vec2 prevPixelF = vec2(pixelCoordinate) + motionVectorPixels;
 
     vec4 history = vec4(0.0f);

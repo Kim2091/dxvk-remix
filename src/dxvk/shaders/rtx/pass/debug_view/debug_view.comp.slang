@@ -208,6 +208,9 @@ SamplerState LinearSampler;
 // fall back to safe no-op stubs in this translation unit, which is
 // correct — the enum-875 case uses the explicit-parameter variant.
 #include "rtx/pass/atmosphere/atmosphere_common.slangh"
+// NV-DXVK start: Use the active camera projection for Numos clouds.
+#include "rtx/pass/atmosphere/cloud_camera.slangh"
+// NV-DXVK end
 
 float4 sampleTexture(Texture2D<float4> texture, ivec2 threadId)
 {
@@ -956,38 +959,10 @@ vec4 loadInput(inout RNG randomState, ivec2 threadId)
       }
       else
       {
-        // jitter = false, in lockstep with composite's cloudReprojectionMotionVectorPixels (fork —
-        // 2026-09-05, ghosting follow-up): the cloud RT and its history are pixel-centre quantities,
-        // so the reprojected direction must be the unjittered one -- see that function's comment.
-        const CameraDirections rayDirections =
-          cameraPixelCoordinateToDirection(cb.camera, ivec2(threadId), /*jitter=*/ false);
-        const bool isZUpFlag = (cb.isZUp != 0u);
-        const bool flipUpAxis = (cb.atmosphereArgs.flipUpAxis != 0);
-        const vec3 viewDirYUp = normalize(worldToAtmosphereYUp(
-            rayDirections.worldDirection, isZUpFlag, flipUpAxis));
-
-        // ---- rotation-only term (duplicate of geometry_resolver.slangh's calcMotionVectorForRayMiss) ----
-        vec4 prevNDC = mul(cb.camera.prevWorldToProjection, vec4(rayDirections.worldDirection, 0.0f));
-        prevNDC /= prevNDC.w;
-        const vec2 ndc = cameraPixelCoordinateToNDC(cb.camera, ivec2(threadId));
-        const vec2 rotationMV = (prevNDC.xy - ndc.xy) * vec2(0.5f, -0.5f) * vec2(cb.camera.resolution);
-
-        // ---- translation parallax term (duplicate of composite.comp.slang's
-        // cloudParallaxMotionVectorPixels -- see that function for the full derivation) ----
-        const vec3 deltaKm = cb.cloudAnchorDeltaYUpKm;
-        const vec3 deltaPerp = deltaKm - viewDirYUp * dot(deltaKm, viewDirYUp);
-        const vec3 rightAxis = cb.atmosphereArgs.cloudRenderRightYUp;
-        const vec3 upAxis    = cb.atmosphereArgs.cloudRenderUpYUp;
-        const float rightLenSq = max(dot(rightAxis, rightAxis), 1e-9f);
-        const float upLenSq    = max(dot(upAxis, upAxis), 1e-9f);
-        const float viewAxisCosine = max(abs(dot(viewDirYUp, normalize(cb.atmosphereArgs.cloudRenderForwardYUp))), 1e-3f);
-        const float zForwardKm = max(meanKm, 0.05f) * viewAxisCosine;
-        vec2 parallaxNdcDelta;
-        parallaxNdcDelta.x = dot(deltaPerp, rightAxis) / (zForwardKm * rightLenSq);
-        parallaxNdcDelta.y = dot(deltaPerp, upAxis)    / (zForwardKm * upLenSq);
-        const vec2 parallaxMV = parallaxNdcDelta * vec2(0.5f, -0.5f) * vec2(cb.camera.resolution);
-
-        const vec2 totalMV = rotationMV + parallaxMV;
+// NV-DXVK start: Use the active camera projection for Numos clouds.
+        const vec2 totalMV = cloudReprojectionMotionVectorPixels(
+          cb.camera, threadId, meanKm, cb.cloudAnchorDeltaYUpKm, cb.atmosphereArgs);
+// NV-DXVK end
         mvMagnitude = length(totalMV);
 
         // ---- bilinear, per-tap age-validated history fetch (duplicate of composite.comp.slang's

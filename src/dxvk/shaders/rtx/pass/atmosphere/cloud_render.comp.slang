@@ -57,10 +57,10 @@
 // world rather than rigidly with the camera — the parallax depth cue that
 // distinguishes a 3D volume from cardboard cutouts.
 //
-// Per-pixel view directions are reconstructed CPU-side into the
-// cloudRenderForwardYUp / RightYUp / UpYUp basis vectors in AtmosphereArgs;
-// the shader builds viewDir per pixel from those basis vectors. Sun
-// direction comes from args.sunDirection (already Y-up).
+// NV-DXVK start: Use the active camera projection for Numos clouds.
+// Cloud rays use the primary camera's inverse projection, without temporal jitter.
+// Sun direction comes from args.sunDirection (already Y-up).
+// NV-DXVK end
 
 // Note: define ATMOSPHERE_AVAILABLE so the sampleDSun / sampleDAmbient
 // helpers in atmosphere_common.slangh resolve to texture lookups (rather
@@ -75,9 +75,17 @@
 // global texture declarations so AtmosphereArgs is defined before slot 0's CB.
 #include "rtx/utility/shader_types.h"
 #include "rtx/pass/atmosphere/atmosphere_args.h"
+// NV-DXVK start: Use the active camera projection for Numos clouds.
+#include "rtx/concept/camera/camera.slangh"
+// NV-DXVK end
 
 layout(binding = 0)
 ConstantBuffer<AtmosphereArgs> atmosphereArgs;
+
+// NV-DXVK start: Use the active camera projection for Numos clouds.
+layout(binding = 17)
+ConstantBuffer<Camera> cloudCamera;
+// NV-DXVK end
 
 // Linear/REPEAT sampler for the Nubis3 volume taps (matches the
 // frac()-tile-wrap convention). Slot 1 held the legacy 256^3 noise volume —
@@ -193,17 +201,13 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
     return;
   }
 
-  // ===== Reconstruct per-pixel view ray in Y-up world space =====
-  // NDC in [-1, 1] with top-left pixel mapping to (-1, +1) Vulkan convention.
-  vec2 uv = (vec2(pixelCoord) + 0.5f) / vec2(outputDim);
-  vec2 ndc = uv * 2.0f - 1.0f;
-  ndc.y = -ndc.y;  // y-down pixels -> y-up NDC
-
-  // Basis vectors are pre-multiplied by tan(halfFovX/Y) and aspect ratio
-  // CPU-side, so the math is just a weighted sum.
-  vec3 viewDirYUp = normalize(args.cloudRenderForwardYUp
-                              + ndc.x * args.cloudRenderRightYUp
-                              + ndc.y * args.cloudRenderUpYUp);
+// NV-DXVK start: Use the active camera projection for Numos clouds.
+  // Normalized UV supports a cloud target smaller than the primary camera resolution.
+  const vec2 uv = (vec2(pixelCoord) + 0.5f) / vec2(outputDim);
+  const CameraDirections cloudRay = cameraScreenUVToDirection(cloudCamera, uv, /*jitter=*/ false);
+  const vec3 viewDirYUp = worldToAtmosphereYUp(
+    cloudRay.worldDirection, args.isZUp != 0u, args.flipUpAxis != 0);
+// NV-DXVK end
 
   // No below-horizon early-out (fork — 2026-09-05, world-space cloud migration Stage 1; ported
   // from archaeology commit 30d20a8f5).
@@ -285,7 +289,9 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
     if (linearViewZ < args.cloudMissLinearViewZ)
     {
       // Linear view Z is measured along the camera forward axis; the march needs slant range.
-      const float cosToForward = max(dot(viewDirYUp, normalize(args.cloudRenderForwardYUp)), 1e-3f);
+// NV-DXVK start: Use the active camera projection for Numos clouds.
+      const float cosToForward = max(abs(cloudRay.viewDirection.z), 1e-3f);
+// NV-DXVK end
       tSurfaceKm = (abs(linearViewZ) / cosToForward) / max(args.worldUnitsPerKm, 1e-6f);
     }
   }

@@ -232,6 +232,7 @@ namespace dxvk {
         // 4a) — see the matching binding declarations in cloud_render.comp.slang.
         TEXTURE2D(15)
         RW_TEXTURE2D(16)
+        CONSTANT_BUFFER(17)
       END_PARAMETER()
     };
     PREWARM_SHADER_PIPELINE(CloudRenderShader);
@@ -323,6 +324,8 @@ RtxAtmosphere::RtxAtmosphere(DxvkDevice* device)
   info.access = VK_ACCESS_UNIFORM_READ_BIT;
   info.size = sizeof(AtmosphereArgs);
   m_constantsBuffer = device->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXBuffer, "Atmosphere constants buffer");
+  info.size = sizeof(Camera);
+  m_cloudCameraBuffer = device->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXBuffer, "Cloud camera constants buffer");
 }
 
 RtxAtmosphere::~RtxAtmosphere() {
@@ -436,9 +439,6 @@ namespace {
     args.cloudWindDirUnitX           = 0.0f;
     args.cloudWindDirUnitZ           = 0.0f;
     args.cloudRenderFrameIdx         = 0u;
-    args.cloudRenderForwardYUp       = vec3(0.0f, 0.0f, 0.0f);
-    args.cloudRenderRightYUp         = vec3(0.0f, 0.0f, 0.0f);
-    args.cloudRenderUpYUp            = vec3(0.0f, 0.0f, 0.0f);
     args.cameraWorldPosYUpKm         = vec3(0.0f, 0.0f, 0.0f);
     // Altitude is zeroed in the BASE key (fork — 2026-09-05, world-space cloud migration Stage 2)
     // because the transmittance and multiscattering LUTs are parameterized by altitude internally
@@ -1231,21 +1231,9 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
     args.cloudEdgeAmbientFade          = RtxAtmosphere::cloudEdgeAmbientFade();
   }
 
-  // Cloud render camera basis (fork — 2026-05-12, C4). Pushed from
-  // RtxAtmosphere::updateFrame via setCloudRenderCameraBasis() before
-  // computeLuts runs, so the values here are this-frame-fresh. The Right /
-  // Up vectors are pre-scaled by tan(halfFovX/Y) and aspect ratio so the
-  // shader does just a weighted sum.
-  {
-    args.cloudRenderForwardYUp = m_cloudRenderForwardYUp;
-    args.cloudRenderRightYUp   = m_cloudRenderRightYUp;
-    args.cloudRenderUpYUp      = m_cloudRenderUpYUp;
-    // Column-shaping scalars riding the former pad_cr0..2 slots (fork —
-    // 2026-06-11, column-shaping rework); CB layout unchanged.
-    args.cloudColumnTopVariation   = RtxAtmosphere::cloudColumnTopVariation();
-    args.cloudColumnTopShape       = RtxAtmosphere::cloudColumnTopShape();
-    args.cloudColumnBaseVariation  = RtxAtmosphere::cloudColumnBaseVariation();
-  }
+  args.cloudColumnTopVariation = RtxAtmosphere::cloudColumnTopVariation();
+  args.cloudColumnTopShape = RtxAtmosphere::cloudColumnTopShape();
+  args.cloudColumnBaseVariation = RtxAtmosphere::cloudColumnBaseVariation();
 
   // Nubis Cubed sky-miss composite gate (fork — 2026-05-12, C5).
   // Drives the primary-ray-only branch in evalSkyRadiance that composites the
@@ -2122,7 +2110,7 @@ void RtxAtmosphere::setAerialPerspectiveCamera(const RtCamera& camera) {
   //
   // Kept in world space rather than the atmosphere's Y-up km frame: the composite pass reconstructs
   // the same basis from a screen UV, and the bake swaps to Y-up itself once it has a direction.
-  // freecam=true matches setCloudRenderCameraBasis, the other screen-aligned consumer.
+  // freecam=true matches the active camera used by the cloud screen pass.
   const float tanHalfFovY = std::tan(camera.getFov() * 0.5f);
   const float tanHalfFovX = tanHalfFovY * camera.getAspectRatio();
 
@@ -2973,16 +2961,6 @@ void RtxAtmosphere::ensureCloudRenderRT(Rc<DxvkContext> ctx,
   m_cloudRenderExtent = downscaleExtent;
 }
 
-void RtxAtmosphere::setCloudRenderCameraBasis(const Vector3& forwardYUp,
-                                                const Vector3& rightYUp,
-                                                const Vector3& upYUp,
-                                                uint32_t frameIdx) {
-  m_cloudRenderForwardYUp = forwardYUp;
-  m_cloudRenderRightYUp   = rightYUp;
-  m_cloudRenderUpYUp      = upYUp;
-  m_cloudRenderFrameIdx   = frameIdx;
-}
-
 void RtxAtmosphere::setCloudShadowCameraPosition(const Vector3& cameraWorldPosYUpKm) {
   m_cameraWorldPosYUpKm = cameraWorldPosYUpKm;
 }
@@ -3198,11 +3176,14 @@ void RtxAtmosphere::dispatchCloudRender(Rc<DxvkContext> ctx, const Resources::Ra
     return;  // ensureCloudRenderRT hasn't allocated yet (first frame with zero extent)
   }
 
-  // Refresh the AtmosphereArgs buffer so the camera basis + Nubis Cubed
-  // tuning knobs land in the GPU CB before the dispatch reads them.
   AtmosphereArgs args = getAtmosphereArgs();
   ctx->updateBuffer(m_constantsBuffer, 0, sizeof(AtmosphereArgs), &args);
   ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_constantsBuffer);
+
+  // Match the primary-ray and composite camera, including the active free camera.
+  const Camera camera = ctx->getCommonObjects()->getSceneManager().getCamera().getShaderConstants();
+  ctx->updateBuffer(m_cloudCameraBuffer, 0, sizeof(Camera), &camera);
+  ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_cloudCameraBuffer);
 
   // Linear/REPEAT sampler for the Nubis3 volume + voxel grid taps. REPEAT
   // matches the frac()-tile-wrap convention used everywhere else in the
@@ -3253,6 +3234,7 @@ void RtxAtmosphere::dispatchCloudRender(Rc<DxvkContext> ctx, const Resources::Ra
   // not share numbering with the common ray-tracing bindings.
   ctx->bindResourceView(15, rtOutput.m_primaryLinearViewZ.view, nullptr);
   ctx->bindResourceView(16, m_cloudDepthRT.view, nullptr);
+  ctx->bindResourceBuffer(17, DxvkBufferSlice(m_cloudCameraBuffer, 0, m_cloudCameraBuffer->info().size));
 
   ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_cloudDSun.image);
   ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_cloudDAmbient.image);
@@ -3494,11 +3476,8 @@ AtmosphereArgs RtxAtmosphere::updateFrame(RtxContext& ctx,
 
   const RtCamera& camera = ctx.getSceneManager().getCamera();
   const Vector3 forward = camera.getDirection(/*freecam=*/true);
-  const Vector3 right   = camera.getRight(/*freecam=*/true);
-  const Vector3 up      = camera.getUp(/*freecam=*/true);
 
-  // CPU twin of worldToAtmosphereYUp(); must stay in lockstep with it or the cloud render basis
-  // and the sky it composites against disagree about which way is up.
+  // Positions and shader ray directions must use the same world-to-atmosphere conversion.
   const bool isZUp = RtxOptions::zUp();
   const bool flipUpAxisForYUp = RtxAtmosphere::flipUpAxis();
   auto toYUp = [isZUp, flipUpAxisForYUp](const Vector3& v) -> Vector3 {
@@ -3668,18 +3647,7 @@ AtmosphereArgs RtxAtmosphere::updateFrame(RtxContext& ctx,
     }
   }
 
-  const Vector3 forwardYUp = toYUp(forward);
-  const Vector3 rightYUp   = toYUp(right);
-  const Vector3 upYUp      = toYUp(up);
-
-  const float halfFovY = 0.5f * camera.getFov();
-  const float tanHalfFovY = std::tan(halfFovY);
-  const float tanHalfFovX = tanHalfFovY * camera.getAspectRatio();
-  setCloudRenderCameraBasis(
-    forwardYUp,
-    rightYUp * tanHalfFovX,
-    upYUp * tanHalfFovY,
-    static_cast<uint32_t>(ctx.getDevice()->getCurrentFrameId()));
+  m_cloudRenderFrameIdx = static_cast<uint32_t>(ctx.getDevice()->getCurrentFrameId());
 
   // Feed the resolved anchor into the density frame (fork — 2026-09-05, world-space cloud
   // migration Stage 2). This used to independently recompute toYUp(camera.getPosition(false)) here
