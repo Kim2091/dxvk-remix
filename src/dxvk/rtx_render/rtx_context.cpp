@@ -1795,6 +1795,21 @@ namespace dxvk {
     }
 
     // Secondary Combined light denoiser
+    //
+    // The secondary signal only exists on pixels whose primary surface was replaced by PSR. When
+    // nothing in the pipeline can produce such a surface, the secondary radiance buffers hold only
+    // the integrator's "miss" writes, and denoising those is a no-op on the composited output - so
+    // the entire NRD instance (a multi-dispatch prepass/accumulate/history-fix/blur/stabilize chain
+    // at full internal resolution) can be skipped.
+    //
+    // The predicate is deliberately over-inclusive. Raytraced render targets force performPSRR /
+    // performPSTR independently of the two PSR options (geometry_resolver.slangh:2143-2181), so they
+    // are counted here without re-testing the camera-validity half of that condition. Erring this
+    // way costs a redundant denoise; erring the other way would leave real reflections undenoised.
+    const bool secondarySignalPossible =
+      RtxOptions::enablePSRR() || RtxOptions::enablePSTR() || RtxOptions::RaytracedRenderTarget::enable();
+
+    if (secondarySignalPossible)
     {
       ScopedGpuProfileZone(this, "Secondary Combined Denoising");
 
@@ -1811,6 +1826,9 @@ namespace dxvk {
       denoiseOutput.specular_hitT = &rtOutput.m_secondaryCombinedSpecularRadiance.resource(Resources::AccessType::Write);
 
       runDenoising(denoiser2, referenceDenoiserSecondLobe2, denoiseInput, denoiseOutput);
+    } else {
+      denoiser2.releaseResources();
+      referenceDenoiserSecondLobe2.releaseResources();
     }
   }
 
