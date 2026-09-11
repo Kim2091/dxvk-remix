@@ -1322,9 +1322,12 @@ void RtxAtmosphere::showImguiSettings(WeatherBlender* blender) {
         }
         ImGui::EndDisabled();
         RemixGui::SetTooltipToLastWidgetOnHover(
-            "Moves Ground Level once so the primary cloud layer's midpoint is at the player, "
-            "including while freecam is active. This changes the atmosphere's altitude datum; "
+            "Moves Ground Level once so the primary cloud layer's midpoint is at the last rendered "
+            "player position, including while freecam is active. This changes the atmosphere's altitude datum; "
             "the layer stays fixed as you move. Clear gaps can remain between cloud bodies.");
+        if (!canPlaceLayer) {
+          ImGui::TextDisabled("Requires a rendered player position and a valid cloud layer.");
+        }
 
         const AtmosphereArgs placement = getAtmosphereArgs();
         ImGui::Text("Camera Altitude (m)         %10.1f", placement.cameraAltitudeKm * 1000.0f);
