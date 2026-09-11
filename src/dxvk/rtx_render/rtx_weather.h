@@ -48,10 +48,10 @@ namespace dxvk {
   X(float, cloudAerialHazePerKm,     0.05f, WK_Scalar, "Clouds", "Distance", "Distance Haze",     0.0f, 1.0f, 0.005f, "%.3f") \
   X(float, lightningStrikesPerMinute, 0.0f, WK_Scalar, "Clouds", "Lightning", "Strikes Per Minute", 0.0f, 60.0f, 0.1f, "%.1f") \
   /* Atmosphere (5) */ \
-  X(float,   airDensity,                         1.0f,                            WK_Scalar,     "Atmosphere",     "Atmosphere",       "Air",                        0.0f,    5.0f,    0.05f,   "%.2f") \
-  X(float,   aerosolDensity,                     1.0f,                            WK_Scalar,     "Atmosphere",     "Atmosphere",       "Dust",                       0.0f,    5.0f,    0.05f,   "%.2f") \
+  X(float,   airDensity,                         1.0f,                            WK_Scalar,     "Haze",           "Density & Color",       "Air",                        0.0f,    5.0f,    0.05f,   "%.2f") \
+  X(float,   aerosolDensity,                     1.0f,                            WK_Scalar,     "Haze",           "Density & Color",       "Dust",                       0.0f,    5.0f,    0.05f,   "%.2f") \
   X(Vector3, sunIlluminance,                     Vector3(20.0f, 20.0f, 20.0f),    WK_Color,      "Atmosphere",     "Atmosphere",       "Sun Illuminance",            0.0f,    100.0f,  0.5f,    "%.1f") \
-  X(Vector3, rayleighScattering,                 Vector3(5.8e-3f, 13.5e-3f, 33.1e-3f), WK_Color, "Atmosphere",     "Atmosphere",       "Air Color (Base)",           0.0f,    0.05f,   0.0005f, "%.4f") \
+  X(Vector3, rayleighScattering,                 Vector3(5.8e-3f, 13.5e-3f, 33.1e-3f), WK_Color, "Haze",           "Density & Color",       "Air Color (Base)",           0.0f,    0.05f,   0.0005f, "%.4f") \
   X(float,   skyIndirectRadianceScale,           1.0f,                            WK_Scalar,     "Atmosphere",     "Atmosphere",       "Sky Indirect Scale",         0.0f,    20.0f,   0.01f,   "%.2f") \
   /* Sky/moon mood (4) */ \
   X(float,   nightSkyBrightness,                 0.008f,                          WK_Scalar,     "Sky & Moon",     "Sky & Moon",       "Night Sky Brightness",       0.0f,    1.0f,    0.001f,  "%.3f") \
@@ -971,6 +971,10 @@ namespace dxvk {
 
     RTX_OPTION("rtx.weather", float, blendDurationSeconds, 30.0f,
                "Default ImGui weather preset transition duration in seconds [0,600].");
+
+    RTX_OPTION("rtx.weather", bool, controlVolumetricFog, false,
+               "Allows weather presets to control global volumetric fog and enables its preset editor controls. "
+               "Disabled by default; use Numos distance haze and the preset Air/Dust settings for atmospheric weather.");
 
     void update(float deltaTimeSeconds);
     void showImguiSettings();

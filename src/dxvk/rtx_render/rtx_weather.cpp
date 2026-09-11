@@ -658,11 +658,19 @@ namespace dxvk { namespace {
         continue;
       }
 
-      ImGui::SetNextItemOpen(true, filtering ? ImGuiCond_Always : ImGuiCond_Once);
+      const bool volumetricGroup = std::strcmp(group, "Volumetric Fog") == 0;
+      ImGui::SetNextItemOpen(filtering || !volumetricGroup, filtering ? ImGuiCond_Always : ImGuiCond_Once);
       if (!ImGui::TreeNode(group)) {
         continue;
       }
 
+      if (std::strcmp(group, "Haze") == 0) {
+        RemixGui::Checkbox("Enable Distance Haze (All Presets)", &RtxAtmosphere::aerialPerspectiveObject());
+        RemixGui::SetTooltipToLastWidgetOnHover(
+          "Enables Numos aerial perspective for all weather. Air and Dust below are saved per preset. "
+          "Adjust haze range and compression in Sky > Haze.");
+      }
+      ImGui::BeginDisabled(volumetricGroup && !WeatherBlender::controlVolumetricFog());
       for (int si = 0; si < kFieldCount; ++si) {
         if (std::strcmp(kFieldDescs[si].group, group) != 0) {
           continue;
@@ -705,6 +713,7 @@ namespace dxvk { namespace {
         }
         ImGui::TreePop();
       }
+      ImGui::EndDisabled();
       ImGui::TreePop();
     }
   }
@@ -877,6 +886,16 @@ namespace dxvk { namespace {
     FALLBACK_IF_INVARIANT(nightSkyColor);
     FALLBACK_IF_INVARIANT(skyIndirectRadianceScale);
 #undef FALLBACK_IF_INVARIANT
+
+    if (!WeatherBlender::controlVolumetricFog()) {
+#define FALLBACK_VOLUMETRIC(type, name, defaultValue, kind, group, section, label, mn, mx, step, fmt) \
+      if (std::strcmp(group, "Volumetric Fog") == 0) { \
+        s.name = live.name; \
+        s.ownership.name = false; \
+      }
+      WEATHER_PRESET_FIELD_LIST(FALLBACK_VOLUMETRIC)
+#undef FALLBACK_VOLUMETRIC
+    }
 
     // Precipitation was historically gated as one block. All-equal zero means
     // weather does not own any precipitation look field; equal nonzero still does.
@@ -1135,6 +1154,12 @@ namespace dxvk {
 
     ImGui::SetNextItemWidth(-1.0f);
     ImGui::InputTextWithHint("##weatherFilter", "filter settings by name...", m_uiFilter, sizeof(m_uiFilter));
+
+    ImGui::TextWrapped("Use Haze to shape atmospheric weather. Volumetric fog is optional.");
+    RemixGui::Checkbox("Weather Controls Volumetric Fog", &controlVolumetricFogObject());
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Allows all weather presets to override global volumetric fog. Off by default. "
+      "When off, the global volumetric settings remain in control and preset fog controls are disabled.");
 
     if (ImGui::TreeNode("Authoring tools")) {
       bool pinned = m_pinnedForTuning;
