@@ -26,7 +26,7 @@
 // this volume is and why the march starts past the global volumetrics froxel grid.
 //
 // Camera-fitted, so unlike the transmittance / multiscattering / sky-view bakes this rebuilds every
-// frame. It is cheap enough for that: 32^3 froxels at 12 steps each.
+// frame, with six integration steps and six sky probes per depth slice in each screen column.
 
 #include "rtx/pass/atmosphere/atmosphere_common.slangh"
 #include "rtx/pass/atmosphere/aerial_perspective_lut_binding_indices.h"
@@ -55,7 +55,7 @@ RaytracingAccelerationStructure sceneTlas;
 // Without it the bake treats the air in front of a surface as fully sunlit even when that surface
 // is precisely what is hiding the sun, and the forward-scatter lobe peaks in exactly that
 // direction: a bright orange halo bleeding through walls and terrain wherever the sun sits behind
-// them. See the forward-scatter cap block in evalAtmosphereInScatterSegment.
+// them. See the forward-scatter cap block in prepareAtmosphereInScatterRay.
 //
 // One ray per march step, so the visibility the volume ends up storing is the fraction of the
 // column that actually sees the sun rather than a single yes/no for the whole segment. That is
@@ -77,9 +77,8 @@ RaytracingAccelerationStructure sceneTlas;
 // here: not stopping a raindrop is defensible for an alpha-tested card, not stopping sunlight is
 // not.
 //
-// Every candidate is therefore committed as a full occluder. Resolving real alpha would need the
-// surface, material and bindless texture bindings this pass deliberately does not carry, and for a
-// 32^3 volume whose output is a broad haze term, alpha-as-opaque is the right trade.
+// FORCE_OPAQUE preserves the full-triangle occlusion policy without returning triangle candidates
+// to the shader, including instances marked FORCE_NO_OPAQUE for clip planes.
 struct SceneSunOccluder : IAtmosphereSunOccluder {
   vec3 worldOrigin;         // Camera position, world units
   vec3 worldDirection;      // Normalized marched ray in world space
@@ -98,16 +97,14 @@ struct SceneSunOccluder : IAtmosphereSunOccluder {
     ray.TMin = 0.0f;
     ray.TMax = maxTraceDistance;
 
-    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> query;
-    query.TraceRayInline(sceneTlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH,
+    static const uint kRayFlags = RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH
+      | RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES;
+    RayQuery<kRayFlags> query;
+    query.TraceRayInline(sceneTlas, kRayFlags,
                          OBJECT_MASK_OPAQUE, ray);
 
-    // An opaque candidate ends the search on its own; a non-opaque one (alpha-tested, clip-planed)
-    // has to be committed by hand or traversal walks past it. Committing also ends the search under
-    // ACCEPT_FIRST_HIT_AND_END_SEARCH, so this loop runs at most once past the first candidate.
-    while (query.Proceed()) {
-      query.CommitNonOpaqueTriangleHit();
-    }
+    // Solid triangles are committed by traversal, and procedural primitives cannot produce candidates.
+    query.Proceed();
 
     return query.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
   }
@@ -241,6 +238,7 @@ void main(uint3 threadId : SV_DispatchThreadID) {
   const float kmPerWorldUnit = 1.0f / max(args.aerialPerspectiveWorldUnitsPerKm, 1e-6f);
   // Ground level, matching the sky-view LUT bake's camera position.
   const vec3 rayOrigin = vec3(0.0f, 0.0f, 0.0f);
+  const AtmosphereInScatterRay atmosphereRay = prepareAtmosphereInScatterRay(rayOrigin, rayDir, sunDir, args);
 
   // The march runs in the atmosphere's Y-up km frame, but the scene TLAS is in world space, so the
   // occluder carries the same ray expressed in world units alongside the world-space sun direction.
@@ -274,18 +272,11 @@ void main(uint3 threadId : SV_DispatchThreadID) {
       // Compose this segment onto the running totals. Both terms are along the same ray, so the
       // segment's in-scatter arrives at the camera through the transmittance already accumulated
       // in front of it, and the two transmittances simply multiply.
-      // Sky visibility for the multiple-scattering term, sampled once at the segment's midpoint
-      // rather than per step. Each segment spans a fixed fraction of its own distance, and how much
-      // sky a point can see changes far more slowly than that - it is a property of the room you are
-      // standing in, not of where you stand within it.
-      const float skyVisibility =
-        sunOccluder.skyVisibility((segmentStartKm + segmentEndKm) * 0.5f);
-
       vec3 segmentTransmittance = vec3(1.0f);
       const vec3 segmentInScatter = evalAtmosphereInScatterSegment(
         rayOrigin, rayDir, sunDir, args,
         transmittanceLutInput, lutSampler, multiscatteringLutInput,
-        kStepsPerSlice, segmentStartKm, segmentEndKm, skyVisibility, sunOccluder,
+        kStepsPerSlice, segmentStartKm, segmentEndKm, atmosphereRay, sunOccluder,
         segmentTransmittance);
 
       inScatter += transmittance * segmentInScatter;

@@ -2295,39 +2295,35 @@ interface IAtmosphereSunOccluder {
   // Fraction of the sun reaching the point `distanceKm` along the marched ray (same origin,
   // direction and units the march itself uses). 1 when no scene geometry occludes it.
   float sunVisibility(float distanceKm);
+  float skyVisibility(float distanceKm);
 };
 
-// In-scattered radiance along a bounded segment of a ray, with the segment's transmittance returned
-// separately. This is the sky march reduced to what the aerial perspective volume needs: no moons,
-// no artistic sunset saturation, no ground bounce (the volume integrates toward real scene
-// geometry, which supplies its own radiance), and an explicit [startDistance, maxDistance] window.
-//
-// rayOrigin / rayDir are in the atmosphere's Y-up km space; distances are in km.
-vec3 evalAtmosphereInScatterSegment<TSunOccluder : IAtmosphereSunOccluder>(
-  vec3 rayOrigin,
-  vec3 rayDir,
-  vec3 sunDir,
-  AtmosphereArgs args,
-  Texture2D<float4> transmittanceLut,
-  SamplerState transmittanceLutSampler,
-  Texture2D<float4> multiscatteringLut,
-  int numSamples,
-  float startDistance,
-  float maxDistance,
-  float skyVisibility,
-  TSunOccluder sunOccluder,
-  out vec3 outTransmittance
-) {
-  outTransmittance = vec3(1.0f);
+struct AtmosphereInScatterRay {
+  vec3 planetCenter;
+  float nearDistance;
+  float farDistance;
+  float phaseR;
+  float phaseM;
+};
 
+// Shared by all depth slices of a column, including when scene queries prevent loop hoisting.
+AtmosphereInScatterRay prepareAtmosphereInScatterRay(
+  vec3 rayOrigin, vec3 rayDir, vec3 sunDir, AtmosphereArgs args
+) {
+  AtmosphereInScatterRay ray;
   const vec3 planetCenter = getPlanetCenter(args);
+  ray.planetCenter = planetCenter;
+  ray.nearDistance = 0.0f;
+  ray.farDistance = 0.0f;
+  ray.phaseR = 0.0f;
+  ray.phaseM = 0.0f;
 
   float t0, t1;
   if (!intersectSphere(rayOrigin, rayDir, planetCenter, args.atmosphereRadius, t0, t1)) {
-    return vec3(0.0f);
+    return ray;
   }
 
-  t0 = max(max(0.0f, t0), startDistance);
+  ray.nearDistance = max(0.0f, t0);
 
   // Stop at the planet surface, then at the caller's far bound.
   float tPlanet0, tPlanet1;
@@ -2335,20 +2331,10 @@ vec3 evalAtmosphereInScatterSegment<TSunOccluder : IAtmosphereSunOccluder>(
   if (hitsPlanet && tPlanet0 > 0.0f) {
     t1 = min(t1, tPlanet0);
   }
-  if (maxDistance > 0.0f) {
-    t1 = min(t1, maxDistance);
-  }
-
-  if (t1 <= t0) {
-    return vec3(0.0f);
-  }
-
-  const int actualSamples = clamp(numSamples, 1, 64);
-  const float span = t1 - t0;
-  const float invSamples = 1.0f / float(actualSamples);
+  ray.farDistance = t1;
 
   const float cosTheta = dot(rayDir, sunDir);
-  const float phaseR = rayleighPhase(cosTheta);
+  ray.phaseR = rayleighPhase(cosTheta);
 
   // Forward-scatter cap, this volume only.
   //
@@ -2366,7 +2352,46 @@ vec3 evalAtmosphereInScatterSegment<TSunOccluder : IAtmosphereSunOccluder>(
   // march is back to knowing nothing about the scene. Note the sky path deliberately keeps the
   // uncapped anisotropy: its aureole is a primary-miss term that geometry occludes correctly, and
   // with no sun disk drawn that lobe is what reads as the sun.
-  const float phaseM = hgPhase(cosTheta, min(args.mieAnisotropy, args.aerialPerspectiveMieAnisotropyMax));
+  ray.phaseM = hgPhase(cosTheta, min(args.mieAnisotropy, args.aerialPerspectiveMieAnisotropyMax));
+  return ray;
+}
+
+// Returns segment in-scatter and RGB transmittance without ground bounce or moon lighting.
+// Ray origin/direction and segment bounds use the atmosphere's Y-up kilometre frame.
+vec3 evalAtmosphereInScatterSegment<TSunOccluder : IAtmosphereSunOccluder>(
+  vec3 rayOrigin,
+  vec3 rayDir,
+  vec3 sunDir,
+  AtmosphereArgs args,
+  Texture2D<float4> transmittanceLut,
+  SamplerState transmittanceLutSampler,
+  Texture2D<float4> multiscatteringLut,
+  int numSamples,
+  float startDistance,
+  float maxDistance,
+  AtmosphereInScatterRay ray,
+  TSunOccluder sunOccluder,
+  out vec3 outTransmittance
+) {
+  outTransmittance = vec3(1.0f);
+  const float t0 = max(ray.nearDistance, startDistance);
+  const float t1 = maxDistance > 0.0f ? min(ray.farDistance, maxDistance) : ray.farDistance;
+  if (t1 <= t0) {
+    return vec3(0.0f);
+  }
+
+  const vec3 planetCenter = ray.planetCenter;
+  const float phaseR = ray.phaseR;
+  const float phaseM = ray.phaseM;
+  const int actualSamples = clamp(numSamples, 1, 64);
+  const float span = t1 - t0;
+  const float invSamples = 1.0f / float(actualSamples);
+
+  // Preserve the original, unclipped midpoint; empty segments and disabled multiscattering need no probes.
+  float skyVisibility = 1.0f;
+  if (args.multiScatterStrength != 0.0f) {
+    skyVisibility = sunOccluder.skyVisibility((startDistance + maxDistance) * 0.5f);
+  }
 
   vec3 L = vec3(0.0f);
   vec3 transmittance = vec3(1.0f);
@@ -2383,11 +2408,6 @@ vec3 evalAtmosphereInScatterSegment<TSunOccluder : IAtmosphereSunOccluder>(
     }
 
     const vec3 samplePos = rayOrigin + rayDir * t;
-    const float altitude = clamp(
-      length(samplePos - planetCenter) - args.planetRadius, 0.0f, args.atmosphereThickness);
-
-    const AtmosphereMedium medium = sampleAtmosphereMedium(altitude, args);
-
     // Single scattering, phase weighted (paper Equation 11), gated on the scene actually seeing the
     // sun from this sample. Deliberately applied to the single-scatter term only: multiScatter
     // below stands in for every higher order, which reaches a shadowed sample from all directions
@@ -2395,7 +2415,15 @@ vec3 evalAtmosphereInScatterSegment<TSunOccluder : IAtmosphereSunOccluder>(
     // shaded interior reading as softly hazy rather than snapping to black.
     const vec3 sunShadowing = evalSunShadowing(
       samplePos, sunDir, transmittanceLut, transmittanceLutSampler, args);
-    const float sceneSunVisibility = sunOccluder.sunVisibility(t);
+    float sceneSunVisibility = 1.0f;
+    // A zero solar term stays zero under either production or inverted scene visibility.
+    if (any(sunShadowing != vec3(0.0f))) {
+      sceneSunVisibility = sunOccluder.sunVisibility(t);
+    }
+    // Keep medium coefficients out of the live state carried through ray traversal.
+    const float altitude = clamp(
+      length(samplePos - planetCenter) - args.planetRadius, 0.0f, args.atmosphereThickness);
+    const AtmosphereMedium medium = sampleAtmosphereMedium(altitude, args);
     const vec3 singleScatter = sunShadowing * sceneSunVisibility
       * (medium.rayleighScattering * phaseR + medium.mieScattering * phaseM);
 
