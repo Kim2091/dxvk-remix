@@ -161,6 +161,51 @@ remixapi_ErrorCode REMIXAPI_CALL remixapi_DestroyMaterial(remixapi_MaterialHandl
   return REMIXAPI_ERROR_CODE_SUCCESS;
 }
 
+// The public API represents uploaded textures as a byte range rather than a
+// path.  Keep the large payload in its own bridge data-queue entry: unlike a
+// DDS filename this reaches the 64-bit runtime before CreateMaterial tries
+// to resolve its 0xHASH pseudo-path.
+remixapi_ErrorCode REMIXAPI_CALL remixapi_CreateTexture(
+  const remixapi_TextureInfo* info,
+  remixapi_TextureHandle*     out_handle) {
+  ASSERT_REMIXAPI_PFN_TYPE(remixapi_CreateTexture);
+  if (!info || !out_handle || info->sType != REMIXAPI_STRUCT_TYPE_TEXTURE_INFO ||
+      !info->data || info->dataSize == 0 || info->dataSize > 0xFFFFFFFFull) {
+    return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+  }
+
+  TextureHandle newHandle;
+  {
+    ClientMessage c(Commands::RemixApi_CreateTexture);
+    send(c, info->sType);
+    send(c, info->hash);
+    send(c, info->width);
+    send(c, info->height);
+    send(c, info->depth);
+    send(c, info->mipLevels);
+    send(c, info->format);
+    send(c, info->dataSize);
+    c.send_data(static_cast<uint32_t>(info->dataSize), info->data);
+    sendHandle(c, newHandle);
+  }
+
+  *out_handle = newHandle;
+  return REMIXAPI_ERROR_CODE_SUCCESS;
+}
+
+remixapi_ErrorCode REMIXAPI_CALL remixapi_DestroyTexture(remixapi_TextureHandle handle) {
+  ASSERT_REMIXAPI_PFN_TYPE(remixapi_DestroyTexture);
+  TextureHandle textureHandle(handle);
+  if (!textureHandle.isValid()) {
+    return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+  }
+  {
+    ClientMessage c(Commands::RemixApi_DestroyTexture);
+    sendHandle(c, textureHandle);
+  }
+  return REMIXAPI_ERROR_CODE_SUCCESS;
+}
+
 remixapi_ErrorCode REMIXAPI_CALL remixapi_CreateMesh(
   const remixapi_MeshInfo* info,
   remixapi_MeshHandle*     out_handle) {
@@ -440,6 +485,8 @@ extern "C" {
       // interf.Present = remixapi_Present;
       interf.CreateMaterial = remixapi_CreateMaterial;
       interf.DestroyMaterial = remixapi_DestroyMaterial;
+      interf.CreateTexture = remixapi_CreateTexture;
+      interf.DestroyTexture = remixapi_DestroyTexture;
       interf.CreateMesh = remixapi_CreateMesh;
       interf.DestroyMesh = remixapi_DestroyMesh;
       // interf.SetupCamera = remixapi_SetupCamera;

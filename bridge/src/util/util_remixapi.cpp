@@ -36,6 +36,7 @@ namespace util {
 MaterialHandle::HandleMapT MaterialHandle::s_handleMap;
 MeshHandle::HandleMapT MeshHandle::s_handleMap;
 LightHandle::HandleMapT LightHandle::s_handleMap;
+TextureHandle::HandleMapT TextureHandle::s_handleMap;
 #endif
 }
 }

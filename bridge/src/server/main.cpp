@@ -2907,6 +2907,54 @@ void ProcessDeviceCommandQueue() {
         break;
       }
 
+      case RemixApi_CreateTexture:
+      {
+        PULL(remixapi_StructType, sType);
+        PULL(uint64_t, hash);
+        PULL(uint32_t, width);
+        PULL(uint32_t, height);
+        PULL(uint32_t, depth);
+        PULL(uint32_t, mipLevels);
+        PULL(remixapi_Format, format);
+        PULL(uint64_t, dataSize);
+        void* data = nullptr;
+        PULL_DATA(dataSize, data);
+        const auto bridgeHandle = DeviceBridge::get_data();
+
+        remixapi_TextureInfo info = {};
+        info.sType     = sType;
+        info.hash      = hash;
+        info.width     = width;
+        info.height    = height;
+        info.depth     = depth;
+        info.mipLevels = mipLevels;
+        info.format    = format;
+        info.data      = data;
+        info.dataSize  = dataSize;
+
+        remixapi_TextureHandle remixApiHandle = nullptr;
+        if (info.sType == REMIXAPI_STRUCT_TYPE_TEXTURE_INFO &&
+            remixapi::g_remix.CreateTexture &&
+            remixapi::g_remix.CreateTexture(&info, &remixApiHandle) == REMIXAPI_ERROR_CODE_SUCCESS) {
+          TextureHandle(bridgeHandle, remixApiHandle);
+        } else {
+          Logger::err("[RemixApi_CreateTexture] Remix API call failed!");
+        }
+        break;
+      }
+
+      case RemixApi_DestroyTexture:
+      {
+        TextureHandle handle(DeviceBridge::get_data());
+        if (handle.isValid() && remixapi::g_remix.DestroyTexture) {
+          remixapi::g_remix.DestroyTexture(handle);
+          handle.invalidate();
+        } else {
+          Logger::err("[RemixApi_DestroyTexture] Invalid texture handle!");
+        }
+        break;
+      }
+
       case RemixApi_CreateMesh:
       {
         const auto meshInfoSType = remixapi::pullSType();
