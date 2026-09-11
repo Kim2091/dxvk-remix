@@ -1495,8 +1495,10 @@ void applyCloudComposite(
   }
 }
 
+// NV-DXVK start: Apply the full fog extent over the sky.
 void applyFog(
   float viewDistance,
+  bool primaryMiss,
   float radianceScale,
   inout vec3 radianceOutput,
   inout vec4 particleLayerOutput)
@@ -1508,7 +1510,9 @@ void applyFog(
 
   // Todo: Using view distance is a bit of a hack here, the primary emissive contribution will not be fully weighted correctly
   // as emissive hits will be over-attenuated.
-  vec4 fogColor = calculateFog(viewDistance);
+  // Ray-miss depth is a denoiser sentinel, not a physical fog distance.
+  const float fogDistance = primaryMiss ? cb.maxFogDistance : viewDistance;
+  vec4 fogColor = calculateFog(fogDistance);
 
   if (cb.sparseRenderingArgs.mode != SparseRenderingMode::Off)
   {
@@ -1521,6 +1525,7 @@ void applyFog(
   // TODO: Disable fog for particle layer to avoid flickering, need to find a proper way to apply fog to particles
   // particleLayerOutput.rgb = lerp(particleLayerOutput.rgb, fogColor.rgb, fogColor.a);
 }
+// NV-DXVK end
 
 void demodulateAttenuation(
   uint2 pixelCoordinate,
@@ -1698,7 +1703,9 @@ vec4 compositeResult(
   applySkyContribution(pixelCoordinate, primaryRayDirections, primaryMiss, radianceScale, volumeAttenuation, radianceOutput);
 
   // Apply fog 
-  applyFog(viewDistance, radianceScale, radianceOutput, particleLayerOutput);
+  // NV-DXVK start: Classify sky independently of the reconstructed miss depth.
+  applyFog(viewDistance, primaryMiss, radianceScale, radianceOutput, particleLayerOutput);
+  // NV-DXVK end
 
   // DLSS-RR needs to do alpha blending using the backgroundAlpha, so the input is untouched here.
   // Output final composite result for NRD denoiser.
