@@ -278,13 +278,8 @@ namespace dxvk {
       {FusedWorldViewMode::World, "In World Transform"},
   } });
 
-  static auto skyAutoDetectCombo = RemixGui::ComboWithKey<SkyAutoDetectMode>(
-    "Sky Auto-Detect",
-    RemixGui::ComboWithKey<SkyAutoDetectMode>::ComboEntries{ {
-      {SkyAutoDetectMode::None, "Off"},
-      {SkyAutoDetectMode::CameraPosition, "By Camera Position"},
-      {SkyAutoDetectMode::CameraPositionAndDepthFlags, "By Camera Position and Depth Flags"}
-  } });
+  // NV-DXVK start: Sky detection controls live with the sky setup page.
+  // NV-DXVK end
 
   static auto upscalerNoDLSSCombo = RemixGui::ComboWithKey<UpscalerType>(
     "Upscaler Type",
@@ -2894,45 +2889,14 @@ namespace dxvk {
         ImGui::Unindent();
       }
 
-      if (RemixGui::CollapsingHeader("Sky Tuning", collapsingHeaderClosedFlags)) {
+      // NV-DXVK start: Sky appearance and game setup UI
+      if (RemixGui::CollapsingHeader("Sky###Sky Tuning", collapsingHeaderClosedFlags)) {
         ImGui::Indent();
-        // NV-DXVK start: Numos native atmosphere UI
         ctx->getCommonObjects()->metaAtmosphere().showImguiSettings(
           ctx->getCommonObjects()->getSceneManager().getWeatherBlender());
-        // NV-DXVK end
-        RemixGui::InputInt("First N Untextured Draw Calls", &RtxOptions::skyDrawcallIdThresholdObject(), 1, 1, 0);
-        RemixGui::SliderFloat("Sky Min Z Threshold", &RtxOptions::skyMinZThresholdObject(), 0.0f, 1.0f);
-        skyAutoDetectCombo.getKey(&RtxOptions::skyAutoDetectObject());
-
-        if (RemixGui::CollapsingHeader("Advanced", collapsingHeaderClosedFlags)) {
-          ImGui::Indent();
-
-          RemixGui::Checkbox("Reproject Sky to Main Camera", &RtxOptions::skyReprojectToMainCameraSpaceObject());
-          {
-            ImGui::BeginDisabled(!RtxOptions::skyReprojectToMainCameraSpace());
-            RemixGui::DragFloat("Reprojected Sky Scale", &RtxOptions::skyReprojectScaleObject(), 1.0f, 0.1f, 1000.0f);
-            RemixGui::Checkbox("Force Auto-Detected Sky to Reproject", &RtxOptions::skyForceAutoDetectedToReprojectObject());
-            ImGui::EndDisabled();
-          }
-          RemixGui::DragFloat("Sky Auto-Detect Unique Camera Search Distance", &RtxOptions::skyAutoDetectUniqueCameraDistanceObject(), 1.0f, 0.1f, 1000.0f);
-
-          RemixGui::Checkbox("Force HDR sky", &RtxOptions::skyForceHDRObject());
-
-          static const char* exts[] = { "256 (1.5MB vidmem)", "512 (6MB vidmem)", "1024 (24MB vidmem)",
-            "2048 (96MB vidmem)", "4096 (384MB vidmem)", "8192 (1.5GB vidmem)" };
-
-          static int extIdx;
-          extIdx = std::clamp(bit::tzcnt(RtxOptions::skyProbeSide()), 8u, 13u) - 8;
-
-          if (RemixGui::Combo("Sky Probe Extent", &extIdx, exts, IM_ARRAYSIZE(exts))) {
-            RemixGui::CheckRtxOptionPopups(&RtxOptions::skyProbeSideObject());
-          }
-          RtxOptions::skyProbeSide.setDeferred(1 << (extIdx + 8));
-
-          ImGui::Unindent();
-        }
         ImGui::Unindent();
       }
+      // NV-DXVK end
 
       if (RtxOptions::Eye::showOptions() && RemixGui::CollapsingHeader("Eyes", collapsingHeaderClosedFlags)) {
         ImGui::Indent();

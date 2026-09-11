@@ -6,6 +6,7 @@
 #include <cstdio>
 
 #include "imgui/imgui.h"
+#include "../../util/util_bit.h"
 
 #include "rtx_atmosphere.h"
 #include "rtx_imgui.h"
@@ -87,10 +88,51 @@ namespace {
   RemixGui::ComboWithKey<SkyMode> skyModeCombo {
     "Sky Mode",
     RemixGui::ComboWithKey<SkyMode>::ComboEntries { {
-        {SkyMode::SkyboxRasterization, "Skybox Rasterization"},
-        {SkyMode::Numos, "Numos"}
+        {SkyMode::SkyboxRasterization, "Original game sky"},
+        {SkyMode::Numos, "Numos atmosphere"}
     } }
   };
+
+  auto skyAutoDetectCombo = RemixGui::ComboWithKey<SkyAutoDetectMode>(
+    "Sky Auto-Detect",
+    RemixGui::ComboWithKey<SkyAutoDetectMode>::ComboEntries{ {
+      {SkyAutoDetectMode::None, "Off"},
+      {SkyAutoDetectMode::CameraPosition, "By Camera Position"},
+      {SkyAutoDetectMode::CameraPositionAndDepthFlags, "By Camera Position and Depth Flags"}
+  } });
+
+  void renderSkyCaptureUI() {
+    if (ImGui::TreeNode("Sky detection")) {
+      RemixGui::InputInt("First N Untextured Draw Calls", &RtxOptions::skyDrawcallIdThresholdObject(), 1, 1, 0);
+      RemixGui::SliderFloat("Sky Min Z Threshold", &RtxOptions::skyMinZThresholdObject(), 0.0f, 1.0f);
+      skyAutoDetectCombo.getKey(&RtxOptions::skyAutoDetectObject());
+      ImGui::TreePop();
+    }
+
+    if (ImGui::TreeNode("Sky capture & reflections")) {
+      RemixGui::Checkbox("Reproject Sky to Main Camera", &RtxOptions::skyReprojectToMainCameraSpaceObject());
+      {
+        ImGui::BeginDisabled(!RtxOptions::skyReprojectToMainCameraSpace());
+        RemixGui::DragFloat("Reprojected Sky Scale", &RtxOptions::skyReprojectScaleObject(), 1.0f, 0.1f, 1000.0f);
+        RemixGui::Checkbox("Force Auto-Detected Sky to Reproject", &RtxOptions::skyForceAutoDetectedToReprojectObject());
+        ImGui::EndDisabled();
+      }
+      RemixGui::DragFloat("Sky Auto-Detect Unique Camera Search Distance", &RtxOptions::skyAutoDetectUniqueCameraDistanceObject(), 1.0f, 0.1f, 1000.0f);
+
+      RemixGui::Checkbox("Force HDR sky", &RtxOptions::skyForceHDRObject());
+
+      static const char* exts[] = { "256 (1.5MB vidmem)", "512 (6MB vidmem)", "1024 (24MB vidmem)",
+        "2048 (96MB vidmem)", "4096 (384MB vidmem)", "8192 (1.5GB vidmem)" };
+
+      int extIdx = std::clamp(bit::tzcnt(RtxOptions::skyProbeSide()), 8u, 13u) - 8;
+
+      if (RemixGui::Combo("Sky Probe Extent", &extIdx, exts, IM_ARRAYSIZE(exts))) {
+        RemixGui::CheckRtxOptionPopups(&RtxOptions::skyProbeSideObject());
+        RtxOptions::skyProbeSideObject().setDeferred(1 << (extIdx + 8));
+      }
+      ImGui::TreePop();
+    }
+  }
 
   void renderMoonUI(int idx) {
     constexpr ImGuiSliderFlags sliderFlags = ImGuiSliderFlags_AlwaysClamp;
@@ -195,105 +237,92 @@ namespace {
   void renderSunUI(float liveTimeOfDayHours) {
     constexpr ImGuiSliderFlags sliderFlags = ImGuiSliderFlags_AlwaysClamp;
 
-    if (ImGui::TreeNode("Sun")) {
-      // Grey out Sun Size when Shadow Softness > 0 — the softness knob owns the half-angle then.
+    RemixGui::DragFloat("Sun Intensity", &RtxAtmosphere::sunIntensityObject(), 0.01f, 0.0f, 100.0f, "%.2f", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Brightness of sunlight. Use Sky color & brightness for the ambient sky.");
+
+    const bool timeCycleOwnsSun = RtxAtmosphere::timeCycleEnable();
+    ImGui::BeginDisabled(timeCycleOwnsSun);
+    if (timeCycleOwnsSun) {
+      float drivenElevationDeg = 0.0f;
+      float drivenAzimuthDeg = 0.0f;
+      RtxAtmosphere::computeTimeCycleSunAngles(liveTimeOfDayHours, drivenElevationDeg, drivenAzimuthDeg);
+      ImGui::Text("Sun Elevation   %7.2f deg", drivenElevationDeg);
+      ImGui::Text("Sun Rotation    %7.2f deg", drivenAzimuthDeg);
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "Driven by the Day / night cycle below. Disable it to control the sun directly again.");
+    } else {
+      RemixGui::DragFloat("Sun Elevation", &RtxAtmosphere::sunElevationObject(), 0.01f, -90.0f, 90.0f, "%.2f deg", sliderFlags);
+      RemixGui::SetTooltipToLastWidgetOnHover("Sun angle from horizon");
+
+      RemixGui::DragFloat("Sun Rotation", &RtxAtmosphere::sunRotationObject(), 0.01f, 0.0f, 360.0f, "%.1f deg", sliderFlags);
+      RemixGui::SetTooltipToLastWidgetOnHover("Rotation of sun around zenith");
+    }
+    ImGui::EndDisabled();
+
+    if (ImGui::TreeNode("Sun size & shadows")) {
       const bool softnessOverride = RtxAtmosphere::sunShadowSoftnessDeg() > 0.0f;
       ImGui::BeginDisabled(softnessOverride);
       RemixGui::DragFloat("Sun Size", &RtxAtmosphere::sunSizeObject(), 0.01f, 0.0f, 10.0f, "%.3f deg", sliderFlags);
       RemixGui::SetTooltipToLastWidgetOnHover(
-          "Angular diameter of the sun light in degrees (Earth's sun is "
-          "~0.545 deg). The light's half-angle = Sun Size / 2, which sets "
-          "shadow softness and the sun's size in reflective highlights. "
-          "Numos draws no separate sun disc. Greyed out while Shadow "
-          "Softness > 0 (the override owns the half-angle).");
+        "Angular diameter of the sun light in degrees (Earth's sun is "
+        "~0.545 deg). The light's half-angle = Sun Size / 2, which sets "
+        "shadow softness and the sun's size in reflective highlights. "
+        "Numos draws no separate sun disc. Greyed out while Shadow "
+        "Softness > 0 (the override owns the half-angle).");
       ImGui::EndDisabled();
 
       RemixGui::DragFloat("Shadow Softness", &RtxAtmosphere::sunShadowSoftnessDegObject(), 0.01f, 0.0f, 10.0f, "%.3f deg", sliderFlags);
       RemixGui::SetTooltipToLastWidgetOnHover(
-          "Override for the sun light's angular half-angle, in degrees. "
-          "0 = physical: track Sun Size / 2 (leave here unless you need the "
-          "override). When > 0 it owns the half-angle and Sun Size greys "
-          "out - larger = softer penumbra. Kept separate from Sun Size so a "
-          "game/API-driven physical sun size can stay untouched while "
-          "shadows are art-directed.");
+        "Override for the sun light's angular half-angle, in degrees. "
+        "0 = physical: track Sun Size / 2 (leave here unless you need the "
+        "override). When > 0 it owns the half-angle and Sun Size greys "
+        "out - larger = softer penumbra. Kept separate from Sun Size so a "
+        "game/API-driven physical sun size can stay untouched while "
+        "shadows are art-directed.");
+      ImGui::TreePop();
+    }
 
-      RemixGui::DragFloat("Sun Intensity", &RtxAtmosphere::sunIntensityObject(), 0.01f, 0.0f, 100.0f, "%.2f", sliderFlags);
-      RemixGui::SetTooltipToLastWidgetOnHover("Strength of Sun");
-
-      // The Remix-side time cycle owns the sun direction while it is on, so these two are inert.
-      // Show them disabled, displaying the angles the cycle is actually driving.
-      const bool timeCycleOwnsSun = RtxAtmosphere::timeCycleEnable();
-      ImGui::BeginDisabled(timeCycleOwnsSun);
-      if (timeCycleOwnsSun) {
-        float drivenElevationDeg = 0.0f;
-        float drivenAzimuthDeg = 0.0f;
-        RtxAtmosphere::computeTimeCycleSunAngles(liveTimeOfDayHours, drivenElevationDeg, drivenAzimuthDeg);
-        ImGui::Text("Sun Elevation   %7.2f deg", drivenElevationDeg);
-        ImGui::Text("Sun Rotation    %7.2f deg", drivenAzimuthDeg);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Driven by the Time Cycle below. Disable it to control the sun directly again.");
-      } else {
-        RemixGui::DragFloat("Sun Elevation", &RtxAtmosphere::sunElevationObject(), 0.01f, -90.0f, 90.0f, "%.2f deg", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover("Sun angle from horizon");
-
-        RemixGui::DragFloat("Sun Rotation", &RtxAtmosphere::sunRotationObject(), 0.01f, 0.0f, 360.0f, "%.1f deg", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover("Rotation of sun around zenith");
-      }
-      ImGui::EndDisabled();
-
-      RemixGui::Checkbox("Flip Up Axis", &RtxAtmosphere::flipUpAxisObject());
+    if (ImGui::TreeNode("Day / night cycle")) {
+      RemixGui::Checkbox("Enable Time Cycle", &RtxAtmosphere::timeCycleEnableObject());
       RemixGui::SetTooltipToLastWidgetOnHover(
-          "Fixes a sky rendered exactly upside down - bright zenith beneath you, dark ground half "
-          "overhead - in games whose up axis points the opposite way to what Remix assumes.\n\n"
-          "NOT the fix for a sky that looks rotated or sideways; that is rtx.zUp not matching the "
-          "game. To tell them apart: turn the Time Cycle off, set Sun Elevation to about 45, and "
-          "look straight up. Zenith off to one side = zUp problem. Zenith under your feet = this.\n\n"
-          "Also reverses the direction the sun travels across the sky - flipping which way is up "
-          "reverses the sense of rotation seen from the new zenith. Sun Rotation / North Offset move "
-          "where the arc sits but cannot undo that.");
+        "Drive the sun from a Remix-side clock instead of Sun Elevation / Sun Rotation. The "
+        "intended workflow is for the game to push the sun through the Remix API, but plenty of "
+        "games have no day/night cycle to push - this gives them one. While enabled it OWNS the "
+        "sun direction, and Sun Elevation / Sun Rotation (including API pushes) are ignored.");
 
-      if (ImGui::TreeNode("Time Cycle")) {
-        RemixGui::Checkbox("Enable Time Cycle", &RtxAtmosphere::timeCycleEnableObject());
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Drive the sun from a Remix-side clock instead of Sun Elevation / Sun Rotation. The "
-            "intended workflow is for the game to push the sun through the Remix API, but plenty of "
-            "games have no day/night cycle to push - this gives them one. While enabled it OWNS the "
-            "sun direction, and Sun Elevation / Sun Rotation (including API pushes) are ignored.");
+      const int liveHour = int(liveTimeOfDayHours);
+      const int liveMinute = int((liveTimeOfDayHours - float(liveHour)) * 60.0f);
+      ImGui::Text("Current time    %02d:%02d", liveHour, liveMinute);
 
-        // Live readout: the clock runs off this, not off the authored option, once it is ticking.
-        const int liveHour = int(liveTimeOfDayHours);
-        const int liveMinute = int((liveTimeOfDayHours - float(liveHour)) * 60.0f);
-        ImGui::Text("Current time    %02d:%02d", liveHour, liveMinute);
+      RemixGui::DragFloat("Time Of Day", &RtxAtmosphere::timeOfDayHoursObject(), 0.01f, 0.0f, 24.0f, "%.2f h", sliderFlags);
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "Hours, 0-24. 12 is solar noon. While the cycle runs this is the START time and editing "
+        "it re-seeds the running clock; while the cycle is off it places the sun directly, so it "
+        "doubles as a manual time-of-day control.");
 
-        RemixGui::DragFloat("Time Of Day", &RtxAtmosphere::timeOfDayHoursObject(), 0.01f, 0.0f, 24.0f, "%.2f h", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Hours, 0-24. 12 is solar noon. While the cycle runs this is the START time and editing "
-            "it re-seeds the running clock; while the cycle is off it places the sun directly, so it "
-            "doubles as a manual time-of-day control.");
+      RemixGui::DragFloat("Day Length", &RtxAtmosphere::dayLengthMinutesObject(), 0.1f, 0.01f, 600.0f, "%.2f min", sliderFlags);
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "Real-world minutes for one full 24-hour cycle. 24 gives a minute per in-game hour.");
 
-        RemixGui::DragFloat("Day Length", &RtxAtmosphere::dayLengthMinutesObject(), 0.1f, 0.01f, 600.0f, "%.2f min", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Real-world minutes for one full 24-hour cycle. 24 gives a minute per in-game hour.");
+      RemixGui::DragFloat("North Offset", &RtxAtmosphere::northOffsetDegreesObject(), 0.1f, -360.0f, 360.0f, "%.1f deg", sliderFlags);
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "Rotates the whole solar arc so the model's north matches the game world's. Adjust until "
+        "sunrise arrives from the direction the game treats as east.");
 
+      if (ImGui::TreeNode("Season & location")) {
         RemixGui::DragFloat("Latitude", &RtxAtmosphere::latitudeDegreesObject(), 0.1f, -90.0f, 90.0f, "%.1f deg", sliderFlags);
         RemixGui::SetTooltipToLastWidgetOnHover(
-            "Observer latitude, positive north. Sets how high the sun climbs and how tilted its arc "
-            "is: 0 sends it near-vertically overhead, high latitudes keep it low with long shallow "
-            "sunrises and sunsets.");
+          "Observer latitude, positive north. Sets how high the sun climbs and how tilted its arc "
+          "is: 0 sends it near-vertically overhead, high latitudes keep it low with long shallow "
+          "sunrises and sunsets.");
 
         RemixGui::DragInt("Day Of Year", &RtxAtmosphere::dayOfYearObject(), 1.0f, 1, 365, "%d", sliderFlags);
         RemixGui::SetTooltipToLastWidgetOnHover(
-            "Sets the solar declination, i.e. the season. 80 = March equinox (due-east sunrise, "
-            "12-hour day), 172 = June solstice, 355 = December solstice.");
-
-        RemixGui::DragFloat("North Offset", &RtxAtmosphere::northOffsetDegreesObject(), 0.1f, -360.0f, 360.0f, "%.1f deg", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Rotates the whole solar arc so the model's north matches the game world's. Adjust until "
-            "sunrise arrives from the direction the game treats as east.");
-
+          "Sets the solar declination, i.e. the season. 80 = March equinox (due-east sunrise, "
+          "12-hour day), 172 = June solstice, 355 = December solstice.");
         ImGui::TreePop();
       }
-
       ImGui::TreePop();
     }
   }
@@ -347,7 +376,7 @@ namespace {
 
   void renderStarAppearanceUI() {
     constexpr ImGuiSliderFlags sliderFlags = ImGuiSliderFlags_AlwaysClamp;
-    if (ImGui::TreeNode("Star Appearance")) {
+    if (ImGui::TreeNode("Star rendering (advanced)")) {
       RemixGui::DragFloat("Star PSF Sharpness", &RtxAtmosphere::starPsfSharpnessObject(),
                           0.5f, 1.0f, 500.0f, "%.1f", sliderFlags);
       RemixGui::SetTooltipToLastWidgetOnHover(
@@ -367,7 +396,7 @@ namespace {
 
   void renderMoonGlobalLightingUI(const float* weatherAtmosphericCoupling) {
     constexpr ImGuiSliderFlags sliderFlags = ImGuiSliderFlags_AlwaysClamp;
-    if (ImGui::TreeNode("Global Lighting")) {
+    if (ImGui::TreeNode("Moon lighting")) {
       dragFloatWithWeatherOverride(
           "Atmospheric Coupling", &RtxAtmosphere::moonAtmosphericCouplingStrengthObject(),
           weatherAtmosphericCoupling,
@@ -403,7 +432,7 @@ namespace {
 
   void renderMoonCloudLookUI() {
     constexpr ImGuiSliderFlags sliderFlags = ImGuiSliderFlags_AlwaysClamp;
-    if (ImGui::TreeNode("Cloud-Look & Halo Shape")) {
+    if (ImGui::TreeNode("Cloud lighting & halos")) {
       RemixGui::DragFloat("Silver Lining Intensity", &RtxAtmosphere::moonSilverLiningIntensityObject(),
                           0.05f, 0.0f, 5.0f, "%.2f", sliderFlags);
       RemixGui::SetTooltipToLastWidgetOnHover(
@@ -540,27 +569,13 @@ void RtxAtmosphere::renderChromaticityWidget(const char* colorLabel,
 }
 
 
-void RtxAtmosphere::showImguiSettings(WeatherBlender* blender) {
-  constexpr ImGuiSliderFlags sliderFlags = ImGuiSliderFlags_AlwaysClamp;
-
-  const WeatherSnapshot* weatherSnapshot =
-    blender ? blender->getBlendedSnapshot() : nullptr;
-
 #define WEATHER_OVERRIDE_PTR(field) \
   ((weatherSnapshot && weatherSnapshot->ownership.field) ? &weatherSnapshot->field : nullptr)
 
-  // Sky mode selection
-  skyModeCombo.getKey(&RtxOptions::skyModeObject());
-  RemixGui::SetTooltipToLastWidgetOnHover("Skybox Rasterization: Traditional skybox rendering\nNumos: Hillaire atmospheric scattering");
+void RtxAtmosphere::showSkyAppearance(const WeatherSnapshot* weatherSnapshot) {
+  constexpr ImGuiSliderFlags sliderFlags = ImGuiSliderFlags_AlwaysClamp;
 
-  if (RtxOptions::skyMode() == SkyMode::SkyboxRasterization) {
-    RemixGui::DragFloat("Sky Brightness", &RtxOptions::skyBrightnessObject(), 0.01f, 0.01f, FLT_MAX, "%.3f", sliderFlags);
-  } else {
-    // Atmosphere Presets
-    ImGui::Separator();
-    ImGui::Text("Atmosphere Presets:");
-
-    // Reset multipliers on any preset click so non-default multipliers don't silently re-tint the preset.
+  if (ImGui::BeginCombo("Atmosphere preset", "Choose to apply...")) {
     auto resetAtmosphereMultipliers = [] {
       RtxAtmosphere::sunIntensityObject().setDeferred(RtxAtmosphere::sunIntensityObject().getDefaultValue());
       RtxAtmosphere::airDensityObject().setDeferred(RtxAtmosphere::airDensityObject().getDefaultValue());
@@ -568,13 +583,11 @@ void RtxAtmosphere::showImguiSettings(WeatherBlender* blender) {
       RtxAtmosphere::ozoneDensityObject().setDeferred(RtxAtmosphere::ozoneDensityObject().getDefaultValue());
     };
 
-    if (ImGui::Button("Earth (Default)", ImVec2(120, 0))) {
+    if (ImGui::Selectable("Earth (Default)")) {
       resetAtmosphereMultipliers();
-      // Earth-like atmosphere based on Hillaire paper
       RtxAtmosphere::sunIlluminanceObject().setDeferred(Vector3(20.0f, 20.0f, 20.0f));
       RtxAtmosphere::planetRadiusObject().setDeferred(6371.0f);  // Earth's actual radius
       RtxAtmosphere::atmosphereThicknessObject().setDeferred(100.0f);
-      // Table 1 of the paper, converted from m^-1 to km^-1.
       RtxAtmosphere::rayleighScatteringObject().setDeferred(Vector3(5.802e-3f, 13.558e-3f, 33.1e-3f));
       RtxAtmosphere::mieScatteringObject().setDeferred(Vector3(3.996e-3f, 3.996e-3f, 3.996e-3f));
       RtxAtmosphere::mieAbsorptionObject().setDeferred(Vector3(4.4e-3f, 4.4e-3f, 4.4e-3f));
@@ -585,17 +598,13 @@ void RtxAtmosphere::showImguiSettings(WeatherBlender* blender) {
     }
     RemixGui::SetTooltipToLastWidgetOnHover("Physically accurate Earth atmosphere parameters from Hillaire paper");
 
-    ImGui::SameLine();
-    if (ImGui::Button("Mars", ImVec2(120, 0))) {
+    if (ImGui::Selectable("Mars")) {
       resetAtmosphereMultipliers();
-      // Mars atmosphere (thin, dusty, red-shifted)
       RtxAtmosphere::sunIlluminanceObject().setDeferred(Vector3(15.0f, 12.0f, 10.0f));  // Weaker, reddish sun
       RtxAtmosphere::planetRadiusObject().setDeferred(3389.5f);  // Mars radius
       RtxAtmosphere::atmosphereThicknessObject().setDeferred(50.0f);  // Thinner atmosphere
       RtxAtmosphere::rayleighScatteringObject().setDeferred(Vector3(8.0e-3f, 10.0e-3f, 12.0e-3f));  // Red bias
       RtxAtmosphere::mieScatteringObject().setDeferred(Vector3(8.0e-3f, 8.0e-3f, 8.0e-3f));  // More dust
-      // Iron-rich dust absorbs strongly toward the blue end, which is what inverts the sky and
-      // sunset colours relative to Earth.
       RtxAtmosphere::mieAbsorptionObject().setDeferred(Vector3(4.0e-3f, 6.0e-3f, 10.0e-3f));
       RtxAtmosphere::mieAnisotropyObject().setDeferred(0.7f);
       RtxAtmosphere::ozoneAbsorptionObject().setDeferred(Vector3(0.0f, 0.0f, 0.0f));  // No ozone
@@ -604,10 +613,8 @@ void RtxAtmosphere::showImguiSettings(WeatherBlender* blender) {
     }
     RemixGui::SetTooltipToLastWidgetOnHover("Mars-like atmosphere: thin, dusty, yellowish sky with blue sunsets");
 
-    ImGui::SameLine();
-    if (ImGui::Button("Clear Sky", ImVec2(120, 0))) {
+    if (ImGui::Selectable("Clear Sky")) {
       resetAtmosphereMultipliers();
-      // Very clear, minimal scattering (high altitude/clean air)
       RtxAtmosphere::sunIlluminanceObject().setDeferred(Vector3(25.0f, 25.0f, 25.0f));
       RtxAtmosphere::planetRadiusObject().setDeferred(6371.0f);
       RtxAtmosphere::atmosphereThicknessObject().setDeferred(80.0f);
@@ -621,15 +628,13 @@ void RtxAtmosphere::showImguiSettings(WeatherBlender* blender) {
     }
     RemixGui::SetTooltipToLastWidgetOnHover("Crystal clear atmosphere with minimal haze");
 
-    if (ImGui::Button("Polluted/Hazy", ImVec2(120, 0))) {
+    if (ImGui::Selectable("Polluted/Hazy")) {
       resetAtmosphereMultipliers();
-      // Heavy pollution/haze (smoggy city)
       RtxAtmosphere::sunIlluminanceObject().setDeferred(Vector3(18.0f, 18.0f, 18.0f));
       RtxAtmosphere::planetRadiusObject().setDeferred(6371.0f);
       RtxAtmosphere::atmosphereThicknessObject().setDeferred(100.0f);
       RtxAtmosphere::rayleighScatteringObject().setDeferred(Vector3(5.802e-3f, 13.558e-3f, 33.1e-3f));
       RtxAtmosphere::mieScatteringObject().setDeferred(Vector3(12.0e-3f, 12.0e-3f, 12.0e-3f));  // Heavy aerosols
-      // Pollution is soot heavy, so absorption dominates scattering here.
       RtxAtmosphere::mieAbsorptionObject().setDeferred(Vector3(18.0e-3f, 18.0e-3f, 18.0e-3f));
       RtxAtmosphere::mieAnisotropyObject().setDeferred(0.65f);  // More diffuse sun
       RtxAtmosphere::ozoneAbsorptionObject().setDeferred(Vector3(0.650e-3f, 1.881e-3f, 0.085e-3f));
@@ -638,10 +643,8 @@ void RtxAtmosphere::showImguiSettings(WeatherBlender* blender) {
     }
     RemixGui::SetTooltipToLastWidgetOnHover("Heavy atmospheric haze with strong light scattering");
 
-    ImGui::SameLine();
-    if (ImGui::Button("Alien World", ImVec2(120, 0))) {
+    if (ImGui::Selectable("Alien World")) {
       resetAtmosphereMultipliers();
-      // Exotic alien atmosphere (greenish tint)
       RtxAtmosphere::sunIlluminanceObject().setDeferred(Vector3(15.0f, 22.0f, 18.0f));  // Green bias
       RtxAtmosphere::planetRadiusObject().setDeferred(5000.0f);
       RtxAtmosphere::atmosphereThicknessObject().setDeferred(120.0f);
@@ -649,18 +652,14 @@ void RtxAtmosphere::showImguiSettings(WeatherBlender* blender) {
       RtxAtmosphere::mieScatteringObject().setDeferred(Vector3(5.0e-3f, 5.0e-3f, 5.0e-3f));
       RtxAtmosphere::mieAbsorptionObject().setDeferred(Vector3(5.5e-3f, 5.5e-3f, 5.5e-3f));
       RtxAtmosphere::mieAnisotropyObject().setDeferred(0.75f);
-      // Artistic ozone, rescaled by the same ~0.38 factor the Earth default took moving to Table 1
-      // so this preset's tint stays at its authored strength relative to Earth's.
       RtxAtmosphere::ozoneAbsorptionObject().setDeferred(Vector3(0.38e-3f, 0.19e-3f, 1.14e-3f));  // Exotic absorption
       RtxAtmosphere::ozoneLayerAltitudeObject().setDeferred(30.0f);
       RtxAtmosphere::ozoneLayerWidthObject().setDeferred(20.0f);
     }
     RemixGui::SetTooltipToLastWidgetOnHover("Fictional alien atmosphere with green-tinted scattering");
 
-    ImGui::SameLine();
-    if (ImGui::Button("Desert Planet", ImVec2(120, 0))) {
+    if (ImGui::Selectable("Desert Planet")) {
       resetAtmosphereMultipliers();
-      // Arid desert world (Dune-like)
       RtxAtmosphere::sunIlluminanceObject().setDeferred(Vector3(28.0f, 24.0f, 18.0f));  // Warm sun
       RtxAtmosphere::planetRadiusObject().setDeferred(6000.0f);
       RtxAtmosphere::atmosphereThicknessObject().setDeferred(90.0f);
@@ -673,1177 +672,983 @@ void RtxAtmosphere::showImguiSettings(WeatherBlender* blender) {
       RtxAtmosphere::ozoneLayerWidthObject().setDeferred(10.0f);
     }
     RemixGui::SetTooltipToLastWidgetOnHover("Hot, arid world with sandy atmospheric dust");
-
-    ImGui::Separator();
-
-    // ----- Weather Presets panel (placed right under atmosphere presets) -----
-    if (blender) {
-      if (ImGui::TreeNode("Weather Presets")) {
-        blender->showImguiSettings();
-        ImGui::TreePop();
-      }
-      blender->renderEditorWindow();
-    }
-
-    if (weatherSnapshot) {
-      ImGui::TextDisabled(
-        "Active weather-owned controls below show the effective blended value "
-        "and are read-only. Edit them in Weather Presets.");
-    }
-
-    ImGui::Separator();
-
-    // Sun (lifted out of former "Atmosphere Parameters" tree)
-    renderSunUI(getTimeOfDayHours());
-
-    // Numos controls (renamed; Sun fields moved to renderSunUI above)
-    if (ImGui::TreeNode("Atmosphere")) {
-
-      // Altitude slider removed 2026-07-17 (panel audit): the option fed
-      // AtmosphereArgs::viewAltitude, which nothing ever read. The RTX_OPTION
-      // was retired outright (see rtx_options.h).
-
-      dragFloatWithWeatherOverride(
-          "Air", &RtxAtmosphere::airDensityObject(), WEATHER_OVERRIDE_PTR(airDensity),
-          0.01f, 0.0f, 100.0f, "%.2f", sliderFlags);
-      RemixGui::SetTooltipToLastWidgetOnHover("Density of air molecules");
-
-      dragFloatWithWeatherOverride(
-          "Dust", &RtxAtmosphere::aerosolDensityObject(), WEATHER_OVERRIDE_PTR(aerosolDensity),
-          0.01f, 0.0f, 100.0f, "%.2f", sliderFlags);
-      RemixGui::SetTooltipToLastWidgetOnHover("Density of aerosols/dust");
-
-      RemixGui::DragFloat("Ozone", &RtxAtmosphere::ozoneDensityObject(), 0.01f, 0.0f, 100.0f, "%.2f", sliderFlags);
-      RemixGui::SetTooltipToLastWidgetOnHover("Density of ozone layer");
-
-      if (ImGui::TreeNode("Aerial Perspective")) {
-        RemixGui::Checkbox("Enable", &RtxAtmosphere::aerialPerspectiveObject());
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Apply the atmosphere's in-scatter and extinction to scene geometry, which is what gives "
-            "distant buildings and terrain their haze and desaturation - the strongest distance cue an "
-            "outdoor scene has. With this off, everything past the global volumetrics froxel range "
-            "renders at full saturation and contrast. Hands off to the volumetrics grid at its range so "
-            "the two do not double count.");
-
-        if (RtxAtmosphere::aerialPerspective()) {
-          // Read-only now (fork -- 2026-09-06, units/altitude redesign). Aerial perspective shares
-          // Units Per Metre with the clouds rather than carrying a second answer to "how big is a
-          // game unit", because a disagreement between haze distance and cloud distance is exactly
-          // the kind of error nobody traces back to a config. Shown rather than hidden so the
-          // number the Range and Near Fade controls below are calibrated against stays visible.
-          ImGui::Text("Units Per Metre             %10.2f", RtxAtmosphere::resolveUnitsPerMeter());
-          RemixGui::SetTooltipToLastWidgetOnHover(
-              "Game units per real metre, shared with the clouds. Set it under Clouds > World Space; "
-              "it calibrates the Range, Near Fade and Scene Shadow Range controls below. Unlike the "
-              "clouds, aerial perspective ignores Cloud World Compression - haze stays physical.");
-
-          RemixGui::DragFloat("Cloud In-Scatter",
-                              &RtxAtmosphere::cloudAerialInScatterStrengthObject(),
-                              0.01f, 0.0f, 1.0f, "%.2f", sliderFlags);
-          RemixGui::SetTooltipToLastWidgetOnHover(
-              "How much of this volume's in-scattered air light the clouds receive, sampled at the "
-              "cloud's own mean depth. 1 = the whole column between the camera and the cloud; 0 = "
-              "off, which is what the clouds got before 2026-09-08 - this volume skipped every sky "
-              "pixel, and sky pixels are where the clouds are.\n\n"
-              "This is the half of aerial perspective the clouds were missing. Clouds > Distance > "
-              "Distance Haze only ever multiplies cloud radiance DOWN with nothing added back, so "
-              "distant cloud dimmed toward black rather than toward the colour of the air in front "
-              "of it. That term still does its job; this supplies the light it was subtracting "
-              "toward. It cannot brighten cloud past the sky behind it.");
-
-          RemixGui::DragFloat("Range", &RtxAtmosphere::aerialPerspectiveDepthRangeMetersObject(),
-                              100.0f, 100.0f, 200000.0f, "%.0f m", sliderFlags);
-          RemixGui::SetTooltipToLastWidgetOnHover(
-              "Depth covered by the 32-slice aerial perspective volume. Reduce for denser atmospheres "
-              "to spend the slices over a shorter, more accurate range.");
-
-          RemixGui::DragFloat("Near Fade Start",
-                              &RtxAtmosphere::aerialPerspectiveNearFadeStartMetersObject(),
-                              1.0f, 0.0f, 5000.0f, "%.0f m", sliderFlags);
-          RemixGui::SetTooltipToLastWidgetOnHover(
-              "Distance below which this volume is not applied to a surface at all - its fogStart.\n\n"
-              "The volume starts integrating at the global volumetrics handoff (20 m by default), which "
-              "is the right bound for the physics but far too near to be the bound on what it may "
-              "paint. Its scene shadowing is resolved on a 32x32 screen grid, so a surface just past "
-              "the handoff reads a column blended from neighbours up to ~60 px away; where those look "
-              "past it into sunlit air, the forward-scatter lobe lands on it as a halo bleeding through "
-              "walls and terrain.\n\n"
-              "Raise this if halos still reach interior geometry, lower it if near-field haze is "
-              "visibly missing. Clear-air extinction over the first few hundred metres is negligible, "
-              "so there is very little real haze to lose here.");
-
-          RemixGui::DragFloat("Near Fade End",
-                              &RtxAtmosphere::aerialPerspectiveNearFadeEndMetersObject(),
-                              1.0f, 0.0f, 20000.0f, "%.0f m", sliderFlags);
-          RemixGui::SetTooltipToLastWidgetOnHover(
-              "Distance at which this volume reaches full strength. Between the fade start and here it "
-              "ramps in smoothly, so a receding floor or road shows no band where the volume takes "
-              "over. At or below the start distance the transition becomes a hard step.");
-
-          RemixGui::DragInt("Resolution",
-                            &RtxAtmosphere::aerialPerspectiveLutResolutionObject(),
-                            1.0f, 8, 256, "%d", sliderFlags);
-          RemixGui::SetTooltipToLastWidgetOnHover(
-              "Screen-space resolution of this volume, on both axes.\n\n"
-              "Resolves how the haze varies with view DIRECTION. Most of that is smooth, but the Mie "
-              "aureole around the sun is not, and undersampling it reads as coarse banding in the "
-              "haze near the sun. At 32 one texel spans roughly 60x34 px at 1080p.\n\n"
-              "Cost is quadratic in this value, and arithmetic only - the bake traces no rays unless "
-              "scene shadows are enabled below.");
-
-          RemixGui::DragInt("Depth Slices",
-                            &RtxAtmosphere::aerialPerspectiveLutDepthSlicesObject(),
-                            1.0f, 4, 128, "%d", sliderFlags);
-          RemixGui::SetTooltipToLastWidgetOnHover(
-              "Depth slices in this volume.\n\n"
-              "Separate from the resolution above because this axis resolves how the haze varies with "
-              "DISTANCE, and the exponential slice distribution already gives every slice the same "
-              "relative depth resolution - so it needs far fewer samples than the screen axes do. "
-              "Cost is linear in this value.");
-
-          RemixGui::Checkbox("Scene Shadows",
-                             &RtxAtmosphere::aerialPerspectiveSceneShadowObject());
-          RemixGui::SetTooltipToLastWidgetOnHover(
-  "Trace the scene for sun occlusion of the air column this volume integrates.\n\n"
-              "This volume is applied only to pixels that hit geometry, so any shadowing of the column is clipped exactly to the occluder's silhouette - one pixel to the side the ray reaches sky, gets no aerial perspective, and so gets no darkening. It reads as the object's outline stamped on the haze rather than a shadow cast through it, and no resolution or sample count changes that.\n\n"
-              "Shadow shafts belong to the global volumetrics grid, which integrates for every pixel including sky misses and so carries shadows across silhouettes without a seam. This volume begins where rtx.volumetrics.froxelMaxDistanceMeters ends, so widening that range hands more of the shadowed near field to the system that resolves it correctly.");
-
-          if (RtxAtmosphere::aerialPerspectiveSceneShadow()) {
-            RemixGui::Checkbox("Separate Visibility Pass (Experimental)",
-                               &RtxAtmosphere::aerialPerspectiveSeparateVisibilityObject());
-            RemixGui::SetTooltipToLastWidgetOnHover(
-                "Preserves the sun samples and sky probes while evaluating visibility in a separate pass. "
-                "Uses an additional 4.5 MiB at the default resolution. Performance depends on the GPU and scene; "
-                "disable to use the original combined pass.");
-            RemixGui::DragFloat("Shadow Range",
-                                &RtxAtmosphere::aerialPerspectiveSceneShadowRangeMetersObject(),
-                                10.0f, 0.0f, 100000.0f, "%.0f m", sliderFlags);
-            RemixGui::SetTooltipToLastWidgetOnHover(
-                "How far from the camera scene geometry may shadow the column. Samples past this "
-                "trace nothing and count as sunlit, which is what the air above the rooftops "
-                "actually is. Raise it for scenes with occluders far larger than a kilometre; lower "
-                "it to spend fewer rays.");
-
-            const char* kShadowDebugModes[] = {
-              "Off (production)",
-              "1: Force occluded (no trace)",
-              "2: Trace, inverted",
-            };
-            RemixGui::Combo("Scene Shadow Diagnostic",
-                            &RtxAtmosphere::aerialPerspectiveSceneShadowDebugObject(),
-                            kShadowDebugModes, IM_ARRAYSIZE(kShadowDebugModes));
-            RemixGui::SetTooltipToLastWidgetOnHover(
-                "Takes apart the ways scene shadowing can silently do nothing - they all look the "
-                "same on screen otherwise.\n\n"
-                "1 occludes the column without consulting the scene: the halo MUST vanish. If it "
-                "does not, the constant or the dispatch is broken and the ray tracing is beside the "
-                "point.\n\n"
-                "2 traces and inverts: the halo must survive ONLY where a ray found geometry. A "
-                "screen that stays uniformly lit means the rays are hitting nothing.");
-          }
-
-          ImGui::Separator();
-
-          RemixGui::Checkbox("Local Lights",
-                             &RtxAtmosphere::aerialPerspectiveLocalLightsObject());
-          RemixGui::SetTooltipToLastWidgetOnHover(
-              "Scatter ordinary scene lights - lamps, torches, muzzle flashes, headlights - through "
-              "this volume, alongside the sun and sky it already carries.\n\n"
-              "This is what makes the volume a general participating medium rather than an "
-              "outdoor-daytime one. Without it the air is lit by the atmosphere alone: an interior "
-              "reads as unlit haze and a light in fog throws no glow at all, and that job belongs "
-              "instead to the global volumetrics froxel grid, which resolves it per froxel with "
-              "ReSTIR and a shadow ray each.\n\n"
-              "Lights are culled into this volume's own froxel grid once per frame and the survivors "
-              "evaluated analytically along the march the bake is already doing, which is why it "
-              "covers the same ground for a fraction of the cost - and why turning this on is what "
-              "lets rtx.volumetrics.enable be turned off. Scenes with no positional lights in range "
-              "pay nothing.");
-
-          if (RtxAtmosphere::aerialPerspectiveLocalLights()) {
-            RemixGui::DragFloat("Local Light Intensity",
-                                &RtxAtmosphere::aerialPerspectiveLocalLightIntensityObject(),
-                                0.05f, 0.0f, 100.0f, "%.2f", sliderFlags);
-            RemixGui::SetTooltipToLastWidgetOnHover(
-                "Gain on the local light contribution alone. 1.0 is physical: a light's radiance "
-                "enters the medium at face value and leaves scaled by the air's own scattering "
-                "coefficient. Raise it when a game's lights are authored dimmer than the air density "
-                "that reads correctly for distant haze - the usual reason a lamp shows no glow.");
-
-            RemixGui::Checkbox("Local Light Shadows",
-                               &RtxAtmosphere::aerialPerspectiveLocalLightShadowsObject());
-            RemixGui::SetTooltipToLastWidgetOnHover(
-                "Trace the scene for occlusion of local lights.\n\n"
-                "Without it a lamp lights the fog on both sides of the wall it stands behind, which "
-                "is the most obvious way volumetric lighting reads as fake - and unlike the sun's "
-                "halo no phase cap softens it, because a local light's brightest air is the air "
-                "nearest it rather than the air pointing at it. With it, a light through a doorway "
-                "or a window throws a real shaft.\n\n"
-                "One ray per light per depth slice, and it stops at the emitter rather than running "
-                "to the shadow range, so it is far cheaper than the sun's equivalent. Only clusters "
-                "that actually contain a light trace anything.");
-
-            if (RtxAtmosphere::aerialPerspectiveLocalLightShadows()) {
-              RemixGui::DragFloat("Local Light Shadow Range",
-                                  &RtxAtmosphere::aerialPerspectiveLocalLightShadowRangeMetersObject(),
-                                  5.0f, 0.0f, 100000.0f, "%.0f m", sliderFlags);
-              RemixGui::SetTooltipToLastWidgetOnHover(
-                  "How far from the camera local lights may be shadowed. Slices past this treat "
-                  "their lights as unoccluded, which costs nothing and is rarely visible: a light "
-                  "reaching that far is either bright enough that its shaft is lost in the haze or "
-                  "far enough that the volume cannot resolve the shaft anyway.");
-            }
-
-            RemixGui::DragFloat("Local Light Cutoff",
-                                &RtxAtmosphere::aerialPerspectiveLocalLightCutoffObject(),
-                                0.0005f, 0.0f, 1.0f, "%.4f", sliderFlags);
-            RemixGui::SetTooltipToLastWidgetOnHover(
-                "In-scattered radiance below which a light is considered not to reach a point, used "
-                "to size each light's cull radius from its own power.\n\n"
-                "This is what keeps the cost proportional to local light DENSITY rather than to the "
-                "scene's light count: a torch is culled after a few metres while a floodlight "
-                "survives to a hundred, instead of every light paying for the brightest one's range. "
-                "Lower it if bright lights visibly stop affecting the fog at a fixed radius; raise "
-                "it to spend less.");
-
-            RemixGui::DragInt("Local Light Budget",
-                              &RtxAtmosphere::aerialPerspectiveLocalLightMaxCountObject(),
-                              1.0f, 0, 4096, "%d", sliderFlags);
-            RemixGui::SetTooltipToLastWidgetOnHover(
-                "Upper bound on how many scene lights may be submitted to the volume in a frame. "
-                "Lights are ranked by the peak in-scatter they can produce anywhere in the view "
-                "frustum and the brightest survive, so raising this adds progressively dimmer "
-                "lights. The cull pass costs linearly in it; the march does not, since a cluster "
-                "still holds at most sixteen of them.");
-          }
-
-          ImGui::Separator();
-
-          RemixGui::DragFloat("Forward Scatter Cap",
-                              &RtxAtmosphere::aerialPerspectiveMieAnisotropyMaxObject(),
-                              0.01f, -1.0f, 1.0f, "%.2f", sliderFlags);
-          RemixGui::SetTooltipToLastWidgetOnHover(
-              "Caps the Mie anisotropy the aerial perspective volume may use. The sky keeps the full "
-              "Mie Anisotropy under Advanced, so this does not touch the glow around the sun itself.\n\n"
-              "A strongly forward-scattering lobe is brightest looking straight into the sun, which is "
-              "also where the air in front of a surface is most likely to sit in that surface's own "
-              "shadow. Scene Shadows above is what removes the resulting halo; this cap is the second "
-              "line of defence for the column beyond Shadow Range, where nothing is traced. Raise it "
-              "toward Mie Anisotropy for a stronger sunward haze wash on distant geometry.");
-        }
-
-        ImGui::TreePop();
-      }
-
-      if (ImGui::TreeNode("Advanced")) {
-        RemixGui::DragFloat("Planet Radius", &RtxAtmosphere::planetRadiusObject(), 10.0f, 1000.0f, 10000.0f, "%.0f km", sliderFlags);
-        RemixGui::DragFloat("Atmosphere Thickness", &RtxAtmosphere::atmosphereThicknessObject(), 1.0f, 10.0f, 500.0f, "%.0f km", sliderFlags);
-        RemixGui::DragFloat("Mie Anisotropy", &RtxAtmosphere::mieAnisotropyObject(), 0.01f, -1.0f, 1.0f, "%.2f", sliderFlags);
-
-        renderChromaticityWidget(
-            "Sun Color (Base)", "Sun Illuminance",
-            &RtxAtmosphere::sunIlluminanceObject(),
-            0.1f, 100.0f, "%.1f",
-            "Sun spectral color (Hillaire base illuminance, chromaticity).",
-            "Sun base illuminance magnitude (overall sun-power level).",
-            m_sunIlluminanceUiState,
-            WEATHER_OVERRIDE_PTR(sunIlluminance));
-
-        renderChromaticityWidget(
-            "Air Color (Base)", "Air Scattering Strength",
-            &RtxAtmosphere::rayleighScatteringObject(),
-            0.0005f, 0.1f, "%.4f /km",
-            "Air molecule scattering chromaticity (Rayleigh per-channel scattering coefficients). "
-            "Larger blue = cooler sky.",
-            "Air scattering magnitude. Higher = more atmospheric scattering overall.",
-            m_rayleighScatteringUiState,
-            WEATHER_OVERRIDE_PTR(rayleighScattering));
-
-        renderChromaticityWidget(
-            "Dust Color (Base)", "Dust Scattering Strength",
-            &RtxAtmosphere::mieScatteringObject(),
-            0.0005f, 0.05f, "%.4f /km",
-            "Aerosol / dust scattering chromaticity (Mie per-channel coefficients).",
-            "Dust scattering magnitude. Higher = hazier atmosphere.",
-            m_mieScatteringUiState);
-
-        renderChromaticityWidget(
-            "Dust Absorption Tint (Base)", "Dust Absorption Strength",
-            &RtxAtmosphere::mieAbsorptionObject(),
-            0.0005f, 0.05f, "%.4f /km",
-            "Aerosol / dust ABSORPTION chromaticity. Aerosols absorb as well as scatter, and this is "
-            "the half that darkens rather than brightens. Tinting it is what makes dust brown-and-dim "
-            "or smoke grey-and-dark instead of merely denser; a blue-weighted absorption is what "
-            "inverts a Mars-like sky and its sunsets.",
-            "Dust absorption magnitude. Raise relative to Dust Scattering Strength to darken haze as "
-            "it thickens; Earth's aerosols sit at roughly 4.4e-3 /km, comparable to their scattering.",
-            m_mieAbsorptionUiState);
-
-        renderChromaticityWidget(
-            "Ozone Tint (Base)", "Ozone Absorption Strength",
-            &RtxAtmosphere::ozoneAbsorptionObject(),
-            0.0001f, 0.05f, "%.5f /km",
-            "Ozone absorption chromaticity (per-channel coefficients). "
-            "Affects twilight color and high-altitude tint.",
-            "Ozone absorption magnitude.",
-            m_ozoneAbsorptionUiState);
-        RemixGui::DragFloat("Ozone Layer Altitude", &RtxAtmosphere::ozoneLayerAltitudeObject(), 0.5f, 0.0f, 50.0f, "%.1f km", sliderFlags);
-        RemixGui::DragFloat("Ozone Layer Width", &RtxAtmosphere::ozoneLayerWidthObject(), 0.5f, 1.0f, 30.0f, "%.1f km", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Half-width of the ozone tent profile, and therefore the vertical ozone column in km "
-            "(the paper uses a 30 km wide tent, so 15).");
-
-        RemixGui::DragFloat("Multiscatter Physical Strength", &RtxAtmosphere::multiScatterPhysicalStrengthObject(), 0.01f, 0.0f, 1.0f, "%.2f", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "0 = artistic multiscattering (analytical inline fit; preset color stays faithful, easy to style). "
-            "1 = physical multiscattering (the Hillaire EGSR 2020 Psi_ms LUT: second-order scattering plus the "
-            "1/(1-f_ms) series for every higher order, with the ground bounce evaluated in-march. Its colour is "
-            "derived from the atmosphere's composition rather than assumed, so it is harder to art-direct but "
-            "correct). Intermediate values blend.");
-
-        // Artistic sunset color controls (2026-06-14). Recover the
-        // sunset warmth/saturation lost when reddening moved onto the physical
-        // two-term LUT model; both feed the sky-view LUT so clouds inherit them.
-        RemixGui::DragFloat("Multiscatter Strength", &RtxAtmosphere::multiScatterStrengthObject(), 0.01f, 0.0f, 2.0f, "%.2f", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Global scale on the multiscattering 'fill' term. The physical model adds a broadband (pale-blue) "
-            "multiscatter term that desaturates warm sunset color. Lower (e.g. 0.3-0.6) to let warm single-scatter "
-            "dominate for a punchier sunset; 1.0 = physical. Feeds the sky-view LUT, so clouds inherit it.");
-
-        RemixGui::DragFloat("Sunset Saturation", &RtxAtmosphere::sunsetSaturationObject(), 0.01f, 0.0f, 3.0f, "%.2f", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Saturation boost on sky radiance, ramped in only as the sun nears the horizon (midday sky untouched). "
-            ">1 amplifies the warm horizon hues the physical model renders accurately but undersaturated; 1.0 = no change. "
-            "Feeds the sky-view LUT, so clouds inherit the warmer ambient.");
-
-        dragFloatWithWeatherOverride(
-            "Sky Indirect Scale", &RtxAtmosphere::skyIndirectRadianceScaleObject(),
-            WEATHER_OVERRIDE_PTR(skyIndirectRadianceScale),
-            0.01f, 0.0f, 20.0f, "%.2f", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Multiplier for sky radiance gathered by diffuse indirect bounces only. 1.0 = physical. "
-            "Raise it to brighten diffuse sky fill (the distant-light sun out-radiates the sky, so indirect "
-            "lighting reads dull). Sky seen via reflection, refraction, alpha-cutout, or the primary view stays "
-            "at physical brightness, so reflections keep matching the visible sky.");
-
-        // Sky perf workstream knobs (2026-06-11) are conf-only by
-        // design: skyLutCacheKeySplitEnable, skyViewRebakeGranularityDeg and
-        // the debug* bisect toggles all default to their validated production
-        // values and stay out of the UI (user decision after the in-game
-        // validation pass — "this is in a good enough spot now").
-
-        // (cloudVoxelGridRebakeGranularityKm is conf-only like the other
-        // workstream knobs above; validated at its 0.1 default.)
-
-        ImGui::TreePop();
-      }
-
-      ImGui::TreePop();
-    }
-
-    // The Perf Bisect (Diagnostic) tree (2026-06-11) was removed
-    // from the UI after the sky perf workstream closed; the six
-    // rtx.atmosphere.debug* skip toggles it drove remain conf-tunable
-    // (all default ON = normal rendering) for future regression hunting.
-
-    // ----- Night Sky tree (restructured) -----
-    if (ImGui::TreeNode("Night Sky")) {
-      dragFloatWithWeatherOverride(
-          "Night Sky Brightness", &RtxAtmosphere::nightSkyBrightnessObject(),
-          WEATHER_OVERRIDE_PTR(nightSkyBrightness),
-          0.001f, 0.0f, 0.1f, "%.4f", sliderFlags);
-      RemixGui::SetTooltipToLastWidgetOnHover("Airglow / ambient night-sky brightness.");
-      colorEdit3WithWeatherOverride(
-          "Night Sky Color", &RtxAtmosphere::nightSkyColorObject(),
-          WEATHER_OVERRIDE_PTR(nightSkyColor));
-      RemixGui::SetTooltipToLastWidgetOnHover(
-          "Tint of the ambient night-sky / airglow contribution. Magnitude is set by Night Sky Brightness above.");
-
-      renderStarsUI();
-      renderMilkyWayUI();
-      renderStarAppearanceUI();
-
-      ImGui::TreePop();
-    }
-
-    // ----- Moons tree (restructured) -----
-    if (ImGui::TreeNode("Moons")) {
-      renderMoonGlobalLightingUI(WEATHER_OVERRIDE_PTR(moonAtmosphericCouplingStrength));
-      renderMoonCloudLookUI();
-
-      for (int i = 0; i < static_cast<int>(MAX_MOONS); ++i) {
-        renderMoonUI(i);
-      }
-      ImGui::TreePop();
-    }
-
-    // ----- Clouds tree  -----
-    // Curated menu surface (2026-07-17 preset-tunability pass,
-    // second cut after the 2026-05-19 simplification). Rule: a slider stays
-    // only if dragging it visibly changes the image in normal play. Look
-    // tuning = Basic / Shape / Detail / Lighting / Cloud Motion (~24
-    // knobs); Performance is a separate concern; Lightning and Layer 2 are
-    // opt-in behind master toggles. Every demoted RTX_OPTION remains alive
-    // in code and .conf-tunable — each removal site carries a dated
-    // comment naming the option.
-    if (ImGui::TreeNode("Clouds")) {
-      RemixGui::Checkbox("Enable Clouds", &RtxAtmosphere::cloudEnabledObject());
-
-      // Conditional-disable gates (2026-06-15, cloud UI rework). Controls
-      // that the shader only consumes in a given mode are greyed (not hidden) so
-      // they stay discoverable but can't be dragged when inert.
-      const bool layer2On  = RtxAtmosphere::cloudLayer2Enable();
-
-      // ---- World-space cloud migration, Stage 0/2: anchor and altitude datum -----
-      // (fork — 2026-09-05, world-space cloud migration Stage 0/2)
-      // Everything in this subtree reads RtxAtmosphere::CloudAnchor (see its doc comment in
-      // rtx_atmosphere.h) plus the RTX_OPTIONs that resolve and calibrate it: cloudScale (the
-      // anchor's unit conversion), useCameraWorldOverride / cameraWorldOverride (the explicit
-      // anchor source Stage 2 adds), and seaLevelWorldKm / altitudeScale / viewAltitudeKm (the
-      // altitude datum). Stage 0 was read-only diagnostics only; Stage 2 makes the override and
-      // datum controls here EDITABLE — this subtree now writes AtmosphereArgs, through
-      // updateFrame's anchor-resolve block and getAtmosphereArgs()'s calibration block. Placed
-      // first in the Clouds tree, ahead of Basic, because this is the control surface for whether
-      // world-anchored clouds work AT ALL on a camera-relative engine, not a look-tuning knob to
-      // stumble on.
-      // Default-open (fork — 2026-09-05, Stage 0 follow-up): this subtree is
-      // the readout that answers whether a camera-view-matrix anchor is usable
-      // at all on the running engine, so it should be visible the moment the
-      // Clouds tree is opened rather than needing a third click to find. The
-      // look-tuning subtrees below stay closed by default as before.
-      ImGui::SetNextItemOpen(true, ImGuiCond_Once);
-      if (ImGui::TreeNode("World Space")) {
-        // Scale, split into measurement and artistic compression (fork -- 2026-09-06,
-        // units/altitude redesign). Previously one "Cloud Scene Unit Scale" carried both, which is
-        // why entering a game's true figure looked like a regression: on Fallout: New Vegas the
-        // working number is the true 70.4 u/m divided by a deliberate ~7x compression.
-        RemixGui::DragFloat("Units Per Metre", &RtxAtmosphere::unitsPerMeterObject(),
-                            0.1f, 0.0f, 10000.0f, "%.2f", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "How many game units make one real metre - a measurement of the game, not a look "
-            "setting. 70.4 for Gamebryo (Fallout / Skyrim), 100 for a centimetre engine, 39.37 for "
-            "an inch engine. 0 inherits it from the global Scene Unit Scale. Shared with the aerial "
-            "perspective so both agree about the size of the world. To change how large the "
-            "cloudscape reads, use Cloud World Compression instead of skewing this.");
-        RemixGui::DragFloat("Aerial Perspective Compression",
-                            &RtxAtmosphere::aerialPerspectiveWorldCompressionObject(),
-                            0.05f, 0.1f, 100.0f, "%.2f", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Makes haze read as though the world were larger than it is modelled, without touching "
-            "clouds, sky or global volumetrics. 1 is physically correct. Raise it on a map built "
-            "smaller than the region it depicts, where correct haze looks far too thin because the "
-            "far ridge is 300 m away rather than the 3 km it stands for. Replaces the retired "
-            "independent aerial perspective scale - the measurement above stays shared with the "
-            "clouds so the two can never disagree about the size of the world.");
-
-        RemixGui::DragFloat("Cloud World Compression", &RtxAtmosphere::cloudWorldCompressionObject(),
-                            0.1f, 0.1f, 10000.0f, "%.2f", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Shrinks the whole cloudscape by this factor - deck height, depth, cell and tile size, "
-            "wind and anchor distances together. 1 means the cloud system's metres are real metres. "
-            "Larger values suit a map built smaller than the region it depicts, where a physically "
-            "correct cloudscape reads far too high and too large. Around 7 for Fallout: New Vegas. "
-            "Clouds only; the aerial perspective stays physical.");
-
-
-        ImGui::Separator();
-
-        // Anchor source override (fork — 2026-09-05, world-space cloud migration Stage 2). Stage 0
-        // measured, in-game on Fallout: New Vegas, that RtCamera::getPosition() never moves — an
-        // anchor source that is not the view matrix is therefore not optional on that target. These
-        // two controls are that source: the game integration (e.g. the FalloutNV Remix wrapper)
-        // pushes cameraWorldOverride every frame and flips useCameraWorldOverride on once, after
-        // which the readouts below reflect it instead of the camera view matrix.
-        RemixGui::Checkbox("Use Camera World Override", &RtxAtmosphere::useCameraWorldOverrideObject());
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Anchor world-space clouds to Camera World Override below instead of the Remix camera "
-            "position. Required on camera-relative engines where RtCamera::getPosition() reads as "
-            "(0,0,0) — without it the cloud volume welds to the view and produces no parallax while "
-            "walking. The game integration is expected to push the real camera world position every "
-            "frame regardless of whether this is currently checked.");
-        RemixGui::DragFloat3("Camera World Override", &RtxAtmosphere::cameraWorldOverrideObject(),
-                             1.0f, -1.0e7f, 1.0e7f, "%.1f", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Camera world position, in the SAME raw game units / convention RtCamera::getPosition() "
-            "would have returned this frame. Normally pushed by the game integration every frame "
-            "(e.g. the FalloutNV Remix wrapper); editable here for manual testing. Only used as the "
-            "anchor while Use Camera World Override above is checked.");
-
-        ImGui::Separator();
-
-        // Read-only snapshot filled once per frame by RtxAtmosphere::updateFrame. Safe to read here
-        // even before the first frame has run: CloudAnchor default-constructs to all-zero, and every
-        // derived value below (length(), the /2pi turn count, cloudWorldUnitsPerKm()'s own clamp)
-        // stays finite at that state.
-        const CloudAnchor& anchor = getCloudAnchor();
-
-        const char* anchorSourceName = "Unknown";
-        switch (anchor.source) {
-          case CloudAnchor::Source::CameraViewMatrix:    anchorSourceName = "Camera View Matrix"; break;
-          case CloudAnchor::Source::CameraWorldOverride: anchorSourceName = "Camera World Override"; break;
-          default: break;
-        }
-        ImGui::Text("Anchor Source                %s", anchorSourceName);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Which source actually won this frame — the camera view matrix, or Camera World "
-            "Override above when Use Camera World Override is checked. A runtime/heuristic "
-            "estimator for engines with neither a usable view matrix nor an explicit push is "
-            "intentionally NOT implemented; see the warning at the bottom of this panel for what to "
-            "do instead if you land there.");
-
-        ImGui::Text("Raw Position (no freecam)   %10.2f, %10.2f, %10.2f",
-                    anchor.rawWorldUnits.x, anchor.rawWorldUnits.y, anchor.rawWorldUnits.z);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "camera.getPosition(freecam=false), in raw game units, unconverted (still whatever "
-            "handedness/up-axis the engine's view-to-world matrix uses). Diagnostic ONLY — always "
-            "the raw camera view matrix reading, even while Anchor Source above reads Camera World "
-            "Override; see Resolved Position below for what is actually in use this frame.");
-
-        ImGui::Text("Raw Position (freecam)      %10.2f, %10.2f, %10.2f",
-                    anchor.rawWorldUnitsFreecam.x, anchor.rawWorldUnitsFreecam.y, anchor.rawWorldUnitsFreecam.z);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Active viewer position in game units. Clouds use this position when Camera View Matrix "
-            "is the anchor source; freecam movement also offsets an explicit camera override.");
-
-        ImGui::Text("Resolved Position            %10.2f, %10.2f, %10.2f",
-                    anchor.resolvedRawWorldUnits.x, anchor.resolvedRawWorldUnits.y, anchor.resolvedRawWorldUnits.z);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "The active viewer position used by the clouds, in game units. An explicit camera "
-            "override supplies the player position plus the freecam displacement.");
-
-        ImGui::Text("Derived Position (Y-up, km) %10.3f, %10.3f, %10.3f",
-                    anchor.posYUpKm.x, anchor.posYUpKm.y, anchor.posYUpKm.z);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Resolved Position converted to Y-up cloud kilometres using Units Per Metre and Cloud "
-            "World Compression. This readout is before subtracting Ground Level; Camera Altitude "
-            "below includes that calibration.");
-
-        const float deltaKmMagnitude = length(anchor.deltaKm);
-        ImGui::Text("|Delta| This Frame (km)     %10.5f", deltaKmMagnitude);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Magnitude of this frame's change in Derived Position — how far the anchor moved since "
-            "last frame. A long run of exactly zero here, even while the view keeps turning, is the "
-            "pattern Cumulative Rotation / Ever Moved below are actually watching for.");
-
-        const float resolvedScale = RtxAtmosphere::cloudWorldUnitsPerKm();
-        ImGui::Text("Resolved Units Per Metre      %10.3f  [%s]", RtxAtmosphere::resolveUnitsPerMeter(),
-                    RtxAtmosphere::unitsPerMeter() > 0.0f ? "configured" : "inherited Scene Unit Scale");
-        ImGui::Text("Cloud Scale (units/km)        %10.3f", resolvedScale);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "1000 times Resolved Units Per Metre divided by Cloud World Compression. A smaller "
-            "number makes the cloud volume smaller and nearer in the game world.");
-
-        ImGui::Separator();
-
-        ImGui::Text("Static Frames                %u", anchor.staticFrameCount);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Consecutive frames where |Delta| has been exactly zero while the view direction is "
-            "still changing. Readout only — it does NOT gate the warning below, because a player "
-            "standing still and looking around produces exactly this pattern on a perfectly "
-            "healthy world-space engine too.");
-
-        ImGui::Text("Ever Moved This Session      %s", anchor.everMoved ? "true" : "false");
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Latched true the first time Raw Position (no freecam) is ever observed to differ from "
-            "this session's first sample; never clears once set. Paired with Cumulative Rotation "
-            "below as the only signal that actually tells 'not moving right now' apart from "
-            "'incapable of ever reporting movement'.");
-
-        const float cumulativeTurns = anchor.cumulativeRotationRadians / (2.0f * dxvk::kPi);
-        ImGui::Text("Cumulative Rotation         %10.2f rad  (%.3f turns)",
-                    anchor.cumulativeRotationRadians, cumulativeTurns);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Session-cumulative view rotation: sum of acos(dot(forward, prevForward)) taken every "
-            "frame after the first, shown here in full turns (divide by 2*pi) because that is the "
-            "readable unit. Exists only to pair with Ever Moved above as the warning gate.");
-
-        // Mirrors rtx_atmosphere.cpp's kWarnRotationRadians (search that name there): four full
-        // turns. Keep this threshold, and the wording below, in lockstep with that Logger::warn if
-        // either changes — this panel is meant to be the same measurement made visible, not a
-        // second opinion on top of it. Gated on !useCameraWorldOverride() (fork — 2026-09-05,
-        // world-space cloud migration Stage 2), mirroring the CPU-side gate added alongside it:
-        // once the override is on and actually resolving the anchor, this would otherwise keep
-        // warning about a problem that already has its fix checked above.
-        constexpr float kWarnRotationRadians = 4.0f * 2.0f * dxvk::kPi;
-        if (!RtxAtmosphere::useCameraWorldOverride()
-            && !anchor.everMoved && anchor.cumulativeRotationRadians > kWarnRotationRadians) {
-          // Same amber used for the upscaler panel's "fault" status color (rtx_fork_upscaler_ui.cpp).
-          constexpr ImVec4 kWarnColor { 250 / 255.f, 176 / 255.f, 50 / 255.f, 1.0f };
-          ImGui::PushStyleColor(ImGuiCol_Text, kWarnColor);
-          ImGui::TextWrapped(
-              "The position has never changed even once across %.1f turns of view rotation this "
-              "session. A real play session ordinarily moves the tracked position at least once "
-              "well before that much looking-around accumulates; never seeing that suggests this "
-              "engine keeps camera translation out of the D3D view matrix. Enable Use Camera World "
-              "Override above and push the game's real camera position through Camera World "
-              "Override instead of relying on the camera view matrix.",
-              cumulativeTurns);
-          ImGui::PopStyleColor();
-          RemixGui::SetTooltipToLastWidgetOnHover(
-              "This reports a measurement, not a verdict: what has been observed this session, not "
-              "a diagnosis. Check whether the game's view matrix actually carries translation "
-              "(RtCamera::getPosition(), rtx_camera.cpp:57-59) before concluding a "
-              "camera-view-matrix anchor is unusable on this engine.");
-        }
-
-        ImGui::Separator();
-
-        // Altitude datum (fork — 2026-09-05, world-space cloud migration Stage 2). Calibrates the
-        // resolved anchor's raw Y-up height (Derived Position's y component above) into the
-        // physical altitude every other atmosphere system shares — see getEyeRadius
-        // (atmosphere_common.slangh) and the calibration block in getAtmosphereArgs().
-        // Datum in RAW ENGINE UNITS (fork -- 2026-09-06, units/altitude redesign; was
-        // "Sea Level (world km)"). A km-valued datum is relative to the scale in force when it was
-        // captured, so re-scaling silently moved the ground out from under the deck. This is the
-        // number the calibration log prints, and Set to Here captures it directly.
-        RemixGui::DragFloat("Ground Level (world units)", &RtxAtmosphere::groundLevelWorldUnitsObject(),
-                            10.0f, -1000000.0f, 1000000.0f, "%.1f", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "The height, in the game's own world units, that counts as ground level - altitude "
-            "zero. Cloud heights are measured up from here. Use Set to Here rather than typing a "
-            "number. Unaffected by unit-scale changes.");
-        if (ImGui::Button("Set to Here", ImVec2(120, 0))) {
-          // Raw resolved anchor height in the engine's own up axis, pre-toYUp: exactly what the
-          // option stores, so no scale or axis conversion can go stale between capture and use.
-          const Vector3& raw = anchor.resolvedRawWorldUnits;
-          RtxAtmosphere::groundLevelWorldUnitsObject().setDeferred(RtxOptions::zUp() ? raw.z : raw.y);
-        }
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Set Ground Level to where the camera is standing right now, so cloud heights read as "
-            "height above the ground. Stand somewhere the game treats as ground level before "
-            "clicking. Unlike the old sea-level datum this stays correct if you change the scale.");
-
-        RemixGui::DragFloat("Cloud Vertical Offset (world units)",
-                            &RtxAtmosphere::cloudVerticalOffsetWorldUnitsObject(),
-                            10.0f, -100000000.0f, 100000000.0f, "%.1f", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Moves the whole cloud field vertically without changing cloud size or atmospheric ground level. "
-            "Positive raises it; negative lowers it. Use this to bring large clouds down into the level.");
-
-        float cloudOffset = 0.0f;
-        const bool canPlaceLayer = getCloudOffsetAtPlayer(cloudOffset);
-        ImGui::BeginDisabled(!canPlaceLayer);
-        if (ImGui::Button("Center Layer at Player")) {
-          RemixGui::CheckRtxOptionPopups(&RtxAtmosphere::cloudVerticalOffsetWorldUnitsObject());
-          RtxAtmosphere::cloudVerticalOffsetWorldUnitsObject().setDeferred(cloudOffset);
-        }
-        ImGui::EndDisabled();
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Moves the cloud field once so the primary layer's midpoint is at the last rendered player "
-            "position, including while freecam is active. Preserves cloud size and atmospheric ground level. "
-            "The layer stays fixed as you move. Re-center after changing compression or depth. "
-            "Clear gaps can remain between cloud bodies.");
-        if (!canPlaceLayer) {
-          ImGui::TextDisabled("Requires a rendered player position and a valid cloud layer.");
-        }
-
-        const AtmosphereArgs placement = getAtmosphereArgs();
-        ImGui::Text("Atmosphere Camera Altitude (m): %.1f", placement.cameraAltitudeKm * 1000.0f);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Physical camera altitude above Ground Level. Cloud compression and vertical offset do not change it.");
-        ImGui::Text("Cloud Frame Camera Altitude (m): %.1f", placement.cameraWorldPosYUpKm.y * 1000.0f);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Camera height in the cloud model, after compression and the cloud-only vertical offset.");
-        ImGui::Text("Cloud base / top from camera: %+.1f / %+.1f m",
-                    (placement.cloudAltitude - placement.cameraWorldPosYUpKm.y) * 1000.0f,
-                    (placement.cloudAltitude + placement.cloudThickness - placement.cameraWorldPosYUpKm.y) * 1000.0f);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Layer boundaries relative to the camera, including the active weather depth. "
-            "Positive values are above the camera; negative values are below it.");
-        ImGui::Text("Cloud base / top from camera: %+.1f / %+.1f world units",
-                    (placement.cloudAltitude - placement.cameraWorldPosYUpKm.y) * placement.worldUnitsPerKm,
-                    (placement.cloudAltitude + placement.cloudThickness - placement.cameraWorldPosYUpKm.y) * placement.worldUnitsPerKm);
-        ImGui::Text("Layer depth in game: %.1f world units", placement.cloudThickness * placement.worldUnitsPerKm);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "The cloud layer's actual size after scale and compression. Lowering Altitude moves "
-            "the base; it does not shrink the bodies. Increase Cloud World Compression to fit "
-            "the whole volume into a smaller area of the level.");
-        ImGui::Checkbox("Log Cloud Placement", &m_traceCloudPlacement);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Write camera, altitude, layer bounds and scale to remix-dxvk.log every 120 cloud "
-            "frames. Enable while reproducing placement problems. This does not change rendering.");
-
-        ImGui::Separator();
-
-        RemixGui::DragFloat("Anchor Cut Threshold (km)", &RtxAtmosphere::cloudAnchorCutKmObject(),
-                            0.05f, 0.0f, 50.0f, "%.2f", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Per-frame movement (km) of |Delta| This Frame above that counts as a camera cut, "
-            "forcing a one-frame reset of the screen-space cloud temporal history. "
-            "RtCamera::isCameraCut() cannot substitute for this — it compares the same view-matrix "
-            "translation Ever Moved above found permanently fixed on Fallout: New Vegas. A "
-            "teleport, a cell transition, or toggling Use Camera World Override can all move the "
-            "anchor by more than a real walking/flying player would in one frame; 0 disables the "
-            "reset entirely.");
-
-        ImGui::TreePop();
-      }
-
-      ImGui::SetNextItemOpen(true, ImGuiCond_Once);
-      if (ImGui::TreeNode("Basic")) {
-        dragFloatWithWeatherOverride(
-            "Coverage", &RtxAtmosphere::cloudCoverageMeanObject(),
-            WEATHER_OVERRIDE_PTR(cloudCoverageMean),
-            0.01f, 0.0f, 1.0f, "%.2f", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "How much of the sky has clouds. 0 = clear, 1 = overcast.");
-        dragFloatWithWeatherOverride(
-            "Cloud Type", &RtxAtmosphere::cloudTypeMeanObject(),
-            WEATHER_OVERRIDE_PTR(cloudTypeMean),
-            0.01f, 0.0f, 1.0f, "%.2f", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Erosion character of the clouds: 0 = wispy / stratiform "
-            "carving, 1 = billowy cumulus lumps. (Under the Nubis3 SDF "
-            "model, vertical cloud shape comes from the baked bodies - this "
-            "styles how they are carved, it no longer re-profiles "
-            "stratus -> cumulus.)");
-        // Slider max 4 -> 8 (fork -- 2026-09-07, smoke fix). Extinction is cloudDensity x profile^0.6
-        // per km and nothing else, and in a 1.5 km deck at a 1 km profile depth NO sample reaches
-        // profile 1 -- so with this pinned at 4 the only opacity lever left was Profile Depth, which
-        // the live conf had dragged down to make the deck cover the sky, and which at the same time
-        // made the lobe strands opaque enough to read as smoke. A half-height column goes 65% -> 88%
-        // opaque at zenith between 4 and 8. The default is unchanged. Past ~6 the 100-400 m far
-        // steps carry an optical depth per step near 1, which the animated jitter and the composite
-        // EMA absorb but do not hide entirely.
-        dragFloatWithWeatherOverride(
-            "Density", &RtxAtmosphere::cloudDensityObject(),
-            WEATHER_OVERRIDE_PTR(cloudDensity),
-            0.05f, 0.0f, 8.0f, "%.2f", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Cloud opacity (extinction per km of full-density cloud). Higher = thicker / darker "
-            "clouds. This, not Profile Depth, is the lever for making the deck cover the sky; "
-            "above ~6 the far march steps get coarse enough to show faint banding at the horizon.");
-        // Lower bound 0.5 -> 0.05 km and finer step (fork — 2026-09-05, world-space cloud
-        // migration): this range was authored against the uncorrected unit scale, where
-        // worldUnitsPerKm came from rtx.sceneScale (10000 units/km on FNV). With
-        // rtx.atmosphere.cloudScale set to the real Gamebryo figure (~0.704 -> 70400 units/km)
-        // the world converts to ~7x fewer km, so a deck at a given ALTITUDE IN KM sits ~7x
-        // higher relative to the terrain. Reproducing the pre-correction look needs roughly
-        // 0.8 / 7.04 = 0.11 km, which the old 0.5 km floor made unreachable -- the slider
-        // bottomed out with the clouds still far too high.
-        // Metres, not km (fork -- 2026-09-06, units/altitude redesign). "0.05 km" for a 50 m
-        // feature was the readability problem; the CB fields keep their km meaning and are filled
-        // by dividing by 1000. Rule the panel follows: heights are metres, sizes stay kilometres.
-        RemixGui::DragFloat("Altitude", &RtxAtmosphere::cloudBaseHeightMetersObject(),
-                            10.0f, 50.0f, 12000.0f, "%.0f m", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Height of the cloud deck's underside above the ground datum, in metres.");
-        RemixGui::DragFloat("Depth", &RtxAtmosphere::cloudDepthMetersObject(),
-                            50.0f, 100.0f, 8000.0f, "%.0f m", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Vertical depth of the cloud deck in metres. While a weather preset is active the "
-            "preset supplies this value instead.");
-        colorEdit3WithWeatherOverride(
-            "Color", &RtxAtmosphere::cloudColorObject(),
-            WEATHER_OVERRIDE_PTR(cloudColor));
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Base cloud albedo (RGB). Click the swatch for a color picker.");
-        ImGui::TreePop();
-      }
-
-      // Nubis3 SDF density model (Nubis3 conversion Phase B).
-      // Shape: the knobs that visibly restructure the cloud bodies
-      // (2026-07-17 preset-tunability pass; was "Nubis3 Model
-      // (SDF)"). Demoted to conf-only in the same pass — all live, all
-      // set-once or internal march quality: nvdfCoverageOffsetKm,
-      // nubis3SharpenStrength (nubis3SunNearFieldKm was RETIRED
-      // 2026-07-30 along with the live near-field sun path),
-      // nvdfStepScale, nubis3AdaptiveStepKm, nvdfNominalCoverage.
-      // (Interior Texture / HF Detail / Fine Detail were demoted earlier
-      // the same day — ship-at-0 / unreachable-in-normal-play.)
-      if (ImGui::TreeNode("Shape")) {
-        RemixGui::DragFloat("Shape Variety", &RtxAtmosphere::nubis3ShapeVarietyKmObject(),
-                            0.01f, 0.0f, 2.0f, "%.2f km", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Mid-frequency (Lobe Wavelength) push/pull of the whole body surface — "
-            "lobes, notches and full splits that break round singular "
-            "blobs into varied cloud clusters (the GT7 mid-band role). "
-            "Live, no rebake. Higher costs some empty-space-skip perf. "
-            "The effective value is capped at 0.65 x Lobe Wavelength.");
-        // Lobe Wavelength (fork -- 2026-09-07, smoke fix): the size of the shape-variety lobes,
-        // which used to be a hidden function of Detail Scale. Surfaced next to the amplitude it
-        // pairs with because the two only make sense together (see the cap in the tooltip).
-        RemixGui::DragFloat("Lobe Wavelength", &RtxAtmosphere::nubis3ShapeVarietyWavelengthKmObject(),
-                            0.05f, 0.5f, 6.0f, "%.2f km", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Size of the shape-variety lobes: the wavelength of the largest "
-            "bumps in a cloud's outline. Independent of Detail Scale, which "
-            "controls surface texture only. Shape Variety is capped at 0.65 x "
-            "this, so shrinking the lobes also shallows them — a displacement "
-            "deeper than about a third of its own wavelength tears the surface "
-            "into strands instead of bulging it. Below ~2 km the lobe pattern "
-            "repeats inside the 12 km noise tile.");
-        RemixGui::DragFloat("Lighting LOD", &RtxAtmosphere::cloudLightingLodThresholdObject(),
-                            0.002f, 0.0f, 0.25f, "%.3f", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Skips the expensive Sun Shadow (Near) refinement and the moon "
-            "shadow march on samples that barely reach the pixel — weight = "
-            "view transmittance x aerial haze x the sample's own opacity. "
-            "Recovers most of Sun Shadow (Near)'s cost while keeping the "
-            "lobe shading where it is actually visible. Raise until crevice "
-            "contrast or edges visibly soften, then back off. 0 = off.");
-        RemixGui::DragFloat("Edge Wisp Cut", &RtxAtmosphere::nubis3EdgeErosionObject(),
-                            0.02f, 0.0f, 3.0f, "%.2f", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Extra erosion shaped by the wispy noise, concentrated at the "
-            "silhouette — cuts trailing wisp shapes out of cloud edges. "
-            "Billowy cores keep rounded edges. 0 = off.");
-        RemixGui::DragFloat("Erosion Strength", &RtxAtmosphere::nubis3ErosionStrengthObject(),
-                            0.02f, 0.0f, 2.0f, "%.2f", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Wispy/billowy erosion of the body profile. 0 = smooth SDF "
-            "blobs; 1 = paper-faithful; higher = ragged carved clouds.");
-        RemixGui::DragFloat("Body Erosion", &RtxAtmosphere::nvdfBodyErosionStrengthObject(),
-                            0.02f, 0.0f, 1.5f, "%.2f", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "3D noise carve baked into the cloud BODIES (the anti-blobby "
-            "body lever): shifts the placement waterline per voxel so "
-            "columns bake in overhangs, notches and lumps instead of "
-            "convex blobs. 0 = smooth bodies. Re-bakes the SDF on change "
-            "(amortized, ~6 frames).");
-        RemixGui::DragFloat("Cloud Cell Size", &RtxAtmosphere::cloudCellSizeKmObject(),
-                            0.05f, 0.5f, 6.0f, "%.2f km", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Average footprint of a cloud cluster in km. Smaller = many "
-            "small clouds; larger = fewer, broader cloud banks. Re-bakes "
-            "the placement map live on change.");
-        RemixGui::DragFloat("Profile Depth", &RtxAtmosphere::nvdfProfileDepthKmObject(),
-                            0.02f, 0.1f, 3.0f, "%.2f km", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Depth into the body over which the dimensional profile ramps "
-            "0 -> 1. Small = hard-shelled dense clouds; large = soft "
-            "translucent edges.");
-        // Lighting Depth (fork -- 2026-09-08, painted-shading fix): the ramp the LIGHTING reads,
-        // split from the density ramp above. Sits under Profile Depth because it is the same ramp
-        // on a second depth, and the A/B that motivated it was a Profile Depth A/B (0.10 solid but
-        // painted vs 0.50 rich but ghostly).
-        RemixGui::DragFloat("Lighting Depth", &RtxAtmosphere::nvdfLightingProfileDepthKmObject(),
-                            0.02f, 0.0f, 3.0f, "%.2f km", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Depth over which the LIGHTING profile ramps 0 -> 1: the term that "
-            "fades the multi-scatter body light in and the sky ambient out with "
-            "depth. 0 = same as Profile Depth (the old behaviour). Set it deeper "
-            "than Profile Depth to keep solid hard-edged bodies while the "
-            "shading inside them keeps a continuous gradient instead of going "
-            "flat past the skin. Lighting only: silhouettes, density and the "
-            "shadow grids do not change.");
-        ImGui::TreePop();
-      }
-
-      // Detail: the detail knobs that visibly change the image in normal
-      // play (2026-07-17 preset-tunability pass; replaces the
-      // "Shaping" tree). Demoted to conf-only in the same pass (all still
-      // live in code):
-      //  - Variation: cloudCoverageSpread + cloudCoverageNoiseScale (ship
-      //    inert at spread 0), cloudTypeSpread + cloudTypeNoiseScale
-      //    (subtle erosion-character patchiness);
-      //  - Detail & Edges: cloudNoiseTileKm + cloudHexTilingEnable
-      //    (set-once field structure), cloudPowderStrength /
-      //    cloudDetailBaseShearKm / cloudEdgeAmbientFade (conditional
-      //    cues, user-verified invisible at FNV view distances);
-      //  - Columns: cloudColumnTopVariation / TopShape / BaseVariation /
-      //    Feather (bake-time via NVDF occupancy — amortized ~6 frames,
-      //    SDF-smoothed, evaluated at the pinned nominal coverage) and
-      //    cloudUndersideLightSigma (shape param; its Bottom Darkening
-      //    master stays in Lighting, and it remains a weather-preset
-      //    field). Cloud Cell Size moved to Shape.
-      if (ImGui::TreeNode("Detail")) {
-        RemixGui::DragFloat("Detail Shading", &RtxAtmosphere::cloudMicroAoStrengthObject(),
-                            0.01f, 0.0f, 1.0f, "%.2f", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Shades the carved detail: grown knuckles brighten, carved "
-            "crevices darken, so the detail reads INSIDE the cloud body "
-            "instead of only at the silhouette. Silver linings are exempt. "
-            "0 = off (smooth legacy shading).");
-        ImGui::TreePop();
-      }
-
-      if (ImGui::TreeNode("Lighting")) {
-        RemixGui::DragFloat("Forward Scatter", &RtxAtmosphere::cloudPhaseG1Object(),
-                            0.01f, 0.0f, 0.99f, "%.2f", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Strength of the silver-lining glow when looking toward the sun. "
-            "Higher = sharper rim of bright light around backlit clouds.");
-        // Glow Spread (cloudPhaseG2, secondary HG lobe) demoted to
-        // conf-only 2026-07-17 (preset-tunability pass): subtle envelope
-        // shaping under the Forward Scatter master.
-        RemixGui::DragFloat("Multi-Scatter", &RtxAtmosphere::cloudMsScaleObject(),
-                            0.05f, 0.0f, 2.0f, "%.2f", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Extinction scale on the multi-scatter body lobe. 1.0 = Nubis "
-            "Cubed paper baseline; HIGHER = darker sun-shadowed bulk (more "
-            "shading contrast), LOWER = brighter, flatter body fill. (Tooltip "
-            "direction fixed 2026-07-14.)");
-        dragFloatWithWeatherOverride(
-            "Ground Shadow", &RtxAtmosphere::cloudShadowStrengthObject(),
-            WEATHER_OVERRIDE_PTR(cloudShadowStrength),
-            0.01f, 0.0f, 1.0f, "%.2f", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "How strongly clouds cast shadows on terrain. 0 = no cloud "
-            "shadows, 1 = full voxel-grid cumulus-shaped shadow patches.");
-        dragFloatWithWeatherOverride(
-            "Bottom Darkening", &RtxAtmosphere::cloudBottomDarkeningObject(),
-            WEATHER_OVERRIDE_PTR(cloudBottomDarkening),
-            0.01f, 0.0f, 1.0f, "%.2f", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Overall strength of the cloud-underside darkening. Scales the "
-            "analytic per-column light field on the multi-scatter and "
-            "ambient terms; the direct sun beam (silver lining) is "
-            "unaffected. Strongest with the sun overhead and fades out "
-            "toward the horizon, where the low sun lights the bases "
-            "directly (sunset glow). 0 = uniformly lit (paper baseline). "
-            "The falloff SHAPE is the conf-only cloudUndersideLightSigma "
-            "(per-preset: Weather > Clouds > Lighting > Underside Shading).");
-        // Dramatic-shading pass (2026-07-14): D_sun-keyed attenuation
-        // of the sky-ambient fill, the contrast axis the flat ambient lacked.
-        RemixGui::DragFloat("Ambient Shadowing", &RtxAtmosphere::cloudAmbientShadowStrengthObject(),
-                            0.01f, 0.0f, 1.0f, "%.2f", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "How much sun-shadow depth darkens the cloud's ambient fill. The "
-            "sky-ambient otherwise refloods shaded bulk with bright daytime "
-            "sky, flattening the cloud; with this, shadowed cores fall toward "
-            "dark grey while sunlit faces and silver linings keep their full "
-            "ambient - the dramatic high-contrast cumulus read. Sky Fill is "
-            "exempt (it is the underside floor). 0 = off (flat legacy "
-            "ambient).");
-        RemixGui::DragFloat("Sky Fill", &RtxAtmosphere::cloudSkyAmbientFillObject(),
-                            0.01f, 0.0f, 1.0f, "%.2f", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "How strongly cloud undersides pick up the open sky around them. "
-            "Adds the overhead sky color as fill light that bypasses Bottom "
-            "Darkening (skylight reaches the base from below/around, not "
-            "through the cloud), so a bright daytime sky lifts gloomy "
-            "undersides and tints them with the real sky color. Fades on its "
-            "own at sunset. Higher = brighter, more sky-colored bases; 0 = "
-            "undersides ignore the open sky.");
-        // Sky Cloud Bleed (cloudSkyBleedStrength) demoted to conf-only
-        // 2026-07-17 (preset-tunability pass): subtle sky-tint coupling,
-        // default 0.15 kept.
-        ImGui::TreePop();
-      }
-
-      // Cloud Motion (2026-06-21, unification). One subtree for every
-      // way the cloud field moves/changes: bulk wind advection, in-place field
-      // morphing, and edge boil. All three are integrated by a single per-frame
-      // accumulator (RtxAtmosphere::advanceCloudMotion), so the slow weather
-      // "Weather Variation" (Weather panel) that varies wind speed/direction
-      // composes smoothly here rather than snapping the field. Rates are
-      // independent (no cross-coupling). Any speed at 0 freezes that part.
-      if (ImGui::TreeNode("Cloud Motion")) {
-        dragSpeedKmSAsMS("Wind Speed", &RtxAtmosphere::cloudWindSpeedObject(),
-                         0.5f, 0.0f, 1000.0f, sliderFlags,
-                         WEATHER_OVERRIDE_PTR(cloudWindSpeed));
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "How fast the whole cloud field drifts across the sky (m/s). "
-            "Real decks drift ~5-30 m/s. (Stored as km/s in the conf.)");
-        dragFloatWithWeatherOverride(
-            "Wind Direction", &RtxAtmosphere::cloudWindDirectionObject(),
-            WEATHER_OVERRIDE_PTR(cloudWindDirection),
-            1.0f, 0.0f, 360.0f, "%.1f deg", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Compass direction the wind blows toward in degrees. "
-            "0 = +X, 90 = +Z.");
-
-        ImGui::Separator();
-
-        dragSpeedKmSAsMS("Morph Speed", &RtxAtmosphere::cloudEvolutionSpeedObject(),
-                         0.1f, 0.0f, 50.0f, sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "How fast the carved cloud detail churns in place (m/s), "
-            "decorrelated from wind. Under the Nubis3 SDF model the cloud "
-            "BODIES change only on amortized re-bakes - this animates the "
-            "erosion / edge detail, not whole formations. 0 = detail "
-            "frozen. (Stored as km/s in the conf.)");
-        // Edge Boil Speed (cloudBoilSpeed) + Morph Vertical Bias
-        // (cloudEvolutionVerticalBias) demoted to conf-only 2026-07-17
-        // (panel audit): post-SDF, boil and morph scroll the SAME erosion/
-        // detail tap (differing only by a fixed direction), and the bias
-        // only re-aims that scroll - sub-perceptual as separate sliders.
-        // Both stay live in code at their defaults (boil 0.004 km/s keeps
-        // its churn contribution).
-
-        ImGui::TextDisabled("Slow weather-scale wind/coverage wander: Weather "
-                            "-> Weather Variation");
-        ImGui::TreePop();
-      }
-
-      // Lightning (2026-07-14, tier 1+2): in-cloud flash glow + a
-      // transient scene sphere light, driven by the RtxAtmosphere strike
-      // scheduler.
-      if (ImGui::TreeNode("Lightning")) {
-        RemixGui::Checkbox("Enable Lightning", &RtxAtmosphere::lightningEnableObject());
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Master switch (on by default). Lightning only actually fires "
-            "when Strikes Per Minute > 0 - raised automatically by storm "
-            "weather presets. Uncheck to mute lightning everywhere, storm "
-            "presets included.");
-        ImGui::SameLine();
-        if (ImGui::Button("Test Strike", ImVec2(120, 0))) {
-          RtxAtmosphere::requestLightningStrike();
-        }
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Fire one strike right now (requires Enable Lightning; works "
-            "at 0 strikes/min). Handy for tuning intensities without "
-            "waiting on the random schedule.");
-        dragFloatWithWeatherOverride(
-            "Strikes Per Minute", &RtxAtmosphere::lightningStrikesPerMinuteObject(),
-            WEATHER_OVERRIDE_PTR(lightningStrikesPerMinute),
-            0.1f, 0.0f, 60.0f, "%.1f", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Mean strike rate. Gaps are randomized so strikes cluster and "
-            "lull like a real storm. 0 = no automatic strikes. The weather "
-            "presets drive this while active (thunderstorm 12, rainstorm "
-            "4) - manual edits will be overridden during a preset blend.");
-        RemixGui::DragFloat("Cloud Flash Brightness", &RtxAtmosphere::lightningFlashIntensityObject(),
-                            1.0f, 0.0f, 1000.0f, "%.0f", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Radiance of the glow inside the cloud deck. The flash competes "
-            "with direct sunlight - day storms need much more than night "
-            "ones.");
-        RemixGui::DragFloat("Scene Flash Brightness", &RtxAtmosphere::lightningSceneLightIntensityObject(),
-                            10.0f, 0.0f, 100000.0f, "%.0f", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Radiance of the transient light that flashes the ground / "
-            "scene, independent of the in-cloud glow. 0 = cloud-only "
-            "lightning.");
-        RemixGui::DragFloat("Max Strike Distance", &RtxAtmosphere::lightningRangeKmObject(),
-                            0.1f, 1.5f, 30.0f, "%.1f km", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "How far from the camera strikes may land. Distant strikes "
-            "read as horizon sheet-lightning; near ones light the ground "
-            "hard.");
-        RemixGui::ColorEdit3("Flash Color", &RtxAtmosphere::lightningColorObject());
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Flash tint for both the in-cloud glow and the scene flash. "
-            "Default is a cool blue-white.");
-        ImGui::TreePop();
-      }
-
-      if (ImGui::TreeNode("Layer 2")) {
-        RemixGui::Checkbox("Enable Layer 2",
-                           &RtxAtmosphere::cloudLayer2EnableObject());
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Adds a second high-altitude cloud deck on top of the main "
-            "layer. Off by default. Voxel-grid terrain shadows still come "
-            "from layer 1 only.");
-        ImGui::BeginDisabled(!layer2On);
-        RemixGui::DragFloat("Layer 2 Altitude", &RtxAtmosphere::cloudLayer2BaseHeightMetersObject(),
-                            50.0f, 500.0f, 20000.0f, "%.0f m", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Height of the second deck's underside above the ground datum, in metres. The default "
-            "targets the cirrus band.");
-        RemixGui::DragFloat("Layer 2 Depth", &RtxAtmosphere::cloudLayer2DepthMetersObject(),
-                            50.0f, 50.0f, 6000.0f, "%.0f m", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Vertical depth of the second deck in metres. Cirrus is thin.");
-        RemixGui::DragFloat("Layer 2 Coverage", &RtxAtmosphere::cloudLayer2CoverageMeanObject(),
-                            0.01f, 0.0f, 1.0f, "%.2f", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "How much of the sky has layer-2 clouds. Defaults sparser than "
-            "layer 1 so cirrus reads as patches, not overcast.");
-        RemixGui::DragFloat("Layer 2 Cloud Type", &RtxAtmosphere::cloudLayer2TypeMeanObject(),
-                            0.01f, 0.0f, 1.0f, "%.2f", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Cloud type for layer 2. Low values (~0.05) read as stratiform "
-            "wisps - appropriate for cirrus.");
-        // Layer 2 Type Spread (cloudLayer2TypeSpread) demoted to conf-only
-        // 2026-07-17 (preset-tunability pass).
-        RemixGui::DragFloat("Layer 2 Density", &RtxAtmosphere::cloudLayer2DensityScaleObject(),
-                            0.01f, 0.0f, 2.0f, "%.2f", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Per-step density multiplier for layer 2 only. Lower values keep "
-            "the echo deck from competing with the main cumulus deck.");
-        // Layer 2 Step Floor / Max Steps (cloudLayer2StepFloor /
-        // cloudLayer2StepMax) demoted to conf-only 2026-07-17
-        // (preset-tunability pass): march-quality internals.
-        RemixGui::ColorEdit3("Layer 2 Color", &RtxAtmosphere::cloudLayer2ColorObject());
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Base color (albedo) of the echo deck, independent of the main "
-            "cloud Color. Defaults to the same near-white; tint it to "
-            "differentiate the upper deck. All other look knobs stay shared "
-            "with layer 1.");
-        ImGui::EndDisabled();
-        ImGui::TreePop();
-      }
-
-      if (ImGui::TreeNode("Performance")) {
-        RemixGui::Checkbox("Fast Cloud Reflections", &RtxAtmosphere::cloudSecondaryLutEnableObject());
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Reflections and indirect light sample a small per-frame cloud "
-            "lookup table instead of re-marching the cloud volume per ray. "
-            "Large performance win on cloudy skies; reflected clouds also "
-            "match the main sky exactly. Uncheck to restore the legacy "
-            "per-ray cloud march for comparison.");
-        RemixGui::DragFloat("Cloud Render Scale", &RtxAtmosphere::cloudRenderResolutionScaleObject(),
-                            0.05f, 0.25f, 1.0f, "%.2f", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Resolution of the cloud render relative to the internal render "
-            "resolution. 0.5 = quarter the pixels (~4x cheaper clouds, "
-            "slightly softer); 1.0 = native (legacy). Applies live.");
-        RemixGui::DragFloat("Temporal Smoothing", &RtxAtmosphere::cloudHistoryWeightObject(),
-                            0.005f, 0.0f, 0.98f, "%.2f", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "EMA history weight of the cloud temporal smoother. Higher = "
-            "smoother clouds that respond slowly; lower = crisper detail "
-            "with more visible per-frame jitter. 0 = raw jittered march (no "
-            "temporal blend). The history is neighbourhood-clipped (see "
-            "Temporal Clamp) so a high weight cannot trail. Applies live.");
-        RemixGui::DragFloat("Temporal Clamp", &RtxAtmosphere::cloudHistoryClampGammaObject(),
-                            0.01f, 0.0f, 4.0f, "%.2f", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Neighbourhood clip strength of the cloud temporal smoother: the "
-            "reprojected history is clipped to mean +- gamma * stddev of the "
-            "current frame's 3x3 cloud neighbourhood before blending, so a "
-            "reprojection error can never trail further than the local spread. "
-            "Lower = tighter/crisper; higher = looser/smoother. 0 = no clip "
-            "(the pre-2026-09-06 blend, for A/B only). Applies live.");
-        RemixGui::DragFloat("Cloud Sample Spacing", &RtxAtmosphere::cloudViewStepKmObject(),
-                            0.01f, 0.0f, 1.0f, "%.2f km", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Distance between cloud samples along each view ray, in km. "
-            "This is the fix for the horizontal banding near the horizon: "
-            "sightlines there cross 50+ km of cloud layer, and the old "
-            "fixed 32-sample march spaced samples too far apart to resolve "
-            "the clouds.\n\nPERFORMANCE: cost scales with how many samples "
-            "a ray needs -- overhead sightlines are unchanged, but "
-            "horizon-heavy views can take up to Max Cloud Samples / 32 "
-            "times the cloud cost (2x at the defaults). Raise the spacing "
-            "or lower Max Cloud Samples to claw the cost back, or set 0 "
-            "to restore the legacy fixed march (banding returns). "
-            "Cloud Render Scale above also directly offsets this cost. "
-            "Applies live.");
-        RemixGui::DragInt("Max Cloud Samples", &RtxAtmosphere::cloudViewSamplesMaxObject(),
-                          1.0f, 32, 256, "%d", sliderFlags);
-        RemixGui::SetTooltipToLastWidgetOnHover(
-            "Hard cap on cloud samples per ray -- the performance governor "
-            "for Cloud Sample Spacing. 64 resolves the default spacing "
-            "out to ~6 km of cloud span; lower values cost less but let "
-            "a little banding back in at the far horizon. 32 = legacy "
-            "cost ceiling. Applies live.");
-        ImGui::TreePop();
-      }
-
-      // Horizon & Haze tree demoted to conf-only 2026-07-17
-      // (preset-tunability pass): cloudCurvature (set-once, pinned 0.38) —
-      // fully retired 2026-09-05, world-space cloud migration Stage 1; see
-      // rtx_atmosphere.h — cloudAerialHazePerKm + cloudAerialFadePerKm are
-      // still per-preset editable in the Weather panel (they are
-      // weather-preset fields "Distance Haze" / "Horizon Fade" under
-      // Clouds > Distance).
-
-      ImGui::TreePop();
-    }
-
-    // ----- Precipitation (global) -----
-    // Sibling of Clouds, not a child of the Weather panel: these are budget,
-    // spawn-volume, collision and material knobs — the precipitation analogue
-    // of Clouds > Performance — and every one of them is a global RtxOption.
-    // The per-preset look values stay in the weather preset editor, generated
-    // from WEATHER_PRESET_FIELD_LIST.
-    PrecipitationSystem::showImguiSettings();
+    ImGui::EndCombo();
+  }
+  RemixGui::SetTooltipToLastWidgetOnHover("Applies a starting atmosphere and sun color. Clouds and weather are configured in their own tabs.");
+
+  ImGui::Separator();
+  renderSunUI(getTimeOfDayHours());
+
+  if (ImGui::TreeNode("Sky color & brightness")) {
+    dragFloatWithWeatherOverride(
+      "Air", &RtxAtmosphere::airDensityObject(), WEATHER_OVERRIDE_PTR(airDensity),
+      0.01f, 0.0f, 100.0f, "%.2f", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover("Density of air molecules");
+
+    dragFloatWithWeatherOverride(
+      "Dust", &RtxAtmosphere::aerosolDensityObject(), WEATHER_OVERRIDE_PTR(aerosolDensity),
+      0.01f, 0.0f, 100.0f, "%.2f", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover("Density of aerosols/dust");
+
+    RemixGui::DragFloat("Ozone", &RtxAtmosphere::ozoneDensityObject(), 0.01f, 0.0f, 100.0f, "%.2f", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover("Density of ozone layer");
+
+    RemixGui::DragFloat("Sunset Saturation", &RtxAtmosphere::sunsetSaturationObject(), 0.01f, 0.0f, 3.0f, "%.2f", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Saturation boost on sky radiance, ramped in only as the sun nears the horizon (midday sky untouched). "
+      ">1 amplifies the warm horizon hues the physical model renders accurately but undersaturated; 1.0 = no change. "
+      "Feeds the sky-view LUT, so clouds inherit the warmer ambient.");
+
+    dragFloatWithWeatherOverride(
+      "Sky Indirect Scale", &RtxAtmosphere::skyIndirectRadianceScaleObject(),
+      WEATHER_OVERRIDE_PTR(skyIndirectRadianceScale),
+      0.01f, 0.0f, 20.0f, "%.2f", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Multiplier for sky radiance gathered by diffuse indirect bounces only. 1.0 = physical. "
+      "Raise it to brighten diffuse sky fill (the distant-light sun out-radiates the sky, so indirect "
+      "lighting reads dull). Sky seen via reflection, refraction, alpha-cutout, or the primary view stays "
+      "at physical brightness, so reflections keep matching the visible sky.");
+    ImGui::TreePop();
   }
 
+  if (ImGui::TreeNode("Atmosphere model (advanced)")) {
+    RemixGui::DragFloat("Planet Radius", &RtxAtmosphere::planetRadiusObject(), 10.0f, 1000.0f, 10000.0f, "%.0f km", sliderFlags);
+    RemixGui::DragFloat("Atmosphere Thickness", &RtxAtmosphere::atmosphereThicknessObject(), 1.0f, 10.0f, 500.0f, "%.0f km", sliderFlags);
+    RemixGui::DragFloat("Mie Anisotropy", &RtxAtmosphere::mieAnisotropyObject(), 0.01f, -1.0f, 1.0f, "%.2f", sliderFlags);
+
+    renderChromaticityWidget(
+      "Sun Color (Base)", "Sun Illuminance",
+      &RtxAtmosphere::sunIlluminanceObject(),
+      0.1f, 100.0f, "%.1f",
+      "Sun spectral color (Hillaire base illuminance, chromaticity).",
+      "Sun base illuminance magnitude (overall sun-power level).",
+      m_sunIlluminanceUiState,
+      WEATHER_OVERRIDE_PTR(sunIlluminance));
+
+    renderChromaticityWidget(
+      "Air Color (Base)", "Air Scattering Strength",
+      &RtxAtmosphere::rayleighScatteringObject(),
+      0.0005f, 0.1f, "%.4f /km",
+      "Air molecule scattering chromaticity (Rayleigh per-channel scattering coefficients). "
+      "Larger blue = cooler sky.",
+      "Air scattering magnitude. Higher = more atmospheric scattering overall.",
+      m_rayleighScatteringUiState,
+      WEATHER_OVERRIDE_PTR(rayleighScattering));
+
+    renderChromaticityWidget(
+      "Dust Color (Base)", "Dust Scattering Strength",
+      &RtxAtmosphere::mieScatteringObject(),
+      0.0005f, 0.05f, "%.4f /km",
+      "Aerosol / dust scattering chromaticity (Mie per-channel coefficients).",
+      "Dust scattering magnitude. Higher = hazier atmosphere.",
+      m_mieScatteringUiState);
+
+    renderChromaticityWidget(
+      "Dust Absorption Tint (Base)", "Dust Absorption Strength",
+      &RtxAtmosphere::mieAbsorptionObject(),
+      0.0005f, 0.05f, "%.4f /km",
+      "Aerosol / dust ABSORPTION chromaticity. Aerosols absorb as well as scatter, and this is "
+      "the half that darkens rather than brightens. Tinting it is what makes dust brown-and-dim "
+      "or smoke grey-and-dark instead of merely denser; a blue-weighted absorption is what "
+      "inverts a Mars-like sky and its sunsets.",
+      "Dust absorption magnitude. Raise relative to Dust Scattering Strength to darken haze as "
+      "it thickens; Earth's aerosols sit at roughly 4.4e-3 /km, comparable to their scattering.",
+      m_mieAbsorptionUiState);
+
+    renderChromaticityWidget(
+      "Ozone Tint (Base)", "Ozone Absorption Strength",
+      &RtxAtmosphere::ozoneAbsorptionObject(),
+      0.0001f, 0.05f, "%.5f /km",
+      "Ozone absorption chromaticity (per-channel coefficients). "
+      "Affects twilight color and high-altitude tint.",
+      "Ozone absorption magnitude.",
+      m_ozoneAbsorptionUiState);
+    RemixGui::DragFloat("Ozone Layer Altitude", &RtxAtmosphere::ozoneLayerAltitudeObject(), 0.5f, 0.0f, 50.0f, "%.1f km", sliderFlags);
+    RemixGui::DragFloat("Ozone Layer Width", &RtxAtmosphere::ozoneLayerWidthObject(), 0.5f, 1.0f, 30.0f, "%.1f km", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Half-width of the ozone tent profile, and therefore the vertical ozone column in km "
+      "(the paper uses a 30 km wide tent, so 15).");
+
+    RemixGui::DragFloat("Multiscatter Physical Strength", &RtxAtmosphere::multiScatterPhysicalStrengthObject(), 0.01f, 0.0f, 1.0f, "%.2f", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "0 = artistic multiscattering (analytical inline fit; preset color stays faithful, easy to style). "
+      "1 = physical multiscattering (the Hillaire EGSR 2020 Psi_ms LUT: second-order scattering plus the "
+      "1/(1-f_ms) series for every higher order, with the ground bounce evaluated in-march. Its colour is "
+      "derived from the atmosphere's composition rather than assumed, so it is harder to art-direct but "
+      "correct). Intermediate values blend.");
+
+    RemixGui::DragFloat("Multiscatter Strength", &RtxAtmosphere::multiScatterStrengthObject(), 0.01f, 0.0f, 2.0f, "%.2f", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Global scale on the multiscattering 'fill' term. The physical model adds a broadband (pale-blue) "
+      "multiscatter term that desaturates warm sunset color. Lower (e.g. 0.3-0.6) to let warm single-scatter "
+      "dominate for a punchier sunset; 1.0 = physical. Feeds the sky-view LUT, so clouds inherit it.");
+    ImGui::TreePop();
+  }
+}
+
+void RtxAtmosphere::showCloudSettings(const WeatherSnapshot* weatherSnapshot) {
+  constexpr ImGuiSliderFlags sliderFlags = ImGuiSliderFlags_AlwaysClamp;
+
+  ImGui::TextWrapped("Shape the clouds here. Use placement to move the layer without shrinking its clouds.");
+  RemixGui::Checkbox("Enable Clouds", &RtxAtmosphere::cloudEnabledObject());
+  if (!RtxAtmosphere::cloudEnabled()) {
+    ImGui::TextWrapped("Clouds are off. You can still prepare their settings below.");
+  }
+  dragFloatWithWeatherOverride(
+    "Coverage", &RtxAtmosphere::cloudCoverageMeanObject(),
+    WEATHER_OVERRIDE_PTR(cloudCoverageMean),
+    0.01f, 0.0f, 1.0f, "%.2f", sliderFlags);
+  RemixGui::SetTooltipToLastWidgetOnHover(
+    "How much of the sky has clouds. 0 = clear, 1 = overcast.");
+  dragFloatWithWeatherOverride(
+    "Cloud Type (wispy - billowy)", &RtxAtmosphere::cloudTypeMeanObject(),
+    WEATHER_OVERRIDE_PTR(cloudTypeMean),
+    0.01f, 0.0f, 1.0f, "%.2f", sliderFlags);
+  RemixGui::SetTooltipToLastWidgetOnHover(
+    "Erosion character of the clouds: 0 = wispy / stratiform "
+    "carving, 1 = billowy cumulus lumps. (Under the Nubis3 SDF "
+    "model, vertical cloud shape comes from the baked bodies - this "
+    "styles how they are carved, it no longer re-profiles "
+    "stratus -> cumulus.)");
+  dragFloatWithWeatherOverride(
+    "Density", &RtxAtmosphere::cloudDensityObject(),
+    WEATHER_OVERRIDE_PTR(cloudDensity),
+    0.05f, 0.0f, 8.0f, "%.2f", sliderFlags);
+  RemixGui::SetTooltipToLastWidgetOnHover(
+    "Cloud opacity (extinction per km of full-density cloud). Higher = thicker / darker "
+    "clouds. This, not Profile Depth, is the lever for making the deck cover the sky; "
+    "above ~6 the far march steps get coarse enough to show faint banding at the horizon.");
+  colorEdit3WithWeatherOverride(
+    "Cloud Color", &RtxAtmosphere::cloudColorObject(),
+    WEATHER_OVERRIDE_PTR(cloudColor));
+  RemixGui::SetTooltipToLastWidgetOnHover(
+    "Base cloud albedo (RGB). Click the swatch for a color picker.");
+
+  if (ImGui::TreeNode("Placement & scale")) {
+    RemixGui::DragFloat("Layer Base Height", &RtxAtmosphere::cloudBaseHeightMetersObject(),
+      10.0f, 50.0f, 12000.0f, "%.0f m", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Base height within the cloud model, before compression and vertical offset. Use Vertical Offset to "
+      "position the layer in the level.");
+    const float* weatherDepth = WEATHER_OVERRIDE_PTR(cloudThickness);
+    const float weatherDepthMeters = weatherDepth ? *weatherDepth * 1000.0f : 0.0f;
+    dragFloatWithWeatherOverride("Layer Thickness", &RtxAtmosphere::cloudDepthMetersObject(),
+      weatherDepth ? &weatherDepthMeters : nullptr,
+      50.0f, 100.0f, 8000.0f, "%.0f m", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Thickness of the cloud layer before compression. Active weather can supply this value; edit it in "
+      "the Weather tab.");
+
+    RemixGui::DragFloat("Cloud World Compression", &RtxAtmosphere::cloudWorldCompressionObject(),
+      0.1f, 0.1f, 10000.0f, "%.2f", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Higher values shrink the whole cloudscape, including cloud bodies. Use Vertical Offset to move "
+      "clouds without shrinking them. Re-center after changing compression.");
+
+    RemixGui::DragFloat("Cloud Vertical Offset (world units)",
+      &RtxAtmosphere::cloudVerticalOffsetWorldUnitsObject(),
+      10.0f, -100000000.0f, 100000000.0f, "%.1f", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Moves both cloud layers without changing their size or atmospheric ground. Positive raises them; "
+      "negative lowers them.");
+
+    float cloudOffset = 0.0f;
+    const bool canPlaceLayer = getCloudOffsetAtPlayer(cloudOffset);
+    ImGui::BeginDisabled(!canPlaceLayer);
+    if (ImGui::Button("Center Layer at Player")) {
+      RemixGui::CheckRtxOptionPopups(&RtxAtmosphere::cloudVerticalOffsetWorldUnitsObject());
+      RtxAtmosphere::cloudVerticalOffsetWorldUnitsObject().setDeferred(cloudOffset);
+    }
+    ImGui::EndDisabled();
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Places the main layer around the player once, even in freecam. Clouds stay fixed afterward. "
+      "Re-center after changing compression or depth. Clear gaps between clouds can remain.");
+    if (!canPlaceLayer) {
+      ImGui::TextDisabled("Requires a rendered player position and a valid cloud layer.");
+    }
+
+    if (ImGui::TreeNode("Placement readouts")) {
+      const AtmosphereArgs placement = getAtmosphereArgs();
+      ImGui::Text("Atmosphere Camera Altitude (m): %.1f", placement.cameraAltitudeKm * 1000.0f);
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "Physical camera altitude above Ground Level. Cloud compression and vertical offset do not change it.");
+      ImGui::Text("Cloud Frame Camera Altitude (m): %.1f", placement.cameraWorldPosYUpKm.y * 1000.0f);
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "Camera height in the cloud model, after compression and the cloud-only vertical offset.");
+      ImGui::Text("Cloud base / top from camera: %+.1f / %+.1f m",
+        (placement.cloudAltitude - placement.cameraWorldPosYUpKm.y) * 1000.0f,
+        (placement.cloudAltitude + placement.cloudThickness - placement.cameraWorldPosYUpKm.y) * 1000.0f);
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "Layer boundaries relative to the camera, including the active weather depth. "
+        "Positive values are above the camera; negative values are below it.");
+      ImGui::Text("Cloud base / top from camera: %+.1f / %+.1f world units",
+        (placement.cloudAltitude - placement.cameraWorldPosYUpKm.y) * placement.worldUnitsPerKm,
+        (placement.cloudAltitude + placement.cloudThickness - placement.cameraWorldPosYUpKm.y) * placement.worldUnitsPerKm);
+      ImGui::Text("Layer depth in game: %.1f world units", placement.cloudThickness * placement.worldUnitsPerKm);
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "The cloud layer's actual size after scale and compression. Lowering Layer Base Height moves "
+        "the base; it does not shrink the bodies. Increase Cloud World Compression to fit "
+        "the whole volume into a smaller area of the level.");
+      ImGui::TreePop();
+    }
+    ImGui::TreePop();
+  }
+
+  if (ImGui::TreeNode("Shape & edges")) {
+    RemixGui::DragFloat("Shape Variety", &RtxAtmosphere::nubis3ShapeVarietyKmObject(),
+      0.01f, 0.0f, 2.0f, "%.2f km", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Mid-frequency (Lobe Wavelength) push/pull of the whole body surface — "
+      "lobes, notches and full splits that break round singular "
+      "blobs into varied cloud clusters (the GT7 mid-band role). "
+      "Live, no rebake. Higher costs some empty-space-skip perf. "
+      "The effective value is capped at 0.65 x Lobe Wavelength.");
+    RemixGui::DragFloat("Lobe Wavelength", &RtxAtmosphere::nubis3ShapeVarietyWavelengthKmObject(),
+      0.05f, 0.5f, 6.0f, "%.2f km", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Size of the shape-variety lobes: the wavelength of the largest "
+      "bumps in a cloud's outline. Independent of Detail Scale, which "
+      "controls surface texture only. Shape Variety is capped at 0.65 x "
+      "this, so shrinking the lobes also shallows them — a displacement "
+      "deeper than about a third of its own wavelength tears the surface "
+      "into strands instead of bulging it. Below ~2 km the lobe pattern "
+      "repeats inside the 12 km noise tile.");
+    RemixGui::DragFloat("Edge Wisp Cut", &RtxAtmosphere::nubis3EdgeErosionObject(),
+      0.02f, 0.0f, 3.0f, "%.2f", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Extra erosion shaped by the wispy noise, concentrated at the "
+      "silhouette — cuts trailing wisp shapes out of cloud edges. "
+      "Billowy cores keep rounded edges. 0 = off.");
+    RemixGui::DragFloat("Erosion Strength", &RtxAtmosphere::nubis3ErosionStrengthObject(),
+      0.02f, 0.0f, 2.0f, "%.2f", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Wispy/billowy erosion of the body profile. 0 = smooth SDF "
+      "blobs; 1 = paper-faithful; higher = ragged carved clouds.");
+    RemixGui::DragFloat("Body Erosion", &RtxAtmosphere::nvdfBodyErosionStrengthObject(),
+      0.02f, 0.0f, 1.5f, "%.2f", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "3D noise carve baked into the cloud BODIES (the anti-blobby "
+      "body lever): shifts the placement waterline per voxel so "
+      "columns bake in overhangs, notches and lumps instead of "
+      "convex blobs. 0 = smooth bodies. Re-bakes the SDF on change "
+      "(amortized, ~6 frames).");
+    RemixGui::DragFloat("Cloud Cell Size", &RtxAtmosphere::cloudCellSizeKmObject(),
+      0.05f, 0.5f, 6.0f, "%.2f km", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Average footprint of a cloud cluster in km. Smaller = many "
+      "small clouds; larger = fewer, broader cloud banks. Re-bakes "
+      "the placement map live on change.");
+    RemixGui::DragFloat("Profile Depth", &RtxAtmosphere::nvdfProfileDepthKmObject(),
+      0.02f, 0.1f, 3.0f, "%.2f km", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Depth into the body over which the dimensional profile ramps "
+      "0 -> 1. Small = hard-shelled dense clouds; large = soft "
+      "translucent edges.");
+    ImGui::TreePop();
+  }
+
+  if (ImGui::TreeNode("Lighting")) {
+    RemixGui::DragFloat("Forward Scatter", &RtxAtmosphere::cloudPhaseG1Object(),
+      0.01f, 0.0f, 0.99f, "%.2f", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Strength of the silver-lining glow when looking toward the sun. "
+      "Higher = sharper rim of bright light around backlit clouds.");
+    RemixGui::DragFloat("Multi-Scatter", &RtxAtmosphere::cloudMsScaleObject(),
+      0.05f, 0.0f, 2.0f, "%.2f", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Extinction scale on the multi-scatter body lobe. 1.0 = Nubis "
+      "Cubed paper baseline; HIGHER = darker sun-shadowed bulk (more "
+      "shading contrast), LOWER = brighter, flatter body fill. (Tooltip "
+      "direction fixed 2026-07-14.)");
+    dragFloatWithWeatherOverride(
+      "Ground Shadow", &RtxAtmosphere::cloudShadowStrengthObject(),
+      WEATHER_OVERRIDE_PTR(cloudShadowStrength),
+      0.01f, 0.0f, 1.0f, "%.2f", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "How strongly clouds cast shadows on terrain. 0 = no cloud "
+      "shadows, 1 = full voxel-grid cumulus-shaped shadow patches.");
+    dragFloatWithWeatherOverride(
+      "Bottom Darkening", &RtxAtmosphere::cloudBottomDarkeningObject(),
+      WEATHER_OVERRIDE_PTR(cloudBottomDarkening),
+      0.01f, 0.0f, 1.0f, "%.2f", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Overall strength of the cloud-underside darkening. Scales the "
+      "analytic per-column light field on the multi-scatter and "
+      "ambient terms; the direct sun beam (silver lining) is "
+      "unaffected. Strongest with the sun overhead and fades out "
+      "toward the horizon, where the low sun lights the bases "
+      "directly (sunset glow). 0 = uniformly lit (paper baseline). "
+      "The falloff SHAPE is the conf-only cloudUndersideLightSigma "
+      "(per-preset: Weather > Clouds > Lighting > Underside Shading).");
+    RemixGui::DragFloat("Ambient Shadowing", &RtxAtmosphere::cloudAmbientShadowStrengthObject(),
+      0.01f, 0.0f, 1.0f, "%.2f", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "How much sun-shadow depth darkens the cloud's ambient fill. The "
+      "sky-ambient otherwise refloods shaded bulk with bright daytime "
+      "sky, flattening the cloud; with this, shadowed cores fall toward "
+      "dark grey while sunlit faces and silver linings keep their full "
+      "ambient - the dramatic high-contrast cumulus read. Sky Fill is "
+      "exempt (it is the underside floor). 0 = off (flat legacy "
+      "ambient).");
+    RemixGui::DragFloat("Sky Fill", &RtxAtmosphere::cloudSkyAmbientFillObject(),
+      0.01f, 0.0f, 1.0f, "%.2f", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "How strongly cloud undersides pick up the open sky around them. "
+      "Adds the overhead sky color as fill light that bypasses Bottom "
+      "Darkening (skylight reaches the base from below/around, not "
+      "through the cloud), so a bright daytime sky lifts gloomy "
+      "undersides and tints them with the real sky color. Fades on its "
+      "own at sunset. Higher = brighter, more sky-colored bases; 0 = "
+      "undersides ignore the open sky.");
+    RemixGui::DragFloat("Lighting Depth", &RtxAtmosphere::nvdfLightingProfileDepthKmObject(),
+      0.02f, 0.0f, 3.0f, "%.2f km", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Depth over which the LIGHTING profile ramps 0 -> 1: the term that "
+      "fades the multi-scatter body light in and the sky ambient out with "
+      "depth. 0 = same as Profile Depth (the old behaviour). Set it deeper "
+      "than Profile Depth to keep solid hard-edged bodies while the "
+      "shading inside them keeps a continuous gradient instead of going "
+      "flat past the skin. Lighting only: silhouettes, density and the "
+      "shadow grids do not change.");
+    RemixGui::DragFloat("Detail Shading", &RtxAtmosphere::cloudMicroAoStrengthObject(),
+      0.01f, 0.0f, 1.0f, "%.2f", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Shades the carved detail: grown knuckles brighten, carved "
+      "crevices darken, so the detail reads INSIDE the cloud body "
+      "instead of only at the silhouette. Silver linings are exempt. "
+      "0 = off (smooth legacy shading).");
+    ImGui::TreePop();
+  }
+
+  if (ImGui::TreeNode("Wind & motion")) {
+    dragSpeedKmSAsMS("Wind Speed", &RtxAtmosphere::cloudWindSpeedObject(),
+      0.5f, 0.0f, 1000.0f, sliderFlags,
+      WEATHER_OVERRIDE_PTR(cloudWindSpeed));
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "How fast the whole cloud field drifts across the sky (m/s). "
+      "Real decks drift ~5-30 m/s. (Stored as km/s in the conf.)");
+    dragFloatWithWeatherOverride(
+      "Wind Direction", &RtxAtmosphere::cloudWindDirectionObject(),
+      WEATHER_OVERRIDE_PTR(cloudWindDirection),
+      1.0f, 0.0f, 360.0f, "%.1f deg", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Compass direction the wind blows toward in degrees. "
+      "0 = +X, 90 = +Z.");
+
+    ImGui::Separator();
+
+    dragSpeedKmSAsMS("Morph Speed", &RtxAtmosphere::cloudEvolutionSpeedObject(),
+      0.1f, 0.0f, 50.0f, sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "How fast the carved cloud detail churns in place (m/s), "
+      "decorrelated from wind. Under the Nubis3 SDF model the cloud "
+      "BODIES change only on amortized re-bakes - this animates the "
+      "erosion / edge detail, not whole formations. 0 = detail "
+      "frozen. (Stored as km/s in the conf.)");
+
+    ImGui::TextDisabled("Slow weather-scale wind/coverage wander: Weather "
+      "-> Weather Variation");
+    ImGui::TreePop();
+  }
+
+  if (ImGui::TreeNode("Second cloud layer")) {
+    RemixGui::Checkbox("Enable Layer 2",
+      &RtxAtmosphere::cloudLayer2EnableObject());
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Adds a second high-altitude cloud deck on top of the main "
+      "layer. Off by default. Voxel-grid terrain shadows still come "
+      "from layer 1 only.");
+    ImGui::BeginDisabled(!RtxAtmosphere::cloudLayer2Enable());
+    RemixGui::DragFloat("Layer 2 Altitude", &RtxAtmosphere::cloudLayer2BaseHeightMetersObject(),
+      50.0f, 500.0f, 20000.0f, "%.0f m", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Height of the second deck's underside above the ground datum, in metres. The default "
+      "targets the cirrus band.");
+    RemixGui::DragFloat("Layer 2 Depth", &RtxAtmosphere::cloudLayer2DepthMetersObject(),
+      50.0f, 50.0f, 6000.0f, "%.0f m", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Vertical depth of the second deck in metres. Cirrus is thin.");
+    RemixGui::DragFloat("Layer 2 Coverage", &RtxAtmosphere::cloudLayer2CoverageMeanObject(),
+      0.01f, 0.0f, 1.0f, "%.2f", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "How much of the sky has layer-2 clouds. Defaults sparser than "
+      "layer 1 so cirrus reads as patches, not overcast.");
+    RemixGui::DragFloat("Layer 2 Cloud Type", &RtxAtmosphere::cloudLayer2TypeMeanObject(),
+      0.01f, 0.0f, 1.0f, "%.2f", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Cloud type for layer 2. Low values (~0.05) read as stratiform "
+      "wisps - appropriate for cirrus.");
+    RemixGui::DragFloat("Layer 2 Density", &RtxAtmosphere::cloudLayer2DensityScaleObject(),
+      0.01f, 0.0f, 2.0f, "%.2f", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Per-step density multiplier for layer 2 only. Lower values keep "
+      "the echo deck from competing with the main cumulus deck.");
+    RemixGui::ColorEdit3("Layer 2 Color", &RtxAtmosphere::cloudLayer2ColorObject());
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Base color (albedo) of the echo deck, independent of the main "
+      "cloud Color. Defaults to the same near-white; tint it to "
+      "differentiate the upper deck. All other look knobs stay shared "
+      "with layer 1.");
+    ImGui::EndDisabled();
+    ImGui::TreePop();
+  }
+
+  if (ImGui::TreeNode("Quality & performance")) {
+    RemixGui::Checkbox("Fast Cloud Reflections", &RtxAtmosphere::cloudSecondaryLutEnableObject());
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Reflections and indirect light sample a small per-frame cloud "
+      "lookup table instead of re-marching the cloud volume per ray. "
+      "Large performance win on cloudy skies; reflected clouds also "
+      "match the main sky exactly. Uncheck to restore the legacy "
+      "per-ray cloud march for comparison.");
+    RemixGui::DragFloat("Cloud Render Scale", &RtxAtmosphere::cloudRenderResolutionScaleObject(),
+      0.05f, 0.25f, 1.0f, "%.2f", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Resolution of the cloud render relative to the internal render "
+      "resolution. 0.5 = quarter the pixels (~4x cheaper clouds, "
+      "slightly softer); 1.0 = native (legacy). Applies live.");
+    RemixGui::DragFloat("Temporal Smoothing", &RtxAtmosphere::cloudHistoryWeightObject(),
+      0.005f, 0.0f, 0.98f, "%.2f", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "EMA history weight of the cloud temporal smoother. Higher = "
+      "smoother clouds that respond slowly; lower = crisper detail "
+      "with more visible per-frame jitter. 0 = raw jittered march (no "
+      "temporal blend). The history is neighbourhood-clipped (see "
+      "Temporal Clamp) so a high weight cannot trail. Applies live.");
+    RemixGui::DragFloat("Temporal Clamp", &RtxAtmosphere::cloudHistoryClampGammaObject(),
+      0.01f, 0.0f, 4.0f, "%.2f", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Neighbourhood clip strength of the cloud temporal smoother: the "
+      "reprojected history is clipped to mean +- gamma * stddev of the "
+      "current frame's 3x3 cloud neighbourhood before blending, so a "
+      "reprojection error can never trail further than the local spread. "
+      "Lower = tighter/crisper; higher = looser/smoother. 0 = no clip "
+      "(the pre-2026-09-06 blend, for A/B only). Applies live.");
+    RemixGui::DragFloat("Cloud Sample Spacing", &RtxAtmosphere::cloudViewStepKmObject(),
+      0.01f, 0.0f, 1.0f, "%.2f km", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Distance between cloud samples along each view ray, in km. "
+      "This is the fix for the horizontal banding near the horizon: "
+      "sightlines there cross 50+ km of cloud layer, and the old "
+      "fixed 32-sample march spaced samples too far apart to resolve "
+      "the clouds.\n\nPERFORMANCE: cost scales with how many samples "
+      "a ray needs -- overhead sightlines are unchanged, but "
+      "horizon-heavy views can take up to Max Cloud Samples / 32 "
+      "times the cloud cost (2x at the defaults). Raise the spacing "
+      "or lower Max Cloud Samples to claw the cost back, or set 0 "
+      "to restore the legacy fixed march (banding returns). "
+      "Cloud Render Scale above also directly offsets this cost. "
+      "Applies live.");
+    RemixGui::DragInt("Max Cloud Samples", &RtxAtmosphere::cloudViewSamplesMaxObject(),
+      1.0f, 32, 256, "%d", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Hard cap on cloud samples per ray -- the performance governor "
+      "for Cloud Sample Spacing. 64 resolves the default spacing "
+      "out to ~6 km of cloud span; lower values cost less but let "
+      "a little banding back in at the far horizon. 32 = legacy "
+      "cost ceiling. Applies live.");
+    RemixGui::DragFloat("Lighting LOD", &RtxAtmosphere::cloudLightingLodThresholdObject(),
+      0.002f, 0.0f, 0.25f, "%.3f", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Skips the expensive Sun Shadow (Near) refinement and the moon "
+      "shadow march on samples that barely reach the pixel — weight = "
+      "view transmittance x aerial haze x the sample's own opacity. "
+      "Recovers most of Sun Shadow (Near)'s cost while keeping the "
+      "lobe shading where it is actually visible. Raise until crevice "
+      "contrast or edges visibly soften, then back off. 0 = off.");
+    ImGui::TreePop();
+  }
+}
+
+void RtxAtmosphere::showHazeSettings() {
+  constexpr ImGuiSliderFlags sliderFlags = ImGuiSliderFlags_AlwaysClamp;
+
+  ImGui::TextWrapped("Aerial perspective adds haze and depth to distant terrain, buildings, and clouds.");
+  RemixGui::Checkbox("Enable Distance Haze", &RtxAtmosphere::aerialPerspectiveObject());
+  RemixGui::SetTooltipToLastWidgetOnHover(
+    "Adds atmospheric haze to distant surfaces and clouds. Near-field fog is handled by global "
+    "volumetrics.");
+
+  if (RtxAtmosphere::aerialPerspective()) {
+    RemixGui::DragFloat("Aerial Perspective Compression",
+      &RtxAtmosphere::aerialPerspectiveWorldCompressionObject(),
+      0.05f, 0.1f, 100.0f, "%.2f", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Increases haze as if distances were larger. 1 uses the measured game scale. Does not resize clouds.");
+
+    ImGui::Text("Units Per Metre             %10.2f", RtxAtmosphere::resolveUnitsPerMeter());
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Shared game scale, configured in Setup. Cloud compression does not affect haze.");
+
+    RemixGui::DragFloat("Cloud In-Scatter",
+      &RtxAtmosphere::cloudAerialInScatterStrengthObject(),
+      0.01f, 0.0f, 1.0f, "%.2f", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Adds atmospheric light between you and the clouds. 0 disables it; 1 applies the full contribution.");
+
+    RemixGui::DragFloat("Range", &RtxAtmosphere::aerialPerspectiveDepthRangeMetersObject(),
+      100.0f, 100.0f, 200000.0f, "%.0f m", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Farthest distance represented by the haze volume. Reduce it for denser fog to concentrate detail "
+      "nearer the camera.");
+
+    if (ImGui::TreeNode("Near surfaces")) {
+      RemixGui::DragFloat("Near Fade Start",
+        &RtxAtmosphere::aerialPerspectiveNearFadeStartMetersObject(),
+        1.0f, 0.0f, 5000.0f, "%.0f m", sliderFlags);
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "No distant haze is applied closer than this distance. Raise it if haze leaks onto nearby surfaces or "
+        "interiors.");
+
+      RemixGui::DragFloat("Near Fade End",
+        &RtxAtmosphere::aerialPerspectiveNearFadeEndMetersObject(),
+        1.0f, 0.0f, 20000.0f, "%.0f m", sliderFlags);
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "Distance where haze reaches full strength. Keep it above Near Fade Start for a smooth transition.");
+      ImGui::TreePop();
+    }
+
+    if (ImGui::TreeNode("Sun shadows")) {
+      RemixGui::Checkbox("Scene Shadows",
+        &RtxAtmosphere::aerialPerspectiveSceneShadowObject());
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "Lets scene geometry block sunlight in the haze. Adds ray-tracing cost; for continuous shadow shafts "
+        "across sky and terrain, use global volumetrics.");
+
+      if (RtxAtmosphere::aerialPerspectiveSceneShadow()) {
+        RemixGui::Checkbox("Separate Visibility Pass (Experimental)",
+          &RtxAtmosphere::aerialPerspectiveSeparateVisibilityObject());
+        RemixGui::SetTooltipToLastWidgetOnHover(
+          "Preserves the sun samples and sky probes while evaluating visibility in a separate pass. "
+          "Uses an additional 4.5 MiB at the default resolution. Performance depends on the GPU and scene; "
+          "disable to use the original combined pass.");
+        RemixGui::DragFloat("Shadow Range",
+          &RtxAtmosphere::aerialPerspectiveSceneShadowRangeMetersObject(),
+          10.0f, 0.0f, 100000.0f, "%.0f m", sliderFlags);
+        RemixGui::SetTooltipToLastWidgetOnHover(
+          "How far from the camera scene geometry may shadow the column. Samples past this "
+          "trace nothing and count as sunlit, which is what the air above the rooftops "
+          "actually is. Raise it for scenes with occluders far larger than a kilometre; lower "
+          "it to spend fewer rays.");
+
+        if (ImGui::TreeNode("Diagnostics")) {
+          const char* kShadowDebugModes[] = {
+            "Off (production)",
+            "1: Force occluded (no trace)",
+            "2: Trace, inverted",
+          };
+          RemixGui::Combo("Scene Shadow Diagnostic",
+            &RtxAtmosphere::aerialPerspectiveSceneShadowDebugObject(),
+            kShadowDebugModes, IM_ARRAYSIZE(kShadowDebugModes));
+          RemixGui::SetTooltipToLastWidgetOnHover(
+            "Takes apart the ways scene shadowing can silently do nothing - they all look the "
+            "same on screen otherwise.\n\n"
+            "1 occludes the column without consulting the scene: the halo MUST vanish. If it "
+            "does not, the constant or the dispatch is broken and the ray tracing is beside the "
+            "point.\n\n"
+            "2 traces and inverts: the halo must survive ONLY where a ray found geometry. A "
+            "screen that stays uniformly lit means the rays are hitting nothing.");
+          ImGui::TreePop();
+        }
+
+      }
+      ImGui::TreePop();
+    }
+
+    if (ImGui::TreeNode("Local lights")) {
+      RemixGui::Checkbox("Local Lights",
+        &RtxAtmosphere::aerialPerspectiveLocalLightsObject());
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "Lets lamps, torches, and other scene lights illuminate distant haze. Additional cost depends on the "
+        "lights in range.");
+
+      if (RtxAtmosphere::aerialPerspectiveLocalLights()) {
+        RemixGui::DragFloat("Local Light Intensity",
+          &RtxAtmosphere::aerialPerspectiveLocalLightIntensityObject(),
+          0.05f, 0.0f, 100.0f, "%.2f", sliderFlags);
+        RemixGui::SetTooltipToLastWidgetOnHover(
+          "Gain on the local light contribution alone. 1.0 is physical: a light's radiance "
+          "enters the medium at face value and leaves scaled by the air's own scattering "
+          "coefficient. Raise it when a game's lights are authored dimmer than the air density "
+          "that reads correctly for distant haze - the usual reason a lamp shows no glow.");
+
+        RemixGui::Checkbox("Local Light Shadows",
+          &RtxAtmosphere::aerialPerspectiveLocalLightShadowsObject());
+        RemixGui::SetTooltipToLastWidgetOnHover(
+          "Stops local lights from illuminating haze through walls. Adds shadow rays for lights in range.");
+
+        if (RtxAtmosphere::aerialPerspectiveLocalLightShadows()) {
+          RemixGui::DragFloat("Local Light Shadow Range",
+            &RtxAtmosphere::aerialPerspectiveLocalLightShadowRangeMetersObject(),
+            5.0f, 0.0f, 100000.0f, "%.0f m", sliderFlags);
+          RemixGui::SetTooltipToLastWidgetOnHover(
+            "How far from the camera local lights may be shadowed. Slices past this treat "
+            "their lights as unoccluded, which costs nothing and is rarely visible: a light "
+            "reaching that far is either bright enough that its shaft is lost in the haze or "
+            "far enough that the volume cannot resolve the shaft anyway.");
+        }
+
+        RemixGui::DragFloat("Local Light Cutoff",
+          &RtxAtmosphere::aerialPerspectiveLocalLightCutoffObject(),
+          0.0005f, 0.0f, 1.0f, "%.4f", sliderFlags);
+        RemixGui::SetTooltipToLastWidgetOnHover(
+          "Minimum contribution worth keeping from a light. Raise to reduce cost; lower if light glows end too "
+          "abruptly.");
+
+        RemixGui::DragInt("Local Light Budget",
+          &RtxAtmosphere::aerialPerspectiveLocalLightMaxCountObject(),
+          1.0f, 0, 4096, "%d", sliderFlags);
+        RemixGui::SetTooltipToLastWidgetOnHover(
+          "Maximum scene lights considered for haze. The brightest lights are kept first. Higher values "
+          "increase light-culling cost.");
+      }
+      ImGui::TreePop();
+    }
+
+    if (ImGui::TreeNode("Quality & scattering limits")) {
+      RemixGui::DragInt("Resolution",
+        &RtxAtmosphere::aerialPerspectiveLutResolutionObject(),
+        1.0f, 8, 256, "%d", sliderFlags);
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "Screen resolution of the haze volume. Higher reduces angular banding but increases cost "
+        "quadratically.");
+
+      RemixGui::DragInt("Depth Slices",
+        &RtxAtmosphere::aerialPerspectiveLutDepthSlicesObject(),
+        1.0f, 4, 128, "%d", sliderFlags);
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "Samples along the depth of the haze volume. Higher improves distance detail and increases cost "
+        "linearly.");
+
+      RemixGui::DragFloat("Forward Scatter Cap",
+        &RtxAtmosphere::aerialPerspectiveMieAnisotropyMaxObject(),
+        0.01f, -1.0f, 1.0f, "%.2f", sliderFlags);
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "Limits sun-facing glare in distant haze. Lower it to soften halos; the visible sky keeps its own "
+        "scattering setting.");
+      ImGui::TreePop();
+    }
+
+  }
+}
+
+void RtxAtmosphere::showNightSettings(const WeatherSnapshot* weatherSnapshot) {
+  constexpr ImGuiSliderFlags sliderFlags = ImGuiSliderFlags_AlwaysClamp;
+
+  dragFloatWithWeatherOverride(
+    "Night Sky Brightness", &RtxAtmosphere::nightSkyBrightnessObject(),
+    WEATHER_OVERRIDE_PTR(nightSkyBrightness),
+    0.001f, 0.0f, 0.1f, "%.4f", sliderFlags);
+  RemixGui::SetTooltipToLastWidgetOnHover("Airglow / ambient night-sky brightness.");
+  colorEdit3WithWeatherOverride(
+    "Night Sky Color", &RtxAtmosphere::nightSkyColorObject(),
+    WEATHER_OVERRIDE_PTR(nightSkyColor));
+  RemixGui::SetTooltipToLastWidgetOnHover(
+    "Tint of the ambient night-sky / airglow contribution. Magnitude is set by Night Sky Brightness above.");
+
+  renderStarsUI();
+  renderMilkyWayUI();
+  renderStarAppearanceUI();
+
+  if (ImGui::TreeNode("Moons")) {
+    renderMoonGlobalLightingUI(WEATHER_OVERRIDE_PTR(moonAtmosphericCouplingStrength));
+    renderMoonCloudLookUI();
+
+    for (int i = 0; i < static_cast<int>(MAX_MOONS); ++i) {
+      renderMoonUI(i);
+    }
+    ImGui::TreePop();
+  }
+}
+
+void RtxAtmosphere::showWeatherSettings(WeatherBlender* blender, const WeatherSnapshot* weatherSnapshot) {
+  constexpr ImGuiSliderFlags sliderFlags = ImGuiSliderFlags_AlwaysClamp;
+
+  if (blender) {
+    blender->showImguiSettings();
+  } else {
+    ImGui::TextWrapped("Weather controls become available when a scene is loaded.");
+  }
+  ImGui::Separator();
+  if (ImGui::TreeNode("Lightning")) {
+    RemixGui::Checkbox("Enable Lightning", &RtxAtmosphere::lightningEnableObject());
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Master switch (on by default). Lightning only actually fires "
+      "when Strikes Per Minute > 0 - raised automatically by storm "
+      "weather presets. Uncheck to mute lightning everywhere, storm "
+      "presets included.");
+    ImGui::SameLine();
+    if (ImGui::Button("Test Strike", ImVec2(120, 0))) {
+      RtxAtmosphere::requestLightningStrike();
+    }
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Fire one strike right now (requires Enable Lightning; works "
+      "at 0 strikes/min). Handy for tuning intensities without "
+      "waiting on the random schedule.");
+    dragFloatWithWeatherOverride(
+      "Strikes Per Minute", &RtxAtmosphere::lightningStrikesPerMinuteObject(),
+      WEATHER_OVERRIDE_PTR(lightningStrikesPerMinute),
+      0.1f, 0.0f, 60.0f, "%.1f", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Mean strike rate. Gaps are randomized so strikes cluster and "
+      "lull like a real storm. 0 = no automatic strikes. The weather "
+      "presets drive this while active (thunderstorm 12, rainstorm "
+      "4) - manual edits will be overridden during a preset blend.");
+    RemixGui::DragFloat("Cloud Flash Brightness", &RtxAtmosphere::lightningFlashIntensityObject(),
+      1.0f, 0.0f, 1000.0f, "%.0f", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Radiance of the glow inside the cloud deck. The flash competes "
+      "with direct sunlight - day storms need much more than night "
+      "ones.");
+    RemixGui::DragFloat("Scene Flash Brightness", &RtxAtmosphere::lightningSceneLightIntensityObject(),
+      10.0f, 0.0f, 100000.0f, "%.0f", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Radiance of the transient light that flashes the ground / "
+      "scene, independent of the in-cloud glow. 0 = cloud-only "
+      "lightning.");
+    RemixGui::DragFloat("Max Strike Distance", &RtxAtmosphere::lightningRangeKmObject(),
+      0.1f, 1.5f, 30.0f, "%.1f km", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "How far from the camera strikes may land. Distant strikes "
+      "read as horizon sheet-lightning; near ones light the ground "
+      "hard.");
+    RemixGui::ColorEdit3("Flash Color", &RtxAtmosphere::lightningColorObject());
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Flash tint for both the in-cloud glow and the scene flash. "
+      "Default is a cool blue-white.");
+    ImGui::TreePop();
+  }
+
+  PrecipitationSystem::showImguiSettings();
+}
+
+void RtxAtmosphere::showSkySetup() {
+  constexpr ImGuiSliderFlags sliderFlags = ImGuiSliderFlags_AlwaysClamp;
+
+  if (RtxOptions::skyMode() == SkyMode::Numos) {
+    ImGui::TextWrapped("Set the game's orientation and scale once. Cloud height and size are under Clouds > Placement & scale.");
+    RemixGui::Checkbox("Z is up", &RtxOptions::zUpObject());
+    RemixGui::SetTooltipToLastWidgetOnHover("Global game orientation. Enable for Z-up games; disable for Y-up games. This also affects other Remix systems.");
+    RemixGui::Checkbox("Flip Up Axis", &RtxAtmosphere::flipUpAxisObject());
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Use if the sky is upside down. For a sideways sky, change Z is up instead.");
+
+    RemixGui::DragFloat("Units Per Metre", &RtxAtmosphere::unitsPerMeterObject(),
+      0.1f, 0.0f, 10000.0f, "%.2f", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Game units per real metre, shared by clouds and haze. 0 uses the global Scene Unit Scale; Fallout "
+      "games typically use 70.4. Use cloud compression to change cloud size.");
+
+    const CloudAnchor& anchor = getCloudAnchor();
+    RemixGui::DragFloat("Ground Level (world units)", &RtxAtmosphere::groundLevelWorldUnitsObject(),
+      10.0f, -1000000.0f, 1000000.0f, "%.1f", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Height that counts as zero atmosphere altitude, in game units. Stand at ground level and use Set to "
+      "Here.");
+    if (ImGui::Button("Set to Here", ImVec2(120, 0))) {
+      const Vector3& raw = anchor.resolvedRawWorldUnits;
+      RtxAtmosphere::groundLevelWorldUnitsObject().setDeferred(RtxOptions::zUp() ? raw.z : raw.y);
+    }
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Use the current viewer height as atmospheric ground. Exit freecam and stand at normal ground level "
+      "first.");
+    if (ImGui::TreeNode("Camera override (advanced)")) {
+      RemixGui::Checkbox("Use Camera World Override", &RtxAtmosphere::useCameraWorldOverrideObject());
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "Use a position supplied by a game integration when the regular camera position does not track "
+        "movement.");
+      RemixGui::DragFloat3("Camera World Override", &RtxAtmosphere::cameraWorldOverrideObject(),
+        1.0f, -1.0e7f, 1.0e7f, "%.1f", sliderFlags);
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "Player position in raw game units, normally updated by a game integration. Used only while the "
+        "override is enabled.");
+
+      ImGui::Separator();
+      ImGui::TreePop();
+    }
+
+    if (ImGui::TreeNode("Diagnostics")) {
+      const char* anchorSourceName = "Unknown";
+      switch (anchor.source) {
+        case CloudAnchor::Source::CameraViewMatrix:    anchorSourceName = "Camera View Matrix"; break;
+        case CloudAnchor::Source::CameraWorldOverride: anchorSourceName = "Camera World Override"; break;
+        default: break;
+      }
+      ImGui::Text("Anchor Source                %s", anchorSourceName);
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "Which source actually won this frame — the camera view matrix, or Camera World "
+        "Override when Use Camera World Override is checked. A runtime/heuristic "
+        "estimator for engines with neither a usable view matrix nor an explicit push is "
+        "intentionally NOT implemented; see the warning at the bottom of this panel for what to "
+        "do instead if you land there.");
+
+      ImGui::Text("Raw Position (no freecam)   %10.2f, %10.2f, %10.2f",
+        anchor.rawWorldUnits.x, anchor.rawWorldUnits.y, anchor.rawWorldUnits.z);
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "camera.getPosition(freecam=false), in raw game units, unconverted (still whatever "
+        "handedness/up-axis the engine's view-to-world matrix uses). Diagnostic ONLY — always "
+        "the raw camera view matrix reading, even while Anchor Source above reads Camera World "
+        "Override; see Resolved Position below for what is actually in use this frame.");
+
+      ImGui::Text("Raw Position (freecam)      %10.2f, %10.2f, %10.2f",
+        anchor.rawWorldUnitsFreecam.x, anchor.rawWorldUnitsFreecam.y, anchor.rawWorldUnitsFreecam.z);
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "Active viewer position in game units. Clouds use this position when Camera View Matrix "
+        "is the anchor source; freecam movement also offsets an explicit camera override.");
+
+      ImGui::Text("Resolved Position            %10.2f, %10.2f, %10.2f",
+        anchor.resolvedRawWorldUnits.x, anchor.resolvedRawWorldUnits.y, anchor.resolvedRawWorldUnits.z);
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "The active viewer position used by the clouds, in game units. An explicit camera "
+        "override supplies the player position plus the freecam displacement.");
+
+      ImGui::Text("Derived Position (Y-up, km) %10.3f, %10.3f, %10.3f",
+        anchor.posYUpKm.x, anchor.posYUpKm.y, anchor.posYUpKm.z);
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "Resolved position in the cloud model before ground calibration and vertical offset. Detailed layer "
+        "heights are under Clouds > Placement & scale > Placement readouts.");
+
+      const float deltaKmMagnitude = length(anchor.deltaKm);
+      ImGui::Text("|Delta| This Frame (km)     %10.5f", deltaKmMagnitude);
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "Magnitude of this frame's change in Derived Position — how far the anchor moved since "
+        "last frame. A long run of exactly zero here, even while the view keeps turning, is the "
+        "pattern Cumulative Rotation / Ever Moved below are actually watching for.");
+
+      const float resolvedScale = RtxAtmosphere::cloudWorldUnitsPerKm();
+      ImGui::Text("Resolved Units Per Metre      %10.3f  [%s]", RtxAtmosphere::resolveUnitsPerMeter(),
+        RtxAtmosphere::unitsPerMeter() > 0.0f ? "configured" : "inherited Scene Unit Scale");
+      ImGui::Text("Cloud Scale (units/km)        %10.3f", resolvedScale);
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "1000 times Resolved Units Per Metre divided by Cloud World Compression. A smaller "
+        "number makes the cloud volume smaller and nearer in the game world.");
+
+      ImGui::Separator();
+
+      ImGui::Text("Static Frames                %u", anchor.staticFrameCount);
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "Consecutive frames where |Delta| has been exactly zero while the view direction is "
+        "still changing. Readout only — it does NOT gate the warning below, because a player "
+        "standing still and looking around produces exactly this pattern on a perfectly "
+        "healthy world-space engine too.");
+
+      ImGui::Text("Ever Moved This Session      %s", anchor.everMoved ? "true" : "false");
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "Latched true the first time Raw Position (no freecam) is ever observed to differ from "
+        "this session's first sample; never clears once set. Paired with Cumulative Rotation "
+        "below as the only signal that actually tells 'not moving right now' apart from "
+        "'incapable of ever reporting movement'.");
+
+      const float cumulativeTurns = anchor.cumulativeRotationRadians / (2.0f * dxvk::kPi);
+      ImGui::Text("Cumulative Rotation         %10.2f rad  (%.3f turns)",
+        anchor.cumulativeRotationRadians, cumulativeTurns);
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "Session-cumulative view rotation: sum of acos(dot(forward, prevForward)) taken every "
+        "frame after the first, shown here in full turns (divide by 2*pi) because that is the "
+        "readable unit. Exists only to pair with Ever Moved above as the warning gate.");
+
+      constexpr float kWarnRotationRadians = 4.0f * 2.0f * dxvk::kPi;
+      if (!RtxAtmosphere::useCameraWorldOverride()
+        && !anchor.everMoved && anchor.cumulativeRotationRadians > kWarnRotationRadians) {
+        constexpr ImVec4 kWarnColor { 250 / 255.f, 176 / 255.f, 50 / 255.f, 1.0f };
+        ImGui::PushStyleColor(ImGuiCol_Text, kWarnColor);
+        ImGui::TextWrapped(
+          "The position has never changed even once across %.1f turns of view rotation this "
+          "session. A real play session ordinarily moves the tracked position at least once "
+          "well before that much looking-around accumulates; never seeing that suggests this "
+          "engine keeps camera translation out of the D3D view matrix. Enable Use Camera World "
+          "Override under Camera override (advanced) and supply the real camera position through Camera World "
+          "Override instead of relying on the camera view matrix.",
+          cumulativeTurns);
+        ImGui::PopStyleColor();
+        RemixGui::SetTooltipToLastWidgetOnHover(
+          "This reports a measurement, not a verdict: what has been observed this session, not "
+          "a diagnosis. Check whether the game's view matrix actually carries translation "
+          "(RtCamera::getPosition(), rtx_camera.cpp:57-59) before concluding a "
+          "camera-view-matrix anchor is unusable on this engine.");
+      }
+
+      ImGui::Separator();
+
+      ImGui::Checkbox("Log Cloud Placement", &m_traceCloudPlacement);
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "Write camera, altitude, layer bounds and scale to remix-dxvk.log every 120 cloud "
+        "frames. Enable while reproducing placement problems. This does not change rendering.");
+
+      ImGui::Separator();
+
+      RemixGui::DragFloat("Anchor Cut Threshold (km)", &RtxAtmosphere::cloudAnchorCutKmObject(),
+        0.05f, 0.0f, 50.0f, "%.2f", sliderFlags);
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "Per-frame movement (km) of |Delta| This Frame above that counts as a camera cut, "
+        "forcing a one-frame reset of the screen-space cloud temporal history. "
+        "RtCamera::isCameraCut() cannot substitute for this — it compares the same view-matrix "
+        "translation Ever Moved above found permanently fixed on Fallout: New Vegas. A "
+        "teleport, a cell transition, or toggling Use Camera World Override can all move the "
+        "anchor by more than a real walking/flying player would in one frame; 0 disables the "
+        "reset entirely.");
+      ImGui::TreePop();
+    }
+
+  }
+  ImGui::Separator();
+  renderSkyCaptureUI();
+}
+
 #undef WEATHER_OVERRIDE_PTR
+
+void RtxAtmosphere::showImguiSettings(WeatherBlender* blender) {
+  constexpr ImGuiSliderFlags sliderFlags = ImGuiSliderFlags_AlwaysClamp;
+  const WeatherSnapshot* weatherSnapshot = blender ? blender->getBlendedSnapshot() : nullptr;
+  const bool useNumos = RtxOptions::skyMode() == SkyMode::Numos;
+
+  ImGui::PushID("SkySettings");
+  skyModeCombo.getKey(&RtxOptions::skyModeObject());
+  RemixGui::SetTooltipToLastWidgetOnHover("Original game sky uses the game's skybox. Numos creates a sky with atmosphere, clouds, and weather.");
+  if (useNumos && weatherSnapshot) {
+    ImGui::TextWrapped("Weather-controlled values are read-only here. Edit them in the Weather tab.");
+  }
+
+  // Scrollable tabs retain readable names when the Remix window is narrow.
+  if (ImGui::BeginTabBar("SkyPages", ImGuiTabBarFlags_FittingPolicyScroll)) {
+    if (ImGui::BeginTabItem("Sky")) {
+      if (useNumos) {
+        showSkyAppearance(weatherSnapshot);
+      } else {
+        RemixGui::DragFloat("Sky Brightness", &RtxOptions::skyBrightnessObject(), 0.01f, 0.01f, FLT_MAX, "%.3f", sliderFlags);
+      }
+      ImGui::EndTabItem();
+    }
+    if (useNumos) {
+      if (ImGui::BeginTabItem("Clouds")) {
+        showCloudSettings(weatherSnapshot);
+        ImGui::EndTabItem();
+      }
+      if (ImGui::BeginTabItem("Haze")) {
+        showHazeSettings();
+        ImGui::EndTabItem();
+      }
+      if (ImGui::BeginTabItem("Night")) {
+        showNightSettings(weatherSnapshot);
+        ImGui::EndTabItem();
+      }
+      if (ImGui::BeginTabItem("Weather")) {
+        showWeatherSettings(blender, weatherSnapshot);
+        ImGui::EndTabItem();
+      }
+    }
+    if (ImGui::BeginTabItem("Setup")) {
+      showSkySetup();
+      ImGui::EndTabItem();
+    }
+    ImGui::EndTabBar();
+  }
+  ImGui::PopID();
+
+  // An open editor must keep rendering when the user visits another sky tab.
+  if (useNumos && blender) {
+    blender->renderEditorWindow();
+  }
 }
 
 } // namespace dxvk

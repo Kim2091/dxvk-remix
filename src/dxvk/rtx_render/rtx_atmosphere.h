@@ -1526,6 +1526,12 @@ public:
                "knobs with layer 1 (phase, multi-scatter, detail, etc.).");
 
 private:
+  void showSkyAppearance(const WeatherSnapshot* weatherSnapshot);
+  void showCloudSettings(const WeatherSnapshot* weatherSnapshot);
+  void showHazeSettings();
+  void showNightSettings(const WeatherSnapshot* weatherSnapshot);
+  void showWeatherSettings(WeatherBlender* blender, const WeatherSnapshot* weatherSnapshot);
+  void showSkySetup();
   bool getCloudOffsetAtPlayer(float& offsetWorldUnits) const;
   void traceCloudPlacement(const AtmosphereArgs& args);
   bool m_traceCloudPlacement = false;
