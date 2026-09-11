@@ -5091,6 +5091,7 @@ namespace dxvk {
 
       // NV-DXVK start: Implement memoization for some expensive CPU operations
       pResource->remixMemoization.invalidateAll();
+      ++pResource->remixContentVersion;
       // NV-DXVK end
     }
     else {
@@ -5126,6 +5127,7 @@ namespace dxvk {
       // NV-DXVK start: Implement memoization for some expensive CPU operations
       if (!readOnly) {
         pResource->remixMemoization.invalidate(offset, size);
+        ++pResource->remixContentVersion;
       }
       // NV-DXVK end
     }
