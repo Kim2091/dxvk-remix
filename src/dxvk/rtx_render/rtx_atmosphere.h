@@ -366,7 +366,7 @@ public:
     // problem these fix; the CB fields keep their km meaning and are filled by dividing by 1000.
     RTX_OPTION("rtx.atmosphere", float, cloudBaseHeightMeters, 1300.0f,
                "Height of the cloud deck's underside above the ground datum, in metres.");
-    RTX_OPTION("rtx.atmosphere", float, cloudDepthMeters, 3050.0f,
+    RTX_OPTION("rtx.atmosphere", float, cloudDepthMeters, 2000.0f,
                "Vertical depth of the cloud deck, in metres, measured up from its base.");
     RTX_OPTION("rtx.atmosphere", float, cloudLayer2BaseHeightMeters, 5500.0f,
                "Height of the second (echo/cirrus) deck's underside above the ground datum, in metres.");
@@ -831,13 +831,13 @@ public:
                "Composes with moonHaloMagnitude / moonAmbientAirglow for ratio tuning.");
 
     RTX_OPTION("rtx.atmosphere", bool, cloudEnabled, true, "Enable procedural cloud rendering.");
-    RTX_OPTION("rtx.atmosphere", float, cloudDensity, 4.0f, "Cloud opacity/density multiplier.");
+    RTX_OPTION("rtx.atmosphere", float, cloudDensity, 6.7f, "Cloud opacity/density multiplier.");
     RTX_OPTION_ARGS("rtx.atmosphere", float, cloudAltitude, 1.3f,
                "*DEPRECATED* replaced by rtx.atmosphere.cloudBaseHeightMeters (same height in metres). "
                "An existing value is migrated automatically; re-save your config to silence the notice.",
                args.onChangeCallback = &cloudAltitudeOnChange, args.flags = RtxOptionFlags::NoSave);
     RTX_OPTION("rtx.atmosphere", Vector3, cloudColor, Vector3(0.89f, 0.92f, 1.0f), "Base cloud color (albedo).");
-    RTX_OPTION("rtx.atmosphere", float, cloudWindSpeed, 0.02f, "Cloud drift speed in km/s. Clouds scroll with this velocity.");
+    RTX_OPTION("rtx.atmosphere", float, cloudWindSpeed, 0.0f, "Cloud drift speed in km/s. Clouds scroll with this velocity.");
     RTX_OPTION("rtx.atmosphere", float, cloudWindDirection, 45.0f, "Cloud wind direction in degrees (0 = +X, 90 = +Z).");
     // Detail motion (fork -- 2026-09-07, reworked). These two used to scroll the detail field along
     // two hardcoded directions unrelated to the wind, which made every cloud's surface slide the
@@ -919,7 +919,7 @@ public:
                "Region size frequency for type noise. Numerically smaller = larger spatial features. "
                "Capped at 0.0034 in the UI because faster variation puts visible 2D-noise cell "
                "structure at sub-cumulus scales (regular grid of cumulus blobs).");
-    RTX_OPTION("rtx.atmosphere", float, cloudCoverageMean, 0.29f,
+    RTX_OPTION("rtx.atmosphere", float, cloudCoverageMean, 0.44f,
                "Mean cloud coverage across the sky [0,1]: 0=clear, 1=overcast.");
     RTX_OPTION("rtx.atmosphere", float, cloudCoverageSpread, 0.0f,
                "Spatial variation amplitude for coverage [0,1]. 0=uniform, 1=full range.");
@@ -939,7 +939,7 @@ public:
 
     // Per-column model: derives per-cloud base/top from a baked placement map and re-keys all vertical shaping
     // on each cloud's own normalized height, fixing the old "stacked disconnected puffs" read.
-    RTX_OPTION("rtx.atmosphere", float, cloudCellSizeKm, 2.0f,
+    RTX_OPTION("rtx.atmosphere", float, cloudCellSizeKm, 3.65f,
                "Average cloud-cluster footprint in km [0.5..6] for the "
                "placement map bake. Smaller = many small clouds; larger = "
                "fewer, broader banks. Re-bakes the placement map live on "
@@ -949,7 +949,7 @@ public:
                "Per-cloud tower-height jitter [0..1]. 0 = all cloud tops at "
                "one altitude (flat deck); higher = a varied skyline. "
                "Applies live.");
-    RTX_OPTION("rtx.atmosphere", float, cloudColumnTopShape, 0.6f,
+    RTX_OPTION("rtx.atmosphere", float, cloudColumnTopShape, 0.4f,
                "Exponent mapping column presence to cloud-top height "
                "[0.1..2]. Low = thin cluster edges still tower (blockier); "
                "high = only dense cores rise (domed tops, feathered "
@@ -962,14 +962,14 @@ public:
                "Coverage-remap feather band at cloud-cluster edges "
                "[0.05..1]. Narrow = crisp solid-cored clouds; wide = soft "
                "wispy transitions. Applies live.");
-    RTX_OPTION("rtx.atmosphere", float, nvdfNominalCoverage, 0.65f,
+    RTX_OPTION("rtx.atmosphere", float, nvdfNominalCoverage, 0.0f,
                "Coverage the cloud-body SDF (NVDF) bakes at [0 or 0.25..1]. "
                "0 = auto: track the live weather coverage quantized to 0.25 "
                "steps (recommended — keeps the sample-time coverage "
                "level-set offset small; re-bakes amortized only when the "
                "drift crosses a step). Nonzero pins the bake nominal for "
                "debugging or look-tuning.");
-    RTX_OPTION("rtx.atmosphere", float, nvdfProfileDepthKm, 0.6f,
+    RTX_OPTION("rtx.atmosphere", float, nvdfProfileDepthKm, 0.7f,
                "Nubis3: depth into the cloud body (km) over which the "
                "dimensional profile ramps 0 -> 1 [0.1..3]. Small = dense "
                "hard-shelled clouds; large = soft translucent-edged bodies. "
@@ -993,7 +993,7 @@ public:
     // its 0.42-OD skin while M spans 0.08..0.70 and the ambient 0.49..0.96, with 4.7% of the light
     // from a saturated sample instead of 66%. Density, erosion, the wisp cut and the D_sun /
     // D_ambient bakes never read this; it is a lighting-only input, live, no rebake.
-    RTX_OPTION_ARGS("rtx.atmosphere", float, nvdfLightingProfileDepthKm, 0.0f,
+    RTX_OPTION_ARGS("rtx.atmosphere", float, nvdfLightingProfileDepthKm, 3.0f,
                "Nubis3: depth into the cloud body (km) over which the LIGHTING profile ramps "
                "0 -> 1 [0..3] -- the term that fades the multi-scatter body light in and the sky "
                "ambient out with depth. 0 = follow nvdfProfileDepthKm (the density ramp), the "
@@ -1008,7 +1008,7 @@ public:
                "coverage changes grow/shrink clouds more aggressively "
                "(bodies merge sooner at high coverage). Applies live with "
                "zero rebakes.");
-    RTX_OPTION("rtx.atmosphere", float, nubis3ErosionStrength, 0.42f,
+    RTX_OPTION("rtx.atmosphere", float, nubis3ErosionStrength, 0.58f,
                "Nubis3: scale on the wispy/billowy noise composite that "
                "erodes the dimensional profile [0..2]. 0 = smooth un-eroded "
                "bodies (pure SDF blobs); 1 = paper-faithful erosion; higher "
@@ -1040,18 +1040,18 @@ public:
     // a bulge into a tear -- the "long stringy wisps, almost like smoke" under the deck. Stated
     // absolutely, the outline scale means what it says regardless of Detail Scale. 2.4 reproduces
     // the default-config wavelength to within 0.4%, so it is render-identical where it was right.
-    RTX_OPTION_ARGS("rtx.atmosphere", float, nubis3ShapeVarietyWavelengthKm, 2.4f,
+    RTX_OPTION_ARGS("rtx.atmosphere", float, nubis3ShapeVarietyWavelengthKm, 2.1f,
                "Wavelength in km of the largest bumps in a cloud's outline (the shape-variety "
                "lobes). Larger = broader, smoother lobes; smaller = finer structure. Independent "
                "of cloudDetailScale, which controls surface texture only. The lobe amplitude "
                "(nubis3ShapeVarietyKm) is capped at 0.65 x this so the displacement stays in the "
                "regime where it bulges the surface rather than tearing it into strands.",
                args.minValue = 0.05f, args.maxValue = 20.0f);
-    RTX_OPTION("rtx.atmosphere", float, nubis3ShapeVarietyKm, 1.11f,
+    RTX_OPTION("rtx.atmosphere", float, nubis3ShapeVarietyKm, 2.0f,
                "Nubis3: mid-frequency SHAPE displacement amplitude in km "
-               "[0..1.5] (the GT7 mid-band role). Pushes/pulls the body "
+               "[0..2] (the GT7 mid-band role). Pushes/pulls the body "
                "iso-surface by up to half this at the "
-               "nubis3ShapeVarietyWavelengthKm wavelength (2.4 km default) — "
+               "nubis3ShapeVarietyWavelengthKm wavelength (2.1 km default) — "
                "lobes, notches and full splits that turn round singular "
                "blobs into varied cloud clusters. Whole-body reshaping, "
                "not edge detail; coverage-neutral on average. 0 = off. "
@@ -1083,7 +1083,7 @@ public:
                "granulation on lit faces and scalloped wisp edges, the grain "
                "the sqrt-adaptive march can resolve but the base texture "
                "tops out above. 0 = off. Applies live.");
-    RTX_OPTION("rtx.atmosphere", float, nubis3EdgeErosion, 2.28f,
+    RTX_OPTION("rtx.atmosphere", float, nubis3EdgeErosion, 0.0f,
                "Nubis3: edge wisp cut [0..3]. Extra erosion shaped by the "
                "wispy noise channel, concentrated at the silhouette and "
                "fading by mid-shell — cuts trailing wisp shapes out of cloud "
@@ -1121,19 +1121,19 @@ public:
                "legacy fixed 32-sample march could not resolve). "
                "PERFORMANCE: cost scales with samples per ray — overhead "
                "views are unchanged, horizon-heavy views can cost up to "
-               "cloudViewSamplesMax/32 times more cloud time (2x at "
+               "cloudViewSamplesMax/32 times more cloud time (8x at "
                "defaults). Raise the spacing or lower the cap to trade "
                "quality for speed; 0 = legacy fixed count (banding "
                "returns). Applies live.");
-    RTX_OPTION("rtx.atmosphere", uint32_t, cloudViewSamplesMax, 64,
+    RTX_OPTION("rtx.atmosphere", uint32_t, cloudViewSamplesMax, 256,
                "Hard cap on cloud samples per ray [32..256] — the "
-               "performance governor for cloudViewStepKm. 64 resolves the "
-               "default spacing out to ~6 km of cloud span; lower costs "
+               "performance governor for cloudViewStepKm. At fixed 0.1 km "
+               "spacing, 256 spans ~25 km; adaptive stepping varies this. Lower costs "
                "less but lets some banding back in at the far horizon. "
                "32 = legacy cost ceiling. Applies live.");
-    RTX_OPTION("rtx.atmosphere", float, cloudUndersideLightSigma, 0.2f,
+    RTX_OPTION("rtx.atmosphere", float, cloudUndersideLightSigma, 1.5f,
                "Extinction of the light filtering down through each cloud, "
-               "per km of overlying water [0..0.5]. Drives the analytic "
+               "per km of overlying water. Drives the analytic "
                "per-column underside light field: brightness varies "
                "continuously with the water above every point (dark cores, "
                "bright thin spots, smooth gradients) instead of one flat-lit "
@@ -1148,11 +1148,11 @@ public:
                "cores solid. 0 = off (smooth legacy silhouettes). Note: the "
                "added billows thicken the silhouette band slightly, so high "
                "values read as marginally higher coverage.");
-    RTX_OPTION("rtx.atmosphere", float, cloudDetailScale, 4.3f,
+    RTX_OPTION("rtx.atmosphere", float, cloudDetailScale, 12.0f,
                "Edge-detail noise frequency as a multiple of the base cloud "
                "noise frequency (cloudNoiseTileKm). Higher = finer edge "
                "filigree; lower = chunkier edge billows. Non-integer values "
-               "keep the combined base+detail repeat period long. Default 4.3, "
+               "keep the combined base+detail repeat period long. Default 12, "
                "viable range 2-12. Applies live (no re-bake).");
 
     RTX_OPTION("rtx.atmosphere", float, cloudMicroAoStrength, 0.6f,
@@ -1204,7 +1204,7 @@ public:
                "Lightning flash color (linear RGB), shared by the in-cloud "
                "glow and the scene flash. Default is a cool blue-white.");
 
-    RTX_OPTION("rtx.atmosphere", float, cloudEdgeAmbientFade, 0.15f,
+    RTX_OPTION("rtx.atmosphere", float, cloudEdgeAmbientFade, 0.05f,
                "Thin-edge ambient fade [0..0.5]. Sub-threshold skirt samples are "
                "ambient-dominated, and the ambient is sampled at the horizon (a "
                "dirty grey-brown), so the soft fringe can read as discolored "
@@ -1222,7 +1222,7 @@ public:
                "with the sun overhead and fades out toward the horizon, where "
                "the low sun rakes under the deck and lights the bases (sunset "
                "glow). 0 = off (uniformly lit undersides).");
-    RTX_OPTION("rtx.atmosphere", float, cloudSkyAmbientFill, 0.52f,
+    RTX_OPTION("rtx.atmosphere", float, cloudSkyAmbientFill, 0.35f,
                "How strongly cloud undersides pick up the open sky around them "
                "[0..1]. Adds a sky-dome fill - the overhead sky color, "
                "bypassing the bottom-darkening since that skylight reaches the "
@@ -1231,7 +1231,7 @@ public:
                "the actual sky color; naturally fades at sunset (the overhead "
                "sky is dim then). Higher = brighter, more sky-colored bases; "
                "0 = off (legacy, undersides ignore the open sky). Applies live.");
-    RTX_OPTION("rtx.atmosphere", float, cloudAmbientShadowStrength, 1.0f,
+    RTX_OPTION("rtx.atmosphere", float, cloudAmbientShadowStrength, 0.5f,
                "Dramatic shading [0..1]: how much the sky-ambient fill is "
                "attenuated by sun-shadow depth inside the cloud. The ambient "
                "term otherwise refloods sun-shadowed bulk with bright daytime "
@@ -1258,7 +1258,7 @@ public:
                "toward atmospheric color so they read as 'softer / duller "
                "with distance.' Visual softness control - does NOT prevent "
                "the horizon white wall by itself. 0 = no haze. Default 0.05.");
-    RTX_OPTION("rtx.atmosphere", float, cloudAerialFadePerKm, 0.15f,
+    RTX_OPTION("rtx.atmosphere", float, cloudAerialFadePerKm, 0.05f,
                "Per-km fade extinction applied to cloud ALPHA accumulation "
                "(effect B of the aerial-perspective path). Distant samples "
                "stop piling up extinction so horizon-grazing rays don't form "

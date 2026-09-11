@@ -1443,7 +1443,7 @@ void RtxAtmosphere::showImguiSettings(WeatherBlender* blender) {
       // the same day — ship-at-0 / unreachable-in-normal-play.)
       if (ImGui::TreeNode("Shape")) {
         RemixGui::DragFloat("Shape Variety", &RtxAtmosphere::nubis3ShapeVarietyKmObject(),
-                            0.01f, 0.0f, 1.5f, "%.2f km", sliderFlags);
+                            0.01f, 0.0f, 2.0f, "%.2f km", sliderFlags);
         RemixGui::SetTooltipToLastWidgetOnHover(
             "Mid-frequency (Lobe Wavelength) push/pull of the whole body surface — "
             "lobes, notches and full splits that break round singular "
