@@ -204,7 +204,8 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
 // NV-DXVK start: Use the active camera projection for Numos clouds.
   // Normalized UV supports a cloud target smaller than the primary camera resolution.
   const vec2 uv = (vec2(pixelCoord) + 0.5f) / vec2(outputDim);
-  const CameraDirections cloudRay = cameraScreenUVToDirection(cloudCamera, uv, /*jitter=*/ false);
+  // Match the primary depth ray, including temporal jitter, at geometry silhouettes.
+  const CameraDirections cloudRay = cameraScreenUVToDirection(cloudCamera, uv, /*jitter=*/ true);
   const vec3 viewDirYUp = worldToAtmosphereYUp(
     cloudRay.worldDirection, args.isZUp != 0u, args.flipUpAxis != 0);
 // NV-DXVK end
@@ -226,32 +227,6 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
   // page-142 ambient term (sampleSkyAmbientForVolume) is unaffected by this removal — that helper
   // has its own below-horizon clamp and is untouched this stage.
 
-  // ===== The march is deliberately NOT clamped by geometry depth =====
-  // (fork — 2026-09-05, world-space cloud migration Stage 4b fix.)
-  //
-  // Stage 4a clamped tMaxClamp to the slant range of the resolved surface, so a cloud never marched
-  // past the geometry in front of it. That was exact, and it was wrong, for a reason that only
-  // shows up in motion: it makes the contents of this render target a function of GEOMETRY. The
-  // composite then runs a temporal EMA over that target and reprojects the history with a motion
-  // vector built from the camera basis and the cloud's own depth -- which knows nothing about where
-  // geometry moved. So whenever the depth buffer changed under a pixel, the EMA blended in a
-  // history value computed against completely different occlusion, and the stale value took roughly
-  // 1/(1-cloudHistoryWeight) frames to wash out. In practice: a heavy smear trailing the Pip-Boy as
-  // it swings up, and cloud ghosting dragging behind world geometry while walking.
-  //
-  // A signal an EMA smooths must be a function of view direction only, so that rotation-only
-  // reprojection is valid for it. This pass therefore marches the full reachable span and reports
-  // entry / mean depth alongside it, and the OCCLUSION IS APPLIED PER-FRAME IN THE COMPOSITE, after
-  // the EMA, where it carries no history (composite.comp.slang, applyCloudComposite). That is
-  // already exactly how the alpha-blended path there worked.
-  //
-  // Cost: pixels with near geometry now march cloud that is later discarded. That is a real
-  // regression in this pass's cost and belongs to Stage 6 -- a conservative clamp (a per-tile
-  // maximum depth, say) could recover most of it without reintroducing a per-pixel geometry
-  // dependence. Correctness first.
-  //
-  // PrimaryLinearViewZ (binding 15) stays bound but unread here, for that follow-up.
-
   float jitter = fastJitter(pixelCoord, args.cloudRenderFrameIdx).x;
   // Static per-pixel hash for far-field jitter (animated < 250 m, static beyond — no distant shimmer).
   float jitterStatic = fastJitter(pixelCoord, 0u).x;
@@ -267,15 +242,7 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
   // (no doubling — Nubis Cubed equations take raw cloudDensity as extinction).
   // marchCloudLayers sequences layer 1 (cumulus) then the optional layer-2
   // cirrus deck front-to-back, zeroing the moon coefficients for layer 2.
-  // Both clamps are 0/no-op: the full reachable span is marched for every pixel, sky or geometry
-  // alike, so this target stays a pure function of view direction and is therefore safe to smooth
-  // temporally. See the no-clamp rationale above.
-  // ===== Distance to the surface the primary ray hit =====
-  // Read here, used ONLY to measure the occlusion prefix (fork -- 2026-09-06). This does not clamp
-  // the march: the render target stays a full-span function of view direction, which is the
-  // invariant the temporal EMA in the composite depends on and the reason the Stage 4a clamp was
-  // removed. What geometry now affects is a single scalar the composite applies AFTER the EMA,
-  // exactly where the occlusion ramp it replaces was already applied.
+  // Clamp to the primary surface; composite validates history against this depth.
   float tSurfaceKm = kNoSurfaceKm;
   {
     uint2 depthDim;

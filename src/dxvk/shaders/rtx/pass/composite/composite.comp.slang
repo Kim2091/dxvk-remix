@@ -951,28 +951,15 @@ float cloudDepthVisibility(float entryKm, float meanKm, float surfaceKm, float c
   return saturate(frontAlpha / cloudAlpha);
 }
 
-// Current-frame cloud sample at `pixelCoordinate` in the composite's OPACITY convention (fork —
-// 2026-09-06, EMA rectification). The RT stores TRANSMITTANCE in .a; the premultiplied-over
-// composite and the history both want opacity, so the flip evalSkyRadiance always applied happens
-// here, once. Zeroed when the march found no cloud along this ray at all (depth companion entry
-// sentinel < 0, cloud_render.comp.slang).
-//
-// CORRECTION (fork -- 2026-09-06): this comment used to claim the entry distance is the GEOMETRIC
-// slab entry, "a property of the view ray alone and never of the per-frame jitter". That stopped
-// being true at cc8198b1c, which redefined entry as the first sample carrying real density -- which
-// does move with the jitter. It is still free of GEOMETRY dependence, which is the property that
-// matters for baking it into the EMA's input, and the zeroing it gates coincides with alpha ~ 0, so
-// the signal is unchanged either way. The same gate was removed from the OPAQUE path, where it was
-// not harmless: see the note at opaqueVisibility below. This is
-// the one definition of "the cloud along pixel p this frame": the 3x3 neighbourhood statistics and
-// the centre sample in applyCloudComposite both go through it, so the clamp box and the value being
-// clamped agree by construction.
+// NV-DXVK start: Keep filtered cloud radiance and opacity from the same taps.
 vec4 loadCurrentCloudOpacity(uint2 pixelCoordinate, AtmosphereArgs args, float surfaceKm)
 {
   const vec4 cloudRT = sampleCloudRenderRT(pixelCoordinate, args, surfaceKm);
-  const float entryKm = sampleCloudDepthKm(pixelCoordinate, args).x;
-  return (entryKm < 0.0f) ? vec4(0.0f) : vec4(cloudRT.rgb, 1.0f - cloudRT.a);
+  // Empty marches already store zero radiance and unit transmittance. A separate nearest-depth
+  // gate can discard valid neighboring cloud samples selected by the depth-aware upsampler.
+  return vec4(cloudRT.rgb, 1.0f - cloudRT.a);
 }
+// NV-DXVK end
 
 // Clips `history` toward the centre of the box [aabbMin, aabbMax] along the ray from that centre
 // (fork — 2026-09-06, EMA rectification). The usual temporal-AA "clip" rather than a per-component
@@ -1325,8 +1312,10 @@ void applyCloudComposite(
       if (clampGamma > 0.0f)
       {
         const int2 resolution = int2(cb.camera.resolution);
-        vec4 m1 = vec4(0.0f);
-        vec4 m2 = vec4(0.0f);
+        // NV-DXVK start: Keep foreground samples out of the cloud history bounds.
+        vec4 m1 = currentCloud;
+        vec4 m2 = currentCloud * currentCloud;
+        float sampleCount = 1.0f;
         [unroll]
         for (int dy = -1; dy <= 1; ++dy)
         {
@@ -1334,16 +1323,23 @@ void applyCloudComposite(
           for (int dx = -1; dx <= 1; ++dx)
           {
             const int2 neighbour = clamp(int2(pixelCoordinate) + int2(dx, dy), int2(0, 0), resolution - int2(1, 1));
-            // This pixel's surface, not the neighbour's: the box exists to bound the cloud that
-            // could legitimately appear at THIS pixel's depth, so a neighbour describing a different
-            // surface should not widen it.
+            if (all(neighbour == int2(pixelCoordinate))) {
+              continue;
+            }
+            const float neighbourSurfaceKm = min(sampleCloudDepthKm(uint2(neighbour), args).z, kCloudSkyDepthKm);
+            const float depthDelta = abs(neighbourSurfaceKm - currentSurfaceKm);
+            if (depthDelta > cb.cloudHistoryDepthTolerance * max(max(neighbourSurfaceKm, currentSurfaceKm), 1e-3f)) {
+              continue;
+            }
             const vec4 v = loadCurrentCloudOpacity(uint2(neighbour), args, currentSurfaceKm);
             m1 += v;
             m2 += v * v;
+            sampleCount += 1.0f;
           }
         }
-        m1 *= (1.0f / 9.0f);
-        m2 *= (1.0f / 9.0f);
+        m1 /= sampleCount;
+        m2 /= sampleCount;
+        // NV-DXVK end
         const vec4 sigma = sqrt(max(m2 - m1 * m1, vec4(0.0f)));
         history = clipCloudHistoryToAABB(m1 - clampGamma * sigma, m1 + clampGamma * sigma, history);
       }
@@ -1460,8 +1456,8 @@ void applyCloudComposite(
   // mechanism would not depend on this pass's history weight. With the premise gone, the routing
   // was a split composite (half the term in the denoised signal, half outside it) carried on no
   // evidence of benefit; upstream's own screen-static fog (applyFog) goes into radianceOutput the
-  // same way this does. The two incidental fixes from that commit stay: the unjittered reprojection
-  // direction (cloudReprojectionMotionVectorPixels) and the alpha-blend coverage weighting below.
+  // same way this does. The shared reprojection helper now follows the jittered primary ray; the
+  // alpha-blend coverage weighting below is retained.
   // If an RR-only artefact ever shows at cloudHistoryWeight = 0, that commit is the reference for
   // restoring the toggle.
   radianceOutput = radianceOutput * (1.0f - smoothedCloud.a * opaqueVisibility)
@@ -1506,6 +1502,12 @@ void applyFog(
   if (cb.volumeArgs.enable)
   {
     return; // Volumetric fog is applied in volume integration
+  }
+
+  // Games can fog level geometry separately from their authored sky.
+  if (primaryMiss && !cb.fogApplyToSky)
+  {
+    return;
   }
 
   // Todo: Using view distance is a bit of a hack here, the primary emissive contribution will not be fully weighted correctly

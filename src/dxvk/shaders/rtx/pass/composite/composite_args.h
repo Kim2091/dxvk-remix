@@ -77,7 +77,9 @@ struct CompositeArgs {
   uint8_t compositeSecondaryCombinedSpecular;
   // The number of active Ray Portals (Used for Ray Portal sampling). Always <= RAY_PORTAL_MAX_COUNT
   uint8_t numActiveRayPortals;
-  uint8_t pad0;
+  // NV-DXVK start: Independent sky fog compatibility control; reuses padding.
+  uint8_t fogApplyToSky;
+  // NV-DXVK end
 
   uint enableSeparatedDenoisers;
   uint frameIdx;

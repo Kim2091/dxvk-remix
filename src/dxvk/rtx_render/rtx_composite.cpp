@@ -193,6 +193,7 @@ namespace dxvk {
 
     ImGui::BeginDisabled(!enableFog());
     ImGui::Indent();
+    RemixGui::Checkbox("Apply Fog to Sky", &fogApplyToSkyObject());
     RemixGui::DragFloat("Fog Color Scale", &fogColorScaleObject(), 0.01f, 0.0f, 10.f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
     RemixGui::DragFloat("Max Fog Distance", &maxFogDistanceObject(), 1.f, 0.0f, 0.f, "%.0f", ImGuiSliderFlags_AlwaysClamp);
     ImGui::Unindent();
@@ -486,6 +487,7 @@ namespace dxvk {
       const float colorScale = fogColorScale();
       auto& fog = settings.fog;
       compositeArgs.fogMode = fog.mode;
+      compositeArgs.fogApplyToSky = fogApplyToSky();
       compositeArgs.fogColor = { fog.color.x * colorScale, fog.color.y * colorScale, fog.color.z * colorScale };
       // Todo: Scene scale stuff ignored for now because scene scale stuff is not actually functioning properly. Add back in if it's ever fixed.
       // compositeArgs.fogEnd = fog.end * RtxOptions::sceneScale();

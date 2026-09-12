@@ -25,17 +25,17 @@
 #include "rtx/concept/camera/camera.slangh"
 #include "rtx/pass/atmosphere/atmosphere_common.slangh"
 
-// The cloud target and history both use unjittered pixel-centre rays.
+// Match the jittered primary ray and the previous cloud sample grid.
 vec2 cloudReprojectionMotionVectorPixels(Camera camera, uint2 pixelCoordinate, float depthKm,
                                         vec3 anchorDeltaYUpKm, AtmosphereArgs args)
 {
-  const CameraDirections ray = cameraPixelCoordinateToDirection(camera, ivec2(pixelCoordinate), /*jitter=*/ false);
+  const CameraDirections ray = cameraPixelCoordinateToDirection(camera, ivec2(pixelCoordinate), /*jitter=*/ true);
   const vec3 anchorDeltaWorldKm = atmosphereYUpToWorld(anchorDeltaYUpKm, args.isZUp != 0u, args.flipUpAxis != 0);
   const vec3 previousRelativePositionKm = ray.worldDirection * max(depthKm, 0.05f) + anchorDeltaWorldKm;
 
   // The resolved anchor supplies translation even in camera-relative games. w=0 avoids applying
   // matrix translation a second time, while preserving the previous rotation and full projection.
-  const vec4 previousClip = mul(camera.prevWorldToProjection, vec4(previousRelativePositionKm, 0.0f));
+  const vec4 previousClip = mul(camera.prevWorldToProjectionJittered, vec4(previousRelativePositionKm, 0.0f));
   if (!all(isfinite(previousClip)) || previousClip.w <= 1e-6f)
   {
     // An off-screen coordinate rejects history for points behind the previous camera.
