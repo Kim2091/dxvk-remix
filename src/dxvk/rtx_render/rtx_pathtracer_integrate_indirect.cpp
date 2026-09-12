@@ -117,6 +117,8 @@
 #include <rtx_shaders/integrate_indirect_miss_nrc_neeCache_wboit.h>
 
 #include <rtx_shaders/integrate_nee.h>
+#include <rtx_shaders/integrate_nee_nrc.h>
+#include <rtx_shaders/integrate_nee_restir_gi.h>
 #include <rtx_shaders/visualize_nee.h>
 
 #include "dxvk_scoped_annotation.h"
@@ -311,6 +313,8 @@ namespace dxvk {
     ScopedCpuProfileZoneN("Indirect Integrate Shader Prewarming");
 
     IntegrateNEEShader::getShader();
+    GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, IntegrateNEEShader, integrate_nee_nrc);
+    GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, IntegrateNEEShader, integrate_nee_restir_gi);
 
     const bool isNrcSupported = NeuralRadianceCache::checkIsSupported(device());
     const bool isOpacityMicromapSupported = OpacityMicromapManager::checkIsOpacityMicromapSupported(*m_device);
@@ -579,7 +583,19 @@ namespace dxvk {
     DxvkReSTIRGIRayQuery& reSTIRGI = ctx->getCommonObjects()->metaReSTIRGIRayQuery();
     reSTIRGI.bindIntegrateIndirectNeeResources(*ctx);
 
-    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, IntegrateNEEShader::getShader());
+    const bool nrcEnabled = nrc.isActive();
+    const bool restirGiEnabled = reSTIRGI.isActive();
+    Rc<DxvkShader> integrateNeeShader;
+    if (nrcEnabled && !restirGiEnabled) {
+      integrateNeeShader = GET_SHADER_VARIANT(
+        VK_SHADER_STAGE_COMPUTE_BIT, IntegrateNEEShader, integrate_nee_nrc);
+    } else if (restirGiEnabled && !nrcEnabled) {
+      integrateNeeShader = GET_SHADER_VARIANT(
+        VK_SHADER_STAGE_COMPUTE_BIT, IntegrateNEEShader, integrate_nee_restir_gi);
+    } else {
+      integrateNeeShader = IntegrateNEEShader::getShader();
+    }
+    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, integrateNeeShader);
     ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
 
     // Visualize the nee cache when debug view is chosen.

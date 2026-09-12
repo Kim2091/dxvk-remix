@@ -20,10 +20,22 @@
 * DEALINGS IN THE SOFTWARE.
 */
 
+// NV-DXVK start: Compile NRC and ReSTIR GI NEE paths only in their active variants.
+//!variant integrate_nee.comp
+//!>       RAB_HAS_RESTIR_GI_RESERVOIRS=1
+//!>       ENABLE_NRC=1
+
+//!variant integrate_nee_nrc.comp
+//!>       ENABLE_NRC=1
+
+//!variant integrate_nee_restir_gi.comp
+//!>       RAB_HAS_RESTIR_GI_RESERVOIRS=1
+
+//!end-variants
+// NV-DXVK end
+
 #define RAB_HAS_CURRENT_GBUFFER 1
-#define RAB_HAS_RESTIR_GI_RESERVOIRS 1
 #define OPAQUE_MATERIAL_USE_POM 1
-#define ENABLE_NRC 1
 
 #include "rtx/pass/integrate/integrate_nee_binding_indices.h"
 
@@ -50,6 +62,7 @@ float getLobeAngleFromMaterial(OpaqueSurfaceMaterialInteraction opaqueSurfaceMat
   return pi * 0.25 * finalLobeAngleNorm;
 }
 
+#if ENABLE_NRC
 void addRadianceToNrcTrainingPathVertex(
   uvec2 trainingPixelCoordinate,
   uint bounceIndex,
@@ -75,6 +88,7 @@ void addRadianceToNrcTrainingPathVertex(
   // Register radiance for a training path
   Nrc::debugRegisterNrcRadiance(trainingPixelCoordinate, true, bounceIndex, radiance, dummyThroughput, cb.debugView);
 }
+#endif
 
 [shader("compute")]
 [numthreads(INTEGRATE_NEE_THREADS_DISPATCH_WIDTH, INTEGRATE_NEE_THREADS_DISPATCH_HEIGHT, 1)]
@@ -160,7 +174,9 @@ void main(uint2 threadIndex : SV_DispatchThreadID, uint2 LocalIndex : SV_GroupTh
   // Perform next event estimation on cached emissive triangle list
   // Also add NEE sample to sample reservoir
   // ToDo - calculate non-Restir GI portion to secondary signal as well
+#ifdef RAB_HAS_RESTIR_GI_RESERVOIRS
   ReSTIRGI_Reservoir resultReservoir = ReSTIRGI_Reservoir.createEmpty();
+#endif
   if (cb.neeCacheArgs.enable && cb.neeCacheArgs.enableOnFirstBounce &&
       polymorphicSurfaceMaterialInteractionGetTypeHelper(polymorphicSurfaceMaterialInteraction) == surfaceMaterialTypeOpaque)
   {
@@ -230,19 +246,23 @@ void main(uint2 threadIndex : SV_DispatchThreadID, uint2 LocalIndex : SV_GroupTh
           diffuseLight, specularLight, SharedSurfaceIndex[pixelCoordinate], SharedTextureCoord[pixelCoordinate]);
 
         // Coordinate of a training path in NRC training pixel coordinate space
+#if ENABLE_NRC
         uvec2 nrcTrainingPixelCoordinate;
         bool hasNrcTrainingPath = false;
-
         if (cb.enableNrc)
         {
           hasNrcTrainingPath = Nrc::calculateIfPixelHasActiveNrcTrainingPath(pixelCoordinate, cb.nrcArgs, nrcTrainingPixelCoordinate);
         }
+#endif
 
         // Feed back to NEE cache hash tasks (skip when using cached samples — triangleID may be stale)
         if ((!usedCachedSample || !reshuffleResilience)
           && any(diffuseLight + specularLight) > 0
-          && (hasNrcTrainingPath
-              || (pixelCoordinate.x + pixelCoordinate.y) % 4 == 0))
+          && (
+#if ENABLE_NRC
+            hasNrcTrainingPath ||
+#endif
+            (pixelCoordinate.x + pixelCoordinate.y) % 4 == 0))
         {
           int prefixTask = NEECacheUtils.convertIDToPrefixSumID(candidate.getSurfaceID(), primitiveIndex, PrimitiveIDPrefixSum);
           if (cb.neeCacheArgs.enableSpatialReuse)
@@ -257,13 +277,16 @@ void main(uint2 threadIndex : SV_DispatchThreadID, uint2 LocalIndex : SV_GroupTh
         indirectSpecularOutput.xyz += specularLight;
 
         // Add the sampled NEE Cache light radiance to NRC training paths
+#if ENABLE_NRC
         if (hasNrcTrainingPath)
         {
           const uint bounceIndex = 0;
           const vec3 neeRadiance = diffuseLight + specularLight;
           addRadianceToNrcTrainingPathVertex(nrcTrainingPixelCoordinate, bounceIndex, neeRadiance);
         }
+#endif
 
+#ifdef RAB_HAS_RESTIR_GI_RESERVOIRS
         if (cb.enableReSTIRGI && isVisible)
         {
           ReSTIRGI_Reservoir neeSample = ReSTIRGI_Reservoir.createEmpty();
@@ -282,14 +305,17 @@ void main(uint2 threadIndex : SV_DispatchThreadID, uint2 LocalIndex : SV_GroupTh
           float wi = RAB_GetGITargetPdfForSurface(neeSample.radiance, neeSample.position, surface);
           resultReservoir.update(wi, neeSample, 0.5);
         }
+#endif
       }
     }
   }
 
+#ifdef RAB_HAS_RESTIR_GI_RESERVOIRS
   if (cb.enableReSTIRGI)
   {
     RAB_StoreGIReservoir(resultReservoir, pixelCoordinate, ReSTIRGI_GetInitSamplePage());
   }
+#endif
 
   PrimaryIndirectDiffuseLobeRadianceHitDistance[pixelCoordinate] = indirectDiffuseOutput;
   PrimaryIndirectSpecularLobeRadianceHitDistance[pixelCoordinate] = indirectSpecularOutput;
