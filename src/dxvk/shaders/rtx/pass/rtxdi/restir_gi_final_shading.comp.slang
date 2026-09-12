@@ -19,6 +19,12 @@
 * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 * DEALINGS IN THE SOFTWARE.
 */
+// NV-DXVK start: Stop ordinary visibility rays at the first occluder.
+//!variant restir_gi_final_shading.comp
+//!variant restir_gi_final_shading_occlusion.comp
+//!> RESTIR_GI_OCCLUSION_ONLY
+//!end-variants
+// NV-DXVK end
 #define RAB_HAS_CURRENT_GBUFFER 1
 #define RAB_HAS_RESTIR_GI_RESERVOIRS 1
 #define OPAQUE_MATERIAL_USE_POM 1
@@ -188,9 +194,17 @@ void main(uint2 threadIndex : SV_DispatchThreadID, uint2 LocalIndex : SV_GroupTh
       // If the actual hit distance is lower than sampleDistance * visibleSampleMinRange, the samle is valid but the surface is in the shadow area.
       const float visibleSampleMinRange = RAB_RESTIR_GI_VISIBILITY_SHORTENING;
       const float validSampleMaxRange = cb.reSTIRGIVisibilityValidationRange;
+// NV-DXVK start: Visibility validation still requires the original hit distance.
+#ifdef RESTIR_GI_OCCLUSION_ONLY
+      const bool validateSamples = false;
+      const uint visibilityMode = visibilityModeEnablePom;
+#else
+      const uint visibilityMode = visibilityModeEnablePom | visibilityModeAccurateHitDistance;
       const bool validateSamples = cb.enableReSTIRGIVisibilityValidation && portalID == invalidRayPortalIndex &&
        !spatialReservoir.getFlag(RESTIR_GI_FLAG_NON_OPAQUE_HIT) &&
        spatialReservoir.getVirtualFraction() == 0.0;
+#endif
+// NV-DXVK end
       float tMaxFactor = RAB_RESTIR_GI_VISIBILITY_SHORTENING;
       if (validateSamples)
       {
@@ -199,7 +213,7 @@ void main(uint2 threadIndex : SV_DispatchThreadID, uint2 LocalIndex : SV_GroupTh
       }
 
       // TODO: Why ignore SSS here?
-      VisibilityResult visibility = traceVisibilityRay<visibilityModeEnablePom | visibilityModeAccurateHitDistance>(minimalSurfaceInteraction,
+      VisibilityResult visibility = traceVisibilityRay<visibilityMode>(minimalSurfaceInteraction,
         samplePosition, rayMask, portalID,
         geometryFlags.portalSpace, geometryFlags.pomOpaqueSurfaceEncountered, 0, coneSpreadAngle, tMaxFactor, geometryFlags.isViewModel, 
         false, primarySurfaceIndex, SharedTextureCoord[threadIndex], /*isThinOpaqueSubsurface*/ false, /*shadingNormal*/ vec3(0.0f), /*clearOpaqueHitAttenuation*/ !validateSamples);

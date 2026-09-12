@@ -38,6 +38,7 @@
 #include <rtx_shaders/restir_gi_temporal_reuse.h>
 #include <rtx_shaders/restir_gi_spatial_reuse.h>
 #include <rtx_shaders/restir_gi_final_shading.h>
+#include <rtx_shaders/restir_gi_final_shading_occlusion.h>
 
 namespace dxvk {
 
@@ -177,6 +178,7 @@ namespace dxvk {
     ReSTIRGITemporalReuseShader::getShader();
     ReSTIRGISpatialReuseShader::getShader();
     ReSTIRGIFinalShadingShader::getShader();
+    GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, ReSTIRGIFinalShadingShader, restir_gi_final_shading_occlusion);
   }
 
   void DxvkReSTIRGIRayQuery::showImguiSettings() {
@@ -454,7 +456,10 @@ namespace dxvk {
       ctx->bindResourceBuffer(RESTIR_GI_FINAL_SHADING_BINDING_RESTIR_GI_RESERVOIR_OUTPUT, DxvkBufferSlice(m_restirGIReservoirBuffer, 0, m_restirGIReservoirBuffer->info().size));
       ctx->bindResourceView(RESTIR_GI_FINAL_SHADING_BINDING_BSDF_FACTOR2_OUTPUT, m_bsdfFactor2.view, nullptr);
 
-      ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, ReSTIRGIFinalShadingShader::getShader());
+      const auto shader = validateVisibilityChange()
+        ? ReSTIRGIFinalShadingShader::getShader()
+        : GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, ReSTIRGIFinalShadingShader, restir_gi_final_shading_occlusion);
+      ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, shader);
       ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
     }
   }
