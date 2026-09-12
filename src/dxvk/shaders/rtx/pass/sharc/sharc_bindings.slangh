@@ -1,0 +1,25 @@
+// Copyright (c) 2026, NVIDIA CORPORATION. SPDX-License-Identifier: MIT
+#pragma once
+#include "rtx/pass/sharc/sharc_sdk.slangh"
+#include "rtx/pass/sharc/sharc_binding_indices.h"
+
+layout(binding = SHARC_BINDING_HASH)
+RWStructuredBuffer<HashGridKey> SharcHash;
+layout(binding = SHARC_BINDING_ACCUMULATION)
+RWStructuredBuffer<SharcAccumulationData> SharcAccumulation;
+layout(binding = SHARC_BINDING_RESOLVED)
+RWStructuredBuffer<SharcPackedData> SharcResolved;
+
+SharcParameters makeSharcParameters() {
+  SharcParameters p;
+  p.hashGridParameters.cameraPosition = cb.sharcArgs.cameraPosition;
+  p.hashGridParameters.logarithmBase = SHARC_GRID_LOGARITHM_BASE;
+  p.hashGridParameters.sceneScale = cb.sharcArgs.gridScale;
+  p.hashGridParameters.levelBias = 0.0f;
+  p.hashGridData.capacity = cb.sharcArgs.capacity;
+  p.hashGridData.hashEntriesBuffer = SharcHash;
+  p.accumulationBuffer = SharcAccumulation;
+  p.resolvedBuffer = SharcResolved;
+  p.radianceScale = cb.sharcArgs.radianceScale;
+  return p;
+}

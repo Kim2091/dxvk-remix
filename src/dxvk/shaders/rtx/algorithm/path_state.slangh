@@ -21,6 +21,10 @@
 */
 #pragma once
 
+#ifndef SHARC_UPDATE
+#define SHARC_UPDATE 0
+#endif
+
 #include "rtx/concept/ray_portal/ray_portal.slangh"
 #include "rtx/utility/packing.slangh"
 #include "rtx/algorithm/resolve_expanded.slangh"
@@ -57,6 +61,9 @@ struct PathState : IBasePayloadState
 
   // Note: Radiance, throughput and hit distances are passed in and then written back out
   // so they can be accumulated into in the path tracing loop.
+#if SHARC_UPDATE
+  SharcState sharcState;
+#endif
   vec3 radiance;
   float _segmentHitDistance;
 
@@ -287,7 +294,11 @@ struct PathState : IBasePayloadState
   {
     get
     {
+#if SHARC_UPDATE
+      return uint8_t(cb.sharcArgs.updateBounces);
+#else
       return cb.pathMaxBounces;
+#endif
     }
   }
 
@@ -479,7 +490,11 @@ struct PathState : IBasePayloadState
     }
 #endif    
 
+#if SHARC_UPDATE
+    return false;
+#else
     return useRussianRoulette;
+#endif
   }
 
   // Note: Using separate accumulation for particles and whatever else as while they should be visible in reflections

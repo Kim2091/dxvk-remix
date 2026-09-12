@@ -1340,6 +1340,7 @@ namespace dxvk {
     constants.enableNrc = nrc.isActive();
     constants.allowNrcTraining = NeuralRadianceCache::NrcOptions::trainCache();
     nrc.setRaytraceArgs(constants);
+    m_common->metaSharc().prepareFrame(*this, constants, m_resetHistory);
 
     m_common->metaNeeCache().setRaytraceArgs(constants, m_resetHistory);
     constants.surfaceCount = getSceneManager().getAccelManager().getSurfaceCount();
@@ -1651,7 +1652,14 @@ namespace dxvk {
     {
       ScopedGpuProfileZone(this, "Integrate Indirect Raytracing");
       setFramePassStage(RtxFramePassStage::IndirectIntegration);
-      
+
+      RtxSharc& sharc = m_common->metaSharc();
+      if (sharc.isActive()) {
+        // SHARC's sparse update writes the cache; resolve must publish it
+        // before the full-resolution query pass reads the resolved entries.
+        m_common->metaPathtracerIntegrateIndirect().dispatch(this, rtOutput, true);
+        sharc.dispatchResolve(*this, rtOutput);
+      }
       m_common->metaPathtracerIntegrateIndirect().dispatch(this, rtOutput);
     }
 

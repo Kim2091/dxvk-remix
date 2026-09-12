@@ -20,6 +20,7 @@
 * DEALINGS IN THE SOFTWARE.
 */
 #include "rtx_pathtracer_integrate_indirect.h"
+#include <algorithm>
 #include "dxvk_device.h"
 #include "rtx_shader_manager.h"
 #include "rtx_context.h"
@@ -51,6 +52,8 @@
 #include <rtx_shaders/integrate_indirect_rayquery.h>
 #include <rtx_shaders/integrate_indirect_rayquery_nrc_neeCache.h>
 #include <rtx_shaders/integrate_indirect_rayquery_nrc.h>
+#include <rtx_shaders/integrate_indirect_sharc_update.h>
+#include <rtx_shaders/integrate_indirect_sharc_query.h>
 
 #include <rtx_shaders/integrate_indirect_material_opaque_translucent_closestHit.h>
 #include <rtx_shaders/integrate_indirect_material_rayPortal_closestHit.h>
@@ -124,6 +127,8 @@
 #include "dxvk_scoped_annotation.h"
 #include "rtx_opacity_micromap_manager.h"
 #include "rtx_neural_radiance_cache.h"
+#include "rtx_sharc.h"
+#include "rtx/pass/sharc/sharc_binding_indices.h"
 
 namespace dxvk {
 
@@ -200,6 +205,40 @@ namespace dxvk {
         RW_TEXTURE2D(INTEGRATE_INSTRUMENTATION)
 
       END_PARAMETER()
+    };
+
+    // Keep the legacy descriptor layout unchanged. SHARC variants add only
+    // their reserved cache bindings.
+    class IntegrateIndirectSharcShader : public IntegrateIndirectRayGenShader {
+    public:
+      static std::vector<dxvk::DxvkResourceSlot> getResourceSlots() {
+        auto slots = IntegrateIndirectRayGenShader::getResourceSlots();
+        slots.push_back({ SHARC_BINDING_HASH, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_IMAGE_VIEW_TYPE_MAX_ENUM, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT });
+        slots.push_back({ SHARC_BINDING_ACCUMULATION, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_IMAGE_VIEW_TYPE_MAX_ENUM, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT });
+        slots.push_back({ SHARC_BINDING_RESOLVED, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_IMAGE_VIEW_TYPE_MAX_ENUM, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT });
+        return slots;
+      }
+    };
+
+    class IntegrateIndirectSharcUpdateShader : public IntegrateIndirectSharcShader {
+    public:
+      static std::vector<dxvk::DxvkResourceSlot> getResourceSlots() {
+        auto slots = IntegrateIndirectSharcShader::getResourceSlots();
+        slots.erase(std::remove_if(slots.begin(), slots.end(), [](const auto& slot) {
+          return slot.slot == INTEGRATE_INDIRECT_BINDING_INDIRECT_RADIANCE_HIT_DISTANCE_OUTPUT
+              || slot.slot == INTEGRATE_INDIRECT_BINDING_RESTIR_GI_RESERVOIR_OUTPUT
+              || slot.slot == INTEGRATE_INDIRECT_BINDING_RESTIR_GI_RADIANCE_OUTPUT
+              || slot.slot == INTEGRATE_INDIRECT_BINDING_RESTIR_GI_HIT_GEOMETRY_OUTPUT
+              || slot.slot == INTEGRATE_INDIRECT_BINDING_NEE_CACHE_TASK
+              || slot.slot == BINDING_DEBUG_VIEW_TEXTURE;
+        }), slots.end());
+        for (auto& slot : slots) {
+          if (slot.slot == INTEGRATE_INDIRECT_BINDING_NEE_CACHE_THREAD_TASK) {
+            slot.access = VK_ACCESS_SHADER_READ_BIT;
+          }
+        }
+        return slots;
+      }
     };
 
     class IntegrateIndirectClosestHitShader : public ManagedShader {
@@ -346,6 +385,13 @@ namespace dxvk {
           }
         }
       }
+      // SHARC uses only these two dedicated compute RayQuery variants.  They
+      // are intentionally prewarmed separately from the legacy permutation
+      // matrix because they carry the cache bindings and estimator defines.
+      if (RtxSharc::isSupported(*m_device)) {
+        getComputeShader(NeeCachePass::enable(), false, false, true, false);
+        getComputeShader(NeeCachePass::enable(), false, false, false, true);
+      }
     } else {
       // Note: The getters for these SER/OMM enabled flags also check if SER/OMMs are supported, so we do not need to check for that manually.
       const bool serEnabled = RtxOptions::isShaderExecutionReorderingInPathtracerIntegrateIndirectEnabled();
@@ -353,6 +399,12 @@ namespace dxvk {
       const bool useNeeCache = NeeCachePass::enable();
       const bool nrcEnabled = RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::NeuralRadianceCache;
       const bool wboitEnabled = RtxOptions::wboitEnabled();
+
+      if (RtxSharc::isSupported(*m_device)
+          && RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::Sharc) {
+        getComputeShader(useNeeCache, false, false, true, false);
+        getComputeShader(useNeeCache, false, false, false, true);
+      }
 
       for (int32_t includesPortals = portalsEnabled; includesPortals >= 0; includesPortals--) {
         // Prewarm POM on and off, as that can change based on game content (if nothing in the frame has a height texture, then POM turns off)
@@ -394,13 +446,17 @@ namespace dxvk {
       case IntegrateIndirectMode::NeuralRadianceCache:
         Logger::info("[RTX] Integrate Indirect Mode: Neural Radiance Cache - activated");
         break;
+      case IntegrateIndirectMode::Sharc:
+        Logger::info("[RTX] Integrate Indirect Mode: SHARC - activated");
+        break;
       }
     }
   }
 
   void DxvkPathtracerIntegrateIndirect::dispatch(
     RtxContext* ctx, 
-    const Resources::RaytracingOutput& rtOutput) {
+    const Resources::RaytracingOutput& rtOutput,
+    bool sharcUpdate) {
 
     const uint32_t frameIdx = ctx->getDevice()->getCurrentFrameId();
 
@@ -478,18 +534,24 @@ namespace dxvk {
 
     // Bind necessary resources for Neural Radiance Cache
     NeuralRadianceCache& nrc = ctx->getCommonObjects()->metaNeuralRadianceCache();
+    RtxSharc& sharc = ctx->getCommonObjects()->metaSharc();
     nrc.bindIntegrateIndirectPathTracingResources(*ctx);
+    if (sharc.isActive()) {
+      sharc.bindResources(*ctx);
+    }
 
     // Bind necessary resources for ReSTIR GI
     DxvkReSTIRGIRayQuery& reSTIRGI = ctx->getCommonObjects()->metaReSTIRGIRayQuery();
     reSTIRGI.bindIntegrateIndirectPathTracingResources(*ctx);
 
-    ctx->bindResourceView(INTEGRATE_INDIRECT_BINDING_INDIRECT_RADIANCE_HIT_DISTANCE_OUTPUT, rtOutput.m_indirectRadianceHitDistance.view(Resources::AccessType::Write), nullptr);
+    if (!sharcUpdate) {
+      ctx->bindResourceView(INTEGRATE_INDIRECT_BINDING_INDIRECT_RADIANCE_HIT_DISTANCE_OUTPUT, rtOutput.m_indirectRadianceHitDistance.view(Resources::AccessType::Write), nullptr);
+    }
     
     DebugView& debugView = ctx->getDevice()->getCommon()->metaDebugView();
     ctx->bindResourceView(INTEGRATE_INSTRUMENTATION, debugView.getInstrumentation(), nullptr);
 
-    const bool nrcEnabled = nrc.isActive();
+    const bool nrcEnabled = nrc.isActive() && !sharc.isActive();
 
     const VkExtent3D& rayDims = nrcEnabled
       ? nrc.calcRaytracingResolution()
@@ -506,10 +568,32 @@ namespace dxvk {
       ScopedGpuProfileZone(ctx, "Integrate Indirect Raytracing");
       const NeeCachePass& neeCache = ctx->getCommonObjects()->metaNeeCache();
       const bool neeCacheEnabled = neeCache.isActive();
-      const VkExtent3D workgroups = util::computeBlockCount(rayDims, VkExtent3D { 16, 8, 1 });
+      // SHARC update launches one logical thread per update tile.  The shader
+      // maps that logical coordinate to a rotating source pixel, so dispatch
+      // over the tile grid and ceil both dimensions before applying the local
+      // 16x8 workgroup shape.  Query and all legacy variants remain at their
+      // normal (or NRC-expanded) resolution.
+      VkExtent3D dispatchDims = rayDims;
+      if (sharcUpdate) {
+        const uint32_t tileSize = std::max(1u, rtOutput.m_raytraceArgs.sharcArgs.updateTileSize);
+        dispatchDims.width = (rayDims.width + tileSize - 1) / tileSize;
+        dispatchDims.height = (rayDims.height + tileSize - 1) / tileSize;
+        dispatchDims.depth = 1;
+      }
+      const VkExtent3D workgroups = util::computeBlockCount(dispatchDims, VkExtent3D { 16, 8, 1 });
+      if (sharcUpdate || sharc.isActive()) {
+        // SHARC variants are deliberately compute RayQuery only.  Do not let
+        // the user's normal indirect backend selection bind an incompatible
+        // ray-generation or TraceRay pipeline while the cache is active.
+        ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT,
+          getComputeShader(neeCacheEnabled, nrcEnabled, wboitEnabled,
+                           sharcUpdate, !sharcUpdate));
+        ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
+        return;
+      }
       switch (RtxOptions::renderPassIntegrateIndirectRaytraceMode()) {
       case RaytraceMode::RayQuery:
-        ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, getComputeShader(neeCacheEnabled, nrcEnabled, wboitEnabled));
+        ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, getComputeShader(neeCacheEnabled, nrcEnabled, wboitEnabled, sharcUpdate, sharc.isActive() && !sharcUpdate));
         ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
         break;
       case RaytraceMode::RayQueryRayGen:
@@ -883,7 +967,13 @@ namespace dxvk {
     return shaders;
   }
 
-  Rc<DxvkShader> DxvkPathtracerIntegrateIndirect::getComputeShader(const bool useNeeCache, const bool nrcEnabled, const bool wboitEnabled) const {
+  Rc<DxvkShader> DxvkPathtracerIntegrateIndirect::getComputeShader(const bool useNeeCache, const bool nrcEnabled, const bool wboitEnabled, const bool sharcUpdate, const bool sharcQuery) const {
+    if (sharcUpdate) {
+      return GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, IntegrateIndirectSharcUpdateShader, integrate_indirect_sharc_update);
+    }
+    if (sharcQuery) {
+      return GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, IntegrateIndirectSharcShader, integrate_indirect_sharc_query);
+    }
     if (wboitEnabled) {
       if (nrcEnabled) {
         if (useNeeCache) {

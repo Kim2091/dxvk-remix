@@ -31,12 +31,20 @@ vec4 readInDebugView(uvec2 pixelCoordinate)
 
 void storeInDebugView(uvec2 pixelCoordinate, bool value)
 {
+// NV-DXVK start: Cache update paths must not alter the render debug image
+#if !defined(SHARC_UPDATE) || !SHARC_UPDATE
   imageStore(DebugView, ivec2(pixelCoordinate), value ? vec4(1.0) : vec4(0.0));
+#endif
+// NV-DXVK end
 }
 
 void storeInDebugView(uvec2 pixelCoordinate, vec4 value)
 {
+// NV-DXVK start: Cache update paths must not alter the render debug image
+#if !defined(SHARC_UPDATE) || !SHARC_UPDATE
   imageStore(DebugView, ivec2(pixelCoordinate), value);
+#endif
+// NV-DXVK end
 }
 
 void storeInDebugView(uvec2 pixelCoordinate, vec3 value)

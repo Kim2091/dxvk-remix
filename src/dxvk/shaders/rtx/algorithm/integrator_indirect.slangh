@@ -48,6 +48,9 @@ static const uint kRestirGIAcceptLowRoughnessInput = false;
 PathState pathStateCreateEmpty(GeometryFlags geometryFlags)
 {
   PathState pathState;
+#if SHARC_UPDATE
+  SharcInit(pathState.sharcState);
+#endif
 
   // Note: Primary linear roughness, origin, cone radius, medium material index, inside medium flag and
   // direction assumed to be set by primary vertex intergation.
@@ -86,6 +89,9 @@ PathState pathStateCreateEmpty(GeometryFlags geometryFlags)
 // Helper function to accumulate attenuation or other throughputs into the Path State throughput.
 void accumulateThroughput(inout PathState pathState, vec3 throughput)
 {
+#if SHARC_UPDATE
+  SharcSetThroughput(pathState.sharcState, throughput);
+#endif
   pathState.throughput = clampedMaximumPositiveMultiply(pathState.throughput, throughput, kThroughputClampedDivisionMaximum);
 }
 
@@ -104,6 +110,10 @@ void accumulateRadiance(inout vec3 accumulatedRadiance, PathState pathState, vec
 // Overload for simpler path state usage when accumulating radiance.
 void accumulateRadiance(inout PathState pathState, vec3 radiance)
 {
+#if SHARC_UPDATE
+  // Stored weights start at the cached surface, excluding the camera prefix.
+  SharcUpdateMiss(makeSharcParameters(), pathState.sharcState, radiance);
+#endif
   accumulateRadiance(pathState.radiance, pathState, radiance);
 }
 
@@ -266,7 +276,7 @@ void integratePathVertex(
 
     if ((cb.debugView == DEBUG_VIEW_SECONDARY_UNORDERED_INTERACTIONS 
          || cb.debugView == DEBUG_VIEW_SECONDARY_RAY_AND_UNORDERED_INTERACTIONS)
-        && TRUE_OR_CHECK_WHEN_NRC_ENABLED(pathState.isNrcQuery))
+        && (!SHARC_UPDATE && TRUE_OR_CHECK_WHEN_NRC_ENABLED(pathState.isNrcQuery)))
     {
       accumulateInDebugViewAdd(pathState.pixelCoordinate, numUnorderedInteractions);
     }
@@ -276,7 +286,9 @@ void integratePathVertex(
       // Insert new task
       NEECell cell = NEECache.getCell(pathState.neeCacheCellOffset);
       int prefixTask = NEECacheUtils.convertIDToPrefixSumID(unorderedSurfaceIndex, 0, PrimitiveIDPrefixSum);
+#if !SHARC_UPDATE
       cell.insertSlotTask(prefixTask, emissiveRadiance * pathState.calculateFullThroughput(), false);
+#endif
     }
   }
 
@@ -318,7 +330,7 @@ void integratePathVertex(
   //  we must also handle that case and ensure nothing tries to use POM elsewhere.
   pomOpaqueSurfaceEncountered = pomOpaqueSurfaceEncountered && cb.pomEnableIndirectLighting;
   
-#if !ENABLE_NRC
+#if !ENABLE_NRC && !ENABLE_SHARC
   // Output ReSTIR GI geometry information
 
   if (cb.enableReSTIRGI && !pathState.restirGiHasHitGeometry)
@@ -472,7 +484,7 @@ void integratePathVertex(
     pathState.continuePath = true;
     
     if (cb.debugView == DEBUG_VIEW_RAYTRACED_RENDER_TARGET_INDIRECT
-      && TRUE_OR_CHECK_WHEN_NRC_ENABLED(pathState.isNrcQuery))
+      && (!SHARC_UPDATE && TRUE_OR_CHECK_WHEN_NRC_ENABLED(pathState.isNrcQuery)))
     {
       storeInDebugView(pathState.pixelCoordinate, vec4(1.f));
     }
@@ -499,7 +511,9 @@ void integratePathVertex(
       int primitiveIndex = shouldSampleObject ? 0 : rayInteraction.primitiveIndex;
       int surfaceIndex = rayInteraction.surfaceIndex;
       int prefixTask = NEECacheUtils.convertIDToPrefixSumID(surfaceIndex, primitiveIndex, PrimitiveIDPrefixSum);
+#if !SHARC_UPDATE
       cell.insertSlotTask(prefixTask, emissiveLight * pathState.calculateFullThroughput(), false);
+#endif
 
       lightSelectionPDF = cell.searchCandidate(surfaceIndex, primitiveIndex);
       if (lightSelectionPDF > 0.0 && shouldSampleObject)
@@ -540,6 +554,42 @@ void integratePathVertex(
     const vec3 emissiveLightRadiance = emissiveLight * misWeight;
     accumulateRadiance(pathState, emissiveLightRadiance);
   }
+
+#if ENABLE_SHARC
+  // Keep emission above this point live: the cache contains reflected lighting.
+  const OpaqueSurfaceMaterialInteraction sharcMaterial = opaqueSurfaceMaterialInteractionCreate(polymorphicSurfaceMaterialInteraction);
+  const bool sharcEligible = materialType == surfaceMaterialTypeOpaque
+    && pathState.mediumMaterialIndex == SURFACE_INDEX_INVALID
+    && !pathState.insideMedium && pathState.skyGatherEligible
+    && sharcMaterial.isotropicRoughness >= cb.sharcArgs.minRoughness
+    && sharcMaterial.opacity >= 1.0f
+    && !isSubsurfaceDiffusionProfileMaterial(sharcMaterial)
+    && !any(emissiveLight > 0.0f);
+  if (sharcEligible)
+  {
+    SharcParameters sharcParameters = makeSharcParameters();
+    SharcHitData sharcHit = (SharcHitData)0;
+    sharcHit.positionWorld = surfaceInteraction.position;
+    sharcHit.normalWorld = surfaceInteraction.geometryNormal;
+#if SHARC_UPDATE
+    // NEE below adds to this new vertex and older vertices through the same hook.
+    // With resampling/responsive lighting disabled, insertion failure leaves
+    // the existing vertices intact; continue their lighting estimate on overflow.
+    SharcUpdateHit(sharcParameters, pathState.sharcState, sharcHit, vec3(0.0f), 0.0f);
+#elif SHARC_QUERY
+    const float voxelSize = HashGridGetVoxelSize(HashGridGetLevel(sharcHit.positionWorld, sharcParameters.hashGridParameters), sharcParameters.hashGridParameters);
+    vec3 cachedRadiance = vec3(0.0f);
+    if (pathState.segmentHitDistance > 1.732051f * voxelSize
+        && SharcGetCachedRadiance(sharcParameters, sharcHit, cachedRadiance, false)
+        && isValidValue(cachedRadiance))
+    {
+      accumulateRadiance(pathState, cachedRadiance);
+      pathState.continuePath = false;
+      return;
+    }
+#endif
+  }
+#endif
 
   // When boostEmissives is enabled, defer TerminateImmediately until after emissive accumulation
   // so that the hit surface's emissive self-emission is properly MIS-weighted.
@@ -593,7 +643,7 @@ void integratePathVertex(
 
       // Classify the lobe that generated this ray for skyIndirectRadianceScale.
       // Computed here, where materialType is known, so the opaque lobe enum is
-      // only trusted for opaque surfaces — translucent (glass/water) lobes use a
+      // only trusted for opaque surfaces â€” translucent (glass/water) lobes use a
       // different enum and are never eligible, and an opaque alpha-cutout
       // (opacity transmission) is a straight-through view, also not eligible.
       // Only a genuine diffuse gather (opaque diffuse reflection / transmission)
@@ -705,8 +755,8 @@ void integratePathVertex(
       lightSample.solidAnglePdf = invSelectionPdf > 0 ? lightSample.solidAnglePdf / invSelectionPdf : 0.0;
 
       // Cloud-on-terrain shadow on the atmosphere sun (real distant light) for
-      // secondary bounces — mirror of the primary path in integrator_direct.slangh.
-      // fork — experiment 2026-06-21.
+      // secondary bounces â€” mirror of the primary path in integrator_direct.slangh.
+      // fork â€” experiment 2026-06-21.
       if (lightSampleValid && cb.skyMode == 1 && cb.atmosphereArgs.cloudVoxelShadowsEnable != 0u
           && lightIdx != kInvalidLightIdx)
       {
@@ -815,7 +865,9 @@ void integratePathVertex(
               (isLightTask || lightTask != uint(kInvalidLightIdx)))
           {
             NEECell cell = NEECache.getCell(pathState.neeCacheCellOffset);
+#if !SHARC_UPDATE
             cell.insertSlotTask(lightTask, neeLight, isLightTask);
+#endif
           }
       
           float specularPortion = calcBt709Luminance(specularLight) / calcBt709Luminance(neeLight);
@@ -903,7 +955,7 @@ void integratePathVertex(
       }
     }
 
-#if !ENABLE_NRC
+#if !ENABLE_NRC && !ENABLE_SHARC
     // Steal samples from restir gi
     if (cb.enableReSTIRGI
       && cb.enableReSTIRGISampleStealing > 0
@@ -1046,7 +1098,7 @@ void integratePathVertex(
 // Update the hit distance when a significant contribution to the final result is found
 void updateReSTIRGIHitDistance(inout float oldLuminance, float newLuminance, inout float restirHitT, float newHitT)
 {
-#if !ENABLE_NRC 
+#if !ENABLE_NRC && !ENABLE_SHARC
   // If both oldLuminance and newLuminance are 0, still update hit distance
   if (newLuminance >= oldLuminance * cb.reSTIRGIVirtualSampleLuminanceThreshold)
   {
@@ -1104,7 +1156,7 @@ vec3 calculateReSTIRGIRadianceFactor(
 // multiple times as the integrator progresses through the scene, and with a texture store it's only spilled once.
 void storeRestirGIRadiance(PathState pathState, GeometryFlags geometryFlags, float gbufferSurfaceHitDistance)
 {
-#if !ENABLE_NRC  
+#if !ENABLE_NRC && !ENABLE_SHARC
   if (!(cb.enableReSTIRGI && geometryFlags.primarySelectedIntegrationSurface))
   {
     return;
@@ -1282,7 +1334,7 @@ void initReSTIRGI(
   float firstSampledLobePdf,
   float firstSampledSolidAnglePdf)
 {
-#if !ENABLE_NRC
+#if !ENABLE_NRC && !ENABLE_SHARC
   if (cb.enableReSTIRGI && geometryFlags.primarySelectedIntegrationSurface)
   {
     // Pre-calculate the radiance factor to reduce live state dragged over the integrator
@@ -1369,7 +1421,7 @@ void integrateIndirectPath(
     {
       uint primarySurfaceIndex = uint(SharedSurfaceIndex[gbufferPixelCoordinate]);
       
-      if (cb.debugView == DEBUG_VIEW_HEIGHT_MAP && TRUE_OR_CHECK_WHEN_NRC_ENABLED(pathState.isNrcQuery))
+      if (cb.debugView == DEBUG_VIEW_HEIGHT_MAP && (!SHARC_UPDATE && TRUE_OR_CHECK_WHEN_NRC_ENABLED(pathState.isNrcQuery)))
       {
         if (primarySurfaceIndex != SURFACE_INDEX_INVALID)
         {
@@ -1454,10 +1506,11 @@ void integrateIndirectPath(
       SEGMENT_HIT_DISTANCE_UNUSED,
       DEBUG_VIEW_SECONDARY_RAY_INTERACTIONS, 
       DEBUG_VIEW_SECONDARY_RAY_AND_UNORDERED_INTERACTIONS,
-      TRUE_OR_CHECK_WHEN_NRC_ENABLED(pathState.isNrcQuery));
+      (!SHARC_UPDATE && TRUE_OR_CHECK_WHEN_NRC_ENABLED(pathState.isNrcQuery)));
   }
 
-  if (TRUE_OR_CHECK_WHEN_NRC_ENABLED(pathState.isNrcQuery))
+#if !SHARC_UPDATE
+  if ((!SHARC_UPDATE && TRUE_OR_CHECK_WHEN_NRC_ENABLED(pathState.isNrcQuery)))
   {
     const u16vec2 gbufferPixelCoordinate = pathState.pixelCoordinate;
 
@@ -1485,6 +1538,7 @@ void integrateIndirectPath(
     indirectPathTextures,
     pathState,
     geometryFlags);
+#endif
 }
 
 void integratorIndirectPathOutputDebugView(
@@ -1492,7 +1546,7 @@ void integratorIndirectPathOutputDebugView(
   PathState pathState,
   GeometryFlags geometryFlags)
 {
-  if (!TRUE_OR_CHECK_WHEN_NRC_ENABLED(pathState.isNrcQuery))
+  if (!(!SHARC_UPDATE && TRUE_OR_CHECK_WHEN_NRC_ENABLED(pathState.isNrcQuery)))
   {
     return;
   }

@@ -355,6 +355,7 @@ namespace dxvk {
         {IntegrateIndirectMode::ImportanceSampled, "Importance Sampled",  
           "Importance Sampled. Importance sampled mode uses typical GI sampling and it is not recommended for general use as it provides the noisiest output.\n"
           "It serves as a reference integration mode for validation of other indirect integration modes." },
+        {IntegrateIndirectMode::Sharc, "SHARC (experimental)", "Sparse world-space diffuse radiance cache. Uses compute RayQuery; see SHARC settings for support status."},
         {IntegrateIndirectMode::ReSTIRGI, "ReSTIR GI", 
           "ReSTIR GI provides improved indirect path sampling over \"Importance Sampled\" mode with better indirect diffuse and specular GI quality at increased performance cost."},
         {IntegrateIndirectMode::NeuralRadianceCache, "RTX Neural Radiance Cache", 
@@ -3779,6 +3780,11 @@ namespace dxvk {
       if (RemixGui::CollapsingHeader("Indirect Illumination", collapsingHeaderClosedFlags)) {
         ImGui::Indent();
         integrateIndirectModeCombo.getKey(&RtxOptions::integrateIndirectModeObject());
+        // NV-DXVK start: SHARC settings
+        if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::Sharc) {
+          common->metaSharc().showImguiSettings();
+        }
+        // NV-DXVK end
 
         if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::ReSTIRGI) {
           if (RemixGui::CollapsingHeader("ReSTIR GI", collapsingHeaderClosedFlags)) {

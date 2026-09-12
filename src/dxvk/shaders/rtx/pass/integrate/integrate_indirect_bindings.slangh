@@ -26,6 +26,10 @@
 #include "rtx/algorithm/rtxdi/rtxdi.slangh"
 #include "rtx/utility/shader_types.slangh"
 
+#if ENABLE_SHARC
+#include "rtx/pass/sharc/sharc_bindings.slangh"
+#endif
+
 // Shared Inputs
 
 layout(binding = INTEGRATE_INDIRECT_BINDING_LINEAR_WRAP_SAMPLER)

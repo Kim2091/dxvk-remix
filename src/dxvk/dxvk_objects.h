@@ -43,6 +43,9 @@
 #include "rtx_render/rtx_pathtracer_integrate_indirect.h"
 #include "rtx_render/rtx_demodulate.h"
 #include "rtx_render/rtx_nee_cache.h"
+// NV-DXVK start: SHARC device ownership
+#include "rtx_render/rtx_sharc.h"
+// NV-DXVK end
 #include "rtx_render/rtx_denoise.h"
 #include "rtx_render/rtx_ngx_wrapper.h"
 #include "rtx_render/rtx_dlfg.h"
@@ -192,6 +195,10 @@ namespace dxvk {
     NeeCachePass& metaNeeCache() {
       return m_neeCache.get();
     }
+
+    // NV-DXVK start: SHARC device ownership
+    RtxSharc& metaSharc() { return m_sharc.get(); }
+    // NV-DXVK end
 
     NeuralRadianceCache& metaNeuralRadianceCache() {
       return m_neuralRadianceCache.get();
@@ -414,6 +421,9 @@ namespace dxvk {
     Active<DemodulatePass>                  m_demodulate;
     Active<NeeCachePass>                    m_neeCache;
     Active<NeuralRadianceCache>             m_neuralRadianceCache;
+    // NV-DXVK start: SHARC device ownership
+    Active<RtxSharc>                         m_sharc;
+    // NV-DXVK end
     Active<DxvkDenoise>                     m_primaryDirectLightDenoiser;
     Active<DxvkDenoise>                     m_primaryIndirectLightDenoiser;
     Active<DxvkDenoise>                     m_primaryCombinedLightDenoiser;

@@ -41,6 +41,19 @@
 //!variant integrate_indirect_rayquery.comp
 //!>       NEE_CACHE_ENABLE=0
 
+// SHARC proof variants currently use the compute RayQuery path only.  Keeping
+// these as dedicated variants avoids adding SHARC descriptors and payload state
+// to the ordinary indirect shader matrix.
+//!variant integrate_indirect_sharc_update.comp
+//!>       ENABLE_SHARC=1
+//!>       SHARC_UPDATE=1
+//!>       NEE_CACHE_ENABLE=1
+
+//!variant integrate_indirect_sharc_query.comp
+//!>       ENABLE_SHARC=1
+//!>       SHARC_QUERY=1
+//!>       NEE_CACHE_ENABLE=1
+
 //!variant integrate_indirect_rayquery_raygen.rgen
 //!>       RAY_PIPELINE
 //!>       NEE_CACHE_ENABLE=0

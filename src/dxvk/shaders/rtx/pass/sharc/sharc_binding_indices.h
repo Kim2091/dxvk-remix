@@ -1,0 +1,5 @@
+// Copyright (c) 2026, NVIDIA CORPORATION. SPDX-License-Identifier: MIT
+#pragma once
+#define SHARC_BINDING_HASH 230
+#define SHARC_BINDING_ACCUMULATION 231
+#define SHARC_BINDING_RESOLVED 232
