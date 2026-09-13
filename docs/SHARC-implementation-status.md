@@ -343,3 +343,5 @@ Assembly retest result: user reports properly measured performance largely match
 Query-probe experiment 0ba50562d built, validated and deployed. Only the SHARC query lookup-loop unroll attribute changes; performance pending game test. See SHARC-query-probe-test-2026-09-13.md.
 
 Query-probe first capture: user confirms correct lighting and perceives a slight improvement. IndirectIntegration median 2.366 vs 2.390 ms, but total measured sequence 15.932 vs 15.387 ms. Result inconclusive across separate runs; no demonstrated overall speedup. Capture retained and candidate left installed for comparison. See SHARC-query-probe-test-2026-09-13.md.
+
+Fusion prerequisite: extracted shared per-pixel NEE assembly helper; source calculation unchanged, release and embedded resource checks passed. No fused mode exists yet and game install unchanged. Audit identifies throughput/diffuse aliasing, raw secondary consumer, half-precision handoff, sparse/miss exits and NEE feedback interleaving as requirements. See SHARC-query-assembly-fusion-2026-09-13.md.
