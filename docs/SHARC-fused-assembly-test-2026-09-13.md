@@ -13,3 +13,15 @@ FNV was launched through nvse_loader.exe; FalloutNV and NvRemixBridge processes 
 Load the same save/view. Inspect emissive lights, glass/reflections, and camera movement. Then hold the camera still for 45?60 seconds. The runtime activation marker is [SHARC] Combined query/assembly active. Compare combined IndirectIntegration + IndirectAssembly and overall frame time against standalone; assembly cost moves into integration in this candidate.
 
 For a baseline test, exit FNV, set rtx.sharc.fuseAssembly = False, and relaunch the same build. To fully restore the previous installation, exit FNV and restore both DLL/PDB plus rtx.conf from the rollback directory.
+
+## First capture and same-build baseline follow-up
+
+User completed the test; no explicit visual-quality report was supplied. Preserved runtime log in _Comp64Release/fused-assembly-first-capture.log and settings in fused-assembly-first-capture-rtx.conf.
+
+Last 12 complete samples, fused frames 3298?4618 versus previous split frames 2534?3854:
+- Median per-frame sum of IndirectIntegration + IndirectAssembly: split 2.682511 ms, fused 2.955839 ms (+0.273328 ms, approximately 10.2%).
+- Median measured GPU sequence: split 15.932 ms, fused 15.628 ms.
+- Samples vary substantially; these captures do not establish a causal speedup or definitive regression. The target interval points against fusion despite a lower overall median.
+- GPU sequence excludes game CPU and presentation work.
+
+With FNV closed, retained the same DLL/PDB and changed only rtx.sharc.fuseAssembly to False for a fresh standalone baseline. Restarting with false restores the original aliased throughput allocation; this compares the full enabled/disabled feature cost. A same-allocation live toggle comparison has not been performed. Next test: same save/view, stationary 45?60 seconds, with visual feedback.
