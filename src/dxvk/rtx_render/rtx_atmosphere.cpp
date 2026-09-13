@@ -1703,7 +1703,8 @@ void RtxAtmosphere::createLutResources(Rc<DxvkContext> ctx) {
   );
 }
 
-void RtxAtmosphere::computeLuts(Rc<DxvkContext> ctx) {
+void RtxAtmosphere::computeLuts(RtxContext& rtx) {
+  Rc<DxvkContext> ctx = &rtx;
   if (!m_initialized) {
     return;
   }
@@ -1744,6 +1745,7 @@ void RtxAtmosphere::computeLuts(Rc<DxvkContext> ctx) {
   // completion — consumers keep reading the last complete bake throughout,
   // so weather-drift re-bakes never pop a half-baked field or spike a frame.
   stepCloudNvdfBake(ctx);
+  rtx.recordGpuStageTiming("AtmosphereCloudShapeAndNvdf");
 
   // Sky LUTs (transmittance / multiscattering / sky-view) only rebake when
   // their inputs actually change. Animated fields that feed only cloud and
@@ -1861,6 +1863,8 @@ void RtxAtmosphere::computeLuts(Rc<DxvkContext> ctx) {
     m_lutsNeedRecompute = false;
   }
 
+  rtx.recordGpuStageTiming("AtmosphereSkyLuts");
+
   // Aerial perspective volume. Camera-fitted, so this rebuilds every frame regardless of whether
   // the parameter-driven bakes above ran. It reads the transmittance and multiscattering LUTs; when
   // those were re-baked this frame the barriers above already order the writes ahead of this read,
@@ -1873,8 +1877,10 @@ void RtxAtmosphere::computeLuts(Rc<DxvkContext> ctx) {
     // them would bake with the previous frame's cluster lists against this frame's camera.
     buildAerialPerspectiveLights(ctx);
     dispatchAerialPerspectiveLightCull(ctx);
+    rtx.recordGpuStageTiming("AtmosphereLightCull");
 
-    dispatchAerialPerspectiveLut(ctx);
+    dispatchAerialPerspectiveLut(rtx);
+    rtx.recordGpuStageTiming("AtmosphereFogIntegration");
 
     ctx->emitMemoryBarrier(0,
       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -1890,6 +1896,7 @@ void RtxAtmosphere::computeLuts(Rc<DxvkContext> ctx) {
   if (RtxAtmosphere::debugDispatchCloudSkyTransmittance()) {
     dispatchCloudSkyTransmittanceLut(ctx);
   }
+  rtx.recordGpuStageTiming("AtmosphereCloudSkyTransmittance");
 
   // Full-rate cloud voxel grid bake (Nubis Cubed 2023, fork — 2026-05-12;
   // full-rate flip 2026-05-19). The original implementation amortized each
@@ -1953,6 +1960,7 @@ void RtxAtmosphere::computeLuts(Rc<DxvkContext> ctx) {
       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
       VK_ACCESS_SHADER_READ_BIT);
     dispatchCloudSunDensityGrid(ctx);
+    rtx.recordGpuStageTiming("AtmosphereCloudSunGrid");
     ctx->emitMemoryBarrier(0,
       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
       VK_ACCESS_SHADER_WRITE_BIT,
@@ -1960,6 +1968,7 @@ void RtxAtmosphere::computeLuts(Rc<DxvkContext> ctx) {
       VK_ACCESS_SHADER_READ_BIT);
     dispatchCloudAmbientDensityGrid(ctx);
   }
+  rtx.recordGpuStageTiming("AtmosphereCloudAmbientGrid");
 
   // Cloud render compute pass — MOVED OUT of computeLuts (fork — 2026-09-05, world-space cloud
   // migration Stage 4a; was here, gated on debugDispatchCloudRender, from the 2026-05-12 C4 add
@@ -1985,6 +1994,7 @@ void RtxAtmosphere::computeLuts(Rc<DxvkContext> ctx) {
       VK_ACCESS_SHADER_READ_BIT);
     dispatchCloudSecondaryLut(ctx);
   }
+  rtx.recordGpuStageTiming("AtmosphereCloudSecondaryLut");
 
   // Cloud render dispatch itself no longer lives here — see dispatchCloudScreenPass (fork —
   // 2026-09-05, world-space cloud migration Stage 4a). debugDispatchCloudRender's gate and the
@@ -2444,7 +2454,8 @@ void RtxAtmosphere::createAerialPerspectiveLut(Rc<DxvkContext> ctx, uint32_t siz
   );
 }
 
-void RtxAtmosphere::dispatchAerialPerspectiveLut(Rc<DxvkContext> ctx) {
+void RtxAtmosphere::dispatchAerialPerspectiveLut(RtxContext& rtx) {
+  Rc<DxvkContext> ctx = &rtx;
   // Both dimensions are runtime options, so honour a change by rebuilding the volume before writing
   // to it. The old image stays alive as long as a command list still references it, so this is safe
   // mid-frame; it only ever runs on an actual resize.
@@ -2527,6 +2538,7 @@ void RtxAtmosphere::dispatchAerialPerspectiveLut(Rc<DxvkContext> ctx) {
     ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_aerialPerspectiveLightClusterBuffer);
   }
 
+  rtx.recordGpuStageTiming("AtmosphereFogSetup");
   const bool traceScene = (args.aerialPerspectiveSceneShadowMode == 1u
     || args.aerialPerspectiveSceneShadowMode == 3u) && args.aerialPerspectiveSceneShadowRange > 0.0f;
   const bool separateVisibility = traceScene && aerialPerspectiveSeparateVisibility();
@@ -2555,6 +2567,7 @@ void RtxAtmosphere::dispatchAerialPerspectiveLut(Rc<DxvkContext> ctx) {
     m_aerialPerspectiveVisibility = {};
   }
 
+  rtx.recordGpuStageTiming("AtmosphereFogVisibility");
   {
     ScopedGpuProfileZone(ctx, "Atmosphere Aerial Perspective Integration");
     ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, separateVisibility
@@ -3717,7 +3730,8 @@ AtmosphereArgs RtxAtmosphere::updateFrame(RtxContext& ctx,
   const VkExtent3D downscaledExtent3D = ctx.getResourceManager().getDownscaleDimensions();
   ensureCloudRenderRT(&ctx, VkExtent2D { downscaledExtent3D.width, downscaledExtent3D.height });
 
-  computeLuts(&ctx);
+  ctx.recordGpuStageTiming("AtmosphereArgs");
+  computeLuts(ctx);
   args = getAtmosphereArgs();
   syncDistantLights(ctx.getSceneManager().getLightManager(), args);
   return args;

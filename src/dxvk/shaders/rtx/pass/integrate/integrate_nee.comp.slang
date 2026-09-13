@@ -25,6 +25,9 @@
 //!>       RAB_HAS_RESTIR_GI_RESERVOIRS=1
 //!>       ENABLE_NRC=1
 
+//!variant integrate_nee_plain.comp
+//!>       ENABLE_NRC=0
+
 //!variant integrate_nee_nrc.comp
 //!>       ENABLE_NRC=1
 

@@ -317,3 +317,25 @@ The experimental SHARC update cache resampling commit was removed from branch hi
 ## Lean secondary profile — September 13
 
 Opt-in full-resolution lean SHARC shader profile implemented and built. See [first-milestone details](Lean-SHARC-first-milestone-2026-09-13.md) for scope, artifacts, validation and A/B instructions. No game deployment or runtime performance/quality validation yet.
+
+## 2026-09-13: Feature-preserving SHARC resource specialization
+
+Full-feature SHARC now uses a resource layout without NRC/ReSTIR-GI descriptors and skips their indirect binding helpers while active. Release build and compiled contracts passed; 66 current stages verified in the DLL. Local only, no deployment or performance measurement. See [SHARC-first renderer](SHARC-first-renderer-2026-09-13.md).
+
+### Test build deployed to FNV
+
+The feature-preserving resource specialization and dedicated indirect-lighting scheduling entry point were built and deployed to FNV on 2026-09-13. DLL/PDB backup suffix: .backup-pre-sharc-first-20260913-012241. Existing settings and bridge hashes unchanged; lean remains enabled in the user's configuration. No in-game test performed. See [test build and boundary](SHARC-first-test-build-2026-09-13.md).
+
+### Whole-sequence profiling prepared
+
+User reported no measurable resource-cleanup gain. Full/lean SHARC stage snapshots were 2.47/1.15 ms; full frame time 18.5 ms. Opt-in sampled GPU stage logging is now built and deployed reversibly to FNV, with local log analysis. See [profiling record](GPU-stage-profiling-2026-09-13.md). No GitHub push.
+
+## Assembly boundary test candidate (2026-09-13)
+
+Built and deployed the indirect subsystem ownership refactor plus an explicit borrowed AssemblyResources interface. Plain NEE assembly now omits three unused backend descriptors and skips their CPU preparation; legacy and NEE visualization bindings remain intact. No shader algorithm or quality setting changed. Release build and compiled resource/DLL embedding validation passed. FNV and the bridge launched; in-game compatibility remains to be checked. No measured speedup is claimed, and the complete backend resource boundary remains unfinished. Deployment hashes, rollback suffix and test instructions: [assembly test](SHARC-assembly-test-2026-09-13.md).
+
+Assembly candidate follow-up: user found appearance correct but performance worse. Capture preserved and installed DLL/PDB reverted to pre-assembly-boundary backup. Main measured increase is ScenePreparation; causality is unresolved. See SHARC-assembly-test-2026-09-13.md. Do not redeploy current build outputs as a known-good candidate.
+
+Retest requested: the assembly-boundary candidate is installed again, restored from verified backup. Performance verdict remains pending retest.
+
+Assembly retest result: user reports properly measured performance largely matches the old build. Latest 12-sample median sequence is 15.387 ms; scene preparation returned to 0.117 ms and assembly is 0.312 ms. Earlier slowdown did not reproduce. Keep candidate installed; count this as structural progress with no demonstrated speedup, not a confirmed performance regression. See SHARC-assembly-test-2026-09-13.md for capture details and remaining coverage limits.

@@ -40,6 +40,7 @@ def main():
         text = contracts.disassemble(path, dis)
         name = path.stem.removeprefix('integrate_indirect_sharc_').removesuffix('_lean')
         bindings = set(contracts.binding_variables(text))
+        assert not bindings & {10, 51}, f'{name}: lean pipeline omits a required light/reservoir descriptor'
         baseline = contracts.disassemble(path.with_stem(path.stem.removesuffix('_lean')), dis)
         assert bindings <= set(contracts.binding_variables(baseline)), f'{name}: new unmanaged descriptors'
         for flag in ('enableRtxdiSampleStealing', 'enableUnorderedResolveInIndirectRays', 'enableIndirectAlphaBlendShadows'):

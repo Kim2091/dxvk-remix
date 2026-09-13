@@ -49,7 +49,7 @@ public:
   ~RtxAtmosphere();
 
   void initialize(Rc<DxvkContext> ctx);
-  void computeLuts(Rc<DxvkContext> ctx);
+  void computeLuts(RtxContext& rtx);
 
   // Advances Numos atmosphere state once for the current frame and returns the
   // effective shader constants. Weather remains transient scene state and is
@@ -1553,7 +1553,7 @@ private:
   void dispatchTransmittanceLut(Rc<DxvkContext> ctx);
   void dispatchMultiscatteringLut(Rc<DxvkContext> ctx);
   void dispatchSkyViewLut(Rc<DxvkContext> ctx);
-  void dispatchAerialPerspectiveLut(Rc<DxvkContext> ctx);  // per-frame; camera-fitted
+  void dispatchAerialPerspectiveLut(RtxContext& rtx);  // per-frame; camera-fitted
   // Per-frame local light pipeline for the aerial perspective volume: gather the frame's positional
   // lights into the compact GPU form, then cull them into the volume's own cluster grid. Both run
   // immediately before the bake reads them.

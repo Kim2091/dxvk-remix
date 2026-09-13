@@ -652,17 +652,21 @@ namespace dxvk {
       m_submitContainsInjectRtx = true;
       m_cachedReflexFrameId = cachedReflexFrameId;
 
+      beginGpuStageTiming();
+
       // Submit weather precipitation before prepareSceneData; particle
       // simulation consumes this frame's spawn contexts there.
       getCommonObjects()->metaPrecipitation().submit(*this);
 
       // Update all the GPU buffers needed to describe the scene
       getSceneManager().prepareSceneData(this, m_execBarriers);
+      recordGpuStageTiming("ScenePreparation");
       
       // If we really don't have any RT to do, just bail early (could be UI/menus rendering)
       if (getSceneManager().getSurfaceBuffer() != nullptr) {
 
         VkExtent3D downscaledExtent = onInjectRtxFrameBegin(targetImage->info().extent);
+        recordGpuStageTiming("FrameResourcePreparation");
 
         Resources::RaytracingOutput& rtOutput = getResourceManager().getRaytracingOutput();
 
@@ -678,9 +682,11 @@ namespace dxvk {
 
         // Generate ray tracing constant buffer
         updateRaytraceArgsConstantBuffer(rtOutput, downscaledExtent, targetImage->info().extent);
+        recordGpuStageTiming("RaytraceArgsAfterAtmosphere");
 
         // Volumetric Lighting
         dispatchVolumetrics(rtOutput);
+        recordGpuStageTiming("Volumetrics");
         
         // Path Tracing
         dispatchPathTracing(rtOutput);
@@ -694,6 +700,7 @@ namespace dxvk {
         // See RtxAtmosphere::dispatchCloudScreenPass's doc comment for what stays behind in
         // updateFrame/computeLuts instead.
         m_common->metaAtmosphere().dispatchCloudScreenPass(*this, rtOutput);
+        recordGpuStageTiming("CloudScreen");
 
         // Neural Radiance Cache
         m_common->metaNeuralRadianceCache().dispatchTrainingAndResolve(*this, rtOutput);
@@ -703,6 +710,7 @@ namespace dxvk {
 
         // ReSTIR GI
         m_common->metaReSTIRGIRayQuery().dispatch(this, rtOutput);
+        recordGpuStageTiming("OtherLightingAndConfidence");
         
         if (captureScreenImage && captureDebugImage) {
           takeScreenshot("baseReflectivity", rtOutput.m_primaryBaseReflectivity.image(Resources::AccessType::Read));
@@ -712,6 +720,7 @@ namespace dxvk {
 
         // Demodulation
         dispatchDemodulate(rtOutput);
+        recordGpuStageTiming("Demodulation");
 
         // Note: Primary direct diffuse/specular radiance textures noisy and in a demodulated state after demodulation step.
         if (captureScreenImage && captureDebugImage) {
@@ -721,6 +730,7 @@ namespace dxvk {
 
         // Denoising
         dispatchDenoise(rtOutput);
+        recordGpuStageTiming("Denoising");
 
         // Note: Primary direct diffuse/specular radiance textures denoised but in a still demodulated state after denoising step.
         if (captureScreenImage && captureDebugImage) {
@@ -730,6 +740,7 @@ namespace dxvk {
 
         // Composition
         dispatchComposite(rtOutput);
+        recordGpuStageTiming("Composition");
 
         // Post composite Debug View that may overwrite Composite output
         dispatchReplaceCompositeWithDebugView(rtOutput);
@@ -740,6 +751,7 @@ namespace dxvk {
 
         getCommonObjects()->getTextureManager().copySamplerFeedbackToHost(this);
         dispatchObjectPicking(rtOutput, downscaledExtent, targetImage->info().extent);
+        recordGpuStageTiming("FeedbackAndPicking");
 
         // Upscaling if DLSS/NIS enabled, or the Composition Pass will do upscaling
         if (m_currentUpscaler == InternalUpscaler::DLSS) {
@@ -772,6 +784,7 @@ namespace dxvk {
         }
         fork_hooks::dispatchRcasSharpening(*this, rtOutput);
         m_previousUpscaler = m_currentUpscaler;
+        recordGpuStageTiming("UpscalingOrRayReconstruction");
 
         RtxDustParticles& dust = m_common->metaDustParticles();
         dust.simulateAndDraw(this, m_state, rtOutput);
@@ -803,6 +816,7 @@ namespace dxvk {
 
         // Composite screen overlay (from external C API) after tone mapping, before screenshot capture.
         dispatchScreenOverlay(rtOutput);
+        recordGpuStageTiming("PostProcessing");
 
         if (captureScreenImage) {
           if (m_common->metaDebugView().debugViewIdx() == DEBUG_VIEW_DISABLED) {
@@ -846,6 +860,7 @@ namespace dxvk {
         raytracedThisFrame = true;
       }
 
+      endGpuStageTiming();
       m_framesWithoutValidScene = 0;
     } else {
       // If raytracing is only disabled because we don't have shaders available, we don't want to clear the scene.
@@ -1468,8 +1483,10 @@ namespace dxvk {
     }
 
     RtxAtmosphere& atmosphere = getCommonObjects()->metaAtmosphere();
+    recordGpuStageTiming("RaytraceArgsBeforeAtmosphere");
     const AtmosphereArgs atmosphereArgs = atmosphere.updateFrame(
       *this, weatherSnapshot, GlobalTime::get().deltaTime());
+    recordGpuStageTiming("AtmosphereFinish");
     if (currentSkyMode == SkyMode::Numos) {
       constants.atmosphereArgs = atmosphereArgs;
     }
@@ -1642,62 +1659,112 @@ namespace dxvk {
     }
   }
 
+  void RtxContext::beginGpuStageTiming() {
+    m_gpuStageSlot = -1;
+    if (!gpuStages() || !m_device->adapter()->deviceProperties().limits.timestampComputeAndGraphics) {
+      return;
+    }
+    for (auto& frame : m_gpuStageFrames) {
+      if (!frame.pending) {
+        continue;
+      }
+      std::array<DxvkQueryData, 64> data;
+      bool ready = true;
+      for (uint32_t i = 0; i < frame.count; ++i) {
+        const auto status = frame.queries[i]->getData(data[i]);
+        if (status != DxvkGpuQueryStatus::Available) {
+          ready = false;
+          if (status != DxvkGpuQueryStatus::Pending) {
+            frame.pending = false;
+          }
+          break;
+        }
+      }
+      if (!ready) {
+        continue;
+      }
+      const double scale = m_device->adapter()->deviceProperties().limits.timestampPeriod * 1e-6;
+      for (uint32_t i = 1; i < frame.count; ++i) {
+        Logger::info(str::format("[GPU stages] frame=", frame.frameId, " stage=", frame.labels[i],
+          " ms=", double(data[i].timestamp.time - data[i - 1].timestamp.time) * scale));
+      }
+      Logger::info(str::format("[GPU stages] frame=", frame.frameId, " stage=MeasuredSequence ms=",
+        double(data[frame.count - 1].timestamp.time - data[0].timestamp.time) * scale));
+      frame.pending = false;
+    }
+    if (m_gpuStageSampleCounter++ % 120 != 0) {
+      return;
+    }
+    const uint32_t slot = m_gpuStageNextSlot++ % m_gpuStageFrames.size();
+    auto& frame = m_gpuStageFrames[slot];
+    if (frame.pending) {
+      return;
+    }
+    frame.count = 0;
+    frame.frameId = m_device->getCurrentFrameId();
+    m_gpuStageSlot = int(slot);
+    recordGpuStageTiming("Begin");
+  }
+
+  void RtxContext::recordGpuStageTiming(const char* label) {
+    if (m_gpuStageSlot < 0) {
+      return;
+    }
+    auto& frame = m_gpuStageFrames[m_gpuStageSlot];
+    if (frame.count >= frame.queries.size()) {
+      m_gpuStageSlot = -1;
+      return;
+    }
+    auto& query = frame.queries[frame.count];
+    if (query == nullptr) {
+      query = m_device->createGpuQuery(VK_QUERY_TYPE_TIMESTAMP, 0, 0);
+    }
+    frame.labels[frame.count++] = label;
+    writeTimestamp(query);
+  }
+
+  void RtxContext::endGpuStageTiming() {
+    if (m_gpuStageSlot >= 0) {
+      recordGpuStageTiming("OutputAndFrameGeneration");
+      if (m_gpuStageSlot >= 0) {
+        m_gpuStageFrames[m_gpuStageSlot].pending = true;
+        m_gpuStageSlot = -1;
+      }
+    }
+  }
+
   void RtxContext::dispatchIntegrate(const Resources::RaytracingOutput& rtOutput) {
     ScopedGpuProfileZone(this, "Integrate Raytracing");
 
     // Integrate direct
     m_common->metaPathtracerIntegrateDirect().dispatch(this, rtOutput);
+    recordGpuStageTiming("DirectIntegration");
 
     // RTXDI Gradient pass
     m_common->metaRtxdiRayQuery().dispatchGradient(this, rtOutput);
+    recordGpuStageTiming("RTXDIGradients");
 
-    // Integrate indirect
-    {
-      ScopedGpuProfileZone(this, "Integrate Indirect Raytracing");
-      setFramePassStage(RtxFramePassStage::IndirectIntegration);
-
-      RtxSharc& sharc = m_common->metaSharc();
-      if (sharc.isActive()) {
-        // SHARC's sparse update writes the cache; resolve must publish it
-        // before the full-resolution query pass reads the resolved entries.
-        sharc.recordTimestamp(*this, RtxSharc::TimingPoint::Begin);
-        {
-          ScopedGpuProfileZone(this, "SHARC Update");
-          m_common->metaPathtracerIntegrateIndirect().dispatch(this, rtOutput, true);
-        }
-        sharc.recordTimestamp(*this, RtxSharc::TimingPoint::UpdateEnd);
-        sharc.dispatchResolve(*this, rtOutput);
-        sharc.beginQueryStats(*this);
-        sharc.recordTimestamp(*this, RtxSharc::TimingPoint::ResolveEnd);
-        {
-          ScopedGpuProfileZone(this, "SHARC Query");
-          m_common->metaPathtracerIntegrateIndirect().dispatch(this, rtOutput);
-        }
-        sharc.recordTimestamp(*this, RtxSharc::TimingPoint::QueryEnd);
-        sharc.endQueryStats(*this);
-      } else {
-        m_common->metaPathtracerIntegrateIndirect().dispatch(this, rtOutput);
-      }
-    }
-
-    // Integrate indirect - NEE Cache pass
-    m_common->metaPathtracerIntegrateIndirect().dispatchNEE(this, rtOutput);
+    m_common->metaPathtracerIntegrateIndirect().dispatchLighting(this, rtOutput);
   }
 
   void RtxContext::dispatchPathTracing(const Resources::RaytracingOutput& rtOutput) {
 
     // Gbuffer Raytracing
     m_common->metaPathtracerGbuffer().dispatch(this, rtOutput);
+    recordGpuStageTiming("GBuffer");
 
     // Sparse Rendering: sampling rates + active-pixel mask + compaction.
     // Runs after Gbuffer so the active-pixel mask can read current-frame SharedFlags.
     m_common->metaSparseRendering().dispatch(*this, rtOutput);
+    recordGpuStageTiming("SparsePreparation");
 
     // RTXDI
     m_common->metaRtxdiRayQuery().dispatch(this, rtOutput);
+    recordGpuStageTiming("RTXDI");
 
     // NEE Cache
     dispatchNeeCache(rtOutput);
+    recordGpuStageTiming("NEECache");
 
     // Integration Raytracing
     dispatchIntegrate(rtOutput);

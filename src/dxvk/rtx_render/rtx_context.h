@@ -179,6 +179,9 @@ namespace dxvk {
 #endif
     }
 
+    // Labels must outlive the delayed query readback.
+    void recordGpuStageTiming(const char* label);
+
   protected:
     virtual void updateComputeShaderResources() override;
     virtual void updateRaytracingShaderResources() override;
@@ -211,6 +214,22 @@ namespace dxvk {
 
     void dispatchVolumetrics(const Resources::RaytracingOutput& rtOutput);
     void dispatchIntegrate(const Resources::RaytracingOutput& rtOutput);
+
+    RTX_OPTION("rtx.profile", bool, gpuStages, false, "Log sampled GPU stage timings every 120 rendered frames. Diagnostic timestamps can affect overlap; disable for performance comparisons.");
+    void beginGpuStageTiming();
+    void endGpuStageTiming();
+    struct GpuStageFrame {
+      std::array<Rc<DxvkGpuQuery>, 64> queries;
+      std::array<const char*, 64> labels = {};
+      uint32_t count = 0;
+      uint32_t frameId = 0;
+      bool pending = false;
+    };
+    std::array<GpuStageFrame, 4> m_gpuStageFrames;
+    uint32_t m_gpuStageSampleCounter = 0;
+    uint32_t m_gpuStageNextSlot = 0;
+    int m_gpuStageSlot = -1;
+
     void dispatchPathTracing(const Resources::RaytracingOutput& rtOutput);
     void dispatchDemodulate(const Resources::RaytracingOutput& rtOutput);
     void dispatchNeeCache(const Resources::RaytracingOutput& rtOutput);
