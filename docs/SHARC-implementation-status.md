@@ -312,3 +312,8 @@ their test. User requested committing this baseline and trying cache resampling.
 Confirmed IPC deadlock with both bridge command rings full; renderer workers were idle. Built and deployed shared recursive response/device serialization, fail-fast response identity/timeout handling, and reset/readback corrections. Paired-queue regression passed 1,000 request/response UIDs. User reports the deployed fix worked; original initiating event remains unproven. See FNV-hang-diagnosis-2026-09-12.md for evidence and deployment records.
 
 The experimental SHARC update cache resampling commit was removed from branch history at user request after showing no performance benefit. SHARC and its earlier performance improvements remain. This source-history change does not replace the currently deployed game binaries; the diagnosis records describe the historical deployment.
+
+
+## Lean secondary profile — September 13
+
+Opt-in full-resolution lean SHARC shader profile implemented and built. See [first-milestone details](Lean-SHARC-first-milestone-2026-09-13.md) for scope, artifacts, validation and A/B instructions. No game deployment or runtime performance/quality validation yet.

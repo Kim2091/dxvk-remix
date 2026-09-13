@@ -418,12 +418,107 @@
 //!>       SHARC_QUERY_STATS=1
 //!>       UNORDERED_RESOLVE_WBOIT
 
+//!variant integrate_indirect_sharc_update_lean.comp
+//!>       ENABLE_SHARC=1
+//!>       SHARC_UPDATE=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       SHARC_LEAN_SECONDARY=1
+//!>       SURFACE_MATERIAL_RESOLVE_TYPE_ACTIVE_MASK=SURFACE_MATERIAL_RESOLVE_TYPE_OPAQUE_TRANSLUCENT
+
+//!variant integrate_indirect_sharc_update_raygen_lean.rgen
+//!>       RAY_PIPELINE
+//!>       ENABLE_SHARC=1
+//!>       SHARC_UPDATE=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       SHARC_LEAN_SECONDARY=1
+//!>       SURFACE_MATERIAL_RESOLVE_TYPE_ACTIVE_MASK=SURFACE_MATERIAL_RESOLVE_TYPE_OPAQUE_TRANSLUCENT
+
+//!variant integrate_indirect_sharc_update_deferred_lean.comp
+//!>       ENABLE_SHARC=1
+//!>       SHARC_UPDATE=1
+//!>       SHARC_DEFERRED_UPDATE=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       SHARC_LEAN_SECONDARY=1
+//!>       SURFACE_MATERIAL_RESOLVE_TYPE_ACTIVE_MASK=SURFACE_MATERIAL_RESOLVE_TYPE_OPAQUE_TRANSLUCENT
+
+//!variant integrate_indirect_sharc_update_deferred_raygen_lean.rgen
+//!>       RAY_PIPELINE
+//!>       ENABLE_SHARC=1
+//!>       SHARC_UPDATE=1
+//!>       SHARC_DEFERRED_UPDATE=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       SHARC_LEAN_SECONDARY=1
+//!>       SURFACE_MATERIAL_RESOLVE_TYPE_ACTIVE_MASK=SURFACE_MATERIAL_RESOLVE_TYPE_OPAQUE_TRANSLUCENT
+
+//!variant integrate_indirect_sharc_update_deferred4_lean.comp
+//!>       ENABLE_SHARC=1
+//!>       SHARC_UPDATE=1
+//!>       SHARC_DEFERRED_UPDATE=1
+//!>       SHARC_PROPAGATION_DEPTH=4
+//!>       NEE_CACHE_ENABLE=1
+//!>       SHARC_LEAN_SECONDARY=1
+//!>       SURFACE_MATERIAL_RESOLVE_TYPE_ACTIVE_MASK=SURFACE_MATERIAL_RESOLVE_TYPE_OPAQUE_TRANSLUCENT
+
+//!variant integrate_indirect_sharc_update_deferred4_raygen_lean.rgen
+//!>       RAY_PIPELINE
+//!>       ENABLE_SHARC=1
+//!>       SHARC_UPDATE=1
+//!>       SHARC_DEFERRED_UPDATE=1
+//!>       SHARC_PROPAGATION_DEPTH=4
+//!>       NEE_CACHE_ENABLE=1
+//!>       SHARC_LEAN_SECONDARY=1
+//!>       SURFACE_MATERIAL_RESOLVE_TYPE_ACTIVE_MASK=SURFACE_MATERIAL_RESOLVE_TYPE_OPAQUE_TRANSLUCENT
+
+//!variant integrate_indirect_sharc_query_trace_lean.rgen
+//!>       ENABLE_SHARC=1
+//!>       SHARC_QUERY=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       RT_TRACE_RAY
+//!>       RAY_PIPELINE
+//!>       SHARC_LEAN_SECONDARY=1
+//!>       SURFACE_MATERIAL_RESOLVE_TYPE_ACTIVE_MASK=SURFACE_MATERIAL_RESOLVE_TYPE_OPAQUE_TRANSLUCENT
+
+//!variant integrate_indirect_sharc_query_trace_stats_lean.rgen
+//!>       ENABLE_SHARC=1
+//!>       SHARC_QUERY=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       RT_TRACE_RAY
+//!>       RAY_PIPELINE
+//!>       SHARC_QUERY_STATS=1
+//!>       SHARC_LEAN_SECONDARY=1
+//!>       SURFACE_MATERIAL_RESOLVE_TYPE_ACTIVE_MASK=SURFACE_MATERIAL_RESOLVE_TYPE_OPAQUE_TRANSLUCENT
+
+//!variant integrate_indirect_sharc_query_trace_ser_lean.rgen
+//!>       ENABLE_SHARC=1
+//!>       SHARC_QUERY=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       RT_TRACE_RAY
+//!>       RAY_PIPELINE
+//!>       RT_SHADER_EXECUTION_REORDERING
+//!>       SHARC_LEAN_SECONDARY=1
+//!>       SURFACE_MATERIAL_RESOLVE_TYPE_ACTIVE_MASK=SURFACE_MATERIAL_RESOLVE_TYPE_OPAQUE_TRANSLUCENT
+
+//!variant integrate_indirect_sharc_query_trace_ser_stats_lean.rgen
+//!>       ENABLE_SHARC=1
+//!>       SHARC_QUERY=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       RT_TRACE_RAY
+//!>       RAY_PIPELINE
+//!>       RT_SHADER_EXECUTION_REORDERING
+//!>       SHARC_QUERY_STATS=1
+//!>       SHARC_LEAN_SECONDARY=1
+//!>       SURFACE_MATERIAL_RESOLVE_TYPE_ACTIVE_MASK=SURFACE_MATERIAL_RESOLVE_TYPE_OPAQUE_TRANSLUCENT
+
 //!end-variants
 #define ATMOSPHERE_AVAILABLE
 
 #define INTEGRATE_INDIRECT
 #define RAB_HAS_PREVIOUS_GBUFFER 1
+#if defined(SHARC_LEAN_SECONDARY)
+#define OPAQUE_MATERIAL_USE_POM 0
+#else
 #define OPAQUE_MATERIAL_USE_POM 1
+#endif
 // Note: Opacity lighting approximation used in the indirect integration pass due to particle lighting being somewhat
 // important in reflections off shiny surfaces (as without this it can make areas with many particles look weird in reflections).
 #define RESOLVE_OPACITY_LIGHTING_APPROXIMATION 1

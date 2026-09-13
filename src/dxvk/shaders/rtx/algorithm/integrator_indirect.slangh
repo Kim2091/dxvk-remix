@@ -702,8 +702,12 @@ void integratePathVertex(
       // The value is based on experiment.
       const float baseReflectivityFactor = 3.0f;
       uint16_t lightIdx = kInvalidLightIdx;
+#if defined(SHARC_LEAN_SECONDARY)
+      if (false)
+#else
       if (cb.enableRtxdi && cb.enableRtxdiSampleStealing &&
-        calcBt709Luminance(opaqueSurfaceMaterialInteraction.baseReflectivity) < baseReflectivityFactor * opaqueSurfaceMaterialInteraction.isotropicRoughness) 
+        calcBt709Luminance(opaqueSurfaceMaterialInteraction.baseReflectivity) < baseReflectivityFactor * opaqueSurfaceMaterialInteraction.isotropicRoughness)
+#endif
       {
         // Perform some safety checks, and if lucky, steal some high quality samples from RTX-DI reservoirs
         ivec2 pixelCoordinate;

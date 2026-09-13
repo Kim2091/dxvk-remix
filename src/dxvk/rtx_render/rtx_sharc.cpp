@@ -40,6 +40,7 @@ namespace dxvk {
     const bool selected = RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::Sharc;
     const bool wasActive = m_active;
     m_active = false;
+    m_leanActive = false;
     if (!selected) {
       m_hash = nullptr;
       m_accumulation = nullptr;
@@ -75,14 +76,16 @@ namespace dxvk {
       m_status = "OMM blocks SHARC: enable Allow SHARC with OMM below to test; tracing normally";
       return;
     }
+    const bool leanActive = leanSecondary() && !rayPortals;
     // Discard cached estimates when the tested feature combination changes.
     const uint32_t compatibilityFlags = (wboit ? 1u : 0u) | (rayPortals ? 2u : 0u)
       | (opacityMicromap ? 4u : 0u) | (allowWboit() ? 8u : 0u)
       | (allowRayPortals() ? 16u : 0u) | (allowOpacityMicromap() ? 32u : 0u)
       | (deferredUpdates() ? 64u : 0u) | (queryRayGeneration() ? 128u : 0u)
       | (updateRayGeneration() ? 256u : 0u) | (allowSpecularPaths() ? 512u : 0u)
-      | (queryTraceRay() ? 1024u : 0u)
-      | (queryTraceRay() && RtxOptions::isShaderExecutionReorderingInPathtracerIntegrateIndirectEnabled() ? 2048u : 0u);
+      | ((queryTraceRay() || leanActive) ? 1024u : 0u)
+      | ((queryTraceRay() || leanActive) && RtxOptions::isShaderExecutionReorderingInPathtracerIntegrateIndirectEnabled() ? 2048u : 0u)
+      | (leanActive ? 4096u : 0u);
     if (m_allocationFailed && !m_resetRequested) {
       return;
     }
@@ -148,6 +151,7 @@ namespace dxvk {
     m_resetRequested = false;
     m_allocationFailed = false;
     m_active = true;
+    m_leanActive = leanActive;
     m_status = (wboit || rayPortals || opacityMicromap)
       ? "SHARC active: experimental compatibility override in use"
       : "Experimental diffuse cache; finite update paths";
@@ -267,6 +271,11 @@ namespace dxvk {
     RemixGui::Checkbox("Allow SHARC with ray portals", &allowRayPortalsObject());
     RemixGui::Checkbox("Allow SHARC with OMM", &allowOpacityMicromapObject());
     ImGui::TextWrapped("Compatibility testing: these overrides let SHARC run with features enabled in their normal settings.");
+    RemixGui::Checkbox("Lean secondary rendering", &leanSecondaryObject());
+    if (leanSecondary()) {
+      ImGui::TextWrapped("Full-resolution experimental profile. Simplifies indirect particles, decals, displacement and shadows; queries use TraceRay. Portal scenes use the full profile.");
+      ImGui::Text("Secondary profile: %s", isLeanActive() ? "Lean" : "Full / inactive");
+    }
     RemixGui::Checkbox("Batch SHARC cache writes", &deferredUpdatesObject());
     RemixGui::Checkbox("TraceRay SHARC query", &queryTraceRayObject());
     if (!queryTraceRay()) {
@@ -287,7 +296,7 @@ namespace dxvk {
       ImGui::Text("Query backend: %s", (m_compatibilityFlags & 1024u)
         ? ((m_compatibilityFlags & 2048u) ? "TraceRay + SER" : "TraceRay")
         : ((m_compatibilityFlags & 128u) ? "RayQuery (ray generation)" : "RayQuery (compute)"));
-      ImGui::Text("Particle transparency: %s", (m_compatibilityFlags & 1u) ? "WBOIT" : "sorted bins");
+      ImGui::Text("Indirect particle resolver: %s", isLeanActive() ? "Disabled (lean)" : ((m_compatibilityFlags & 1u) ? "WBOIT" : "sorted bins"));
       if (collectQueryStats() && m_haveQueryStats) {
         const auto& s = m_queryStats;
         const float paths = float(std::max(1u, s[0]));

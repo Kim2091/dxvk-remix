@@ -1340,7 +1340,10 @@ namespace dxvk {
     constants.enableNrc = nrc.isActive();
     constants.allowNrcTraining = NeuralRadianceCache::NrcOptions::trainCache();
     nrc.setRaytraceArgs(constants);
-    m_common->metaSharc().prepareFrame(*this, constants, m_resetHistory);
+    RtxSharc& sharc = m_common->metaSharc();
+    const bool wasLean = sharc.isLeanActive();
+    sharc.prepareFrame(*this, constants, m_resetHistory);
+    m_resetHistory = m_resetHistory || wasLean != sharc.isLeanActive();
 
     m_common->metaNeeCache().setRaytraceArgs(constants, m_resetHistory);
     constants.surfaceCount = getSceneManager().getAccelManager().getSurfaceCount();

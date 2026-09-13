@@ -180,6 +180,21 @@
 #include <rtx_shaders/integrate_indirect_sharc_query_miss_no_portals_stats_wboit.h>
 
 #include "rtx_sharc.h"
+#include <rtx_shaders/integrate_indirect_sharc_update_lean.h>
+#include <rtx_shaders/integrate_indirect_sharc_update_raygen_lean.h>
+#include <rtx_shaders/integrate_indirect_sharc_update_deferred_lean.h>
+#include <rtx_shaders/integrate_indirect_sharc_update_deferred_raygen_lean.h>
+#include <rtx_shaders/integrate_indirect_sharc_update_deferred4_lean.h>
+#include <rtx_shaders/integrate_indirect_sharc_update_deferred4_raygen_lean.h>
+#include <rtx_shaders/integrate_indirect_sharc_query_trace_lean.h>
+#include <rtx_shaders/integrate_indirect_sharc_query_trace_stats_lean.h>
+#include <rtx_shaders/integrate_indirect_sharc_query_trace_ser_lean.h>
+#include <rtx_shaders/integrate_indirect_sharc_query_trace_ser_stats_lean.h>
+#include <rtx_shaders/integrate_indirect_sharc_query_closesthit_no_portals_no_pom_lean.h>
+#include <rtx_shaders/integrate_indirect_sharc_query_miss_no_portals_lean.h>
+#include <rtx_shaders/integrate_indirect_sharc_query_closesthit_no_portals_no_pom_stats_lean.h>
+#include <rtx_shaders/integrate_indirect_sharc_query_miss_no_portals_stats_lean.h>
+
 #include "rtx/pass/sharc/sharc_binding_indices.h"
 
 namespace dxvk {
@@ -314,6 +329,46 @@ namespace dxvk {
       BEGIN_PARAMETER()
       END_PARAMETER()
     };
+
+    DxvkRaytracingPipelineShaders getLeanSharcTracePipelineShaders(bool serEnabled, bool ommEnabled, bool statsEnabled) {
+      DxvkRaytracingPipelineShaders shaders;
+      if (statsEnabled) {
+        shaders.addGeneralShader(serEnabled
+          ? GET_SHADER_VARIANT(VK_SHADER_STAGE_RAYGEN_BIT_KHR, IntegrateIndirectSharcStatsShader, integrate_indirect_sharc_query_trace_ser_stats_lean)
+          : GET_SHADER_VARIANT(VK_SHADER_STAGE_RAYGEN_BIT_KHR, IntegrateIndirectSharcStatsShader, integrate_indirect_sharc_query_trace_stats_lean));
+        shaders.addGeneralShader(GET_SHADER_VARIANT(VK_SHADER_STAGE_MISS_BIT_KHR, IntegrateIndirectMissShader, integrate_indirect_sharc_query_miss_no_portals_stats_lean));
+        shaders.addHitGroup(GET_SHADER_VARIANT(VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, IntegrateIndirectClosestHitShader, integrate_indirect_sharc_query_closesthit_no_portals_no_pom_stats_lean), nullptr, nullptr);
+      } else {
+        shaders.addGeneralShader(serEnabled
+          ? GET_SHADER_VARIANT(VK_SHADER_STAGE_RAYGEN_BIT_KHR, IntegrateIndirectSharcShader, integrate_indirect_sharc_query_trace_ser_lean)
+          : GET_SHADER_VARIANT(VK_SHADER_STAGE_RAYGEN_BIT_KHR, IntegrateIndirectSharcShader, integrate_indirect_sharc_query_trace_lean));
+        shaders.addGeneralShader(GET_SHADER_VARIANT(VK_SHADER_STAGE_MISS_BIT_KHR, IntegrateIndirectMissShader, integrate_indirect_sharc_query_miss_no_portals_lean));
+        shaders.addHitGroup(GET_SHADER_VARIANT(VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, IntegrateIndirectClosestHitShader, integrate_indirect_sharc_query_closesthit_no_portals_no_pom_lean), nullptr, nullptr);
+      }
+      shaders.debugName = "SHARC Lean Query";
+      if (ommEnabled) {
+        shaders.pipelineFlags |= VK_PIPELINE_CREATE_RAY_TRACING_OPACITY_MICROMAP_BIT_EXT;
+      }
+      return shaders;
+    }
+
+    Rc<DxvkShader> getLeanSharcUpdateShader(bool rayGeneration, bool deferred, bool shortPath) {
+      if (rayGeneration) {
+        if (!deferred) {
+          return GET_SHADER_VARIANT(VK_SHADER_STAGE_RAYGEN_BIT_KHR, IntegrateIndirectSharcUpdateShader, integrate_indirect_sharc_update_raygen_lean);
+        }
+        return shortPath
+          ? GET_SHADER_VARIANT(VK_SHADER_STAGE_RAYGEN_BIT_KHR, IntegrateIndirectSharcUpdateShader, integrate_indirect_sharc_update_deferred4_raygen_lean)
+          : GET_SHADER_VARIANT(VK_SHADER_STAGE_RAYGEN_BIT_KHR, IntegrateIndirectSharcUpdateShader, integrate_indirect_sharc_update_deferred_raygen_lean);
+      } else {
+        if (!deferred) {
+          return GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, IntegrateIndirectSharcUpdateShader, integrate_indirect_sharc_update_lean);
+        }
+        return shortPath
+          ? GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, IntegrateIndirectSharcUpdateShader, integrate_indirect_sharc_update_deferred4_lean)
+          : GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, IntegrateIndirectSharcUpdateShader, integrate_indirect_sharc_update_deferred_lean);
+      }
+    }
 
     DxvkRaytracingPipelineShaders getSharcTracePipelineShaders(
       bool serEnabled, bool ommEnabled, bool wboitEnabled, bool statsEnabled, bool includePortals, bool pomEnabled) {
@@ -553,6 +608,12 @@ namespace dxvk {
 
       if (RtxSharc::isSupported(*m_device)
           && RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::Sharc) {
+        if (RtxSharc::leanSecondary()) {
+          for (bool stats : { false, true }) {
+            pipelineManager.registerRaytracingShaders(getLeanSharcTracePipelineShaders(serEnabled, ommEnabled, stats));
+          }
+          getLeanSharcUpdateShader(RtxSharc::updateRayGeneration(), RtxSharc::deferredUpdates(), RtxSharc::updateBounces() <= 4);
+        }
         getComputeShader(useNeeCache, false, false, true, false);
         getComputeShader(useNeeCache, false, false, false, true);
         if (RtxSharc::queryTraceRay()) {
@@ -737,6 +798,29 @@ namespace dxvk {
       }
       const VkExtent3D workgroups = util::computeBlockCount(dispatchDims, VkExtent3D { 16, 8, 1 });
       if (sharcUpdate || sharc.isActive()) {
+        if (sharc.isLeanActive()) {
+          if (!sharcUpdate) {
+            ctx->bindRaytracingPipelineShaders(getLeanSharcTracePipelineShaders(serEnabled, ommEnabled, sharc.queryStatsActive()));
+            ctx->traceRays(rayDims.width, rayDims.height, rayDims.depth);
+          } else {
+            auto shader = getLeanSharcUpdateShader(RtxSharc::updateRayGeneration(), RtxSharc::deferredUpdates(),
+              rtOutput.m_raytraceArgs.sharcArgs.updateBounces <= 4);
+            if (RtxSharc::updateRayGeneration()) {
+              DxvkRaytracingPipelineShaders shaders;
+              shaders.addGeneralShader(shader);
+              shaders.debugName = "SHARC Lean Update";
+              if (ommEnabled) {
+                shaders.pipelineFlags |= VK_PIPELINE_CREATE_RAY_TRACING_OPACITY_MICROMAP_BIT_EXT;
+              }
+              ctx->bindRaytracingPipelineShaders(shaders);
+              ctx->traceRays(dispatchDims.width, dispatchDims.height, dispatchDims.depth);
+            } else {
+              ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, shader);
+              ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
+            }
+          }
+          return;
+        }
         if (!sharcUpdate) {
           if (RtxSharc::queryTraceRay()) {
             ctx->bindRaytracingPipelineShaders(getSharcTracePipelineShaders(serEnabled, ommEnabled, wboitEnabled, sharc.queryStatsActive(), includePortals, pomEnabled));

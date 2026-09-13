@@ -127,6 +127,21 @@
 //!>       SHARC_QUERY_STATS=1
 //!>       UNORDERED_RESOLVE_WBOIT
 
+//!variant integrate_indirect_sharc_query_miss_no_portals_lean.rmiss
+//!>       ENABLE_SHARC=1
+//!>       SHARC_QUERY=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       SURFACE_MATERIAL_RESOLVE_TYPE_ACTIVE_MASK=SURFACE_MATERIAL_RESOLVE_TYPE_OPAQUE_TRANSLUCENT
+//!>       SHARC_LEAN_SECONDARY=1
+
+//!variant integrate_indirect_sharc_query_miss_no_portals_stats_lean.rmiss
+//!>       ENABLE_SHARC=1
+//!>       SHARC_QUERY=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       SURFACE_MATERIAL_RESOLVE_TYPE_ACTIVE_MASK=SURFACE_MATERIAL_RESOLVE_TYPE_OPAQUE_TRANSLUCENT
+//!>       SHARC_QUERY_STATS=1
+//!>       SHARC_LEAN_SECONDARY=1
+
 //!end-variants
 #define ATMOSPHERE_AVAILABLE
 

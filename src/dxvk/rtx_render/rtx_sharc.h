@@ -23,6 +23,9 @@ namespace dxvk {
     void endQueryStats(RtxContext& ctx);
     bool queryStatsActive() const { return m_statsSlot >= 0; }
     bool isActive() const { return m_active; }
+    bool isLeanActive() const { return m_active && m_leanActive; }
+
+    RTX_OPTION("rtx.sharc", bool, leanSecondary, false, "Use experimental full-resolution lean secondary shaders: no unordered particles/decals, POM, alpha-blended indirect shadows, or RTXDI sample stealing. Uses TraceRay queries; portal scenes retain the full profile.");
 
     RTX_OPTION("rtx.sharc", bool, allowWboit, false, "Allow SHARC while WBOIT is enabled for compatibility testing. Does not enable WBOIT.");
     RTX_OPTION("rtx.sharc", bool, allowRayPortals, false, "Allow SHARC with ray portals for compatibility testing. Does not enable ray portals.");
@@ -65,6 +68,7 @@ namespace dxvk {
     Rc<DxvkBuffer> m_resolved;
     SharcArgs m_args = {};
     bool m_active = false;
+    bool m_leanActive = false;
     bool m_resetRequested = true;
     bool m_allocationFailed = false;
     const char* m_status = "Inactive";
