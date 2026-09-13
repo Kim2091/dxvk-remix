@@ -25,3 +25,17 @@ Last 12 complete samples, fused frames 3298?4618 versus previous split frames 25
 - GPU sequence excludes game CPU and presentation work.
 
 With FNV closed, retained the same DLL/PDB and changed only rtx.sharc.fuseAssembly to False for a fresh standalone baseline. Restarting with false restores the original aliased throughput allocation; this compares the full enabled/disabled feature cost. A same-allocation live toggle comparison has not been performed. Next test: same save/view, stationary 45?60 seconds, with visual feedback.
+
+## Fresh split baseline result
+
+User completed the follow-up. Runtime configuration confirms fuseAssembly=False; no err: log entries were found. Preserved the log as _Comp64Release/fused-assembly-split-baseline-capture.log.
+
+Last 12 complete split samples, frames 5548?6868:
+- Median per-frame query+assembly sum: 2.338705 ms (range 2.193282?2.621308).
+- Saved fused median: 2.955839 ms (range 2.481156?3.305054).
+- Fused target interval is 0.617134 ms higher, approximately 26.4%.
+- Median measured GPU sequence: split 15.4916 ms versus fused 15.62805 ms (fused +0.13645 ms).
+- Target and total deltas differ because other stages vary between captures; do not equate the target difference to an end-to-end frame-time gain.
+- No explicit visual-quality feedback has been supplied.
+
+Decision: keep fusion disabled in FNV and retain the opt-in implementation for research. Two split comparisons provide no evidence of a fusion win; the fresh baseline supports a target-stage regression. These are separate captures, not a controlled randomized benchmark. Shader register pressure, occupancy, and resource-layout changes are possible explanations, not measured causes. Further fusion changes should require GPU-level evidence rather than assuming fewer passes must be faster. No DLL changes or additional restart were needed.

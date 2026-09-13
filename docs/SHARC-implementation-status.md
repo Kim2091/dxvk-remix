@@ -350,3 +350,7 @@ Fusion prerequisite: extracted shared per-pixel NEE assembly helper; source calc
 ## 2026-09-13: selectable combined query/assembly prototype
 
 The next test candidate introduces opt-in `rtx.sharc.fuseAssembly` (default false), merging full-feature TraceRay SHARC query and primary NEE assembly. It preserves update/resolve, raw secondary output, primary lighting math, and existing split fallback. It needs one independent throughput allocation (8 bytes per render pixel). Build, shader-resource/embedding validation, and DLL factory smoke test passed; runtime quality and speed remain unmeasured. See [fusion audit and test procedure](SHARC-query-assembly-fusion-2026-09-13.md).
+
+### Fused assembly runtime decision
+
+The fresh same-DLL split comparison measured median query+assembly at 2.339 ms versus 2.956 ms fused; measured GPU sequence was 15.492 ms split versus 15.628 ms fused. Fusion remains disabled in FNV and defaults off in source. Separate-capture variability limits causal attribution, but current evidence does not justify adoption. See SHARC-fused-assembly-test-2026-09-13.md for preserved captures and limitations.
