@@ -32,4 +32,11 @@
 #ifndef SHARC_PROPAGATION_DEPTH
 #define SHARC_PROPAGATION_DEPTH 8
 #endif
+// Query probes are read-only; leave update insertion and resolve loops unchanged.
+#if SHARC_QUERY
+#define HASH_GRID_FIND_LOOP_ATTR [unroll]
+#endif
 #include "rtx/external/sharc/SharcCommon.h"
+#if SHARC_QUERY
+#undef HASH_GRID_FIND_LOOP_ATTR
+#endif
