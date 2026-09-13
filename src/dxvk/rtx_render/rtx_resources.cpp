@@ -21,6 +21,7 @@
 */
 #include <random>
 #include "rtx_resources.h"
+#include "rtx_sharc.h"
 #include "dxvk_device.h"
 #include "dxvk_context.h"
 #include "../util/util_blueNoise_128x128x64.h"
@@ -1149,7 +1150,11 @@ namespace dxvk {
     m_raytracingOutput.m_gbufferPSRData[6] = AliasedResource(m_raytracingOutput.m_secondaryCombinedSpecularRadiance, ctx, m_downscaledExtent, VK_FORMAT_R32G32_UINT, "GBuffer PSR Data 6");
 
     m_raytracingOutput.m_indirectRayOriginDirection = AliasedResource(m_raytracingOutput.m_secondaryWorldPositionWorldTriangleNormal, ctx, m_downscaledExtent, VK_FORMAT_R32G32B32A32_SFLOAT, "Indirect Ray Origin Direction");
-    m_raytracingOutput.m_indirectThroughputConeRadius = AliasedResource(m_raytracingOutput.m_primaryIndirectDiffuseRadiance, ctx, m_downscaledExtent, VK_FORMAT_R16G16B16A16_SFLOAT, "Indirect Throughput Cone Radius", allowCompatibleFormatAliasing);
+    if (RtxSharc::fuseAssembly()) {
+      m_raytracingOutput.m_indirectThroughputConeRadius = AliasedResource(ctx, m_downscaledExtent, VK_FORMAT_R16G16B16A16_SFLOAT, "Indirect Throughput Cone Radius", allowCompatibleFormatAliasing);
+    } else {
+      m_raytracingOutput.m_indirectThroughputConeRadius = AliasedResource(m_raytracingOutput.m_primaryIndirectDiffuseRadiance, ctx, m_downscaledExtent, VK_FORMAT_R16G16B16A16_SFLOAT, "Indirect Throughput Cone Radius", allowCompatibleFormatAliasing);
+    }
     m_raytracingOutput.m_indirectFirstSampledLobeData = AliasedResource(m_raytracingOutput.m_secondaryPositionError, ctx, m_downscaledExtent, VK_FORMAT_R32_UINT, "Indirect First Sampled Lobe Data");
     m_raytracingOutput.m_indirectFirstHitPerceptualRoughness = AliasedResource(m_raytracingOutput.m_secondaryPerceptualRoughness, ctx, m_downscaledExtent, VK_FORMAT_R8_UNORM, "Indirect First Hit Perceptual Roughness");
     m_raytracingOutput.m_bsdfFactor = createImageResource(ctx, "bsdf factor", m_downscaledExtent, VK_FORMAT_R16G16_SFLOAT);

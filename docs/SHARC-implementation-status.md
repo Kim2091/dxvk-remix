@@ -345,3 +345,8 @@ Query-probe experiment 0ba50562d built, validated and deployed. Only the SHARC q
 Query-probe first capture: user confirms correct lighting and perceives a slight improvement. IndirectIntegration median 2.366 vs 2.390 ms, but total measured sequence 15.932 vs 15.387 ms. Result inconclusive across separate runs; no demonstrated overall speedup. Capture retained and candidate left installed for comparison. See SHARC-query-probe-test-2026-09-13.md.
 
 Fusion prerequisite: extracted shared per-pixel NEE assembly helper; source calculation unchanged, release and embedded resource checks passed. No fused mode exists yet and game install unchanged. Audit identifies throughput/diffuse aliasing, raw secondary consumer, half-precision handoff, sparse/miss exits and NEE feedback interleaving as requirements. See SHARC-query-assembly-fusion-2026-09-13.md.
+
+
+## 2026-09-13: selectable combined query/assembly prototype
+
+The next test candidate introduces opt-in `rtx.sharc.fuseAssembly` (default false), merging full-feature TraceRay SHARC query and primary NEE assembly. It preserves update/resolve, raw secondary output, primary lighting math, and existing split fallback. It needs one independent throughput allocation (8 bytes per render pixel). Build, shader-resource/embedding validation, and DLL factory smoke test passed; runtime quality and speed remain unmeasured. See [fusion audit and test procedure](SHARC-query-assembly-fusion-2026-09-13.md).

@@ -38,6 +38,11 @@ def main():
     for path in files:
         blob = path.read_bytes()
         assert not bindings(blob) & foreign, f'{path.name}: requires removed resources'
+        if '_fused' in path.stem:
+            assert {190, 249, 250} <= bindings(blob), f'{path.name}: missing raw/primary outputs'
+        else:
+            assert not bindings(blob) & {249, 250}, f'{path.name}: unexpectedly requires fused outputs'
+
         if dll is not None:
             assert blob in dll, f'{path.name}: not embedded in final DLL'
     plain = (args.root / '_Comp64Release/src/dxvk/rtx_shaders/integrate_nee_plain.spv').read_bytes()

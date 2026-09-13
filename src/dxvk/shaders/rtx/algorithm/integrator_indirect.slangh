@@ -1579,6 +1579,10 @@ void integrateIndirectPath(
 
     // Store the integrated ray path radiance and hit distance
     indirectPathTextures.IndirectRadianceHitDistance[gbufferPixelCoordinate] = indirectOutData;
+#if SHARC_FUSED_ASSEMBLY
+    // Match the rgba16f handoff used by the standalone assembly pass.
+    fusedIndirectRadiance = vec4(f16vec4(indirectOutData));
+#endif
   }
   
   writeToNrcOutputsAfterIntegration(pathState);

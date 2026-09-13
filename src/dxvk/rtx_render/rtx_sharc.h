@@ -25,6 +25,8 @@ namespace dxvk {
     bool isActive() const { return m_active; }
     bool isLeanActive() const { return m_active && m_leanActive; }
 
+    RTX_OPTION("rtx.sharc", bool, fuseAssembly, false, "Experimental combined TraceRay query and primary NEE assembly. Enable before launch to allocate independent throughput storage. Unsupported modes use standalone assembly.");
+
     RTX_OPTION("rtx.sharc", bool, leanSecondary, false, "Use experimental full-resolution lean secondary shaders: no unordered particles/decals, POM, alpha-blended indirect shadows, or RTXDI sample stealing. Uses TraceRay queries; portal scenes retain the full profile.");
 
     RTX_OPTION("rtx.sharc", bool, allowWboit, false, "Allow SHARC while WBOIT is enabled for compatibility testing. Does not enable WBOIT.");

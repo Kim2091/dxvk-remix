@@ -1,0 +1,39 @@
+// Copyright (c) 2026, NVIDIA CORPORATION. SPDX-License-Identifier: MIT
+#pragma once
+#include "rtx/pass/integrate/integrate_fused_binding_indices.h"
+
+static vec4 fusedIndirectRadiance;
+
+layout(r32ui, binding = INTEGRATE_FUSED_BINDING_SHARED_MATERIAL_DATA0)
+Texture2D<uint> SharedMaterialData0;
+
+layout(r32ui, binding = INTEGRATE_FUSED_BINDING_SHARED_MATERIAL_DATA1)
+Texture2D<uint> SharedMaterialData1;
+
+layout(rg32ui, binding = INTEGRATE_FUSED_BINDING_SHARED_SUBSURFACE_DIFFUSION_PROFILE_DATA)
+Texture2D<uint2> SharedSubsurfaceDiffusionProfileData;
+
+layout(r32ui, binding = INTEGRATE_FUSED_BINDING_PRIMARY_WORLD_SHADING_NORMAL)
+Texture2D<uint> PrimaryWorldShadingNormal;
+
+layout(r8, binding = INTEGRATE_FUSED_BINDING_PRIMARY_PERCEPTUAL_ROUGHNESS)
+Texture2D<float> PrimaryPerceptualRoughness;
+
+layout(rgb10_a2, binding = INTEGRATE_FUSED_BINDING_PRIMARY_ALBEDO)
+Texture2D<float4> PrimaryAlbedo;
+
+layout(rg16_snorm, binding = INTEGRATE_FUSED_BINDING_PRIMARY_VIEW_DIRECTION)
+Texture2D<float2> PrimaryViewDirection;
+
+layout(r32f, binding = INTEGRATE_FUSED_BINDING_PRIMARY_POSITION_ERROR)
+Texture2D<float> PrimaryPositionError;
+
+layout(rgb10_a2, binding = INTEGRATE_FUSED_BINDING_PRIMARY_BASE_REFLECTIVITY)
+RWTexture2D<float4> PrimaryBaseReflectivity;
+
+layout(rgba16f, binding = INTEGRATE_FUSED_BINDING_PRIMARY_INDIRECT_DIFFUSE)
+RWTexture2D<float4> PrimaryIndirectDiffuseLobeRadianceHitDistance;
+
+layout(rgba16f, binding = INTEGRATE_FUSED_BINDING_PRIMARY_INDIRECT_SPECULAR)
+RWTexture2D<float4> PrimaryIndirectSpecularLobeRadianceHitDistance;
+

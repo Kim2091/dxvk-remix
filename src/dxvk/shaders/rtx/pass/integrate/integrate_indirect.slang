@@ -509,10 +509,49 @@
 //!>       SHARC_LEAN_SECONDARY=1
 //!>       SURFACE_MATERIAL_RESOLVE_TYPE_ACTIVE_MASK=SURFACE_MATERIAL_RESOLVE_TYPE_OPAQUE_TRANSLUCENT
 
+//!variant integrate_indirect_sharc_query_fused.rgen
+//!>       ENABLE_SHARC=1
+//!>       SHARC_QUERY=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       RT_TRACE_RAY
+//!>       RAY_PIPELINE
+//!>       SHARC_FUSED_ASSEMBLY=1
+
+//!variant integrate_indirect_sharc_query_fused_wboit.rgen
+//!>       ENABLE_SHARC=1
+//!>       SHARC_QUERY=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       RT_TRACE_RAY
+//!>       RAY_PIPELINE
+//!>       SHARC_FUSED_ASSEMBLY=1
+//!>       UNORDERED_RESOLVE_WBOIT
+
+//!variant integrate_indirect_sharc_query_fused_ser.rgen
+//!>       ENABLE_SHARC=1
+//!>       SHARC_QUERY=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       RT_TRACE_RAY
+//!>       RAY_PIPELINE
+//!>       SHARC_FUSED_ASSEMBLY=1
+//!>       RT_SHADER_EXECUTION_REORDERING
+
+//!variant integrate_indirect_sharc_query_fused_ser_wboit.rgen
+//!>       ENABLE_SHARC=1
+//!>       SHARC_QUERY=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       RT_TRACE_RAY
+//!>       RAY_PIPELINE
+//!>       SHARC_FUSED_ASSEMBLY=1
+//!>       RT_SHADER_EXECUTION_REORDERING
+//!>       UNORDERED_RESOLVE_WBOIT
+
 //!end-variants
 #define ATMOSPHERE_AVAILABLE
 
 #define INTEGRATE_INDIRECT
+#if SHARC_FUSED_ASSEMBLY
+#define RAB_HAS_CURRENT_GBUFFER 1
+#endif
 #define RAB_HAS_PREVIOUS_GBUFFER 1
 #if defined(SHARC_LEAN_SECONDARY)
 #define OPAQUE_MATERIAL_USE_POM 0
@@ -527,17 +566,32 @@
 #include "rtx/pass/common_binding_indices.h"
 #include "rtx/pass/common_bindings.slangh"
 #include "rtx/pass/integrate/integrate_indirect_binding_indices.h"
+#if SHARC_FUSED_ASSEMBLY
+#include "rtx/pass/integrate/integrate_fused_bindings.slangh"
+#endif
 #include "rtx/pass/integrate/integrate_indirect_bindings.slangh"
 // Note: Needed for declaration of integration ray payload structure
 #include "rtx/algorithm/integrator.slangh"
 
 #include "rtx/pass/integrate/integrate_indirect.slangh"
 
+#if SHARC_FUSED_ASSEMBLY
+#include "rtx/pass/integrate/integrate_nee.slangh"
+#endif
+
 #ifdef RAY_PIPELINE
 [shader("raygeneration")]
 void main()
 {
   integrate_indirect_pass(DispatchRaysIndex().xy);
+#if SHARC_FUSED_ASSEMBLY
+  // Map from the original launch coordinate, never from an already remapped pixel.
+  uvec2 assemblyPixel = DispatchRaysIndex().xy;
+  bool unusedUpdate;
+  if (initPixelCoordinateOnLaunch(assemblyPixel, unusedUpdate)) {
+    assembleIndirectLighting(assemblyPixel);
+  }
+#endif
 }
 #else
 [shader("compute")]
