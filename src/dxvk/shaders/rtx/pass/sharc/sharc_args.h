@@ -14,7 +14,7 @@ struct SharcArgs {
   float radianceScale;
   float minRoughness;
   uint enabled;
-  uint debugMode;
+  uint allowSpecularPaths;
 };
 #ifdef __cplusplus
 static_assert(sizeof(SharcArgs) == 64);

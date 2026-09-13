@@ -1,6 +1,7 @@
 // Copyright (c) 2026, NVIDIA CORPORATION. SPDX-License-Identifier: MIT
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include "rtx_sharc.h"
 #include "dxvk_device.h"
 #include "rtx_context.h"
@@ -58,13 +59,30 @@ namespace dxvk {
       m_status = "Raytraced render target active; using importance-sampled paths";
       return;
     }
-    // These combinations need independent estimator validation before caching them.
-    if (RtxOptions::wboitEnabled() || args.numActiveRayPortals > 0
-        || !RtxOptions::rayPortalModelTextureHashes().empty()
-        || RtxOptions::getEnableOpacityMicromap()) {
-      m_status = "Disable WBOIT, ray portals and OMM to use SHARC; tracing normally";
+    const bool wboit = RtxOptions::wboitEnabled();
+    const bool rayPortals = args.numActiveRayPortals > 0
+      || !RtxOptions::rayPortalModelTextureHashes().empty();
+    const bool opacityMicromap = RtxOptions::getEnableOpacityMicromap();
+    if (wboit && !allowWboit()) {
+      m_status = "WBOIT blocks SHARC: enable Allow SHARC with WBOIT below to test; tracing normally";
       return;
     }
+    if (rayPortals && !allowRayPortals()) {
+      m_status = "Ray portals block SHARC: enable Allow SHARC with ray portals below to test; tracing normally";
+      return;
+    }
+    if (opacityMicromap && !allowOpacityMicromap()) {
+      m_status = "OMM blocks SHARC: enable Allow SHARC with OMM below to test; tracing normally";
+      return;
+    }
+    // Discard cached estimates when the tested feature combination changes.
+    const uint32_t compatibilityFlags = (wboit ? 1u : 0u) | (rayPortals ? 2u : 0u)
+      | (opacityMicromap ? 4u : 0u) | (allowWboit() ? 8u : 0u)
+      | (allowRayPortals() ? 16u : 0u) | (allowOpacityMicromap() ? 32u : 0u)
+      | (deferredUpdates() ? 64u : 0u) | (queryRayGeneration() ? 128u : 0u)
+      | (updateRayGeneration() ? 256u : 0u) | (allowSpecularPaths() ? 512u : 0u)
+      | (queryTraceRay() ? 1024u : 0u)
+      | (queryTraceRay() && RtxOptions::isShaderExecutionReorderingInPathtracerIntegrateIndirectEnabled() ? 2048u : 0u);
     if (m_allocationFailed && !m_resetRequested) {
       return;
     }
@@ -74,14 +92,14 @@ namespace dxvk {
     const float scale = std::isfinite(gridScale()) ? std::clamp(gridScale(), 1.0f, 1000.0f) : 50.0f;
     const float roughness = std::isfinite(minRoughness()) ? std::clamp(minRoughness(), 0.5f, 1.0f) : 0.8f;
     const uint32_t updateBounceLimit = std::clamp(updateBounces(), 1, 8);
-    bool clear = resetHistory || m_resetRequested || !wasActive || m_lastFrame + 1 != frame
+    bool clear = resetHistory || m_resetRequested || compatibilityFlags != m_compatibilityFlags || !wasActive || m_lastFrame + 1 != frame
       || m_args.gridScale != scale || m_args.minRoughness != roughness
       || m_args.updateBounces != updateBounceLimit;
     if (m_hash == nullptr || m_args.capacity != capacity) {
       try {
         DxvkBufferCreateInfo info = {};
         info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-        info.stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+        info.stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_TRANSFER_BIT;
         info.access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
         info.size = VkDeviceSize(capacity) * 8;
         auto hash = m_device->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXBuffer, "SHARC hash");
@@ -101,10 +119,12 @@ namespace dxvk {
       }
     }
     if (clear) {
+      m_haveGpuTimes = false;
       ctx.clearBuffer(m_hash, 0, m_hash->info().size, 0);
       ctx.clearBuffer(m_accumulation, 0, m_accumulation->info().size, 0);
       ctx.clearBuffer(m_resolved, 0, m_resolved->info().size, 0);
     }
+    m_cacheAge = clear ? 0 : m_cacheAge + 1;
     m_args.cameraPositionPrev = m_args.cameraPosition;
     const auto& camera = ctx.getSceneManager().getCamera();
     const auto position = camera.getPosition();
@@ -121,12 +141,16 @@ namespace dxvk {
     m_args.updateBounces = updateBounceLimit;
     m_args.radianceScale = 1000.0f;
     m_args.enabled = 1;
+    m_args.allowSpecularPaths = allowSpecularPaths() ? 1u : 0u;
     args.sharcArgs = m_args;
+    m_compatibilityFlags = compatibilityFlags;
     m_lastFrame = frame;
     m_resetRequested = false;
     m_allocationFailed = false;
     m_active = true;
-    m_status = "Experimental diffuse cache; compute RayQuery backend, finite update paths";
+    m_status = (wboit || rayPortals || opacityMicromap)
+      ? "SHARC active: experimental compatibility override in use"
+      : "Experimental diffuse cache; finite update paths";
   }
 
   void RtxSharc::bindResources(RtxContext& ctx) const {
@@ -143,15 +167,155 @@ namespace dxvk {
     ctx.dispatch((m_args.capacity + 255) / 256, 1, 1);
   }
 
+  void RtxSharc::recordTimestamp(RtxContext& ctx, TimingPoint point) {
+    if (point == TimingPoint::Begin) {
+      m_timingSlot = -1;
+      if (!measureGpuTime() || !m_active
+          || !m_device->adapter()->deviceProperties().limits.timestampComputeAndGraphics) {
+        m_haveGpuTimes = false;
+        return;
+      }
+      const uint32_t slot = m_device->getCurrentFrameId() % m_frameTimings.size();
+      auto& frame = m_frameTimings[slot];
+      if (frame.pending) {
+        std::array<DxvkQueryData, 4> data;
+        for (uint32_t i = 0; i < data.size(); ++i) {
+          const auto status = frame.queries[i]->getData(data[i]);
+          if (status == DxvkGpuQueryStatus::Pending) {
+            return; // Skip measurement instead of waiting for the GPU.
+          }
+          if (status != DxvkGpuQueryStatus::Available) {
+            frame.pending = false;
+            m_haveGpuTimes = false;
+            return;
+          }
+        }
+        const double scale = m_device->adapter()->deviceProperties().limits.timestampPeriod * 1e-6;
+        for (uint32_t i = 0; i < m_gpuTimes.size(); ++i) {
+          const float ms = float((data[i + 1].timestamp.time - data[i].timestamp.time) * scale);
+          m_gpuTimes[i] = m_haveGpuTimes ? m_gpuTimes[i] * 0.9f + ms * 0.1f : ms;
+        }
+        m_haveGpuTimes = true;
+        frame.pending = false;
+      }
+      for (auto& query : frame.queries) {
+        if (query == nullptr) {
+          query = m_device->createGpuQuery(VK_QUERY_TYPE_TIMESTAMP, 0, 0);
+        }
+      }
+      m_timingSlot = int(slot);
+    }
+    if (m_timingSlot >= 0) {
+      auto& frame = m_frameTimings[m_timingSlot];
+      ctx.writeTimestamp(frame.queries[static_cast<uint32_t>(point)]);
+      if (point == TimingPoint::QueryEnd) {
+        frame.pending = true;
+        m_timingSlot = -1;
+      }
+    }
+  }
+
+  void RtxSharc::beginQueryStats(RtxContext& ctx) {
+    m_statsSlot = -1;
+    if (!measureGpuTime() || !collectQueryStats() || !m_active) {
+      m_haveQueryStats = false;
+      return;
+    }
+    if (m_statsGpu == nullptr) {
+      DxvkBufferCreateInfo info = {};
+      info.size = kStatsStride * m_statsReady.size();
+      info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+      info.stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_TRANSFER_BIT;
+      info.access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+      m_statsGpu = m_device->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXBuffer, "SHARC Query Stats GPU");
+      info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+      info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT;
+      info.access = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+      m_statsReadback = m_device->createBuffer(info, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, DxvkMemoryStats::Category::RTXBuffer, "SHARC Query Stats Readback");
+    }
+    const uint32_t slot = m_device->getCurrentFrameId() % m_statsReady.size();
+    const VkDeviceSize offset = slot * kStatsStride;
+    if (m_statsReady[slot] != nullptr) {
+      if (m_statsReady[slot]->test() != DxvkGpuEventStatus::Signaled) {
+        return;
+      }
+      std::memcpy(m_queryStats.data(), m_statsReadback->mapPtr(offset), sizeof(m_queryStats));
+      m_haveQueryStats = true;
+    } else {
+      m_statsReady[slot] = m_device->createGpuEvent();
+    }
+    ctx.clearBuffer(m_statsGpu, offset, kStatsStride, 0);
+    ctx.bindResourceBuffer(SHARC_BINDING_QUERY_STATS, DxvkBufferSlice(m_statsGpu, offset, kStatsStride));
+    m_statsSlot = int(slot);
+  }
+
+  void RtxSharc::endQueryStats(RtxContext& ctx) {
+    if (m_statsSlot < 0) {
+      return;
+    }
+    const VkDeviceSize offset = m_statsSlot * kStatsStride;
+    ctx.copyBuffer(m_statsReadback, offset, m_statsGpu, offset, sizeof(m_queryStats));
+    ctx.emitMemoryBarrier(0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+      VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT);
+    ctx.signalGpuEvent(m_statsReady[m_statsSlot]);
+    m_statsSlot = -1;
+  }
+
   void RtxSharc::showImguiSettings() {
     ImGui::TextWrapped("%s", m_status);
+    RemixGui::Checkbox("Allow SHARC with WBOIT", &allowWboitObject());
+    RemixGui::Checkbox("Allow SHARC with ray portals", &allowRayPortalsObject());
+    RemixGui::Checkbox("Allow SHARC with OMM", &allowOpacityMicromapObject());
+    ImGui::TextWrapped("Compatibility testing: these overrides let SHARC run with features enabled in their normal settings.");
+    RemixGui::Checkbox("Batch SHARC cache writes", &deferredUpdatesObject());
+    RemixGui::Checkbox("TraceRay SHARC query", &queryTraceRayObject());
+    if (!queryTraceRay()) {
+      RemixGui::Checkbox("Ray-generation SHARC query", &queryRayGenerationObject());
+    }
+    RemixGui::Checkbox("Ray-generation SHARC updates", &updateRayGenerationObject());
+    RemixGui::Checkbox("Reuse rough surfaces in specular paths", &allowSpecularPathsObject());
+    if (allowSpecularPaths()) {
+      ImGui::TextWrapped("Experimental: wider cache reuse can soften reflected lighting. Roughness and distance limits still apply.");
+    }
+    RemixGui::Checkbox("Measure SHARC GPU time", &measureGpuTimeObject());
+    if (measureGpuTime() && m_haveGpuTimes) {
+      ImGui::Text("GPU ms: update %.2f | resolve %.2f | query %.2f", m_gpuTimes[0], m_gpuTimes[1], m_gpuTimes[2]);
+    }
+    if (measureGpuTime()) {
+      RemixGui::Checkbox("Include cache reuse statistics", &collectQueryStatsObject());
+      ImGui::Text("Cache age: %u frames", m_cacheAge);
+      ImGui::Text("Query backend: %s", (m_compatibilityFlags & 1024u)
+        ? ((m_compatibilityFlags & 2048u) ? "TraceRay + SER" : "TraceRay")
+        : ((m_compatibilityFlags & 128u) ? "RayQuery (ray generation)" : "RayQuery (compute)"));
+      ImGui::Text("Particle transparency: %s", (m_compatibilityFlags & 1u) ? "WBOIT" : "sorted bins");
+      if (collectQueryStats() && m_haveQueryStats) {
+        const auto& s = m_queryStats;
+        const float paths = float(std::max(1u, s[0]));
+        const float surfaces = float(std::max(1u, s[2]));
+        ImGui::Text("Cache terminates %.1f%% of paths | %.2f segments/path", 100.0f * s[7] / paths, s[1] / paths);
+        ImGui::Text("Lookup hit rate %.1f%% | eligible surfaces %.1f%%", 100.0f * s[7] / std::max(1u, s[6] + s[7]), 100.0f * s[4] / surfaces);
+        ImGui::Text("Surface rejects: roughness %.1f%% | incoming non-diffuse %.1f%% | other %.1f%%",
+          100.0f * s[3] / surfaces, 100.0f * s[8] / surfaces, 100.0f * s[9] / surfaces);
+        ImGui::Text("Too close: %.1f%% of eligible surfaces | samples: %u paths", 100.0f * s[5] / std::max(1u, s[4]), s[0]);
+        ImGui::Text("Path ends: sky %.1f%% | bounce limit %.1f%% | zero weight %.1f%% | roulette %.1f%%",
+          100.0f * s[10] / paths, 100.0f * s[11] / paths, 100.0f * s[12] / paths, 100.0f * s[13] / paths);
+        ImGui::Text("Path limits: %u..%u | roulette %s", RtxOptions::pathMinBounces(), RtxOptions::pathMaxBounces(),
+          RtxOptions::enableRussianRoulette() ? "on" : "off");
+      }
+    }
+    if (ImGui::Button("Performance preset (fewer updates)")) {
+      updateTileSizeObject().setDeferred(8);
+      updateBouncesObject().setDeferred(4);
+      capacityLog2Object().setDeferred(20);
+      m_resetRequested = true;
+    }
     RemixGui::DragInt("Capacity exponent", &capacityLog2Object(), 1.0f, 18, 22);
     RemixGui::DragInt("Update tile size", &updateTileSizeObject(), 1.0f, 1, 16);
     RemixGui::DragInt("Update bounces", &updateBouncesObject(), 1.0f, 1, 8);
     RemixGui::DragInt("Accumulation frames", &accumulationFramesObject(), 1.0f, 1, 64);
     RemixGui::DragInt("Stale frames", &staleFramesObject(), 1.0f, 8, 128);
     RemixGui::DragFloat("Grid density", &gridScaleObject(), 1.0f, 1.0f, 1000.0f);
-    RemixGui::DragFloat("Minimum roughness", &minRoughnessObject(), 0.01f, 0.5f, 1.0f);
+    RemixGui::DragFloat("Minimum roughness (squared)", &minRoughnessObject(), 0.01f, 0.5f, 1.0f);
     if (ImGui::Button("Reset SHARC")) {
       m_resetRequested = true;
     }

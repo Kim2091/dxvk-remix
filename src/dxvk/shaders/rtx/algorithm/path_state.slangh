@@ -29,6 +29,9 @@
 #include "rtx/utility/packing.slangh"
 #include "rtx/algorithm/resolve_expanded.slangh"
 #include "rtx/external/NRC.slangh"
+#if SHARC_UPDATE && SHARC_DEFERRED_UPDATE
+#include "rtx/pass/sharc/sharc_update.slangh"
+#endif
 
 // RNG state is not carried via PathState from RayGen to Hit shader, 
 // but instead it is reconstructed using following explicit constants.
@@ -61,7 +64,9 @@ struct PathState : IBasePayloadState
 
   // Note: Radiance, throughput and hit distances are passed in and then written back out
   // so they can be accumulated into in the path tracing loop.
-#if SHARC_UPDATE
+#if SHARC_UPDATE && SHARC_DEFERRED_UPDATE
+  SharcUpdateState sharcState;
+#elif SHARC_UPDATE
   SharcState sharcState;
 #endif
   vec3 radiance;
@@ -295,7 +300,7 @@ struct PathState : IBasePayloadState
     get
     {
 #if SHARC_UPDATE
-      return uint8_t(cb.sharcArgs.updateBounces);
+      return uint8_t(min(cb.sharcArgs.updateBounces, uint(SHARC_PROPAGATION_DEPTH)));
 #else
       return cb.pathMaxBounces;
 #endif

@@ -48,7 +48,9 @@ static const uint kRestirGIAcceptLowRoughnessInput = false;
 PathState pathStateCreateEmpty(GeometryFlags geometryFlags)
 {
   PathState pathState;
-#if SHARC_UPDATE
+#if SHARC_UPDATE && SHARC_DEFERRED_UPDATE
+  pathState.sharcState.count = 0;
+#elif SHARC_UPDATE
   SharcInit(pathState.sharcState);
 #endif
 
@@ -89,7 +91,9 @@ PathState pathStateCreateEmpty(GeometryFlags geometryFlags)
 // Helper function to accumulate attenuation or other throughputs into the Path State throughput.
 void accumulateThroughput(inout PathState pathState, vec3 throughput)
 {
-#if SHARC_UPDATE
+#if SHARC_UPDATE && SHARC_DEFERRED_UPDATE
+  sharcAccumulateThroughput(pathState.sharcState, throughput);
+#elif SHARC_UPDATE
   SharcSetThroughput(pathState.sharcState, throughput);
 #endif
   pathState.throughput = clampedMaximumPositiveMultiply(pathState.throughput, throughput, kThroughputClampedDivisionMaximum);
@@ -110,7 +114,9 @@ void accumulateRadiance(inout vec3 accumulatedRadiance, PathState pathState, vec
 // Overload for simpler path state usage when accumulating radiance.
 void accumulateRadiance(inout PathState pathState, vec3 radiance)
 {
-#if SHARC_UPDATE
+#if SHARC_UPDATE && SHARC_DEFERRED_UPDATE
+  sharcAccumulateRadiance(pathState.sharcState, radiance);
+#elif SHARC_UPDATE
   // Stored weights start at the cached surface, excluding the camera prefix.
   SharcUpdateMiss(makeSharcParameters(), pathState.sharcState, radiance);
 #endif
@@ -536,6 +542,9 @@ void integratePathVertex(
   // Exit on a miss
   if (!rayInteractionHasHit(rayInteraction))
   {
+#if SHARC_QUERY_STATS
+    sharcCount(pathState.pixelCoordinate, 10); // Path exits to sky.
+#endif
     // Reduce the bounce iteration on miss so that when integrator loop exits and increments the variable one more time,
     // the bounce iteration is + 1 since the last surface hit for both misses and hits
     --pathState.bounceIteration;
@@ -558,30 +567,45 @@ void integratePathVertex(
 #if ENABLE_SHARC
   // Keep emission above this point live: the cache contains reflected lighting.
   const OpaqueSurfaceMaterialInteraction sharcMaterial = opaqueSurfaceMaterialInteractionCreate(polymorphicSurfaceMaterialInteraction);
-  const bool sharcEligible = materialType == surfaceMaterialTypeOpaque
+  const bool sharcSurfaceEligible = materialType == surfaceMaterialTypeOpaque
     && pathState.mediumMaterialIndex == SURFACE_INDEX_INVALID
-    && !pathState.insideMedium && pathState.skyGatherEligible
-    && sharcMaterial.isotropicRoughness >= cb.sharcArgs.minRoughness
-    && sharcMaterial.opacity >= 1.0f
+    && !pathState.insideMedium && sharcMaterial.opacity >= 1.0f
     && !isSubsurfaceDiffusionProfileMaterial(sharcMaterial)
     && !any(emissiveLight > 0.0f);
+  // The optional broader policy still checks the receiving material, not the preceding lobe.
+  const bool sharcLobeEligible = pathState.skyGatherEligible || cb.sharcArgs.allowSpecularPaths != 0;
+  const bool sharcEligible = sharcSurfaceEligible && sharcLobeEligible
+    && sharcMaterial.isotropicRoughness >= cb.sharcArgs.minRoughness;
+#if SHARC_QUERY_STATS
+  sharcCount(pathState.pixelCoordinate, 2); // Resolved surface hits.
+  sharcCount(pathState.pixelCoordinate, !sharcSurfaceEligible ? 9u
+    : !sharcLobeEligible ? 8u : !sharcEligible ? 3u : 4u);
+#endif
   if (sharcEligible)
   {
     SharcParameters sharcParameters = makeSharcParameters();
     SharcHitData sharcHit = (SharcHitData)0;
     sharcHit.positionWorld = surfaceInteraction.position;
     sharcHit.normalWorld = surfaceInteraction.geometryNormal;
-#if SHARC_UPDATE
+#if SHARC_UPDATE && SHARC_DEFERRED_UPDATE
+    sharcInsertVertex(pathState.sharcState, sharcHit);
+#elif SHARC_UPDATE
     // NEE below adds to this new vertex and older vertices through the same hook.
     // With resampling/responsive lighting disabled, insertion failure leaves
     // the existing vertices intact; continue their lighting estimate on overflow.
     SharcUpdateHit(sharcParameters, pathState.sharcState, sharcHit, vec3(0.0f), 0.0f);
 #elif SHARC_QUERY
-    const float voxelSize = HashGridGetVoxelSize(HashGridGetLevel(sharcHit.positionWorld, sharcParameters.hashGridParameters), sharcParameters.hashGridParameters);
+    float voxelSize;
+    const HashGridKey key = HashGridComputeSpatialHashWithVoxelSize(sharcHit.positionWorld, sharcHit.normalWorld, sharcParameters.hashGridParameters, voxelSize);
     vec3 cachedRadiance = vec3(0.0f);
-    if (pathState.segmentHitDistance > 1.732051f * voxelSize
-        && SharcGetCachedRadiance(sharcParameters, sharcHit, cachedRadiance, false)
-        && isValidValue(cachedRadiance))
+    const bool farEnough = pathState.segmentHitDistance > 1.732051f * voxelSize;
+    const bool cacheHit = farEnough
+      && SharcGetCachedRadianceFromHash(sharcParameters, sharcHit, key, cachedRadiance, false)
+      && isValidValue(cachedRadiance);
+#if SHARC_QUERY_STATS
+    sharcCount(pathState.pixelCoordinate, !farEnough ? 5u : cacheHit ? 7u : 6u);
+#endif
+    if (cacheHit)
     {
       accumulateRadiance(pathState, cachedRadiance);
       pathState.continuePath = false;
@@ -905,6 +929,9 @@ void integratePathVertex(
     {
       // Note: Don't continue paths past the maximum number of requested bounces.
       pathState.continuePath = false;
+#if SHARC_QUERY_STATS
+      sharcCount(pathState.pixelCoordinate, 11); // Bounce limit.
+#endif
     }
     else if (all(continuationThroughput == vec3(0.0f)))
     {
@@ -918,6 +945,9 @@ void integratePathVertex(
       // avoid this potential mistake by forcing callers to consider the boolean separately rather than encoding
       // it in the throughput.
       pathState.continuePath = false;
+#if SHARC_QUERY_STATS
+      sharcCount(pathState.pixelCoordinate, 12); // Zero continuation weight.
+#endif
     }
     else if (pathState.calculateUseRussianRoulette())
     {
@@ -942,6 +972,9 @@ void integratePathVertex(
       if (terminate)
       {
         pathState.continuePath = false;
+#if SHARC_QUERY_STATS
+        sharcCount(pathState.pixelCoordinate, 13); // Russian roulette.
+#endif
       }
       else
       {
@@ -1470,6 +1503,11 @@ void integrateIndirectPath(
   }
 
   // Integrate Secondary Vertices
+#if SHARC_QUERY_STATS
+  if (cb.enableSecondaryBounces && pathState.continuePath) {
+    sharcCount(pathState.pixelCoordinate, 0); // Paths that actually launch rays.
+  }
+#endif
 
   if (cb.enableSecondaryBounces)
   for (; pathState.continuePath; ++pathState.bounceIteration)
@@ -1478,6 +1516,9 @@ void integrateIndirectPath(
     // This is done to easily account for the various cases the path vertex function may return on
     // which do not require path extension.
     pathState.continuePath = false;
+#if SHARC_QUERY_STATS
+    sharcCount(pathState.pixelCoordinate, 1); // Ray segments per sampled path.
+#endif
 
     pathState.decalEncountered = false;
 
@@ -1508,6 +1549,10 @@ void integrateIndirectPath(
       DEBUG_VIEW_SECONDARY_RAY_AND_UNORDERED_INTERACTIONS,
       (!SHARC_UPDATE && TRUE_OR_CHECK_WHEN_NRC_ENABLED(pathState.isNrcQuery)));
   }
+
+#if SHARC_UPDATE && SHARC_DEFERRED_UPDATE
+  sharcFlushVertices(pathState.sharcState);
+#endif
 
 #if !SHARC_UPDATE
   if ((!SHARC_UPDATE && TRUE_OR_CHECK_WHEN_NRC_ENABLED(pathState.isNrcQuery)))

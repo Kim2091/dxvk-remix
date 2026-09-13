@@ -41,17 +41,68 @@
 //!variant integrate_indirect_rayquery.comp
 //!>       NEE_CACHE_ENABLE=0
 
-// SHARC proof variants currently use the compute RayQuery path only.  Keeping
-// these as dedicated variants avoids adding SHARC descriptors and payload state
-// to the ordinary indirect shader matrix.
+// Dedicated variants keep SHARC descriptors and payload state out of ordinary shaders.
 //!variant integrate_indirect_sharc_update.comp
 //!>       ENABLE_SHARC=1
 //!>       SHARC_UPDATE=1
 //!>       NEE_CACHE_ENABLE=1
 
+//!variant integrate_indirect_sharc_update_deferred.comp
+//!>       ENABLE_SHARC=1
+//!>       SHARC_UPDATE=1
+//!>       SHARC_DEFERRED_UPDATE=1
+//!>       NEE_CACHE_ENABLE=1
+
+//!variant integrate_indirect_sharc_update_deferred4.comp
+//!>       ENABLE_SHARC=1
+//!>       SHARC_UPDATE=1
+//!>       SHARC_DEFERRED_UPDATE=1
+//!>       SHARC_PROPAGATION_DEPTH=4
+//!>       NEE_CACHE_ENABLE=1
+
+//!variant integrate_indirect_sharc_update_raygen.rgen
+//!>       RAY_PIPELINE
+//!>       ENABLE_SHARC=1
+//!>       SHARC_UPDATE=1
+//!>       NEE_CACHE_ENABLE=1
+
+//!variant integrate_indirect_sharc_update_deferred_raygen.rgen
+//!>       RAY_PIPELINE
+//!>       ENABLE_SHARC=1
+//!>       SHARC_UPDATE=1
+//!>       SHARC_DEFERRED_UPDATE=1
+//!>       NEE_CACHE_ENABLE=1
+
+//!variant integrate_indirect_sharc_update_deferred4_raygen.rgen
+//!>       RAY_PIPELINE
+//!>       ENABLE_SHARC=1
+//!>       SHARC_UPDATE=1
+//!>       SHARC_DEFERRED_UPDATE=1
+//!>       SHARC_PROPAGATION_DEPTH=4
+//!>       NEE_CACHE_ENABLE=1
+
 //!variant integrate_indirect_sharc_query.comp
 //!>       ENABLE_SHARC=1
 //!>       SHARC_QUERY=1
+//!>       NEE_CACHE_ENABLE=1
+
+//!variant integrate_indirect_sharc_query_stats.comp
+//!>       ENABLE_SHARC=1
+//!>       SHARC_QUERY=1
+//!>       SHARC_QUERY_STATS=1
+//!>       NEE_CACHE_ENABLE=1
+
+//!variant integrate_indirect_sharc_query_raygen.rgen
+//!>       RAY_PIPELINE
+//!>       ENABLE_SHARC=1
+//!>       SHARC_QUERY=1
+//!>       NEE_CACHE_ENABLE=1
+
+//!variant integrate_indirect_sharc_query_raygen_stats.rgen
+//!>       RAY_PIPELINE
+//!>       ENABLE_SHARC=1
+//!>       SHARC_QUERY=1
+//!>       SHARC_QUERY_STATS=1
 //!>       NEE_CACHE_ENABLE=1
 
 //!variant integrate_indirect_rayquery_raygen.rgen
@@ -225,6 +276,148 @@
 /* NRC WBOIT atmosphere */
 
 
+// Match the selected particle resolver in both cache updates and queries.
+//!variant integrate_indirect_sharc_update_wboit.comp
+//!>       ENABLE_SHARC=1
+//!>       SHARC_UPDATE=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       UNORDERED_RESOLVE_WBOIT
+
+//!variant integrate_indirect_sharc_update_deferred_wboit.comp
+//!>       ENABLE_SHARC=1
+//!>       SHARC_UPDATE=1
+//!>       SHARC_DEFERRED_UPDATE=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       UNORDERED_RESOLVE_WBOIT
+
+//!variant integrate_indirect_sharc_update_deferred4_wboit.comp
+//!>       ENABLE_SHARC=1
+//!>       SHARC_UPDATE=1
+//!>       SHARC_DEFERRED_UPDATE=1
+//!>       SHARC_PROPAGATION_DEPTH=4
+//!>       NEE_CACHE_ENABLE=1
+//!>       UNORDERED_RESOLVE_WBOIT
+
+//!variant integrate_indirect_sharc_update_raygen_wboit.rgen
+//!>       RAY_PIPELINE
+//!>       ENABLE_SHARC=1
+//!>       SHARC_UPDATE=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       UNORDERED_RESOLVE_WBOIT
+
+//!variant integrate_indirect_sharc_update_deferred_raygen_wboit.rgen
+//!>       RAY_PIPELINE
+//!>       ENABLE_SHARC=1
+//!>       SHARC_UPDATE=1
+//!>       SHARC_DEFERRED_UPDATE=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       UNORDERED_RESOLVE_WBOIT
+
+//!variant integrate_indirect_sharc_update_deferred4_raygen_wboit.rgen
+//!>       RAY_PIPELINE
+//!>       ENABLE_SHARC=1
+//!>       SHARC_UPDATE=1
+//!>       SHARC_DEFERRED_UPDATE=1
+//!>       SHARC_PROPAGATION_DEPTH=4
+//!>       NEE_CACHE_ENABLE=1
+//!>       UNORDERED_RESOLVE_WBOIT
+
+//!variant integrate_indirect_sharc_query_wboit.comp
+//!>       ENABLE_SHARC=1
+//!>       SHARC_QUERY=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       UNORDERED_RESOLVE_WBOIT
+
+//!variant integrate_indirect_sharc_query_stats_wboit.comp
+//!>       ENABLE_SHARC=1
+//!>       SHARC_QUERY=1
+//!>       SHARC_QUERY_STATS=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       UNORDERED_RESOLVE_WBOIT
+
+//!variant integrate_indirect_sharc_query_raygen_wboit.rgen
+//!>       RAY_PIPELINE
+//!>       ENABLE_SHARC=1
+//!>       SHARC_QUERY=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       UNORDERED_RESOLVE_WBOIT
+
+//!variant integrate_indirect_sharc_query_raygen_stats_wboit.rgen
+//!>       RAY_PIPELINE
+//!>       ENABLE_SHARC=1
+//!>       SHARC_QUERY=1
+//!>       SHARC_QUERY_STATS=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       UNORDERED_RESOLVE_WBOIT
+
+//!variant integrate_indirect_sharc_query_trace.rgen
+//!>       ENABLE_SHARC=1
+//!>       SHARC_QUERY=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       RT_TRACE_RAY
+//!>       RAY_PIPELINE
+
+//!variant integrate_indirect_sharc_query_trace_wboit.rgen
+//!>       ENABLE_SHARC=1
+//!>       SHARC_QUERY=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       RT_TRACE_RAY
+//!>       RAY_PIPELINE
+//!>       UNORDERED_RESOLVE_WBOIT
+
+//!variant integrate_indirect_sharc_query_trace_stats.rgen
+//!>       ENABLE_SHARC=1
+//!>       SHARC_QUERY=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       RT_TRACE_RAY
+//!>       RAY_PIPELINE
+//!>       SHARC_QUERY_STATS=1
+
+//!variant integrate_indirect_sharc_query_trace_stats_wboit.rgen
+//!>       ENABLE_SHARC=1
+//!>       SHARC_QUERY=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       RT_TRACE_RAY
+//!>       RAY_PIPELINE
+//!>       SHARC_QUERY_STATS=1
+//!>       UNORDERED_RESOLVE_WBOIT
+
+//!variant integrate_indirect_sharc_query_trace_ser.rgen
+//!>       ENABLE_SHARC=1
+//!>       SHARC_QUERY=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       RT_TRACE_RAY
+//!>       RAY_PIPELINE
+//!>       RT_SHADER_EXECUTION_REORDERING
+
+//!variant integrate_indirect_sharc_query_trace_ser_wboit.rgen
+//!>       ENABLE_SHARC=1
+//!>       SHARC_QUERY=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       RT_TRACE_RAY
+//!>       RAY_PIPELINE
+//!>       RT_SHADER_EXECUTION_REORDERING
+//!>       UNORDERED_RESOLVE_WBOIT
+
+//!variant integrate_indirect_sharc_query_trace_ser_stats.rgen
+//!>       ENABLE_SHARC=1
+//!>       SHARC_QUERY=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       RT_TRACE_RAY
+//!>       RAY_PIPELINE
+//!>       RT_SHADER_EXECUTION_REORDERING
+//!>       SHARC_QUERY_STATS=1
+
+//!variant integrate_indirect_sharc_query_trace_ser_stats_wboit.rgen
+//!>       ENABLE_SHARC=1
+//!>       SHARC_QUERY=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       RT_TRACE_RAY
+//!>       RAY_PIPELINE
+//!>       RT_SHADER_EXECUTION_REORDERING
+//!>       SHARC_QUERY_STATS=1
+//!>       UNORDERED_RESOLVE_WBOIT
+
 //!end-variants
 #define ATMOSPHERE_AVAILABLE
 
@@ -253,7 +446,11 @@ void main()
 }
 #else
 [shader("compute")]
+#if SHARC_QUERY
+[numthreads(8, 8, 1)]
+#else
 [numthreads(16, 8, 1)]
+#endif
 void main(uint2 ipos : SV_DispatchThreadID)
 { 
   integrate_indirect_pass(ipos);

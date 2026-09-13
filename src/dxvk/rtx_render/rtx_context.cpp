@@ -1657,10 +1657,24 @@ namespace dxvk {
       if (sharc.isActive()) {
         // SHARC's sparse update writes the cache; resolve must publish it
         // before the full-resolution query pass reads the resolved entries.
-        m_common->metaPathtracerIntegrateIndirect().dispatch(this, rtOutput, true);
+        sharc.recordTimestamp(*this, RtxSharc::TimingPoint::Begin);
+        {
+          ScopedGpuProfileZone(this, "SHARC Update");
+          m_common->metaPathtracerIntegrateIndirect().dispatch(this, rtOutput, true);
+        }
+        sharc.recordTimestamp(*this, RtxSharc::TimingPoint::UpdateEnd);
         sharc.dispatchResolve(*this, rtOutput);
+        sharc.beginQueryStats(*this);
+        sharc.recordTimestamp(*this, RtxSharc::TimingPoint::ResolveEnd);
+        {
+          ScopedGpuProfileZone(this, "SHARC Query");
+          m_common->metaPathtracerIntegrateIndirect().dispatch(this, rtOutput);
+        }
+        sharc.recordTimestamp(*this, RtxSharc::TimingPoint::QueryEnd);
+        sharc.endQueryStats(*this);
+      } else {
+        m_common->metaPathtracerIntegrateIndirect().dispatch(this, rtOutput);
       }
-      m_common->metaPathtracerIntegrateIndirect().dispatch(this, rtOutput);
     }
 
     // Integrate indirect - NEE Cache pass

@@ -39,11 +39,25 @@ def strides(text: str) -> set[int]:
     return {int(x) for x in re.findall(r"ArrayStride\s+(\d+)", text)}
 
 
+def uses_wboit_compensation(text: str) -> bool:
+    # An actual uniform access distinguishes the resolver branches after dead-code elimination.
+    member = re.search(r'OpMemberName\s+(%\S+)\s+(\d+)\s+"wboitEnergyLossCompensation"', text)
+    if not member:
+        raise RuntimeError("missing WBOIT member in RaytraceArgs")
+    pointers = re.findall(r'(%\S+)\s+=\s+OpTypePointer\s+Uniform\s+' + re.escape(member[1]) + r'\b', text)
+    variables = set()
+    for pointer in pointers:
+        variables.update(re.findall(r'(%\S+)\s+=\s+OpVariable\s+' + re.escape(pointer) + r'\s+Uniform\b', text))
+    indices = set(re.findall(r'(%\S+)\s+=\s+OpConstant\s+%\S+\s+' + member[2] + r'\b', text))
+    return any(base in variables and index in indices for base, index in re.findall(
+        r'OpAccessChain\s+%\S+\s+(%\S+)\s+(%\S+)', text))
+
+
 def check(name: str, text: str) -> None:
     bv = binding_variables(text)
     b = set(bv)
     s = strides(text)
-    if name == "update":
+    if name.startswith("update"):
         required = {230, 231}
         if not required <= b:
             raise RuntimeError(f"{name}: missing SHARC bindings {sorted(required - b)}")
@@ -55,7 +69,7 @@ def check(name: str, text: str) -> None:
             raise RuntimeError(f"{name}: expected Int64Atomics capability and atomic operation")
         if "OpImageWrite" in text:
             raise RuntimeError(f"{name}: unexpected image output write")
-    elif name == "query":
+    elif name.startswith("query"):
         required = {230, 232}
         if not required <= b:
             raise RuntimeError(f"{name}: missing SHARC bindings {sorted(required - b)}")
@@ -69,23 +83,87 @@ def check(name: str, text: str) -> None:
             raise RuntimeError(f"{name}: missing SHARC bindings {sorted(required - b)}")
         if not {8, 16} <= s:
             raise RuntimeError(f"{name}: expected SHARC strides 8/16, got {sorted(s)}")
-    elif name == "baseline":
+    elif name.startswith("baseline"):
         if b & {230, 231, 232}:
             raise RuntimeError(f"{name}: baseline unexpectedly declares SHARC binding")
         if "Int64Atomics" in text:
             raise RuntimeError(f"{name}: baseline unexpectedly requires Int64Atomics")
 
+    if "raygen" in name:
+        if not re.search(r"OpEntryPoint RayGeneration", text):
+            raise RuntimeError(f"{name}: missing ray-generation entry point")
+        if "OpTraceRayKHR" in text or "OpRayQueryInitializeKHR" not in text:
+            raise RuntimeError(f"{name}: must use inline RayQuery without hit shaders")
+
+    if name.startswith("query"):
+        if (235 in b) != ("stats" in name.split("_")):
+            raise RuntimeError(f"{name}: incorrect statistics binding")
+        if "raygen" not in name and not re.search(r"OpExecutionMode\s+%\S+\s+LocalSize\s+8\s+8\s+1", text):
+            raise RuntimeError(f"{name}: expected 8x8 compute workgroup")
+
+    if name.startswith(("update", "query", "baseline")):
+        if uses_wboit_compensation(text) != name.endswith("wboit"):
+            raise RuntimeError(f"{name}: incorrect compiled particle resolver")
+
     # Updates read thread-task image 82 for the incoming PDF. Its RW image
     # declaration need not be NonWritable; absence of OpImageWrite proves isolation.
     # Query retains the ordinary indirect image and NEE feedback outputs.
     forbidden = {83, 170, 171, 172, 190}
-    if name == "update" and b & forbidden:
+    if name.startswith("update") and b & forbidden:
         raise RuntimeError(f"{name}: forbidden output binding(s) present: {sorted(b & forbidden)}")
-    if name == "update":
+    if name.startswith("update"):
         for slot in (80, 81):
             ident = bv.get(slot)
             if ident and not re.search(rf"OpDecorate\s+{re.escape(ident)}\s+NonWritable", text):
                 raise RuntimeError(f"{name}: NEE cache binding {slot} is writable")
+
+
+def payload_signature(text: str) -> tuple:
+    definitions = dict(re.findall(r"^\s*(%\S+)\s+=\s+(Op(?:Type\w+|Constant)\b[^\r\n]*)", text, re.MULTILINE))
+    payloads = re.findall(r"OpTypePointer\s+(?:Incoming)?RayPayloadKHR\s+(%\S+)", text)
+    if not payloads:
+        raise RuntimeError("missing ray payload")
+
+    def shape(ident: str) -> tuple:
+        return tuple(shape(token) if token.startswith("%") else token
+                     for token in definitions[ident].split())
+
+    signatures = {shape(ident) for ident in payloads}
+    if len(signatures) != 1:
+        raise RuntimeError("inconsistent payload types within a shader")
+    return signatures.pop()
+
+
+def check_trace(name: str, text: str, stage: str) -> None:
+    b = set(binding_variables(text))
+    if not re.search(r"OpEntryPoint\s+" + stage + r"KHR\b", text):
+        raise RuntimeError(f"{name}: wrong ray tracing stage")
+    if 231 in b or "Int64Atomics" in text:
+        raise RuntimeError(f"{name}: query contains cache accumulation writes")
+    if (235 in b) != ("stats" in name.split("_")):
+        raise RuntimeError(f"{name}: incorrect statistics binding")
+    if stage == "RayGeneration":
+        if 190 not in b or "OpImageWrite" not in text:
+            raise RuntimeError(f"{name}: missing final indirect image output")
+        if b & {230, 232}:
+            raise RuntimeError(f"{name}: cache lookup should run in hit/miss stages")
+        if "ser" in name.split("_"):
+            required_ops = ("OpHitObjectTraceRayNV", "OpReorderThreadWithHitObjectNV", "OpHitObjectExecuteShaderNV")
+            if not all(op in text for op in required_ops) or "OpTraceRayKHR" in text:
+                raise RuntimeError(f"{name}: expected SER hit-object trace/reorder/execute")
+        elif "OpTraceRayKHR" not in text or "OpHitObjectTraceRayNV" in text:
+            raise RuntimeError(f"{name}: expected ordinary TraceRay")
+    else:
+        if not {230, 232} <= b or not {8, 16} <= strides(text):
+            raise RuntimeError(f"{name}: missing cache lookup bindings or strides")
+        if "OpTraceRayKHR" in text or "OpHitObjectTraceRayNV" in text:
+            raise RuntimeError(f"{name}: recursive TraceRay requires a deeper pipeline")
+        if "OpRayQueryInitializeKHR" not in text:
+            raise RuntimeError(f"{name}: expected inline visibility queries")
+        if uses_wboit_compensation(text) != name.endswith("wboit"):
+            raise RuntimeError(f"{name}: incorrect compiled particle resolver")
+    if b & {51, 170, 171, 172}:
+        raise RuntimeError(f"{name}: reservoir policy differs from inline SHARC")
 
 
 def main() -> int:
@@ -96,16 +174,56 @@ def main() -> int:
     args = ap.parse_args()
     files = {
         "update": args.shader_dir / "integrate_indirect_sharc_update.spv",
+        "update_deferred": args.shader_dir / "integrate_indirect_sharc_update_deferred.spv",
+        "update_deferred4": args.shader_dir / "integrate_indirect_sharc_update_deferred4.spv",
+        "update_raygen": args.shader_dir / "integrate_indirect_sharc_update_raygen.spv",
+        "update_deferred_raygen": args.shader_dir / "integrate_indirect_sharc_update_deferred_raygen.spv",
+        "update_deferred4_raygen": args.shader_dir / "integrate_indirect_sharc_update_deferred4_raygen.spv",
         "query": args.shader_dir / "integrate_indirect_sharc_query.spv",
+        "query_stats": args.shader_dir / "integrate_indirect_sharc_query_stats.spv",
+        "query_raygen": args.shader_dir / "integrate_indirect_sharc_query_raygen.spv",
+        "query_raygen_stats": args.shader_dir / "integrate_indirect_sharc_query_raygen_stats.spv",
         "resolve": args.shader_dir / "sharc_resolve.spv",
         "baseline": args.shader_dir / "integrate_indirect_rayquery_neeCache.spv",
     }
+    for name, path in list(files.items()):
+        if name.startswith(("update", "query")):
+            files[name + "_wboit"] = path.with_stem(path.stem + "_wboit")
+    files["baseline_wboit"] = args.shader_dir / "integrate_indirect_rayquery_neeCache_wboit.spv"
+    for name, stem in (("baseline_closesthit", "integrate_indirect_neeCache_pom_material_rayportal_closestHit"),
+                       ("baseline_miss", "integrate_indirect_miss_neeCache")):
+        files[name] = args.shader_dir / (stem + ".spv")
+        files[name + "_wboit"] = args.shader_dir / (stem + "_wboit.spv")
+    compiled = {}
     for name, path in files.items():
         if not path.is_file():
             raise RuntimeError(f"missing {name} shader: {path}")
         validate_spirv(path, args.spirv_val)
-        check(name, disassemble(path, args.spirv_dis))
+        compiled[name] = disassemble(path, args.spirv_dis)
+        check(name, compiled[name])
         print(f"PASS {name}: {path.name}")
+    trace_payload = None
+    for stage in ("trace", "closesthit", "miss", "closesthit_no_pom", "closesthit_no_portals",
+                  "closesthit_no_portals_no_pom", "miss_no_portals"):
+        for ser in ((False, True) if stage == "trace" else (False,)):
+            for stats in (False, True):
+                for wboit in (False, True):
+                    suffix = ("_stats" if stats else "") + ("_wboit" if wboit else "")
+                    name = stage + ("_ser" if ser else "") + suffix
+                    path = args.shader_dir / ("integrate_indirect_sharc_query_" + name + ".spv")
+                    validate_spirv(path, args.spirv_val)
+                    text = disassemble(path, args.spirv_dis)
+                    check_trace(name, text, {"trace": "RayGeneration", "closesthit": "ClosestHit", "miss": "Miss"}[stage.split("_")[0]])
+                    signature = payload_signature(text)
+                    if trace_payload is None:
+                        trace_payload = signature
+                    elif trace_payload != signature:
+                        raise RuntimeError(f"{name}: ray payload ABI differs across shader stages/variants")
+                    inline_bindings = set(binding_variables(compiled["query_raygen" + suffix]))
+                    extra = set(binding_variables(text)) - inline_bindings
+                    if extra:
+                        raise RuntimeError(f"{name}: descriptors exceed inline SHARC layout: {sorted(extra)}")
+                    print(f"PASS {name}: stage, payload ABI, descriptors, tracing and resolver")
     return 0
 
 

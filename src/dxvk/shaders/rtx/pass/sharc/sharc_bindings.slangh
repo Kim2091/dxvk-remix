@@ -10,6 +10,19 @@ RWStructuredBuffer<SharcAccumulationData> SharcAccumulation;
 layout(binding = SHARC_BINDING_RESOLVED)
 RWStructuredBuffer<SharcPackedData> SharcResolved;
 
+#if SHARC_QUERY_STATS
+layout(binding = SHARC_BINDING_QUERY_STATS)
+RWStructuredBuffer<uint> SharcQueryStats;
+
+void sharcCount(uvec2 pixel, uint counter) {
+  // Rotate a 1/64 pixel sample to keep diagnostics out of most tracing lanes.
+  const uint sample = pixel.x * 1973u + pixel.y * 9277u + cb.frameIdx * 26699u;
+  if ((sample & 63u) == 0u) {
+    InterlockedAdd(SharcQueryStats[counter], 1u);
+  }
+}
+#endif
+
 SharcParameters makeSharcParameters() {
   SharcParameters p;
   p.hashGridParameters.cameraPosition = cb.sharcArgs.cameraPosition;

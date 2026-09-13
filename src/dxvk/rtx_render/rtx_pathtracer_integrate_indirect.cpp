@@ -53,7 +53,25 @@
 #include <rtx_shaders/integrate_indirect_rayquery_nrc_neeCache.h>
 #include <rtx_shaders/integrate_indirect_rayquery_nrc.h>
 #include <rtx_shaders/integrate_indirect_sharc_update.h>
+#include <rtx_shaders/integrate_indirect_sharc_update_wboit.h>
+#include <rtx_shaders/integrate_indirect_sharc_update_deferred.h>
+#include <rtx_shaders/integrate_indirect_sharc_update_deferred_wboit.h>
+#include <rtx_shaders/integrate_indirect_sharc_update_deferred4.h>
+#include <rtx_shaders/integrate_indirect_sharc_update_deferred4_wboit.h>
+#include <rtx_shaders/integrate_indirect_sharc_update_raygen.h>
+#include <rtx_shaders/integrate_indirect_sharc_update_raygen_wboit.h>
+#include <rtx_shaders/integrate_indirect_sharc_update_deferred_raygen.h>
+#include <rtx_shaders/integrate_indirect_sharc_update_deferred_raygen_wboit.h>
+#include <rtx_shaders/integrate_indirect_sharc_update_deferred4_raygen.h>
+#include <rtx_shaders/integrate_indirect_sharc_update_deferred4_raygen_wboit.h>
 #include <rtx_shaders/integrate_indirect_sharc_query.h>
+#include <rtx_shaders/integrate_indirect_sharc_query_wboit.h>
+#include <rtx_shaders/integrate_indirect_sharc_query_stats.h>
+#include <rtx_shaders/integrate_indirect_sharc_query_stats_wboit.h>
+#include <rtx_shaders/integrate_indirect_sharc_query_raygen.h>
+#include <rtx_shaders/integrate_indirect_sharc_query_raygen_wboit.h>
+#include <rtx_shaders/integrate_indirect_sharc_query_raygen_stats.h>
+#include <rtx_shaders/integrate_indirect_sharc_query_raygen_stats_wboit.h>
 
 #include <rtx_shaders/integrate_indirect_material_opaque_translucent_closestHit.h>
 #include <rtx_shaders/integrate_indirect_material_rayPortal_closestHit.h>
@@ -127,6 +145,40 @@
 #include "dxvk_scoped_annotation.h"
 #include "rtx_opacity_micromap_manager.h"
 #include "rtx_neural_radiance_cache.h"
+#include <rtx_shaders/integrate_indirect_sharc_query_trace.h>
+#include <rtx_shaders/integrate_indirect_sharc_query_trace_wboit.h>
+#include <rtx_shaders/integrate_indirect_sharc_query_trace_stats.h>
+#include <rtx_shaders/integrate_indirect_sharc_query_trace_stats_wboit.h>
+#include <rtx_shaders/integrate_indirect_sharc_query_trace_ser.h>
+#include <rtx_shaders/integrate_indirect_sharc_query_trace_ser_wboit.h>
+#include <rtx_shaders/integrate_indirect_sharc_query_trace_ser_stats.h>
+#include <rtx_shaders/integrate_indirect_sharc_query_trace_ser_stats_wboit.h>
+#include <rtx_shaders/integrate_indirect_sharc_query_closesthit.h>
+#include <rtx_shaders/integrate_indirect_sharc_query_closesthit_wboit.h>
+#include <rtx_shaders/integrate_indirect_sharc_query_closesthit_stats.h>
+#include <rtx_shaders/integrate_indirect_sharc_query_closesthit_stats_wboit.h>
+#include <rtx_shaders/integrate_indirect_sharc_query_miss.h>
+#include <rtx_shaders/integrate_indirect_sharc_query_miss_wboit.h>
+#include <rtx_shaders/integrate_indirect_sharc_query_miss_stats.h>
+#include <rtx_shaders/integrate_indirect_sharc_query_miss_stats_wboit.h>
+
+#include <rtx_shaders/integrate_indirect_sharc_query_closesthit_no_pom.h>
+#include <rtx_shaders/integrate_indirect_sharc_query_closesthit_no_pom_wboit.h>
+#include <rtx_shaders/integrate_indirect_sharc_query_closesthit_no_pom_stats.h>
+#include <rtx_shaders/integrate_indirect_sharc_query_closesthit_no_pom_stats_wboit.h>
+#include <rtx_shaders/integrate_indirect_sharc_query_closesthit_no_portals.h>
+#include <rtx_shaders/integrate_indirect_sharc_query_closesthit_no_portals_wboit.h>
+#include <rtx_shaders/integrate_indirect_sharc_query_closesthit_no_portals_stats.h>
+#include <rtx_shaders/integrate_indirect_sharc_query_closesthit_no_portals_stats_wboit.h>
+#include <rtx_shaders/integrate_indirect_sharc_query_closesthit_no_portals_no_pom.h>
+#include <rtx_shaders/integrate_indirect_sharc_query_closesthit_no_portals_no_pom_wboit.h>
+#include <rtx_shaders/integrate_indirect_sharc_query_closesthit_no_portals_no_pom_stats.h>
+#include <rtx_shaders/integrate_indirect_sharc_query_closesthit_no_portals_no_pom_stats_wboit.h>
+#include <rtx_shaders/integrate_indirect_sharc_query_miss_no_portals.h>
+#include <rtx_shaders/integrate_indirect_sharc_query_miss_no_portals_wboit.h>
+#include <rtx_shaders/integrate_indirect_sharc_query_miss_no_portals_stats.h>
+#include <rtx_shaders/integrate_indirect_sharc_query_miss_no_portals_stats_wboit.h>
+
 #include "rtx_sharc.h"
 #include "rtx/pass/sharc/sharc_binding_indices.h"
 
@@ -213,17 +265,27 @@ namespace dxvk {
     public:
       static std::vector<dxvk::DxvkResourceSlot> getResourceSlots() {
         auto slots = IntegrateIndirectRayGenShader::getResourceSlots();
-        slots.push_back({ SHARC_BINDING_HASH, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_IMAGE_VIEW_TYPE_MAX_ENUM, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT });
-        slots.push_back({ SHARC_BINDING_ACCUMULATION, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_IMAGE_VIEW_TYPE_MAX_ENUM, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT });
-        slots.push_back({ SHARC_BINDING_RESOLVED, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_IMAGE_VIEW_TYPE_MAX_ENUM, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT });
+        slots.push_back({ SHARC_BINDING_HASH, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_IMAGE_VIEW_TYPE_MAX_ENUM, VK_ACCESS_SHADER_READ_BIT });
+        slots.push_back({ SHARC_BINDING_RESOLVED, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_IMAGE_VIEW_TYPE_MAX_ENUM, VK_ACCESS_SHADER_READ_BIT });
         return slots;
       }
     };
 
-    class IntegrateIndirectSharcUpdateShader : public IntegrateIndirectSharcShader {
+    class IntegrateIndirectSharcStatsShader : public IntegrateIndirectSharcShader {
     public:
       static std::vector<dxvk::DxvkResourceSlot> getResourceSlots() {
         auto slots = IntegrateIndirectSharcShader::getResourceSlots();
+        slots.push_back({ SHARC_BINDING_QUERY_STATS, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_IMAGE_VIEW_TYPE_MAX_ENUM, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT });
+        return slots;
+      }
+    };
+
+    class IntegrateIndirectSharcUpdateShader : public IntegrateIndirectRayGenShader {
+    public:
+      static std::vector<dxvk::DxvkResourceSlot> getResourceSlots() {
+        auto slots = IntegrateIndirectRayGenShader::getResourceSlots();
+        slots.push_back({ SHARC_BINDING_HASH, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_IMAGE_VIEW_TYPE_MAX_ENUM, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT });
+        slots.push_back({ SHARC_BINDING_ACCUMULATION, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_IMAGE_VIEW_TYPE_MAX_ENUM, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT });
         slots.erase(std::remove_if(slots.begin(), slots.end(), [](const auto& slot) {
           return slot.slot == INTEGRATE_INDIRECT_BINDING_INDIRECT_RADIANCE_HIT_DISTANCE_OUTPUT
               || slot.slot == INTEGRATE_INDIRECT_BINDING_RESTIR_GI_RESERVOIR_OUTPUT
@@ -252,6 +314,97 @@ namespace dxvk {
       BEGIN_PARAMETER()
       END_PARAMETER()
     };
+
+    DxvkRaytracingPipelineShaders getSharcTracePipelineShaders(
+      bool serEnabled, bool ommEnabled, bool wboitEnabled, bool statsEnabled, bool includePortals, bool pomEnabled) {
+      DxvkRaytracingPipelineShaders shaders;
+      if (statsEnabled) {
+        if (serEnabled) {
+          shaders.addGeneralShader(wboitEnabled
+            ? GET_SHADER_VARIANT(VK_SHADER_STAGE_RAYGEN_BIT_KHR, IntegrateIndirectSharcStatsShader, integrate_indirect_sharc_query_trace_ser_stats_wboit)
+            : GET_SHADER_VARIANT(VK_SHADER_STAGE_RAYGEN_BIT_KHR, IntegrateIndirectSharcStatsShader, integrate_indirect_sharc_query_trace_ser_stats));
+        } else {
+          shaders.addGeneralShader(wboitEnabled
+            ? GET_SHADER_VARIANT(VK_SHADER_STAGE_RAYGEN_BIT_KHR, IntegrateIndirectSharcStatsShader, integrate_indirect_sharc_query_trace_stats_wboit)
+            : GET_SHADER_VARIANT(VK_SHADER_STAGE_RAYGEN_BIT_KHR, IntegrateIndirectSharcStatsShader, integrate_indirect_sharc_query_trace_stats));
+        }
+        if (includePortals) {
+          shaders.addGeneralShader(wboitEnabled
+            ? GET_SHADER_VARIANT(VK_SHADER_STAGE_MISS_BIT_KHR, IntegrateIndirectMissShader, integrate_indirect_sharc_query_miss_stats_wboit)
+            : GET_SHADER_VARIANT(VK_SHADER_STAGE_MISS_BIT_KHR, IntegrateIndirectMissShader, integrate_indirect_sharc_query_miss_stats));
+        } else {
+          shaders.addGeneralShader(wboitEnabled
+            ? GET_SHADER_VARIANT(VK_SHADER_STAGE_MISS_BIT_KHR, IntegrateIndirectMissShader, integrate_indirect_sharc_query_miss_no_portals_stats_wboit)
+            : GET_SHADER_VARIANT(VK_SHADER_STAGE_MISS_BIT_KHR, IntegrateIndirectMissShader, integrate_indirect_sharc_query_miss_no_portals_stats));
+        }
+        if (includePortals) {
+          if (pomEnabled) {
+            shaders.addHitGroup(wboitEnabled
+              ? GET_SHADER_VARIANT(VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, IntegrateIndirectClosestHitShader, integrate_indirect_sharc_query_closesthit_stats_wboit)
+              : GET_SHADER_VARIANT(VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, IntegrateIndirectClosestHitShader, integrate_indirect_sharc_query_closesthit_stats), nullptr, nullptr);
+          } else {
+            shaders.addHitGroup(wboitEnabled
+              ? GET_SHADER_VARIANT(VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, IntegrateIndirectClosestHitShader, integrate_indirect_sharc_query_closesthit_no_pom_stats_wboit)
+              : GET_SHADER_VARIANT(VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, IntegrateIndirectClosestHitShader, integrate_indirect_sharc_query_closesthit_no_pom_stats), nullptr, nullptr);
+          }
+        } else {
+          if (pomEnabled) {
+            shaders.addHitGroup(wboitEnabled
+              ? GET_SHADER_VARIANT(VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, IntegrateIndirectClosestHitShader, integrate_indirect_sharc_query_closesthit_no_portals_stats_wboit)
+              : GET_SHADER_VARIANT(VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, IntegrateIndirectClosestHitShader, integrate_indirect_sharc_query_closesthit_no_portals_stats), nullptr, nullptr);
+          } else {
+            shaders.addHitGroup(wboitEnabled
+              ? GET_SHADER_VARIANT(VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, IntegrateIndirectClosestHitShader, integrate_indirect_sharc_query_closesthit_no_portals_no_pom_stats_wboit)
+              : GET_SHADER_VARIANT(VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, IntegrateIndirectClosestHitShader, integrate_indirect_sharc_query_closesthit_no_portals_no_pom_stats), nullptr, nullptr);
+          }
+        }
+      } else {
+        if (serEnabled) {
+          shaders.addGeneralShader(wboitEnabled
+            ? GET_SHADER_VARIANT(VK_SHADER_STAGE_RAYGEN_BIT_KHR, IntegrateIndirectSharcShader, integrate_indirect_sharc_query_trace_ser_wboit)
+            : GET_SHADER_VARIANT(VK_SHADER_STAGE_RAYGEN_BIT_KHR, IntegrateIndirectSharcShader, integrate_indirect_sharc_query_trace_ser));
+        } else {
+          shaders.addGeneralShader(wboitEnabled
+            ? GET_SHADER_VARIANT(VK_SHADER_STAGE_RAYGEN_BIT_KHR, IntegrateIndirectSharcShader, integrate_indirect_sharc_query_trace_wboit)
+            : GET_SHADER_VARIANT(VK_SHADER_STAGE_RAYGEN_BIT_KHR, IntegrateIndirectSharcShader, integrate_indirect_sharc_query_trace));
+        }
+        if (includePortals) {
+          shaders.addGeneralShader(wboitEnabled
+            ? GET_SHADER_VARIANT(VK_SHADER_STAGE_MISS_BIT_KHR, IntegrateIndirectMissShader, integrate_indirect_sharc_query_miss_wboit)
+            : GET_SHADER_VARIANT(VK_SHADER_STAGE_MISS_BIT_KHR, IntegrateIndirectMissShader, integrate_indirect_sharc_query_miss));
+        } else {
+          shaders.addGeneralShader(wboitEnabled
+            ? GET_SHADER_VARIANT(VK_SHADER_STAGE_MISS_BIT_KHR, IntegrateIndirectMissShader, integrate_indirect_sharc_query_miss_no_portals_wboit)
+            : GET_SHADER_VARIANT(VK_SHADER_STAGE_MISS_BIT_KHR, IntegrateIndirectMissShader, integrate_indirect_sharc_query_miss_no_portals));
+        }
+        if (includePortals) {
+          if (pomEnabled) {
+            shaders.addHitGroup(wboitEnabled
+              ? GET_SHADER_VARIANT(VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, IntegrateIndirectClosestHitShader, integrate_indirect_sharc_query_closesthit_wboit)
+              : GET_SHADER_VARIANT(VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, IntegrateIndirectClosestHitShader, integrate_indirect_sharc_query_closesthit), nullptr, nullptr);
+          } else {
+            shaders.addHitGroup(wboitEnabled
+              ? GET_SHADER_VARIANT(VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, IntegrateIndirectClosestHitShader, integrate_indirect_sharc_query_closesthit_no_pom_wboit)
+              : GET_SHADER_VARIANT(VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, IntegrateIndirectClosestHitShader, integrate_indirect_sharc_query_closesthit_no_pom), nullptr, nullptr);
+          }
+        } else {
+          if (pomEnabled) {
+            shaders.addHitGroup(wboitEnabled
+              ? GET_SHADER_VARIANT(VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, IntegrateIndirectClosestHitShader, integrate_indirect_sharc_query_closesthit_no_portals_wboit)
+              : GET_SHADER_VARIANT(VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, IntegrateIndirectClosestHitShader, integrate_indirect_sharc_query_closesthit_no_portals), nullptr, nullptr);
+          } else {
+            shaders.addHitGroup(wboitEnabled
+              ? GET_SHADER_VARIANT(VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, IntegrateIndirectClosestHitShader, integrate_indirect_sharc_query_closesthit_no_portals_no_pom_wboit)
+              : GET_SHADER_VARIANT(VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, IntegrateIndirectClosestHitShader, integrate_indirect_sharc_query_closesthit_no_portals_no_pom), nullptr, nullptr);
+          }
+        }
+      }
+      shaders.debugName = serEnabled ? "SHARC Query TraceRay + SER" : "SHARC Query TraceRay";
+      if (ommEnabled) {
+        shaders.pipelineFlags |= VK_PIPELINE_CREATE_RAY_TRACING_OPACITY_MICROMAP_BIT_EXT;
+      }
+      return shaders;
+    }
 
     class IntegrateNEEShader : public ManagedShader {
       SHADER_SOURCE(IntegrateNEEShader, VK_SHADER_STAGE_COMPUTE_BIT, integrate_nee)
@@ -385,9 +538,7 @@ namespace dxvk {
           }
         }
       }
-      // SHARC uses only these two dedicated compute RayQuery variants.  They
-      // are intentionally prewarmed separately from the legacy permutation
-      // matrix because they carry the cache bindings and estimator defines.
+      // Prewarm the SHARC compute fallbacks separately from the legacy variants.
       if (RtxSharc::isSupported(*m_device)) {
         getComputeShader(NeeCachePass::enable(), false, false, true, false);
         getComputeShader(NeeCachePass::enable(), false, false, false, true);
@@ -404,6 +555,14 @@ namespace dxvk {
           && RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::Sharc) {
         getComputeShader(useNeeCache, false, false, true, false);
         getComputeShader(useNeeCache, false, false, false, true);
+        if (RtxSharc::queryTraceRay()) {
+          for (int32_t includesPortals = portalsEnabled; includesPortals >= 0; --includesPortals) {
+            for (int32_t pomEnabled = 1; pomEnabled >= 0; --pomEnabled) {
+              pipelineManager.registerRaytracingShaders(getSharcTracePipelineShaders(serEnabled, ommEnabled, wboitEnabled,
+                RtxSharc::measureGpuTime() && RtxSharc::collectQueryStats(), includesPortals != 0, pomEnabled != 0));
+            }
+          }
+        }
       }
 
       for (int32_t includesPortals = portalsEnabled; includesPortals >= 0; includesPortals--) {
@@ -568,11 +727,7 @@ namespace dxvk {
       ScopedGpuProfileZone(ctx, "Integrate Indirect Raytracing");
       const NeeCachePass& neeCache = ctx->getCommonObjects()->metaNeeCache();
       const bool neeCacheEnabled = neeCache.isActive();
-      // SHARC update launches one logical thread per update tile.  The shader
-      // maps that logical coordinate to a rotating source pixel, so dispatch
-      // over the tile grid and ceil both dimensions before applying the local
-      // 16x8 workgroup shape.  Query and all legacy variants remain at their
-      // normal (or NRC-expanded) resolution.
+      // Both update backends map one logical invocation per tile to a rotating source pixel.
       VkExtent3D dispatchDims = rayDims;
       if (sharcUpdate) {
         const uint32_t tileSize = std::max(1u, rtOutput.m_raytraceArgs.sharcArgs.updateTileSize);
@@ -582,13 +737,68 @@ namespace dxvk {
       }
       const VkExtent3D workgroups = util::computeBlockCount(dispatchDims, VkExtent3D { 16, 8, 1 });
       if (sharcUpdate || sharc.isActive()) {
-        // SHARC variants are deliberately compute RayQuery only.  Do not let
-        // the user's normal indirect backend selection bind an incompatible
-        // ray-generation or TraceRay pipeline while the cache is active.
-        ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT,
-          getComputeShader(neeCacheEnabled, nrcEnabled, wboitEnabled,
-                           sharcUpdate, !sharcUpdate));
-        ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
+        if (!sharcUpdate) {
+          if (RtxSharc::queryTraceRay()) {
+            ctx->bindRaytracingPipelineShaders(getSharcTracePipelineShaders(serEnabled, ommEnabled, wboitEnabled, sharc.queryStatsActive(), includePortals, pomEnabled));
+            ctx->traceRays(rayDims.width, rayDims.height, rayDims.depth);
+          } else if (RtxSharc::queryRayGeneration()) {
+            DxvkRaytracingPipelineShaders shaders;
+            if (sharc.queryStatsActive()) {
+              shaders.addGeneralShader(wboitEnabled
+                ? GET_SHADER_VARIANT(VK_SHADER_STAGE_RAYGEN_BIT_KHR, IntegrateIndirectSharcStatsShader, integrate_indirect_sharc_query_raygen_stats_wboit)
+                : GET_SHADER_VARIANT(VK_SHADER_STAGE_RAYGEN_BIT_KHR, IntegrateIndirectSharcStatsShader, integrate_indirect_sharc_query_raygen_stats));
+            } else {
+              shaders.addGeneralShader(wboitEnabled
+                ? GET_SHADER_VARIANT(VK_SHADER_STAGE_RAYGEN_BIT_KHR, IntegrateIndirectSharcShader, integrate_indirect_sharc_query_raygen_wboit)
+                : GET_SHADER_VARIANT(VK_SHADER_STAGE_RAYGEN_BIT_KHR, IntegrateIndirectSharcShader, integrate_indirect_sharc_query_raygen));
+            }
+            shaders.debugName = "SHARC Query RayGen";
+            if (ommEnabled) {
+              shaders.pipelineFlags |= VK_PIPELINE_CREATE_RAY_TRACING_OPACITY_MICROMAP_BIT_EXT;
+            }
+            ctx->bindRaytracingPipelineShaders(shaders);
+            ctx->traceRays(rayDims.width, rayDims.height, rayDims.depth);
+          } else {
+            ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, sharc.queryStatsActive()
+              ? (wboitEnabled
+                ? GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, IntegrateIndirectSharcStatsShader, integrate_indirect_sharc_query_stats_wboit)
+                : GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, IntegrateIndirectSharcStatsShader, integrate_indirect_sharc_query_stats))
+              : (wboitEnabled
+                ? GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, IntegrateIndirectSharcShader, integrate_indirect_sharc_query_wboit)
+                : GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, IntegrateIndirectSharcShader, integrate_indirect_sharc_query)));
+            const auto queryGroups = util::computeBlockCount(dispatchDims, VkExtent3D { 8, 8, 1 });
+            ctx->dispatch(queryGroups.width, queryGroups.height, queryGroups.depth);
+          }
+          return;
+        }
+        if (RtxSharc::updateRayGeneration()) {
+          DxvkRaytracingPipelineShaders shaders;
+          if (RtxSharc::deferredUpdates()) {
+            if (rtOutput.m_raytraceArgs.sharcArgs.updateBounces <= 4) {
+              shaders.addGeneralShader(wboitEnabled
+                ? GET_SHADER_VARIANT(VK_SHADER_STAGE_RAYGEN_BIT_KHR, IntegrateIndirectSharcUpdateShader, integrate_indirect_sharc_update_deferred4_raygen_wboit)
+                : GET_SHADER_VARIANT(VK_SHADER_STAGE_RAYGEN_BIT_KHR, IntegrateIndirectSharcUpdateShader, integrate_indirect_sharc_update_deferred4_raygen));
+            } else {
+              shaders.addGeneralShader(wboitEnabled
+                ? GET_SHADER_VARIANT(VK_SHADER_STAGE_RAYGEN_BIT_KHR, IntegrateIndirectSharcUpdateShader, integrate_indirect_sharc_update_deferred_raygen_wboit)
+                : GET_SHADER_VARIANT(VK_SHADER_STAGE_RAYGEN_BIT_KHR, IntegrateIndirectSharcUpdateShader, integrate_indirect_sharc_update_deferred_raygen));
+            }
+          } else {
+            shaders.addGeneralShader(wboitEnabled
+              ? GET_SHADER_VARIANT(VK_SHADER_STAGE_RAYGEN_BIT_KHR, IntegrateIndirectSharcUpdateShader, integrate_indirect_sharc_update_raygen_wboit)
+              : GET_SHADER_VARIANT(VK_SHADER_STAGE_RAYGEN_BIT_KHR, IntegrateIndirectSharcUpdateShader, integrate_indirect_sharc_update_raygen));
+          }
+          shaders.debugName = "SHARC Update RayGen";
+          if (ommEnabled) {
+            shaders.pipelineFlags |= VK_PIPELINE_CREATE_RAY_TRACING_OPACITY_MICROMAP_BIT_EXT;
+          }
+          ctx->bindRaytracingPipelineShaders(shaders);
+          ctx->traceRays(dispatchDims.width, dispatchDims.height, dispatchDims.depth);
+        } else {
+          ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT,
+            getComputeShader(neeCacheEnabled, nrcEnabled, wboitEnabled, true, false));
+          ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
+        }
         return;
       }
       switch (RtxOptions::renderPassIntegrateIndirectRaytraceMode()) {
@@ -969,10 +1179,24 @@ namespace dxvk {
 
   Rc<DxvkShader> DxvkPathtracerIntegrateIndirect::getComputeShader(const bool useNeeCache, const bool nrcEnabled, const bool wboitEnabled, const bool sharcUpdate, const bool sharcQuery) const {
     if (sharcUpdate) {
-      return GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, IntegrateIndirectSharcUpdateShader, integrate_indirect_sharc_update);
+      if (RtxSharc::deferredUpdates()) {
+        if (RtxSharc::updateBounces() <= 4) {
+          return (wboitEnabled
+            ? GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, IntegrateIndirectSharcUpdateShader, integrate_indirect_sharc_update_deferred4_wboit)
+            : GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, IntegrateIndirectSharcUpdateShader, integrate_indirect_sharc_update_deferred4));
+        }
+        return (wboitEnabled
+          ? GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, IntegrateIndirectSharcUpdateShader, integrate_indirect_sharc_update_deferred_wboit)
+          : GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, IntegrateIndirectSharcUpdateShader, integrate_indirect_sharc_update_deferred));
+      }
+      return (wboitEnabled
+        ? GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, IntegrateIndirectSharcUpdateShader, integrate_indirect_sharc_update_wboit)
+        : GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, IntegrateIndirectSharcUpdateShader, integrate_indirect_sharc_update));
     }
     if (sharcQuery) {
-      return GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, IntegrateIndirectSharcShader, integrate_indirect_sharc_query);
+      return (wboitEnabled
+        ? GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, IntegrateIndirectSharcShader, integrate_indirect_sharc_query_wboit)
+        : GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, IntegrateIndirectSharcShader, integrate_indirect_sharc_query));
     }
     if (wboitEnabled) {
       if (nrcEnabled) {
