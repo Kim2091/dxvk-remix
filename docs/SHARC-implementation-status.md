@@ -339,3 +339,5 @@ Assembly candidate follow-up: user found appearance correct but performance wors
 Retest requested: the assembly-boundary candidate is installed again, restored from verified backup. Performance verdict remains pending retest.
 
 Assembly retest result: user reports properly measured performance largely matches the old build. Latest 12-sample median sequence is 15.387 ms; scene preparation returned to 0.117 ms and assembly is 0.312 ms. Earlier slowdown did not reproduce. Keep candidate installed; count this as structural progress with no demonstrated speedup, not a confirmed performance regression. See SHARC-assembly-test-2026-09-13.md for capture details and remaining coverage limits.
+
+Query-probe experiment 0ba50562d built, validated and deployed. Only the SHARC query lookup-loop unroll attribute changes; performance pending game test. See SHARC-query-probe-test-2026-09-13.md.
