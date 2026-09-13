@@ -603,6 +603,8 @@ extern "C" {
       return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
     }
 
+    DeviceBridge::ResponseTransaction responseTransaction;
+
     UID currentUID = 0;
     {
       ClientMessage c(Commands::RemixApi_SetGameValue);
@@ -631,6 +633,8 @@ extern "C" {
     if (in_buffer_size > 0 && out_buffer == nullptr) {
       return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
     }
+
+    DeviceBridge::ResponseTransaction responseTransaction;
 
     UID currentUID = 0;
     {

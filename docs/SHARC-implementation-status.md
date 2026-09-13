@@ -306,3 +306,9 @@ User validation of specialized build: the apparent FNV hang was a false alarm.
 SHARC is now very fast and, in the user's assessment, visually outperforms
 ReSTIR GI and NRC. Rough-surface reuse no longer has a noticeable effect in
 their test. User requested committing this baseline and trying cache resampling.
+
+## FNV bridge hang fix and resampling removal (2026-09-12)
+
+Confirmed IPC deadlock with both bridge command rings full; renderer workers were idle. Built and deployed shared recursive response/device serialization, fail-fast response identity/timeout handling, and reset/readback corrections. Paired-queue regression passed 1,000 request/response UIDs. User reports the deployed fix worked; original initiating event remains unproven. See FNV-hang-diagnosis-2026-09-12.md for evidence and deployment records.
+
+The experimental SHARC update cache resampling commit was removed from branch history at user request after showing no performance benefit. SHARC and its earlier performance improvements remain. This source-history change does not replace the currently deployed game binaries; the diagnosis records describe the historical deployment.
