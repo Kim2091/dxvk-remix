@@ -21,3 +21,9 @@ Keep the existing full-feature SHARC settings. Load the same save/view as the pr
 Release build and all 66 SHARC compiled-resource/DLL embedding checks passed, including plain assembly validation. Existing shader/linker warnings remain. Runtime result pending.
 
 Deployed query probe experiment 0ba50562d to FNV. Backup suffix: .backup-pre-query-probe-20260913-055157. DLL SHA256: A62077CD661F8F812FFB2129015A61E95DB7F5A9DAFE29B2B84712B00EFAD2AA. PDB SHA256: 83C320F48259C58F48CA60D996E4F32B68A5473AB09BA1B7F2917FDD1556F503. Both verified. Configuration unchanged; profiling remains enabled.
+
+## First runtime result
+
+User reports a very slight perceived improvement and correct lighting. Last 12 complete samples (2534..3854): IndirectIntegration median 2.366 ms versus 2.390 ms in the assembly-boundary retest (0.024 ms / approximately 1% lower). MeasuredSequence median is 15.932 ms versus 15.387 ms (0.545 ms higher). Query-run indirect interval range is 1.967..3.353 ms, with substantial overlap with the baseline range. Separate captures and diagnostic timestamp overhead prevent attributing either difference to the loop attribute. No overall speedup is demonstrated and no causal regression is established. Visual compatibility passed the user's scene check; broader coverage is not implied.
+
+Capture and summary preserved in _Comp64Release/gpu-query-probe-test*. Candidate remains installed as an experiment. No settings changed. Require warmed paired A/B before accepting this as a performance optimization; do not use the slight indirect median improvement as proof of a win.
