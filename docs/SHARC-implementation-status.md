@@ -354,3 +354,9 @@ The next test candidate introduces opt-in `rtx.sharc.fuseAssembly` (default fals
 ### Fused assembly runtime decision
 
 The fresh same-DLL split comparison measured median query+assembly at 2.339 ms versus 2.956 ms fused; measured GPU sequence was 15.492 ms split versus 15.628 ms fused. Fusion remains disabled in FNV and defaults off in source. Separate-capture variability limits causal attribution, but current evidence does not justify adoption. See SHARC-fused-assembly-test-2026-09-13.md for preserved captures and limitations.
+
+## Work paused by user - 2026-09-13
+
+Stop the renderer overhaul here. Preserve the current implementation and experimental options without further optimization or deployment work.
+
+Fusion produced no useful demonstrated performance benefit. In the fresh comparison, query plus assembly was slower with fusion (2.956 ms versus 2.339 ms split), while the overall measured GPU sequence was similar (15.628 ms versus 15.492 ms). Separate captures limit causal conclusions. Keep fusion disabled; it remains an opt-in research prototype, not an accepted optimization. FNV remains on full-feature SHARC with leanSecondary=False and fuseAssembly=False.
