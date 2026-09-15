@@ -64,8 +64,10 @@ namespace dxvk {
       return;
     }
     const bool wboit = RtxOptions::wboitEnabled();
-    const bool rayPortals = args.numActiveRayPortals > 0
-      || !RtxOptions::rayPortalModelTextureHashes().empty();
+    // Only an actually active portal can put a path into portal space. Configuring portal
+    // texture hashes does not, and testing them here disabled SHARC for a whole session in
+    // any game that defines portals at all, including rooms with none in sight.
+    const bool rayPortals = args.numActiveRayPortals > 0;
     const bool opacityMicromap = RtxOptions::getEnableOpacityMicromap();
     if (rayPortals && !allowRayPortals()) {
       ++m_otherFallbackFrames;

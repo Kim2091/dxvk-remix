@@ -38,7 +38,22 @@ bool sharcOnResolvedVertex(
   sharcCount(pathState.pixelCoordinate, !sharcSurfaceEligible ? 9u
     : !sharcLobeEligible ? 8u : !sharcEligible ? 3u : 4u);
 #endif
-  if (sharcEligible)
+  // Crossing a ray portal rewrites the path's ray mask, and that mask feeds the
+  // continuation ray, the NEE shadow ray and the unordered resolve. Radiance at a vertex
+  // is therefore a function of (position, normal, portalSpace), while the cache keys only
+  // on position and normal. Inserting from a portal-space vertex would pollute the cell
+  // that main-space paths read back.
+  //
+  // Queries stay unconditional: the cell describes the same physical point either way, so
+  // reading it is sound even from behind a portal. Only writing is restricted. The cost is
+  // that geometry reachable only through a portal never populates the cache, because
+  // portalSpace is sticky for the remainder of a path.
+#if SHARC_UPDATE
+  const bool sharcCacheEligible = sharcEligible && pathState.portalSpace == PORTAL_SPACE_NONE;
+#else
+  const bool sharcCacheEligible = sharcEligible;
+#endif
+  if (sharcCacheEligible)
   {
     SharcParameters sharcParameters = makeSharcParameters();
     SharcHitData sharcHit = (SharcHitData)0;
