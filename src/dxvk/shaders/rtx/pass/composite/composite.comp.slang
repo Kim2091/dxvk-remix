@@ -419,10 +419,12 @@ void applyVolumetricLighting(
   // much of the cloud it should be fogged by (see cloudDepthVisibility) -- foliage rendered crisp
   // through a cloud the ground beneath it is already fogged by is the artefact this exists to avoid.
   out bool alphaBlendSurfaceValid,
-  out float alphaBlendHitDistance)
+  out float alphaBlendHitDistance,
+  out vec3 alphaVolumeAttenuation)
 {
   alphaBlendSurfaceValid = false;
   alphaBlendHitDistance = 0.0f;
+  alphaVolumeAttenuation = vec3(1.0f);
 
   // Override the default volume sampling RNG seed offset
   setVolumeSamplingRngSeed(1);
@@ -523,13 +525,12 @@ void applyVolumetricLighting(
         volumeUV.x /= cb.volumeArgs.numFroxelVolumes;
         
         vec3 alphaVolumetricPreintegratedRadiance = vec3(0.0f, 0.0f, 0.0f);
-        vec3 alphaVolumetricAttenuation = vec3(1.0f, 1.0f, 1.0f);
         integrateVolumetricNEE(
           randomState, VolumeFilteredRadianceAge, VolumeFilteredRadianceY, VolumeFilteredRadianceCoCg,
           cb.volumeArgs, cb.timeSinceStartMS, pixelCoordinate, volumeUV, false, cameraGetWorldPosition(cb.camera), surface.hitT, primaryRayDirections.worldDirection,
-          alphaVolumetricPreintegratedRadiance, alphaVolumetricAttenuation);
+          alphaVolumetricPreintegratedRadiance, alphaVolumeAttenuation);
 
-        alphaBlendOutput *= alphaVolumetricAttenuation * (1 - backgroundAlpha);
+        alphaBlendOutput *= alphaVolumeAttenuation * (1 - backgroundAlpha);
         alphaBlendOutput += alphaVolumetricPreintegratedRadiance * (1 - backgroundAlpha);
       }
       else
@@ -633,6 +634,7 @@ void applyAerialPerspective(
   bool primaryMiss,
   float viewDistance,
   vec3 volumeAttenuation,
+  vec3 radianceThroughput,
   inout vec3 radianceOutput)
 {
   if (cb.atmosphereArgs.aerialPerspectiveLutSize == 0 ||
@@ -672,7 +674,7 @@ void applyAerialPerspective(
       const vec4 aerialPerspective = sampleAerialPerspectiveLut(
         AtmosphereAerialPerspectiveLut, AtmosphereAerialPerspectiveSampler, uvw, cb.atmosphereArgs);
 
-      const vec3 inScatter = max(aerialPerspective.rgb, vec3(0.0f)) * volumeAttenuation * nearFade;
+      const vec3 inScatter = max(aerialPerspective.rgb, vec3(0.0f)) * volumeAttenuation * radianceThroughput * nearFade;
 
       // Fade toward the identity transform, not toward zero: at nearFade 0 this has to leave the
       // surface exactly as it found it, which means a transmittance of one rather than a black
@@ -705,7 +707,7 @@ void applyAerialPerspective(
       AtmosphereAerialPerspectiveLocalLut, AtmosphereAerialPerspectiveSampler,
       uvw, cb.atmosphereArgs).rgb, vec3(0.0f));
 
-    radianceOutput += localInScatter * volumeAttenuation;
+    radianceOutput += localInScatter * volumeAttenuation * radianceThroughput;
   }
 }
 
@@ -947,6 +949,7 @@ void applyCloudComposite(
   bool primaryMiss,
   float viewDistance,
   float backgroundAlpha,
+  vec3 radianceThroughput,
   inout vec3 radianceOutput,
   inout vec3 alphaBlendOutput,
   bool alphaBlendSurfaceValid,
@@ -1044,8 +1047,9 @@ void applyCloudComposite(
   // alpha-blend coverage weighting below is retained.
   // If an RR-only artefact ever shows at cloudHistoryWeight = 0, that commit is the reference for
   // restoring the toggle.
+  // In-scatter follows the same foreground throughput as the sky it replaces.
   radianceOutput = radianceOutput * (1.0f - cloud.a * opaqueVisibility)
-                 + cloud.rgb * opaqueVisibility;
+                 + cloud.rgb * opaqueVisibility * radianceThroughput;
 
   // ---- Alpha-blended (foliage / particle) surfaces ----
   // Depth-ratio rule (fork — 2026-09-05): the same cloudDepthVisibility gate as the opaque path,
@@ -1198,6 +1202,7 @@ vec4 compositeResult(
   vec3 sharedFinalOutput;
   bool alphaBlendSurfaceValid;
   float alphaBlendHitDistance;
+  vec3 alphaVolumeAttenuation;
 
   // Determine radiance scales for sparse rendering. Scaling only applies at union-active pixels;
   // at inactive pixels the contributions that would be scaled (alpha blend, fog, sky) come from
@@ -1254,7 +1259,7 @@ vec4 compositeResult(
     radianceScale, volumetricRadianceScale, remodulatedTotalSecondaryRadiance, sharedRadiance,
     volumetricPreintegratedRadiance, volumeAttenuation, alphaBlendOutput, backgroundAlpha,
     radianceOutput, particleLayerOutput,
-    alphaBlendSurfaceValid, alphaBlendHitDistance);
+    alphaBlendSurfaceValid, alphaBlendHitDistance, alphaVolumeAttenuation);
 
   // Calculate final combined radiance output
   // Note: The primary hit accumulated radiance value is not affected by the throughput (rather takes attenuation into account
@@ -1265,7 +1270,13 @@ vec4 compositeResult(
   radianceOutput += sharedRadiance;
 
   // Applied before the sky so it only affects geometry; the sky already carries its full column.
-  applyAerialPerspective(pixelCoordinate, primaryMiss, viewDistance, volumeAttenuation, radianceOutput);
+  // Background radiance already carries foreground transparency from the geometry resolver.
+  applyAerialPerspective(pixelCoordinate, primaryMiss, viewDistance, volumeAttenuation,
+    primaryAttenuation, radianceOutput);
+  if (alphaBlendSurfaceValid) {
+    applyAerialPerspective(pixelCoordinate, false, alphaBlendHitDistance, alphaVolumeAttenuation,
+      vec3(1.0f - backgroundAlpha), alphaBlendOutput);
+  }
 
   // Cloud composite (fork — 2026-09-05, world-space cloud migration Stage 4b). Placed immediately
   // after aerial perspective and before the dome-light sky contribution / fog: the composite is the
@@ -1281,7 +1292,7 @@ vec4 compositeResult(
   // particleLayerOutput argument 794ffd716 added (DLSS-RR transparency-layer routing) was removed
   // 2026-09-06 with that routing; see the note above the opaque composite in applyCloudComposite.
   applyCloudComposite(
-    pixelCoordinate, primaryMiss, viewDistance, backgroundAlpha,
+    pixelCoordinate, primaryMiss, viewDistance, backgroundAlpha, primaryAttenuation,
     radianceOutput, alphaBlendOutput, alphaBlendSurfaceValid, alphaBlendHitDistance,
     geometryFlags.performedAnyPSR());
 

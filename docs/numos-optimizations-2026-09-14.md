@@ -116,3 +116,11 @@ User reports shimmer across clouds while walking, especially scale 0.25, not onl
 At reduced cloud resolution, use the existing static per-pixel march offset for both jitter inputs. Keep primary-camera projection jitter and all density, sampling budgets, and native-scale behavior unchanged. This removes frame-index noise from the reduced-resolution march, but cannot guarantee stability while walking: screen-space static noise can still move over the volume, and coarse spatial undersampling remains. Watch for fixed grain/banding replacing shimmer. This is a targeted test candidate, not a claim of runtime success.
 
 All seven cloud-render SPIR-V variants passed Vulkan 1.3 validation; release relink includes these shaders together with the prior silhouette reconstruction fix. Local commits only; no push.
+
+## Alpha foliage / atmosphere overlay test package
+
+User confirmed the silhouette and stable-sampling packages fixed the main issues. New screenshots show foliage fading under cloud/haze while solid trunks remain visible. Source inspection found the geometry resolver attenuates background sky/radiance by accumulated foreground transparency (PrimaryAttenuation), but the later cloud and aerial in-scatter additions ignored that throughput. Added radiance now carries PrimaryAttenuation, including local aerial light contributions; the final stochastic alpha coverage multiplication remains separate.
+
+The separate stochastic alpha layer also lacked aerial perspective entirely. It now samples aerial perspective at its own hit distance, using its existing near-volume attenuation and premultiplied coverage for in-scatter. No material alpha mode, texture opacity, temporal smoothing, or depth routing changed.
+
+Validation: composite shader compiled and passed SPIR-V Vulkan 1.3 scalar-block-layout validation; diff whitespace check passed. Release relink and embedded-shader verification precede deployment. Runtime confirmation remains pending. This fixes a demonstrated additive-light weighting mismatch; it does not establish that every transparent-material path or foreground emissive contribution is correctly ordered. Inspect the pictured foliage against both sky/clouds and distant terrain, plus distant foliage that should still receive haze.
