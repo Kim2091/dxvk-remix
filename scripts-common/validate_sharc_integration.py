@@ -166,11 +166,85 @@ def check_trace(name: str, text: str, stage: str) -> None:
         raise RuntimeError(f"{name}: reservoir policy differs from inline SHARC")
 
 
+def uniform_member_used(text: str, name: str) -> bool:
+    """True when a RaytraceArgs member is actually accessed after dead-code elimination."""
+    member = re.search(r'OpMemberName\s+(%\S+)\s+(\d+)\s+"' + re.escape(name) + '"', text)
+    if not member:
+        return False
+    pointers = re.findall(r'(%\S+)\s+=\s+OpTypePointer\s+Uniform\s+' + re.escape(member[1]) + r'\b', text)
+    variables = set()
+    for pointer in pointers:
+        variables.update(re.findall(r'(%\S+)\s+=\s+OpVariable\s+' + re.escape(pointer) + r'\s+Uniform\b', text))
+    indices = set(re.findall(r'(%\S+)\s+=\s+OpConstant\s+%\S+\s+' + member[2] + r'\b', text))
+    return any(base in variables and index in indices for base, index in re.findall(
+        r'OpAccessChain\s+%\S+\s+(%\S+)\s+(%\S+)', text))
+
+
+def declared_sharc_variants(root: Path) -> set:
+    declared = set()
+    for source in ("integrate_indirect.slang", "integrate_indirect_closesthit.rchit.slang", "integrate_indirect_miss.rmiss.slang"):
+        text = (root / "src/dxvk/shaders/rtx/pass/integrate" / source).read_text(encoding="utf-8")
+        declared.update(re.findall(r"^//!variant\s+(integrate_indirect_sharc_\S+)\.\w+\s*$", text, re.MULTILINE))
+    return declared
+
+
+def check_reservoir_guard(root: Path, shader_dir: Path, dis: Path, baseline_dir, baseline_dll) -> None:
+    """Pin the SHARC stealing guard: SHARC stages must not enter the RTXDI stealing branch.
+
+    Without RAB_HAS_RTXDI_RESERVOIRS a steal always fails and skips the NEE cache / RIS fallback,
+    so SHARC stages (which never bind the reservoir) must compile the branch out entirely.
+    """
+    source = (root / "src/dxvk/shaders/rtx/algorithm/integrator_indirect.slangh").read_text(encoding="utf-8")
+    if not re.search(r"#if (?:defined\(SHARC_LEAN_SECONDARY\) \|\| \()?ENABLE_SHARC && !defined\(RAB_HAS_RTXDI_RESERVOIRS\)\)?\s*\n\s*if \(false\)", source):
+        raise RuntimeError("integrator_indirect.slangh: SHARC reservoir guard around the stealing branch is missing")
+    context = (root / "src/dxvk/rtx_render/rtx_context.cpp").read_text(encoding="utf-8")
+    for needle in ("enableIndirectAlphaBlendShadows() && accelManager.hasAlphaBlendInstances()",
+                   "enableUnorderedResolveInIndirectRays() && accelManager.getUnorderedInstanceCount() > 0"):
+        if needle not in context:
+            raise RuntimeError(f"rtx_context.cpp: scene gate missing: {needle}")
+    declared = sorted(declared_sharc_variants(root))
+    if not declared:
+        raise RuntimeError("no SHARC variants declared")
+    for stem in declared:
+        path = shader_dir / (stem + ".spv")
+        if not path.is_file():
+            raise RuntimeError(f"declared SHARC variant not compiled: {stem}")
+        text = disassemble(path, dis)
+        if set(binding_variables(text)) & {10, 51}:
+            raise RuntimeError(f"{stem}: SHARC stage binds the RTXDI reservoir or previous lights")
+        if uniform_member_used(text, "enableRtxdiSampleStealing"):
+            raise RuntimeError(f"{stem}: SHARC stage still enters the RTXDI stealing branch")
+        if baseline_dir is not None:
+            reference = baseline_dir / (stem + ".spv")
+            if not reference.is_file():
+                raise RuntimeError(f"{stem}: missing from baseline directory")
+            if reference.read_bytes() != path.read_bytes():
+                raise RuntimeError(f"{stem}: differs from baseline")
+    print(f"PASS reservoir guard: {len(declared)} declared SHARC stages omit bindings 10/51 and the stealing flag"
+          + (", byte-identical to baseline" if baseline_dir is not None else ""))
+    legacy = disassemble(shader_dir / "integrate_indirect_neeCache_material_opaque_translucent_closestHit.spv", dis)
+    if 51 not in set(binding_variables(legacy)) or not uniform_member_used(legacy, "enableRtxdiSampleStealing"):
+        raise RuntimeError("legacy TraceRay closest hit lost RTXDI sample stealing")
+    print("PASS legacy TraceRay closest hit retains the reservoir binding and sample stealing")
+    if baseline_dll is not None:
+        old = baseline_dll.read_bytes()
+        for stem in ("integrate_indirect_rayquery_neeCache", "integrate_indirect_rayquery_neeCache_wboit",
+                     "integrate_indirect_neeCache_material_opaque_translucent_closestHit",
+                     "integrate_indirect_neeCache_material_rayportal_closestHit"):
+            if (shader_dir / (stem + ".spv")).read_bytes() not in old:
+                raise RuntimeError(f"{stem}: legacy shader differs from the baseline DLL")
+        print("PASS legacy stages byte-identical to the baseline DLL")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--shader-dir", required=True, type=Path)
     ap.add_argument("--spirv-dis", required=True, type=Path)
     ap.add_argument("--spirv-val", required=True, type=Path)
+    ap.add_argument("--root", type=Path, default=Path(__file__).resolve().parent.parent,
+                    help="repository root for source-level checks")
+    ap.add_argument("--baseline-dir", type=Path, help="directory of SHARC blobs that must be byte-identical")
+    ap.add_argument("--baseline-dll", type=Path, help="older DLL that must still embed the legacy stages")
     args = ap.parse_args()
     files = {
         "update": args.shader_dir / "integrate_indirect_sharc_update.spv",
@@ -224,6 +298,7 @@ def main() -> int:
                     if extra:
                         raise RuntimeError(f"{name}: descriptors exceed inline SHARC layout: {sorted(extra)}")
                     print(f"PASS {name}: stage, payload ABI, descriptors, tracing and resolver")
+    check_reservoir_guard(args.root, args.shader_dir, args.spirv_dis, args.baseline_dir, args.baseline_dll)
     return 0
 
 

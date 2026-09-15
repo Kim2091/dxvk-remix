@@ -1846,14 +1846,20 @@ namespace dxvk {
     for (const auto& instance : m_mergedInstances[Tlas::Unordered]) {
       m_unorderedInstanceCount += instance.mask != 0 ? 1u : 0u;
     }
+    m_alphaBlendInstanceCountPrevious = m_alphaBlendInstanceCount;
+    m_translucentInstanceCountPrevious = m_translucentInstanceCount;
     m_alphaBlendInstanceCount = 0;
+    m_translucentInstanceCount = 0;
     for (const auto& instance : m_mergedInstances[Tlas::Opaque]) {
       m_alphaBlendInstanceCount += (instance.mask & OBJECT_MASK_ALPHA_BLEND) != 0 ? 1u : 0u;
+      m_translucentInstanceCount += (instance.mask & OBJECT_MASK_TRANSLUCENT) != 0 ? 1u : 0u;
     }
     for (const auto& batch : m_pointInstancerBatches) {
-      if (batch.tlasType == Tlas::Opaque && (batch.instanceMask & OBJECT_MASK_ALPHA_BLEND) != 0) {
-        m_alphaBlendInstanceCount += batch.instanceCount;
+      if (batch.tlasType != Tlas::Opaque) {
+        continue;
       }
+      m_alphaBlendInstanceCount += (batch.instanceMask & OBJECT_MASK_ALPHA_BLEND) != 0 ? batch.instanceCount : 0u;
+      m_translucentInstanceCount += (batch.instanceMask & OBJECT_MASK_TRANSLUCENT) != 0 ? batch.instanceCount : 0u;
     }
 
     if (m_vkInstanceBuffer == nullptr) {

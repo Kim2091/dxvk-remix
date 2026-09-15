@@ -167,9 +167,12 @@ public:
 
   // Instance statistics for the TLAS set built this frame (valid after buildTlas). Entries with
   // mask 0 never intersect and are not counted; point-instancer batches count their input size.
+  // The has* queries also cover the previous frame so previous-TLAS visibility rays are safe.
   uint32_t getUnorderedInstanceCount() const { return m_unorderedInstanceCount; }
   uint32_t getAlphaBlendInstanceCount() const { return m_alphaBlendInstanceCount; }
-  bool hasAlphaBlendInstances() const { return m_alphaBlendInstanceCount > 0; }
+  uint32_t getTranslucentInstanceCount() const { return m_translucentInstanceCount; }
+  bool hasAlphaBlendInstances() const { return m_alphaBlendInstanceCount > 0 || m_alphaBlendInstanceCountPrevious > 0; }
+  bool hasTranslucentInstances() const { return m_translucentInstanceCount > 0 || m_translucentInstanceCountPrevious > 0; }
   const std::vector<RtInstance*>& getOrderedInstances() const { return m_reorderedSurfaces; }
 
   // Returns true if the last mergeInstancesIntoBlas call took the fast-skip
@@ -244,6 +247,9 @@ private:
   // Per-frame instance statistics, see getUnorderedInstanceCount / getAlphaBlendInstanceCount.
   uint32_t m_unorderedInstanceCount = 0;
   uint32_t m_alphaBlendInstanceCount = 0;
+  uint32_t m_alphaBlendInstanceCountPrevious = 0;
+  uint32_t m_translucentInstanceCount = 0;
+  uint32_t m_translucentInstanceCountPrevious = 0;
 
   // --- Incremental BLAS build caching ---
   // Scene generation from InstanceManager when the BLAS was last built.

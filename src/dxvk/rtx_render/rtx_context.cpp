@@ -1221,10 +1221,16 @@ namespace dxvk {
     constants.enableDirectLighting = RtxOptions::enableDirectLighting();
     constants.enableStochasticAlphaBlend = m_common->metaComposite().enableStochasticAlphaBlend();
     constants.enableSeparateUnorderedApproximations = RtxOptions::enableSeparateUnorderedApproximations() && getResourceManager().getTLAS(Tlas::Unordered).accelStructure != nullptr;
-    constants.enableDirectTranslucentShadows = RtxOptions::enableDirectTranslucentShadows();
-    constants.enableDirectAlphaBlendShadows = RtxOptions::enableDirectAlphaBlendShadows();
-    constants.enableIndirectTranslucentShadows = RtxOptions::enableIndirectTranslucentShadows();
-    constants.enableIndirectAlphaBlendShadows = RtxOptions::enableIndirectAlphaBlendShadows();
+    // Scene gate: a shadow-ray mask bit only matters when an opaque-TLAS instance carries it (this
+    // frame or, for previous-TLAS visibility rays, last frame), and the indirect unordered resolve only
+    // when the unordered TLAS has instances. Skipping them is output-identical. Shared producers (TLAS
+    // builds, reservoirs, light history, NEE cache) are untouched, and enableSeparateUnorderedApproximations
+    // keeps driving the primary path as before.
+    const AccelManager& accelManager = getSceneManager().getAccelManager();
+    constants.enableDirectTranslucentShadows = RtxOptions::enableDirectTranslucentShadows() && accelManager.hasTranslucentInstances();
+    constants.enableDirectAlphaBlendShadows = RtxOptions::enableDirectAlphaBlendShadows() && accelManager.hasAlphaBlendInstances();
+    constants.enableIndirectTranslucentShadows = RtxOptions::enableIndirectTranslucentShadows() && accelManager.hasTranslucentInstances();
+    constants.enableIndirectAlphaBlendShadows = RtxOptions::enableIndirectAlphaBlendShadows() && accelManager.hasAlphaBlendInstances();
     constants.enableRussianRoulette = RtxOptions::enableRussianRoulette();
     constants.enableDemodulateRoughness = m_common->metaDemodulate().demodulateRoughness();
     constants.enableReplaceDirectSpecularHitTWithIndirectSpecularHitT = RtxOptions::replaceDirectSpecularHitTWithIndirectSpecularHitT();
@@ -1237,7 +1243,7 @@ namespace dxvk {
     constants.enhanceBSDFIndirectLightMaxValue = m_common->metaComposite().dlssEnhancementIndirectLightMaxValue();
     constants.enhanceBSDFIndirectLightMinRoughness = m_common->metaComposite().dlssEnhancementIndirectLightMinRoughness();
     constants.enableFirstBounceLobeProbabilityDithering = RtxOptions::enableFirstBounceLobeProbabilityDithering();
-    constants.enableUnorderedResolveInIndirectRays = RtxOptions::enableUnorderedResolveInIndirectRays();
+    constants.enableUnorderedResolveInIndirectRays = RtxOptions::enableUnorderedResolveInIndirectRays() && accelManager.getUnorderedInstanceCount() > 0;
     constants.enableProbabilisticUnorderedResolveInIndirectRays = RtxOptions::enableProbabilisticUnorderedResolveInIndirectRays();
     constants.enableTransmissionApproximationInIndirectRays = RtxOptions::enableTransmissionApproximationInIndirectRays();
     constants.enableUnorderedEmissiveParticlesInIndirectRays = RtxOptions::enableUnorderedEmissiveParticlesInIndirectRays();
