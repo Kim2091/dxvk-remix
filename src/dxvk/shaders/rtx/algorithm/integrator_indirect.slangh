@@ -34,6 +34,7 @@
 #include "rtx/algorithm/integrator.slangh"
 #include "rtx/concept/surface_material/opaque_surface_material_interaction.slangh"
 #include "rtx/pass/nrc/nrc_integrator_utilities.slangh"
+#include "rtx/pass/sharc/sharc_integrator_hooks.slangh"
 #include "rtx/pass/sparse_rendering/sparse_rendering.slangh"
 #include "rtx/pass/atmosphere/atmosphere_common.slangh"
 #ifdef ATMOSPHERE_AVAILABLE
@@ -564,56 +565,11 @@ void integratePathVertex(
     accumulateRadiance(pathState, emissiveLightRadiance);
   }
 
-#if ENABLE_SHARC
   // Keep emission above this point live: the cache contains reflected lighting.
-  const OpaqueSurfaceMaterialInteraction sharcMaterial = opaqueSurfaceMaterialInteractionCreate(polymorphicSurfaceMaterialInteraction);
-  const bool sharcSurfaceEligible = materialType == surfaceMaterialTypeOpaque
-    && pathState.mediumMaterialIndex == SURFACE_INDEX_INVALID
-    && !pathState.insideMedium && sharcMaterial.opacity >= 1.0f
-    && !isSubsurfaceDiffusionProfileMaterial(sharcMaterial)
-    && !any(emissiveLight > 0.0f);
-  // The optional broader policy still checks the receiving material, not the preceding lobe.
-  const bool sharcLobeEligible = pathState.skyGatherEligible || cb.sharcArgs.allowSpecularPaths != 0;
-  const bool sharcEligible = sharcSurfaceEligible && sharcLobeEligible
-    && sharcMaterial.isotropicRoughness >= cb.sharcArgs.minRoughness;
-#if SHARC_QUERY_STATS
-  sharcCount(pathState.pixelCoordinate, 2); // Resolved surface hits.
-  sharcCount(pathState.pixelCoordinate, !sharcSurfaceEligible ? 9u
-    : !sharcLobeEligible ? 8u : !sharcEligible ? 3u : 4u);
-#endif
-  if (sharcEligible)
+  if (sharcOnResolvedVertex(pathState, surfaceInteraction, polymorphicSurfaceMaterialInteraction, materialType, emissiveLight))
   {
-    SharcParameters sharcParameters = makeSharcParameters();
-    SharcHitData sharcHit = (SharcHitData)0;
-    sharcHit.positionWorld = surfaceInteraction.position;
-    sharcHit.normalWorld = surfaceInteraction.geometryNormal;
-#if SHARC_UPDATE && SHARC_DEFERRED_UPDATE
-    sharcInsertVertex(pathState.sharcState, sharcHit);
-#elif SHARC_UPDATE
-    // NEE below adds to this new vertex and older vertices through the same hook.
-    // With resampling/responsive lighting disabled, insertion failure leaves
-    // the existing vertices intact; continue their lighting estimate on overflow.
-    SharcUpdateHit(sharcParameters, pathState.sharcState, sharcHit, vec3(0.0f), 0.0f);
-#elif SHARC_QUERY
-    float voxelSize;
-    const HashGridKey key = HashGridComputeSpatialHashWithVoxelSize(sharcHit.positionWorld, sharcHit.normalWorld, sharcParameters.hashGridParameters, voxelSize);
-    vec3 cachedRadiance = vec3(0.0f);
-    const bool farEnough = pathState.segmentHitDistance > 1.732051f * voxelSize;
-    const bool cacheHit = farEnough
-      && SharcGetCachedRadianceFromHash(sharcParameters, sharcHit, key, cachedRadiance, false)
-      && isValidValue(cachedRadiance);
-#if SHARC_QUERY_STATS
-    sharcCount(pathState.pixelCoordinate, !farEnough ? 5u : cacheHit ? 7u : 6u);
-#endif
-    if (cacheHit)
-    {
-      accumulateRadiance(pathState, cachedRadiance);
-      pathState.continuePath = false;
-      return;
-    }
-#endif
+    return;
   }
-#endif
 
   // When boostEmissives is enabled, defer TerminateImmediately until after emissive accumulation
   // so that the hit surface's emissive self-emission is properly MIS-weighted.

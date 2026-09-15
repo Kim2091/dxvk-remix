@@ -33,10 +33,6 @@
 #include "rtx/pass/common_binding_indices.h"
 #include "rtx/pass/integrate/integrate_indirect_binding_indices.h"
 #include "rtx/pass/integrate/integrate_nee_binding_indices.h"
-#include <rtx_shaders/integrate_indirect_sharc_query_fused.h>
-#include <rtx_shaders/integrate_indirect_sharc_query_fused_wboit.h>
-#include <rtx_shaders/integrate_indirect_sharc_query_fused_ser.h>
-#include <rtx_shaders/integrate_indirect_sharc_query_fused_ser_wboit.h>
 
 #include "rtx/concept/surface_material/surface_material_hitgroup.h"
 

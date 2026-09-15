@@ -1,0 +1,75 @@
+// Copyright (c) 2026, NVIDIA CORPORATION. SPDX-License-Identifier: MIT
+#pragma once
+
+// SHARC's contract with the indirect integrator, named so that the integrator body
+// carries call sites instead of preprocessor blocks.  A different radiance cache can
+// implement the same two hooks plus its own //!variant rows; nothing here pretends the
+// variant matrix is abstracted away.
+//
+// Keeping the bodies in this fork-owned file means integrator_indirect.slangh -- a file
+// upstream edits regularly -- holds only the calls, which is the whole point: less text
+// to re-conflict on every upstream re-plant.
+
+// Called once per resolved opaque vertex, after emissive radiance has been accumulated
+// (the cache stores reflected lighting, so emission must already be live).
+//
+// Returns true when the cache supplied radiance for this vertex and the caller should
+// stop walking the path.
+bool sharcOnResolvedVertex(
+  inout PathState pathState,
+  SurfaceInteraction surfaceInteraction,
+  PolymorphicSurfaceMaterialInteraction polymorphicSurfaceMaterialInteraction,
+  uint materialType,
+  vec3 emissiveLight)
+{
+#if ENABLE_SHARC
+  const OpaqueSurfaceMaterialInteraction sharcMaterial = opaqueSurfaceMaterialInteractionCreate(polymorphicSurfaceMaterialInteraction);
+  const bool sharcSurfaceEligible = materialType == surfaceMaterialTypeOpaque
+    && pathState.mediumMaterialIndex == SURFACE_INDEX_INVALID
+    && !pathState.insideMedium && sharcMaterial.opacity >= 1.0f
+    && !isSubsurfaceDiffusionProfileMaterial(sharcMaterial)
+    && !any(emissiveLight > 0.0f);
+  // The optional broader policy still checks the receiving material, not the preceding lobe.
+  const bool sharcLobeEligible = pathState.skyGatherEligible || cb.sharcArgs.allowSpecularPaths != 0;
+  const bool sharcEligible = sharcSurfaceEligible && sharcLobeEligible
+    && sharcMaterial.isotropicRoughness >= cb.sharcArgs.minRoughness;
+#if SHARC_QUERY_STATS
+  sharcCount(pathState.pixelCoordinate, 2); // Resolved surface hits.
+  sharcCount(pathState.pixelCoordinate, !sharcSurfaceEligible ? 9u
+    : !sharcLobeEligible ? 8u : !sharcEligible ? 3u : 4u);
+#endif
+  if (sharcEligible)
+  {
+    SharcParameters sharcParameters = makeSharcParameters();
+    SharcHitData sharcHit = (SharcHitData)0;
+    sharcHit.positionWorld = surfaceInteraction.position;
+    sharcHit.normalWorld = surfaceInteraction.geometryNormal;
+#if SHARC_UPDATE && SHARC_DEFERRED_UPDATE
+    sharcInsertVertex(pathState.sharcState, sharcHit);
+#elif SHARC_UPDATE
+    // NEE below adds to this new vertex and older vertices through the same hook.
+    // With resampling/responsive lighting disabled, insertion failure leaves
+    // the existing vertices intact; continue their lighting estimate on overflow.
+    SharcUpdateHit(sharcParameters, pathState.sharcState, sharcHit, vec3(0.0f), 0.0f);
+#elif SHARC_QUERY
+    float voxelSize;
+    const HashGridKey key = HashGridComputeSpatialHashWithVoxelSize(sharcHit.positionWorld, sharcHit.normalWorld, sharcParameters.hashGridParameters, voxelSize);
+    vec3 cachedRadiance = vec3(0.0f);
+    const bool farEnough = pathState.segmentHitDistance > 1.732051f * voxelSize;
+    const bool cacheHit = farEnough
+      && SharcGetCachedRadianceFromHash(sharcParameters, sharcHit, key, cachedRadiance, false)
+      && isValidValue(cachedRadiance);
+#if SHARC_QUERY_STATS
+    sharcCount(pathState.pixelCoordinate, !farEnough ? 5u : cacheHit ? 7u : 6u);
+#endif
+    if (cacheHit)
+    {
+      accumulateRadiance(pathState, cachedRadiance);
+      pathState.continuePath = false;
+      return true;
+    }
+#endif
+  }
+#endif
+  return false;
+}
