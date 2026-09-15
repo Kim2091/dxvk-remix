@@ -247,9 +247,12 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
   // page-142 ambient term (sampleSkyAmbientForVolume) is unaffected by this removal — that helper
   // has its own below-horizon clamp and is untouched this stage.
 
-  float jitter = fastJitter(pixelCoord, args.cloudRenderFrameIdx).x;
-  // Static per-pixel hash for far-field jitter (animated < 250 m, static beyond — no distant shimmer).
   float jitterStatic = fastJitter(pixelCoord, 0u).x;
+  // Reduced-resolution texels magnify animated march noise without cloud history accumulation.
+  // Keep camera projection jitter above: it must still match the primary geometry rays.
+  const bool reducedResolution = outputDim.x < args.cloudRenderFullDimX
+                              || outputDim.y < args.cloudRenderFullDimY;
+  float jitter = reducedResolution ? jitterStatic : fastJitter(pixelCoord, args.cloudRenderFrameIdx).x;
 
   // ===== Static-per-frame shading context (cloud_march_common.slangh) =====
   // Sun/sky radiances, the full per-moon precompute, combined-moon shadow
