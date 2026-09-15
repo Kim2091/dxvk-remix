@@ -1331,6 +1331,11 @@ public:
                "reflected/indirect clouds match the primary Nubis look. Disable "
                "to make secondary sky-miss rays cloudless.");
 
+    RTX_OPTION("rtx.atmosphere", bool, cloudReflectionDensityCache, false,
+               "Experimental world-space density cache for cloud reflection traversal. "
+               "Keeps the reference lookup resolution and sampling budget; compare total "
+               "cache-build plus reflection traversal cost before enabling permanently.");
+
     // Quantizing wind/camera motion into the voxel-grid cache key bounds staleness to this step size.
     RTX_OPTION("rtx.atmosphere", float, cloudVoxelGridRebakeGranularityKm, 0.1f,
                "Distance (km) the cloud wind scroll or camera must travel "
@@ -1553,6 +1558,7 @@ private:
   // can no longer run from inside computeLuts.
   void dispatchCloudRender(Rc<DxvkContext> ctx, const Resources::RaytracingOutput& rtOutput);
   void dispatchCloudSecondaryLut(Rc<DxvkContext> ctx);
+  void dispatchCloudReflectionDensity(Rc<DxvkContext> ctx);
 
   static constexpr uint32_t kTransmittanceLutWidth = 512;
   static constexpr uint32_t kTransmittanceLutHeight = 128;
@@ -1640,6 +1646,7 @@ private:
   VkExtent2D          m_cloudRenderExtent = { 0u, 0u };
   VkExtent2D          m_cloudRenderFullExtent = { 0u, 0u };
   RtxMipmap::Resource m_cloudSecondaryLut;
+  Resources::Resource m_cloudReflectionDensity;
   Resources::Resource m_cloudPlacementMap;
 
   uint32_t m_cloudRenderFrameIdx   { 0u };

@@ -1099,6 +1099,13 @@ void RtxAtmosphere::showCloudSettings(const WeatherSnapshot* weatherSnapshot) {
       "Reflections and indirect light sample a cloud lookup built from the same "
       "cloud model as the main sky. Unchecking removes clouds from secondary "
       "sky rays; it does not enable a higher-quality ray march.");
+    ImGui::BeginDisabled(!RtxAtmosphere::cloudSecondaryLutEnable());
+    RemixGui::Checkbox("World-space Reflection Cache (Experimental)", &RtxAtmosphere::cloudReflectionDensityCacheObject());
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Compare world-space cached cloud density with procedural reflection traversal. "
+      "Keeps resolution, samples, and lighting; dense cloud detail is spatially filtered. "
+      "Logs cache-building and traversal costs separately. This is a prototype, not a proven speedup.");
+    ImGui::EndDisabled();
     RemixGui::DragFloat("Cloud Render Scale", &RtxAtmosphere::cloudRenderResolutionScaleObject(),
       0.05f, 0.25f, 1.0f, "%.2f", sliderFlags);
     RemixGui::SetTooltipToLastWidgetOnHover(
