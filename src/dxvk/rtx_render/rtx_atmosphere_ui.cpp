@@ -1096,11 +1096,9 @@ void RtxAtmosphere::showCloudSettings(const WeatherSnapshot* weatherSnapshot) {
   if (ImGui::TreeNode("Quality & performance")) {
     RemixGui::Checkbox("Fast Cloud Reflections", &RtxAtmosphere::cloudSecondaryLutEnableObject());
     RemixGui::SetTooltipToLastWidgetOnHover(
-      "Reflections and indirect light sample a small per-frame cloud "
-      "lookup table instead of re-marching the cloud volume per ray. "
-      "Large performance win on cloudy skies; reflected clouds also "
-      "match the main sky exactly. Uncheck to restore the legacy "
-      "per-ray cloud march for comparison.");
+      "Reflections and indirect light sample a cloud lookup built from the same "
+      "cloud model as the main sky. Unchecking removes clouds from secondary "
+      "sky rays; it does not enable a higher-quality ray march.");
     RemixGui::DragFloat("Cloud Render Scale", &RtxAtmosphere::cloudRenderResolutionScaleObject(),
       0.05f, 0.25f, 1.0f, "%.2f", sliderFlags);
     RemixGui::SetTooltipToLastWidgetOnHover(
