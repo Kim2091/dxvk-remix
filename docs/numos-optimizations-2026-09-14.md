@@ -98,3 +98,13 @@ Validation: release Meson build and explicit successful incremental recheck; com
 Deployed DLL and matching PDB while game/bridge were absent; backed up and verified hashes. DLL SHA256 949E0BC226719E08E1215A45F95C5B83BF55017381F3F7C2C44CA6A96754E15F. Backup suffix .backup-pre-numos-current-frame-20260914-202336.
 
 User test: launch FNV, Cloud Profiling Normal; same outdoor view with foreground geometry, set render scale 1.0 -> 0.5 -> 0.25 -> 1.0, wait about five seconds each. Pan/walk at final 1.0 to inspect smudging, then at 0.5 inspect foreground silhouettes. Report visual issues; say done and leave game running. Read live log for actual extents; no shutdown required after testing. Smoothing controls should be absent. Look for restored native detail on returning to 1.0 and any newly exposed jitter without temporal accumulation.
+
+## Reduced-scale silhouette follow-up
+
+User confirmed the current-frame package was a major fix, with stair stepping remaining on geometry/cloud boundaries. Runtime resize logs confirm 1280x800 -> 320x200 -> 1280x800 recovery; capture ended at scale 0.25. Whether native scale also exhibits the issue is not yet confirmed.
+
+Checkpoint f8544fa82 records the previously validated work. User now requests local commits for changes, never push.
+
+The reduced-scale composite previously reconstructed color with depth-compatible taps but read entry/mean depth from an unrelated nearest texel. That can give sky cloud color foreground/no-cloud depth, changing aerial in-scatter and alpha-surface visibility at the coarse texel boundary. Reconstruction now keeps color and cloud depth together: entry is the minimum contributing cloud entry, mean depth is opacity-weighted over the same taps. If the four bilinear taps contain no matching surface, search their outer 4x4 ring; explicitly separate sky from geometry. A foreground surface before the fallback cloud entry gets no cloud. Native scale retains exact texel loads.
+
+This is a targeted reconstruction fix, not proof of the screenshot's complete cause. A reduced-resolution texture cannot reconstruct arbitrary thin surfaces absent from every tap; unmatched fallback and surfaces inside a cloud remain approximate. No temporal filtering added. Validation: composite SPIR-V passes Vulkan 1.3 scalar-block-layout validation; release shader build succeeded; relink required to embed fresh generated header. Runtime test should compare the same ridge at 1.0, 0.5, and 0.25 while stationary and moving, and check for halos or missing clouds.

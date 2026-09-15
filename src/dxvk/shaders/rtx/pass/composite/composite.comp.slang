@@ -757,98 +757,87 @@ void applyAerialPerspective(
 // f16-representable (the history companion packs it) and beyond any reachable slant range.
 static const float kCloudSkyDepthKm = 60000.0f;
 
-vec4 sampleCloudRenderRT(uint2 pixelCoordinate, AtmosphereArgs args, float surfaceKm)
+struct CloudReconstruction {
+  vec4 value;
+  vec2 depthKm;
+};
+
+CloudReconstruction sampleCloudRenderRT(uint2 pixelCoordinate, AtmosphereArgs args, float surfaceKm)
 {
   uint2 rtDim;
   CompositeCloudRender.GetDimensions(rtDim.x, rtDim.y);
+  CloudReconstruction result;
+  if (all(rtDim == uint2(args.cloudRenderFullDimX, args.cloudRenderFullDimY))) {
+    result.value = CompositeCloudRender.Load(int3(pixelCoordinate, 0));
+    result.depthKm = CompositeCloudDepth.Load(int3(pixelCoordinate, 0)).xy;
+    return result;
+  }
 
-  // Gate on a RESOLUTION MISMATCH, not on the dims being non-zero (fork -- 2026-09-08, silhouette
-  // outline fix; the audit branch found the same defect independently, 4aaeb6ec6).
-  // ensureCloudRenderRT assigns m_cloudRenderFullExtent unconditionally, so cloudRenderFullDimX is
-  // never 0 once the RT exists and this path ran at native resolution too -- where it replaced an
-  // exact 1:1 Load with a four-tap depth-validated fallback that, for sky, could not pass its own
-  // depth test (see the tap read below). At matched resolution the Load is both the correct
-  // answer and the cheapest one: ~20 texture loads per pixel instead of ~90 across the 3x3
-  // neighbourhood statistics. The non-zero test stays as the divide guard it always was.
-  if (args.cloudRenderFullDimX != 0u && args.cloudRenderFullDimY != 0u
-      && (rtDim.x != args.cloudRenderFullDimX || rtDim.y != args.cloudRenderFullDimY))
-  {
-    const vec2 uv = (vec2(pixelCoordinate) + 0.5f)
-                  / vec2(float(args.cloudRenderFullDimX), float(args.cloudRenderFullDimY));
-    const vec2 texelF = uv * vec2(rtDim) - 0.5f;
-    const vec2 base   = floor(texelF);
-    const vec2 f      = texelF - base;
-    const int2 baseTexel = int2(base);
-    const int2 maxTexel  = int2(rtDim) - int2(1);
+  const vec2 uv = (vec2(pixelCoordinate) + 0.5f)
+                / max(vec2(args.cloudRenderFullDimX, args.cloudRenderFullDimY), vec2(1.0f));
+  const vec2 texelF = uv * vec2(rtDim) - 0.5f;
+  const int2 baseTexel = int2(floor(texelF));
+  const int2 maxTexel = int2(rtDim) - int2(1);
+  vec4 sum = vec4(0.0f);
+  float weightSum = 0.0f;
+  float cloudWeightSum = 0.0f;
+  float meanSum = 0.0f;
+  float entryKm = kCloudSkyDepthKm;
+  vec4 nearestValue = vec4(0.0f, 0.0f, 0.0f, 1.0f);
+  vec2 nearestDepth = vec2(-1.0f, 0.0f);
+  float nearestDelta = 1e30f;
 
-    const float weights[4] = {
-      (1.0f - f.x) * (1.0f - f.y), f.x * (1.0f - f.y),
-      (1.0f - f.x) * f.y,          f.x * f.y };
-    const int2 offsets[4] = { int2(0, 0), int2(1, 0), int2(0, 1), int2(1, 1) };
-
-    vec4 sum = vec4(0.0f);
-    float weightSum = 0.0f;
-    vec4 nearestValue = vec4(0.0f, 0.0f, 0.0f, 1.0f);
-    float nearestDelta = 1e30f;
-
-    [unroll]
-    for (uint i = 0u; i < 4u; ++i)
-    {
-      const int2 texel = clamp(baseTexel + offsets[i], int2(0, 0), maxTexel);
-      const vec4 value = CompositeCloudRender.Load(int3(texel, 0));
-      // Clamped to the shared sky depth (fork -- 2026-09-08, silhouette outline fix). The cloud
-      // pass writes sky as kNoSurfaceKm = 1e9; this pass calls sky kCloudSkyDepthKm = 60000.
-      // Compared raw, EVERY sky tap failed the relative test (|1e9 - 6e4| > 0.1 * 1e9), so every
-      // sky pixel fell through to the nearest-depth fallback -- and next to a ridge the tap nearest
-      // in depth to 60000 is the GEOMETRY texel (|3 - 60000| < |1e9 - 60000|), whose march was
-      // clamped at that ridge and holds no cloud. Those sky pixels took opacity 0 and drew raw
-      // cloudless sky. With an overcast deck darker than the sky behind it, that is a bright
-      // one-texel outline on the sky side of every silhouette (the +x / +y / +xy taps of the
-      // bilinear footprint), tracing ridgelines exactly. At native resolution the gate above now
-      // keeps this path from running at all; the clamp is what makes it right below native.
-      const float tapSurfaceKm = min(CompositeCloudDepth.Load(int3(texel, 0)).z, kCloudSkyDepthKm);
-
-      const float delta = abs(tapSurfaceKm - surfaceKm);
-      if (delta < nearestDelta)
-      {
-        nearestDelta = delta;
-        nearestValue = value;
-      }
-
-      if (delta <= cb.cloudHistoryDepthTolerance * max(max(tapSurfaceKm, surfaceKm), 1e-3f))
-      {
-        sum       += value * weights[i];
-        weightSum += weights[i];
+  // Only widen the footprint when the bilinear taps contain no matching surface.
+  for (int ring = 0; ring < 2; ++ring) {
+    for (int y = -ring; y <= 1 + ring; ++y) {
+      for (int x = -ring; x <= 1 + ring; ++x) {
+        if (ring != 0 && x >= 0 && x <= 1 && y >= 0 && y <= 1) {
+          continue;
+        }
+        const int2 texel = clamp(baseTexel + int2(x, y), int2(0), maxTexel);
+        const vec4 depth = CompositeCloudDepth.Load(int3(texel, 0));
+        const float tapSurfaceKm = min(depth.z, kCloudSkyDepthKm);
+        const float delta = abs(tapSurfaceKm - surfaceKm);
+        const vec4 value = CompositeCloudRender.Load(int3(texel, 0));
+        if (delta < nearestDelta) {
+          nearestDelta = delta;
+          nearestValue = value;
+          nearestDepth = depth.xy;
+        }
+        const bool sameSurfaceClass = (tapSurfaceKm == kCloudSkyDepthKm) == (surfaceKm == kCloudSkyDepthKm);
+        if (!sameSurfaceClass || delta > cb.cloudHistoryDepthTolerance * max(max(tapSurfaceKm, surfaceKm), 1e-3f)) {
+          continue;
+        }
+        const vec2 distance = abs(vec2(baseTexel + int2(x, y)) - texelF);
+        const vec2 tent = max(vec2(float(ring + 1)) - distance, vec2(0.0f));
+        const float weight = tent.x * tent.y;
+        sum += value * weight;
+        weightSum += weight;
+        // Depth must describe the same cloud taps as color, not a nearest foreground texel.
+        const float cloudWeight = weight * saturate(1.0f - value.a);
+        if (cloudWeight > 0.0f && depth.x >= 0.0f) {
+          cloudWeightSum += cloudWeight;
+          meanSum += depth.y * cloudWeight;
+          entryKm = min(entryKm, depth.x);
+        }
       }
     }
-
-    return (weightSum > 1e-3f) ? (sum / weightSum) : nearestValue;
+    if (weightSum > 1e-3f) {
+      result.value = sum / weightSum;
+      result.depthKm = cloudWeightSum > 1e-6f
+        ? vec2(entryKm, meanSum / cloudWeightSum) : vec2(-1.0f, 0.0f);
+      return result;
+    }
   }
-  return CompositeCloudRender.Load(int3(pixelCoordinate, 0));
-}
 
-// Point-sampled (never bilinear) read of the depth companion -- r = entry distance km, g =
-// transmittance-weighted mean cloud depth km, both from RtxAtmosphere::dispatchCloudScreenPass /
-// cloud_render.comp.slang. Mirrors sampleCloudRenderRT's dimension-ratio mapping so the same native
-// texel a bilinear color fetch blends AROUND is the one this reads exactly, but with Load instead of
-// SampleLevel: averaging two different surfaces' depths across a silhouette is meaningless (the same
-// reasoning cloud_render.comp.slang's own PrimaryLinearViewZ read and debug views 880/884 already
-// follow -- see their comments). (-1, 0) is the "no cloud entered" sentinel.
-// Returns (entryKm, meanKm, surfaceKm, unused). Nearest-texel by construction, which for the
-// geometry-locked .z is the CORRECT filter rather than a limitation: bilinear across a silhouette
-// would blend a mountain's surface distance with the sky's behind it.
-vec4 sampleCloudDepthKm(uint2 pixelCoordinate, AtmosphereArgs args)
-{
-  if (args.cloudRenderFullDimX != 0u && args.cloudRenderFullDimY != 0u)
-  {
-    vec2 uv = (vec2(pixelCoordinate) + 0.5f)
-            / vec2(float(args.cloudRenderFullDimX), float(args.cloudRenderFullDimY));
-    uint2 rtDim;
-    CompositeCloudDepth.GetDimensions(rtDim.x, rtDim.y);
-    ivec2 texel = clamp(ivec2(uv * vec2(rtDim)), ivec2(0), ivec2(rtDim) - ivec2(1));
-    return CompositeCloudDepth.Load(int3(texel, 0));
+  // A thin foreground object may have no representative in the cloud texture.
+  if (nearestDepth.x >= 0.0f && surfaceKm <= nearestDepth.x) {
+    nearestValue = vec4(0.0f, 0.0f, 0.0f, 1.0f);
+    nearestDepth = vec2(-1.0f, 0.0f);
   }
-  return CompositeCloudDepth.Load(int3(pixelCoordinate, 0));
+  result.value = nearestValue;
+  result.depthKm = nearestDepth;
+  return result;
 }
 
 // Depth-ratio visibility rule (fork — 2026-09-05). Answers "how much of the marched cloud actually
@@ -952,15 +941,6 @@ float cloudDepthVisibility(float entryKm, float meanKm, float surfaceKm, float c
 }
 
 // NV-DXVK start: Keep filtered cloud radiance and opacity from the same taps.
-vec4 loadCurrentCloudOpacity(uint2 pixelCoordinate, AtmosphereArgs args, float surfaceKm)
-{
-  const vec4 cloudRT = sampleCloudRenderRT(pixelCoordinate, args, surfaceKm);
-  // Empty marches already store zero radiance and unit transmittance. A separate nearest-depth
-  // gate can discard valid neighboring cloud samples selected by the depth-aware upsampler.
-  return vec4(cloudRT.rgb, 1.0f - cloudRT.a);
-}
-// NV-DXVK end
-
 // Composite current-frame cloud radiance over sky and surfaces.
 void applyCloudComposite(
   uint2 pixelCoordinate,
@@ -980,21 +960,12 @@ void applyCloudComposite(
     return;
   }
 
-  const vec4 cloudDepthKm = sampleCloudDepthKm(pixelCoordinate, args);
-  const float entryKm = cloudDepthKm.x;
-  const float meanKm  = cloudDepthKm.y;
   const float kmPerWorldUnit = 1.0f / max(args.worldUnitsPerKm, 1e-6f);
-
-  // The surface distance this pixel's cloud was integrated against. Needed before the cloud is even
-  // read, because at reduced cloud resolution the upsample has to know which of its four candidate
-  // texels describe THIS pixel's surface (fork -- 2026-09-07). Sky uses a fixed far depth rather
-  // than a sentinel so sky-vs-sky compares equal under the ordinary relative test while
-  // sky-vs-surface is rejected, with no special case anywhere. 60000 km is f16-representable and
-  // beyond any reachable slant range. kCloudSkyDepthKm itself moved to file scope above
-  // sampleCloudRenderRT (2026-09-08), which compares tap depths against it.
   const float currentSurfaceKm = primaryMiss ? kCloudSkyDepthKm : (viewDistance * kmPerWorldUnit);
-
-  vec4 cloud = loadCurrentCloudOpacity(pixelCoordinate, args, currentSurfaceKm);
+  const CloudReconstruction reconstructed = sampleCloudRenderRT(pixelCoordinate, args, currentSurfaceKm);
+  const float entryKm = reconstructed.depthKm.x;
+  const float meanKm = reconstructed.depthKm.y;
+  vec4 cloud = vec4(reconstructed.value.rgb, 1.0f - reconstructed.value.a);
   // PSR already carries clouds along the reflected ray.
   float opaqueVisibility = performedPSR ? 0.0f : 1.0f;
 
