@@ -332,6 +332,7 @@ namespace dxvk {
     ctx->bindResourceView(COMPOSITE_SHARED_FLAGS_INPUT, rtOutput.m_sharedFlags.view, nullptr);
     ctx->bindResourceView(COMPOSITE_SHARED_RADIANCE_RG_INPUT, rtOutput.m_sharedRadianceRG.view, nullptr);
     ctx->bindResourceView(COMPOSITE_SHARED_RADIANCE_B_INPUT, rtOutput.m_sharedRadianceB.view, nullptr);
+    ctx->bindResourceView(COMPOSITE_ATMOSPHERE_FOREGROUND_INPUT, rtOutput.m_atmosphereForeground.view, nullptr);
     
     ctx->bindResourceView(COMPOSITE_PRIMARY_ATTENUATION_INPUT, rtOutput.m_primaryAttenuation.view, nullptr);
     

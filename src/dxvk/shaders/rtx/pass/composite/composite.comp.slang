@@ -954,6 +954,8 @@ void applyCloudComposite(
   inout vec3 alphaBlendOutput,
   bool alphaBlendSurfaceValid,
   float alphaBlendHitDistance,
+  inout vec3 foregroundRadiance,
+  float foregroundDepthKm,
   // Reflected rays already received their cloud contribution during path tracing.
   bool performedPSR)
 {
@@ -1050,6 +1052,12 @@ void applyCloudComposite(
   // In-scatter follows the same foreground throughput as the sky it replaces.
   radianceOutput = radianceOutput * (1.0f - cloud.a * opaqueVisibility)
                  + cloud.rgb * opaqueVisibility * radianceThroughput;
+
+  if (foregroundDepthKm > 0.0f && entryKm >= 0.0f && !performedPSR) {
+    const float visibility = cloudDepthVisibility(entryKm, meanKm, foregroundDepthKm, cloud.a);
+    foregroundRadiance = foregroundRadiance * (1.0f - cloud.a * visibility)
+      + cloud.rgb * visibility * saturate(vec3(1.0f) - radianceThroughput);
+  }
 
   // ---- Alpha-blended (foliage / particle) surfaces ----
   // Depth-ratio rule (fork — 2026-09-05): the same cloudDepthVisibility gate as the opaque path,
@@ -1266,8 +1274,19 @@ vec4 compositeResult(
   // while accumulating already), so it can be added in here without issue.
   radianceOutput += remodulatedTotalPrimaryRadiance * volumeAttenuation;
 
-  // Note: Shared radiance should always be pre-attenuated so no need to factor that in here - it contains multiple layers of signal so each contribution must be attenuated inline.
-  radianceOutput += sharedRadiance;
+  // Shared radiance also contains transparent foreground emission, which must not
+  // receive the background's atmospheric extinction.
+  const vec4 foreground = AtmosphereForeground[pixelCoordinate];
+  const bool separateForeground = foreground.w > 0.0f && !geometryFlags.performedAnyPSR();
+  vec3 foregroundRadiance = separateForeground ? min(max(foreground.rgb, vec3(0.0f)), max(sharedRadiance, vec3(0.0f))) : vec3(0.0f);
+  radianceOutput += sharedRadiance - foregroundRadiance;
+  if (separateForeground) {
+    const float foregroundDistance = foreground.w * cb.atmosphereArgs.worldUnitsPerKm;
+    const vec3 foregroundVolumeAttenuation = calcVolumetricAttenuation(cb.volumeArgs, none, false,
+      foregroundDistance, cameraGetWorldPosition(cb.camera), primaryRayDirections.worldDirection);
+    applyAerialPerspective(pixelCoordinate, false, foregroundDistance, foregroundVolumeAttenuation,
+      saturate(vec3(1.0f) - primaryAttenuation), foregroundRadiance);
+  }
 
   // Applied before the sky so it only affects geometry; the sky already carries its full column.
   // Background radiance already carries foreground transparency from the geometry resolver.
@@ -1294,7 +1313,9 @@ vec4 compositeResult(
   applyCloudComposite(
     pixelCoordinate, primaryMiss, viewDistance, backgroundAlpha, primaryAttenuation,
     radianceOutput, alphaBlendOutput, alphaBlendSurfaceValid, alphaBlendHitDistance,
+    foregroundRadiance, separateForeground ? foreground.w : 0.0f,
     geometryFlags.performedAnyPSR());
+  radianceOutput += foregroundRadiance;
 
   // Add sky radiance
   applySkyContribution(pixelCoordinate, primaryRayDirections, primaryMiss, radianceScale, volumeAttenuation, radianceOutput);

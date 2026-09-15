@@ -38,6 +38,8 @@ layout(binding = COMPOSITE_SHARED_RADIANCE_RG_INPUT)
 Texture2D<float2> SharedRadianceRG;
 layout(binding = COMPOSITE_SHARED_RADIANCE_B_INPUT)
 Texture2D<float> SharedRadianceB;
+layout(binding = COMPOSITE_ATMOSPHERE_FOREGROUND_INPUT)
+Texture2D<float4> AtmosphereForeground;
 
 layout(binding = COMPOSITE_PRIMARY_ATTENUATION_INPUT)
 RWTexture2D<uint> PrimaryAttenuation;

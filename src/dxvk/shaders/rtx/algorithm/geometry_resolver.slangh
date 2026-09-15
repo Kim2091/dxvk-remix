@@ -1742,6 +1742,7 @@ void geometryResolverVertex(
   uint4 decalMemory = 0;
   vec3 decalEmissiveRadiance = vec3(0.0f);
   int surfaceIndex = -1;
+  float nearestContributorDistance;
   resolveVertexUnorderedParticles<
     GBUFFER_RAY_FLAGS>(
     resolveMode, unorderedResolveRay,
@@ -1750,7 +1751,7 @@ void geometryResolverVertex(
     geometryResolverState.pixelCoordinate,
     geometryResolverState.accumulatedRotation, geometryResolverState.accumulatedHitDistance, 1.0f,
     radianceAttenuation, emissiveRadiance,
-    numUnorderedInteractions, surfaceIndex);
+    numUnorderedInteractions, surfaceIndex, nearestContributorDistance);
 
   bool ignoreTransparencyLayer = false;
   if (surfaceIndex >= 0)
@@ -1877,6 +1878,20 @@ void geometryResolverVertex(
 
   // Note: Emissive radiance handled first so objects with opacity do not attenuate themselves.
   geometryResolverState.radiance += emissiveRadiance * geometryResolverState.attenuation;
+  if (cb.skyMode == 1) {
+    vec4 foreground = AtmosphereForeground[geometryResolverState.pixelCoordinate];
+    foreground.rgb = geometryResolverState.radiance;
+    if (nearestContributorDistance < floatMax) {
+      const float depthKm = max(nearestContributorDistance / max(cb.atmosphereArgs.worldUnitsPerKm, 1e-6f), 1e-5f);
+      foreground.w = foreground.w > 0.0f ? min(foreground.w, depthKm) : depthKm;
+    }
+    if (rayInteractionHasHit(rayInteraction) &&
+        (any(emissiveRadiance > 0.0f) || any(radianceAttenuation < 1.0f))) {
+      const float depthKm = max(geometryResolverState.accumulatedHitDistance / max(cb.atmosphereArgs.worldUnitsPerKm, 1e-6f), 1e-5f);
+      foreground.w = foreground.w > 0.0f ? min(foreground.w, depthKm) : depthKm;
+    }
+    AtmosphereForeground[geometryResolverState.pixelCoordinate] = foreground;
+  }
   geometryResolverState.attenuation *= radianceAttenuation;
 
   // Record alpha blend surface when stochastic alpha blend is enabled
@@ -3041,6 +3056,7 @@ void geometryPSRResolver(inout GeometryPSRResolverState psrResolverState) {
 }
 
 void geometryResolver(ivec2 pixelCoordinate) {
+  AtmosphereForeground[pixelCoordinate] = vec4(0.0f);
   // Initialize Geometry Resolver State
 
   // Note: Acts partially as live state due to some values being carried across both the
