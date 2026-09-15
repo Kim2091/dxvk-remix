@@ -1331,9 +1331,9 @@ public:
                "reflected/indirect clouds match the primary Nubis look. Disable "
                "to make secondary sky-miss rays cloudless.");
 
-    RTX_OPTION("rtx.atmosphere", bool, cloudAmbientColumnScan, false,
-               "Experimental shared vertical density integration for ambient cloud lighting. "
-               "Changes quadrature; compare cloud underside shading before enabling permanently.");
+    RTX_OPTION("rtx.atmosphere", bool, cloudAmbientColumnScan, true,
+               "Share vertical density integration across ambient cloud lighting voxels. "
+               "Disable to use the legacy per-voxel integration.");
 
     RTX_OPTION("rtx.atmosphere", bool, cloudReflectionDensityCache, false,
                "Experimental world-space density cache for cloud reflection traversal. "

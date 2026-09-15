@@ -1106,10 +1106,10 @@ void RtxAtmosphere::showCloudSettings(const WeatherSnapshot* weatherSnapshot) {
       "Keeps resolution, samples, and lighting; dense cloud detail is spatially filtered. "
       "Logs cache-building and traversal costs separately. This is a prototype, not a proven speedup.");
     ImGui::EndDisabled();
-    RemixGui::Checkbox("Shared Ambient Cloud Integration (Experimental)", &RtxAtmosphere::cloudAmbientColumnScanObject());
+    RemixGui::Checkbox("Shared Ambient Cloud Integration", &RtxAtmosphere::cloudAmbientColumnScanObject());
     RemixGui::SetTooltipToLastWidgetOnHover(
       "Samples each vertical cloud column once for ambient lighting. "
-      "Reduces repeated density work; may change underside shading. "
+      "Reduces repeated density work. "
       "Updates every frame when cloud ground shadows are enabled. Applies live.");
     RemixGui::DragFloat("Cloud Render Scale", &RtxAtmosphere::cloudRenderResolutionScaleObject(),
       0.05f, 0.25f, 1.0f, "%.2f", sliderFlags);

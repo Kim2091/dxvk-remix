@@ -1,4 +1,4 @@
-﻿# Numos cloud optimizations - 2026-09-14
+# Numos cloud optimizations - 2026-09-14
 
 Base commit: 3c3d2a1ce. Changes are uncommitted.
 
@@ -163,3 +163,7 @@ Nominal procedural density evaluations fall from 256*256*32*6 = 12,582,912 to 25
 Validation: release Meson build passed. Reference and scan SPIR-V modules passed Vulkan 1.3 scalar-block-layout validation, and exact shader byte sequences were verified in the final DLL. A CPU arithmetic check passed 2064 analytic cases for empty, homogeneous, and upper-half dense columns, including fractional-cell positions and boundaries. These checks do not validate runtime appearance or performance.
 
 Test in one session at 100% coverage with the World-space Reflection Cache off: fixed camera, ambient experiment off/on/off for about 20 seconds each. Compare FPS using the user's trusted overlay and inspect underside shading. Leave the game running; no additional restart is required for toggles. A failure to improve meaningfully leaves the sun bake and actual adaptive iteration count as the next targets rather than establishing that all lighting-grid cost is negligible.
+
+## Ambient integration accepted
+
+The user reports the shared ambient integration is quite a bit faster and explicitly chose to keep it. No timing logs were read or used to quantify this result. Enable cloudAmbientColumnScan by default and remove its experimental UI label; retain the legacy toggle for compatibility. Existing explicit config overrides still take precedence over the default. The tested shader implementation is unchanged.
