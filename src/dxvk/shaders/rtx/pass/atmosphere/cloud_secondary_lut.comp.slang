@@ -45,11 +45,6 @@
 //
 // Jitter is per-texel and frame-constant so the LUT is temporally stable.
 
-//!variant cloud_secondary_lut.comp
-//!variant cloud_secondary_lut_cached.comp
-//!> CLOUD_REFLECTION_DENSITY_CACHE
-//!end-variants
-
 #define ATMOSPHERE_AVAILABLE
 
 #include "rtx/utility/shader_types.h"
@@ -96,9 +91,6 @@ layout(binding = 14)
 Texture3D<float4> AtmosphereCloudDetailNoise3D;
 
 #include "rtx/pass/atmosphere/atmosphere_common.slangh"
-#ifdef CLOUD_REFLECTION_DENSITY_CACHE
-layout(binding = 15) Texture3D<float4> AtmosphereCloudReflectionDensity;
-#endif
 #include "rtx/pass/atmosphere/cloud_march_common.slangh"
 
 [shader("compute")]

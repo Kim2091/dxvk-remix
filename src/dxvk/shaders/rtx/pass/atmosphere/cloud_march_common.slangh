@@ -853,39 +853,13 @@ bool integrateCloudSample(float tSampleKm,
   // runs with ray origin = the camera).
   float nubisProfile;
   float nubisSdfKm;
-  float density;
-#ifdef CLOUD_REFLECTION_DENSITY_CACHE
-  // NV-DXVK start: Experimental world-space density cache, secondary traversal only.
-  const vec3 cacheOrigin = cloudVoxelGridOriginKm(args);
-  const vec3 cacheUvw = vec3(
-    (samplePos.x - cacheOrigin.x) / args.cloudVoxelGridExtentKm + 0.5f,
-    hf * slabThicknessKm / args.cloudVoxelGridVerticalKm,
-    (samplePos.z - cacheOrigin.z) / args.cloudVoxelGridExtentKm + 0.5f);
-  uint3 cacheDimensions;
-  AtmosphereCloudReflectionDensity.GetDimensions(cacheDimensions.x, cacheDimensions.y, cacheDimensions.z);
-  const vec3 halfTexel = 0.5f / vec3(cacheDimensions);
-  const bool insideCache = all(cacheUvw >= halfTexel) && all(cacheUvw <= 1.0f - halfTexel);
-  vec4 cachedDensity = 0.0f;
-  if (insideCache) {
-    cachedDensity = AtmosphereCloudReflectionDensity.SampleLevel(AtmosphereCloudNoise3DSampler, cacheUvw, 0);
-  }
-  // Low cached densities fall back; interpolation can still soften dense boundaries.
-  if (insideCache && cachedDensity.x > 0.2f) {
-    density = cachedDensity.x;
-    nubisProfile = cachedDensity.y;
-    detailSigned = cachedDensity.z;
-    nubisSdfKm = cachedDensity.w;
-    sdfStepKmOut = 0.0f;
-  } else
-  // NV-DXVK end
-#endif
-  {
-    density = sampleCloudDensityNubis3(samplePos, hf, typeLocal, coverageLocal,
-                                      slabDensityScale, tSampleKm, args,
-                                      AtmosphereCloudNvdfSdf, AtmosphereCloudDetailNoise3D,
-                                      AtmosphereCloudNoise3DSampler, false,
-                                      nubisProfile, detailSigned, nubisSdfKm, sdfStepKmOut);
-  }
+  float density = sampleCloudDensityNubis3(samplePos, hf, typeLocal, coverageLocal,
+                                           slabDensityScale, tSampleKm, args,
+                                           AtmosphereCloudNvdfSdf, AtmosphereCloudDetailNoise3D,
+                                           AtmosphereCloudNoise3DSampler,
+                                           /*coarseOd=*/false,
+                                           nubisProfile, detailSigned, nubisSdfKm,
+                                           sdfStepKmOut);
   if (density < 0.001f) {
     return false;
   }

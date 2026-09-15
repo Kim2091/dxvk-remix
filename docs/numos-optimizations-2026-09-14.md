@@ -167,3 +167,7 @@ Test in one session at 100% coverage with the World-space Reflection Cache off: 
 ## Ambient integration accepted
 
 The user reports the shared ambient integration is quite a bit faster and explicitly chose to keep it. No timing logs were read or used to quantify this result. Enable cloudAmbientColumnScan by default and remove its experimental UI label; retain the legacy toggle for compatibility. Existing explicit config overrides still take precedence over the default. The tested shader implementation is unchanged.
+
+## Reflection cache removed
+
+At the user's request, remove the rejected world-space reflection-density cache and its optional shader, resource, dispatch, config option, and UI. Keep the original secondary reflection dome and the accepted shared ambient column integration (default true). See numos-handoff-2026-09-14.md for current state and remaining work. Cleanup is not deployed by this handoff task.

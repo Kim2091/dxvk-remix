@@ -58,8 +58,6 @@
 #include <rtx_shaders/cloud_render_tight_bounds.h>
 #include <rtx_shaders/cloud_render_density_tight_bounds.h>
 #include <rtx_shaders/cloud_secondary_lut.h>
-#include <rtx_shaders/cloud_secondary_lut_cached.h>
-#include <rtx_shaders/cloud_reflection_density.h>
 #include <rtx_shaders/cloud_placement_map_baker.h>
 #include <rtx_shaders/cloud_nvdf_occupancy.h>
 #include <rtx_shaders/cloud_nvdf_jfa.h>
@@ -283,38 +281,6 @@ namespace dxvk {
       END_PARAMETER()
     };
     PREWARM_SHADER_PIPELINE(CloudSecondaryLutShader);
-
-    class CloudSecondaryCachedLutShader : public ManagedShader {
-      SHADER_SOURCE(CloudSecondaryCachedLutShader, VK_SHADER_STAGE_COMPUTE_BIT, cloud_secondary_lut_cached)
-
-      BEGIN_PARAMETER()
-        CONSTANT_BUFFER(0)
-        SAMPLER(2)
-        TEXTURE3D(3)
-        TEXTURE3D(4)
-        TEXTURE2DARRAY(5)
-        RW_TEXTURE2D(6)
-        TEXTURE2D(7)
-        TEXTURE2D(8)
-        SAMPLER(9)
-        TEXTURE3D(13)
-        TEXTURE3D(14)
-        TEXTURE3D(15)
-      END_PARAMETER()
-    };
-    PREWARM_SHADER_PIPELINE(CloudSecondaryCachedLutShader);
-
-    class CloudReflectionDensityShader : public ManagedShader {
-      SHADER_SOURCE(CloudReflectionDensityShader, VK_SHADER_STAGE_COMPUTE_BIT, cloud_reflection_density)
-      BEGIN_PARAMETER()
-        CONSTANT_BUFFER(0)
-        RW_TEXTURE3D(1)
-        SAMPLER(2)
-        TEXTURE3D(3)
-        TEXTURE3D(4)
-      END_PARAMETER()
-    };
-    PREWARM_SHADER_PIPELINE(CloudReflectionDensityShader);
 
     class CloudPlacementMapBakerShader : public ManagedShader {
       SHADER_SOURCE(CloudPlacementMapBakerShader, VK_SHADER_STAGE_COMPUTE_BIT, cloud_placement_map_baker)
@@ -2051,17 +2017,7 @@ void RtxAtmosphere::computeLuts(RtxContext& rtx) {
       VK_ACCESS_SHADER_WRITE_BIT,
       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
       VK_ACCESS_SHADER_READ_BIT);
-    if (cloudReflectionDensityCache()) {
-      dispatchCloudReflectionDensity(ctx);
-      rtx.recordGpuStageTiming("AtmosphereCloudReflectionDensity");
-      ctx->emitMemoryBarrier(0, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
-    }
     dispatchCloudSecondaryLut(ctx);
-    if (m_cloudRenderFrameIdx % 120u == 0u) {
-      Logger::info(str::format("[Cloud reflections] mode=",
-        cloudReflectionDensityCache() ? "WorldDensityPrototype" : "ProceduralReference"));
-    }
   }
   rtx.recordGpuStageTiming("AtmosphereCloudSecondaryLut");
 
@@ -3424,36 +3380,6 @@ void RtxAtmosphere::dispatchCloudRender(Rc<DxvkContext> ctx, const Resources::Ra
   ctx->dispatch(groupsX, groupsY, 1);
 }
 
-void RtxAtmosphere::dispatchCloudReflectionDensity(Rc<DxvkContext> ctx) {
-  ScopedGpuProfileZone(ctx, "Atmosphere Cloud Reflection Density");
-  constexpr VkExtent3D extent = {128u, 64u, 128u};
-  if (!m_cloudReflectionDensity.isValid()) {
-    m_cloudReflectionDensity = Resources::createImageResource(ctx, "Cloud reflection density",
-      extent, VK_FORMAT_R16G16B16A16_SFLOAT, 1, VK_IMAGE_TYPE_3D, VK_IMAGE_VIEW_TYPE_3D,
-      0, VK_IMAGE_USAGE_STORAGE_BIT, VkClearColorValue{}, 1);
-  }
-  const AtmosphereArgs args = getAtmosphereArgs();
-  ctx->updateBuffer(m_constantsBuffer, 0, sizeof(args), &args);
-  DxvkSamplerCreateInfo info = {};
-  info.magFilter = VK_FILTER_LINEAR;
-  info.minFilter = VK_FILTER_LINEAR;
-  info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-  info.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-  info.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-  info.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-  ctx->bindResourceBuffer(0, DxvkBufferSlice(m_constantsBuffer, 0, m_constantsBuffer->info().size));
-  ctx->bindResourceView(1, m_cloudReflectionDensity.view, nullptr);
-  ctx->bindResourceSampler(2, m_device->createSampler(info));
-  ctx->bindResourceView(3, m_cloudNvdfSdf[m_cloudNvdfSdfFront].view, nullptr);
-  ctx->bindResourceView(4, m_cloudDetailNoise3D.view, nullptr);
-  ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_constantsBuffer);
-  ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_cloudNvdfSdf[m_cloudNvdfSdfFront].image);
-  ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_cloudDetailNoise3D.image);
-  ctx->getCommandList()->trackResource<DxvkAccess::Write>(m_cloudReflectionDensity.image);
-  ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, CloudReflectionDensityShader::getShader());
-  ctx->dispatch(extent.width / 8u, extent.height / 4u, extent.depth / 8u);
-}
-
 void RtxAtmosphere::dispatchCloudSecondaryLut(Rc<DxvkContext> ctx) {
   ScopedGpuProfileZone(ctx, "Atmosphere Cloud Secondary LUT");
 
@@ -3512,13 +3438,7 @@ void RtxAtmosphere::dispatchCloudSecondaryLut(Rc<DxvkContext> ctx) {
     ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_cloudSkyTransmittanceLut.image);
   }
 
-  const bool useDensityCache = cloudReflectionDensityCache() && m_cloudReflectionDensity.isValid();
-  if (useDensityCache) {
-    ctx->bindResourceView(15, m_cloudReflectionDensity.view, nullptr);
-    ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_cloudReflectionDensity.image);
-  }
-  ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, useDensityCache
-    ? CloudSecondaryCachedLutShader::getShader() : CloudSecondaryLutShader::getShader());
+  ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, CloudSecondaryLutShader::getShader());
 
   // Shader declares [numthreads(8, 8, 1)].
   const uint32_t groupsX = (kCloudSecondaryLutWidth  + 7u) / 8u;
