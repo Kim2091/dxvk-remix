@@ -48,7 +48,10 @@ namespace dxvk {
       m_status = "Inactive";
       return;
     }
+    ++m_selectedFrames;
+    logFallbackStatsIfDue();
     if (!isSupported(*m_device)) {
+      ++m_otherFallbackFrames;
       m_status = "Unsupported device features; using importance-sampled paths";
       return;
     }
@@ -56,6 +59,7 @@ namespace dxvk {
     // secondary rays are not yet represented by the SHARC estimator.  Keep a
     // conservative fallback until the cache can tag those paths explicitly.
     if (args.enableRaytracedRenderTarget) {
+      ++m_rttFallbackFrames;
       m_status = "Raytraced render target active; using importance-sampled paths";
       return;
     }
@@ -64,14 +68,17 @@ namespace dxvk {
       || !RtxOptions::rayPortalModelTextureHashes().empty();
     const bool opacityMicromap = RtxOptions::getEnableOpacityMicromap();
     if (wboit && !allowWboit()) {
+      ++m_otherFallbackFrames;
       m_status = "WBOIT blocks SHARC: enable Allow SHARC with WBOIT below to test; tracing normally";
       return;
     }
     if (rayPortals && !allowRayPortals()) {
+      ++m_otherFallbackFrames;
       m_status = "Ray portals block SHARC: enable Allow SHARC with ray portals below to test; tracing normally";
       return;
     }
     if (opacityMicromap && !allowOpacityMicromap()) {
+      ++m_otherFallbackFrames;
       m_status = "OMM blocks SHARC: enable Allow SHARC with OMM below to test; tracing normally";
       return;
     }
@@ -84,6 +91,7 @@ namespace dxvk {
       | (queryTraceRay() ? 1024u : 0u)
       | (queryTraceRay() && RtxOptions::isShaderExecutionReorderingInPathtracerIntegrateIndirectEnabled() ? 2048u : 0u);
     if (m_allocationFailed && !m_resetRequested) {
+      ++m_otherFallbackFrames;
       return;
     }
 
@@ -261,8 +269,29 @@ namespace dxvk {
     m_statsSlot = -1;
   }
 
+  void RtxSharc::logFallbackStatsIfDue() {
+    if (!logFallbackStats() || (m_selectedFrames % kFallbackLogInterval) != 0) {
+      return;
+    }
+    const float denominator = float(m_selectedFrames);
+    Logger::info(str::format(
+      "SHARC fallback stats: selected for ", m_selectedFrames, " frames; ",
+      m_rttFallbackFrames, " (", (100.0f * float(m_rttFallbackFrames) / denominator),
+      "%) fell back on a raytraced render target; ",
+      m_otherFallbackFrames, " (", (100.0f * float(m_otherFallbackFrames) / denominator),
+      "%) on other conditions."));
+  }
+
   void RtxSharc::showImguiSettings() {
     ImGui::TextWrapped("%s", m_status);
+    if (m_selectedFrames > 0 && (m_rttFallbackFrames + m_otherFallbackFrames) > 0) {
+      const float denominator = float(m_selectedFrames);
+      ImGui::Text("Fell back on %u of %u frames: %.1f%% render target, %.1f%% other",
+        m_rttFallbackFrames + m_otherFallbackFrames, m_selectedFrames,
+        100.0f * float(m_rttFallbackFrames) / denominator,
+        100.0f * float(m_otherFallbackFrames) / denominator);
+    }
+    RemixGui::Checkbox("Log SHARC fallback statistics", &logFallbackStatsObject());
     RemixGui::Checkbox("Allow SHARC with WBOIT", &allowWboitObject());
     RemixGui::Checkbox("Allow SHARC with ray portals", &allowRayPortalsObject());
     RemixGui::Checkbox("Allow SHARC with OMM", &allowOpacityMicromapObject());

@@ -19,6 +19,7 @@ namespace dxvk {
     enum class TimingPoint { Begin, UpdateEnd, ResolveEnd, QueryEnd };
     void recordTimestamp(RtxContext& ctx, TimingPoint point);
     void showImguiSettings();
+    void logFallbackStatsIfDue();
     void beginQueryStats(RtxContext& ctx);
     void endQueryStats(RtxContext& ctx);
     bool queryStatsActive() const { return m_statsSlot >= 0; }
@@ -35,6 +36,7 @@ namespace dxvk {
     RTX_OPTION("rtx.sharc", bool, updateRayGeneration, true, "Run sparse SHARC updates as inline RayQuery in a ray-generation shader. Disable to compare compute updates with the same sampling and estimator.");
     RTX_OPTION("rtx.sharc", bool, allowSpecularPaths, false, "Allow cache insertion and reuse at rough opaque surfaces reached by non-diffuse rays. Can soften reflected lighting; changing this resets the cache.");
     RTX_OPTION("rtx.sharc", bool, collectQueryStats, false, "Collect sampled cache reuse and rejection counts while GPU timing is enabled. Disable for timing comparisons without diagnostic atomics.");
+    RTX_OPTION("rtx.sharc", bool, logFallbackStats, false, "Periodically log how often SHARC was selected but fell back to importance-sampled paths, split by reason. Diagnostic only; counts cost nothing when this is disabled.");
     RTX_OPTION("rtx.sharc", bool, measureGpuTime, false, "Measure SHARC update, resolve and query GPU times. Timing boundaries can affect overlap; disable for final frame-time comparisons.");
     RTX_OPTION("rtx.sharc", int, capacityLog2, 21, "Cache capacity exponent, 18..22. 21 uses 80 MiB; 22 uses 160 MiB.");
     RTX_OPTION("rtx.sharc", int, updateTileSize, 5, "One cache update path per NxN tile, 1..16.");
@@ -72,5 +74,12 @@ namespace dxvk {
     const char* m_status = "Inactive";
     uint32_t m_compatibilityFlags = 0;
     uint32_t m_lastFrame = ~0u;
+    // Fallback accounting.  SHARC can be selected yet inactive for a whole frame; these
+    // counters say how often that happens and why, so the cost of each fallback reason
+    // can be judged from a real play session instead of guessed at.
+    static constexpr uint32_t kFallbackLogInterval = 1800;
+    uint32_t m_selectedFrames = 0;
+    uint32_t m_rttFallbackFrames = 0;
+    uint32_t m_otherFallbackFrames = 0;
   };
 }
