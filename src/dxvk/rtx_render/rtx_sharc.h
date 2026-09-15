@@ -25,9 +25,24 @@ namespace dxvk {
     bool isActive() const { return m_active; }
     bool isLeanActive() const { return m_active && m_leanActive; }
 
+    // Effective lean shader selection for the current frame, resolved once per frame from the
+    // options, the renderer feature flags and the scene contents. Level 0 is the original lean profile.
+    struct LeanProfile {
+      uint32_t level = 0;        // Query tier: 0 lean, 1 adds alpha-blended indirect shadows, 2 adds the unordered resolve.
+      uint32_t updateLevel = 0;  // Tier used by the sparse update; 0 unless ray-generation deferred updates are selected.
+      bool wboit = false;        // Level 2 stages use the WBOIT unordered resolver.
+      bool pom = false;          // Displacement-aware closest-hit stage.
+      bool operator==(const LeanProfile& o) const { return level == o.level && updateLevel == o.updateLevel && wboit == o.wboit && pom == o.pom; }
+      bool operator!=(const LeanProfile& o) const { return !(*this == o); }
+    };
+    void resolveLeanProfile(RtxContext& ctx, const RaytraceArgs& args);
+    const LeanProfile& leanProfile() const { return m_leanProfile; }
+
     RTX_OPTION("rtx.sharc", bool, fuseAssembly, false, "Experimental combined TraceRay query and primary NEE assembly. Enable before launch to allocate independent throughput storage. Unsupported modes use standalone assembly.");
 
     RTX_OPTION("rtx.sharc", bool, leanSecondary, false, "Use experimental full-resolution lean secondary shaders: no unordered particles/decals, POM, alpha-blended indirect shadows, or RTXDI sample stealing. Uses TraceRay queries; portal scenes retain the full profile.");
+    RTX_OPTION("rtx.sharc", int, leanFeatureLevel, 0, "Restore full-profile features to the lean secondary profile: 0 keeps the lean shaders, 1 adds alpha-blended indirect shadows, 2 also adds the unordered particle/decal resolve (using the WBOIT resolver when WBOIT is enabled). A level is only used in frames whose scene contains the geometry it handles. Levels above 0 need ray-generation deferred updates; other update backends keep level 0 for updates. Changing the level resets the cache.");
+    RTX_OPTION("rtx.sharc", bool, leanIndirectPom, false, "Use displacement-aware lean closest-hit shaders when rtx.displacement.enableIndirectHit is enabled and the scene contains displaced materials. Otherwise the lean profile ignores displacement in secondary rays.");
 
     RTX_OPTION("rtx.sharc", bool, allowWboit, false, "Allow SHARC while WBOIT is enabled for compatibility testing. Does not enable WBOIT.");
     RTX_OPTION("rtx.sharc", bool, allowRayPortals, false, "Allow SHARC with ray portals for compatibility testing. Does not enable ray portals.");
@@ -71,6 +86,8 @@ namespace dxvk {
     SharcArgs m_args = {};
     bool m_active = false;
     bool m_leanActive = false;
+    LeanProfile m_leanProfile;
+    uint64_t m_loggedLeanProfiles = 0;
     bool m_resetRequested = true;
     bool m_allocationFailed = false;
     const char* m_status = "Inactive";

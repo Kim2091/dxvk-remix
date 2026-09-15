@@ -509,6 +509,100 @@
 //!>       SHARC_LEAN_SECONDARY=1
 //!>       SURFACE_MATERIAL_RESOLVE_TYPE_ACTIVE_MASK=SURFACE_MATERIAL_RESOLVE_TYPE_OPAQUE_TRANSLUCENT
 
+//!variant integrate_indirect_sharc_query_trace_ser_lean_particles.rgen
+//!>       ENABLE_SHARC=1
+//!>       SHARC_QUERY=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       RT_TRACE_RAY
+//!>       RAY_PIPELINE
+//!>       RT_SHADER_EXECUTION_REORDERING
+//!>       SHARC_LEAN_SECONDARY=1
+//!>       SHARC_LEAN_ALPHA_BLEND_SHADOWS=1
+//!>       SHARC_LEAN_UNORDERED=1
+//!>       SURFACE_MATERIAL_RESOLVE_TYPE_ACTIVE_MASK=SURFACE_MATERIAL_RESOLVE_TYPE_OPAQUE_TRANSLUCENT
+
+//!variant integrate_indirect_sharc_query_trace_ser_stats_lean_particles.rgen
+//!>       ENABLE_SHARC=1
+//!>       SHARC_QUERY=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       RT_TRACE_RAY
+//!>       RAY_PIPELINE
+//!>       RT_SHADER_EXECUTION_REORDERING
+//!>       SHARC_QUERY_STATS=1
+//!>       SHARC_LEAN_SECONDARY=1
+//!>       SHARC_LEAN_ALPHA_BLEND_SHADOWS=1
+//!>       SHARC_LEAN_UNORDERED=1
+//!>       SURFACE_MATERIAL_RESOLVE_TYPE_ACTIVE_MASK=SURFACE_MATERIAL_RESOLVE_TYPE_OPAQUE_TRANSLUCENT
+
+//!variant integrate_indirect_sharc_update_deferred_raygen_lean_shadows.rgen
+//!>       RAY_PIPELINE
+//!>       ENABLE_SHARC=1
+//!>       SHARC_UPDATE=1
+//!>       SHARC_DEFERRED_UPDATE=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       SHARC_LEAN_SECONDARY=1
+//!>       SHARC_LEAN_ALPHA_BLEND_SHADOWS=1
+//!>       SURFACE_MATERIAL_RESOLVE_TYPE_ACTIVE_MASK=SURFACE_MATERIAL_RESOLVE_TYPE_OPAQUE_TRANSLUCENT
+
+//!variant integrate_indirect_sharc_update_deferred_raygen_lean_particles.rgen
+//!>       RAY_PIPELINE
+//!>       ENABLE_SHARC=1
+//!>       SHARC_UPDATE=1
+//!>       SHARC_DEFERRED_UPDATE=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       SHARC_LEAN_SECONDARY=1
+//!>       SHARC_LEAN_ALPHA_BLEND_SHADOWS=1
+//!>       SHARC_LEAN_UNORDERED=1
+//!>       SURFACE_MATERIAL_RESOLVE_TYPE_ACTIVE_MASK=SURFACE_MATERIAL_RESOLVE_TYPE_OPAQUE_TRANSLUCENT
+
+//!variant integrate_indirect_sharc_update_deferred_raygen_lean_particles_wboit.rgen
+//!>       RAY_PIPELINE
+//!>       ENABLE_SHARC=1
+//!>       SHARC_UPDATE=1
+//!>       SHARC_DEFERRED_UPDATE=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       SHARC_LEAN_SECONDARY=1
+//!>       SHARC_LEAN_ALPHA_BLEND_SHADOWS=1
+//!>       SHARC_LEAN_UNORDERED=1
+//!>       UNORDERED_RESOLVE_WBOIT
+//!>       SURFACE_MATERIAL_RESOLVE_TYPE_ACTIVE_MASK=SURFACE_MATERIAL_RESOLVE_TYPE_OPAQUE_TRANSLUCENT
+
+//!variant integrate_indirect_sharc_update_deferred4_raygen_lean_shadows.rgen
+//!>       RAY_PIPELINE
+//!>       ENABLE_SHARC=1
+//!>       SHARC_UPDATE=1
+//!>       SHARC_DEFERRED_UPDATE=1
+//!>       SHARC_PROPAGATION_DEPTH=4
+//!>       NEE_CACHE_ENABLE=1
+//!>       SHARC_LEAN_SECONDARY=1
+//!>       SHARC_LEAN_ALPHA_BLEND_SHADOWS=1
+//!>       SURFACE_MATERIAL_RESOLVE_TYPE_ACTIVE_MASK=SURFACE_MATERIAL_RESOLVE_TYPE_OPAQUE_TRANSLUCENT
+
+//!variant integrate_indirect_sharc_update_deferred4_raygen_lean_particles.rgen
+//!>       RAY_PIPELINE
+//!>       ENABLE_SHARC=1
+//!>       SHARC_UPDATE=1
+//!>       SHARC_DEFERRED_UPDATE=1
+//!>       SHARC_PROPAGATION_DEPTH=4
+//!>       NEE_CACHE_ENABLE=1
+//!>       SHARC_LEAN_SECONDARY=1
+//!>       SHARC_LEAN_ALPHA_BLEND_SHADOWS=1
+//!>       SHARC_LEAN_UNORDERED=1
+//!>       SURFACE_MATERIAL_RESOLVE_TYPE_ACTIVE_MASK=SURFACE_MATERIAL_RESOLVE_TYPE_OPAQUE_TRANSLUCENT
+
+//!variant integrate_indirect_sharc_update_deferred4_raygen_lean_particles_wboit.rgen
+//!>       RAY_PIPELINE
+//!>       ENABLE_SHARC=1
+//!>       SHARC_UPDATE=1
+//!>       SHARC_DEFERRED_UPDATE=1
+//!>       SHARC_PROPAGATION_DEPTH=4
+//!>       NEE_CACHE_ENABLE=1
+//!>       SHARC_LEAN_SECONDARY=1
+//!>       SHARC_LEAN_ALPHA_BLEND_SHADOWS=1
+//!>       SHARC_LEAN_UNORDERED=1
+//!>       UNORDERED_RESOLVE_WBOIT
+//!>       SURFACE_MATERIAL_RESOLVE_TYPE_ACTIVE_MASK=SURFACE_MATERIAL_RESOLVE_TYPE_OPAQUE_TRANSLUCENT
+
 //!variant integrate_indirect_sharc_query_fused.rgen
 //!>       ENABLE_SHARC=1
 //!>       SHARC_QUERY=1

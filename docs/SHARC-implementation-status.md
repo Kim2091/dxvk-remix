@@ -364,3 +364,7 @@ Fusion produced no useful demonstrated performance benefit. In the fresh compari
 ## Lean parity pass resumed - 2026-09-14
 
 User lifted the pause. Analysis of the five lean gaps found that the full SHARC RTXDI sample stealing branch was non-functional and dropped NEE at camera-visible secondary vertices (no SHARC stage binds the reservoir); it is now compiled out for SHARC stages, matching lean. Lean and legacy blobs unchanged. See [parity record](Lean-SHARC-parity-2026-09-14.md) for the per-gap analysis, ranking and validation. Local only; no deployment, no push.
+
+### Lean feature tiers built (2026-09-14)
+
+Added opt-in `rtx.sharc.leanFeatureLevel` (1 restores alpha-blended indirect shadows, 2 also restores the unordered particle/decal resolve; each tier used only in frames containing that geometry) and `rtx.sharc.leanIndirectPom`. 28 new lean variants; level-2 query stages are byte-identical to the full stages after the stealing guard. All validators pass; RtxOptions.md regenerated. See [parity record](Lean-SHARC-parity-2026-09-14.md) for sizes, validation and the FNV A/B procedure. Not deployed; no timing measured.

@@ -1841,6 +1841,21 @@ namespace dxvk {
   }
 
   void AccelManager::buildTlas(Rc<DxvkContext> ctx) {
+    // Instance statistics consumed by pass specialization later in the frame.
+    m_unorderedInstanceCount = m_pointInstancerSlotsPerType[Tlas::Unordered];
+    for (const auto& instance : m_mergedInstances[Tlas::Unordered]) {
+      m_unorderedInstanceCount += instance.mask != 0 ? 1u : 0u;
+    }
+    m_alphaBlendInstanceCount = 0;
+    for (const auto& instance : m_mergedInstances[Tlas::Opaque]) {
+      m_alphaBlendInstanceCount += (instance.mask & OBJECT_MASK_ALPHA_BLEND) != 0 ? 1u : 0u;
+    }
+    for (const auto& batch : m_pointInstancerBatches) {
+      if (batch.tlasType == Tlas::Opaque && (batch.instanceMask & OBJECT_MASK_ALPHA_BLEND) != 0) {
+        m_alphaBlendInstanceCount += batch.instanceCount;
+      }
+    }
+
     if (m_vkInstanceBuffer == nullptr) {
       return;
     }

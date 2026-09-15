@@ -507,7 +507,7 @@ struct PathState : IBasePayloadState
   // first bounce as past that all particles and similar things will be skipped anyways.
   bool getSeparateUnorderedApproximationsActive()
   {
-#if defined(SHARC_LEAN_SECONDARY)
+#if defined(SHARC_LEAN_SECONDARY) && !defined(SHARC_LEAN_UNORDERED)
     return false;
 #else
     RNG rng = createRNG(pixelCoordinate, cb.frameIdx, 101);
@@ -538,7 +538,7 @@ struct PathState : IBasePayloadState
     coherenceHints = 0;
     numCoherenceHints = 0;
 
-#if !defined(SHARC_LEAN_SECONDARY)
+#if !defined(SHARC_LEAN_SECONDARY) || defined(SHARC_LEAN_UNORDERED)
     if (cb.enableSeparateUnorderedApproximations &&
         cb.enableUnorderedResolveInIndirectRays) 
     {

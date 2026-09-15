@@ -164,6 +164,12 @@ public:
   static uint32_t getBlasCount();
 
   uint32_t getSurfaceCount() const { return m_reorderedSurfaces.size(); }
+
+  // Instance statistics for the TLAS set built this frame (valid after buildTlas). Entries with
+  // mask 0 never intersect and are not counted; point-instancer batches count their input size.
+  uint32_t getUnorderedInstanceCount() const { return m_unorderedInstanceCount; }
+  uint32_t getAlphaBlendInstanceCount() const { return m_alphaBlendInstanceCount; }
+  bool hasAlphaBlendInstances() const { return m_alphaBlendInstanceCount > 0; }
   const std::vector<RtInstance*>& getOrderedInstances() const { return m_reorderedSurfaces; }
 
   // Returns true if the last mergeInstancesIntoBlas call took the fast-skip
@@ -234,6 +240,10 @@ private:
   // instances in each TLAS type.  These slots are NOT stored in m_mergedInstances —
   // the GPU culling shader fills them directly in the instance buffer.
   uint32_t m_pointInstancerSlotsPerType[Tlas::Count] = {};
+
+  // Per-frame instance statistics, see getUnorderedInstanceCount / getAlphaBlendInstanceCount.
+  uint32_t m_unorderedInstanceCount = 0;
+  uint32_t m_alphaBlendInstanceCount = 0;
 
   // --- Incremental BLAS build caching ---
   // Scene generation from InstanceManager when the BLAS was last built.
