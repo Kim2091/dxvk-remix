@@ -51,14 +51,13 @@ namespace dxvk {
 
   private:
     struct AssemblyResources;
-    void dispatch(RtxContext* ctx, const Resources::RaytracingOutput& rtOutput, bool sharcUpdate = false, bool fusedAssembly = false);
+    void dispatch(RtxContext* ctx, const Resources::RaytracingOutput& rtOutput, bool sharcUpdate = false);
     void dispatchNEE(RtxContext* ctx, const AssemblyResources& resources);
 
     static DxvkRaytracingPipelineShaders getPipelineShaders(const bool useRayQuery, const bool serEnabled, const bool ommEnabled, const bool useNeeCache, const bool includePortals, const bool pomEnabled, const bool nrcEnabled, const bool wboitEnbaled);
     Rc<DxvkShader> getComputeShader(const bool useNeeCache, const bool nrcEnabled, const bool wboitEnabled, const bool sharcUpdate = false, const bool sharcQuery = false) const;
     void logIntegrateIndirectMode();
     
-    bool m_fusedAssemblyActive = false;
     IntegrateIndirectMode m_integrateIndirectMode;
   };
 }

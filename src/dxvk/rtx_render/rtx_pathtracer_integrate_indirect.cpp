@@ -33,7 +33,6 @@
 #include "rtx/pass/common_binding_indices.h"
 #include "rtx/pass/integrate/integrate_indirect_binding_indices.h"
 #include "rtx/pass/integrate/integrate_nee_binding_indices.h"
-#include "rtx/pass/integrate/integrate_fused_binding_indices.h"
 #include <rtx_shaders/integrate_indirect_sharc_query_fused.h>
 #include <rtx_shaders/integrate_indirect_sharc_query_fused_wboit.h>
 #include <rtx_shaders/integrate_indirect_sharc_query_fused_ser.h>
@@ -143,7 +142,6 @@
 #include <rtx_shaders/integrate_indirect_miss_nrc_wboit.h>
 #include <rtx_shaders/integrate_indirect_miss_nrc_neeCache_wboit.h>
 
-#include <rtx_shaders/integrate_nee.h>
 #include <rtx_shaders/integrate_nee_plain.h>
 #include <rtx_shaders/integrate_nee_nrc.h>
 #include <rtx_shaders/integrate_nee_restir_gi.h>
@@ -310,25 +308,6 @@ namespace dxvk {
       }
     };
 
-    class IntegrateIndirectSharcFusedShader : public IntegrateIndirectSharcShader {
-    public:
-      static std::vector<dxvk::DxvkResourceSlot> getResourceSlots() {
-        auto slots = IntegrateIndirectSharcShader::getResourceSlots();
-        slots.push_back({ INTEGRATE_FUSED_BINDING_SHARED_MATERIAL_DATA0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_IMAGE_VIEW_TYPE_2D, VK_ACCESS_SHADER_READ_BIT });
-        slots.push_back({ INTEGRATE_FUSED_BINDING_SHARED_MATERIAL_DATA1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_IMAGE_VIEW_TYPE_2D, VK_ACCESS_SHADER_READ_BIT });
-        slots.push_back({ INTEGRATE_FUSED_BINDING_SHARED_SUBSURFACE_DIFFUSION_PROFILE_DATA, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_IMAGE_VIEW_TYPE_2D, VK_ACCESS_SHADER_READ_BIT });
-        slots.push_back({ INTEGRATE_FUSED_BINDING_PRIMARY_WORLD_SHADING_NORMAL, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_IMAGE_VIEW_TYPE_2D, VK_ACCESS_SHADER_READ_BIT });
-        slots.push_back({ INTEGRATE_FUSED_BINDING_PRIMARY_PERCEPTUAL_ROUGHNESS, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_IMAGE_VIEW_TYPE_2D, VK_ACCESS_SHADER_READ_BIT });
-        slots.push_back({ INTEGRATE_FUSED_BINDING_PRIMARY_ALBEDO, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_IMAGE_VIEW_TYPE_2D, VK_ACCESS_SHADER_READ_BIT });
-        slots.push_back({ INTEGRATE_FUSED_BINDING_PRIMARY_VIEW_DIRECTION, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_IMAGE_VIEW_TYPE_2D, VK_ACCESS_SHADER_READ_BIT });
-        slots.push_back({ INTEGRATE_FUSED_BINDING_PRIMARY_POSITION_ERROR, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_IMAGE_VIEW_TYPE_2D, VK_ACCESS_SHADER_READ_BIT });
-        slots.push_back({ INTEGRATE_FUSED_BINDING_PRIMARY_BASE_REFLECTIVITY, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_IMAGE_VIEW_TYPE_2D, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT });
-        slots.push_back({ INTEGRATE_FUSED_BINDING_PRIMARY_INDIRECT_DIFFUSE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_IMAGE_VIEW_TYPE_2D, VK_ACCESS_SHADER_WRITE_BIT });
-        slots.push_back({ INTEGRATE_FUSED_BINDING_PRIMARY_INDIRECT_SPECULAR, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_IMAGE_VIEW_TYPE_2D, VK_ACCESS_SHADER_WRITE_BIT });
-        return slots;
-      }
-    };
-
     class IntegrateIndirectSharcStatsShader : public IntegrateIndirectSharcShader {
     public:
       static std::vector<dxvk::DxvkResourceSlot> getResourceSlots() {
@@ -374,7 +353,7 @@ namespace dxvk {
     };
 
     DxvkRaytracingPipelineShaders getSharcTracePipelineShaders(
-      bool serEnabled, bool ommEnabled, bool wboitEnabled, bool statsEnabled, bool includePortals, bool pomEnabled, bool fusedAssembly = false) {
+      bool serEnabled, bool ommEnabled, bool wboitEnabled, bool statsEnabled, bool includePortals, bool pomEnabled) {
       DxvkRaytracingPipelineShaders shaders;
       if (statsEnabled) {
         if (serEnabled) {
@@ -417,17 +396,7 @@ namespace dxvk {
           }
         }
       } else {
-        if (fusedAssembly) {
-          if (serEnabled) {
-            shaders.addGeneralShader(wboitEnabled
-              ? GET_SHADER_VARIANT(VK_SHADER_STAGE_RAYGEN_BIT_KHR, IntegrateIndirectSharcFusedShader, integrate_indirect_sharc_query_fused_ser_wboit)
-              : GET_SHADER_VARIANT(VK_SHADER_STAGE_RAYGEN_BIT_KHR, IntegrateIndirectSharcFusedShader, integrate_indirect_sharc_query_fused_ser));
-          } else {
-            shaders.addGeneralShader(wboitEnabled
-              ? GET_SHADER_VARIANT(VK_SHADER_STAGE_RAYGEN_BIT_KHR, IntegrateIndirectSharcFusedShader, integrate_indirect_sharc_query_fused_wboit)
-              : GET_SHADER_VARIANT(VK_SHADER_STAGE_RAYGEN_BIT_KHR, IntegrateIndirectSharcFusedShader, integrate_indirect_sharc_query_fused));
-          }
-        } else if (serEnabled) {
+        if (serEnabled) {
           shaders.addGeneralShader(wboitEnabled
             ? GET_SHADER_VARIANT(VK_SHADER_STAGE_RAYGEN_BIT_KHR, IntegrateIndirectSharcShader, integrate_indirect_sharc_query_trace_ser_wboit)
             : GET_SHADER_VARIANT(VK_SHADER_STAGE_RAYGEN_BIT_KHR, IntegrateIndirectSharcShader, integrate_indirect_sharc_query_trace_ser));
@@ -475,7 +444,7 @@ namespace dxvk {
     }
 
     class IntegrateNEEShader : public ManagedShader {
-      SHADER_SOURCE(IntegrateNEEShader, VK_SHADER_STAGE_COMPUTE_BIT, integrate_nee)
+      SHADER_SOURCE(IntegrateNEEShader, VK_SHADER_STAGE_COMPUTE_BIT, integrate_nee_nrc)
 
       BINDLESS_ENABLED()
 
@@ -697,7 +666,7 @@ namespace dxvk {
   void DxvkPathtracerIntegrateIndirect::dispatch(
     RtxContext* ctx, 
     const Resources::RaytracingOutput& rtOutput,
-    bool sharcUpdate, bool fusedAssembly) {
+    bool sharcUpdate) {
 
     const uint32_t frameIdx = ctx->getDevice()->getCurrentFrameId();
 
@@ -792,20 +761,6 @@ namespace dxvk {
       ctx->bindResourceView(INTEGRATE_INDIRECT_BINDING_INDIRECT_RADIANCE_HIT_DISTANCE_OUTPUT, rtOutput.m_indirectRadianceHitDistance.view(Resources::AccessType::Write), nullptr);
     }
     
-    if (fusedAssembly) {
-      ctx->bindResourceView(INTEGRATE_FUSED_BINDING_SHARED_MATERIAL_DATA0, rtOutput.m_sharedMaterialData0.view, nullptr);
-      ctx->bindResourceView(INTEGRATE_FUSED_BINDING_SHARED_MATERIAL_DATA1, rtOutput.m_sharedMaterialData1.view, nullptr);
-      ctx->bindResourceView(INTEGRATE_FUSED_BINDING_SHARED_SUBSURFACE_DIFFUSION_PROFILE_DATA, rtOutput.m_sharedSubsurfaceDiffusionProfileData.view, nullptr);
-      ctx->bindResourceView(INTEGRATE_FUSED_BINDING_PRIMARY_WORLD_SHADING_NORMAL, rtOutput.m_primaryWorldShadingNormal.view, nullptr);
-      ctx->bindResourceView(INTEGRATE_FUSED_BINDING_PRIMARY_PERCEPTUAL_ROUGHNESS, rtOutput.m_primaryPerceptualRoughness.view, nullptr);
-      ctx->bindResourceView(INTEGRATE_FUSED_BINDING_PRIMARY_ALBEDO, rtOutput.m_primaryAlbedo.view, nullptr);
-      ctx->bindResourceView(INTEGRATE_FUSED_BINDING_PRIMARY_VIEW_DIRECTION, rtOutput.m_primaryViewDirection.view, nullptr);
-      ctx->bindResourceView(INTEGRATE_FUSED_BINDING_PRIMARY_POSITION_ERROR, rtOutput.m_primaryPositionError.view, nullptr);
-      ctx->bindResourceView(INTEGRATE_FUSED_BINDING_PRIMARY_BASE_REFLECTIVITY, rtOutput.m_primaryBaseReflectivity.view(Resources::AccessType::ReadWrite), nullptr);
-      ctx->bindResourceView(INTEGRATE_FUSED_BINDING_PRIMARY_INDIRECT_DIFFUSE, rtOutput.m_primaryIndirectDiffuseRadiance.view(Resources::AccessType::Write), nullptr);
-      ctx->bindResourceView(INTEGRATE_FUSED_BINDING_PRIMARY_INDIRECT_SPECULAR, rtOutput.m_primaryIndirectSpecularRadiance.view(Resources::AccessType::Write), nullptr);
-    }
-
     DebugView& debugView = ctx->getDevice()->getCommon()->metaDebugView();
     ctx->bindResourceView(INTEGRATE_INSTRUMENTATION, debugView.getInstrumentation(), nullptr);
 
@@ -838,7 +793,7 @@ namespace dxvk {
       if (sharcUpdate || sharc.isActive()) {
         if (!sharcUpdate) {
           if (RtxSharc::queryTraceRay()) {
-            ctx->bindRaytracingPipelineShaders(getSharcTracePipelineShaders(serEnabled, ommEnabled, wboitEnabled, sharc.queryStatsActive(), includePortals, pomEnabled, fusedAssembly));
+            ctx->bindRaytracingPipelineShaders(getSharcTracePipelineShaders(serEnabled, ommEnabled, wboitEnabled, sharc.queryStatsActive(), includePortals, pomEnabled));
             ctx->traceRays(rayDims.width, rayDims.height, rayDims.depth);
           } else if (RtxSharc::queryRayGeneration()) {
             DxvkRaytracingPipelineShaders shaders;
@@ -979,18 +934,6 @@ namespace dxvk {
   };
 
   void DxvkPathtracerIntegrateIndirect::dispatchLighting(RtxContext* ctx, const Resources::RaytracingOutput& rtOutput) {
-    const auto& activeSharc = ctx->getCommonObjects()->metaSharc();
-    const bool fusedAssembly = RtxSharc::fuseAssembly() && activeSharc.isActive()
-      && RtxSharc::queryTraceRay()
-      && !RtxSharc::collectQueryStats() && !SparseRendering::Options::enableSparseRendering()
-      && ctx->getCommonObjects()->metaDebugView().debugViewIdx() == 0
-      && !ctx->getCommonObjects()->metaNeuralRadianceCache().isActive()
-      && !ctx->getCommonObjects()->metaReSTIRGIRayQuery().isActive()
-      && !rtOutput.m_indirectThroughputConeRadius.sharesTheSameView(rtOutput.m_primaryIndirectDiffuseRadiance);
-    if (m_fusedAssemblyActive != fusedAssembly) {
-      Logger::info(fusedAssembly ? "[SHARC] Combined query/assembly active" : "[SHARC] Standalone query/assembly active");
-      m_fusedAssemblyActive = fusedAssembly;
-    }
     {
       ScopedGpuProfileZone(ctx, "Integrate Indirect Raytracing");
       ctx->setFramePassStage(RtxFramePassStage::IndirectIntegration);
@@ -1010,7 +953,7 @@ namespace dxvk {
         sharc.recordTimestamp(*ctx, RtxSharc::TimingPoint::ResolveEnd);
         {
           ScopedGpuProfileZone(ctx, "SHARC Query");
-          dispatch(ctx, rtOutput, false, fusedAssembly);
+          dispatch(ctx, rtOutput, false);
         }
         sharc.recordTimestamp(*ctx, RtxSharc::TimingPoint::QueryEnd);
         sharc.endQueryStats(*ctx);
@@ -1020,11 +963,9 @@ namespace dxvk {
     }
     ctx->recordGpuStageTiming("IndirectIntegration");
 
-    if (!fusedAssembly) {
-      ctx->setFramePassStage(RtxFramePassStage::NEE_Integration);
-      ctx->bindCommonRayTracingResources(rtOutput);
-      dispatchNEE(ctx, AssemblyResources(rtOutput));
-    }
+    ctx->setFramePassStage(RtxFramePassStage::NEE_Integration);
+    ctx->bindCommonRayTracingResources(rtOutput);
+    dispatchNEE(ctx, AssemblyResources(rtOutput));
     ctx->recordGpuStageTiming("IndirectAssembly");
   }
 
@@ -1100,7 +1041,12 @@ namespace dxvk {
       integrateNeeShader = GET_SHADER_VARIANT(
         VK_SHADER_STAGE_COMPUTE_BIT, IntegrateNEEPlainShader, integrate_nee_plain);
     } else {
-      integrateNeeShader = IntegrateNEEShader::getShader();
+      // Unreachable: NRC and ReSTIR GI both reduce to integrateIndirectMode, which holds
+      // one value, so they cannot be active together.  The combined variant that used to
+      // serve this branch was removed rather than shipped for a state that cannot occur.
+      assert(false && "NRC and ReSTIR GI cannot both be active");
+      integrateNeeShader = GET_SHADER_VARIANT(
+        VK_SHADER_STAGE_COMPUTE_BIT, IntegrateNEEPlainShader, integrate_nee_plain);
     }
     ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, integrateNeeShader);
     ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);

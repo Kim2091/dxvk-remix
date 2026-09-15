@@ -158,9 +158,6 @@ void integrate_indirect_pass(uvec2 threadIndex)
     }
 
     IndirectRadianceHitDistance[gbufferPixelCoordinate] = vec4(vec3(0), kEmptyPixelHitDistance);
-#if SHARC_FUSED_ASSEMBLY
-    fusedIndirectRadiance = vec4(vec3(0), kEmptyPixelHitDistance);
-#endif
 
     return;
   }

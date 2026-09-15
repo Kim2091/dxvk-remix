@@ -81,11 +81,7 @@ void assembleIndirectLighting(uvec2 pixelCoordinate)
   vec4 indirectSpecularOutput = vec4(0);
   if (geometryFlags.primarySelectedIntegrationSurface)
   {
-#if SHARC_FUSED_ASSEMBLY
-    const vec4 indirectRadianceHitDistance = fusedIndirectRadiance;
-#else
     const vec4 indirectRadianceHitDistance = IndirectRadianceHitDistance[pixelCoordinate];
-#endif
     if (geometryFlags.firstSampledLobeIsSpecular)
     {
       indirectSpecularOutput = indirectRadianceHitDistance;

@@ -25,8 +25,6 @@ namespace dxvk {
     bool queryStatsActive() const { return m_statsSlot >= 0; }
     bool isActive() const { return m_active; }
 
-    RTX_OPTION("rtx.sharc", bool, fuseAssembly, false, "Experimental combined TraceRay query and primary NEE assembly. Enable before launch to allocate independent throughput storage. Unsupported modes use standalone assembly.");
-
     RTX_OPTION("rtx.sharc", bool, allowWboit, false, "Allow SHARC while WBOIT is enabled for compatibility testing. Does not enable WBOIT.");
     RTX_OPTION("rtx.sharc", bool, allowRayPortals, false, "Allow SHARC with ray portals for compatibility testing. Does not enable ray portals.");
     RTX_OPTION("rtx.sharc", bool, allowOpacityMicromap, false, "Allow SHARC while opacity micromaps are enabled for compatibility testing. Does not enable opacity micromaps.");
