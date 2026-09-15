@@ -67,25 +67,15 @@ namespace dxvk {
     const bool rayPortals = args.numActiveRayPortals > 0
       || !RtxOptions::rayPortalModelTextureHashes().empty();
     const bool opacityMicromap = RtxOptions::getEnableOpacityMicromap();
-    if (wboit && !allowWboit()) {
-      ++m_otherFallbackFrames;
-      m_status = "WBOIT blocks SHARC: enable Allow SHARC with WBOIT below to test; tracing normally";
-      return;
-    }
     if (rayPortals && !allowRayPortals()) {
       ++m_otherFallbackFrames;
       m_status = "Ray portals block SHARC: enable Allow SHARC with ray portals below to test; tracing normally";
       return;
     }
-    if (opacityMicromap && !allowOpacityMicromap()) {
-      ++m_otherFallbackFrames;
-      m_status = "OMM blocks SHARC: enable Allow SHARC with OMM below to test; tracing normally";
-      return;
-    }
     // Discard cached estimates when the tested feature combination changes.
     const uint32_t compatibilityFlags = (wboit ? 1u : 0u) | (rayPortals ? 2u : 0u)
-      | (opacityMicromap ? 4u : 0u) | (allowWboit() ? 8u : 0u)
-      | (allowRayPortals() ? 16u : 0u) | (allowOpacityMicromap() ? 32u : 0u)
+      | (opacityMicromap ? 4u : 0u)
+      | (allowRayPortals() ? 16u : 0u)
       | (deferredUpdates() ? 64u : 0u) | (queryRayGeneration() ? 128u : 0u)
       | (updateRayGeneration() ? 256u : 0u) | (allowSpecularPaths() ? 512u : 0u)
       | (queryTraceRay() ? 1024u : 0u)
@@ -156,8 +146,8 @@ namespace dxvk {
     m_resetRequested = false;
     m_allocationFailed = false;
     m_active = true;
-    m_status = (wboit || rayPortals || opacityMicromap)
-      ? "SHARC active: experimental compatibility override in use"
+    m_status = rayPortals
+      ? "SHARC active: experimental ray portal override in use"
       : "Experimental diffuse cache; finite update paths";
   }
 
@@ -292,10 +282,8 @@ namespace dxvk {
         100.0f * float(m_otherFallbackFrames) / denominator);
     }
     RemixGui::Checkbox("Log SHARC fallback statistics", &logFallbackStatsObject());
-    RemixGui::Checkbox("Allow SHARC with WBOIT", &allowWboitObject());
     RemixGui::Checkbox("Allow SHARC with ray portals", &allowRayPortalsObject());
-    RemixGui::Checkbox("Allow SHARC with OMM", &allowOpacityMicromapObject());
-    ImGui::TextWrapped("Compatibility testing: these overrides let SHARC run with features enabled in their normal settings.");
+    ImGui::TextWrapped("Ray portal support is untested: the world-space cache may not be valid across a portal transform. WBOIT and opacity micromaps need no override; SHARC has dedicated variants for the first and sets the micromap pipeline flag for the second.");
     RemixGui::Checkbox("Batch SHARC cache writes", &deferredUpdatesObject());
     RemixGui::Checkbox("TraceRay SHARC query", &queryTraceRayObject());
     if (!queryTraceRay()) {
