@@ -1331,6 +1331,10 @@ public:
                "reflected/indirect clouds match the primary Nubis look. Disable "
                "to make secondary sky-miss rays cloudless.");
 
+    RTX_OPTION("rtx.atmosphere", bool, cloudAmbientColumnScan, false,
+               "Experimental shared vertical density integration for ambient cloud lighting. "
+               "Changes quadrature; compare cloud underside shading before enabling permanently.");
+
     RTX_OPTION("rtx.atmosphere", bool, cloudReflectionDensityCache, false,
                "Experimental world-space density cache for cloud reflection traversal. "
                "Keeps the reference lookup resolution and sampling budget; compare total "
@@ -1646,6 +1650,7 @@ private:
   VkExtent2D          m_cloudRenderExtent = { 0u, 0u };
   VkExtent2D          m_cloudRenderFullExtent = { 0u, 0u };
   RtxMipmap::Resource m_cloudSecondaryLut;
+  bool m_cachedAmbientColumnScan = false;
   Resources::Resource m_cloudReflectionDensity;
   Resources::Resource m_cloudPlacementMap;
 

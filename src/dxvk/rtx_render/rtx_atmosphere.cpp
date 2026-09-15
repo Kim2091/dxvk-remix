@@ -49,6 +49,7 @@
 #include <rtx_shaders/cloud_sky_transmittance_lut.h>
 #include <rtx_shaders/cloud_sun_density_grid.h>
 #include <rtx_shaders/cloud_ambient_density_grid.h>
+#include <rtx_shaders/cloud_ambient_density_grid_scan.h>
 #include <rtx_shaders/cloud_render.h>
 #include <rtx_shaders/cloud_render_no_moon_shadows.h>
 #include <rtx_shaders/cloud_render_density_only.h>
@@ -226,6 +227,19 @@ namespace dxvk {
       END_PARAMETER()
     };
     PREWARM_SHADER_PIPELINE(CloudAmbientDensityGridShader);
+
+    class CloudAmbientDensityGridScanShader : public ManagedShader {
+      SHADER_SOURCE(CloudAmbientDensityGridScanShader, VK_SHADER_STAGE_COMPUTE_BIT, cloud_ambient_density_grid_scan)
+
+      BEGIN_PARAMETER()
+        CONSTANT_BUFFER(0)
+        RW_TEXTURE3D(1)
+        SAMPLER(3)
+        TEXTURE3D(5)
+        TEXTURE3D(6)
+      END_PARAMETER()
+    };
+    PREWARM_SHADER_PIPELINE(CloudAmbientDensityGridScanShader);
 
     class CloudRenderShader : public ManagedShader {
       SHADER_SOURCE(CloudRenderShader, VK_SHADER_STAGE_COMPUTE_BIT, cloud_render)
@@ -1987,6 +2001,11 @@ void RtxAtmosphere::computeLuts(RtxContext& rtx) {
     }
   }
 
+  if (m_cachedAmbientColumnScan != cloudAmbientColumnScan()) {
+    voxelGridsDirty = true;
+    m_cachedAmbientColumnScan = cloudAmbientColumnScan();
+  }
+
   if (!cloudsEnabled) {
     // Force a fresh bake on the frame clouds come back, rather than trusting a
     // key that went stale while the gate was closed.
@@ -2724,6 +2743,11 @@ void RtxAtmosphere::dispatchCloudAmbientDensityGrid(Rc<DxvkContext> ctx) {
   ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_cloudDetailNoise3D.image);
   ctx->getCommandList()->trackResource<DxvkAccess::Write>(m_cloudDAmbient.image);
 
+  if (cloudAmbientColumnScan()) {
+    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, CloudAmbientDensityGridScanShader::getShader());
+    ctx->dispatch(kCloudVoxelGridX / 4u, 1u, kCloudVoxelGridZ);
+    return;
+  }
   ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, CloudAmbientDensityGridShader::getShader());
 
   const uint32_t groupsX = (kCloudVoxelGridX + 7u) / 8u;

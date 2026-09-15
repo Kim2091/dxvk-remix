@@ -30,6 +30,11 @@
 // Cadence: rebaked every 8 frames at offset 4 (round-robin with D_sun
 // at offset 0). Driven from RtxAtmosphere::computeLuts.
 
+//!variant cloud_ambient_density_grid.comp
+//!variant cloud_ambient_density_grid_scan.comp
+//!> CLOUD_AMBIENT_COLUMN_SCAN
+//!end-variants
+
 #include "rtx/pass/atmosphere/atmosphere_common.slangh"
 // Nubis3 density model + the bake integrals themselves (moved there,
 // fork — Nubis3 conversion Phase B).
@@ -62,6 +67,57 @@ static const uint kGridX = 256u;
 static const uint kGridY = 32u;
 static const uint kGridZ = 256u;
 
+// NV-DXVK start: Share a vertical density integral across all output heights.
+#ifdef CLOUD_AMBIENT_COLUMN_SCAN
+groupshared float columnDensity[256];
+groupshared float columnIntegral[256];
+groupshared vec2 columnControls[4];
+
+[shader("compute")]
+[numthreads(4, 64, 1)]
+void main(uint3 dispatchId : SV_DispatchThreadID, uint3 groupThreadId : SV_GroupThreadID) {
+  AtmosphereArgs args = atmosphereArgs;
+  const uint lane = groupThreadId.y;
+  const uint base = groupThreadId.x * 64u;
+  const uint index = base + lane;
+  const vec2 xzUv = (vec2(dispatchId.x, dispatchId.z) + 0.5f) / vec2(kGridX, kGridZ);
+  const vec3 bottom = cloudVoxelUVWToWorld(vec3(xzUv.x, 0.0f, xzUv.y), args);
+  const float topY = args.cloudAltitude + args.cloudVoxelGridVerticalKm;
+  const float span = max(topY - bottom.y, 0.0f);
+  const float stepKm = span / 64.0f;
+  if (lane == 0u) {
+    columnControls[groupThreadId.x] = sampleCloudBakeControls(bottom.xz, args);
+  }
+  GroupMemoryBarrierWithGroupSync();
+  const vec2 controls = columnControls[groupThreadId.x];
+  const vec3 samplePos = bottom + vec3(0.0f, (float(lane) + 0.5f) * stepKm, 0.0f);
+  const float hf = computeCloudHeightFraction(samplePos, args);
+  const float density = span > 0.0f ? sampleCloudBakeDensity(samplePos, hf, controls.x, controls.y,
+    args, cloudNoise3DSamplerState, cloudNvdfSdfSrv, cloudDetailNoiseSrv) : 0.0f;
+  columnDensity[index] = density * stepKm;
+  columnIntegral[index] = density * stepKm;
+  GroupMemoryBarrierWithGroupSync();
+  [unroll]
+  for (uint offset = 1u; offset < 64u; offset *= 2u) {
+    float sum = columnIntegral[index];
+    if (lane + offset < 64u) {
+      sum += columnIntegral[index + offset];
+    }
+    GroupMemoryBarrierWithGroupSync();
+    columnIntegral[index] = sum;
+    GroupMemoryBarrierWithGroupSync();
+  }
+  if (lane < kGridY) {
+    const vec3 outputPos = cloudVoxelUVWToWorld(
+      vec3(xzUv.x, (float(lane) + 0.5f) / float(kGridY), xzUv.y), args);
+    const float cell = clamp((outputPos.y - bottom.y) / max(stepKm, 1e-8f), 0.0f, 64.0f);
+    const uint start = min(uint(cell), 63u);
+    const float opticalDepth = max(columnIntegral[base + start]
+      - (cell - float(start)) * columnDensity[base + start], 0.0f);
+    cloudDAmbientGridOutput[uint3(dispatchId.x, lane, dispatchId.z)] = opticalDepth;
+  }
+}
+#else
 // XZ control fields are identical across the eight vertical lanes in each column.
 groupshared vec2 cloudColumnControls[32];
 
@@ -94,3 +150,6 @@ void main(uint3 dispatchId : SV_DispatchThreadID, uint3 groupThreadId : SV_Group
 
   cloudDAmbientGridOutput[dispatchId] = opticalDepth;
 }
+
+#endif
+// NV-DXVK end
