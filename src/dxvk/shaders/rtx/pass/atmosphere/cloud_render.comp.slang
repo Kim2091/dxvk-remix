@@ -20,6 +20,21 @@
 * DEALINGS IN THE SOFTWARE.
 */
 
+//!variant cloud_render.comp
+//!variant cloud_render_no_moon_shadows.comp
+//!> CLOUD_PROFILE_NO_MOON_SHADOWS=1
+//!variant cloud_render_density_only.comp
+//!> CLOUD_PROFILE_DENSITY_ONLY=1
+//!variant cloud_render_wide.comp
+//!> CLOUD_GROUP_X=16 CLOUD_GROUP_Y=4
+//!variant cloud_render_small.comp
+//!> CLOUD_GROUP_X=8 CLOUD_GROUP_Y=4
+//!variant cloud_render_tight_bounds.comp
+//!> CLOUD_TIGHT_DENSITY_BOUNDS=1
+//!variant cloud_render_density_tight_bounds.comp
+//!> CLOUD_TIGHT_DENSITY_BOUNDS=1 CLOUD_PROFILE_DENSITY_ONLY=1
+//!end-variants
+
 // Cloud Render Compute Pass — Nubis Cubed 2023 (fork — 2026-05-12, C4).
 //
 // Per-pixel view-direction raymarch through the cloud slab using the Nubis
@@ -171,8 +186,13 @@ RWTexture2D<float4> cloudDepthOutput;
 #define CLOUD_MARCH_LIGHTNING 1
 #include "rtx/pass/atmosphere/cloud_march_common.slangh"
 
+#ifndef CLOUD_GROUP_X
+#define CLOUD_GROUP_X 8
+#define CLOUD_GROUP_Y 8
+#endif
+
 [shader("compute")]
-[numthreads(8, 8, 1)]
+[numthreads(CLOUD_GROUP_X, CLOUD_GROUP_Y, 1)]
 void main(uint3 dispatchId : SV_DispatchThreadID) {
   uint2 pixelCoord = dispatchId.xy;
   uint2 outputDim;

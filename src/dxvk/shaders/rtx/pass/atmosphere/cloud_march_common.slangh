@@ -64,6 +64,13 @@
 // includes this same header and persists across frames — a flash baked into
 // it would linger in reflections until the next re-bake. Default 0 keeps any
 // other consumer flash-free by construction.
+#ifndef CLOUD_PROFILE_DENSITY_ONLY
+#define CLOUD_PROFILE_DENSITY_ONLY 0
+#endif
+#ifndef CLOUD_PROFILE_NO_MOON_SHADOWS
+#define CLOUD_PROFILE_NO_MOON_SHADOWS 0
+#endif
+
 #ifndef CLOUD_MARCH_LIGHTNING
 #define CLOUD_MARCH_LIGHTNING 0
 #endif
@@ -907,6 +914,7 @@ bool integrateCloudSample(float tSampleKm,
   float aerialT_haze       = exp(-args.cloudAerialHazePerKm * tSampleKm);
   float aerialT_fade       = exp(-args.cloudAerialFadePerKm * tSampleKm);
   float sampleWeight       = viewTransmittance * aerialT_haze * (1.0f - stepTransmittance);
+#if !CLOUD_PROFILE_DENSITY_ONLY
   bool  refineLighting     = sampleWeight >= args.cloudLightingLodThreshold;
 
   // Nubis Cubed lighting at this sample. samplePos is already Y-up, so
@@ -969,11 +977,13 @@ bool integrateCloudSample(float tSampleKm,
   vec3 moonDirectLight = vec3(0.0f);
   if (ctx.moonActive) {
     float moonOpticalDepth = 0.0f;
+#if !CLOUD_PROFILE_NO_MOON_SHADOWS
     if (density >= kMoonShadowSkipDensity && refineLighting) {
       moonOpticalDepth = sampleCloudSunOpticalDepth_local(
           samplePos, ctx.combinedMoonDir, typeLocal, coverageLocal,
           ctx.planetCenterWorldKm, ctx.planetRadiusKm, args);
     }
+#endif
     float moonShadow = exp(-moonOpticalDepth * ctx.moonBaseSigma);
     // msMoonAniso (the Wrenninge phase-octave sum) is ray-constant — precomputed
     // in cloudShadeContextBeginRay instead of per sample (fork — 2026-07-30, perf).
@@ -1005,6 +1015,10 @@ bool integrateCloudSample(float tSampleKm,
   if (args.lightningFlashIntensity > 0.0f) {
     sampleColor += evalLightningFlash(samplePos, args);
   }
+#endif
+
+#else
+  vec3 sampleColor = vec3(1.0f);
 #endif
 
   // Beer-Lambert step accumulation. effectiveDensity / stepTransmittance and the
@@ -1284,10 +1298,18 @@ void marchCloudSlab(vec3   viewDirYUp,
   vec3 exitPosCF  = args.cameraWorldPosYUpKm + viewDirYUp * tExit;
   vec2 entryXZ = vec2(entryPosCF.x, entryPosCF.z);
   vec2 exitXZ  = vec2(exitPosCF.x,  exitPosCF.z);
-  float typeNoiseEntry     = cloudControlField2D(entryXZ * args.cloudTypeNoiseScale,     200.0f + slabNoiseSeedOffset);
-  float typeNoiseExit      = cloudControlField2D(exitXZ  * args.cloudTypeNoiseScale,     200.0f + slabNoiseSeedOffset);
-  float coverageNoiseEntry = cloudControlField2D(entryXZ * args.cloudCoverageNoiseScale, 250.0f + slabNoiseSeedOffset);
-  float coverageNoiseExit  = cloudControlField2D(exitXZ  * args.cloudCoverageNoiseScale, 250.0f + slabNoiseSeedOffset);
+  float typeNoiseEntry = 0.5f;
+  float typeNoiseExit = 0.5f;
+  float coverageNoiseEntry = 0.5f;
+  float coverageNoiseExit = 0.5f;
+  if (args.cloudTypeSpread != 0.0f) {
+    typeNoiseEntry = cloudControlField2D(entryXZ * args.cloudTypeNoiseScale, 200.0f + slabNoiseSeedOffset);
+    typeNoiseExit = cloudControlField2D(exitXZ * args.cloudTypeNoiseScale, 200.0f + slabNoiseSeedOffset);
+  }
+  if (args.cloudCoverageSpread != 0.0f) {
+    coverageNoiseEntry = cloudControlField2D(entryXZ * args.cloudCoverageNoiseScale, 250.0f + slabNoiseSeedOffset);
+    coverageNoiseExit = cloudControlField2D(exitXZ * args.cloudCoverageNoiseScale, 250.0f + slabNoiseSeedOffset);
+  }
 
   // √-adaptive hybrid march gate (fork — detail round 2026-07-16). Active
   // with a nonzero adaptive step floor (the knob is the off-switch) and a
@@ -1561,10 +1583,18 @@ void marchEchoDeck(vec3   viewDirYUp,
   vec3 exitPosCF  = args.cameraWorldPosYUpKm + viewDirYUp * tExit;
   vec2 entryXZ = vec2(entryPosCF.x, entryPosCF.z);
   vec2 exitXZ  = vec2(exitPosCF.x,  exitPosCF.z);
-  float typeNoiseEntry     = cloudControlField2D(entryXZ * args.cloudTypeNoiseScale,     200.0f + slabNoiseSeedOffset);
-  float typeNoiseExit      = cloudControlField2D(exitXZ  * args.cloudTypeNoiseScale,     200.0f + slabNoiseSeedOffset);
-  float coverageNoiseEntry = cloudControlField2D(entryXZ * args.cloudCoverageNoiseScale, 250.0f + slabNoiseSeedOffset);
-  float coverageNoiseExit  = cloudControlField2D(exitXZ  * args.cloudCoverageNoiseScale, 250.0f + slabNoiseSeedOffset);
+  float typeNoiseEntry = 0.5f;
+  float typeNoiseExit = 0.5f;
+  float coverageNoiseEntry = 0.5f;
+  float coverageNoiseExit = 0.5f;
+  if (args.cloudTypeSpread != 0.0f) {
+    typeNoiseEntry = cloudControlField2D(entryXZ * args.cloudTypeNoiseScale, 200.0f + slabNoiseSeedOffset);
+    typeNoiseExit = cloudControlField2D(exitXZ * args.cloudTypeNoiseScale, 200.0f + slabNoiseSeedOffset);
+  }
+  if (args.cloudCoverageSpread != 0.0f) {
+    coverageNoiseEntry = cloudControlField2D(entryXZ * args.cloudCoverageNoiseScale, 250.0f + slabNoiseSeedOffset);
+    coverageNoiseExit = cloudControlField2D(exitXZ * args.cloudCoverageNoiseScale, 250.0f + slabNoiseSeedOffset);
+  }
 
   // Echo-deck Nubis3 conversion (fork — legacy retirement, 2026-07-16). The
   // deck now samples the SAME NVDF/detail model as layer 1 ("the same cloud
@@ -1614,6 +1644,7 @@ void marchEchoDeck(vec3   viewDirYUp,
       continue;
     }
 
+#if !CLOUD_PROFILE_DENSITY_ONLY
     // Analytic sun-shadow optical depth in place of the layer-1-only D_sun
     // grid tap: depth grows toward the deck base (1 - hf) and scales with
     // the deck's own thickness × density. Cheap, artifact-free, and good
@@ -1640,12 +1671,14 @@ void marchEchoDeck(vec3   viewDirYUp,
     vec3 moonDirectLight = vec3(0.0f);
     if (ctx.moonActive) {
       float moonOpticalDepth = 0.0f;
+#if !CLOUD_PROFILE_NO_MOON_SHADOWS
       if (density >= kMoonShadowSkipDensity) {
         moonOpticalDepth = sampleCloudSunOpticalDepth_localSlab(
             samplePos, ctx.combinedMoonDir, typeLocal, coverageLocal,
             slabAltitudeKm, slabThicknessKm, slabDensityScale, fieldOffsetKm,
             ctx.planetCenterWorldKm, ctx.planetRadiusKm, args);
       }
+#endif
       float moonShadow = exp(-moonOpticalDepth * ctx.moonBaseSigma);
       // Ray-constant phase-octave sum — see cloudShadeContextBeginRay.
       moonDirectLight = (ctx.combinedMoonDiffuseCoeff
@@ -1667,6 +1700,10 @@ void marchEchoDeck(vec3   viewDirYUp,
     if (args.lightningFlashIntensity > 0.0f) {
       sampleColor += evalLightningFlash(samplePos, args);
     }
+#endif
+
+#else
+    vec3 sampleColor = vec3(1.0f);
 #endif
 
     float effectiveDensity = density * args.cloudDensity;
@@ -1744,6 +1781,9 @@ void marchCloudLayers(vec3  viewDirYUp,
   // looking down through it, which is the only configuration with two crossings -- so this costs a
   // span test per pixel in every other case, and renders the deck's far underside in that one.
   for (int spanPiece = 0; spanPiece < 2; ++spanPiece) {
+    if (viewTransmittance < kCloudExitTransmittance) {
+      break;
+    }
     marchCloudSlab(viewDirYUp, pixelJitter, pixelJitterStatic,
                    args.cloudAltitude, args.cloudThickness,
                    args.cloudTypeMean, args.cloudCoverageMean,

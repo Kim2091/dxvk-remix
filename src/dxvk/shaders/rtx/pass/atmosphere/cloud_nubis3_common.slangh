@@ -20,6 +20,11 @@
 * DEALINGS IN THE SOFTWARE.
 */
 
+#ifndef CLOUD_TIGHT_DENSITY_BOUNDS
+#define CLOUD_TIGHT_DENSITY_BOUNDS 0
+#endif
+
+
 /*
  * Nubis3 NVDF/SDF density model (fork — Nubis3 conversion Phase B).
  *
@@ -210,6 +215,20 @@ float sampleCloudDensityNubis3(vec3 worldPosKm,
     return 0.0f;
   }
 
+#if CLOUD_TIGHT_DENSITY_BOUNDS
+  const float kAltTypeSwing = 0.5f;
+  float typeShaped = saturate(saturate(typeLocal)
+                              + (smoothstep(0.1f, 0.8f, heightFraction) - 0.5f) * kAltTypeSwing);
+  // Saturated channels bound wispy displacement by 0.5 and billowy by 0.15.
+  const float signalBound = lerp(0.5f, 0.15f, typeShaped);
+  const float boundMarginKm = 1e-5f * max(1.0f, wobbleKm + args.nubis3ShapeVarietyKm);
+  const float localOutwardKm = signalBound * (wobbleKm + args.nubis3ShapeVarietyKm);
+  // Only reject this sample; type can change along the ray, so retain the original step bound.
+  if (sdfLive >= localOutwardKm + boundMarginKm) {
+    return 0.0f;
+  }
+#endif
+
   // 6. Up-rez (Nubis p.125): animated wispy/billowy composite. The detail tap is the ONLY thing that
   //    moves relative to the body -- the body SDF changes only on an NVDF re-bake -- so what this
   //    displacement looks like IS what the cloud animation looks like.
@@ -281,9 +300,11 @@ float sampleCloudDensityNubis3(vec3 worldPosKm,
   // silhouette wobble + mid lobes, interior texture) so the whole look
   // tracks; the D_sun/D_ambient bake integrands call this same sampler, so
   // the grids follow automatically.
+#if !CLOUD_TIGHT_DENSITY_BOUNDS
   const float kAltTypeSwing = 0.5f;
   float typeShaped = saturate(saturate(typeLocal)
                               + (smoothstep(0.1f, 0.8f, heightFraction) - 0.5f) * kAltTypeSwing);
+#endif
 
   // 6d. Mid-frequency silhouette lobes (GT7 pp.229-230 — fork, detail round
   //     2026-07-16). Silhouette spectrum audit: bodies are km-scale smooth
@@ -357,7 +378,12 @@ float sampleCloudDensityNubis3(vec3 worldPosKm,
   // function returns is unchanged either way.
   float sdfAfterMid = sdfLive - 0.4f * wobbleMid * wobbleKm
                     - wobbleMid * args.nubis3ShapeVarietyKm;
+#if CLOUD_TIGHT_DENSITY_BOUNDS
+  if (sdfAfterMid >= 0.3f * wobbleKm
+      || sdfAfterMid >= 0.6f * signalBound * wobbleKm + boundMarginKm) {
+#else
   if (sdfAfterMid >= 0.3f * wobbleKm) {
+#endif
     sdfKmOut = sdfAfterMid;
     return 0.0f;
   }
@@ -710,6 +736,19 @@ float sampleCloudBakeDensity(vec3 samplePos, float hf,
                                   1.0f, args, nvdfSdf, detailNoise, cloudSampler);
 }
 
+vec2 sampleCloudBakeControls(vec2 sampleXZKm, AtmosphereArgs args) {
+  float typeNoise = 0.5f;
+  float coverageNoise = 0.5f;
+  if (args.cloudTypeSpread != 0.0f) {
+    typeNoise = cloudControlField2D(sampleXZKm * args.cloudTypeNoiseScale, 200.0f);
+  }
+  if (args.cloudCoverageSpread != 0.0f) {
+    coverageNoise = cloudControlField2D(sampleXZKm * args.cloudCoverageNoiseScale, 250.0f);
+  }
+  return vec2(saturate(args.cloudTypeMean + (typeNoise - 0.5f) * args.cloudTypeSpread),
+              saturate(args.cloudCoverageMean + (coverageNoise - 0.5f) * args.cloudCoverageSpread));
+}
+
 // Sun-direction optical-depth integral for the D_sun voxel grid bake.
 // Returns raw integral in (km * density); consumers exponentiate with the
 // chosen extinction sigma later (e.g. exp(-σ * D_sun)).
@@ -721,7 +760,7 @@ float sampleCloudBakeDensity(vec3 samplePos, float hf,
 // the grid, so the bake must read coverage at the player rather than at the world origin.
 // That anchoring now arrives in worldPosYUpKm itself, which cloudVoxelUVWToWorld returns
 // already absolute; it is no longer re-added here.
-float sampleCloudSunOpticalDepthAtWorld(vec3 worldPosYUpKm, vec3 sunDirYUp,
+float sampleCloudSunOpticalDepthAtWorld(vec3 worldPosYUpKm, vec3 sunDirYUp, vec2 controls,
                                          AtmosphereArgs args,
                                          SamplerState cloudSampler,
                                          Texture3D<float> nvdfSdf,
@@ -796,11 +835,8 @@ float sampleCloudSunOpticalDepthAtWorld(vec3 worldPosYUpKm, vec3 sunDirYUp,
   // here is already included. Adding it a second time would double-count the anchor and put
   // the ~300 km-wavelength coverage/type fields at twice the player's offset — the very
   // bake/sample mismatch Stage 3 exists to remove, with the sign flipped.
-  vec2 sampleXZKm = vec2(worldPosYUpKm.x, worldPosYUpKm.z);
-  float typeNoise     = cloudControlField2D(sampleXZKm * args.cloudTypeNoiseScale,     200.0f);
-  float coverageNoise = cloudControlField2D(sampleXZKm * args.cloudCoverageNoiseScale, 250.0f);
-  float typeLocal     = saturate(args.cloudTypeMean     + (typeNoise     - 0.5f) * args.cloudTypeSpread);
-  float coverageLocal = saturate(args.cloudCoverageMean + (coverageNoise - 0.5f) * args.cloudCoverageSpread);
+  float typeLocal = controls.x;
+  float coverageLocal = controls.y;
 
   // ===== DE-JITTERED NEAR SECTION (fork — 2026-07-30, perf) =====
   //
@@ -922,7 +958,7 @@ float sampleCloudSunOpticalDepthAtWorld(vec3 worldPosYUpKm, vec3 sunDirYUp,
 // Zenith-direction optical-depth integral for the D_ambient voxel grid bake.
 // 6 uniform-step taps straight up from the voxel center to the slab top.
 // Returns raw integral; consumers exponentiate with their chosen sigma.
-float sampleCloudAmbientOpticalDepthAtWorld(vec3 worldPosYUpKm,
+float sampleCloudAmbientOpticalDepthAtWorld(vec3 worldPosYUpKm, vec2 controls,
                                              AtmosphereArgs args,
                                              SamplerState cloudSampler,
                                              Texture3D<float> nvdfSdf,
@@ -945,11 +981,8 @@ float sampleCloudAmbientOpticalDepthAtWorld(vec3 worldPosYUpKm,
   // here is already included. Adding it a second time would double-count the anchor and put
   // the ~300 km-wavelength coverage/type fields at twice the player's offset — the very
   // bake/sample mismatch Stage 3 exists to remove, with the sign flipped.
-  vec2 sampleXZKm = vec2(worldPosYUpKm.x, worldPosYUpKm.z);
-  float typeNoise     = cloudControlField2D(sampleXZKm * args.cloudTypeNoiseScale,     200.0f);
-  float coverageNoise = cloudControlField2D(sampleXZKm * args.cloudCoverageNoiseScale, 250.0f);
-  float typeLocal     = saturate(args.cloudTypeMean     + (typeNoise     - 0.5f) * args.cloudTypeSpread);
-  float coverageLocal = saturate(args.cloudCoverageMean + (coverageNoise - 0.5f) * args.cloudCoverageSpread);
+  float typeLocal = controls.x;
+  float coverageLocal = controls.y;
 
   [unroll]
   for (int i = 0; i < kSamples; ++i) {

@@ -67,12 +67,12 @@ static const uint kGridX = 256u;
 static const uint kGridY = 32u;
 static const uint kGridZ = 256u;
 
+// XZ control fields are identical across the eight vertical lanes in each column.
+groupshared vec2 cloudColumnControls[32];
+
 [shader("compute")]
 [numthreads(8, 8, 4)]
-void main(uint3 dispatchId : SV_DispatchThreadID) {
-  if (any(dispatchId >= uint3(kGridX, kGridY, kGridZ))) {
-    return;
-  }
+void main(uint3 dispatchId : SV_DispatchThreadID, uint3 groupThreadId : SV_GroupThreadID) {
 
   AtmosphereArgs args = atmosphereArgs;
 
@@ -82,13 +82,24 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
 
   // UVW -> world (Y-up, km), camera-centered.
   vec3 worldPosYUp = cloudVoxelUVWToWorld(uvw, args);
+  const uint columnIndex = groupThreadId.z * 8u + groupThreadId.x;
+  if (groupThreadId.y == 0u) {
+    cloudColumnControls[columnIndex] = sampleCloudBakeControls(worldPosYUp.xz, args);
+  }
+  GroupMemoryBarrierWithGroupSync();
+
+  // Every lane must reach the barrier, including padding if grid dimensions change.
+  if (any(dispatchId >= uint3(kGridX, kGridY, kGridZ))) {
+    return;
+  }
+  const vec2 controls = cloudColumnControls[columnIndex];
 
   // Sun direction is authored in Y-up space.
   vec3 sunDirYUp = normalize(args.sunDirection);
 
   // March integral. Returns 0 if the ray never reaches the slab top.
   float opticalDepth = sampleCloudSunOpticalDepthAtWorld(
-      worldPosYUp, sunDirYUp, args, cloudNoise3DSamplerState,
+      worldPosYUp, sunDirYUp, controls, args, cloudNoise3DSamplerState,
       cloudNvdfSdfSrv, cloudDetailNoiseSrv);
 
   cloudDSunGridOutput[dispatchId] = opticalDepth;

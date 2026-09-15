@@ -239,19 +239,6 @@ public:
   static void viewAltitudeKmOnChange(DxvkDevice* device);
   static void altitudeScaleOnChange(DxvkDevice* device);
 
-  // Allocate cloud history ping-pong at the downscaled extent; cheap when unchanged. Call once per frame.
-  void ensureCloudHistoryResources(Rc<DxvkContext> ctx, const VkExtent3D& downscaledExtent);
-
-  // Advance the ping-pong index once per frame. Idempotent within a frame — safe to call from each raygen-bind site.
-  void onFrameAdvanceForCloudHistory(uint32_t currentFrameId);
-
-  const Resources::Resource& getCurrentCloudHistory() const { return m_cloudHistory[m_cloudHistorySwap ? 1u : 0u]; }
-  const Resources::Resource& getPreviousCloudHistory() const { return m_cloudHistory[m_cloudHistorySwap ? 0u : 1u]; }
-
-  // R16_UINT per-pixel last-write frame index; evalSkyRadiance rejects stale history at foreground-occluded pixels.
-  const Resources::Resource& getCurrentCloudHistoryFrameId() const { return m_cloudHistoryFrameId[m_cloudHistorySwap ? 1u : 0u]; }
-  const Resources::Resource& getPreviousCloudHistoryFrameId() const { return m_cloudHistoryFrameId[m_cloudHistorySwap ? 0u : 1u]; }
-
   AtmosphereArgs getAtmosphereArgs() const;
 
   // Integrate wind/morph/boil accumulators: offset += velocity * dt. MUST be called exactly once per frame
@@ -876,6 +863,15 @@ public:
                "How strongly overcast clouds dim ground and atmosphere lighting [0..1]. "
                "1.0 = full physical voxel-grid shadow contribution from cloudVoxelShadowsEnable; "
                "0 = shadows fully muted (voxel grid still runs but its output is mixed away).");
+    RTX_OPTION("rtx.atmosphere", bool, cloudProfilingLog, false,
+               "Log mode-labelled cloud GPU timings every 120 rendered frames. "
+               "Enabled automatically when selecting a cloud profiling mode in the UI.")
+    RTX_OPTION("rtx.atmosphere", int, cloudProfilingMode, 0,
+               "Cloud screen-pass diagnostic. 0: Normal, 1: No moon shadows, 2: Density only, "
+               "3: Full quality with 16x4 workgroups, 4: Full quality with 8x4 workgroups, "
+               "5: Full quality with tighter density bounds, 6: Density only with tighter bounds. "
+               "Density only keeps density, attenuation and stepping but replaces lighting with white. "
+               "Use identical views and sample settings to compare GPU pass times.")
     RTX_OPTION("rtx.atmosphere", uint32_t, cloudViewSamples, 32,
                "Number of ray-march steps through the cloud slab. Higher = better quality, more cost. Range 1..32.");
     RTX_OPTION_ARGS("rtx.atmosphere", float, cloudThickness, 3.05f,
@@ -1316,42 +1312,17 @@ public:
                "internal (DLSS-input) resolution [0.25..1]. 0.5 = quarter the "
                "pixels (~4x cheaper cloud march); 1.0 = native (legacy, "
                "bit-exact). Applies on the next frame; live-tunable.");
-    // Default restored to 0.85 on 2026-09-06 (fork, EMA rectification) from the temporary 0 that
-    // 03b1acff7 set after the in-game measurement that 0 removed the cloud ghosting entirely. The
-    // composite's EMA now fetches its reprojected history bilinearly with per-tap age validation and
-    // clips it to the current frame's 3x3 neighbourhood (cloudHistoryClampGamma), which bounds any
-    // history/current disagreement to the local spread at every weight -- see applyCloudComposite in
-    // composite.comp.slang for the reasoning and for what was and was not proven about the original
-    // fault. Stage 6's sample-count reduction leans on this smoother.
-    RTX_OPTION("rtx.atmosphere", float, cloudHistoryWeight, 0.85f,
-               "EMA history weight of the cloud temporal smoother [0..0.98]. "
-               "Higher = smoother/softer clouds that respond slowly; lower = "
-               "crisper, faster-responding clouds with more visible per-frame "
-               "jitter. 0 disables the temporal blend entirely (raw jittered "
-               "march). 0.92 = the previous hardcoded value. The reprojected "
-               "history is neighbourhood-clipped (cloudHistoryClampGamma), so a "
-               "high weight cannot trail. Applies live.");
-    // Cloud temporal-EMA neighbourhood clip (fork — 2026-09-06, EMA rectification). Composite-only,
-    // like cloudHistoryWeight: it reaches the shader through CompositeArgs, never AtmosphereArgs, so
-    // it is invisible to every bake and LUT cache key by construction.
-    // Per-tap depth validation for the cloud temporal history (fork -- 2026-09-07). The cloud
-    // signal is integrated up to the primary surface, so a history tap is only comparable when it
-    // was computed against roughly the same surface distance. Relative, because the acceptable
-    // disagreement at 20 km is not the acceptable disagreement at 200 m. Raise it if moving edges
-    // sparkle (more history accepted), lower it if they trail (more rejected).
+    // Retained config keys for older installations; cloud accumulation has been removed.
+    RTX_OPTION("rtx.atmosphere", float, cloudHistoryWeight, 0.0f,
+               "Deprecated; cloud temporal smoothing has been removed.");
+    // Also used to reject mismatched surfaces during spatial upsampling.
     RTX_OPTION_ARGS("rtx.atmosphere", float, cloudHistoryDepthTolerance, 0.1f,
                "How far a cached cloud sample's surface distance may differ from the current pixel's "
                "before it is discarded, as a fraction of the larger of the two. Lower rejects more "
                "history: sharper behind moving objects, noisier at their edges.",
                args.minValue = 0.0f, args.maxValue = 1.0f);
-    RTX_OPTION("rtx.atmosphere", float, cloudHistoryClampGamma, 1.25f,
-               "Neighbourhood clip strength of the cloud temporal smoother [0..4]. The "
-               "reprojected history is clipped to mean +- gamma * stddev of the current "
-               "frame's 3x3 cloud neighbourhood before the EMA blend, so a reprojection "
-               "error can never trail further than the local spread. Lower = tighter "
-               "(crisper, less smoothing under fast motion); higher = looser (smoother, "
-               "more tolerant of jitter noise at low sample counts). 0 disables the clip "
-               "entirely -- the unrectified pre-2026-09-06 blend, for A/B only. Applies live.");
+    RTX_OPTION("rtx.atmosphere", float, cloudHistoryClampGamma, 0.0f,
+               "Deprecated; cloud temporal smoothing has been removed.");
 
     RTX_OPTION("rtx.atmosphere", bool, cloudSecondaryLutEnable, true,
                "Supply clouds to secondary rays (indirect bounces, PSR, "
@@ -1726,14 +1697,6 @@ private:
   uint32_t m_lightningRngState          { 0x9E3779B9u };
   static std::atomic<bool> s_lightningStrikeRequested;
 
-  // Ping-pong cloud history: [swap?1:0] = write target this frame, [swap?0:1] = read source.
-  Resources::Resource m_cloudHistory[2];
-  // R16_UINT per-pixel last-write frame index. Without this, the alpha-only disocclusion guard
-  // misidentifies stale history at foreground-occluded pixels and produces ~30-frame ghost trails.
-  Resources::Resource m_cloudHistoryFrameId[2];
-  VkExtent3D          m_cloudHistoryExtent = { 0u, 0u, 0u };
-  bool                m_cloudHistorySwap = false;
-  uint32_t            m_cloudHistoryLastFrameId = UINT32_MAX;
 
   Rc<DxvkBuffer> m_constantsBuffer;
   Rc<DxvkBuffer> m_cameraBuffer;

@@ -137,10 +137,6 @@ namespace dxvk {
         TEXTURE2D(COMPOSITE_ATMOSPHERE_CLOUD_RENDER_INPUT)
         SAMPLER(COMPOSITE_ATMOSPHERE_CLOUD_RENDER_SAMPLER)
         TEXTURE2D(COMPOSITE_ATMOSPHERE_CLOUD_DEPTH_INPUT)
-        TEXTURE2D(COMPOSITE_ATMOSPHERE_CLOUD_HISTORY_PREV_INPUT)
-        RW_TEXTURE2D(COMPOSITE_ATMOSPHERE_CLOUD_HISTORY_CURR_OUTPUT)
-        TEXTURE2D(COMPOSITE_ATMOSPHERE_CLOUD_HISTORY_FRAME_ID_PREV_INPUT)
-        RW_TEXTURE2D(COMPOSITE_ATMOSPHERE_CLOUD_HISTORY_FRAME_ID_CURR_OUTPUT)
 
         RW_TEXTURE2D(COMPOSITE_PRIMARY_ALBEDO_INPUT_OUTPUT)
         RW_TEXTURE2D(COMPOSITE_ACCUMULATED_FINAL_OUTPUT_INPUT_OUTPUT)
@@ -461,23 +457,6 @@ namespace dxvk {
         ctx->bindResourceView(COMPOSITE_ATMOSPHERE_CLOUD_DEPTH_INPUT, cloudDepthRT.view, nullptr);
       }
 
-      const auto& cloudHistoryPrev = atmosphere.getPreviousCloudHistory();
-      const auto& cloudHistoryCurr = atmosphere.getCurrentCloudHistory();
-      if (cloudHistoryPrev.isValid()) {
-        ctx->bindResourceView(COMPOSITE_ATMOSPHERE_CLOUD_HISTORY_PREV_INPUT, cloudHistoryPrev.view, nullptr);
-      }
-      if (cloudHistoryCurr.isValid()) {
-        ctx->bindResourceView(COMPOSITE_ATMOSPHERE_CLOUD_HISTORY_CURR_OUTPUT, cloudHistoryCurr.view, nullptr);
-      }
-
-      const auto& cloudFrameIdPrev = atmosphere.getPreviousCloudHistoryFrameId();
-      const auto& cloudFrameIdCurr = atmosphere.getCurrentCloudHistoryFrameId();
-      if (cloudFrameIdPrev.isValid()) {
-        ctx->bindResourceView(COMPOSITE_ATMOSPHERE_CLOUD_HISTORY_FRAME_ID_PREV_INPUT, cloudFrameIdPrev.view, nullptr);
-      }
-      if (cloudFrameIdCurr.isValid()) {
-        ctx->bindResourceView(COMPOSITE_ATMOSPHERE_CLOUD_HISTORY_FRAME_ID_CURR_OUTPUT, cloudFrameIdCurr.view, nullptr);
-      }
     }
 
     compositeArgs.camera = sceneManager.getCamera().getShaderConstants();
@@ -526,7 +505,7 @@ namespace dxvk {
     // Cloud temporal-EMA neighbourhood clip strength (fork — 2026-09-06, EMA rectification) -- see
     // composite_args.h's doc comment on the field and applyCloudComposite in composite.comp.slang.
     // Composite-only like cloudHistoryWeight; never reaches AtmosphereArgs or a LUT cache key.
-    compositeArgs.cloudHistoryClampGamma = std::max(RtxAtmosphere::cloudHistoryClampGamma(), 0.0f);
+    compositeArgs.cloudHistoryClampGamma = 0.0f;
     compositeArgs.cloudHistoryDepthTolerance = std::max(RtxAtmosphere::cloudHistoryDepthTolerance(), 0.0f);
     compositeArgs.outputParticleLayer = ctx->useRayReconstruction() && rayReconstruction.useParticleBuffer();
     compositeArgs.outputSecondarySignalToParticleLayer = ctx->useRayReconstruction() && rayReconstruction.preprocessSecondarySignal();

@@ -223,6 +223,9 @@ namespace dxvk {
       std::array<const char*, 64> labels = {};
       uint32_t count = 0;
       uint32_t frameId = 0;
+      int cloudMode = 0;
+      uint32_t cloudSamples = 0;
+      uint32_t cloudSamplesMax = 0;
       bool pending = false;
     };
     std::array<GpuStageFrame, 4> m_gpuStageFrames;

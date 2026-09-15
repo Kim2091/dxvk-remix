@@ -123,18 +123,6 @@ Texture3D<float> DebugViewCloudNvdfSdf;
 [[vk::binding(DEBUG_VIEW_BINDING_CLOUD_DEPTH_RT_INPUT)]]
 Texture2D<float4> DebugViewCloudDepthRT;
 
-// Fork: cloud-history frame-id ping-pong, PREVIOUS slot only (world-space cloud migration Stage 4b,
-// 2026-09-05). Read-only here — used by DEBUG_VIEW_CLOUD_REPROJECTION (883) to show the REAL
-// history-rejection reason (age check), not a current-frame proxy for it.
-[[vk::binding(DEBUG_VIEW_BINDING_CLOUD_HISTORY_FRAME_ID_PREV_INPUT)]]
-Texture2D<uint> DebugViewCloudHistoryFrameIdPrev;
-
-// Fork: cloud-history COLOUR ping-pong, PREVIOUS slot only (2026-09-06, EMA rectification). Read-only
-// -- used by DEBUG_VIEW_CLOUD_REPROJECTION (883) to show the real reprojected-history vs current-frame
-// error, the quantity the composite's neighbourhood clip bounds. Bound by RtxDebugView after composite
-// on the same resolved ping-pong pair, so it is exactly the history applyCloudComposite reprojected.
-[[vk::binding(DEBUG_VIEW_BINDING_CLOUD_HISTORY_PREV_INPUT)]]
-Texture2D<float4> DebugViewCloudHistoryPrev;
 
 [[vk::binding(DEBUG_VIEW_BINDING_VOLUME_RESERVOIRS_INPUT)]]
 Texture3D<uint4> VolumeReservoirs;
@@ -934,106 +922,8 @@ vec4 loadInput(inout RNG randomState, ivec2 threadId)
     }
     break;
   case DEBUG_VIEW_CLOUD_REPROJECTION:
-    {
-      // Fork diagnostic (world-space cloud migration, Stage 4b, 2026-09-05; reworked 2026-09-06, EMA
-      // rectification). Recomputes the SAME reprojection composite.comp.slang's applyCloudComposite
-      // performs (rotation term + translation parallax term), duplicated rather than shared -- see
-      // the enum's registration comment for the channel legend -- and then, unlike the original
-      // version of this view, compares the REAL reprojected history against this frame's raw cloud.
-      // The original reported only the parallax magnitude (identically zero on the Gamebryo target)
-      // and the rejection reason, so it could not distinguish "rotation MV wrong" from "rotation MV
-      // right" -- the one question the ghosting investigation needed answered in-game.
-      uint2 cloudDepthDim;
-      DebugViewCloudDepthRT.GetDimensions(cloudDepthDim.x, cloudDepthDim.y);
-      const vec2 depthKm = DebugViewCloudDepthRT[cloudNativeTexel(threadId, cloudDepthDim)].xy;
-      const float entryKm = depthKm.x;
-      const float meanKm = depthKm.y;
-
-      float reprojError = 0.0f;   // R
-      float rejectReason = 0.0f;  // G: 0 = history accepted
-      float mvMagnitude = 0.0f;   // B
-
-      if (entryKm < 0.0f)
-      {
-        rejectReason = 0.33f;  // no cloud along this ray -- nothing to reject
-      }
-      else
-      {
-// NV-DXVK start: Use the active camera projection for Numos clouds.
-        const vec2 totalMV = cloudReprojectionMotionVectorPixels(
-          cb.camera, threadId, meanKm, cb.cloudAnchorDeltaYUpKm, cb.atmosphereArgs);
-// NV-DXVK end
-        mvMagnitude = length(totalMV);
-
-        // ---- bilinear, per-tap age-validated history fetch (duplicate of composite.comp.slang's
-        // fetchCloudHistoryBilinear; same texel-index-space convention) ----
-        // Deliberately still BILINEAR after that function widened to Catmull-Rom (fork --
-        // 2026-09-08, temporal smear fix): this view measures the reprojected COORDINATE, and a
-        // bilinear read is the sharpest honest probe of it -- a wider reconstruction would blend
-        // some of the coordinate error away and flatter the very thing being measured. The
-        // depth half of the per-tap validation is likewise omitted here, as it always was.
-        const vec2 prevPixelF = vec2(threadId) + totalMV;
-        const vec2 base = floor(prevPixelF);
-        const vec2 f = prevPixelF - base;
-        const int2 baseTexel = int2(base);
-        const int2 resolution = int2(cb.camera.resolution);
-        const uint expectedPrevFrameId = (cb.frameIdx - 1u) & 0xFFFFu;
-        const float weights[4] = {
-          (1.0f - f.x) * (1.0f - f.y), f.x * (1.0f - f.y),
-          (1.0f - f.x) * f.y,          f.x * f.y };
-        const int2 offsets[4] = { int2(0, 0), int2(1, 0), int2(0, 1), int2(1, 1) };
-        vec4 history = vec4(0.0f);
-        float weightSum = 0.0f;
-        [unroll]
-        for (uint i = 0u; i < 4u; ++i)
-        {
-          const int2 texel = baseTexel + offsets[i];
-          if (any(texel < int2(0, 0)) || any(texel >= resolution))
-          {
-            continue;
-          }
-          // Low 16 bits only: the high half carries the packed surface distance since 2026-09-07 (fork).
-          const uint historyFrameId = DebugViewCloudHistoryFrameIdPrev[texel] & 0xFFFFu;
-          if ((historyFrameId != expectedPrevFrameId) || (historyFrameId == 0xFFFFu))
-          {
-            continue;
-          }
-          history += DebugViewCloudHistoryPrev[texel] * weights[i];
-          weightSum += weights[i];
-        }
-        const bool historyValid = (weightSum >= 1e-3f);
-
-        if (!historyValid)
-        {
-          rejectReason = 1.0f;  // no valid tap: stale age or off-screen reprojection
-        }
-        else if (cb.atmosphereArgs.cloudHistoryWeight <= 0.0f)
-        {
-          rejectReason = 0.66f;  // weight forced to 0 this frame (anchor cut) or the knob at 0
-        }
-
-        if (historyValid)
-        {
-          history /= weightSum;
-          // Current raw cloud in the composite's opacity convention (the RT stores transmittance).
-          uint2 cloudRtDim;
-          DebugViewCloudRenderRT.GetDimensions(cloudRtDim.x, cloudRtDim.y);
-          const vec4 rt = DebugViewCloudRenderRT[cloudNativeTexel(threadId, cloudRtDim)];
-          const vec4 current = vec4(rt.rgb, 1.0f - rt.a);
-          const vec3 diff = abs(history.rgb - current.rgb);
-          const vec3 scale = max(max(abs(history.rgb), abs(current.rgb)), vec3(1e-3f));
-          const vec3 relative = diff / scale;
-          const float rgbError = max(max(relative.x, relative.y), relative.z);
-          reprojError = max(rgbError, abs(history.a - current.a));
-        }
-      }
-
-      // R = reprojection error, G = reject reason, B = |MV| px / 8 -- see the enum's registration
-      // comment for the full legend. Packed as R/G/B (not alpha) so the debug view's per-channel
-      // pseudo-color modes read each signal in isolation without an alpha convention clashing with
-      // the coverage/opacity meaning alpha carries in most other debug views.
-      value = vec4(saturate(reprojError), rejectReason, saturate(mvMagnitude / 8.0f), 1.0f);
-    }
+    // Retired diagnostic ID: cloud history no longer exists.
+    value = vec4(0.0f, 0.0f, 0.0f, 1.0f);
     break;
   case DEBUG_VIEW_NRC_UPDATE_RADIANCE:
   case DEBUG_VIEW_NRC_UPDATE_THROUGHPUT:

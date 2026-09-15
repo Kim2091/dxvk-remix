@@ -1661,7 +1661,7 @@ namespace dxvk {
 
   void RtxContext::beginGpuStageTiming() {
     m_gpuStageSlot = -1;
-    if (!gpuStages() || !m_device->adapter()->deviceProperties().limits.timestampComputeAndGraphics) {
+    if (!(gpuStages() || RtxAtmosphere::cloudProfilingLog()) || !m_device->adapter()->deviceProperties().limits.timestampComputeAndGraphics) {
       return;
     }
     for (auto& frame : m_gpuStageFrames) {
@@ -1685,11 +1685,27 @@ namespace dxvk {
       }
       const double scale = m_device->adapter()->deviceProperties().limits.timestampPeriod * 1e-6;
       for (uint32_t i = 1; i < frame.count; ++i) {
-        Logger::info(str::format("[GPU stages] frame=", frame.frameId, " stage=", frame.labels[i],
-          " ms=", double(data[i].timestamp.time - data[i - 1].timestamp.time) * scale));
+        const double milliseconds = double(data[i].timestamp.time - data[i - 1].timestamp.time) * scale;
+        if (std::strcmp(frame.labels[i], "CloudScreen") == 0) {
+          const char* mode = frame.cloudMode == 1 ? "NoMoonShadows"
+                           : frame.cloudMode == 2 ? "DensityOnly"
+                           : frame.cloudMode == 3 ? "FullQuality16x4"
+                           : frame.cloudMode == 4 ? "FullQuality8x4"
+                           : frame.cloudMode == 5 ? "TightDensityBounds"
+                           : frame.cloudMode == 6 ? "DensityOnlyTightBounds" : "Normal";
+          Logger::info(str::format("[Cloud profile] frame=", frame.frameId, " mode=", mode,
+            " samples=", frame.cloudSamples, " maxSamples=", frame.cloudSamplesMax,
+            " ms=", milliseconds));
+        }
+        if (gpuStages()) {
+          Logger::info(str::format("[GPU stages] frame=", frame.frameId, " stage=", frame.labels[i],
+            " ms=", milliseconds));
+        }
       }
-      Logger::info(str::format("[GPU stages] frame=", frame.frameId, " stage=MeasuredSequence ms=",
-        double(data[frame.count - 1].timestamp.time - data[0].timestamp.time) * scale));
+      if (gpuStages()) {
+        Logger::info(str::format("[GPU stages] frame=", frame.frameId, " stage=MeasuredSequence ms=",
+          double(data[frame.count - 1].timestamp.time - data[0].timestamp.time) * scale));
+      }
       frame.pending = false;
     }
     if (m_gpuStageSampleCounter++ % 120 != 0) {
@@ -1702,6 +1718,10 @@ namespace dxvk {
     }
     frame.count = 0;
     frame.frameId = m_device->getCurrentFrameId();
+    // Retain dispatch-time settings while asynchronous timestamp results are pending.
+    frame.cloudMode = RtxAtmosphere::cloudProfilingMode();
+    frame.cloudSamples = RtxAtmosphere::cloudViewSamples();
+    frame.cloudSamplesMax = RtxAtmosphere::cloudViewSamplesMax();
     m_gpuStageSlot = int(slot);
     recordGpuStageTiming("Begin");
   }

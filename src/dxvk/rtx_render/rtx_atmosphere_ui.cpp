@@ -1107,23 +1107,6 @@ void RtxAtmosphere::showCloudSettings(const WeatherSnapshot* weatherSnapshot) {
       "Resolution of the cloud render relative to the internal render "
       "resolution. 0.5 = quarter the pixels (~4x cheaper clouds, "
       "slightly softer); 1.0 = native (legacy). Applies live.");
-    RemixGui::DragFloat("Temporal Smoothing", &RtxAtmosphere::cloudHistoryWeightObject(),
-      0.005f, 0.0f, 0.98f, "%.2f", sliderFlags);
-    RemixGui::SetTooltipToLastWidgetOnHover(
-      "EMA history weight of the cloud temporal smoother. Higher = "
-      "smoother clouds that respond slowly; lower = crisper detail "
-      "with more visible per-frame jitter. 0 = raw jittered march (no "
-      "temporal blend). The history is neighbourhood-clipped (see "
-      "Temporal Clamp) so a high weight cannot trail. Applies live.");
-    RemixGui::DragFloat("Temporal Clamp", &RtxAtmosphere::cloudHistoryClampGammaObject(),
-      0.01f, 0.0f, 4.0f, "%.2f", sliderFlags);
-    RemixGui::SetTooltipToLastWidgetOnHover(
-      "Neighbourhood clip strength of the cloud temporal smoother: the "
-      "reprojected history is clipped to mean +- gamma * stddev of the "
-      "current frame's 3x3 cloud neighbourhood before blending, so a "
-      "reprojection error can never trail further than the local spread. "
-      "Lower = tighter/crisper; higher = looser/smoother. 0 = no clip "
-      "(the pre-2026-09-06 blend, for A/B only). Applies live.");
     RemixGui::DragFloat("Cloud Sample Spacing", &RtxAtmosphere::cloudViewStepKmObject(),
       0.01f, 0.0f, 1.0f, "%.2f km", sliderFlags);
     RemixGui::SetTooltipToLastWidgetOnHover(
@@ -1147,6 +1130,28 @@ void RtxAtmosphere::showCloudSettings(const WeatherSnapshot* weatherSnapshot) {
       "out to ~6 km of cloud span; lower values cost less but let "
       "a little banding back in at the far horizon. 32 = legacy "
       "cost ceiling. Applies live.");
+    const char* kCloudProfilingModes[] = {
+      "Normal", "No moon shadows", "Density only (unlit)",
+      "Full quality (16x4 threads)", "Full quality (8x4 threads)",
+      "Full quality (tighter density bounds)", "Density only (tighter bounds)"
+    };
+    if (RemixGui::Combo("Cloud Profiling", &RtxAtmosphere::cloudProfilingModeObject(),
+      kCloudProfilingModes, IM_ARRAYSIZE(kCloudProfilingModes))) {
+      RtxAtmosphere::cloudProfilingLog.setDeferred(true);
+    }
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Diagnostic only. Compare cloud GPU pass times at the same camera and sample settings. "
+      "Density only preserves cloud shape, opacity and stepping, but removes lighting. "
+      "No moon shadows isolates live moon shadow marches. The full-quality modes change only "
+      "GPU workgroup layout; Normal uses 8x8. Tighter density bounds skip detail reads on "
+      "provably empty samples using the local cloud type, keeping the original ray-step bounds. "
+      "Let shader compilation and history settle "
+      "after switching. Selecting a mode automatically enables mode-labelled timing logs.");
+    RemixGui::Checkbox("Log Cloud Timings", &RtxAtmosphere::cloudProfilingLogObject());
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Writes cloud GPU times and the mode/sample settings to rtx-remix/logs/remix-dxvk.log "
+      "every 120 rendered frames. Keep each mode active for at least 10 seconds. "
+      "Return to Normal and turn logging off after testing.");
     RemixGui::DragFloat("Lighting LOD", &RtxAtmosphere::cloudLightingLodThresholdObject(),
       0.002f, 0.0f, 0.25f, "%.3f", sliderFlags);
     RemixGui::SetTooltipToLastWidgetOnHover(

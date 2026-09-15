@@ -50,6 +50,12 @@
 #include <rtx_shaders/cloud_sun_density_grid.h>
 #include <rtx_shaders/cloud_ambient_density_grid.h>
 #include <rtx_shaders/cloud_render.h>
+#include <rtx_shaders/cloud_render_no_moon_shadows.h>
+#include <rtx_shaders/cloud_render_density_only.h>
+#include <rtx_shaders/cloud_render_wide.h>
+#include <rtx_shaders/cloud_render_small.h>
+#include <rtx_shaders/cloud_render_tight_bounds.h>
+#include <rtx_shaders/cloud_render_density_tight_bounds.h>
 #include <rtx_shaders/cloud_secondary_lut.h>
 #include <rtx_shaders/cloud_placement_map_baker.h>
 #include <rtx_shaders/cloud_nvdf_occupancy.h>
@@ -1127,7 +1133,7 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
     args.nvdfStepScale           = std::min(std::max(RtxAtmosphere::nvdfStepScale(), 0.0f), 0.95f);
     // Cloud temporal-smoother EMA weight (fork — crispness pass). Composite-
     // only; zeroed in normalizeForSkyLutCache so slider drags never re-bake.
-    args.cloudHistoryWeight      = std::min(std::max(RtxAtmosphere::cloudHistoryWeight(), 0.0f), 0.98f);
+    args.cloudHistoryWeight      = 0.0f;
     // Anchor-delta camera cut (fork — 2026-09-05, world-space cloud migration Stage 2). Forces a
     // full one-frame reset of the screen-space cloud temporal history — the same knob the lightning
     // ghost-suppression fade above already collapses toward zero for exactly this reason (see
@@ -2967,7 +2973,9 @@ void RtxAtmosphere::ensureCloudRenderRT(Rc<DxvkContext> ctx,
                                 // cloud_render.comp.slang's unconditional depth-companion write)
     1);                         // mipLevels
 
-  m_cloudRenderExtent = downscaleExtent;
+  m_cloudRenderExtent = scaledExtent;
+  Logger::info(str::format("[Cloud render] extent=", scaledExtent.width, "x", scaledExtent.height,
+    " internal=", downscaleExtent.width, "x", downscaleExtent.height, " scale=", renderScale));
 }
 
 void RtxAtmosphere::setCloudShadowCameraPosition(const Vector3& cameraWorldPosYUpKm) {
@@ -3310,11 +3318,41 @@ void RtxAtmosphere::dispatchCloudRender(Rc<DxvkContext> ctx, const Resources::Ra
     ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_cloudSkyTransmittanceLut.image);
   }
 
-  ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, CloudRenderShader::getShader());
+  const int profilingMode = RtxAtmosphere::cloudProfilingMode();
+  switch (profilingMode) {
+  case 1:
+    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT,
+      GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, CloudRenderShader, cloud_render_no_moon_shadows));
+    break;
+  case 2:
+    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT,
+      GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, CloudRenderShader, cloud_render_density_only));
+    break;
+  case 3:
+    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT,
+      GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, CloudRenderShader, cloud_render_wide));
+    break;
+  case 4:
+    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT,
+      GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, CloudRenderShader, cloud_render_small));
+    break;
+  case 5:
+    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT,
+      GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, CloudRenderShader, cloud_render_tight_bounds));
+    break;
+  case 6:
+    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT,
+      GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, CloudRenderShader, cloud_render_density_tight_bounds));
+    break;
+  default:
+    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, CloudRenderShader::getShader());
+    break;
+  }
 
-  // Shader declares [numthreads(8, 8, 1)].
-  const uint32_t groupsX = (m_cloudRenderExtent.width  + 7u) / 8u;
-  const uint32_t groupsY = (m_cloudRenderExtent.height + 7u) / 8u;
+  const uint32_t groupWidth = profilingMode == 3 ? 16u : 8u;
+  const uint32_t groupHeight = profilingMode == 3 || profilingMode == 4 ? 4u : 8u;
+  const uint32_t groupsX = (m_cloudRenderExtent.width + groupWidth - 1u) / groupWidth;
+  const uint32_t groupsY = (m_cloudRenderExtent.height + groupHeight - 1u) / groupHeight;
   ctx->dispatch(groupsX, groupsY, 1);
 }
 
@@ -3419,93 +3457,6 @@ void RtxAtmosphere::dispatchCloudPlacementMapBake(Rc<DxvkContext> ctx) {
   ctx->dispatch(groupCount, groupCount, 1);
 }
 
-void RtxAtmosphere::onFrameAdvanceForCloudHistory(uint32_t currentFrameId) {
-  if (currentFrameId == m_cloudHistoryLastFrameId) {
-    return;  // already advanced this frame
-  }
-  // Don't swap on the very first observation — leaves swap = false so the
-  // initial frame writes to slot 0 and reads slot 1 (uninitialized -> zero ->
-  // disocclusion fallback). Subsequent frames toggle.
-  if (m_cloudHistoryLastFrameId != UINT32_MAX) {
-    m_cloudHistorySwap = !m_cloudHistorySwap;
-  }
-  m_cloudHistoryLastFrameId = currentFrameId;
-}
-
-void RtxAtmosphere::ensureCloudHistoryResources(Rc<DxvkContext> ctx, const VkExtent3D& downscaledExtent) {
-  // Bail on degenerate extents (can happen during early frames before resize
-  // events have settled) — we'll allocate on a later frame.
-  if (downscaledExtent.width == 0u || downscaledExtent.height == 0u) {
-    return;
-  }
-
-  const bool extentsMatch = (m_cloudHistoryExtent.width == downscaledExtent.width)
-                         && (m_cloudHistoryExtent.height == downscaledExtent.height);
-  if (extentsMatch && m_cloudHistory[0].isValid() && m_cloudHistory[1].isValid()) {
-    return;
-  }
-
-  // (Re)create both ping-pong slices at the requested screen extent.
-  // RGBA16F: rgb = premultiplied cloud radiance, a = cloud alpha. STORAGE bit
-  // for the RW write path; the read path uses the same view as a sampled image.
-  const VkExtent3D extent = { downscaledExtent.width, downscaledExtent.height, 1u };
-  for (uint32_t i = 0u; i < 2u; ++i) {
-    const char* names[2] = {
-      "Atmosphere Cloud History 0",
-      "Atmosphere Cloud History 1",
-    };
-    m_cloudHistory[i] = Resources::createImageResource(
-      ctx,
-      names[i],
-      extent,
-      VK_FORMAT_R16G16B16A16_SFLOAT,
-      1, // numLayers
-      VK_IMAGE_TYPE_2D,
-      VK_IMAGE_VIEW_TYPE_2D,
-      0, // imageCreateFlags
-      VK_IMAGE_USAGE_STORAGE_BIT, // extraUsageFlags
-      VkClearColorValue{}, // clearValue (zero -- treated as "no history" by shader disocclusion guard)
-      1 // mipLevels
-    );
-  }
-
-  // R32_UINT companion ping-pong (fork — 2026-05-13; widened from R16_UINT 2026-09-07). Low 16 bits
-  // hold the frame index (mod 0x10000) at which each pixel of the color ping-pong was last
-  // refreshed; the high 16 hold, as an f16, the primary surface distance in km that the stored cloud
-  // value was integrated against. The cloud signal is clamped at the surface, so a history tap is
-  // only comparable when it was computed against roughly the same surface -- see
-  // fetchCloudHistoryBilinear. Cleared to 0xFFFFFFFF, whose low half is the 0xFFFF "never written"
-  // sentinel the age check already recognised, so
-  // shader's age check rejects history at pixels that have never been
-  // written by the smoother (including foreground-occluded ones whose color
-  // slot retains pre-occlusion radiance). Drives the disocclusion fix for
-  // the bright-trail ghosting under the 2026-05-13 Nubis Cubed work — see
-  // atmosphere_sky.slangh's age-channel comment block for the mechanism.
-  VkClearColorValue frameIdClearValue{};
-  frameIdClearValue.uint32[0] = 0xFFFFFFFFu;
-  for (uint32_t i = 0u; i < 2u; ++i) {
-    const char* frameIdNames[2] = {
-      "Atmosphere Cloud History Frame ID 0",
-      "Atmosphere Cloud History Frame ID 1",
-    };
-    m_cloudHistoryFrameId[i] = Resources::createImageResource(
-      ctx,
-      frameIdNames[i],
-      extent,
-      VK_FORMAT_R32_UINT,
-      1, // numLayers
-      VK_IMAGE_TYPE_2D,
-      VK_IMAGE_VIEW_TYPE_2D,
-      0, // imageCreateFlags
-      VK_IMAGE_USAGE_STORAGE_BIT, // extraUsageFlags
-      frameIdClearValue,
-      1 // mipLevels
-    );
-  }
-
-  m_cloudHistoryExtent = extent;
-}
-
 AtmosphereArgs RtxAtmosphere::updateFrame(RtxContext& ctx,
                                           const WeatherSnapshot* weather,
                                           float deltaTimeSeconds) {
@@ -3523,16 +3474,6 @@ AtmosphereArgs RtxAtmosphere::updateFrame(RtxContext& ctx,
   // generation or AtmosphereArgs reads.
   advanceCloudMotion(deltaTimeSeconds);
   advanceTimeCycle(deltaTimeSeconds);
-
-  // Cloud temporal history is frame state too (fork -- 2026-09-06, open issue #2; was resolved
-  // from bindResources, i.e. from whichever RT pass bound first). Advancing it here puts it with
-  // the other once-per-frame integrators above and ahead of every consumer: the cloud screen pass,
-  // the RT passes' bindings, and the composite all run later in the frame and now read a pair that
-  // is already resolved. Sitting after the non-Numos early return above is deliberate -- with the
-  // Numos sky off there is no cloud history worth allocating or swapping, and bindResources'
-  // isValid() guards already handle the resources simply not existing.
-  onFrameAdvanceForCloudHistory(static_cast<uint32_t>(ctx.getDevice()->getCurrentFrameId()));
-  ensureCloudHistoryResources(&ctx, ctx.getResourceManager().getDownscaleDimensions());
 
   const RtCamera& camera = ctx.getSceneManager().getCamera();
   const Vector3 forward = camera.getDirection(/*freecam=*/true);
