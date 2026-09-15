@@ -360,3 +360,7 @@ The fresh same-DLL split comparison measured median query+assembly at 2.339 ms v
 Stop the renderer overhaul here. Preserve the current implementation and experimental options without further optimization or deployment work.
 
 Fusion produced no useful demonstrated performance benefit. In the fresh comparison, query plus assembly was slower with fusion (2.956 ms versus 2.339 ms split), while the overall measured GPU sequence was similar (15.628 ms versus 15.492 ms). Separate captures limit causal conclusions. Keep fusion disabled; it remains an opt-in research prototype, not an accepted optimization. FNV remains on full-feature SHARC with leanSecondary=False and fuseAssembly=False.
+
+## Lean parity pass resumed - 2026-09-14
+
+User lifted the pause. Analysis of the five lean gaps found that the full SHARC RTXDI sample stealing branch was non-functional and dropped NEE at camera-visible secondary vertices (no SHARC stage binds the reservoir); it is now compiled out for SHARC stages, matching lean. Lean and legacy blobs unchanged. See [parity record](Lean-SHARC-parity-2026-09-14.md) for the per-gap analysis, ranking and validation. Local only; no deployment, no push.
