@@ -200,11 +200,7 @@ struct NEECacheUtils
       lightSample.radiance = sanitize(opaqueSurfaceMaterialInteraction.emissiveRadiance, 0.0);
 
       // Special handling for emissive particles with opaque material, see the opaque material branch in resolveVertex()
-#if defined(SHARC_LEAN_SECONDARY) && !defined(SHARC_LEAN_UNORDERED)
-      const bool separateUnorderedApproximations = false;
-#else
       bool separateUnorderedApproximations = cb.enableSeparateUnorderedApproximations && cb.enableUnorderedResolveInIndirectRays;
-#endif
       const uint8_t resolveMode =
         resolveModeEmissiveOpacityTransmissionApprox |
         (cb.enableTransmissionApproximationInIndirectRays ? resolveModeTranslucencyTransmissionApprox : 0) |

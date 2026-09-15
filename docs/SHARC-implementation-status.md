@@ -368,3 +368,7 @@ User lifted the pause. Analysis of the five lean gaps found that the full SHARC 
 ### Lean feature tiers built (2026-09-14)
 
 Added opt-in `rtx.sharc.leanFeatureLevel` (1 restores alpha-blended indirect shadows, 2 also restores the unordered particle/decal resolve; each tier used only in frames containing that geometry) and `rtx.sharc.leanIndirectPom`. 28 new lean variants; level-2 query stages are byte-identical to the full stages after the stealing guard. All validators pass; RtxOptions.md regenerated. See [parity record](Lean-SHARC-parity-2026-09-14.md) for sizes, validation and the FNV A/B procedure. Not deployed; no timing measured.
+
+## Consolidated into one SHARC path - 2026-09-15
+
+User decision after the parity analysis: the lean profile is removed. Its scene gate was ported into the main path first (commit a4c057777): the direct/indirect alpha-blend and translucent shadow-ray mask bits and the indirect unordered resolve are now skipped per frame when the TLAS contains no such instances, which is output-identical; shader blobs unchanged. Then the lean options, 42 shader variants, selection code, UI and validator were deleted; four shader sources are byte-identical to the pre-lean tree and all 56 SHARC stages are byte-identical to the stealing-guard build. The SHARC reservoir guard from 9901d7e99 is kept and pinned by validate_sharc_integration.py. RtxOptions.md regenerated. Local only; nothing deployed or measured. Record: Lean-SHARC-parity-2026-09-14.md.

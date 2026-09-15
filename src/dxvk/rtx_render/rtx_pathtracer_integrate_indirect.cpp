@@ -187,48 +187,6 @@
 #include <rtx_shaders/integrate_indirect_sharc_query_miss_no_portals_stats_wboit.h>
 
 #include "rtx_sharc.h"
-#include <rtx_shaders/integrate_indirect_sharc_update_lean.h>
-#include <rtx_shaders/integrate_indirect_sharc_update_raygen_lean.h>
-#include <rtx_shaders/integrate_indirect_sharc_update_deferred_lean.h>
-#include <rtx_shaders/integrate_indirect_sharc_update_deferred_raygen_lean.h>
-#include <rtx_shaders/integrate_indirect_sharc_update_deferred4_lean.h>
-#include <rtx_shaders/integrate_indirect_sharc_update_deferred4_raygen_lean.h>
-#include <rtx_shaders/integrate_indirect_sharc_query_trace_lean.h>
-#include <rtx_shaders/integrate_indirect_sharc_query_trace_stats_lean.h>
-#include <rtx_shaders/integrate_indirect_sharc_query_trace_ser_lean.h>
-#include <rtx_shaders/integrate_indirect_sharc_query_trace_ser_stats_lean.h>
-#include <rtx_shaders/integrate_indirect_sharc_query_closesthit_no_portals_no_pom_lean.h>
-#include <rtx_shaders/integrate_indirect_sharc_query_miss_no_portals_lean.h>
-#include <rtx_shaders/integrate_indirect_sharc_query_closesthit_no_portals_no_pom_stats_lean.h>
-#include <rtx_shaders/integrate_indirect_sharc_query_miss_no_portals_stats_lean.h>
-#include <rtx_shaders/integrate_indirect_sharc_query_trace_ser_lean_particles.h>
-#include <rtx_shaders/integrate_indirect_sharc_query_trace_ser_stats_lean_particles.h>
-#include <rtx_shaders/integrate_indirect_sharc_update_deferred_raygen_lean_shadows.h>
-#include <rtx_shaders/integrate_indirect_sharc_update_deferred_raygen_lean_particles.h>
-#include <rtx_shaders/integrate_indirect_sharc_update_deferred_raygen_lean_particles_wboit.h>
-#include <rtx_shaders/integrate_indirect_sharc_update_deferred4_raygen_lean_shadows.h>
-#include <rtx_shaders/integrate_indirect_sharc_update_deferred4_raygen_lean_particles.h>
-#include <rtx_shaders/integrate_indirect_sharc_update_deferred4_raygen_lean_particles_wboit.h>
-#include <rtx_shaders/integrate_indirect_sharc_query_closesthit_no_portals_lean.h>
-#include <rtx_shaders/integrate_indirect_sharc_query_closesthit_no_portals_stats_lean.h>
-#include <rtx_shaders/integrate_indirect_sharc_query_closesthit_no_portals_lean_shadows.h>
-#include <rtx_shaders/integrate_indirect_sharc_query_closesthit_no_portals_stats_lean_shadows.h>
-#include <rtx_shaders/integrate_indirect_sharc_query_closesthit_no_portals_no_pom_lean_shadows.h>
-#include <rtx_shaders/integrate_indirect_sharc_query_closesthit_no_portals_no_pom_stats_lean_shadows.h>
-#include <rtx_shaders/integrate_indirect_sharc_query_closesthit_no_portals_lean_particles.h>
-#include <rtx_shaders/integrate_indirect_sharc_query_closesthit_no_portals_stats_lean_particles.h>
-#include <rtx_shaders/integrate_indirect_sharc_query_closesthit_no_portals_no_pom_lean_particles.h>
-#include <rtx_shaders/integrate_indirect_sharc_query_closesthit_no_portals_no_pom_stats_lean_particles.h>
-#include <rtx_shaders/integrate_indirect_sharc_query_closesthit_no_portals_lean_particles_wboit.h>
-#include <rtx_shaders/integrate_indirect_sharc_query_closesthit_no_portals_stats_lean_particles_wboit.h>
-#include <rtx_shaders/integrate_indirect_sharc_query_closesthit_no_portals_no_pom_lean_particles_wboit.h>
-#include <rtx_shaders/integrate_indirect_sharc_query_closesthit_no_portals_no_pom_stats_lean_particles_wboit.h>
-#include <rtx_shaders/integrate_indirect_sharc_query_miss_no_portals_lean_shadows.h>
-#include <rtx_shaders/integrate_indirect_sharc_query_miss_no_portals_stats_lean_shadows.h>
-#include <rtx_shaders/integrate_indirect_sharc_query_miss_no_portals_lean_particles.h>
-#include <rtx_shaders/integrate_indirect_sharc_query_miss_no_portals_stats_lean_particles.h>
-#include <rtx_shaders/integrate_indirect_sharc_query_miss_no_portals_lean_particles_wboit.h>
-#include <rtx_shaders/integrate_indirect_sharc_query_miss_no_portals_stats_lean_particles_wboit.h>
 
 #include "rtx/pass/sharc/sharc_binding_indices.h"
 
@@ -313,9 +271,12 @@ namespace dxvk {
     public:
       static std::vector<dxvk::DxvkResourceSlot> getResourceSlots() {
         auto slots = IntegrateIndirectRayGenShader::getResourceSlots();
-        // SHARC stages do not consume NRC or ReSTIR GI state.
+        // SHARC stages do not consume NRC or ReSTIR GI state, never reuse RTXDI samples and never
+        // read previous-frame lights (see the reservoir guard in integrator_indirect.slangh).
         slots.erase(std::remove_if(slots.begin(), slots.end(), [](const auto& slot) {
           switch (slot.slot) {
+          case INTEGRATE_INDIRECT_BINDING_PRIMARY_RTXDI_RESERVOIR:
+          case BINDING_PREVIOUS_LIGHT_DATA_BUFFER:
           case INTEGRATE_INDIRECT_BINDING_NRC_PATH_DATA0_INPUT:
           case INTEGRATE_INDIRECT_BINDING_NRC_UPDATE_PATH_DATA0_INPUT:
           case INTEGRATE_INDIRECT_BINDING_NRC_PATH_DATA1_INPUT:
@@ -411,81 +372,6 @@ namespace dxvk {
       BEGIN_PARAMETER()
       END_PARAMETER()
     };
-
-    template<typename BaseShader>
-    class IntegrateIndirectLeanShader : public BaseShader {
-    public:
-      static std::vector<dxvk::DxvkResourceSlot> getResourceSlots() {
-        auto slots = BaseShader::getResourceSlots();
-        // Lean stages never reuse RTXDI samples or access previous-frame lights.
-        slots.erase(std::remove_if(slots.begin(), slots.end(), [](const auto& slot) {
-          return slot.slot == INTEGRATE_INDIRECT_BINDING_PRIMARY_RTXDI_RESERVOIR
-              || slot.slot == BINDING_PREVIOUS_LIGHT_DATA_BUFFER;
-        }), slots.end());
-        return slots;
-      }
-    };
-
-    // Lean stages are selected per frame from the effective lean profile: tier suffixes are
-    // _lean (level 0), _lean_shadows (level 1), _lean_particles / _lean_particles_wboit (level 2).
-#define LEAN_SHARC_RAYGEN(className, name) GET_SHADER_VARIANT(VK_SHADER_STAGE_RAYGEN_BIT_KHR, IntegrateIndirectLeanShader<className>, name)
-#define LEAN_SHARC_UPDATE_RAYGEN(name) GET_SHADER_VARIANT(VK_SHADER_STAGE_RAYGEN_BIT_KHR, IntegrateIndirectLeanShader<IntegrateIndirectSharcUpdateShader>, name)
-#define LEAN_SHARC_UPDATE_COMPUTE(name) GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, IntegrateIndirectLeanShader<IntegrateIndirectSharcUpdateShader>, name)
-#define LEAN_SHARC_MISS(name) GET_SHADER_VARIANT(VK_SHADER_STAGE_MISS_BIT_KHR, IntegrateIndirectMissShader, name)
-#define LEAN_SHARC_CLOSEST_HIT(name) GET_SHADER_VARIANT(VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, IntegrateIndirectClosestHitShader, name)
-#define LEAN_SHARC_TIERED(macro, name, level, wboit) \
-    ((level) >= 2u ? ((wboit) ? macro(name##_lean_particles_wboit) : macro(name##_lean_particles)) \
-                   : ((level) == 1u ? macro(name##_lean_shadows) : macro(name##_lean)))
-
-    DxvkRaytracingPipelineShaders getLeanSharcTracePipelineShaders(bool serEnabled, bool ommEnabled, bool statsEnabled, const RtxSharc::LeanProfile& profile) {
-      DxvkRaytracingPipelineShaders shaders;
-      const uint32_t level = profile.level;
-      const bool wboit = profile.wboit;
-      // The non-SER raygen carries no feature code; the SER raygen only differs by the unordered coherence hint.
-      if (statsEnabled) {
-        shaders.addGeneralShader(serEnabled
-          ? (level >= 2u ? LEAN_SHARC_RAYGEN(IntegrateIndirectSharcStatsShader, integrate_indirect_sharc_query_trace_ser_stats_lean_particles)
-                         : LEAN_SHARC_RAYGEN(IntegrateIndirectSharcStatsShader, integrate_indirect_sharc_query_trace_ser_stats_lean))
-          : LEAN_SHARC_RAYGEN(IntegrateIndirectSharcStatsShader, integrate_indirect_sharc_query_trace_stats_lean));
-        shaders.addGeneralShader(LEAN_SHARC_TIERED(LEAN_SHARC_MISS, integrate_indirect_sharc_query_miss_no_portals_stats, level, wboit));
-        shaders.addHitGroup(profile.pom
-          ? LEAN_SHARC_TIERED(LEAN_SHARC_CLOSEST_HIT, integrate_indirect_sharc_query_closesthit_no_portals_stats, level, wboit)
-          : LEAN_SHARC_TIERED(LEAN_SHARC_CLOSEST_HIT, integrate_indirect_sharc_query_closesthit_no_portals_no_pom_stats, level, wboit), nullptr, nullptr);
-      } else {
-        shaders.addGeneralShader(serEnabled
-          ? (level >= 2u ? LEAN_SHARC_RAYGEN(IntegrateIndirectSharcShader, integrate_indirect_sharc_query_trace_ser_lean_particles)
-                         : LEAN_SHARC_RAYGEN(IntegrateIndirectSharcShader, integrate_indirect_sharc_query_trace_ser_lean))
-          : LEAN_SHARC_RAYGEN(IntegrateIndirectSharcShader, integrate_indirect_sharc_query_trace_lean));
-        shaders.addGeneralShader(LEAN_SHARC_TIERED(LEAN_SHARC_MISS, integrate_indirect_sharc_query_miss_no_portals, level, wboit));
-        shaders.addHitGroup(profile.pom
-          ? LEAN_SHARC_TIERED(LEAN_SHARC_CLOSEST_HIT, integrate_indirect_sharc_query_closesthit_no_portals, level, wboit)
-          : LEAN_SHARC_TIERED(LEAN_SHARC_CLOSEST_HIT, integrate_indirect_sharc_query_closesthit_no_portals_no_pom, level, wboit), nullptr, nullptr);
-      }
-      shaders.debugName = level >= 2u ? "SHARC Lean Query L2" : (level == 1u ? "SHARC Lean Query L1" : "SHARC Lean Query");
-      if (ommEnabled) {
-        shaders.pipelineFlags |= VK_PIPELINE_CREATE_RAY_TRACING_OPACITY_MICROMAP_BIT_EXT;
-      }
-      return shaders;
-    }
-
-    Rc<DxvkShader> getLeanSharcUpdateShader(bool rayGeneration, bool deferred, bool shortPath, uint32_t level, bool wboit) {
-      if (rayGeneration) {
-        if (!deferred) {
-          return LEAN_SHARC_UPDATE_RAYGEN(integrate_indirect_sharc_update_raygen_lean);
-        }
-        // Restored tiers exist for the ray-generation deferred backends only.
-        return shortPath
-          ? LEAN_SHARC_TIERED(LEAN_SHARC_UPDATE_RAYGEN, integrate_indirect_sharc_update_deferred4_raygen, level, wboit)
-          : LEAN_SHARC_TIERED(LEAN_SHARC_UPDATE_RAYGEN, integrate_indirect_sharc_update_deferred_raygen, level, wboit);
-      } else {
-        if (!deferred) {
-          return LEAN_SHARC_UPDATE_COMPUTE(integrate_indirect_sharc_update_lean);
-        }
-        return shortPath
-          ? LEAN_SHARC_UPDATE_COMPUTE(integrate_indirect_sharc_update_deferred4_lean)
-          : LEAN_SHARC_UPDATE_COMPUTE(integrate_indirect_sharc_update_deferred_lean);
-      }
-    }
 
     DxvkRaytracingPipelineShaders getSharcTracePipelineShaders(
       bool serEnabled, bool ommEnabled, bool wboitEnabled, bool statsEnabled, bool includePortals, bool pomEnabled, bool fusedAssembly = false) {
@@ -749,23 +635,6 @@ namespace dxvk {
 
       if (RtxSharc::isSupported(*m_device)
           && RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::Sharc) {
-        if (RtxSharc::leanSecondary()) {
-          const uint32_t maxLevel = uint32_t(std::clamp(RtxSharc::leanFeatureLevel(), 0, 2));
-          const bool updateTiers = RtxSharc::updateRayGeneration() && RtxSharc::deferredUpdates();
-          for (uint32_t level = 0; level <= maxLevel; ++level) {
-            RtxSharc::LeanProfile profile;
-            profile.level = level;
-            profile.updateLevel = updateTiers ? level : 0u;
-            profile.wboit = level == 2u && wboitEnabled;
-            for (int32_t pomEnabled = RtxSharc::leanIndirectPom() ? 1 : 0; pomEnabled >= 0; --pomEnabled) {
-              profile.pom = pomEnabled != 0;
-              for (bool stats : { false, true }) {
-                pipelineManager.registerRaytracingShaders(getLeanSharcTracePipelineShaders(serEnabled, ommEnabled, stats, profile));
-              }
-            }
-            getLeanSharcUpdateShader(RtxSharc::updateRayGeneration(), RtxSharc::deferredUpdates(), RtxSharc::updateBounces() <= 4, profile.updateLevel, profile.wboit);
-          }
-        }
         getComputeShader(useNeeCache, false, false, true, false);
         getComputeShader(useNeeCache, false, false, false, true);
         if (RtxSharc::queryTraceRay()) {
@@ -967,30 +836,6 @@ namespace dxvk {
       }
       const VkExtent3D workgroups = util::computeBlockCount(dispatchDims, VkExtent3D { 16, 8, 1 });
       if (sharcUpdate || sharc.isActive()) {
-        if (sharc.isLeanActive()) {
-          const RtxSharc::LeanProfile& profile = sharc.leanProfile();
-          if (!sharcUpdate) {
-            ctx->bindRaytracingPipelineShaders(getLeanSharcTracePipelineShaders(serEnabled, ommEnabled, sharc.queryStatsActive(), profile));
-            ctx->traceRays(rayDims.width, rayDims.height, rayDims.depth);
-          } else {
-            auto shader = getLeanSharcUpdateShader(RtxSharc::updateRayGeneration(), RtxSharc::deferredUpdates(),
-              rtOutput.m_raytraceArgs.sharcArgs.updateBounces <= 4, profile.updateLevel, profile.wboit);
-            if (RtxSharc::updateRayGeneration()) {
-              DxvkRaytracingPipelineShaders shaders;
-              shaders.addGeneralShader(shader);
-              shaders.debugName = "SHARC Lean Update";
-              if (ommEnabled) {
-                shaders.pipelineFlags |= VK_PIPELINE_CREATE_RAY_TRACING_OPACITY_MICROMAP_BIT_EXT;
-              }
-              ctx->bindRaytracingPipelineShaders(shaders);
-              ctx->traceRays(dispatchDims.width, dispatchDims.height, dispatchDims.depth);
-            } else {
-              ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, shader);
-              ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
-            }
-          }
-          return;
-        }
         if (!sharcUpdate) {
           if (RtxSharc::queryTraceRay()) {
             ctx->bindRaytracingPipelineShaders(getSharcTracePipelineShaders(serEnabled, ommEnabled, wboitEnabled, sharc.queryStatsActive(), includePortals, pomEnabled, fusedAssembly));
@@ -1134,11 +979,9 @@ namespace dxvk {
   };
 
   void DxvkPathtracerIntegrateIndirect::dispatchLighting(RtxContext* ctx, const Resources::RaytracingOutput& rtOutput) {
-    // Scene-gated lean tier selection; must precede the update and query dispatches below.
-    ctx->getCommonObjects()->metaSharc().resolveLeanProfile(*ctx, rtOutput.m_raytraceArgs);
     const auto& activeSharc = ctx->getCommonObjects()->metaSharc();
     const bool fusedAssembly = RtxSharc::fuseAssembly() && activeSharc.isActive()
-      && RtxSharc::queryTraceRay() && !activeSharc.isLeanActive()
+      && RtxSharc::queryTraceRay()
       && !RtxSharc::collectQueryStats() && !SparseRendering::Options::enableSparseRendering()
       && ctx->getCommonObjects()->metaDebugView().debugViewIdx() == 0
       && !ctx->getCommonObjects()->metaNeuralRadianceCache().isActive()

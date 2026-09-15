@@ -32,7 +32,7 @@ def main():
     source = (args.root / 'src/dxvk/rtx_render/rtx_pathtracer_integrate_indirect.cpp').read_text()
     names = set(re.findall(r'#include <rtx_shaders/(integrate_indirect_sharc_\w+)\.h>', source))
     files = [args.root / '_Comp64Release/src/dxvk/rtx_shaders' / (name + '.spv') for name in sorted(names)]
-    assert files and any('_lean' in p.stem for p in files)
+    assert files, 'No SHARC shader includes found'
     assert any('_wboit' in p.stem for p in files)
     dll = args.dll.read_bytes() if args.dll else None
     for path in files:

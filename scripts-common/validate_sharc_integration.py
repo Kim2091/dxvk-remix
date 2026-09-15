@@ -195,7 +195,7 @@ def check_reservoir_guard(root: Path, shader_dir: Path, dis: Path, baseline_dir,
     so SHARC stages (which never bind the reservoir) must compile the branch out entirely.
     """
     source = (root / "src/dxvk/shaders/rtx/algorithm/integrator_indirect.slangh").read_text(encoding="utf-8")
-    if not re.search(r"#if (?:defined\(SHARC_LEAN_SECONDARY\) \|\| \()?ENABLE_SHARC && !defined\(RAB_HAS_RTXDI_RESERVOIRS\)\)?\s*\n\s*if \(false\)", source):
+    if not re.search(r"#if ENABLE_SHARC && !defined\(RAB_HAS_RTXDI_RESERVOIRS\)\s*\n\s*if \(false\)", source):
         raise RuntimeError("integrator_indirect.slangh: SHARC reservoir guard around the stealing branch is missing")
     context = (root / "src/dxvk/rtx_render/rtx_context.cpp").read_text(encoding="utf-8")
     for needle in ("enableIndirectAlphaBlendShadows() && accelManager.hasAlphaBlendInstances()",

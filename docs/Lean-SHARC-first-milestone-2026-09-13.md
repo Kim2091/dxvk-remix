@@ -1,5 +1,7 @@
 # Lean SHARC: first full-resolution implementation
 
+> **Superseded (2026-09-15):** the lean profile and its options no longer exist; see docs/Lean-SHARC-parity-2026-09-14.md. This file is kept as the historical record of the experiment.
+
 Implemented in `C:/Users/sparkles/Projects/Fable_5_testing/wsn3g`, branch `revised-9-10`, over HEAD `bb69836fa`. This is the first secondary-shader milestone, not the completed streamlined renderer.
 
 ## Enable and compare

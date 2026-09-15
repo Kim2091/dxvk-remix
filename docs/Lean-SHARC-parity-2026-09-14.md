@@ -1,5 +1,7 @@
 # Lean SHARC parity with the full profile (2026-09-14)
 
+> **Status (2026-09-15): the lean profile has been removed.** The analysis below is what settled it: after step A the level-2 lean stages were byte-identical to the full stages, so lean only remained useful as a measuring instrument, and `rtx.enableUnorderedResolveInIndirectRays` / `rtx.enableIndirectAlphaBlendShadows` already provide that from the main path. The scene gate was ported into the main path first (output-identical, feature-preserving), then `rtx.sharc.leanSecondary`, `rtx.sharc.leanFeatureLevel`, `rtx.sharc.leanIndirectPom`, the 42 lean shader variants, the lean UI and `validate_lean_sharc.py` were deleted. The step-A reservoir guard is retained and pinned by `validate_sharc_integration.py`. See the consolidation section at the end.
+
 Worktree `wsn3g`, branch `revised-9-10`, starting from `fb2d09e13`. Goal: close the five gaps listed in the dependency audit while keeping the lean profile faster than the full profile. No game deployment and no push were performed; all timing statements below are structural unless labelled as user measurements.
 
 ## What lean actually removes
@@ -97,3 +99,39 @@ Same save and view for every run; hold still 10 s or more after each change so t
 3. Visual checks: level 1 against level 0 in rooms lit through blended glass or effects; level 2 against level 1 in reflections of smoke, sparks or decals (puddles, glass, wet floors). Level 2 against full should be indistinguishable.
 4. Cross-check without lean: full profile with `rtx.enableUnorderedResolveInIndirectRays = False` and `rtx.enableIndirectAlphaBlendShadows = False` should perform like lean level 0; if it does not, the remaining difference is variant selection rather than shader content.
 5. POM only if `rtx.displacement.enableIndirectHit = True` and displaced materials are present: add `rtx.sharc.leanIndirectPom = True`.
+
+## Consolidation: one SHARC path (2026-09-15)
+
+Decision: the lean profile is removed and the full SHARC path is the only path. Rationale: after step A the level-2 lean stages compiled byte-identical to the full stages, so lean's only remaining role was to measure the cost of two runtime features, which `rtx.enableUnorderedResolveInIndirectRays` and `rtx.enableIndirectAlphaBlendShadows` already do from the main path.
+
+### Step 1: scene gate ported into the main path (commit `a4c057777`)
+
+`RtxContext::updateRaytraceArgsConstantBuffer` now derives five per-frame flags from the TLAS contents counted in `AccelManager::buildTlas`:
+
+| Constant | Gate | Consumers (all pure mask bits or an empty-TLAS traversal) |
+|---|---|---|
+| `enableDirectAlphaBlendShadows`, `enableIndirectAlphaBlendShadows` | an opaque-TLAS instance carries `OBJECT_MASK_ALPHA_BLEND` this frame or last | `integrator_direct.slangh`, `integrator.slangh`, `integrate_nee.slangh`, `RtxdiApplicationBridge.slangh` (x2), `rtxdi_compute_gradients`, `restir_gi_*` |
+| `enableDirectTranslucentShadows`, `enableIndirectTranslucentShadows` | an opaque-TLAS instance carries `OBJECT_MASK_TRANSLUCENT` this frame or last | same shadow-ray sites |
+| `enableUnorderedResolveInIndirectRays` | the unordered TLAS has at least one instance with a non-zero mask (point-instancer slots count) | `path_state.slangh` (traversal activation and SER hint), `nee_cache_light.slangh` |
+
+Why the output is identical: a visibility ray whose mask includes a bit no instance carries traverses exactly the same set of instances as one without it; `resolveVertexUnordered` against an empty unordered TLAS returns attenuation 1, no emissive, no decal and no interactions; the `nee_cache_light.slangh` site only forwards the bit into a resolve mode that `evaluateOpaqueApproximations` never reads; and the SER hint is scheduling only. The one-frame memory covers the RTXDI visibility site that can trace `previousTopLevelAS`. Visibility rays never traverse the unordered TLAS. Counts are taken after the TLAS build and before the constants are written, and the gate applies identically during SHARC fallback because the same constants drive the legacy, NRC and ReSTIR GI paths. Nothing is gated on the producer side: TLAS builds, `enableSeparateUnorderedApproximations` (primary path), reservoirs, light history and NEE cache maintenance are unchanged.
+
+Validation: no shader source changed, so every blob is byte-identical (`gate-integration-validation.log`, `gate-lean-validation.log`, all 98 declared stages against the post-B snapshot, legacy stages against the pre-lean DLL). `validate_sharc_integration.py` now also asserts the two gate expressions exist in `rtx_context.cpp`. Structurally cheaper by construction in frames without such geometry; nothing measured.
+
+### Step 2: lean removed (this commit)
+
+Deleted: `rtx.sharc.leanSecondary`, `rtx.sharc.leanFeatureLevel`, `rtx.sharc.leanIndirectPom`, `RtxSharc::LeanProfile`/`resolveLeanProfile`/`isLeanActive`, the lean UI, `IntegrateIndirectLeanShader`, the `LEAN_SHARC_*` selection macros and pipelines, the 42 `*_lean*` variants, the `SHARC_LEAN_*` guards in four shader headers, the `OPAQUE_MATERIAL_USE_POM` lean branch in the raygen, the lean cache-compatibility bits, and `scripts-common/validate_lean_sharc.py`. `path_state.slangh`, `nee_cache_light.slangh`, `integrator.slangh` and the closest-hit/miss sources are byte-identical to the pre-lean tree. The SHARC descriptor layout now omits bindings 10 and 51 for every SHARC stage (formerly the lean-only filter), which matches what the stages bind.
+
+Retained on purpose: the step-A reservoir guard in `integrator_indirect.slangh`, now exactly `#if ENABLE_SHARC && !defined(RAB_HAS_RTXDI_RESERVOIRS)`. `validate_sharc_integration.py` pins it three ways: the source pattern must precede `if (false)`, no declared SHARC stage may bind 10/51 or read `enableRtxdiSampleStealing`, and the legacy TraceRay closest hit must still bind 51 and read the flag. Optional `--baseline-dir` / `--baseline-dll` arguments carry the byte-identity checks that the deleted validator used to run.
+
+Validation on the consolidated build: 56 declared SHARC stages byte-identical to the step-A snapshot; integration validator 62 PASS; resources validator 56 stages embedded; legacy stages byte-identical to the pre-lean DLL; stale `*_lean*` and `*_resample*` blobs removed from the build directory. `RtxOptions.md` regenerated by the isolated factory probe (three `rtx.sharc.lean*` rows gone). DLL 280,848,384 bytes, SHA-256 `F3973271AEE06869A7E46C78A98B6D9A81FD0A13A8442590DEDAE5D5765106B5`; PDB `8783466BCFBAD3485A9D9922AC3AE3EC8D5BA84B3142E563CD51CA8E450A7811`. Not deployed; nothing measured.
+
+### Step 3: what is left to optimize, and what was not touched
+
+Read-through of the unified query path found no further output-identical work to remove: the cache lookup precedes NEE and BSDF sampling, so a cache hit already skips both; responsive lighting is compiled out, so the lookup is a single sixteen-slot probe; material resolve is needed for eligibility and emission either way. Candidates that need the GPU stage harness before any change, in the order the reference capture suggests:
+
+1. Query stage (largest SHARC interval): measure the cache termination rate and the NEE cost at cache misses with statistics on; a lower `rtx.sharc.minRoughness` or `allowSpecularPaths` changes quality and is not an optimization.
+2. Update stage: cost scales with `updateTileSize`^-2 x `updateBounces`; the user's 8/4 already halves the default work. Not changed.
+3. Rejected or inconclusive earlier and not revisited: query/assembly fusion, update resampling, lookup-loop unroll, assembly-boundary refactor.
+
+Left alone deliberately: `enableSeparateUnorderedApproximations` (shared with the primary path), the inline RayQuery stages' upstream stealing structure, and any change to sampling, resolution or cache policy.

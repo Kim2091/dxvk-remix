@@ -5,7 +5,6 @@
 #include "rtx_sharc.h"
 #include "dxvk_device.h"
 #include "rtx_context.h"
-#include "rtx_scene_manager.h"
 #include "rtx_options.h"
 #include "rtx_shader_manager.h"
 #include "rtx_imgui.h"
@@ -41,8 +40,6 @@ namespace dxvk {
     const bool selected = RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::Sharc;
     const bool wasActive = m_active;
     m_active = false;
-    m_leanActive = false;
-    m_leanProfile = {};
     if (!selected) {
       m_hash = nullptr;
       m_accumulation = nullptr;
@@ -78,18 +75,14 @@ namespace dxvk {
       m_status = "OMM blocks SHARC: enable Allow SHARC with OMM below to test; tracing normally";
       return;
     }
-    const bool leanActive = leanSecondary() && !rayPortals;
     // Discard cached estimates when the tested feature combination changes.
     const uint32_t compatibilityFlags = (wboit ? 1u : 0u) | (rayPortals ? 2u : 0u)
       | (opacityMicromap ? 4u : 0u) | (allowWboit() ? 8u : 0u)
       | (allowRayPortals() ? 16u : 0u) | (allowOpacityMicromap() ? 32u : 0u)
       | (deferredUpdates() ? 64u : 0u) | (queryRayGeneration() ? 128u : 0u)
       | (updateRayGeneration() ? 256u : 0u) | (allowSpecularPaths() ? 512u : 0u)
-      | ((queryTraceRay() || leanActive) ? 1024u : 0u)
-      | ((queryTraceRay() || leanActive) && RtxOptions::isShaderExecutionReorderingInPathtracerIntegrateIndirectEnabled() ? 2048u : 0u)
-      | (leanActive ? 4096u : 0u)
-      | (leanActive ? (uint32_t(std::clamp(leanFeatureLevel(), 0, 2)) << 13) : 0u)
-      | (leanActive && leanIndirectPom() ? 32768u : 0u);
+      | (queryTraceRay() ? 1024u : 0u)
+      | (queryTraceRay() && RtxOptions::isShaderExecutionReorderingInPathtracerIntegrateIndirectEnabled() ? 2048u : 0u);
     if (m_allocationFailed && !m_resetRequested) {
       return;
     }
@@ -155,36 +148,9 @@ namespace dxvk {
     m_resetRequested = false;
     m_allocationFailed = false;
     m_active = true;
-    m_leanActive = leanActive;
     m_status = (wboit || rayPortals || opacityMicromap)
       ? "SHARC active: experimental compatibility override in use"
       : "Experimental diffuse cache; finite update paths";
-  }
-
-  void RtxSharc::resolveLeanProfile(RtxContext& ctx, const RaytraceArgs& args) {
-    LeanProfile profile;
-    if (isLeanActive()) {
-      const AccelManager& accel = ctx.getSceneManager().getAccelManager();
-      const uint32_t requested = uint32_t(std::clamp(leanFeatureLevel(), 0, 2));
-      // Each tier is only worth its cost in frames that contain the geometry it handles.
-      const bool shadows = requested >= 1 && args.enableIndirectAlphaBlendShadows != 0 && accel.hasAlphaBlendInstances();
-      const bool unordered = requested >= 2 && args.enableSeparateUnorderedApproximations != 0
-        && args.enableUnorderedResolveInIndirectRays != 0 && accel.getUnorderedInstanceCount() > 0;
-      profile.level = unordered ? 2u : (shadows ? 1u : 0u);
-      profile.updateLevel = (updateRayGeneration() && deferredUpdates()) ? profile.level : 0u;
-      profile.wboit = profile.level == 2 && RtxOptions::wboitEnabled();
-      profile.pom = leanIndirectPom() && args.pomMode != DisplacementMode::Off && RtxOptions::Displacement::enableIndirectHit();
-    }
-    if (profile != m_leanProfile) {
-      // Scene-driven changes can be frequent; log each distinct selection once per session.
-      const uint32_t key = profile.level | (profile.updateLevel << 2) | (profile.wboit ? 16u : 0u) | (profile.pom ? 32u : 0u);
-      if (isLeanActive() && !(m_loggedLeanProfiles & (1ull << key))) {
-        m_loggedLeanProfiles |= 1ull << key;
-        Logger::info(str::format("[SHARC] Lean profile: query level ", profile.level, ", update level ", profile.updateLevel,
-          profile.wboit ? ", WBOIT resolver" : "", profile.pom ? ", displacement" : ""));
-      }
-      m_leanProfile = profile;
-    }
   }
 
   void RtxSharc::bindResources(RtxContext& ctx) const {
@@ -301,18 +267,6 @@ namespace dxvk {
     RemixGui::Checkbox("Allow SHARC with ray portals", &allowRayPortalsObject());
     RemixGui::Checkbox("Allow SHARC with OMM", &allowOpacityMicromapObject());
     ImGui::TextWrapped("Compatibility testing: these overrides let SHARC run with features enabled in their normal settings.");
-    RemixGui::Checkbox("Lean secondary rendering", &leanSecondaryObject());
-    if (leanSecondary()) {
-      ImGui::TextWrapped("Full-resolution experimental profile. Simplifies indirect particles, decals, displacement and shadows; queries use TraceRay. Portal scenes use the full profile.");
-      ImGui::Text("Secondary profile: %s", isLeanActive() ? "Lean" : "Full / inactive");
-      RemixGui::DragInt("Lean feature level", &leanFeatureLevelObject(), 1.0f, 0, 2);
-      RemixGui::Checkbox("Lean secondary displacement", &leanIndirectPomObject());
-      ImGui::TextWrapped("Level 1 restores alpha-blended indirect shadows; level 2 also restores unordered particles and decals. Each is used only in frames containing that geometry.");
-      if (isLeanActive()) {
-        ImGui::Text("Effective: query level %u, update level %u%s%s", m_leanProfile.level, m_leanProfile.updateLevel,
-          m_leanProfile.wboit ? ", WBOIT resolver" : "", m_leanProfile.pom ? ", displacement" : "");
-      }
-    }
     RemixGui::Checkbox("Batch SHARC cache writes", &deferredUpdatesObject());
     RemixGui::Checkbox("TraceRay SHARC query", &queryTraceRayObject());
     if (!queryTraceRay()) {
@@ -333,9 +287,7 @@ namespace dxvk {
       ImGui::Text("Query backend: %s", (m_compatibilityFlags & 1024u)
         ? ((m_compatibilityFlags & 2048u) ? "TraceRay + SER" : "TraceRay")
         : ((m_compatibilityFlags & 128u) ? "RayQuery (ray generation)" : "RayQuery (compute)"));
-      ImGui::Text("Indirect particle resolver: %s", isLeanActive()
-        ? (m_leanProfile.level >= 2 ? (m_leanProfile.wboit ? "WBOIT (lean level 2)" : "sorted bins (lean level 2)") : "Disabled (lean)")
-        : ((m_compatibilityFlags & 1u) ? "WBOIT" : "sorted bins"));
+      ImGui::Text("Particle transparency: %s", (m_compatibilityFlags & 1u) ? "WBOIT" : "sorted bins");
       if (collectQueryStats() && m_haveQueryStats) {
         const auto& s = m_queryStats;
         const float paths = float(std::max(1u, s[0]));
