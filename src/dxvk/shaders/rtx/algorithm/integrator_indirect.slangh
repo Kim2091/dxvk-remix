@@ -533,6 +533,9 @@ void integratePathVertex(
   }
 #endif // SURFACE_MATERIAL_RESOLVE_TYPE_RAY_PORTAL
 
+  // Every resolve leg counts towards the segment length the cache diagnostics compare against.
+  sharcOnResolveLeg(pathState);
+
   // Check if resolving should continue, and if a surface was hit
 
   if (pathState.continueResolving)
@@ -1483,6 +1486,7 @@ void integrateIndirectPath(
 #if SHARC_QUERY_STATS
     sharcCount(pathState.pixelCoordinate, 1); // Ray segments per sampled path.
 #endif
+    sharcOnSegmentBegin(pathState);
 
     pathState.decalEncountered = false;
 

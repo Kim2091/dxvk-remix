@@ -324,8 +324,13 @@ namespace dxvk {
         ImGui::Text("Lookup hit rate %.1f%% | eligible surfaces %.1f%%", 100.0f * s[7] / float(std::max(uint64_t(1), s[6] + s[7])), 100.0f * s[4] / surfaces);
         ImGui::Text("Surface rejects: roughness %.1f%% | incoming non-diffuse %.1f%% | other %.1f%%",
           100.0f * s[3] / surfaces, 100.0f * s[8] / surfaces, 100.0f * s[9] / surfaces);
-        ImGui::Text("Too close: %.1f%% of eligible surfaces | samples: %llu paths over %u frames",
-          100.0f * s[5] / float(std::max(uint64_t(1), s[4])), (unsigned long long)s[0], kStatsWindowFrames);
+        ImGui::Text("  Other: non-opaque %.1f%% | medium %.1f%% | opacity < 1 %.1f%% | subsurface %.1f%% | emissive %.1f%%",
+          100.0f * s[14] / surfaces, 100.0f * s[15] / surfaces, 100.0f * s[16] / surfaces,
+          100.0f * s[17] / surfaces, 100.0f * s[18] / surfaces);
+        const float tooClose = float(std::max(uint64_t(1), s[5]));
+        ImGui::Text("Too close: %.1f%% of eligible surfaces | of those: last leg only %.1f%% | post-portal %.1f%% | first bounce %.1f%%",
+          100.0f * s[5] / float(std::max(uint64_t(1), s[4])), 100.0f * s[19] / tooClose, 100.0f * s[20] / tooClose, 100.0f * s[21] / tooClose);
+        ImGui::Text("Samples: %llu paths over %u frames", (unsigned long long)s[0], kStatsWindowFrames);
         ImGui::Text("Path ends: sky %.1f%% | bounce limit %.1f%% | zero weight %.1f%% | roulette %.1f%%",
           100.0f * s[10] / paths, 100.0f * s[11] / paths, 100.0f * s[12] / paths, 100.0f * s[13] / paths);
         ImGui::Text("Path limits: %u..%u | roulette %s", RtxOptions::pathMinBounces(), RtxOptions::pathMaxBounces(),

@@ -53,16 +53,21 @@ namespace dxvk {
     int m_timingSlot = -1;
     bool m_haveGpuTimes = false;
     static constexpr uint32_t kStatsStride = 256;
+    // Counter slots are documented at the sharcCount call sites in sharc_integrator_hooks.slangh
+    // and integrator_indirect.slangh: 0..13 the path and eligibility aggregates, 14..18 the
+    // surface term behind slot 9, 19..21 the too-close splits.
+    static constexpr uint32_t kStatsCount = 22;
+    static_assert(kStatsCount * sizeof(uint32_t) <= kStatsStride);
     std::array<Rc<DxvkGpuEvent>, 8> m_statsReady;
     Rc<DxvkBuffer> m_statsGpu;
     Rc<DxvkBuffer> m_statsReadback;
-    std::array<uint32_t, 14> m_queryStats = {};
+    std::array<uint32_t, kStatsCount> m_queryStats = {};
     // Per-frame counters are cleared every frame, so displaying them directly flickers
     // unreadably and any frame without a lookup reads as 0%. Accumulate over a window and
     // publish ratios of sums, which is both stable and the statistically correct ratio.
     static constexpr uint32_t kStatsWindowFrames = 120;
-    std::array<uint64_t, 14> m_queryStatsAccum = {};
-    std::array<uint64_t, 14> m_queryStatsWindow = {};
+    std::array<uint64_t, kStatsCount> m_queryStatsAccum = {};
+    std::array<uint64_t, kStatsCount> m_queryStatsWindow = {};
     uint32_t m_queryStatsAccumFrames = 0;
     bool m_haveQueryStatsWindow = false;
     int m_statsSlot = -1;

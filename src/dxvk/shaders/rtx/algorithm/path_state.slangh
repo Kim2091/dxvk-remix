@@ -98,7 +98,14 @@ struct PathState : IBasePayloadState
   // (opaque diffuse reflection / transmission); gates skyIndirectRadianceScale on
   // sky miss so reflections / refractions / cutouts stay physical. (_flags is
   // bit-saturated, so this rides in its own byte.)
+  // SHARC query stages keep the low seven bits of sharcSegmentDistance in bits 1-7.
   uint8_t _skyGatherEligible;
+#if SHARC_QUERY
+  // High eight bits of sharcSegmentDistance. This byte is the padding before _pixelCoordinate,
+  // so the payload does not grow; it is declared only for SHARC query stages so every other
+  // stage keeps its exact struct (the validator checks the legacy blobs byte-for-byte).
+  uint8_t _sharcSegmentDistanceHi;
+#endif
 
   // Need to track pixel coordinate for sparse rendering where threads can remap to different pixels
   u16vec2 _pixelCoordinate;
@@ -407,9 +414,36 @@ struct PathState : IBasePayloadState
   // the indirect integrator's sky-miss path to opt into skyIndirectRadianceScale.
   property bool skyGatherEligible
   {
+#if SHARC_QUERY
+      get { return (_skyGatherEligible & uint8_t(1u)) != uint8_t(0u); }
+      set { _skyGatherEligible = (_skyGatherEligible & uint8_t(0xFEu)) | (newValue ? uint8_t(1u) : uint8_t(0u)); }
+#else
       get { return _skyGatherEligible != uint8_t(0u); }
       set { _skyGatherEligible = newValue ? uint8_t(1u) : uint8_t(0u); }
+#endif
   }
+
+#if SHARC_QUERY
+  // Length of the secondary segment in flight summed over every resolve leg. Cutouts, clipped
+  // geometry, portal quads and teleports re-trace from the interaction and restart
+  // segmentHitDistance, so that field alone is the last leg. Stored as a sign-less float16
+  // (distances are non-negative) split across the spare bits of _skyGatherEligible and the
+  // former padding byte, so SHARC query payloads stay the same size.
+  property float sharcSegmentDistance
+  {
+      get
+      {
+        const uint bits = (uint(_sharcSegmentDistanceHi) << 7) | (uint(_skyGatherEligible) >> 1);
+        return uint16BitsToF32(uint16_t(bits));
+      }
+      set
+      {
+        const uint bits = uint(float16BitsToUint16(float16_t(clamp(newValue, 0.0f, 65504.0f))));
+        _skyGatherEligible = uint8_t((uint(_skyGatherEligible) & 1u) | ((bits & 0x7Fu) << 1));
+        _sharcSegmentDistanceHi = uint8_t((bits >> 7) & 0xFFu);
+      }
+  }
+#endif
 
   // Packed members
 

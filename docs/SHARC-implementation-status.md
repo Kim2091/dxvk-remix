@@ -416,3 +416,71 @@ No frame time was measured on either build; "about the same, maybe a tad worse" 
 user's in-game impression, not a capture. The gate build is retained at
 PortalRTX/bin/.trex/d3d9.dll.backup-portal-gate-20260915-1950 and its source is tagged
 sharc-portals-verified-20260915, so an A/B remains possible without a rebuild.
+
+## Eligibility diagnosis and per-pixel debug views - 2026-09-15
+
+Portal RTX readings with the stats window (roulette on, bounces 1..4, allowSpecularPaths on,
+~2.56M paths): eligible surfaces 0.2%, roughness rejects 62.0%, "other" rejects 37.8%, too close
+30.1% of eligible, hit rate 69.7%. Roulette off lengthened paths (1.71 to 3.96 segments) without
+moving eligibility (0.3%), so path length is not the constraint.
+
+**Clamp bug.** All of those numbers were taken at an effective `minRoughness` of 0.5: `prepareFrame`
+clamped the option to [0.5, 1] before writing `sharcArgs`, while the slider showed the user's 0.05.
+Fixed in 7dcd68206 (floor 0.05), built and deployed to both installs, backup suffix
+`backup-pre-minrough-fix-20260915-203424` (Portal RTX: dll only; FNV: dll and pdb). Not yet
+re-measured; the 62% roughness figure is a reading of the wrong threshold, and how much of it
+survives at a real 0.05 is the first thing to read off the panel.
+
+**What "other" is.** Slot 9 is `!sharcSurfaceEligible`, five terms in one number. The
+integrator's own resolve loop says which are plausible in Portal RTX: translucent materials
+(glass panels) fail the opaque test; any vertex whose `emissiveLight` has a non-zero channel
+fails the emissive test, and the test is strict (`> 0`), so a panel with a faint emissive map
+counts the same as a light fixture. Which of the two dominates cannot be inferred from source,
+which is why slot 9 is now split (counters 14..18: non-opaque, medium, opacity < 1, subsurface,
+emissive) and the panel prints the split under the "Surface rejects" line.
+
+**Too close.** `farEnough` compares `segmentHitDistance` with the voxel diagonal, and
+`segmentHitDistance` is the *last resolve leg*: `RESOLVE_RAY_TRACE` zeroes it before every
+re-trace, and `resolveVertexFinalContinue` re-traces for clipped geometry, opacity below the
+transparency threshold / stochastic alpha (cutouts such as grates and catwalks), the opaque and
+translucent approximations, a miss on a portal quad, and a portal teleport. A wall behind a grate
+therefore measures the grate-to-wall gap, and a wall reached through a portal measures the
+post-portal leg. Both are conservative (the true vertex spacing is never shorter than the last
+leg), so the guard cannot admit a self-referencing lookup; it rejects lookups it should allow.
+The portal case is now moot for self-reference anyway: since 7c337eb39 the cell key carries
+portal space, so the pre- and post-portal vertices can never share a cell. (The 2026-09-15
+portal investigation reasoned the other way, "the guard weakens"; that predates the key change.)
+
+Query stages now track the whole segment length in `PathState.sharcSegmentDistance` (a sign-less
+float16 in the spare bits of `_skyGatherEligible` plus the padding byte before
+`_pixelCoordinate`, so the payload does not grow) via two new hooks, `sharcOnSegmentBegin` and
+`sharcOnResolveLeg`. The guard itself is unchanged: counters 19..21 split too-close into
+"last leg only" (the whole segment passes), "post-portal vertex" and "first indirect bounce", so
+the measurement artefact can be sized before the guard is switched to the whole-segment
+distance, which is a one-line change in `sharcOnResolvedVertex`.
+
+`gridScale` scales the threshold directly (`voxel = 2^level / gridScale`), so it is a lever on
+the genuine too-close share and on nothing else; it has no effect on the last-leg artefact and
+the split says which of the two dominates.
+
+**Debug views** (`rtx.debugView.debugViewIdx` 580..587, listed under "SHARC" in the Debug View
+panel; query stages only, so SHARC must be the active indirect mode). The vertex shown is
+bounce ROUND(Debug Knob [0]) + 1, knob 0 = first indirect hit, the NRC convention:
+
+| Index | View | Reading |
+|---|---|---|
+| 580 | SHARC Query: Outcome | green hit, red miss, blue too close, grey rejected, black no vertex |
+| 581 | SHARC Query: Rejection Reason | red non-opaque, green medium, blue opacity, yellow subsurface, magenta emissive, cyan lobe, white roughness, black eligible |
+| 582 | SHARC Query: Too Close Guard | green passed, red genuinely close, yellow last-leg artefact, magenta/cyan the same two through a portal |
+| 583 | SHARC Query: Cached Radiance | radiance read where the path ended on the cache (HDR) |
+| 584 | SHARC Query: Termination Bounce | bounce at which the cache ended the path, 0 never |
+| 585 | SHARC Grid: Cells | hash-coloured cell at the vertex |
+| 586 | SHARC Grid: Level / Voxel Size / Last Leg | R level, G voxel size, B last leg (raw values) |
+| 587 | SHARC Grid: Cell Age | R accumulated frames, G stale frames, B sample count (raw values) |
+
+The rejection reason, stats split and eligibility test all derive from one function,
+`sharcRejectReason`, so they cannot disagree. Cost when no SHARC view is selected: one uniform
+range compare per resolved vertex in the query stages, plus the segment-length bookkeeping
+(two float16 pack/unpack operations per resolve leg). Not measured.
+
+BUILD_VALIDATION_PLACEHOLDER

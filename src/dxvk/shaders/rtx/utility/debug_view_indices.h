@@ -250,6 +250,19 @@
 #define DEBUG_VIEW_NRC_QUERY_NUMBER_OF_BOUNCES 575
 #define DEBUG_VIEW_NRC_QUERY_NUMBER_OF_PATH_SEGMENTS 576
 #define DEBUG_VIEW_NRC_QUERY_NUMBER_OF_INDIRECT_PATH_SEGMENTS 577
+
+// SHARC (fork, 2026-09-15). Per-pixel views of the world-space radiance cache, written by the
+// SHARC query stages from sharc_integrator_hooks.slangh. All but the two "hit" views show one
+// indirect vertex, selected by ROUND(Debug Knob [0]) with 0 = first indirect hit, the NRC
+// convention. Keep the block contiguous: the shader gates all of them with one range compare.
+#define DEBUG_VIEW_SHARC_QUERY_OUTCOME 580       // green hit, red miss, blue too close, grey rejected
+#define DEBUG_VIEW_SHARC_REJECT_REASON 581       // first failing eligibility term, colour-coded
+#define DEBUG_VIEW_SHARC_TOO_CLOSE 582           // the distance guard, last leg vs whole segment
+#define DEBUG_VIEW_SHARC_CACHED_RADIANCE 583     // radiance read from the cache where the path ended on it
+#define DEBUG_VIEW_SHARC_TERMINATION_BOUNCE 584  // bounce at which the cache ended the path, 0 never
+#define DEBUG_VIEW_SHARC_GRID_CELLS 585          // hash-coloured cell at the vertex
+#define DEBUG_VIEW_SHARC_GRID_LEVEL 586          // R level, G voxel size, B last resolve leg
+#define DEBUG_VIEW_SHARC_CELL_AGE 587            // R accumulated frames, G stale frames, B sample count
 #define DEBUG_VIEW_NRC_IS_OUTSIDE_SCENE_AABB 590
 
 #define DEBUG_VIEW_IS_BAKED_TERRAIN 600

@@ -477,6 +477,50 @@ namespace dxvk {
         {DEBUG_VIEW_NRC_IS_OUTSIDE_SCENE_AABB, "Is Primary or Secondary Hit Outside NRC's Axis Aligned Bounding Box",
                                                "Legend: Black - inside, Red - outside"},
 
+        // SHARC. Written by the query stages only, so they need rtx.integrateIndirectMode = 3.
+        // The vertex shown is bounce ROUND(Debug Knob [0]) + 1, i.e. knob 0 is the first indirect hit.
+        {DEBUG_VIEW_SHARC_QUERY_OUTCOME,       "SHARC Query: Outcome at Bounce ROUND(Debug Knob [0])",
+                                               "What the cache decided at the selected indirect vertex.\n"
+                                               "Legend: Black - no vertex at this bounce (path ended earlier or missed)\n"
+                                               "  Green - cache hit, the path ended here\n"
+                                               "  Red - cache miss (eligible and far enough, but no usable cell)\n"
+                                               "  Blue - too close to the previous vertex, no lookup\n"
+                                               "  Grey - surface rejected; see SHARC Query: Rejection Reason"},
+        {DEBUG_VIEW_SHARC_REJECT_REASON,       "SHARC Query: Rejection Reason at Bounce ROUND(Debug Knob [0])",
+                                               "First failing eligibility term at the selected indirect vertex, in evaluation order.\n"
+                                               "Legend: Black - eligible\n"
+                                               "  Red - non-opaque material\n"
+                                               "  Green - inside a medium / medium on the path\n"
+                                               "  Blue - opacity below 1\n"
+                                               "  Yellow - subsurface material\n"
+                                               "  Magenta - emissive (any non-zero emissive radiance)\n"
+                                               "  Cyan - reached by a non-diffuse lobe (rtx.sharc.allowSpecularPaths off)\n"
+                                               "  White - roughness below rtx.sharc.minRoughness"},
+        {DEBUG_VIEW_SHARC_TOO_CLOSE,           "SHARC Query: Too Close Guard at Bounce ROUND(Debug Knob [0])",
+                                               "The distance guard (last resolve leg > sqrt(3) * voxel size) at eligible vertices.\n"
+                                               "Legend: Black - not eligible or no vertex\n"
+                                               "  Green - passed\n"
+                                               "  Red - too close, and the whole segment is also short\n"
+                                               "  Yellow - too close by the last leg only: the segment re-traced (cutout, clipped\n"
+                                               "           geometry, portal quad or teleport) and the whole segment is long enough\n"
+                                               "  Magenta / Cyan - the red / yellow cases at a vertex reached through a portal"},
+        {DEBUG_VIEW_SHARC_CACHED_RADIANCE,     "SHARC Query: Cached Radiance",
+                                               "Radiance read from the cache at the vertex where it ended the path (HDR; use EV100 or raise the max value).\n"
+                                               "Black - the path never terminated on the cache."},
+        {DEBUG_VIEW_SHARC_TERMINATION_BOUNCE,  "SHARC Query: Termination Bounce",
+                                               "Indirect bounce at which the cache ended the path: 1 = first indirect hit. 0 - never.\n"
+                                               "Set the max value to rtx.pathMaxBounces or use a pseudo-colour mode."},
+        {DEBUG_VIEW_SHARC_GRID_CELLS,          "SHARC Grid: Cells at Bounce ROUND(Debug Knob [0])",
+                                               "Hash-coloured cache cell (position, level, normal octant, portal space) at the selected vertex.\n"
+                                               "Cell size grows with distance from the camera; rtx.sharc.gridScale sets the density."},
+        {DEBUG_VIEW_SHARC_GRID_LEVEL,          "SHARC Grid: Level / Voxel Size / Last Leg at Bounce ROUND(Debug Knob [0])",
+                                               "R - grid level, G - voxel size in world units, B - last resolve leg in world units.\n"
+                                               "Raw values: pick a channel with a pseudo-colour mode and set the max value."},
+        {DEBUG_VIEW_SHARC_CELL_AGE,            "SHARC Grid: Cell Age at Bounce ROUND(Debug Knob [0])",
+                                               "The resolved cell at the selected vertex: R - frames accumulated, G - frames since the\n"
+                                               "last sample (evicted at rtx.sharc.staleFrames), B - sample count. Black - no cell yet.\n"
+                                               "Raw values: pick a channel with a pseudo-colour mode and set the max value."},
+
         {DEBUG_VIEW_SSS_DIFFUSION_PROFILE_SAMPLING,       "SSS Diffusion Profile Sampling" },
         {DEBUG_VIEW_NRD_INSTANCE_0_VALIDATION_LAYER,      "NRD Instance 0 Validation Layer", "Requires NRD and \"NRD/Common Settings/Validation Layer\" enabled" },
         {DEBUG_VIEW_NRD_INSTANCE_1_VALIDATION_LAYER,      "NRD Instance 1 Validation Layer", "Requires NRD and \"NRD/Common Settings/Validation Layer\" enabled" },
