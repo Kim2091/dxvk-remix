@@ -57,6 +57,14 @@ namespace dxvk {
     Rc<DxvkBuffer> m_statsGpu;
     Rc<DxvkBuffer> m_statsReadback;
     std::array<uint32_t, 14> m_queryStats = {};
+    // Per-frame counters are cleared every frame, so displaying them directly flickers
+    // unreadably and any frame without a lookup reads as 0%. Accumulate over a window and
+    // publish ratios of sums, which is both stable and the statistically correct ratio.
+    static constexpr uint32_t kStatsWindowFrames = 120;
+    std::array<uint64_t, 14> m_queryStatsAccum = {};
+    std::array<uint64_t, 14> m_queryStatsWindow = {};
+    uint32_t m_queryStatsAccumFrames = 0;
+    bool m_haveQueryStatsWindow = false;
     int m_statsSlot = -1;
     bool m_haveQueryStats = false;
     uint32_t m_cacheAge = 0;

@@ -241,6 +241,15 @@ namespace dxvk {
       }
       std::memcpy(m_queryStats.data(), m_statsReadback->mapPtr(offset), sizeof(m_queryStats));
       m_haveQueryStats = true;
+      for (size_t i = 0; i < m_queryStats.size(); ++i) {
+        m_queryStatsAccum[i] += m_queryStats[i];
+      }
+      if (++m_queryStatsAccumFrames >= kStatsWindowFrames) {
+        m_queryStatsWindow = m_queryStatsAccum;
+        m_queryStatsAccum.fill(0);
+        m_queryStatsAccumFrames = 0;
+        m_haveQueryStatsWindow = true;
+      }
     } else {
       m_statsReady[slot] = m_device->createGpuEvent();
     }
@@ -307,15 +316,16 @@ namespace dxvk {
         ? ((m_compatibilityFlags & 2048u) ? "TraceRay + SER" : "TraceRay")
         : ((m_compatibilityFlags & 128u) ? "RayQuery (ray generation)" : "RayQuery (compute)"));
       ImGui::Text("Particle transparency: %s", (m_compatibilityFlags & 1u) ? "WBOIT" : "sorted bins");
-      if (collectQueryStats() && m_haveQueryStats) {
-        const auto& s = m_queryStats;
-        const float paths = float(std::max(1u, s[0]));
-        const float surfaces = float(std::max(1u, s[2]));
+      if (collectQueryStats() && m_haveQueryStatsWindow) {
+        const auto& s = m_queryStatsWindow;
+        const float paths = float(std::max(uint64_t(1), s[0]));
+        const float surfaces = float(std::max(uint64_t(1), s[2]));
         ImGui::Text("Cache terminates %.1f%% of paths | %.2f segments/path", 100.0f * s[7] / paths, s[1] / paths);
-        ImGui::Text("Lookup hit rate %.1f%% | eligible surfaces %.1f%%", 100.0f * s[7] / std::max(1u, s[6] + s[7]), 100.0f * s[4] / surfaces);
+        ImGui::Text("Lookup hit rate %.1f%% | eligible surfaces %.1f%%", 100.0f * s[7] / float(std::max(uint64_t(1), s[6] + s[7])), 100.0f * s[4] / surfaces);
         ImGui::Text("Surface rejects: roughness %.1f%% | incoming non-diffuse %.1f%% | other %.1f%%",
           100.0f * s[3] / surfaces, 100.0f * s[8] / surfaces, 100.0f * s[9] / surfaces);
-        ImGui::Text("Too close: %.1f%% of eligible surfaces | samples: %u paths", 100.0f * s[5] / std::max(1u, s[4]), s[0]);
+        ImGui::Text("Too close: %.1f%% of eligible surfaces | samples: %llu paths over %u frames",
+          100.0f * s[5] / float(std::max(uint64_t(1), s[4])), (unsigned long long)s[0], kStatsWindowFrames);
         ImGui::Text("Path ends: sky %.1f%% | bounce limit %.1f%% | zero weight %.1f%% | roulette %.1f%%",
           100.0f * s[10] / paths, 100.0f * s[11] / paths, 100.0f * s[12] / paths, 100.0f * s[13] / paths);
         ImGui::Text("Path limits: %u..%u | roulette %s", RtxOptions::pathMinBounces(), RtxOptions::pathMaxBounces(),
