@@ -529,3 +529,27 @@ so the whole-segment guard change is not needed.
 
 Next lead: a 99.2% hit rate means the cache is over-served and its upkeep can be cut. Raise
 updateTileSize, lower updateBounces, lower capacityLog2, each until the hit rate leaves 99%.
+
+## Footprint gate and sample floor confirmed in Portal RTX - 2026-09-16
+
+Both land, and between them they replace the whole hit-roughness approach to specular reuse.
+
+**Sample floor.** minSampleCount = 2 removes the glow that appeared on camera movement,
+worst on geometry previously cut off by the screen edge. SHARC_SAMPLE_NUM_THRESHOLD is 0 in
+the SDK, so a cell answered a query from a single high-variance sample; cells for off-screen
+geometry were never updated, so the first path to land in one was read back as converged.
+The roughness split could only ever mask this, which is why minRoughnessSpecular had to go
+to 0.68 and still did not fully clear it.
+
+**Footprint gate.** User reports an extreme improvement: far more data in the cache, holding
+even with minRoughnessSpecular at 0.05. That is the expected shape of the fix. The hit-material
+roughness test was a blunt proxy that refused every specular arrival at a surface below the
+floor regardless of the arriving lobe's width; NVIDIA's footprint test measures the lobe that
+launched the segment, so tight lobes are refused and broad ones admitted on their merits. The
+coverage the old threshold was spending is recovered at no quality cost.
+
+Both defaults now reflect this: footprintGate true, minSampleCount 2. minRoughnessSpecular is
+inert while the gate is on and is kept only so the previous behaviour can still be A/B'd.
+
+Not measured: frame time for either change. The cache holding more data is a coverage result,
+not a speed one, and the indirect pass was never this frame's bottleneck.
