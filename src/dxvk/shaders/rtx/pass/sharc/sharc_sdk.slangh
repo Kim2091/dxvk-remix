@@ -36,6 +36,12 @@
 #if SHARC_QUERY
 #define HASH_GRID_FIND_LOOP_ATTR [unroll]
 #endif
+// Runtime, not a constant: the right floor depends on how fast the camera reveals new
+// geometry, so it has to be tunable without a rebuild. Expands at the SDK's five comparison
+// sites, all of which are compiled where cb is already in scope.
+#ifndef SHARC_SAMPLE_NUM_THRESHOLD
+#define SHARC_SAMPLE_NUM_THRESHOLD cb.sharcArgs.minSampleCount
+#endif
 #include "rtx/external/sharc/SharcCommon.h"
 #if SHARC_QUERY
 #undef HASH_GRID_FIND_LOOP_ATTR

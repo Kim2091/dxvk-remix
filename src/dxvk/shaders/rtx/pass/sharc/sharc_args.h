@@ -24,7 +24,10 @@ struct SharcArgs {
   // waived the lobe check. Serving one from an isotropic cache on a smooth surface glows, so
   // those paths get their own, stricter roughness floor.
   float minRoughnessSpecular;
-  uint pad1;
+  // Cells are readable once accumulatedSampleNum exceeds this. The SDK default of 0 lets a
+  // cell answer from a single sample, which is what makes newly revealed geometry glow: one
+  // bright path lands in an empty cell and is read back as if it had converged.
+  uint minSampleCount;
   uint pad2;
 };
 #ifdef __cplusplus
