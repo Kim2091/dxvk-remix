@@ -91,7 +91,10 @@ namespace dxvk {
     const uint32_t capacity = 1u << std::clamp(capacityLog2(), 18, 22);
     const float scale = std::isfinite(gridScale()) ? std::clamp(gridScale(), 1.0f, 1000.0f) : 50.0f;
     const float roughness = std::isfinite(minRoughness()) ? std::clamp(minRoughness(), 0.05f, 1.0f) : 0.8f;
-    const float roughnessSpecular = std::isfinite(minRoughnessSpecular()) ? std::clamp(minRoughnessSpecular(), 0.05f, 1.0f) : 0.5f;
+    // Never looser than the diffuse floor: a specular arrival is the case that needs the
+    // stricter test, so a lower value here would invert the whole point of the split.
+    const float roughnessSpecular = std::max(roughness,
+      std::isfinite(minRoughnessSpecular()) ? std::clamp(minRoughnessSpecular(), 0.05f, 1.0f) : 0.5f);
     const float emissiveLimit = std::isfinite(maxEmissiveLuminance()) ? std::max(maxEmissiveLuminance(), 0.0f) : 0.0f;
     const uint32_t updateBounceLimit = std::clamp(updateBounces(), 1, 8);
     bool clear = resetHistory || m_resetRequested || compatibilityFlags != m_compatibilityFlags || !wasActive || m_lastFrame + 1 != frame
