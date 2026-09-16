@@ -424,6 +424,17 @@
 #define INTEGRATE_INDIRECT
 #define RAB_HAS_PREVIOUS_GBUFFER 1
 #define OPAQUE_MATERIAL_USE_POM 1
+// The compute and RayQuery ray-generation backends run integratePathVertex inline, so they
+// need the same reservoir access as the TraceRay closest-hit stage. Without these defines
+// RAB_LoadReservoir / RAB_LoadGIReservoir return empty reservoirs: an RTXDI steal at a
+// camera-visible secondary vertex then fails and skips the NEE cache / RIS fallback (no
+// shadow ray, no direct light at that vertex), and a ReSTIR GI steal in StealSample mode
+// adds zero radiance and still terminates the path on rough surfaces. SHARC stages keep
+// the inline policy of never touching the reservoirs; see integrator_indirect.slangh.
+#if !ENABLE_SHARC
+#define RAB_HAS_RTXDI_RESERVOIRS 1
+#define RAB_HAS_RESTIR_GI_RESERVOIRS 1
+#endif
 // Note: Opacity lighting approximation used in the indirect integration pass due to particle lighting being somewhat
 // important in reflections off shiny surfaces (as without this it can make areas with many particles look weird in reflections).
 #define RESOLVE_OPACITY_LIGHTING_APPROXIMATION 1
