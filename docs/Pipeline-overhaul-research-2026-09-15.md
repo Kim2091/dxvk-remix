@@ -330,3 +330,20 @@ Stages 1, 2 and 4 remove roughly 45 blobs, three shader layout classes, ~600 lin
 ## 8. Files consulted
 
 `docs/SHARC-implementation-status.md`, `docs/Lean-SHARC-parity-2026-09-14.md`, `docs/Lean-SHARC-dependency-audit-2026-09-13.md`, `docs/CoreRenderingOptimizations.md`, `docs/GPU-stage-profiling-2026-09-13.md`, `docs/NrcExecutionPathResearch.md`, `docs/SHARC-design-revised-9-10.md`, `docs/ShaderVariants.md`, `docs/fork-touchpoints.md`, `docs/CONTRIBUTING.md`, `AGENTS.md`; `src/dxvk/rtx_render/{rtx_context, rtx_pathtracer_integrate_indirect, rtx_pathtracer_gbuffer, rtx_restir_gi_rayquery, rtx_neural_radiance_cache, rtx_nrc_context, rtx_sharc, rtx_rtxdi_rayquery, rtx_nee_cache, rtx_resources, rtx_denoise, rtx_nrd_context, rtx_ray_reconstruction, rtx_composite, rtx_demodulate, rtx_sparse_rendering, rtx_options, rtx_atmosphere, rtx_global_volumetrics}.{cpp,h}`, `src/dxvk/dxvk_objects.h`, `src/dxvk/imgui/{dxvk_imgui, rtx_user_menu}.cpp`; `src/dxvk/shaders/rtx/algorithm/{integrator_indirect, integrator_direct, integrator, path_state, geometry_resolver}.slangh`, `pass/integrate/*`, `pass/sharc/*`, `pass/nrc/*`, `pass/rtxdi/*`, `pass/gbuffer/*.slang`, `pass/composite/composite.comp.slang`, `pass/demodulate/demodulate.comp.slang`, `pass/volumetrics/volume_integrate.slangh`, `pass/atmosphere/atmosphere_sky.slangh`, `pass/raytrace_args.h`, `utility/debug_view_indices.h`; `_Comp64Release/src/dxvk/rtx_shaders/*.spv` (blob inventory), `_Comp64Release/.ninja_log`, `_Comp64Release/fused-assembly-first-capture-rtx.conf`; git history of `upstream/main` against merge-base `59affb700`.
+
+## Stages 6 and 7 scrapped - 2026-09-16
+
+**Stage 7 (hard-delete NRC and ReSTIR GI): dropped.** It buys no runtime performance, which is
+not an inference -- the 2026-09-13 resource-specialization build stripped the NRC/ReSTIR GI
+descriptors and measured no change. What it buys is shipped size, build time and code surface,
+and stage 5 (compiling NRC out at build time) captures the first two for about fifteen upstream
+lines and no merge tax. All stage 7 adds beyond that is the code-surface reduction, paid for
+with roughly ten conflicting hunks a month forever and the portability of the SHARC commits.
+The fork intends to open an upstream PR, so the trade is clearly bad.
+
+**Stage 6 (lazy m_rtxdiGradients): dropped.** 1.4 MB at the working render scale, 3.3 MB at
+native 1440p, against seven touchpoints in upstream-owned files and a mutable/const_cast wart
+at the bind sites. Not worth permanent merge surface.
+
+Neither is deferred; both are decided against. What remains of the plan: stage 2 (prune the
+SHARC backend matrix, parked until optimisation finishes), stage 5, and the PR branch.
