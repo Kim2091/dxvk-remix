@@ -90,7 +90,7 @@ namespace dxvk {
     const uint32_t frame = m_device->getCurrentFrameId();
     const uint32_t capacity = 1u << std::clamp(capacityLog2(), 18, 22);
     const float scale = std::isfinite(gridScale()) ? std::clamp(gridScale(), 1.0f, 1000.0f) : 50.0f;
-    const float roughness = std::isfinite(minRoughness()) ? std::clamp(minRoughness(), 0.5f, 1.0f) : 0.8f;
+    const float roughness = std::isfinite(minRoughness()) ? std::clamp(minRoughness(), 0.05f, 1.0f) : 0.8f;
     const uint32_t updateBounceLimit = std::clamp(updateBounces(), 1, 8);
     bool clear = resetHistory || m_resetRequested || compatibilityFlags != m_compatibilityFlags || !wasActive || m_lastFrame + 1 != frame
       || m_args.gridScale != scale || m_args.minRoughness != roughness
@@ -344,7 +344,7 @@ namespace dxvk {
     RemixGui::DragInt("Accumulation frames", &accumulationFramesObject(), 1.0f, 1, 64);
     RemixGui::DragInt("Stale frames", &staleFramesObject(), 1.0f, 8, 128);
     RemixGui::DragFloat("Grid density", &gridScaleObject(), 1.0f, 1.0f, 1000.0f);
-    RemixGui::DragFloat("Minimum roughness (squared)", &minRoughnessObject(), 0.01f, 0.5f, 1.0f);
+    RemixGui::DragFloat("Minimum roughness (squared)", &minRoughnessObject(), 0.01f, 0.05f, 1.0f);
     if (ImGui::Button("Reset SHARC")) {
       m_resetRequested = true;
     }
