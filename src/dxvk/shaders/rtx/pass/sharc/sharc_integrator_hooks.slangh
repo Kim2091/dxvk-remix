@@ -43,7 +43,7 @@ uint sharcRejectReason(bool opaqueMaterial, bool inMedium, OpaqueSurfaceMaterial
   {
     return kSharcRejectSubsurface;
   }
-  if (any(emissiveLight > 0.0f))
+  if (calcBt709Luminance(emissiveLight) > cb.sharcArgs.maxEmissiveLuminance)
   {
     return kSharcRejectEmissive;
   }

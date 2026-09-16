@@ -40,6 +40,7 @@ namespace dxvk {
     RTX_OPTION("rtx.sharc", int, accumulationFrames, 8, "Temporal cache accumulation, 1..64 frames.");
     RTX_OPTION("rtx.sharc", int, staleFrames, 32, "Evict unobserved entries after 8..128 frames.");
     RTX_OPTION("rtx.sharc", float, gridScale, 50.0f, "SHARC grid density; independent of rtx.sceneScale. Larger values give finer cells.");
+    RTX_OPTION("rtx.sharc", float, maxEmissiveLuminance, 0.0f, "Cache surfaces whose emissive luminance is at or below this. The cache holds reflected light and the path adds emission separately, so emissive surfaces are normally excluded; at 0 any emission at all disqualifies a surface, which rejects every faint emissive map. Raise until emissive surfaces start bleeding their own light into the cache.");
     RTX_OPTION("rtx.sharc", float, minRoughness, 0.8f, "Minimum isotropic roughness for cached diffuse surfaces, 0.05..1. Below roughly 0.5 the isotropic cache starts standing in for directional reflection, so lower it until reflections visibly flatten, then back off.");
 
   private:
