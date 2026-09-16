@@ -80,7 +80,7 @@ namespace dxvk {
       | (allowRayPortals() ? 16u : 0u)
       | (deferredUpdates() ? 64u : 0u) | (queryRayGeneration() ? 128u : 0u)
       | (updateRayGeneration() ? 256u : 0u) | (allowSpecularPaths() ? 512u : 0u)
-      | (queryTraceRay() ? 1024u : 0u)
+      | (queryTraceRay() ? 1024u : 0u) | (footprintGate() ? 4096u : 0u)
       | (queryTraceRay() && RtxOptions::isShaderExecutionReorderingInPathtracerIntegrateIndirectEnabled() ? 2048u : 0u);
     if (m_allocationFailed && !m_resetRequested) {
       ++m_otherFallbackFrames;
@@ -154,6 +154,7 @@ namespace dxvk {
     m_args.radianceScale = 1000.0f;
     m_args.enabled = 1;
     m_args.allowSpecularPaths = allowSpecularPaths() ? 1u : 0u;
+    m_args.footprintGate = footprintGate() ? 1u : 0u;
     args.sharcArgs = m_args;
     m_compatibilityFlags = compatibilityFlags;
     m_lastFrame = frame;
@@ -316,6 +317,10 @@ namespace dxvk {
     RemixGui::Checkbox("Reuse rough surfaces in specular paths", &allowSpecularPathsObject());
     if (allowSpecularPaths()) {
       ImGui::TextWrapped("Experimental: wider cache reuse can soften reflected lighting. Roughness and distance limits still apply.");
+      RemixGui::Checkbox("Footprint gate for specular paths", &footprintGateObject());
+      ImGui::TextWrapped(footprintGate()
+        ? "Specular arrivals are gated by the footprint of the lobe that launched the segment; the specular roughness floor is not used."
+        : "Specular arrivals are gated by the roughness of the surface they hit, using the specular roughness floor below.");
     }
     RemixGui::Checkbox("Measure SHARC GPU time", &measureGpuTimeObject());
     if (measureGpuTime() && m_haveGpuTimes) {
@@ -342,6 +347,8 @@ namespace dxvk {
         const float tooClose = float(std::max(uint64_t(1), s[5]));
         ImGui::Text("Too close: %.1f%% of eligible surfaces | of those: last leg only %.1f%% | post-portal %.1f%% | first bounce %.1f%%",
           100.0f * s[5] / float(std::max(uint64_t(1), s[4])), 100.0f * s[19] / tooClose, 100.0f * s[20] / tooClose, 100.0f * s[21] / tooClose);
+        ImGui::Text("Footprint too narrow: %.1f%% of eligible surfaces (specular arrivals, rtx.sharc.footprintGate)",
+          100.0f * s[22] / float(std::max(uint64_t(1), s[4])));
         ImGui::Text("Samples: %llu paths over %u frames", (unsigned long long)s[0], kStatsWindowFrames);
         ImGui::Text("Path ends: sky %.1f%% | bounce limit %.1f%% | zero weight %.1f%% | roulette %.1f%%",
           100.0f * s[10] / paths, 100.0f * s[11] / paths, 100.0f * s[12] / paths, 100.0f * s[13] / paths);
@@ -364,7 +371,7 @@ namespace dxvk {
     RemixGui::DragFloat("Minimum roughness (squared)", &minRoughnessObject(), 0.01f, 0.05f, 1.0f);
     RemixGui::DragFloat("Max emissive luminance", &maxEmissiveLuminanceObject(), 0.001f, 0.0f, 1.0f);
     RemixGui::DragInt("Minimum cell samples", &minSampleCountObject(), 1.0f, 0, 32);
-    if (allowSpecularPaths()) {
+    if (allowSpecularPaths() && !footprintGate()) {
       RemixGui::DragFloat("Minimum roughness, specular paths", &minRoughnessSpecularObject(), 0.01f, 0.05f, 1.0f);
     }
     if (ImGui::Button("Reset SHARC")) {

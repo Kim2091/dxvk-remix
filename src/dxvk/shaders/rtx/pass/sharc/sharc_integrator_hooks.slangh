@@ -51,9 +51,13 @@ uint sharcRejectReason(bool opaqueMaterial, bool inMedium, OpaqueSurfaceMaterial
   {
     return kSharcRejectLobe;
   }
-  // A specular arrival only got past the lobe check because allowSpecularPaths waived it, so
-  // hold it to the stricter floor; a genuine diffuse gather uses the ordinary one.
-  const float roughnessFloor = diffusePath ? cb.sharcArgs.minRoughness : cb.sharcArgs.minRoughnessSpecular;
+  // A specular arrival only got past the lobe check because allowSpecularPaths waived it.
+  // Without the footprint gate the hit material's roughness stands in for the width of the
+  // arriving lobe, so it is held to the stricter floor. With the gate the lobe's own width is
+  // tested at query time, and the hit material needs only the ordinary floor, as for a diffuse
+  // arrival: the floor guards the cell's own directionality, which does not depend on who reads it.
+  const bool specularFloor = !diffusePath && cb.sharcArgs.footprintGate == 0;
+  const float roughnessFloor = specularFloor ? cb.sharcArgs.minRoughnessSpecular : cb.sharcArgs.minRoughness;
   if (sharcMaterial.isotropicRoughness < roughnessFloor)
   {
     return kSharcRejectRoughness;
@@ -63,6 +67,22 @@ uint sharcRejectReason(bool opaqueMaterial, bool inMedium, OpaqueSurfaceMaterial
 #endif
 
 #if ENABLE_SHARC && SHARC_QUERY
+// NVIDIA's cone-footprint gate for glossy arrivals: by the time the lobe that launched the
+// segment reaches this vertex it must have spread wider than the voxel, otherwise a narrow
+// reflection would be served the cell's isotropic average and glow. Written as in the SHARC
+// integration guidance: alpha is the launching surface's GGX roughness (perceptual roughness
+// squared, which is what Remix calls isotropicRoughness), and the length is the whole segment
+// because cutout, clip and portal re-traces are continuations of the same lobe. A diffuse lobe
+// is as wide as lobes get; the caller never tests one.
+bool sharcFootprintValid(float launchPerceptualRoughness, float segmentLength, float voxelSize)
+{
+  const float clampedRoughness = min(launchPerceptualRoughness, 0.99f);
+  const float alpha = clampedRoughness * clampedRoughness;
+  const float alpha2 = alpha * alpha;
+  const float footprint = segmentLength * sqrt(0.5f * alpha2 / max(1.0f - alpha2, 1e-6f));
+  return footprint > voxelSize;
+}
+
 // Debug views. cb.debugView is uniform, so the production path pays one range compare per
 // resolved vertex; the bodies only run for the selected view. The SHARC indices are kept
 // contiguous so that one compare covers all of them.
@@ -147,7 +167,7 @@ void sharcDebugVertex(PathState pathState, SurfaceInteraction surfaceInteraction
 }
 
 // Views fed by the lookup itself.
-void sharcDebugQuery(PathState pathState, bool selectedBounce, bool farEnough, bool cacheHit, vec3 cachedRadiance, float tooCloseDistance)
+void sharcDebugQuery(PathState pathState, bool selectedBounce, bool farEnough, bool footprintOk, bool cacheHit, vec3 cachedRadiance, float tooCloseDistance)
 {
   const uvec2 pixel = pathState.pixelCoordinate;
   switch (cb.debugView)
@@ -155,8 +175,8 @@ void sharcDebugQuery(PathState pathState, bool selectedBounce, bool farEnough, b
   case DEBUG_VIEW_SHARC_QUERY_OUTCOME:
     if (selectedBounce)
     {
-      // Green hit, blue too close, red miss.
-      storeInDebugView(pixel, sharcDebugPalette(cacheHit ? 2u : (!farEnough ? 3u : 1u)));
+      // Green hit, blue too close, yellow footprint too narrow, red miss.
+      storeInDebugView(pixel, sharcDebugPalette(cacheHit ? 2u : !farEnough ? 3u : !footprintOk ? 4u : 1u));
     }
     break;
   case DEBUG_VIEW_SHARC_TOO_CLOSE:
@@ -209,6 +229,28 @@ void sharcOnResolveLeg(inout PathState pathState)
   {
     pathState.sharcSegmentDistance = pathState.sharcSegmentDistance + pathState.segmentHitDistance;
   }
+#endif
+}
+
+// Called once the continuation lobe has been sampled at an opaque or translucent vertex, before
+// the next segment is traced. The query at the next vertex gates on the lobe that launched the
+// segment and cannot see this vertex, so what it needs is carried on the path state.
+void sharcOnContinuationSampled(inout PathState pathState, bool opaqueMaterial, uint8_t continuationLobe, float isotropicRoughness)
+{
+#if ENABLE_SHARC && SHARC_QUERY
+  if (!opaqueMaterial)
+  {
+    // Translucent lobes are delta: no footprint, so the gate refuses them at any distance.
+    pathState.sharcLaunchPerceptualRoughness = 0.0f;
+  }
+  else if (continuationLobe != opaqueLobeTypeOpacityTransmission)
+  {
+    // isotropicRoughness is already GGX alpha; the gate squares the perceptual value back.
+    pathState.sharcLaunchPerceptualRoughness = sqrt(isotropicRoughness);
+  }
+  // Opacity transmission continues straight through a cutout: the lobe in flight is whichever
+  // one launched into this vertex, so its roughness stays. The segment length restarts here,
+  // which under-states the spread; that errs toward refusing a lookup.
 #endif
 }
 
@@ -279,11 +321,17 @@ bool sharcOnResolvedVertex(
     // the stats and DEBUG_VIEW_SHARC_TOO_CLOSE compare the two so the difference can be
     // measured in-game before the guard is changed.
     const bool farEnough = pathState.segmentHitDistance > sharcTooCloseDistance;
-    const bool cacheHit = farEnough
+    // The footprint gate only ever refuses a specular arrival; it does not replace the distance
+    // guard above. For launching roughness above about 0.7 (perceptual) the lobe has spread past
+    // the voxel before the segment clears the voxel diagonal, so both tests are kept, as in the
+    // SHARC integration guidance.
+    const bool footprintOk = cb.sharcArgs.footprintGate == 0 || pathState.skyGatherEligible
+      || sharcFootprintValid(pathState.sharcLaunchPerceptualRoughness, pathState.sharcSegmentDistance, voxelSize);
+    const bool cacheHit = farEnough && footprintOk
       && SharcGetCachedRadianceFromHash(sharcParameters, sharcHit, key, cachedRadiance, false)
       && isValidValue(cachedRadiance);
 #if SHARC_QUERY_STATS
-    sharcCount(pathState.pixelCoordinate, !farEnough ? 5u : cacheHit ? 7u : 6u);
+    sharcCount(pathState.pixelCoordinate, !farEnough ? 5u : !footprintOk ? 22u : cacheHit ? 7u : 6u);
     if (!farEnough)
     {
       if (pathState.sharcSegmentDistance > sharcTooCloseDistance)
@@ -302,7 +350,7 @@ bool sharcOnResolvedVertex(
 #endif
     if (sharcDebugViewActive())
     {
-      sharcDebugQuery(pathState, sharcDebugBounce, farEnough, cacheHit, cachedRadiance, sharcTooCloseDistance);
+      sharcDebugQuery(pathState, sharcDebugBounce, farEnough, footprintOk, cacheHit, cachedRadiance, sharcTooCloseDistance);
     }
     if (cacheHit)
     {

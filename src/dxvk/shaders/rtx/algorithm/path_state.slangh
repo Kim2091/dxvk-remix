@@ -443,6 +443,18 @@ struct PathState : IBasePayloadState
         _sharcSegmentDistanceHi = uint8_t((bits >> 7) & 0xFFu);
       }
   }
+
+  // Perceptual roughness of the surface that launched the segment in flight, for the query's
+  // footprint gate. Shares _roughness with gbufferPerceptualRoughness rather than growing the
+  // payload: at bounce 1 the launching surface is the G-buffer surface, so the two are the same
+  // value, and the only reader of the G-buffer value, getSeparateUnorderedApproximationsActive,
+  // is gated to bounceIteration <= 1 and runs at the top of integratePathVertex, before the
+  // continuation sample at that vertex overwrites the byte.
+  property float sharcLaunchPerceptualRoughness
+  {
+      get { return unorm8ToF32(_roughness); }
+      set { _roughness = f32ToUnorm8(newValue); }
+  }
 #endif
 
   // Packed members

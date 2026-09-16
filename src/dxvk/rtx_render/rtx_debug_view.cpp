@@ -485,6 +485,7 @@ namespace dxvk {
                                                "  Green - cache hit, the path ended here\n"
                                                "  Red - cache miss (eligible and far enough, but no usable cell)\n"
                                                "  Blue - too close to the previous vertex, no lookup\n"
+                                               "  Yellow - specular arrival whose lobe footprint is narrower than the voxel (rtx.sharc.footprintGate), no lookup\n"
                                                "  Grey - surface rejected; see SHARC Query: Rejection Reason"},
         {DEBUG_VIEW_SHARC_REJECT_REASON,       "SHARC Query: Rejection Reason at Bounce ROUND(Debug Knob [0])",
                                                "First failing eligibility term at the selected indirect vertex, in evaluation order.\n"

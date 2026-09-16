@@ -652,6 +652,13 @@ void integratePathVertex(
     const bool isOpaqueMaterial = materialType == surfaceMaterialTypeOpaque;
     const OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteraction = opaqueSurfaceMaterialInteractionCreate(polymorphicSurfaceMaterialInteraction);
     // polymorphicSurfaceMaterialInteraction is no longer live since this point.
+
+    // The cache query at the next vertex gates on the lobe that launched this segment, which
+    // it cannot see; record it here. Gated like the other hook calls so that the legacy
+    // stages stay byte-identical.
+#if ENABLE_SHARC
+    sharcOnContinuationSampled(pathState, isOpaqueMaterial, continuationLobe, opaqueSurfaceMaterialInteraction.isotropicRoughness);
+#endif
     
     // Perform NEE
     

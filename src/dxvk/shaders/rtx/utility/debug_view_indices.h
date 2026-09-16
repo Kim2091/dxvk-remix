@@ -255,7 +255,7 @@
 // SHARC query stages from sharc_integrator_hooks.slangh. All but the two "hit" views show one
 // indirect vertex, selected by ROUND(Debug Knob [0]) with 0 = first indirect hit, the NRC
 // convention. Keep the block contiguous: the shader gates all of them with one range compare.
-#define DEBUG_VIEW_SHARC_QUERY_OUTCOME 580       // green hit, red miss, blue too close, grey rejected
+#define DEBUG_VIEW_SHARC_QUERY_OUTCOME 580       // green hit, red miss, blue too close, yellow footprint too narrow, grey rejected
 #define DEBUG_VIEW_SHARC_REJECT_REASON 581       // first failing eligibility term, colour-coded
 #define DEBUG_VIEW_SHARC_TOO_CLOSE 582           // the distance guard, last leg vs whole segment
 #define DEBUG_VIEW_SHARC_CACHED_RADIANCE 583     // radiance read from the cache where the path ended on it

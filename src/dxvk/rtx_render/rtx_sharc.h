@@ -31,6 +31,7 @@ namespace dxvk {
     RTX_OPTION("rtx.sharc", bool, queryRayGeneration, true, "Run SHARC queries as inline RayQuery in a ray-generation shader. Disable to compare the compute backend; lighting and cache eligibility are unchanged.");
     RTX_OPTION("rtx.sharc", bool, updateRayGeneration, true, "Run sparse SHARC updates as inline RayQuery in a ray-generation shader. Disable to compare compute updates with the same sampling and estimator.");
     RTX_OPTION("rtx.sharc", bool, allowSpecularPaths, false, "Allow cache insertion and reuse at rough opaque surfaces reached by non-diffuse rays. Can soften reflected lighting; changing this resets the cache.");
+    RTX_OPTION("rtx.sharc", bool, footprintGate, false, "Gate cache reads on specular paths by the footprint of the lobe that launched the segment, NVIDIA's prescribed test, instead of by the roughness of the surface the path hit: footprint = segment length * sqrt(0.5 * alpha^2 / (1 - alpha^2)) must exceed the voxel size, alpha being the launching surface's GGX roughness. While on, rtx.sharc.minRoughnessSpecular is not used and specular arrivals share rtx.sharc.minRoughness with diffuse ones. Only matters with allowSpecularPaths on; changing it resets the cache.");
     RTX_OPTION("rtx.sharc", bool, collectQueryStats, false, "Collect sampled cache reuse and rejection counts while GPU timing is enabled. Disable for timing comparisons without diagnostic atomics.");
     RTX_OPTION("rtx.sharc", bool, logFallbackStats, false, "Periodically log how often SHARC was selected but fell back to importance-sampled paths, split by reason. Diagnostic only; counts cost nothing when this is disabled.");
     RTX_OPTION("rtx.sharc", bool, measureGpuTime, false, "Measure SHARC update, resolve and query GPU times. Timing boundaries can affect overlap; disable for final frame-time comparisons.");
@@ -58,8 +59,8 @@ namespace dxvk {
     static constexpr uint32_t kStatsStride = 256;
     // Counter slots are documented at the sharcCount call sites in sharc_integrator_hooks.slangh
     // and integrator_indirect.slangh: 0..13 the path and eligibility aggregates, 14..18 the
-    // surface term behind slot 9, 19..21 the too-close splits.
-    static constexpr uint32_t kStatsCount = 22;
+    // surface term behind slot 9, 19..21 the too-close splits, 22 the footprint gate.
+    static constexpr uint32_t kStatsCount = 23;
     static_assert(kStatsCount * sizeof(uint32_t) <= kStatsStride);
     std::array<Rc<DxvkGpuEvent>, 8> m_statsReady;
     Rc<DxvkBuffer> m_statsGpu;

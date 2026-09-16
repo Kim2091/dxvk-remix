@@ -28,7 +28,10 @@ struct SharcArgs {
   // cell answer from a single sample, which is what makes newly revealed geometry glow: one
   // bright path lands in an empty cell and is read back as if it had converged.
   uint minSampleCount;
-  uint pad2;
+  // Query-side gate for specular arrivals: test the footprint of the lobe that launched the
+  // segment against the voxel, NVIDIA's prescribed check, instead of the hit material's
+  // roughness. While set, minRoughnessSpecular is unused and both lobe classes share minRoughness.
+  uint footprintGate;
 };
 #ifdef __cplusplus
 static_assert(sizeof(SharcArgs) == 80);
