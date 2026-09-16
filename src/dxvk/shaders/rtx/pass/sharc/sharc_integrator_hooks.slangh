@@ -332,6 +332,19 @@ bool sharcOnResolvedVertex(
       && isValidValue(cachedRadiance);
 #if SHARC_QUERY_STATS
     sharcCount(pathState.pixelCoordinate, !farEnough ? 5u : !footprintOk ? 22u : cacheHit ? 7u : 6u);
+    // A miss covers two different failures with opposite remedies: the cell does not exist
+    // (population -- capacity, grid scale, eviction) or it exists but sits under the sample
+    // floor (trust -- accumulationFrames, minSampleCount). Probe the map to tell them apart.
+    // Stats-only, so the extra find never runs in a production frame.
+    if (farEnough && footprintOk && !cacheHit)
+    {
+      HashGridIndex probeIndex;
+      uint probeOffset;
+      const bool entryExists = HashGridFind(sharcParameters.hashGridData, key,
+        HashGridGetBaseSlot(key, sharcParameters.hashGridData.capacity),
+        HASH_GRID_HASH_MAP_BUCKET_SIZE, probeIndex, probeOffset);
+      sharcCount(pathState.pixelCoordinate, entryExists ? 24u : 23u);
+    }
     if (!farEnough)
     {
       if (pathState.sharcSegmentDistance > sharcTooCloseDistance)

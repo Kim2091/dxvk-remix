@@ -339,6 +339,9 @@ namespace dxvk {
         const float surfaces = float(std::max(uint64_t(1), s[2]));
         ImGui::Text("Cache terminates %.1f%% of paths | %.2f segments/path", 100.0f * s[7] / paths, s[1] / paths);
         ImGui::Text("Lookup hit rate %.1f%% | eligible surfaces %.1f%%", 100.0f * s[7] / float(std::max(uint64_t(1), s[6] + s[7])), 100.0f * s[4] / surfaces);
+        const float misses = float(std::max(uint64_t(1), s[23] + s[24]));
+        ImGui::Text("  Of misses: no cell %.1f%% | below sample floor %.1f%%",
+          100.0f * s[23] / misses, 100.0f * s[24] / misses);
         ImGui::Text("Surface rejects: roughness %.1f%% | incoming non-diffuse %.1f%% | other %.1f%%",
           100.0f * s[3] / surfaces, 100.0f * s[8] / surfaces, 100.0f * s[9] / surfaces);
         ImGui::Text("  Other: non-opaque %.1f%% | medium %.1f%% | opacity < 1 %.1f%% | subsurface %.1f%% | emissive %.1f%%",

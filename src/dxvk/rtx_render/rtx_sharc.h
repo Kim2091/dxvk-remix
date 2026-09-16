@@ -60,7 +60,7 @@ namespace dxvk {
     // Counter slots are documented at the sharcCount call sites in sharc_integrator_hooks.slangh
     // and integrator_indirect.slangh: 0..13 the path and eligibility aggregates, 14..18 the
     // surface term behind slot 9, 19..21 the too-close splits, 22 the footprint gate.
-    static constexpr uint32_t kStatsCount = 23;
+    static constexpr uint32_t kStatsCount = 25;
     static_assert(kStatsCount * sizeof(uint32_t) <= kStatsStride);
     std::array<Rc<DxvkGpuEvent>, 8> m_statsReady;
     Rc<DxvkBuffer> m_statsGpu;
