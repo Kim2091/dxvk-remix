@@ -483,4 +483,11 @@ The rejection reason, stats split and eligibility test all derive from one funct
 range compare per resolved vertex in the query stages, plus the segment-length bookkeeping
 (two float16 pack/unpack operations per resolve leg). Not measured.
 
-BUILD_VALIDATION_PLACEHOLDER
+**Legacy blobs.** The first build of the views left the non-SHARC stages one instruction
+different from the pre-change DLL: the `inout PathState` copy-back of the two new hook calls
+survives as a redundant byte store even though their non-SHARC bodies are empty, and the
+`_sharcSegmentDistanceHi` byte was declared for every variant. Both are now under
+`ENABLE_SHARC` / `SHARC_QUERY`, and `validate_sharc_integration.py --baseline-dll` (the
+pre-change stats build) passes all 62 contracts including "legacy stages byte-identical to the
+baseline DLL". Deployed to both installs with backup suffix
+`backup-pre-legacy-gate-20260915-211222`; no view has been looked at in-game yet.

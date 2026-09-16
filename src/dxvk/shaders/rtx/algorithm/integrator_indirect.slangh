@@ -534,7 +534,11 @@ void integratePathVertex(
 #endif // SURFACE_MATERIAL_RESOLVE_TYPE_RAY_PORTAL
 
   // Every resolve leg counts towards the segment length the cache diagnostics compare against.
+  // Gated rather than left to the empty non-SHARC body: the inout copy-back of an empty call
+  // still emits a store, which would cost the legacy stages their byte-identity.
+#if ENABLE_SHARC
   sharcOnResolveLeg(pathState);
+#endif
 
   // Check if resolving should continue, and if a surface was hit
 
@@ -1486,7 +1490,9 @@ void integrateIndirectPath(
 #if SHARC_QUERY_STATS
     sharcCount(pathState.pixelCoordinate, 1); // Ray segments per sampled path.
 #endif
+#if ENABLE_SHARC
     sharcOnSegmentBegin(pathState);
+#endif
 
     pathState.decalEncountered = false;
 
