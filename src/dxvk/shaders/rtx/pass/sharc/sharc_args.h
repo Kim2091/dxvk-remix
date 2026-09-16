@@ -20,7 +20,10 @@ struct SharcArgs {
   // surface carrying a faint emissive map, which in Portal RTX is most of them, so compare
   // luminance against a threshold instead. Zero reproduces the original behaviour.
   float maxEmissiveLuminance;
-  uint pad0;
+  // A path that arrived by a specular lobe only reaches the cache because allowSpecularPaths
+  // waived the lobe check. Serving one from an isotropic cache on a smooth surface glows, so
+  // those paths get their own, stricter roughness floor.
+  float minRoughnessSpecular;
   uint pad1;
   uint pad2;
 };

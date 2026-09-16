@@ -91,11 +91,13 @@ namespace dxvk {
     const uint32_t capacity = 1u << std::clamp(capacityLog2(), 18, 22);
     const float scale = std::isfinite(gridScale()) ? std::clamp(gridScale(), 1.0f, 1000.0f) : 50.0f;
     const float roughness = std::isfinite(minRoughness()) ? std::clamp(minRoughness(), 0.05f, 1.0f) : 0.8f;
+    const float roughnessSpecular = std::isfinite(minRoughnessSpecular()) ? std::clamp(minRoughnessSpecular(), 0.05f, 1.0f) : 0.5f;
     const float emissiveLimit = std::isfinite(maxEmissiveLuminance()) ? std::max(maxEmissiveLuminance(), 0.0f) : 0.0f;
     const uint32_t updateBounceLimit = std::clamp(updateBounces(), 1, 8);
     bool clear = resetHistory || m_resetRequested || compatibilityFlags != m_compatibilityFlags || !wasActive || m_lastFrame + 1 != frame
       || m_args.gridScale != scale || m_args.minRoughness != roughness
       || m_args.maxEmissiveLuminance != emissiveLimit
+      || m_args.minRoughnessSpecular != roughnessSpecular
       || m_args.updateBounces != updateBounceLimit;
     if (m_hash == nullptr || m_args.capacity != capacity) {
       try {
@@ -138,6 +140,7 @@ namespace dxvk {
     m_args.gridScale = scale;
     m_args.minRoughness = roughness;
     m_args.maxEmissiveLuminance = emissiveLimit;
+    m_args.minRoughnessSpecular = roughnessSpecular;
     m_args.accumulationFrames = std::clamp(accumulationFrames(), 1, 64);
     m_args.staleFrames = std::clamp(staleFrames(), 8, 128);
     m_args.updateTileSize = std::clamp(updateTileSize(), 1, 16);
@@ -354,6 +357,9 @@ namespace dxvk {
     RemixGui::DragFloat("Grid density", &gridScaleObject(), 1.0f, 1.0f, 1000.0f);
     RemixGui::DragFloat("Minimum roughness (squared)", &minRoughnessObject(), 0.01f, 0.05f, 1.0f);
     RemixGui::DragFloat("Max emissive luminance", &maxEmissiveLuminanceObject(), 0.001f, 0.0f, 1.0f);
+    if (allowSpecularPaths()) {
+      RemixGui::DragFloat("Minimum roughness, specular paths", &minRoughnessSpecularObject(), 0.01f, 0.05f, 1.0f);
+    }
     if (ImGui::Button("Reset SHARC")) {
       m_resetRequested = true;
     }

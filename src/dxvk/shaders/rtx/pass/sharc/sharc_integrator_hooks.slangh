@@ -25,7 +25,7 @@ static const uint kSharcRejectRoughness = 7;   // isotropic roughness below minR
 // Reasons 1..5 are the surface terms that the aggregate stats slot 9 lumps together.
 static const uint kSharcSurfaceRejectCount = 5;
 
-uint sharcRejectReason(bool opaqueMaterial, bool inMedium, OpaqueSurfaceMaterialInteraction sharcMaterial, vec3 emissiveLight, bool lobeEligible)
+uint sharcRejectReason(bool opaqueMaterial, bool inMedium, OpaqueSurfaceMaterialInteraction sharcMaterial, vec3 emissiveLight, bool lobeEligible, bool diffusePath)
 {
   if (!opaqueMaterial)
   {
@@ -51,7 +51,10 @@ uint sharcRejectReason(bool opaqueMaterial, bool inMedium, OpaqueSurfaceMaterial
   {
     return kSharcRejectLobe;
   }
-  if (sharcMaterial.isotropicRoughness < cb.sharcArgs.minRoughness)
+  // A specular arrival only got past the lobe check because allowSpecularPaths waived it, so
+  // hold it to the stricter floor; a genuine diffuse gather uses the ordinary one.
+  const float roughnessFloor = diffusePath ? cb.sharcArgs.minRoughness : cb.sharcArgs.minRoughnessSpecular;
+  if (sharcMaterial.isotropicRoughness < roughnessFloor)
   {
     return kSharcRejectRoughness;
   }
@@ -229,7 +232,8 @@ bool sharcOnResolvedVertex(
     sharcMaterial,
     emissiveLight,
     // The optional broader policy still checks the receiving material, not the preceding lobe.
-    pathState.skyGatherEligible || cb.sharcArgs.allowSpecularPaths != 0);
+    pathState.skyGatherEligible || cb.sharcArgs.allowSpecularPaths != 0,
+    pathState.skyGatherEligible);
   const bool sharcSurfaceEligible = sharcReason == kSharcRejectNone || sharcReason > kSharcSurfaceRejectCount;
   const bool sharcEligible = sharcReason == kSharcRejectNone;
 #if SHARC_QUERY_STATS
