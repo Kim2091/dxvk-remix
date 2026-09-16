@@ -491,3 +491,41 @@ survives as a redundant byte store even though their non-SHARC bodies are empty,
 pre-change stats build) passes all 62 contracts including "legacy stages byte-identical to the
 baseline DLL". Deployed to both installs with backup suffix
 `backup-pre-legacy-gate-20260915-211222`; no view has been looked at in-game yet.
+
+## Portal RTX: the cache was gated off, not underperforming - 2026-09-15
+
+Three gates, none of them tuning, were keeping SHARC at 0.2% eligibility in Portal RTX.
+With all three cleared, measured over 2.54M paths in 120 frames at cache age 1012:
+
+| | before | after |
+|---|---|---|
+| eligible surfaces | 0.2% | 73.8% |
+| cache terminates | 0.2% of paths | 78.5% |
+| lookup hit rate | 58.6% | 99.2% |
+| roulette path ends | 89.6% | 21.0% |
+| segments/path | 1.71 | 1.12 |
+
+The gates, in the order they were found:
+
+1. **allowSpecularPaths was absent from the Portal RTX rtx.conf**, so it defaulted false and
+   lobe eligibility collapsed to skyGatherEligible, which is false throughout a windowless
+   test chamber. Config, not code. The rejection-reason view was flooded cyan.
+2. **minRoughness was clamped to 0.5** on the way into sharcArgs while the option and slider
+   accepted lower values, so every earlier attempt to widen eligibility measured an unchanged
+   threshold (7dcd68206).
+3. **The emissive test was any(emissiveLight > 0)**, which disqualified every surface carrying
+   a faint emissive map, most of the level. Now a luminance threshold, default 0 for the old
+   behaviour (9c464b31a). At 0.1 the view goes from almost entirely magenta to 0.8% emissive.
+
+User reports 0.1 ms consistently at maxEmissiveLuminance 0.1, and cached radiance now covering
+most of the image. **0.1 ms is the honest figure**: 78.5% of paths terminating on the cache buys
+little because the indirect pass was never the frame's bottleneck.
+
+Remaining rejects are roughness 15.8%, medium 5.8%, non-opaque 3.9%, emissive 0.8%. Roughness is
+the quality wall rather than a defect: Portal's panels are smoother than an isotropic diffuse
+cache can represent, and minRoughness is already at its 0.05 floor. Too-close is 4.1% of eligible
+surfaces, 88.5% of that at the first bounce, with 0.0% last-leg artefact and 0.0% post-portal --
+so the whole-segment guard change is not needed.
+
+Next lead: a 99.2% hit rate means the cache is over-served and its upkeep can be cut. Raise
+updateTileSize, lower updateBounces, lower capacityLog2, each until the hit rate leaves 99%.
