@@ -401,3 +401,18 @@ geometry caches coarsely for its screen size.
 Deployment: PortalRTX/bin/.trex, our d3d9.dll plus 32 dependency DLLs and the usd/ plugin
 tree from the FNV runtime (CUDA 13, newer NRC_Vulkan, unbundled USD stack, upscalers).
 Backups retained with suffix backup-pre-sharc-20260915-*.
+
+## Portal-space hash key confirmed in Portal RTX - 2026-09-15
+
+User reports through-portal content looks better than the insertion-gate build, with
+performance about the same, possibly a touch worse. That matches the predicted trade:
+portal-only geometry is now cached instead of brute-forced, which improves the image,
+while cells separated by portal space raise occupancy against the fixed capacity.
+
+capacityLog2 is the knob if the slight cost is worth chasing. It is 20 (1M entries) in
+the Portal RTX config; 21 halves collision pressure for twice the memory. Untested.
+
+No frame time was measured on either build; "about the same, maybe a tad worse" is the
+user's in-game impression, not a capture. The gate build is retained at
+PortalRTX/bin/.trex/d3d9.dll.backup-portal-gate-20260915-1950 and its source is tagged
+sharc-portals-verified-20260915, so an A/B remains possible without a rebuild.
