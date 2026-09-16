@@ -820,6 +820,10 @@ HashGridKey SharcGetAdjacentLevelHashKey(HashGridKey hashGridKey, HashGridParame
     modifiedHashGridKey |= hashGridKey & (HashGridKey(HASH_GRID_NORMAL_BIT_MASK) << HASH_GRID_NORMAL_BIT_OFFSET);
 #endif // HASH_GRID_USE_NORMALS
 
+    // NV-DXVK: carry portal space across the level change. Without this the rebuilt key
+    // loses it and SHARC_BLEND_ADJACENT_LEVELS would leak portal-space cells into main space.
+    modifiedHashGridKey |= hashGridKey & (HashGridKey(HASH_GRID_PORTAL_BIT_MASK) << HASH_GRID_PORTAL_BIT_OFFSET);
+
     return modifiedHashGridKey;
 }
 

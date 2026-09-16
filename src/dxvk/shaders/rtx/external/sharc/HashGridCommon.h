@@ -62,7 +62,10 @@ HASH_GRID_CONST uint HASH_GRID_(NORMAL_BIT_NUM)        = 3;
 #else // !HASH_GRID_COMPACT
 HASH_GRID_CONST uint HASH_GRID_(KEY_BIT_NUM)           = 64; // 64-bit hash grid keys. Reserve 1 bit for user data (e.g. responsive lighting signal in SHARC)
 HASH_GRID_CONST uint HASH_GRID_(POSITION_BIT_NUM)      = 17;
-HASH_GRID_CONST uint HASH_GRID_(LEVEL_BIT_NUM)         = 9;
+// NV-DXVK: level narrowed from 9 bits to 7 to free two bits for portal space. Levels are
+// logarithmic in camera distance and never approach 127 in practice, and the reserved
+// user-data bit 63 is untouched.
+HASH_GRID_CONST uint HASH_GRID_(LEVEL_BIT_NUM)         = 7;
 HASH_GRID_CONST uint HASH_GRID_(NORMAL_BIT_NUM)        = 3;
 #endif // HASH_GRID_COMPACT
 
@@ -72,6 +75,12 @@ HASH_GRID_CONST uint HASH_GRID_(NORMAL_BIT_MASK)       = (1u << HASH_GRID_(NORMA
 
 HASH_GRID_CONST uint HASH_GRID_(LEVEL_BIT_OFFSET)      = HASH_GRID_(POSITION_BIT_NUM) * 3;
 HASH_GRID_CONST uint HASH_GRID_(NORMAL_BIT_OFFSET)     = HASH_GRID_(LEVEL_BIT_OFFSET) + HASH_GRID_(LEVEL_BIT_NUM);
+// NV-DXVK: ray portal space. Radiance at a point depends on which portal space reached it,
+// because crossing a portal rewrites the ray mask that feeds the continuation ray, the NEE
+// shadow ray and the unordered resolve. Keying on it keeps those cells apart.
+HASH_GRID_CONST uint HASH_GRID_(PORTAL_BIT_NUM)        = 2;
+HASH_GRID_CONST uint HASH_GRID_(PORTAL_BIT_MASK)       = (1u << HASH_GRID_(PORTAL_BIT_NUM)) - 1;
+HASH_GRID_CONST uint HASH_GRID_(PORTAL_BIT_OFFSET)     = HASH_GRID_(NORMAL_BIT_OFFSET) + HASH_GRID_(NORMAL_BIT_NUM);
 
 // Tweakable parameters
 #ifndef HASH_GRID_ENABLE_64_BIT_ATOMICS
@@ -176,7 +185,7 @@ int4 HashGrid_(CalculatePositionLog)(float3 samplePosition, HashGridParameters g
     return HashGrid_(CalculatePositionLogWithVoxelSize)(samplePosition, gridParameters, voxelSize);
 }
 
-HASH_GRID_KEY_TYPE HashGrid_(ComputeSpatialHashFromGridPosition)(uint4 gridPosition, float3 sampleNormal)
+HASH_GRID_KEY_TYPE HashGrid_(ComputeSpatialHashFromGridPosition)(uint4 gridPosition, float3 sampleNormal, uint portalSpace)
 {
     HASH_GRID_KEY_TYPE hashKey =
         ((HASH_GRID_KEY_TYPE(gridPosition.x) & HASH_GRID_(POSITION_BIT_MASK)) << (HASH_GRID_(POSITION_BIT_NUM) * 0)) |
@@ -193,13 +202,15 @@ HASH_GRID_KEY_TYPE HashGrid_(ComputeSpatialHashFromGridPosition)(uint4 gridPosit
     hashKey |= (HASH_GRID_KEY_TYPE(normalBits) << HASH_GRID_(NORMAL_BIT_OFFSET));
 #endif // HASH_GRID_USE_NORMALS
 
+    hashKey |= ((HASH_GRID_KEY_TYPE(portalSpace) & HASH_GRID_(PORTAL_BIT_MASK)) << HASH_GRID_(PORTAL_BIT_OFFSET));
+
     return hashKey;
 }
 
 HASH_GRID_KEY_TYPE HashGrid_(ComputeSpatialHashWithVoxelSize)(float3 samplePosition, float3 sampleNormal, HashGridParameters gridParameters, out float voxelSize)
 {
     uint4 gridPosition = uint4(HashGrid_(CalculatePositionLogWithVoxelSize)(samplePosition, gridParameters, voxelSize));
-    return HashGrid_(ComputeSpatialHashFromGridPosition)(gridPosition, sampleNormal);
+    return HashGrid_(ComputeSpatialHashFromGridPosition)(gridPosition, sampleNormal, gridParameters.portalSpace);
 }
 
 HASH_GRID_KEY_TYPE HashGrid_(ComputeSpatialHash)(float3 samplePosition, float3 sampleNormal, HashGridParameters gridParameters)

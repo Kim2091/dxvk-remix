@@ -23,8 +23,12 @@ void sharcCount(uvec2 pixel, uint counter) {
 }
 #endif
 
-SharcParameters makeSharcParameters() {
+// portalSpace defaults to main space: callers that only touch existing entries (resolve,
+// the deferred flush, miss accumulation) never recompute a spatial key, so the value is
+// unused there.
+SharcParameters makeSharcParameters(uint portalSpace = PORTAL_SPACE_NONE) {
   SharcParameters p;
+  p.hashGridParameters.portalSpace = portalSpace;
   p.hashGridParameters.cameraPosition = cb.sharcArgs.cameraPosition;
   p.hashGridParameters.logarithmBase = SHARC_GRID_LOGARITHM_BASE;
   p.hashGridParameters.sceneScale = cb.sharcArgs.gridScale;

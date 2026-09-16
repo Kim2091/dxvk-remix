@@ -31,12 +31,12 @@ void sharcAccumulateThroughput(inout SharcUpdateState state, vec3 throughput) {
   }
 }
 
-void sharcInsertVertex(inout SharcUpdateState state, SharcHitData hit) {
+void sharcInsertVertex(inout SharcUpdateState state, SharcHitData hit, uint portalSpace) {
   // Update bounce count is capped at the compiled storage depth.
   if (state.count >= SHARC_PROPAGATION_DEPTH) {
     return;
   }
-  SharcParameters p = makeSharcParameters();
+  SharcParameters p = makeSharcParameters(portalSpace);
   HashGridKey key;
   HashGridIndex index;
   if (!HashGridInsertEntry(p.hashGridData, hit.positionWorld, hit.normalWorld,

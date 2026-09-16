@@ -23,6 +23,7 @@ struct HashGridParameters
     float logarithmBase;        // controls how quickly grid levels change with distance (SHaRC typically uses 2.0f)
     float sceneScale;           // world-space scale factor controlling voxel size
     float levelBias;            // biases level selection: can add more near-camera levels or clamp minimum voxel size (start with 0)
+    uint portalSpace;           // NV-DXVK: ray portal space of the sample; separates cells whose radiance differs by portal space
 };
 
 #endif // HASH_GRID_TYPES_H

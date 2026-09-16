@@ -38,29 +38,18 @@ bool sharcOnResolvedVertex(
   sharcCount(pathState.pixelCoordinate, !sharcSurfaceEligible ? 9u
     : !sharcLobeEligible ? 8u : !sharcEligible ? 3u : 4u);
 #endif
-  // Crossing a ray portal rewrites the path's ray mask, and that mask feeds the
-  // continuation ray, the NEE shadow ray and the unordered resolve. Radiance at a vertex
-  // is therefore a function of (position, normal, portalSpace), while the cache keys only
-  // on position and normal. Inserting from a portal-space vertex would pollute the cell
-  // that main-space paths read back.
-  //
-  // Queries stay unconditional: the cell describes the same physical point either way, so
-  // reading it is sound even from behind a portal. Only writing is restricted. The cost is
-  // that geometry reachable only through a portal never populates the cache, because
-  // portalSpace is sticky for the remainder of a path.
-#if SHARC_UPDATE
-  const bool sharcCacheEligible = sharcEligible && pathState.portalSpace == PORTAL_SPACE_NONE;
-#else
-  const bool sharcCacheEligible = sharcEligible;
-#endif
-  if (sharcCacheEligible)
+  // Portal space is part of the cache key, so a vertex reached through a portal occupies
+  // its own cell rather than polluting the one main-space paths read back. That is what
+  // makes insertion from portal space safe, and it lets portal-only geometry be cached at
+  // all, which the earlier insertion gate could not do.
+  if (sharcEligible)
   {
-    SharcParameters sharcParameters = makeSharcParameters();
+    SharcParameters sharcParameters = makeSharcParameters(pathState.portalSpace);
     SharcHitData sharcHit = (SharcHitData)0;
     sharcHit.positionWorld = surfaceInteraction.position;
     sharcHit.normalWorld = surfaceInteraction.geometryNormal;
 #if SHARC_UPDATE && SHARC_DEFERRED_UPDATE
-    sharcInsertVertex(pathState.sharcState, sharcHit);
+    sharcInsertVertex(pathState.sharcState, sharcHit, pathState.portalSpace);
 #elif SHARC_UPDATE
     // NEE below adds to this new vertex and older vertices through the same hook.
     // With resampling/responsive lighting disabled, insertion failure leaves
