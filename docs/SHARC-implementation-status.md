@@ -372,3 +372,32 @@ Added opt-in `rtx.sharc.leanFeatureLevel` (1 restores alpha-blended indirect sha
 ## Consolidated into one SHARC path - 2026-09-15
 
 User decision after the parity analysis: the lean profile is removed. Its scene gate was ported into the main path first (commit a4c057777): the direct/indirect alpha-blend and translucent shadow-ray mask bits and the indirect unordered resolve are now skipped per frame when the TLAS contains no such instances, which is output-identical; shader blobs unchanged. Then the lean options, 42 shader variants, selection code, UI and validator were deleted; four shader sources are byte-identical to the pre-lean tree and all 56 SHARC stages are byte-identical to the stealing-guard build. The SHARC reservoir guard from 9901d7e99 is kept and pinned by validate_sharc_integration.py. RtxOptions.md regenerated. Local only; nothing deployed or measured. Record: Lean-SHARC-parity-2026-09-14.md.
+
+## Ray portals confirmed working in Portal RTX - 2026-09-15
+
+SHARC ran for a full Portal RTX session with ray portals active and **fell back zero
+times**: 59,400 selected frames, 0 on a raytraced render target, 0 on other conditions,
+across a 21-minute session (18:38 to 18:59). The runtime log carries 0 errors and 4,318
+warnings, all benign -- replacement textures without mip-maps, two unknown D3D9 formats,
+USD skel primvar types, and Sentry declining to initialise. No CUDA, NRC or USD load
+failure. NRC v0.15 initialised cleanly, confirming the dependency deployment.
+
+User reports portal content looked better than the other indirect samplers.
+
+This exercises the 2026-09-15 portal work: insertion is gated on
+portalSpace == PORTAL_SPACE_NONE so portal-reached vertices never pollute a cell that
+main-space paths read, and the gate predicate was narrowed to numActiveRayPortals > 0
+rather than firing whenever portal texture hashes are merely configured -- the latter
+alone would have disabled SHARC for the entire Portal RTX session.
+
+Caveats. allowRayPortals was True, so the portal gate could not have fired regardless;
+the zero on "other conditions" proves WBOIT, micromaps and allocation never fired, not
+that the portal gate was exercised. The insertion gate is shader-side and not logged, so
+its engagement is inferred from portals being active, not observed. No frame time was
+measured. The two known portal artifacts remain unfixed: the farEnough self-reference
+guard weakens after a teleport, and grid level uses true world distance so through-portal
+geometry caches coarsely for its screen size.
+
+Deployment: PortalRTX/bin/.trex, our d3d9.dll plus 32 dependency DLLs and the usd/ plugin
+tree from the FNV runtime (CUDA 13, newer NRC_Vulkan, unbundled USD stack, upscalers).
+Backups retained with suffix backup-pre-sharc-20260915-*.
