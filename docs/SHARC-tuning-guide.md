@@ -26,8 +26,12 @@ rtx.integrateIndirectMode = 3
 
 `3` is SHARC. (`0` plain path tracing, `1` ReSTIR GI, `2` NRC — the stock default.)
 
-Then paste this. It is the profile that produced the measured Portal RTX results, and it is what
-FNV runs:
+**In most cases you do not need to paste anything.** The shipped defaults are the Balanced
+preset, which is the profile below, so `rtx.integrateIndirectMode = 3` on its own gets you there.
+The panel also has a **SHARC preset** dropdown with Quality, Balanced and Performance.
+
+Paste this only if you want the settings written out explicitly, or you are on an older build
+whose defaults predate the presets:
 
 ```ini
 rtx.integrateIndirectMode = 3
@@ -50,20 +54,23 @@ rtx.sharc.staleFrames      = 32         # default
 rtx.sharc.gridScale        = 50         # default
 ```
 
-Where that differs from the shipped defaults, and why:
+Why these values, and what each one is protecting you from:
 
-| Option | Fork default | Start at | Why |
-|---|---|---|---|
-| `allowSpecularPaths` | `False` | `True` | Off, the cache refuses every surface a non-diffuse ray reached. In an enclosed scene that is nearly everything — **measured**: Portal RTX sat at 0.2% eligible surfaces purely because this line was missing from its config. |
-| `minRoughness` | `0.8` | `0.05` | 0.8 is very strict. With `footprintGate` on, the old reason for keeping it high is gone. |
-| `maxEmissiveLuminance` | `0.0` | `0.1` | At 0 *any* emission at all disqualifies a surface, which throws out every faint emissive map. **Measured** in Portal: this alone took the emissive reject share from "almost every surface" down to 0.8%. |
-| `capacityLog2` | `21` | `20` | 20 is 1M cells / 40 MiB and was never measurably short. Raise it only if the panel tells you to. |
-| `updateTileSize` | `5` | `8` | One update path per 8×8 pixel tile instead of 5×5 — about 2.5× cheaper, and **measured** Portal still hit 99.2%. |
-| `updateBounces` | `8` | `4` | Same reasoning: 8 was more depth than the cache needed. |
-| `accumulationFrames` | `8` | `4` | Faster response to lighting changes. Safe wherever cells are fed every frame (enclosed spaces). See §4 before lowering it further. |
+| Option | Value | Why |
+|---|---|---|
+| `allowSpecularPaths` | `True` | Off, the cache refuses every surface a non-diffuse ray reached. In an enclosed scene that is nearly everything — **measured**: Portal RTX sat at 0.2% eligible surfaces purely because this line was missing from its config. |
+| `minRoughness` | `0.05` | A *squared* roughness, so it is stricter than it looks. With `footprintGate` on, the old reason for keeping it high is gone. |
+| `maxEmissiveLuminance` | `0.1` | At 0 *any* emission at all disqualifies a surface, which throws out every faint emissive map. **Measured** in Portal: this alone took the emissive reject share from "almost every surface" down to 0.8%. |
+| `minSampleCount` | `2` | Stops a cell answering from a single sample. **Measured**: this is what removed the glow on geometry coming into view. |
+| `capacityLog2` | `22` | Occupancy was never measurably short even at 20, but the resolve pass runs one thread per slot, so this costs a little every frame regardless. See §5. |
+| `updateTileSize` | `8` | One update path per 8×8 pixel tile. **Measured** Portal still hit 99.2% at this rate. |
+| `updateBounces` | `4` | 8 was more depth than the cache needed. Note this is *not* `rtx.pathMaxBounces`. |
+| `accumulationFrames` | `8` | Response to lighting changes versus per-cell noise. See §4 before changing it in either direction. |
 
-Two more, both **off by default, both untested in game**, worth trying if your game has a lot of
-open sky: `rtx.sharc.updatePrimaryVertex = True` and `rtx.sharc.updateSkyRetries = 1`. See §5.
+Two more are **on by default** and matter most where the sky is visible:
+`rtx.sharc.updatePrimaryVertex = True` and `rtx.sharc.updateSkyRetries = 1`. They recover update
+work that would otherwise be thrown away by paths escaping to the sky. **Neither has been measured
+in game** — if you have an open-world title, they are the first thing worth A/B-ing. See §5.
 
 **Requirements.** SHARC needs shader Int64, buffer Int64 atomics, FP16, 16-bit storage and
 RayQuery. On a device missing any of them it **silently traces ordinary paths** — no error, no
@@ -185,7 +192,7 @@ list in order:
      frame. SHARC drops out for the whole frame. Governed by `rtx.raytracedRenderTarget.enable`.
    - *"Ray portals block SHARC"* — set `rtx.sharc.allowRayPortals = True`.
    - *"Cache allocation failed"* — lower `capacityLog2`, then press Reset SHARC.
-3. **`minRoughness` too high.** The default 0.8 is strict, and it is a *squared* roughness (§4).
+3. **`minRoughness` too high.** Older builds defaulted to 0.8, which is strict, and it is a *squared* roughness (§4).
    Drop it to 0.05 and watch the roughness reject share.
 4. **`maxEmissiveLuminance` at 0.** Every surface carrying even a faint emissive map is refused.
    **Measured** in Portal: at 0.1 the emissive rejects fell to 0.8% of surfaces.
@@ -303,7 +310,7 @@ their merits. It is on by default. If you inherited a config with `minRoughnessS
 up, you can drop it; it is inert anyway.
 
 **`minRoughness` is a *squared* roughness.** 0.05 squared-roughness is roughly 0.22 in the
-perceptual roughness a material editor shows you; the old default 0.8 is roughly 0.89 perceptual.
+perceptual roughness a material editor shows you; 0.8 squared is roughly 0.89 perceptual.
 So 0.05 is far less permissive than the number suggests, and 0.8 is nearly "matte only". The
 in-game slider says "(squared)" for this reason.
 
@@ -337,7 +344,7 @@ different, depending on state elsewhere.
 
 ### Eligibility — which surfaces the cache may use
 
-#### `rtx.sharc.allowSpecularPaths` — default `False`
+#### `rtx.sharc.allowSpecularPaths` — default `True`
 
 Lets the cache store at and read from rough opaque surfaces that a *non-diffuse* ray arrived at.
 Off, eligibility collapses to "the arriving ray came from a diffuse bounce", which in an enclosed
@@ -366,7 +373,7 @@ cell averages and glow.
 > ones. It never applies to diffuse arrivals — a diffuse lobe is as wide as lobes get. Changing it
 > clears the cache.
 
-#### `rtx.sharc.minRoughness` — default `0.8`, range 0.05–1.0
+#### `rtx.sharc.minRoughness` — default `0.05`, range 0.05–1.0
 
 The roughness floor for caching a surface at all. Below it, the surface is considered too shiny for
 an isotropic average to stand in for its reflection.
@@ -383,7 +390,7 @@ Remember it is *squared* roughness — 0.05 here is about 0.22 perceptual.
 > every experiment you ran below 0.5 measured nothing.) `minRoughnessSpecular` is additionally
 > floored at whatever this is. Changing it clears the cache.
 
-#### `rtx.sharc.minRoughnessSpecular` — default `0.5`
+#### `rtx.sharc.minRoughnessSpecular` — default `0.7`
 
 The old, stricter roughness floor applied only to surfaces a specular ray arrived at.
 
@@ -395,7 +402,7 @@ A/B'd.
 > It also requires `allowSpecularPaths` on. And the host floors it at `minRoughness`, so setting it
 > *below* `minRoughness` does nothing. Changing it clears the cache.
 
-#### `rtx.sharc.maxEmissiveLuminance` — default `0.0`
+#### `rtx.sharc.maxEmissiveLuminance` — default `0.1`
 
 The cache stores *reflected* light, and the path adds a surface's own emission separately, so
 emissive surfaces are excluded to avoid confusion. At the default 0, any emission whatsoever
@@ -453,7 +460,7 @@ them readable.
 
 ### Budget — what the cache costs
 
-#### `rtx.sharc.capacityLog2` — default `21`, range 18–22
+#### `rtx.sharc.capacityLog2` — default `22`, range 18–22
 
 Cache size as a power of two. 20 is 1M cells / 40 MiB, 21 is 80 MiB, 22 is 160 MiB. When all 16
 slots of a hash bucket are taken, the new cell is silently dropped — no counter records it, which
@@ -467,7 +474,7 @@ more threads every frame.
 > **Depends on:** nothing. Reallocates buffers and clears the cache on change. Watch
 > `GPU ms: resolve` when you raise it.
 
-#### `rtx.sharc.updateTileSize` — default `5`, range 1–16
+#### `rtx.sharc.updateTileSize` — default `8`, range 1–16
 
 One cache-filling path is traced per N×N pixel tile. 8 means 1/64 of the pixels. This is the main
 lever on how densely the cache is fed.
@@ -479,7 +486,7 @@ directly on `GPU ms: update`; indoors those update paths are the long ones, so t
 
 > **Depends on:** nothing. **Takes effect live — does not clear the cache.**
 
-#### `rtx.sharc.updateBounces` — default `8`, range 1–8
+#### `rtx.sharc.updateBounces` — default `4`, range 1–8
 
 How many bounces a cache-filling path runs. Russian roulette is forced off for these paths, so they
 run the full count unless they miss or lose all their weight first.
@@ -530,7 +537,7 @@ samplers.
 > vertices are never inserted and that the feature is untested. Both statements predate the
 > portal-space key change and the Portal RTX session.*
 
-#### `rtx.sharc.updatePrimaryVertex` — default `False`. **Untested in game.**
+#### `rtx.sharc.updatePrimaryVertex` — default `True`. **Untested in game.**
 
 Normally the cache only stores at *secondary* hits, so an update path whose first bounce flies off
 into the sky stores nothing at all — **measured** FNV desert: two thirds of the update budget,
@@ -555,7 +562,7 @@ rate climbs toward the high 90s, `Path ends: sky` does not move (it is a query s
 > specular highlight. Watch for a tint or brightness on cached glossy surfaces that follows the
 > camera. If you see it, this option stays off for that game.
 
-#### `rtx.sharc.updateSkyRetries` — default `0`, range 0–4. **Untested in game.**
+#### `rtx.sharc.updateSkyRetries` — default `1`, range 0–4. **Untested in game.**
 
 When an update path's first bounce exits to the sky, re-aim it from a cosine lobe about the surface
 normal and trace again, up to N times, so the budget lands on geometry more often outdoors.
