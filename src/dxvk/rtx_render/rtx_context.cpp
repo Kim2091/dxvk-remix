@@ -713,6 +713,8 @@ namespace dxvk {
         // updateFrame/computeLuts instead.
         m_common->metaAtmosphere().dispatchCloudScreenPass(*this, rtOutput);
         recordGpuStageTiming("CloudScreen");
+        m_common->metaAtmosphere().dispatchCloudSampleStatistics(this);
+        recordGpuStageTiming("CloudSampleStatistics");
 
         // Neural Radiance Cache
         m_common->metaNeuralRadianceCache().dispatchTrainingAndResolve(*this, rtOutput);
@@ -1710,6 +1712,9 @@ namespace dxvk {
                            : frame.cloudMode == 6 ? "DensityOnlyTightBounds" : "Normal";
           Logger::info(str::format("[Cloud profile] frame=", frame.frameId, " mode=", mode,
             " samples=", frame.cloudSamples, " maxSamples=", frame.cloudSamplesMax,
+            " spacingKm=", frame.cloudSampleSpacingKm,
+            " screenPeriod=", frame.cloudScreenPeriod,
+            " sunBlocks=", frame.cloudSunCoherentBlocks,
             " bakeInterleave=", frame.cloudSunGridPeriod, "/", frame.cloudDomePeriod,
             " extent=", frame.cloudRenderWidth, "x", frame.cloudRenderHeight,
             " detailLod=", frame.cloudDetailLod, " detailLodBias=", frame.cloudDetailLodBias,
@@ -1724,6 +1729,7 @@ namespace dxvk {
         // Record the resolved bake periods, native extent and live detail-filter settings.
         Logger::info(str::format("[GPU stages] frame=", frame.frameId, " stage=CloudConfig bakeInterleave=",
           frame.cloudSunGridPeriod, "/", frame.cloudDomePeriod,
+          " sunBlocks=", frame.cloudSunCoherentBlocks,
           " extent=", frame.cloudRenderWidth, "x", frame.cloudRenderHeight,
           " detailLod=", frame.cloudDetailLod, " detailLodBias=", frame.cloudDetailLodBias));
         Logger::info(str::format("[GPU stages] frame=", frame.frameId, " stage=MeasuredSequence ms=",
@@ -1765,6 +1771,11 @@ namespace dxvk {
     frame.labels[frame.count++] = label;
     if (std::strcmp(label, "CloudScreen") == 0) {
       const auto& state = m_common->metaAtmosphere().getCloudProfileState();
+      frame.cloudSamples = state.samples;
+      frame.cloudSamplesMax = state.maxSamples;
+      frame.cloudSampleSpacingKm = state.sampleSpacingKm;
+      frame.cloudScreenPeriod = state.screenPeriod;
+      frame.cloudSunCoherentBlocks = state.sunCoherentBlocks;
       frame.cloudSunGridPeriod = state.sunGridPeriod;
       frame.cloudDomePeriod    = state.domePeriod;
       frame.cloudRenderWidth   = state.renderWidth;

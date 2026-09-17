@@ -1122,6 +1122,11 @@ void RtxAtmosphere::showCloudSettings(const WeatherSnapshot* weatherSnapshot) {
       "Re-bakes half or a quarter of the sun-direction lighting grid's columns each frame; the "
       "rest are at most one period old and the filtered read blends across them. A full bake "
       "still runs whenever the grid's inputs cross a re-bake step. Applies live.");
+    RemixGui::Checkbox("Coherent Sun Shadow Blocks", &RtxAtmosphere::cloudSunGridCoherentBlocksObject());
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Experimental: groups Half/Quarter sun-shadow updates into adjacent eight-column blocks. "
+      "Same density calculations and update count; compare sun-grid GPU time with this off/on. "
+      "Every frame mode is unchanged. Applies live.");
     RemixGui::Combo("Cloud Reflection Interleave", &RtxAtmosphere::cloudSecondaryLutInterleaveModeObject(),
       kCloudInterleaveModes, IM_ARRAYSIZE(kCloudInterleaveModes));
     RemixGui::SetTooltipToLastWidgetOnHover(
@@ -1143,26 +1148,27 @@ void RtxAtmosphere::showCloudSettings(const WeatherSnapshot* weatherSnapshot) {
     RemixGui::DragFloat("Cloud Sample Spacing", &RtxAtmosphere::cloudViewStepKmObject(),
       0.01f, 0.0f, 1.0f, "%.2f km", sliderFlags);
     RemixGui::SetTooltipToLastWidgetOnHover(
-      "Distance between cloud samples along each view ray, in km. "
-      "This is the fix for the horizontal banding near the horizon: "
-      "sightlines there cross 50+ km of cloud layer, and the old "
-      "fixed 32-sample march spaced samples too far apart to resolve "
-      "the clouds.\n\nPERFORMANCE: cost scales with how many samples "
-      "a ray needs -- overhead sightlines are unchanged, but "
-      "horizon-heavy views can take up to Max Cloud Samples / 32 "
-      "times the cloud cost (2x at the defaults). Raise the spacing "
-      "or lower Max Cloud Samples to claw the cost back, or set 0 "
-      "to restore the legacy fixed march (banding returns). "
-      "Cloud Render Scale above also directly offsets this cost. "
-      "Applies live.");
+      "Controls actual march spacing. Larger is cheaper/coarser; adaptive mode scales it with "
+      "distance and stops at its floor. Max Cloud Samples only limits rays that reach the cap. "
+      "0 selects the legacy fixed base-count march. Applies live.");
     RemixGui::DragInt("Max Cloud Samples", &RtxAtmosphere::cloudViewSamplesMaxObject(),
       1.0f, 32, 256, "%d", sliderFlags);
     RemixGui::SetTooltipToLastWidgetOnHover(
-      "Hard cap on cloud samples per ray -- the performance governor "
-      "for Cloud Sample Spacing. 64 resolves the default spacing "
-      "out to ~6 km of cloud span; lower values cost less but let "
-      "a little banding back in at the far horizon. 32 = legacy "
-      "cost ceiling. Applies live.");
+      "Main-layer iteration ceiling per slab crossing, floored by the base count. Changing this "
+      "does nothing to rays that finish or become opaque below the ceiling. Adaptive exhaustion "
+      "adds up to four coarse tail samples. The second layer has a separate budget. "
+      "Ignored at zero spacing. Enable Log Cloud Timings for actual GPU evaluation counts.");
+    if (m_cloudStatisticsValid) {
+      ImGui::Text("GPU density evaluations: mean %.1f, max %u", m_cloudSamplesMean, m_cloudSamplesMaximum);
+      ImGui::Text("Evaluated pixels: %.1f%%; their mean %.1f", m_cloudSamplesActivePercent, m_cloudSamplesActiveMean);
+      ImGui::Text("Captured cap %u, spacing %.2f km, screen period %u",
+        m_cloudStatisticsConfig.maxSamples, m_cloudStatisticsConfig.sampleSpacingKm,
+        m_cloudStatisticsConfig.screenPeriod);
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "Last completed GPU measurement; refreshes every 120 frames while Log Cloud Timings is on. "
+        "Counts all visible layer crossings and coarse tails, excluding lighting-shadow taps. "
+        "Reused pixels count zero. This measures evaluations, not the configured maximum.");
+    }
     const char* kCloudProfilingModes[] = {
       "Normal", "No moon shadows", "Density only (unlit)",
       "Full quality (16x4 threads)", "Full quality (8x4 threads)",

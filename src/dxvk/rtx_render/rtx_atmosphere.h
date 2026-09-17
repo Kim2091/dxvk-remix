@@ -26,6 +26,7 @@
 #include "rtx_common_object.h"
 #include "rtx/pass/atmosphere/atmosphere_args.h"
 #include "rtx_option.h"
+#include "../dxvk_gpu_query.h"
 
 #include <atomic>
 
@@ -118,7 +119,13 @@ public:
   // What the cloud dispatches actually did this frame, for the timing log (fork -- 2026-09-17):
   // the resolved interleave periods (1 on a forced full update), the RT extent, and the screen
   // pass's detail-LOD state. Filled by dispatchCloudRender.
+  void dispatchCloudSampleStatistics(Rc<DxvkContext> ctx);
   struct CloudProfileState {
+    uint32_t samples = 0u;
+    uint32_t maxSamples = 0u;
+    uint32_t screenPeriod = 1u;
+    float sampleSpacingKm = 0.0f;
+    bool sunCoherentBlocks = false;
     uint32_t sunGridPeriod = 1u;
     uint32_t domePeriod    = 1u;
     uint32_t renderWidth   = 0u;
@@ -1126,11 +1133,10 @@ public:
                "quality for speed; 0 = legacy fixed count (banding "
                "returns). Applies live.");
     RTX_OPTION("rtx.atmosphere", uint32_t, cloudViewSamplesMax, 64,
-               "Hard cap on cloud samples per ray [32..256] — the "
-               "performance governor for cloudViewStepKm. At the default 0.15 km "
-               "spacing, 64 spans ~9.6 km before the cap bites; adaptive stepping varies this, "
-               "and only horizon-grazing rays reach it. Raise it if far horizon cloud visibly "
-               "thins; lower it to spend less. 32 = legacy cost ceiling. Applies live.");
+               "Main-layer march iteration ceiling per slab crossing, floored by cloudViewSamples. "
+               "Rays that finish or become opaque earlier do not reach this limit. Adaptive budget "
+               "exhaustion adds up to four coarse tail samples; the second layer has its own budget. "
+               "0 spacing selects the base fixed-count march and ignores this ceiling. Applies live.");
     RTX_OPTION("rtx.atmosphere", float, cloudUndersideLightSigma, 1.5f,
                "Extinction of the light filtering down through each cloud, "
                "per km of overlying water. Drives the analytic "
@@ -1335,6 +1341,10 @@ public:
                "history near moving geometry. Applies only to Half/Quarter screen interleave.",
                args.minValue = 0.0f, args.maxValue = 1.0f);
 
+    RTX_OPTION("rtx.atmosphere", bool, cloudSunGridCoherentBlocks, true,
+               "Update contiguous eight-column sun-shadow blocks instead of strided columns at "
+               "Half/Quarter cadence. Same voxel integrals and update count; different spatial age "
+               "pattern. Experimental texture-cache optimization; compare GPU sun-grid timings live.");
     RTX_OPTION("rtx.atmosphere", int, cloudSunGridInterleaveMode, 2,
                "How many columns of the sun-direction cloud lighting grid are re-baked each frame; "
                "the others are at most one period old, and the trilinear read blends across "
@@ -1665,6 +1675,19 @@ private:
   // baker writes [0] and the mip pass reads [n-1] / writes [n]; the march samples the full chain.
   std::vector<Rc<DxvkImageView>> m_cloudDetailNoise3DMipViews;
   CloudProfileState   m_cloudProfileState;
+  Rc<DxvkBuffer>      m_cloudStatisticsGpu;
+  Rc<DxvkBuffer>      m_cloudStatisticsReadback;
+  Rc<DxvkGpuQuery>    m_cloudStatisticsReady;
+  bool               m_cloudStatisticsPending = false;
+  bool               m_cloudStatisticsValid = false;
+  uint32_t           m_cloudStatisticsFrame = 0u;
+  uint32_t           m_cloudStatisticsGroups = 0u;
+  uint32_t           m_cloudStatisticsCounter = 0u;
+  CloudProfileState  m_cloudStatisticsConfig;
+  double             m_cloudSamplesMean = 0.0;
+  double             m_cloudSamplesActiveMean = 0.0;
+  double             m_cloudSamplesActivePercent = 0.0;
+  uint32_t           m_cloudSamplesMaximum = 0u;
   Resources::Resource m_cloudRenderRT;
   Resources::Resource m_cloudDepthRT;
   Resources::Resource m_cloudRenderPrevious;

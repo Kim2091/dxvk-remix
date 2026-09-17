@@ -88,6 +88,11 @@ plus one consumer wire-in inside the volumetric pass.
    Projection jitter matches the primary geometry ray; march jitter remains animated.
    The reuse path has separate compile-time variants, including all profiling modes.
    Sun-grid columns and reflection-dome rows retain independent Quarter interleave.
+   Coherent Sun Shadow Blocks (experimental, default on) groups sun updates into adjacent
+   eight-column blocks; its live toggle restores strided updates for timing/quality comparison.
+   Log Cloud Timings also exposes actual GPU mean/max view-density evaluations in the menu;
+   Max Cloud Samples is a ceiling, not the number of samples every ray takes.
+   See [the experiment and diagnostics](numos-sun-blocks-2026-09-17.md).
    Screen reprojection remains rotation-only; rapid translation through nearby clouds can
    expose reuse errors. No new in-game quality or performance result is claimed.
 

@@ -20,6 +20,11 @@
 * DEALINGS IN THE SOFTWARE.
 */
 
+//!variant cloud_sun_density_grid.comp
+//!variant cloud_sun_density_grid_blocks.comp
+//!> CLOUD_SUN_COHERENT_BLOCKS=1
+//!end-variants
+
 // Cloud D_sun voxel grid bake (Nubis Cubed 2023, fork — 2026-05-12).
 //
 // Bakes summed optical depth along the sun direction at each voxel of a
@@ -82,7 +87,13 @@ void main(uint3 dispatchId : SV_DispatchThreadID, uint3 groupThreadId : SV_Group
   // frame the grid's inputs change, so the interleave only ever spans frames whose bakes agree.
   const uint period = max(args.cloudSunGridInterleave & 0xFFu, 1u);
   const uint phase = (args.cloudSunGridInterleave >> 8u) & 0xFFu;
-  const uint3 voxel = uint3(dispatchId.x * period + phase, dispatchId.y, dispatchId.z);
+#ifdef CLOUD_SUN_COHERENT_BLOCKS
+  // Keep the eight adjacent X lanes adjacent in texture space at every cadence.
+  const uint column = ((dispatchId.x / 8u) * period + phase) * 8u + dispatchId.x % 8u;
+#else
+  const uint column = dispatchId.x * period + phase;
+#endif
+  const uint3 voxel = uint3(column, dispatchId.y, dispatchId.z);
 
   // Voxel center in UVW. The +0.5 puts the sample at the voxel center so
   // adjacent voxels integrate offset positions (no "ringing" between voxels).

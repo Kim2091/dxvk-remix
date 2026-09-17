@@ -48,6 +48,8 @@
 #include <rtx_shaders/aerial_perspective_light_cull.h>
 #include <rtx_shaders/cloud_sky_transmittance_lut.h>
 #include <rtx_shaders/cloud_sun_density_grid.h>
+#include <rtx_shaders/cloud_sun_density_grid_blocks.h>
+#include <rtx_shaders/cloud_sample_statistics.h>
 #include <rtx_shaders/cloud_ambient_density_grid.h>
 #include <rtx_shaders/cloud_ambient_density_grid_scan.h>
 #include <rtx_shaders/cloud_render.h>
@@ -250,6 +252,15 @@ namespace dxvk {
       END_PARAMETER()
     };
     PREWARM_SHADER_PIPELINE(CloudAmbientDensityGridScanShader);
+
+    class CloudSampleStatisticsShader : public ManagedShader {
+      SHADER_SOURCE(CloudSampleStatisticsShader, VK_SHADER_STAGE_COMPUTE_BIT, cloud_sample_statistics)
+      BEGIN_PARAMETER()
+        TEXTURE2D(0)
+        RW_STRUCTURED_BUFFER(1)
+      END_PARAMETER()
+    };
+    PREWARM_SHADER_PIPELINE(CloudSampleStatisticsShader);
 
     class CloudRenderShader : public ManagedShader {
       SHADER_SOURCE(CloudRenderShader, VK_SHADER_STAGE_COMPUTE_BIT, cloud_render)
@@ -2744,10 +2755,12 @@ void RtxAtmosphere::dispatchCloudSunDensityGrid(Rc<DxvkContext> ctx) {
   ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_cloudDetailNoise3D.image);
   ctx->getCommandList()->trackResource<DxvkAccess::Write>(m_cloudDSun.image);
 
-  ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, CloudSunDensityGridShader::getShader());
+  ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, RtxAtmosphere::cloudSunGridCoherentBlocks()
+    ? GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, CloudSunDensityGridShader, cloud_sun_density_grid_blocks)
+    : CloudSunDensityGridShader::getShader());
 
   // Shader declares [numthreads(8, 8, 4)]. With an interleave period P the dispatch covers 1/P of
-  // the X columns and the shader maps each thread onto column P * x + phase (fork -- 2026-09-16).
+  // the X columns, either strided per lane or grouped into contiguous eight-column blocks.
   const uint32_t period = std::max(args.cloudSunGridInterleave & 0xFFu, 1u);
   const uint32_t groupsX = (kCloudVoxelGridX / period + 7u) / 8u;
   const uint32_t groupsY = (kCloudVoxelGridY + 7u) / 8u;
@@ -3387,6 +3400,11 @@ void RtxAtmosphere::dispatchCloudRender(Rc<DxvkContext> ctx, const Resources::Ra
   std::swap(m_cloudDepthRT, m_cloudDepthPrevious);
   AtmosphereArgs args = getAtmosphereArgs();
   traceCloudPlacement(args);
+  m_cloudProfileState.samples = args.cloudViewSamples;
+  m_cloudProfileState.maxSamples = static_cast<uint32_t>(args.cloudViewSamplesMax);
+  m_cloudProfileState.sampleSpacingKm = args.cloudViewStepKm;
+  m_cloudProfileState.screenPeriod = m_cloudScreenPeriodThisFrame;
+  m_cloudProfileState.sunCoherentBlocks = RtxAtmosphere::cloudSunGridCoherentBlocks();
   m_cloudProfileState.sunGridPeriod = m_cloudSunGridPeriodThisFrame;
   m_cloudProfileState.domePeriod    = m_cloudDomePeriodThisFrame;
   m_cloudProfileState.renderWidth   = m_cloudRenderExtent.width;
@@ -3534,6 +3552,81 @@ void RtxAtmosphere::dispatchCloudRender(Rc<DxvkContext> ctx, const Resources::Ra
       m_cloudScreenFullFrames = 0u;
     }
   }
+}
+
+void RtxAtmosphere::dispatchCloudSampleStatistics(Rc<DxvkContext> ctx) {
+  if (m_cloudStatisticsPending) {
+    DxvkQueryData queryData;
+    const auto status = m_cloudStatisticsReady->getData(queryData);
+    if (status == DxvkGpuQueryStatus::Pending) {
+      return;
+    }
+    if (status == DxvkGpuQueryStatus::Available) {
+      const auto* pRows = static_cast<const uint32_t*>(m_cloudStatisticsReadback->mapPtr(0));
+      uint64_t sum = 0u, active = 0u, pixels = 0u;
+      m_cloudSamplesMaximum = 0u;
+      for (uint32_t i = 0u; i < m_cloudStatisticsGroups; ++i) {
+        sum += pRows[i * 4u];
+        m_cloudSamplesMaximum = std::max(m_cloudSamplesMaximum, pRows[i * 4u + 1u]);
+        active += pRows[i * 4u + 2u];
+        pixels += pRows[i * 4u + 3u];
+      }
+      m_cloudSamplesMean = pixels ? double(sum) / double(pixels) : 0.0;
+      m_cloudSamplesActiveMean = active ? double(sum) / double(active) : 0.0;
+      m_cloudSamplesActivePercent = pixels ? 100.0 * double(active) / double(pixels) : 0.0;
+      m_cloudStatisticsValid = true;
+      Logger::info(str::format("[Cloud samples GPU] frame=", m_cloudStatisticsFrame,
+        " base=", m_cloudStatisticsConfig.samples, " cap=", m_cloudStatisticsConfig.maxSamples,
+        " spacingKm=", m_cloudStatisticsConfig.sampleSpacingKm,
+        " screenPeriod=", m_cloudStatisticsConfig.screenPeriod,
+        " meanAll=", m_cloudSamplesMean, " meanEvaluated=", m_cloudSamplesActiveMean,
+        " max=", m_cloudSamplesMaximum, " evaluatedPercent=", m_cloudSamplesActivePercent));
+    }
+    m_cloudStatisticsPending = false;
+  }
+  if (!RtxAtmosphere::cloudProfilingLog() || !RtxAtmosphere::debugDispatchCloudRender()
+      || !m_cloudDepthRT.isValid() || m_cloudLastRenderFrame != m_cloudRenderFrameIdx) {
+    return;
+  }
+  if (m_cloudStatisticsCounter++ % 120u != 0u) {
+    return;
+  }
+  const uint32_t groupsX = (m_cloudRenderExtent.width + 7u) / 8u;
+  const uint32_t groupsY = (m_cloudRenderExtent.height + 7u) / 8u;
+  const uint32_t groups = groupsX * groupsY;
+  const VkDeviceSize size = VkDeviceSize(groups) * 4u * sizeof(uint32_t);
+  if (m_cloudStatisticsGpu == nullptr || m_cloudStatisticsGpu->info().size != size) {
+    DxvkBufferCreateInfo info = {};
+    info.size = size;
+    info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    info.stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+    info.access = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+    m_cloudStatisticsGpu = m_device->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+      DxvkMemoryStats::Category::RTXBuffer, "Cloud Sample Statistics GPU");
+    info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT;
+    info.access = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+    m_cloudStatisticsReadback = m_device->createBuffer(info,
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+      DxvkMemoryStats::Category::RTXBuffer, "Cloud Sample Statistics Readback");
+  }
+  if (m_cloudStatisticsReady == nullptr) {
+    m_cloudStatisticsReady = m_device->createGpuQuery(VK_QUERY_TYPE_TIMESTAMP, 0, 0);
+  }
+  ctx->bindResourceView(0, m_cloudDepthRT.view, nullptr);
+  ctx->bindResourceBuffer(1, DxvkBufferSlice(m_cloudStatisticsGpu, 0, size));
+  ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, CloudSampleStatisticsShader::getShader());
+  ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_cloudDepthRT.image);
+  ctx->getCommandList()->trackResource<DxvkAccess::Write>(m_cloudStatisticsGpu);
+  ctx->dispatch(groupsX, groupsY, 1u);
+  ctx->copyBuffer(m_cloudStatisticsReadback, 0, m_cloudStatisticsGpu, 0, size);
+  ctx->emitMemoryBarrier(0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+    VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT);
+  ctx->writeTimestamp(m_cloudStatisticsReady);
+  m_cloudStatisticsGroups = groups;
+  m_cloudStatisticsFrame = m_cloudRenderFrameIdx;
+  m_cloudStatisticsConfig = m_cloudProfileState;
+  m_cloudStatisticsPending = true;
 }
 
 void RtxAtmosphere::dispatchCloudSecondaryLut(Rc<DxvkContext> ctx) {
