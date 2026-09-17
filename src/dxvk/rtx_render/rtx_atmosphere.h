@@ -106,13 +106,10 @@ public:
   const Resources::Resource& getCloudNvdfSdf() const { return m_cloudNvdfSdf[m_cloudNvdfSdfFront]; }
 
   // Screen-space RGBA16F at downscale extent: premultiplied cloud rgb + transmittance alpha, per frame.
-  const Resources::Resource& getCloudRenderRT() const { return m_cloudRenderRT[m_cloudRenderCurrent]; }
+  const Resources::Resource& getCloudRenderRT() const { return m_cloudRenderRT; }
 
-  // Depth companion to the cloud render RT (fork — 2026-09-05, world-space cloud migration Stage
-  // 4a). Same extent, allocated/resized alongside it (see ensureCloudRenderRT). RG32F: r = entry
-  // distance, g = transmittance-weighted mean cloud depth, both in km. Written by
-  // dispatchCloudScreenPass; no consumer yet (Stage 4b).
-  const Resources::Resource& getCloudDepthRT() const { return m_cloudDepthRT[m_cloudRenderCurrent]; }
+  // RGBA32F: entry, mean and surface distance (km), plus density evaluations for debug view 912.
+  const Resources::Resource& getCloudDepthRT() const { return m_cloudDepthRT; }
 
   // 256x256 RGBA16F dome LUT baked per frame (was 256x128 before the Stage 2 full-sphere mapping);
   // supplies clouds to secondary rays (indirect/PSR/reflection).
@@ -120,15 +117,14 @@ public:
 
   // What the cloud dispatches actually did this frame, for the timing log (fork -- 2026-09-17):
   // the resolved interleave periods (1 on a forced full update), the RT extent, and the screen
-  // pass's detail-LOD / step-scale state. Filled by dispatchCloudRender.
+  // pass's detail-LOD state. Filled by dispatchCloudRender.
   struct CloudProfileState {
-    uint32_t screenPeriod  = 1u;
     uint32_t sunGridPeriod = 1u;
     uint32_t domePeriod    = 1u;
     uint32_t renderWidth   = 0u;
     uint32_t renderHeight  = 0u;
     uint32_t detailLod     = 0u;
-    float    sampleBoost   = 1.0f;
+    float    detailLodBias = 0.0f;
   };
   const CloudProfileState& getCloudProfileState() const { return m_cloudProfileState; }
 
@@ -402,7 +398,7 @@ public:
                "engine's camera NiPoint3).");
     RTX_OPTION("rtx.atmosphere", float, cloudAnchorCutKm, 0.5f,
                "Per-frame movement (km) of the resolved cloud anchor that counts as a camera cut, "
-               "forcing a one-frame reset of the screen-space cloud temporal history. "
+               "forcing a full refresh of the cloud reflection dome. "
                "RtCamera::isCameraCut() cannot substitute for this: it compares the same view-matrix "
                "translation that CloudAnchor::everMoved found permanently fixed on Fallout: New Vegas, "
                "so it never fires there. A teleport, a cell transition, or toggling "
@@ -849,15 +845,10 @@ public:
     // same way at ~5 m/s over a body that never changes. They are now the magnitudes of two physical
     // motions whose directions come from the wind: rise, and downwind shear that grows with height.
     // Neither touches the body SDF, so neither invalidates the NVDF bake.
-    // Beyond this distance the march stops animating its per-sample jitter (fork -- 2026-09-07).
-    // Nubis freezes it past 250 m because the voxel clouds there had no temporal filter; we have
-    // the cloud pass's own accumulator (cloudHistoryWeight), which needs per-frame noise to average.
-    // The composite EMA this used to name alongside it was removed on 2026-09-14. A frozen hash
-    // instead makes the sampling error a fixed pattern that survives both filters as speckle.
     RTX_OPTION_ARGS("rtx.atmosphere", float, nubis3JitterAnimateKm, 1.0e9f,
                "Distance in km beyond which cloud march jitter stops animating. Effectively infinite "
-               "by default, so jitter animates everywhere and the temporal filters can resolve it. "
-               "Lower it only when running with no temporal accumulation at all.",
+               "by default, preserving animated sampling at native resolution. Lower values freeze "
+               "distant sampling noise into a screen-space pattern. Applies live.",
                args.minValue = 0.0f);
     RTX_OPTION("rtx.atmosphere", float, cloudEvolutionSpeed, 0.002f,
                "Convective rise speed of cloud detail, in km/s. Billows and erosion cutouts drift "
@@ -1322,55 +1313,6 @@ public:
                "sin(sun elevation) at which the sunset ambient effect smooth-fades to zero. "
                "Default 0.4 (~24 degrees above horizon). Effect is at full strength when sun is at the horizon.");
 
-    RTX_OPTION("rtx.atmosphere", float, cloudRenderResolutionScale, 1.0f,
-               "Resolution scale of the cloud render target relative to the "
-               "internal (DLSS-input) resolution [0.25..1]. 0.5 (the default) = quarter the "
-               "pixels, which measured ~4x cheaper on the cloud march; 1.0 = native. "
-               "Below 1 the march is reconstructed against the full-resolution depth, so "
-               "silhouettes stay sharp. Applies on the next frame; live-tunable.");
-    // Retained config keys for older installations; cloud accumulation has been removed.
-    // Revived 2026-09-17 as a CLOUD-PASS accumulator (the 2026-09-14 removal took out the
-    // composite-side EMA, which is a different mechanism at a different point in the frame).
-    RTX_OPTION_ARGS("rtx.atmosphere", float, cloudHistoryWeight, 0.0f,
-               "How much of a cloud pixel's previous value is kept when it is re-marched. The cloud "
-               "march jitters each sample by a blue-noise offset, which is what lets it resolve more "
-               "detail than its step size; this is what averages that jitter away again instead of "
-               "leaving it on screen as fine grain or shimmer. 0 disables accumulation and also "
-               "freezes the jitter below native render scale (the pre-2026-09-17 behaviour). 0.85 "
-               "settles in roughly 7 frames at full update rate, 27 at Quarter interleave. Raise for "
-               "a cleaner image, lower if cloud that is moving fast under wind smears.",
-               args.minValue = 0.0f, args.maxValue = 0.98f);
-    // Also used to reject mismatched surfaces during spatial upsampling.
-    RTX_OPTION_ARGS("rtx.atmosphere", float, cloudHistoryDepthTolerance, 0.1f,
-               "How far a cached cloud sample's surface distance may differ from the current pixel's "
-               "before it is discarded, as a fraction of the larger of the two. Lower rejects more "
-               "history: sharper behind moving objects, noisier at their edges.",
-               args.minValue = 0.0f, args.maxValue = 1.0f);
-    // Revived 2026-09-17 for the cloud-pass accumulator, like cloudHistoryWeight. Its old
-    // composite-side twin is gone; this one clamps in the cloud pass.
-    RTX_OPTION_ARGS("rtx.atmosphere", float, cloudHistoryClampGamma, 0.0f,
-               "How far an accumulated cloud pixel is allowed to differ from what was just marched "
-               "there, measured in standard deviations of its own neighbourhood. This is what keeps "
-               "the accumulation from smearing: cloud reprojects along camera rotation only, which "
-               "is accurate when the deck is far away and increasingly wrong as you move through it, "
-               "and without a clamp a wrong history is kept at full weight and folded forward every "
-               "frame. Lower clamps harder: less smear when flying through cloud, less noise "
-               "averaged away. 0 removes the clamp entirely. Applies live.",
-               args.minValue = 0.0f, args.maxValue = 4.0f);
-    // Diagnostic, not a look knob. Two rounds of correct source reading failed to move the image,
-    // so this exists to make the upscaler's actual behaviour observable.
-    RTX_OPTION_ARGS("rtx.atmosphere", int, cloudDebugInjectPattern, 0,
-               "DEBUG. Stamps a 1-pixel checkerboard into the final composite, immediately before "
-               "the upscaler runs. 0 = off; 1/2/3 = static over sky, geometry, both; 4/5/6 = the "
-               "same three with the checkerboard inverted every frame. Compare a static mode against "
-               "its animated twin: they have identical spatial frequency and contrast and differ "
-               "only in time, so if the animated one is cleaned up while the static one survives, "
-               "the upscaler is temporally filtering those pixels. A static pattern survives a "
-               "temporal filter by design, so a static mode alone proves nothing. Judge from a "
-               "screenshot, never the live view -- an alternating pattern averages out in the eye at "
-               "frame rate whether or not anything filtered it. Applies live.",
-               args.minValue = 0, args.maxValue = 6);
-
     RTX_OPTION("rtx.atmosphere", bool, cloudSecondaryLutEnable, true,
                "Supply clouds to secondary rays (indirect bounces, PSR, "
                "reflections) from a small per-frame baked dome LUT instead of a "
@@ -1382,17 +1324,7 @@ public:
                "Share vertical density integration across ambient cloud lighting voxels. "
                "Disable to use the legacy per-voxel integration.");
 
-    // Temporal interleave (fork -- 2026-09-16, perf). Each of the three per-frame cloud dispatches
-    // can spread its work over 2 or 4 frames; every one of them falls back to a full update on any
-    // frame its inputs change (see resolveCloudInterleave), so the interleave only ever spans
-    // frames whose full results would have agreed.
-    RTX_OPTION("rtx.atmosphere", int, cloudScreenInterleaveMode, 0,
-               "How many of the screen's cloud pixels are ray-marched each frame. The rest are "
-               "reprojected from the previous frame along the camera rotation, checked against the "
-               "surface the pixel now resolves, and marched fresh wherever that check fails; every "
-               "pixel is still marched at least once per period. A full march runs on any frame the "
-               "cloud, sun or camera inputs cross a re-bake step, on a camera cut, and during a "
-               "lightning flash. 0: every pixel every frame, 1: half (checkerboard), 2: a quarter (2x2).");
+    // Lighting bakes may reuse unchanged columns or dome rows across frames.
     RTX_OPTION("rtx.atmosphere", int, cloudSunGridInterleaveMode, 2,
                "How many columns of the sun-direction cloud lighting grid are re-baked each frame; "
                "the others are at most one period old, and the trilinear read blends across "
@@ -1403,35 +1335,16 @@ public:
                "at most one period old. A full bake still runs on any frame the cloud inputs cross a "
                "re-bake step or the camera cuts. 0: all rows every frame, 1: half, 2: a quarter.");
 
-    // Detail LOD (fork -- 2026-09-17). The detail volume carries content down to a few texels of
-    // wavelength while the march steps tens to hundreds of metres; at native scale the animated
-    // jitter turns that under-sampling into per-pixel noise the upscaler averages, below native
-    // scale the frozen per-texel jitter turns it into a screen-locked block pattern that crawls
-    // over moving cloud. Sampling the mip the step can integrate removes the error at its source.
-    RTX_OPTION("rtx.atmosphere", int, cloudDetailLodMode, 2,
-               "Band-limit the cloud detail noise to what each ray-march step can integrate, by "
-               "sampling a coarser mip of the detail volume as the step grows. Removes the sampling "
-               "error that reads as crawl or flicker when the cloud render scale is below 1, at the "
-               "cost of fine detail the step could not resolve anyway. 0: off, 1: only when the cloud "
-               "render scale is below 1, 2: always (the reflection dome too).");
-    // -3 is the slider minimum, i.e. the detail LOD barely filters at all. That is a deliberate
-    // pairing rather than a mistake: the LOD exists to band-limit detail the march step cannot
-    // integrate, and since 2026-09-17 the cloud pass accumulates jittered samples across frames,
-    // which averages that same under-sampling instead of discarding the detail that caused it.
-    // Keep the detail, average the noise. Raise this toward 0 if reduced-scale cloud crawls or
-    // flickers with accumulation turned off.
+    // Keep the previous filtered setting available for native-resolution A/B comparisons.
+    RTX_OPTION("rtx.atmosphere", int, cloudDetailLodMode, 0,
+               "Optional step-based mip filtering of cloud detail in the screen march and reflection dome. "
+               "Off preserves the native-resolution baseline. 0: off, 1: legacy off, 2: always. "
+               "Filtering changes cloud shape as well as fine texture; a native-resolution quality "
+               "benefit has not been established. Applies live.");
     RTX_OPTION("rtx.atmosphere", float, cloudDetailLodBias, -3.0f,
-               "Mip bias on the cloud detail LOD, in levels. Negative keeps more detail (and relies "
-               "on cloudHistoryWeight to average the resulting sampling noise), positive softens "
-               "further. Applies live.");
-    // A boost, not a spacing multiplier (fork -- 2026-09-17, second pass): the first form's minimum
-    // meant 4x the samples, so "everything to lowest" quadrupled the reduced-scale march. Here the
-    // minimum is the cheapest setting and the default.
-    RTX_OPTION("rtx.atmosphere", float, cloudReducedScaleSampleBoost, 1.0f,
-               "Extra ray-march samples per cloud ray when the cloud render scale is below 1, as a "
-               "multiplier on the native sample rate: the spacing and adaptive step floor shrink by it "
-               "and the sample cap grows by it. 1 = the native rate (cheapest); 2 doubles the samples, "
-               "which a quarter-scale target's 16x fewer texels can afford. Applies live.");
+               "Mip bias for enabled cloud detail filtering. Negative retains more detail; positive "
+               "softens further. -3 is retained for comparison, not a required native-resolution "
+               "tuning value. Off always samples mip zero regardless of bias. Applies live.");
 
     // Quantizing wind/camera motion into the voxel-grid cache key bounds staleness to this step size.
     RTX_OPTION("rtx.atmosphere", float, cloudVoxelGridRebakeGranularityKm, 0.1f,
@@ -1656,12 +1569,8 @@ private:
   // can no longer run from inside computeLuts.
   void dispatchCloudRender(Rc<DxvkContext> ctx, const Resources::RaytracingOutput& rtOutput);
   void dispatchCloudSecondaryLut(Rc<DxvkContext> ctx);
-  // Decides this frame's interleave period for the screen pass, the sun grid and the reflection
-  // dome; called once per frame from computeLuts before any of the three dispatches reads args.
-  // cloudInputsChanged decides whether every pixel RE-MARCHES this frame; cloudLookChanged decides
-  // whether the accumulated history is DISCARDED. They are deliberately different questions and
-  // deliberately different keys -- see normalizeForCloudLookKey.
-  void resolveCloudInterleave(RtxContext& rtx, bool cloudInputsChanged, bool cloudLookChanged);
+  // Resolve lighting-bake interleave, refreshing the dome on camera cuts.
+  void resolveCloudInterleave(RtxContext& rtx, bool cloudInputsChanged);
 
   static constexpr uint32_t kTransmittanceLutWidth = 512;
   static constexpr uint32_t kTransmittanceLutHeight = 128;
@@ -1746,25 +1655,14 @@ private:
   // baker writes [0] and the mip pass reads [n-1] / writes [n]; the march samples the full chain.
   std::vector<Rc<DxvkImageView>> m_cloudDetailNoise3DMipViews;
   CloudProfileState   m_cloudProfileState;
-  // Ping-pong pair (fork -- 2026-09-16, temporal interleave): dispatchCloudRender advances
-  // m_cloudRenderCurrent, marches into the new current pair and reprojects from the other. Both
-  // halves of each pair are allocated together by ensureCloudRenderRT.
-  Resources::Resource m_cloudRenderRT[2];
-  // Depth companion (fork — 2026-09-05, world-space cloud migration Stage 4a): allocated/resized
-  // in lockstep with m_cloudRenderRT by ensureCloudRenderRT, same extent. See getCloudDepthRT's
-  // doc comment for the channel layout.
-  Resources::Resource m_cloudDepthRT[2];
-  uint32_t            m_cloudRenderCurrent = 0u;
-  // True once the other pair holds a complete cloud image from the previous frame at this extent.
-  bool                m_cloudRenderHistoryValid = false;
+  Resources::Resource m_cloudRenderRT;
+  Resources::Resource m_cloudDepthRT;
   // True while the dome was baked last frame, so a row interleave has fresh rows to lean on.
   bool                m_cloudDomeHistoryValid = false;
   // This frame's resolved interleave periods (1 = full update); see resolveCloudInterleave.
-  uint32_t            m_cloudScreenPeriodThisFrame  = 1u;
   uint32_t            m_cloudSunGridPeriodThisFrame = 1u;
   uint32_t            m_cloudDomePeriodThisFrame    = 1u;
   VkExtent2D          m_cloudRenderExtent = { 0u, 0u };
-  VkExtent2D          m_cloudRenderFullExtent = { 0u, 0u };
   RtxMipmap::Resource m_cloudSecondaryLut;
   bool m_cachedAmbientColumnScan = false;
   Resources::Resource m_cloudPlacementMap;
@@ -1793,10 +1691,7 @@ private:
   // more than the default-initialized state colliding with wherever the camera happens to start.
   Vector3 m_cloudAnchorFirstRawWorldUnits { 0.0f, 0.0f, 0.0f };
   bool    m_cloudAnchorHasFirstSample     { false };
-  // Set once per frame by updateFrame's anchor-resolve block (|deltaKm| > cloudAnchorCutKm), read
-  // by the const getAtmosphereArgs() to force a one-frame reset of the cloud temporal history (fork
-  // — 2026-09-05, world-space cloud migration Stage 2). See cloudAnchorCutKm's doc comment for why
-  // RtCamera::isCameraCut() cannot substitute for this on the engine this migration targets.
+  // Anchor-motion outliers force a fresh dome bake on engines with rotation-only view matrices.
   bool    m_cloudAnchorCutThisFrame        { false };
 
   // Time-of-day clock. Integrated once per frame by advanceTimeCycle(); read by the const
@@ -1818,7 +1713,6 @@ private:
   // Advanced once per frame by advanceLightning(); published into the lightning CB fields.
   Vector3  m_lightningStrikePosKm       { 0.0f, 0.0f, 0.0f };
   float    m_lightningEnvelope          { 0.0f };
-  float    m_lightningHistoryFade       { 0.0f };
   int      m_lightningPulsesLeft        { 0 };
   float    m_lightningTimeToPulse       { 0.0f };
   uint32_t m_lightningRngState          { 0x9E3779B9u };
@@ -1835,15 +1729,6 @@ private:
   AtmosphereArgs m_cachedTransmittanceMsKey = {};
   // Zero-init forces a first-frame bake; cloud-noise re-bakes also zero it to force same-frame refresh.
   AtmosphereArgs m_cachedVoxelGridKey = {};
-  // The same key with camera position, wind, boil and evolution stripped out: "has the cloudscape
-  // itself changed", which is the only thing that should invalidate accumulated history.
-  AtmosphereArgs m_cachedCloudLookKey = {};
-  // Rolling counters behind rtx.atmosphere.cloudProfilingLog (fork -- 2026-09-17). History resets
-  // are invisible in a frame time and were only found from a user describing them, so count them.
-  uint32_t m_cloudHistoryWindowFrames = 0u;
-  uint32_t m_cloudHistoryFullMarch    = 0u;
-  uint32_t m_cloudHistoryResetLook    = 0u;
-  uint32_t m_cloudHistoryResetCut     = 0u;
   // Rolling mean of recent per-frame anchor movement (km), the reference an anchor cut is judged an
   // outlier against. See the cut test in updateFrame.
   float    m_cloudAnchorSpeedEmaKm    = 0.0f;

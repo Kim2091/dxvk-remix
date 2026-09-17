@@ -295,13 +295,7 @@ struct AtmosphereArgs {
 
   float cloudThickness;        // Cloud-slab vertical depth, km
   float cloudLayer2TypeSpread; // [0,1] cloud-type variation for layer 2 (independent of layer 1)
-  float lightningHistoryFade;  // [0..1] lightning ghost-suppression signal (fork — 2026-07-14):
-                               // 1 while a flash is live, decaying over ~0.25 s after it ends.
-                               // evalSkyRadiance collapses the cloud temporal-history weight by
-                               // this factor so the flash never embeds into the ~1 s EMA (the
-                               // reprojected "old frame" ghost on camera move). Reuses the former
-                               // pad_cloudSunsetWarmth slot; CB layout unchanged. Zeroed in
-                               // normalizeForSkyLutCache (per-frame animated, never feeds a bake).
+  float padCloudLighting;
   uint cloudViewSamples;       // Ray-march steps through cloud slab
 
   // ----- Spatial variation fields (Nubis-style weather) -----
@@ -423,16 +417,8 @@ struct AtmosphereArgs {
   // AtmosphereCloudSecondaryLut dome; when 0, secondary sky-miss rays are
   // cloudless. Reuses the former pad_c5_0 slot, so the CB layout is unchanged.
   uint  cloudSecondaryLutEnable;   // 0 or 1
-  // Downscale (DLSS-input) render extent, i.e. the coordinate space of the
-  // pixelCoord evalSkyRadiance receives (fork — 2026-06-11, half-res cloud
-  // RT). The cloud RT may be allocated SMALLER than this
-  // (cloudRenderResolutionScale); the primary-ray composite divides
-  // pixelCoord by these dims to get normalized screen uv and bilinearly
-  // samples the RT — exact texel-center fetch when the RT is full-size.
-  // 0 means "not yet known" (first frames) and selects the legacy Load
-  // path. Reuse the former pad_c5_1/2 slots; CB layout unchanged.
-  uint  cloudRenderFullDimX;
-  uint  cloudRenderFullDimY;
+  uint padCloudRender0;
+  uint padCloudRender1;
 
   // ----- Voxel-grid cloud-on-terrain shadows at NEE (fork — 2026-05-12, C6) -----
   // Plumbing for sampleCloudGroundShadow_OptionB, called from the surface and
@@ -643,21 +629,8 @@ struct AtmosphereArgs {
                                   // this by lightningSceneLightIntensity so the two
                                   // consumers calibrate independently.
 
-  // ----- Cloud temporal-smoothing weight + reserve pads (fork — 2026-07-16,
-  // anti-blobby crispness pass). NEW 16-byte block appended at the struct
-  // tail (all former reserve pads are consumed); grow this struct ONLY in
-  // full vec4 rows (see the CB-alignment discipline note at the top).
-  float cloudHistoryWeight;  // Cloud-pass temporal accumulation weight
-                             // [0..0.98] (fork -- 2026-09-17). Read by
-                             // cloud_render.comp.slang alone: how much of a
-                             // pixel's reprojected previous value survives when
-                             // it is re-marched, and -- at 0 -- the switch that
-                             // also freezes the march jitter below native scale
-                             // and keeps the history lookup jittered. Held the
-                             // composite-side EMA's weight until f8544fa82
-                             // removed that pass; the slot, not the mechanism,
-                             // is what carried over. Zeroed in
-                             // normalizeForSkyLutCache -- never feeds a bake.
+  // Preserve the scalar row shared with the density controls.
+  float padCloudDensity;
   float nubis3InteriorTexture;  // [0..1] strength of the interior density
                                 // modulation by the raw detail channels
                                 // (Nubis3 Density-Scale-NVDF / iw3xo
@@ -813,29 +786,10 @@ struct AtmosphereArgs {
   // nothing - the same trade the sun term makes past aerialPerspectiveSceneShadowRange.
   float aerialPerspectiveLocalLightShadowRange;
 
-  // ----- Cloud temporal interleave (fork -- 2026-09-16, perf) -----
-  // One whole vec4 row (CB alignment rule above). Each cloud dispatch that spreads its work across
-  // frames reads its period (bits 0-7: 1, 2 or 4) and this frame's phase (bits 8-15) from one
-  // packed word, so a full update is simply period 1; RtxAtmosphere::resolveCloudInterleave forces
-  // that on any frame the inputs change. The screen word also carries bit 16: the previous frame's
-  // cloud RT pair is valid to reproject from. Per-frame animated, so all four are zeroed in
-  // normalizeForSkyLutCache and never key a bake.
-  uint  cloudScreenInterleave;
-  uint  cloudSunGridInterleave;
-  uint  cloudDomeInterleave;
-  float cloudReprojectDepthTolerance;  // Relative surface-distance tolerance for a reprojected tap.
-
-  // ----- Detail LOD + reduced-scale sampling (fork -- 2026-09-17) -----
-  // One whole vec4 row. cloudDetailLodEnable is resolved per dispatch by RtxAtmosphere: the screen
-  // pass from cloudDetailLodMode against its render scale, the dome from mode 2 only; the grid bakes
-  // never read it. cloudScreenStepScale (1 / cloudReducedScaleSampleBoost) is applied by cloud_render
-  // alone, to its own copy of the step fields, so the dome and the bakes keep their spacing. All
-  // zeroed in normalizeForSkyLutCache.
+  // Lighting-bake interleave and optional view-detail filtering: one 16-byte row.
+  uint cloudSunGridInterleave;
+  uint cloudDomeInterleave;
   float cloudDetailLodBias;
-  uint  cloudDetailLodEnable;
-  float cloudScreenStepScale;
-  // Neighbourhood clamp strength for the cloud accumulation, in standard deviations (fork --
-  // 2026-09-17). Rides the former padCloudLod0 slot, so the CB layout is unchanged. 0 disables the
-  // clamp and restores the unbounded blend. Read only by cloud_render.comp.slang.
-  float cloudHistoryClampGamma;
+  uint cloudDetailLodEnable;
+
 };

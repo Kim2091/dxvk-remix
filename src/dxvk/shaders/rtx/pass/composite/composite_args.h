@@ -115,38 +115,6 @@ struct CompositeArgs {
   float alphaBlendSurfacePackMult; // for packing/unpacking hitT into Float16 in AlphaBlendSurface
   float postFilterThreshold;
   uint writeRayReconstructionHitDistance;
-  // Upscaler passthrough probe (fork -- 2026-09-17). Was cloudHistoryClampGamma, dead since the EMA
-  // it clipped was removed; same slot, so the CB layout is unchanged.
-  //
-  // Stamps a 1-pixel checkerboard onto the composite output -- the last thing written before the
-  // upscaler runs -- so that what the upscaler does to a given class of pixel can be SEEN instead of
-  // argued about. 0 off; 1/2/3 static over sky, geometry, both; 4/5/6 the same three with the
-  // checkerboard's phase inverted every frame.
-  //
-  // The static/animated pair is the actual measurement -- see the block comment at the injection
-  // site in composite.comp.slang. A static pattern is temporally stable and therefore survives a
-  // temporal filter by design, so static alone cannot tell "not processed" from "processed, but
-  // temporally stable". Animating the phase changes only the time axis.
-  float cloudDebugInjectMode;
+  uint padCloudComposite;
 
-  // Cloud composite parallax reprojection (fork — 2026-09-05, world-space cloud migration Stage 4b).
-  // This frame's cloud-anchor world-space motion, Y-up km (RtxAtmosphere::getCloudAnchor().deltaKm
-  // == posYUpKm - prevPosYUpKm; see rtx_atmosphere.h's CloudAnchor struct). NOT part of
-  // AtmosphereArgs -- that struct cannot grow (see its own alignment-discipline comment) and this
-  // value is composite-only, never feeding a bake or a LUT cache key. Needed because the reliable
-  // reprojection matrix (cb.camera.prevWorldToProjection) only carries camera ROTATION on the
-  // Gamebryo-family engine this migration targets: RtCamera::getPosition() reads a rotation-only D3D
-  // view matrix (see RtxAtmosphere::updateFrame's anchor-resolution block), so a pure-direction
-  // reprojection (as the existing rotation-only screen motion vector already does) is the only thing
-  // that matrix can supply. The cloud RT now carries real depth (AtmosphereCloudDepth), so a
-  // translating camera needs a real parallax correction on top of that rotation-only term -- this is
-  // the one place a translation signal for that correction can come from. See
-  // applyCloudComposite / cloudParallaxMotionVectorPixels in composite.comp.slang.
-  vec3 cloudAnchorDeltaYUpKm;
-  // Relative tolerance for the cloud history's per-tap depth validation (fork -- 2026-09-07). Rides
-  // the slot retired on 2026-09-06 from cloudCompositeRRTransparencyLayer (794ffd716's DLSS-RR
-  // transparency-layer routing, removed with its premise); CB layout unchanged. A history tap is
-  // rejected when its stored surface distance differs from this pixel's by more than this fraction
-  // of the larger of the two. See fetchCloudHistoryBilinear.
-  float cloudHistoryDepthTolerance;
 };

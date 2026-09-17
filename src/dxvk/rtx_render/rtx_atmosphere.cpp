@@ -264,9 +264,6 @@ namespace dxvk {
         TEXTURE2D(15)
         RW_TEXTURE2D(16)
         CONSTANT_BUFFER(17)
-        // Previous frame's cloud RT + depth companion (fork -- 2026-09-16, temporal interleave).
-        TEXTURE2D(18)
-        TEXTURE2D(19)
       END_PARAMETER()
     };
     PREWARM_SHADER_PIPELINE(CloudRenderShader);
@@ -532,18 +529,12 @@ namespace {
     args.lightningStrikePosKm        = vec3(0.0f, 0.0f, 0.0f);
     args.lightningFlashIntensity     = 0.0f;
     args.lightningEnvelope           = 0.0f;
-    args.lightningHistoryFade        = 0.0f;
-    args.cloudHistoryWeight          = 0.0f;
     // Interleave words carry this frame's phase (fork -- 2026-09-16); no bake reads them.
-    args.cloudScreenInterleave         = 0u;
     args.cloudSunGridInterleave        = 0u;
     args.cloudDomeInterleave           = 0u;
-    args.cloudReprojectDepthTolerance  = 0.0f;
-    // View-march-only detail LOD and step scale (fork -- 2026-09-17); the bakes pass lod 0 themselves.
+    // View-march-only detail LOD (fork -- 2026-09-17); the bakes pass lod 0 themselves.
     args.cloudDetailLodBias            = 0.0f;
     args.cloudDetailLodEnable          = 0u;
-    args.cloudScreenStepScale          = 0.0f;
-    args.cloudHistoryClampGamma        = 0.0f;
     // BUG FIX (2026-07-16): starRotation was not zeroed anywhere, re-baking the entire LUT cascade every
     // frame at night. Zeroed here in the base so every derived key inherits it.
     args.starBrightness              = 0.0f;
@@ -682,33 +673,6 @@ namespace {
     args.milkyWayDustAmount           = 0.0f;
     args.milkyWayCoreColor            = vec3(0.0f, 0.0f, 0.0f);
     args.milkyWayDustColor            = vec3(0.0f, 0.0f, 0.0f);
-  }
-
-  // The voxel key with every term that merely tracks WHERE AND WHEN we are removed, leaving only
-  // what the cloudscape actually looks like (fork -- 2026-09-17, accumulation reset fix).
-  //
-  // normalizeForVoxelGridKey exists to decide when to RE-BAKE the lighting grids, so it
-  // deliberately keeps camera position (snapped to a ~47 m voxel), wind scroll, boil phase and the
-  // evolution offsets in the key: the grid genuinely goes stale as any of those advance. Reusing
-  // that same key to decide whether to KEEP ACCUMULATED HISTORY was the defect. Those four terms
-  // change constantly in normal play -- the camera one is a bare floor() with no hysteresis, so a
-  // player walking near a 47 m boundary (or just bobbing across one) flips it every frame -- and
-  // each flip was throwing the entire cloud history away. That is the "temporal smoother resets
-  // randomly with camera movement" the user reported.
-  //
-  // A grid re-bake is a reason to re-march, not a reason to forget: it shifts cloud lighting by at
-  // most one quantization step, which is exactly the kind of small continuous change accumulation
-  // should be smoothing rather than resetting on. Only a genuine change of cloudscape -- a slider
-  // drag, a weather change, layer toggles -- invalidates what the history describes, and that is
-  // what survives into this key.
-  void normalizeForCloudLookKey(AtmosphereArgs& args) {
-    normalizeForVoxelGridKey(args);
-    args.cameraWorldPosYUpKm   = vec3(0.0f, 0.0f, 0.0f);
-    args.cloudWindOffset       = vec2(0.0f, 0.0f);
-    args.cloudBoilPhase        = 0.0f;
-    args.cloudEvolutionOffsetX = 0.0f;
-    args.cloudEvolutionOffsetY = 0.0f;
-    args.cloudEvolutionOffsetZ = 0.0f;
   }
 
   // Interleave option value -> period in frames (fork -- 2026-09-16).
@@ -1166,7 +1130,6 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
     args.lightningEnvelope       = m_lightningEnvelope;
     args.lightningFlashIntensity = m_lightningEnvelope * std::max(RtxAtmosphere::lightningFlashIntensity(), 0.0f);
     args.lightningColor          = RtxAtmosphere::lightningColor();
-    args.lightningHistoryFade    = m_lightningHistoryFade;
   }
 
   // Cloud volumetric / appearance enhancements
@@ -1212,23 +1175,6 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
     args.nvdfBodyErosionStrength = std::min(std::max(RtxAtmosphere::nvdfBodyErosionStrength(), 0.0f), 1.5f);
     args.nubis3HFDetailStrength  = std::min(std::max(RtxAtmosphere::nubis3HFDetailStrength(), 0.0f), 3.0f);
     args.nvdfStepScale           = std::min(std::max(RtxAtmosphere::nvdfStepScale(), 0.0f), 0.95f);
-    // Cloud temporal accumulation weight (fork -- 2026-09-17; the slot was the composite-side
-    // EMA's before f8544fa82 retired that one, and is now the cloud pass's own). Zeroed in
-    // normalizeForSkyLutCache so slider drags never re-bake.
-    args.cloudHistoryWeight      = std::min(std::max(RtxAtmosphere::cloudHistoryWeight(), 0.0f), 0.98f);
-    // A flash is a transient the accumulation would otherwise average most of the way out of
-    // existence. m_lightningHistoryFade is that suppression, already decaying on its own tau.
-    args.cloudHistoryWeight     *= std::max(0.0f, 1.0f - m_lightningHistoryFade);
-    // Anchor-delta camera cut (fork — 2026-09-05, world-space cloud migration Stage 2). Forces a
-    // full one-frame reset of the screen-space cloud temporal history when updateFrame's resolved
-    // anchor jumped by more than cloudAnchorCutKm this frame. m_cloudAnchorCutThisFrame is computed
-    // in updateFrame's anchor block; see its assignment there for why RtCamera::isCameraCut() cannot
-    // substitute on the engine this migration targets. Redundant since 2026-09-17 with
-    // resolveCloudInterleave dropping the history-valid bit on the same condition, and kept because
-    // the two reach the shader by different routes and either alone is a correct reset.
-    if (m_cloudAnchorCutThisFrame) {
-      args.cloudHistoryWeight = 0.0f;
-    }
     // Interior density texture + edge wisp cut (fork — 2026-07-16). Live;
     // both feed the shared sampler, so the D_sun/D_ambient bakes track them
     // automatically.
@@ -1343,58 +1289,13 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
     // Secondary-ray cloud LUT gate (fork — 2026-06-10, perf). Lives in the
     // former pad_c5_0 slot so the CB layout is unchanged.
     args.cloudSecondaryLutEnable = RtxAtmosphere::cloudSecondaryLutEnable() ? 1u : 0u;
-    // Downscale extent for the half-res cloud-RT composite (fork —
-    // 2026-06-11). Zero until ensureCloudRenderRT has seen a real extent;
-    // the shader falls back to the legacy Load path in that case.
-    args.cloudRenderFullDimX = m_cloudRenderFullExtent.width;
-    args.cloudRenderFullDimY = m_cloudRenderFullExtent.height;
-    // Temporal interleave words (fork -- 2026-09-16); periods resolved by resolveCloudInterleave.
-    args.cloudScreenInterleave  = packCloudInterleave(m_cloudScreenPeriodThisFrame, m_cloudRenderFrameIdx)
-                                | (m_cloudRenderHistoryValid ? (1u << 16u) : 0u);
+    // Lighting-bake interleave periods and phases.
     args.cloudSunGridInterleave = packCloudInterleave(m_cloudSunGridPeriodThisFrame, m_cloudRenderFrameIdx);
     args.cloudDomeInterleave    = packCloudInterleave(m_cloudDomePeriodThisFrame, m_cloudRenderFrameIdx);
-    args.cloudReprojectDepthTolerance = std::max(RtxAtmosphere::cloudHistoryDepthTolerance(), 0.0f);
-    // Detail LOD defaults (fork -- 2026-09-17): "always" applies to every consumer; the screen pass
-    // resolves mode 1 against its own render scale in dispatchCloudRender.
+    // Mode 1 remains an inactive legacy value at native resolution.
     args.cloudDetailLodBias   = RtxAtmosphere::cloudDetailLodBias();
     args.cloudDetailLodEnable = RtxAtmosphere::cloudDetailLodMode() >= 2 ? 1u : 0u;
-    args.cloudScreenStepScale = 1.0f;
-    // Velocity-gated (fork -- 2026-09-17, second pass). The clamp shipped unconditional and the
-    // user reported "it shimmers greatly when accumulation clamp is on at all" -- at ANY gamma,
-    // which is the signature of over-clipping rather than of a badly chosen width. The box is built
-    // from the spread of the HISTORY taps, and history is already temporally smoothed, so in smooth
-    // cloud its local spread tends to zero, the box collapses to the 1e-4 floor, and clamping to
-    // +-0.0001 of the fresh march does not weaken accumulation -- it disables it. What is left is
-    // the raw per-frame march noise, which is animated now, so it reads as shimmer instead of the
-    // static powder it used to be. Tightening gamma made it worse, which is why "at all" fits.
-    //
-    // Two changes. The shader floors the box at the march's own noise scale so it can never clip
-    // signal that is legitimately noisy (see accumulateCloudHistory). And the clamp now engages only
-    // when it is needed at all: reprojection error is a TRANSLATION artefact -- rotation reprojects
-    // a distant deck exactly -- while over-clipping costs accumulation always. So scale the width by
-    // this frame's parallax, the ratio of anchor movement to deck distance, which is the angle the
-    // cloud actually slid by. A stationary or turning camera opens the box wide and accumulates
-    // freely, which is the case that already worked; flying closes it to gamma, which is the case
-    // the clamp was added for. When depth-aware reprojection lands and the motion vector stops being
-    // wrong, this same term relaxes on its own.
-    //
-    // Zeroed in normalizeForSkyLutCache, which normalizeForVoxelGridKey and normalizeForCloudLookKey
-    // both reach, so making this per-frame cannot flip a cache key -- the failure this run has
-    // already fixed twice.
-    {
-      const float userGamma = std::max(RtxAtmosphere::cloudHistoryClampGamma(), 0.0f);
-      // Vertical separation from the deck, floored so a camera inside the slab cannot divide by ~0
-      // and declare every frame a high-parallax one.
-      const float deckDistKm = std::max(std::abs(args.cloudAltitude - m_cameraWorldPosYUpKm.y), 1.0f);
-      const float parallaxRad = length(m_cloudAnchor.deltaKm) / deckDistKm;
-      // ~2.6 px at this fork's usual FOV and internal width; below it the history still lands on
-      // very nearly the right texel and needs no clamping.
-      constexpr float kParallaxRefRad = 2.0e-3f;
-      const float velocityFactor = std::min(parallaxRad / kParallaxRefRad, 1.0f);
-      args.cloudHistoryClampGamma = userGamma <= 0.0f
-        ? 0.0f
-        : std::min(userGamma / std::max(velocityFactor, 1.0e-4f), 1.0e4f);
-    }
+
   }
 
   // Voxel-grid cloud-on-terrain shadow plumbing (fork — 2026-05-12, C6).
@@ -2120,19 +2021,7 @@ void RtxAtmosphere::computeLuts(RtxContext& rtx) {
     memset(&m_cachedVoxelGridKey, 0, sizeof(m_cachedVoxelGridKey));
   }
 
-  // Separate from voxelKeyChanged on purpose (fork -- 2026-09-17): that key moves with the camera
-  // and the clock, this one only with the cloudscape. See normalizeForCloudLookKey.
-  bool cloudLookKeyChanged = false;
-  {
-    AtmosphereArgs lookKey = getAtmosphereArgs();
-    normalizeForCloudLookKey(lookKey);
-    cloudLookKeyChanged = memcmp(&lookKey, &m_cachedCloudLookKey, sizeof(AtmosphereArgs)) != 0;
-    if (cloudLookKeyChanged) {
-      m_cachedCloudLookKey = lookKey;
-    }
-  }
-
-  resolveCloudInterleave(rtx, voxelKeyChanged, cloudLookKeyChanged);
+  resolveCloudInterleave(rtx, voxelKeyChanged);
 
   if (cloudsEnabled && RtxAtmosphere::debugDispatchCloudVoxelGrids() && voxelGridsDirty) {
     ctx->emitMemoryBarrier(0,
@@ -2193,7 +2082,7 @@ void RtxAtmosphere::computeLuts(RtxContext& rtx) {
     VK_ACCESS_SHADER_READ_BIT);
 }
 
-void RtxAtmosphere::resolveCloudInterleave(RtxContext& rtx, bool cloudInputsChanged, bool cloudLookChanged) {
+void RtxAtmosphere::resolveCloudInterleave(RtxContext& rtx, bool cloudInputsChanged) {
   // isCameraCut never fires on an engine that keeps translation out of the view matrix (see the
   // anchor block in updateFrame), which is why the anchor-delta cut is tested alongside it.
   const bool cameraJumped = m_cloudAnchorCutThisFrame || rtx.getSceneManager().getCamera().isCameraCut();
@@ -2204,56 +2093,7 @@ void RtxAtmosphere::resolveCloudInterleave(RtxContext& rtx, bool cloudInputsChan
   // The dome is marched from the exact camera position, so a jump moves every texel at once.
   m_cloudDomePeriodThisFrame = (cloudInputsChanged || cameraJumped || !m_cloudDomeHistoryValid)
     ? 1u : cloudInterleavePeriod(RtxAtmosphere::cloudSecondaryLutInterleaveMode());
-  // A flash is transient and would otherwise reach only the marched half of the screen.
-  m_cloudScreenPeriodThisFrame = (cloudInputsChanged || cameraJumped || m_lightningEnvelope > 0.0f)
-    ? 1u : cloudInterleavePeriod(RtxAtmosphere::cloudScreenInterleaveMode());
-  // Forcing every pixel to re-march is only half a reset once the pass accumulates (fork --
-  // 2026-09-17): a freshly marched pixel still blends toward its history, so a changed key or a
-  // camera cut would drag the previous cloudscape in behind it. Dropping the history-valid bit is
-  // what makes the full update actually full. dispatchCloudRender raises it again at the end of this
-  // frame's dispatch, so exactly one frame is unaccumulated -- the frame whose inputs changed, which
-  // had no history worth averaging against anyway.
-  //
-  // Lightning is deliberately NOT in this list even though it forces a full march. A flash does not
-  // invalidate the history geometrically, it only makes it briefly too dim, and clearing the bit for
-  // every frame of a multi-frame envelope would strip the accumulation off the whole strike and show
-  // raw march noise exactly when the cloud is brightest. getAtmosphereArgs scales the weight down by
-  // m_lightningHistoryFade instead -- the suppression term that already exists for this, with its own
-  // decay tau, so history returns as the flash does.
-  //
-  // cloudLookChanged, NOT cloudInputsChanged (fork -- 2026-09-17). cloudInputsChanged is the
-  // voxel-grid re-bake key, which moves every time the camera crosses a ~47 m grid line or the boil
-  // phase steps -- constantly, during ordinary play, with no hysteresis on the floor() that snaps
-  // it. Wiring the history reset to it meant the accumulation was being thrown away every few
-  // seconds of walking and every frame while standing near a boundary, which is what the user saw
-  // as the smoother "resetting randomly with camera movement". A re-bake still forces the full
-  // march above; it just no longer forgets. See normalizeForCloudLookKey.
-  if (cloudLookChanged || cameraJumped) {
-    m_cloudRenderHistoryValid = false;
-  }
 
-  // Make all of this visible (fork -- 2026-09-17). A history reset costs no measurable frame time
-  // and leaves no trace in any existing counter -- this defect was only findable because a user
-  // described it -- so count the resets and say why, on the same 120-frame cadence as the rest of
-  // the cloud profiling.
-  if (RtxAtmosphere::cloudProfilingLog()) {
-    ++m_cloudHistoryWindowFrames;
-    m_cloudHistoryFullMarch += (m_cloudScreenPeriodThisFrame == 1u) ? 1u : 0u;
-    m_cloudHistoryResetLook += cloudLookChanged ? 1u : 0u;
-    m_cloudHistoryResetCut  += cameraJumped ? 1u : 0u;
-    if (m_cloudHistoryWindowFrames >= 120u) {
-      Logger::info(str::format(
-        "[Cloud profile] stage=CloudHistory window=", m_cloudHistoryWindowFrames,
-        " fullMarch=", m_cloudHistoryFullMarch,
-        " resetLook=", m_cloudHistoryResetLook,
-        " resetCut=", m_cloudHistoryResetCut,
-        " weight=", RtxAtmosphere::cloudHistoryWeight()));
-      m_cloudHistoryWindowFrames = 0u;
-      m_cloudHistoryFullMarch    = 0u;
-      m_cloudHistoryResetLook    = 0u;
-      m_cloudHistoryResetCut     = 0u;
-    }
-  }
 }
 
 void RtxAtmosphere::dispatchTransmittanceLut(Rc<DxvkContext> ctx) {
@@ -3193,36 +3033,18 @@ void RtxAtmosphere::ensureCloudRenderRT(Rc<DxvkContext> ctx,
     return;
   }
 
-  // Half-res cloud RT (fork — 2026-06-11, perf). The RT is allocated at
-  // cloudRenderResolutionScale of the downscale extent; the sky-miss
-  // composite bilinearly upsamples using the full extent published via
-  // args.cloudRenderFullDimX/Y. Scale 1.0 reproduces the legacy native-res
-  // path bit-exactly (texel-center bilinear == Load). Live-tunable: a scale
-  // change shows up as an extent mismatch below and reallocates.
-  m_cloudRenderFullExtent = downscaleExtent;
-  const float renderScale = std::min(std::max(RtxAtmosphere::cloudRenderResolutionScale(), 0.25f), 1.0f);
-  const VkExtent2D scaledExtent = {
-    std::max(1u, static_cast<uint32_t>(std::lround(downscaleExtent.width  * renderScale))),
-    std::max(1u, static_cast<uint32_t>(std::lround(downscaleExtent.height * renderScale))),
-  };
+  const VkExtent2D& renderExtent = downscaleExtent;
 
-  const bool extentsMatch = (m_cloudRenderExtent.width  == scaledExtent.width)
-                         && (m_cloudRenderExtent.height == scaledExtent.height);
-  if (extentsMatch && m_cloudRenderRT[0].isValid() && m_cloudDepthRT[0].isValid()
-      && m_cloudRenderRT[1].isValid() && m_cloudDepthRT[1].isValid()) {
+  const bool extentsMatch = (m_cloudRenderExtent.width  == renderExtent.width)
+                         && (m_cloudRenderExtent.height == renderExtent.height);
+  if (extentsMatch && m_cloudRenderRT.isValid() && m_cloudDepthRT.isValid()) {
     return;
   }
 
-  // Two pairs (fork -- 2026-09-16, temporal interleave): the pass marches into one and reprojects
-  // from the other. A fresh allocation holds nothing to reproject from.
-  m_cloudRenderHistoryValid = false;
-  m_cloudRenderCurrent = 0u;
-
-  const VkExtent3D extent3D = { scaledExtent.width, scaledExtent.height, 1u };
-  for (uint32_t i = 0u; i < 2u; ++i) {
-  m_cloudRenderRT[i] = Resources::createImageResource(
+  const VkExtent3D extent3D = { renderExtent.width, renderExtent.height, 1u };
+  m_cloudRenderRT = Resources::createImageResource(
     ctx,
-    i == 0u ? "Atmosphere Cloud Render RT 0" : "Atmosphere Cloud Render RT 1",
+    "Atmosphere Cloud Render RT",
     extent3D,
     VK_FORMAT_R16G16B16A16_SFLOAT,
     1,                          // numLayers
@@ -3233,21 +3055,10 @@ void RtxAtmosphere::ensureCloudRenderRT(Rc<DxvkContext> ctx,
     VkClearColorValue{},        // clearValue (zero -- "no cloud, full transmittance")
     1);                         // mipLevels
 
-  // Depth companion (fork — 2026-09-05, world-space cloud migration Stage 4a): entry distance (r)
-  // + transmittance-weighted mean cloud depth (g), both km. SAME extent and resize cadence as
-  // m_cloudRenderRT above -- allocated together rather than through an independent ensure path so
-  // the two can never drift out of pixel alignment on a resize (Stage 4b's reprojection depends on
-  // that alignment).
-  //
-  // Format: R32G32_SFLOAT, not R16G16_SFLOAT. Horizon-grazing cloud spans reach 50+ km (see the
-  // adaptive-step-count comment in cloud_march_common.slangh's marchCloudSlab), and float16's
-  // ~2^-10 relative step size at that magnitude is on the order of tens of metres per representable
-  // value -- coarse enough to visibly stair-step a parallax reprojection built on it. Full float32
-  // removes the concern entirely; the extra 4 bytes/pixel is modest since this RT is typically
-  // allocated at a fraction of native resolution (cloudRenderResolutionScale).
-  m_cloudDepthRT[i] = Resources::createImageResource(
+  // Keep cloud depth and diagnostics aligned with the color target at the internal extent.
+  m_cloudDepthRT = Resources::createImageResource(
     ctx,
-    i == 0u ? "Atmosphere Cloud Depth RT 0" : "Atmosphere Cloud Depth RT 1",
+    "Atmosphere Cloud Depth RT",
     extent3D,
     VK_FORMAT_R32G32B32A32_SFLOAT,
     1,                          // numLayers
@@ -3258,11 +3069,10 @@ void RtxAtmosphere::ensureCloudRenderRT(Rc<DxvkContext> ctx,
     VkClearColorValue{},        // clearValue (zero -- overwritten every texel every frame, see
                                 // cloud_render.comp.slang's unconditional depth-companion write)
     1);                         // mipLevels
-  }
 
-  m_cloudRenderExtent = scaledExtent;
-  Logger::info(str::format("[Cloud render] extent=", scaledExtent.width, "x", scaledExtent.height,
-    " internal=", downscaleExtent.width, "x", downscaleExtent.height, " scale=", renderScale));
+  m_cloudRenderExtent = renderExtent;
+  Logger::info(str::format("[Cloud render] extent=", renderExtent.width, "x", renderExtent.height,
+    " (internal resolution)"));
 }
 
 void RtxAtmosphere::setCloudShadowCameraPosition(const Vector3& cameraWorldPosYUpKm) {
@@ -3337,7 +3147,6 @@ void RtxAtmosphere::requestLightningStrike() {
 void RtxAtmosphere::advanceLightning(float dt) {
   if (!RtxAtmosphere::lightningEnable()) {
     m_lightningEnvelope = 0.0f;
-    m_lightningHistoryFade = 0.0f;
     m_lightningPulsesLeft = 0;
     s_lightningStrikeRequested.store(false);  // don't bank a Test Strike while disabled
     return;
@@ -3408,21 +3217,6 @@ void RtxAtmosphere::advanceLightning(float dt) {
     m_lightningPulsesLeft = static_cast<int>(rand01() * 3.0f);  // 0-2 restrikes
     m_lightningTimeToPulse = 0.04f + 0.11f * rand01();
   }
-
-  // Ghost-suppression window (fork — 2026-07-14). Tracks the envelope but
-  // decays ~3.5x slower, so it covers the whole flicker PLUS the frames right
-  // after, while any flash residue could still be sitting in the cloud
-  // temporal history. evalSkyRadiance collapses its EMA history weight by
-  // this factor — without it a 100-300 ms flash embeds into the ~1 s history
-  // and a camera move drags a reprojected "old frame" imprint of the lit
-  // deck across the sky. Computed AFTER the fire block so a fresh strike
-  // raises it the same frame its envelope peaks.
-  constexpr float kHistoryFadeTau = 0.25f;
-  m_lightningHistoryFade = std::max(std::min(m_lightningEnvelope, 1.0f),
-                                    m_lightningHistoryFade * std::exp(-dt / kHistoryFadeTau));
-  if (m_lightningHistoryFade < 1e-3f) {
-    m_lightningHistoryFade = 0.0f;
-  }
 }
 
 // Cloud screen pass entry point (fork — 2026-09-05, world-space cloud migration Stage 4a). Called
@@ -3442,9 +3236,7 @@ void RtxAtmosphere::dispatchCloudScreenPass(RtxContext& ctx, const Resources::Ra
   // of cloudRenderRTEnable -- that option only gates the sky-miss COMPOSITE (evalSkyRadiance),
   // leaving this dispatch running so its cost is still paid; debugDispatchCloudRender is the only
   // lever that actually skips it, for an A/B frame-time read.
-  if (!RtxAtmosphere::debugDispatchCloudRender() || !m_cloudRenderRT[0].isValid()) {
-    // Nothing marched this frame, so the next frame has no previous image to reproject from.
-    m_cloudRenderHistoryValid = false;
+  if (!RtxAtmosphere::debugDispatchCloudRender() || !m_cloudRenderRT.isValid()) {
     return;
   }
 
@@ -3533,36 +3325,18 @@ void RtxAtmosphere::traceCloudPlacement(const AtmosphereArgs& args) {
 void RtxAtmosphere::dispatchCloudRender(Rc<DxvkContext> ctx, const Resources::RaytracingOutput& rtOutput) {
   ScopedGpuProfileZone(ctx, "Atmosphere Cloud Render (Nubis Cubed)");
 
-  if (!m_cloudRenderRT[0].isValid()) {
-    m_cloudRenderHistoryValid = false;
+  if (!m_cloudRenderRT.isValid()) {
     return;  // ensureCloudRenderRT hasn't allocated yet (first frame with zero extent)
   }
 
-  // Advance the ping-pong: this frame marches into `current` and reprojects from `previous`
-  // (fork -- 2026-09-16, temporal interleave). Every later consumer this frame (composite, debug
-  // view) reads getCloudRenderRT(), which follows the index.
-  const uint32_t previous = m_cloudRenderCurrent;
-  m_cloudRenderCurrent = 1u - m_cloudRenderCurrent;
-
   AtmosphereArgs args = getAtmosphereArgs();
   traceCloudPlacement(args);
-  // Reduced-scale policy (fork -- 2026-09-17): detail LOD by mode, and an optional sample boost the
-  // smaller texel count pays for. Patched on this dispatch's copy only; the dome and the bakes keep
-  // theirs. The shader takes the boost as a step multiplier (1 / boost).
-  const bool reducedScale = m_cloudRenderExtent.width  < m_cloudRenderFullExtent.width
-                         || m_cloudRenderExtent.height < m_cloudRenderFullExtent.height;
-  const int lodMode = RtxAtmosphere::cloudDetailLodMode();
-  args.cloudDetailLodEnable = (lodMode >= 2 || (lodMode == 1 && reducedScale)) ? 1u : 0u;
-  const float sampleBoost = reducedScale
-    ? std::min(std::max(RtxAtmosphere::cloudReducedScaleSampleBoost(), 1.0f), 4.0f) : 1.0f;
-  args.cloudScreenStepScale = 1.0f / sampleBoost;
-  m_cloudProfileState.screenPeriod  = m_cloudScreenPeriodThisFrame;
   m_cloudProfileState.sunGridPeriod = m_cloudSunGridPeriodThisFrame;
   m_cloudProfileState.domePeriod    = m_cloudDomePeriodThisFrame;
   m_cloudProfileState.renderWidth   = m_cloudRenderExtent.width;
   m_cloudProfileState.renderHeight  = m_cloudRenderExtent.height;
   m_cloudProfileState.detailLod     = args.cloudDetailLodEnable;
-  m_cloudProfileState.sampleBoost   = sampleBoost;
+  m_cloudProfileState.detailLodBias = args.cloudDetailLodBias;
   ctx->updateBuffer(m_constantsBuffer, 0, sizeof(AtmosphereArgs), &args);
   ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_constantsBuffer);
 
@@ -3598,7 +3372,7 @@ void RtxAtmosphere::dispatchCloudRender(Rc<DxvkContext> ctx, const Resources::Ra
   ctx->bindResourceView(3, m_cloudDSun.view, nullptr);
   ctx->bindResourceView(4, m_cloudDAmbient.view, nullptr);
   ctx->bindResourceView(5, ctx->getCommonObjects()->getResources().getBlueNoiseTexture(ctx), nullptr);
-  ctx->bindResourceView(6, m_cloudRenderRT[m_cloudRenderCurrent].view, nullptr);
+  ctx->bindResourceView(6, m_cloudRenderRT.view, nullptr);
   ctx->bindResourceView(7, m_skyViewLut.isValid() ? m_skyViewLut.view : nullptr, nullptr);
   ctx->bindResourceView(8, m_cloudSkyTransmittanceLut.isValid() ? m_cloudSkyTransmittanceLut.view : nullptr, nullptr);
   ctx->bindResourceSampler(9, skyViewSampler);
@@ -3617,22 +3391,15 @@ void RtxAtmosphere::dispatchCloudRender(Rc<DxvkContext> ctx, const Resources::Ra
   // this pass-local slot (16) — this descriptor set is local to cloud_render.comp.slang and does
   // not share numbering with the common ray-tracing bindings.
   ctx->bindResourceView(15, rtOutput.m_primaryLinearViewZ.view, nullptr);
-  ctx->bindResourceView(16, m_cloudDepthRT[m_cloudRenderCurrent].view, nullptr);
+  ctx->bindResourceView(16, m_cloudDepthRT.view, nullptr);
   ctx->bindResourceBuffer(17, DxvkBufferSlice(m_cameraBuffer, 0, m_cameraBuffer->info().size));
-  // Previous frame's pair, read only on the pixels this frame reprojects (see the interleave word
-  // in args). Bound even when the history is invalid so the descriptor set is always complete.
-  ctx->bindResourceView(18, m_cloudRenderRT[previous].view, nullptr);
-  ctx->bindResourceView(19, m_cloudDepthRT[previous].view, nullptr);
-
   ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_cloudDSun.image);
   ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_cloudDAmbient.image);
   ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_cloudNvdfSdf[m_cloudNvdfSdfFront].image);
   ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_cloudDetailNoise3D.image);
-  ctx->getCommandList()->trackResource<DxvkAccess::Write>(m_cloudRenderRT[m_cloudRenderCurrent].image);
+  ctx->getCommandList()->trackResource<DxvkAccess::Write>(m_cloudRenderRT.image);
   ctx->getCommandList()->trackResource<DxvkAccess::Read>(rtOutput.m_primaryLinearViewZ.image);
-  ctx->getCommandList()->trackResource<DxvkAccess::Write>(m_cloudDepthRT[m_cloudRenderCurrent].image);
-  ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_cloudRenderRT[previous].image);
-  ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_cloudDepthRT[previous].image);
+  ctx->getCommandList()->trackResource<DxvkAccess::Write>(m_cloudDepthRT.image);
   if (m_skyViewLut.isValid()) {
     ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_skyViewLut.image);
   }
@@ -3673,18 +3440,9 @@ void RtxAtmosphere::dispatchCloudRender(Rc<DxvkContext> ctx, const Resources::Ra
 
   const uint32_t groupWidth = profilingMode == 3 ? 16u : 8u;
   const uint32_t groupHeight = profilingMode == 3 || profilingMode == 4 ? 4u : 8u;
-  // One thread per interleave cell (1x1, 2x1 or 2x2 pixels); see cloud_render.comp.slang's main.
-  const uint32_t period = args.cloudScreenInterleave & 0xFFu;
-  const uint32_t cellWidth  = period >= 2u ? 2u : 1u;
-  const uint32_t cellHeight = period >= 4u ? 2u : 1u;
-  const uint32_t cellsX = (m_cloudRenderExtent.width  + cellWidth  - 1u) / cellWidth;
-  const uint32_t cellsY = (m_cloudRenderExtent.height + cellHeight - 1u) / cellHeight;
-  const uint32_t groupsX = (cellsX + groupWidth - 1u) / groupWidth;
-  const uint32_t groupsY = (cellsY + groupHeight - 1u) / groupHeight;
+  const uint32_t groupsX = (m_cloudRenderExtent.width + groupWidth - 1u) / groupWidth;
+  const uint32_t groupsY = (m_cloudRenderExtent.height + groupHeight - 1u) / groupHeight;
   ctx->dispatch(groupsX, groupsY, 1);
-
-  // From here on the other pair is a complete previous frame at this extent.
-  m_cloudRenderHistoryValid = true;
 }
 
 void RtxAtmosphere::dispatchCloudSecondaryLut(Rc<DxvkContext> ctx) {
@@ -3921,30 +3679,8 @@ AtmosphereArgs RtxAtmosphere::updateFrame(RtxContext& ctx,
       m_cloudAnchor.cumulativeRotationRadians += std::acos(cosAngle);
     }
 
-    // Anchor-delta camera cut (fork — 2026-09-05, world-space cloud migration Stage 2).
-    // RtCamera::isCameraCut() (rtx_camera.cpp:116-118) compares getViewToWorld()[3] between this
-    // frame and last — the exact same permanently-(0,0,0) translation everMoved above exists to
-    // detect — so it can never fire on the engine this whole migration targets. |deltaKm| is the
-    // equivalent signal built on the anchor this stage actually resolves: a teleport, a cell
-    // transition, or simply flipping useCameraWorldOverride on/off all produce a discontinuous jump
-    // here that a real walking/flying player never would at any reasonable per-frame
-    // cloudAnchorCutKm. Consumed in getAtmosphereArgs() to force a one-frame reset of the cloud
-    // temporal history (see m_cloudAnchorCutThisFrame there) — the same class of fix
-    // RtCamera::isCameraCut() feeds elsewhere in the runtime for denoiser/history state, just built
-    // on a signal that actually fires here.
-    // Judged against how fast the anchor has RECENTLY been moving, not against the fixed threshold
-    // alone (fork -- 2026-09-17, flying judder). The absolute test on its own is the same
-    // hysteresis-free positional trigger as the 47 m voxel key, and the CloudHistory counters this
-    // run added caught it doing the same thing: resetCut fired ~10 times per 120 frames in sustained
-    // runs during ordinary play, so history was being destroyed on 8% of frames. That is the
-    // reported "judder where the accumulation resets and the clouds suddenly aren't blurry any more,
-    // then get blurry again over and over" -- reset, sharp, re-converge, reset.
-    //
-    // Whatever makes this anchor jump half a kilometre between frames (it is pushed per-frame by the
-    // game integration rather than derived from a view matrix), a real cut is distinguished from it
-    // by being an OUTLIER against recent motion, not by crossing a fixed distance. Flying steadily
-    // at 0.6 km/frame settles the average at 0.6 and needs ~5 km to trip; standing still needs only
-    // cloudAnchorCutKm, so a teleport out of a stationary camera still registers at once.
+    // Rotation-only view matrices cannot detect translation cuts. Keep the anchor outlier test
+    // so ordinary sustained flight does not repeatedly force a full reflection-dome bake.
     const float deltaLenKm = length(deltaKm);
     m_cloudAnchorSpeedEmaKm = m_cloudAnchorSpeedEmaKm <= 0.0f
       ? deltaLenKm
@@ -4053,64 +3789,20 @@ void RtxAtmosphere::bindResources(RtxContext& ctx) {
   if (m_cloudDAmbient.isValid()) {
     ctx.bindResourceView(BINDING_ATMOSPHERE_CLOUD_D_AMBIENT, m_cloudDAmbient.view, nullptr);
   }
-  if (m_cloudRenderRT[m_cloudRenderCurrent].isValid()) {
-    ctx.bindResourceView(BINDING_ATMOSPHERE_CLOUD_RENDER_RT, m_cloudRenderRT[m_cloudRenderCurrent].view, nullptr);
+  if (m_cloudRenderRT.isValid()) {
+    ctx.bindResourceView(BINDING_ATMOSPHERE_CLOUD_RENDER_RT, m_cloudRenderRT.view, nullptr);
   }
   // Depth companion (fork — 2026-09-05, world-space cloud migration Stage 4a). Wired into the
   // common ray-tracing bindings the same way as the RT above; no shader samples
   // AtmosphereCloudDepth yet (Stage 4b's composite is the first consumer).
-  if (m_cloudDepthRT[m_cloudRenderCurrent].isValid()) {
-    ctx.bindResourceView(BINDING_ATMOSPHERE_CLOUD_DEPTH_RT, m_cloudDepthRT[m_cloudRenderCurrent].view, nullptr);
+  if (m_cloudDepthRT.isValid()) {
+    ctx.bindResourceView(BINDING_ATMOSPHERE_CLOUD_DEPTH_RT, m_cloudDepthRT.view, nullptr);
   }
   if (m_cloudSecondaryLut.isValid()) {
     ctx.bindResourceView(BINDING_ATMOSPHERE_CLOUD_SECONDARY_LUT, m_cloudSecondaryLut.view, nullptr);
   }
 
-  // The cloud-history ping-pong advance and the resource allocation used to happen HERE (fork --
-  // moved to updateFrame 2026-09-06, open issue #2). This function is reached once per RT pass
-  // that binds the common ray-tracing resources, not once per frame, so per-frame state was being
-  // advanced from whichever pass happened to bind first. It was idempotent -- the advance
-  // early-outs on a repeated frame id -- so it was not broken, but the ownership was wrong in a
-  // way that would bite silently: the composite reads the resolved Prev/Curr pair and merely
-  // ASSUMED some earlier pass had resolved it, so disabling or reordering RT passes could leave
-  // the composite reading an unswapped pair with nothing to indicate why. updateFrame runs exactly
-  // once per frame, before any of these passes (RtxContext::injectRTX calls
-  // updateRaytraceArgsConstantBuffer at rtx_context.cpp:680, well ahead of dispatchPathTracing at
-  // :686), so the pair is already resolved by the time anything binds it. As of open issue #5
-  // below, this function no longer touches the pair at all.
-  // Cloud history is no longer bound here (fork -- 2026-09-06, open issue #5). These four
-  // resources were bound into every RT pass but read by none: the cloud temporal EMA lives in
-  // the composite, which binds them itself at COMPOSITE_ATMOSPHERE_CLOUD_HISTORY_*. Two of
-  // them were RW, so each RT pass paid a barrier for them. The resources themselves are still
-  // allocated and swapped in updateFrame -- only these dead bindings are gone.
 
-  // REPEAT wrapping matches the shader's frac-based tilable texcoords.
-  if (m_cloudNoiseSampler.ptr() == nullptr) {
-    DxvkSamplerCreateInfo samplerInfo = {};
-    samplerInfo.magFilter    = VK_FILTER_LINEAR;
-    samplerInfo.minFilter    = VK_FILTER_LINEAR;
-    samplerInfo.mipmapMode   = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    m_cloudNoiseSampler = m_device->createSampler(samplerInfo);
-  }
-  ctx.bindResourceSampler(BINDING_ATMOSPHERE_CLOUD_NOISE_SAMPLER, m_cloudNoiseSampler);
-
-  // REPEAT-U for azimuth wraparound; CLAMP-V prevents pole rows mixing into
-  // zenith/nadir. The secondary cloud LUT is mipmapped.
-  if (m_skyViewSampler.ptr() == nullptr) {
-    DxvkSamplerCreateInfo samplerInfo = {};
-    samplerInfo.magFilter    = VK_FILTER_LINEAR;
-    samplerInfo.minFilter    = VK_FILTER_LINEAR;
-    samplerInfo.mipmapMode   = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    samplerInfo.mipmapLodMax = VK_LOD_CLAMP_NONE;
-    m_skyViewSampler = m_device->createSampler(samplerInfo);
-  }
-  ctx.bindResourceSampler(BINDING_ATMOSPHERE_SKY_VIEW_SAMPLER, m_skyViewSampler);
 }
 
 namespace {

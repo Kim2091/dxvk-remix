@@ -1,5 +1,9 @@
 # Fork touchpoints
 
+> Screen scaling and cloud temporal reuse were removed on 2026-09-17. See
+> [the native cleanup and LOD evaluation](numos-native-cleanup-2026-09-17.md) for current behavior;
+> the descriptions of those paths below are historical.
+
 This index lists every upstream file the fork touches. It is the authoritative
 inventory of fork-vs-upstream surface area, maintained as fork edits are added
 or removed.

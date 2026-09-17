@@ -56,30 +56,7 @@
 // 203: retired (legacy 256^3 cloud noise volume, removed 2026-07-16 — do not reuse without a collision audit)
 #define BINDING_ATMOSPHERE_CLOUD_NOISE_SAMPLER   204
 // 205: retired (fast noise jitter texture, removed 2026-08-05 — do not reuse without a collision audit)
-// Cloud history textures (fork): screen-space ping-pong for temporal smoothing
-// of the per-frame noise jitter on the cloud ray-march. The PREV slot is
-// the read view of last frame's accumulated cloud (rgb = premultiplied
-// radiance, a = alpha). The CURR slot is the RW write target this frame.
-// Allocated full-screen at downscale dimensions; ping-pong handled in
-// RtxAtmosphere. Consumed only when evalSkyRadiance is called from the
-// primary view ray (geometry_resolver miss path); PSR/indirect callers see
-// the raw cloud value.
-#define BINDING_ATMOSPHERE_CLOUD_HISTORY_PREV    206
-#define BINDING_ATMOSPHERE_CLOUD_HISTORY_CURR    207
-// Cloud history frame-id ping-pong (fork). R16_UINT screen-space pair carrying
-// the frame index at which each pixel of the cloud-history color buffer was
-// last written by the sky-miss path. Read at lookup time and compared against
-// `(frameIdx - 1) & 0xFFFF` to reject stale history at pixels that were
-// foreground-occluded last frame (their color slot retains pre-occlusion
-// values because the sky-miss path didn't run there to refresh them). Without
-// this, the temporal smoother's existing alpha-only disocclusion guard mis-
-// identifies stale-but-nonzero history as valid and produces ~30-frame bright
-// ghost trails when foreground geometry moves through bright sky / emissives.
-// Clear value 0xFFFF is a "never written" sentinel; the only frame-id
-// collision is once every ~18 minutes at 60fps when frameIdx wraps to
-// 0xFFFF — a single rejected blend at affected pixels, imperceptible.
-#define BINDING_ATMOSPHERE_CLOUD_HISTORY_FRAME_ID_PREV 212
-#define BINDING_ATMOSPHERE_CLOUD_HISTORY_FRAME_ID_CURR 213
+// 206/207 and 212/213: retired cloud history bindings.
 // Cloud-occluded sky-ambient transmittance LUT (fork). 2D (azimuth, elevation)
 // R16F texture baked per frame from camera position: for each direction, marches
 // the cloud slab and stores the directional cloud transmittance in [0, 1].

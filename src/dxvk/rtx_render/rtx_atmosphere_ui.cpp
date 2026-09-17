@@ -1104,42 +1104,7 @@ void RtxAtmosphere::showCloudSettings(const WeatherSnapshot* weatherSnapshot) {
       "Samples each vertical cloud column once for ambient lighting. "
       "Reduces repeated density work. "
       "Updates every frame when cloud ground shadows are enabled. Applies live.");
-    RemixGui::DragFloat("Cloud Temporal Accumulation", &RtxAtmosphere::cloudHistoryWeightObject(),
-      0.01f, 0.0f, 0.98f, "%.2f", sliderFlags);
-    RemixGui::SetTooltipToLastWidgetOnHover(
-      "How much of a cloud pixel's previous value is kept when it is re-marched. The march jitters "
-      "each sample so it can resolve detail finer than its own step; this averages that jitter back "
-      "out instead of leaving it on screen as fine grain or shimmer. 0 turns accumulation off and "
-      "freezes the jitter below native Cloud Render Scale, which trades the shimmer for fixed-pattern "
-      "grain. Higher settles cleaner and lags further behind fast-moving cloud. Resets on camera "
-      "cuts, lightning, and any frame the cloud inputs change. Applies live.");
-    RemixGui::DragFloat("Accumulation Clamp", &RtxAtmosphere::cloudHistoryClampGammaObject(),
-      0.05f, 0.0f, 4.0f, "%.2f", sliderFlags);
-    RemixGui::SetTooltipToLastWidgetOnHover(
-      "How far an accumulated cloud pixel may drift from what was just marched there, in standard "
-      "deviations of its own neighbourhood. This is the knob that stops smearing. Clouds are "
-      "reprojected along camera rotation only, which is accurate while the deck is far away and "
-      "increasingly wrong as you fly through it; without a clamp a wrong history is kept at full "
-      "weight and folded forward every frame, which is what makes the smear unbounded. "
-      "Lower clamps harder: less smearing when moving through cloud, and less of the sampling noise "
-      "averaged away. 0 turns the clamp off. Try 0.5 if flying still smears, 2 if the image looks "
-      "noisier than it used to. Applies live.");
-    RemixGui::DragFloat("Accumulation Depth Tolerance", &RtxAtmosphere::cloudHistoryDepthToleranceObject(),
-      0.005f, 0.0f, 1.0f, "%.3f", sliderFlags);
-    RemixGui::SetTooltipToLastWidgetOnHover(
-      "How far the surface behind a cloud pixel may have moved before its accumulated history is "
-      "thrown away, as a fraction of the larger distance. This is what stops cloud smearing across "
-      "the edge of anything that moves in front of it. Lower rejects more: crisper behind moving "
-      "objects, but grainier at their edges because those pixels lose their history. Raise it if "
-      "cloud looks noisy along geometry silhouettes. Applies live.");
     const char* kCloudInterleaveModes[] = { "Every frame", "Half per frame", "Quarter per frame" };
-    RemixGui::Combo("Cloud Temporal Interleave", &RtxAtmosphere::cloudScreenInterleaveModeObject(),
-      kCloudInterleaveModes, IM_ARRAYSIZE(kCloudInterleaveModes));
-    RemixGui::SetTooltipToLastWidgetOnHover(
-      "Marches half or a quarter of the cloud pixels each frame and reprojects the rest from the "
-      "previous frame along the camera rotation, re-marching any pixel whose surface no longer "
-      "matches. Every pixel is still marched within the period. Falls back to a full march on "
-      "camera cuts, lightning, and any frame the cloud or sun inputs change. Applies live.");
     RemixGui::Combo("Sun Shadow Grid Interleave", &RtxAtmosphere::cloudSunGridInterleaveModeObject(),
       kCloudInterleaveModes, IM_ARRAYSIZE(kCloudInterleaveModes));
     RemixGui::SetTooltipToLastWidgetOnHover(
@@ -1151,32 +1116,19 @@ void RtxAtmosphere::showCloudSettings(const WeatherSnapshot* weatherSnapshot) {
     RemixGui::SetTooltipToLastWidgetOnHover(
       "Re-marches half or a quarter of the reflection dome's rows each frame. A full bake still "
       "runs on camera cuts and whenever the cloud inputs cross a re-bake step. Applies live.");
-    const char* kCloudDetailLodModes[] = { "Off", "Reduced scale only", "Always" };
-    RemixGui::Combo("Cloud Detail LOD", &RtxAtmosphere::cloudDetailLodModeObject(),
-      kCloudDetailLodModes, IM_ARRAYSIZE(kCloudDetailLodModes));
+    static RemixGui::ComboWithKey<int> detailLodCombo("Cloud Detail LOD", {
+      { 0, "Off" }, { 2, "Always" }
+    });
+    detailLodCombo.getKey(&RtxAtmosphere::cloudDetailLodModeObject());
     RemixGui::SetTooltipToLastWidgetOnHover(
-      "Samples a coarser copy of the cloud detail noise wherever the ray-march step is too long "
-      "to integrate its finest structure, so that structure is filtered out instead of aliasing. "
-      "Removes the block crawl and flicker of a reduced Cloud Render Scale; costs fine detail the "
-      "step could not resolve anyway. 'Always' applies it at native scale and to reflections too. "
+      "Optional mip filtering in the screen march and reflections. Off is the native-resolution "
+      "baseline. Always can soften cloud shape as well as fine detail; compare before enabling. "
       "Applies live.");
     RemixGui::DragFloat("Detail LOD Bias", &RtxAtmosphere::cloudDetailLodBiasObject(),
       0.05f, -3.0f, 3.0f, "%.2f", sliderFlags);
     RemixGui::SetTooltipToLastWidgetOnHover(
-      "Mip levels added to the detail LOD. Negative keeps more fine detail (and more crawl), "
-      "positive softens further. Applies live.");
-    RemixGui::DragFloat("Reduced-Scale Sample Boost (1 = cheapest)", &RtxAtmosphere::cloudReducedScaleSampleBoostObject(),
-      0.05f, 1.0f, 4.0f, "%.2f x", sliderFlags);
-    RemixGui::SetTooltipToLastWidgetOnHover(
-      "Extra samples per cloud ray while Cloud Render Scale is below 1, as a multiple of the "
-      "native rate: 1 = native spacing and cost, 2 = twice the samples (roughly twice the "
-      "reduced-scale march cost). Applies live.");
-    RemixGui::DragFloat("Cloud Render Scale", &RtxAtmosphere::cloudRenderResolutionScaleObject(),
-      0.05f, 0.25f, 1.0f, "%.2f", sliderFlags);
-    RemixGui::SetTooltipToLastWidgetOnHover(
-      "Resolution of the cloud render relative to the internal render "
-      "resolution. 0.5 = quarter the pixels (~4x cheaper clouds, "
-      "slightly softer); 1.0 = native (legacy). Applies live.");
+      "Mip levels added to the detail LOD. Negative keeps more detail, "
+      "positive softens further. Bias -3 is a comparison setting, not equivalent to Off. Applies live.");
     RemixGui::DragFloat("Cloud Sample Spacing", &RtxAtmosphere::cloudViewStepKmObject(),
       0.01f, 0.0f, 1.0f, "%.2f km", sliderFlags);
     RemixGui::SetTooltipToLastWidgetOnHover(
@@ -1222,28 +1174,6 @@ void RtxAtmosphere::showCloudSettings(const WeatherSnapshot* weatherSnapshot) {
       "Writes cloud GPU times and the mode/sample settings to rtx-remix/logs/remix-dxvk.log "
       "every 120 rendered frames. Keep each mode active for at least 10 seconds. "
       "Return to Normal and turn logging off after testing.");
-    const char* kCloudInjectPatterns[] = {
-      "Off",
-      "Static - sky and cloud", "Static - geometry", "Static - both",
-      "Animated - sky and cloud", "Animated - geometry", "Animated - both"
-    };
-    RemixGui::Combo("Upscaler Passthrough Probe", &RtxAtmosphere::cloudDebugInjectPatternObject(),
-      kCloudInjectPatterns, IM_ARRAYSIZE(kCloudInjectPatterns));
-    RemixGui::SetTooltipToLastWidgetOnHover(
-      "Diagnostic only, and deliberately ugly. Stamps a 1-pixel checkerboard into the image at the "
-      "exact point it is handed to the upscaler, so you can see what the upscaler does to a given "
-      "kind of pixel instead of having to reason about it. "
-      "The measurement is the PAIR: take one screenshot on 'Static - both', then one on "
-      "'Animated - both'. They are the same pattern at the same contrast and differ only in whether "
-      "it holds still or inverts every frame. If the animated shot comes out smooth while the static "
-      "shot keeps its checkerboard, the upscaler is temporally filtering those pixels and the cloud "
-      "fix is to make the cloud noise change every frame. If both shots keep the pattern, the "
-      "upscaler is not filtering them at all and clouds must be cleaned up before they reach it. "
-      "A static pattern survives a temporal filter by design, so a static shot on its own proves "
-      "nothing. "
-      "Use screenshots, not the live view: a pattern that inverts every frame averages out in your "
-      "eye and looks smooth whether or not anything actually filtered it. "
-      "Turn this off when you are done. Applies live.");
     RemixGui::DragFloat("Lighting LOD", &RtxAtmosphere::cloudLightingLodThresholdObject(),
       0.002f, 0.0f, 0.25f, "%.3f", sliderFlags);
     RemixGui::SetTooltipToLastWidgetOnHover(
@@ -1678,7 +1608,7 @@ void RtxAtmosphere::showSkySetup() {
         0.05f, 0.0f, 50.0f, "%.2f", sliderFlags);
       RemixGui::SetTooltipToLastWidgetOnHover(
         "Per-frame movement (km) of |Delta| This Frame above that counts as a camera cut, "
-        "forcing a one-frame reset of the screen-space cloud temporal history. "
+        "forcing a full refresh of the cloud reflection dome. "
         "RtCamera::isCameraCut() cannot substitute for this — it compares the same view-matrix "
         "translation Ever Moved above found permanently fixed on Fallout: New Vegas. A "
         "teleport, a cell transition, or toggling Use Camera World Override can all move the "

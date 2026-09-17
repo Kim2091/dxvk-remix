@@ -383,25 +383,7 @@
 // against PrimaryLinearViewZ, current-frame sources only). White = fully opaque cloud between camera
 // and surface, black = surface not fogged (either no cloud in front of it, or a genuine miss).
 #define DEBUG_VIEW_CLOUD_TRANSMITTANCE_ON_GEOMETRY 882
-// Cloud reprojection (fork — world-space cloud migration Stage 4b, 2026-09-05; reworked 2026-09-06,
-// EMA rectification). Recomputes the SAME rotation + translation-parallax reprojection
-// composite.comp.slang's applyCloudComposite performs (duplicated, not shared — same reasoning as enum
-// 880's cloudSlabSpan duplication: zero risk to the production composite from a diagnostic view),
-// then compares the REAL reprojected history (previous ping-pong colour slot, bilinear, per-tap
-// age-validated) against this frame's raw cloud at the same pixel. This pass runs after composite on
-// the same resolved ping-pong pair, so "previous" here is exactly what composite reprojected. The
-// original version reported only the parallax magnitude (identically zero on the Gamebryo target)
-// and the rejection reason, so it could not tell a wrong rotation motion vector from a right one.
-//   R (0..1) = reprojection error: max over rgb of |history - current| / max(|history|, |current|),
-//     and |opacity difference|. Jitter-noise level everywhere with a correct motion vector; lights up
-//     deck edges along the motion direction with a wrong one. The quantity the neighbourhood clip
-//     bounds -- what a trail is made of.
-//   G = history-rejection reason as a 4-level step: 0 = accepted, 0.33 = no cloud along this ray,
-//     0.66 = history weight is 0 this frame (anchor cut -- see RtxAtmosphere's
-//     m_cloudAnchorCutThisFrame -- or the knob at 0), 1.0 = no valid history tap (stale age or
-//     off-screen).
-//   B (0..1, saturated) = |rotation + parallax motion vector| in pixels / 8. Black while the deck
-//     visibly moves under a pan means no motion vector is being produced at all.
+// Retired cloud reprojection diagnostic; old configs selecting 883 receive black.
 #define DEBUG_VIEW_CLOUD_REPROJECTION 883
 // Cloud density-evaluation count per ray (fork -- 2026-09-17, native-scale optimisation). The march
 // is dominated by density evaluation -- lighting measured ~17% of it -- so the question that chooses

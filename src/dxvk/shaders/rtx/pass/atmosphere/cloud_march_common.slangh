@@ -1376,32 +1376,10 @@ void marchCloudSlab(vec3   viewDirYUp,
   //                       nubis3AdaptiveStepKm, 4 · cloudViewStepKm)
   // → 100 m at 12 km (unchanged by default), ~30 m at the 1.3 km deck base,
   // the floor (default 25 m) for fly-through, growing to ~400 m at the far
-  // horizon (the coarser far lattice is dithered by jitter + the temporal
-  // EMA, and the fewer far samples partly pay for the near refinement).
-  //
-  // Jitter policy (p.172): the sample offsets by hash·step INSIDE its cell
-  // (stratified, like the fixed lattice); the hash is the animated per-frame
-  // one near the camera (temporal dither, resolved by the EMA/DLSS) and the
-  // static per-pixel one beyond 250 m (no distant shimmer). The cursor t
-  // stays unjittered (p.174: jitter offsets the sample position, not the
-  // accumulated distance).
-  //
-  // Iterations are hard-capped by cloudViewSamplesMax (CB-driven-loop
-  // discipline). A ray that exhausts the budget before tExit drops whatever
-  // remains; only broken-cloud horizon-grazing rays approach the cap, with
-  // viewTransmittance already low — raise Max Cloud Samples if far horizon
-  // clouds visibly thin.
+  // horizon. Sample positions are jittered inside each cell; the cursor stays unjittered.
+  // Budget exhaustion is handled by the coarse tail integration below.
   const float kAdaptiveRefDistKm = 12.0f;  // adaptive == cloudViewStepKm here
-  // Animated jitter everywhere by default (fork -- 2026-09-07). This was 0.25 km, following the
-  // paper's choice to freeze the hash beyond 250 m -- but Decima froze it because their voxel
-  // clouds had NO temporal filter at that range (pp.182-185). We have two: the composite's EMA and
-  // DLSS-RR. With a frozen per-pixel hash every sample of a deck that starts at 800 m used the same
-  // offset every frame, so the EMA converged to the sampling error instead of averaging it away and
-  // RR saw a temporally stable high-frequency pattern and faithfully preserved it. That is the
-  // speckle in thin and mid-tone cloud -- worst exactly where hard gates (the density-skip and the
-  // wisp cut) flip against a step much larger than the detail they sample, and absent in saturated
-  // cores where nothing flips. Animating it turns that fixed error into per-frame noise, which is
-  // the one thing a temporal filter can actually remove.
+  // Animated by default so sampling error does not become a fixed screen-space pattern.
   const float kJitterAnimateKm   = args.nubis3JitterAnimateKm;
   float adaptiveCeilKm = max(4.0f * args.cloudViewStepKm, args.nubis3AdaptiveStepKm);
   uint  iterCap = max(uint(args.cloudViewSamplesMax), sampleCount);

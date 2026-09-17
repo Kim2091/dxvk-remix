@@ -1,5 +1,9 @@
 # Numos clouds: migration to true world-space clouds — design document
 
+> Screen scaling and cloud temporal reuse were removed on 2026-09-17. See
+> [the native cleanup and LOD evaluation](numos-native-cleanup-2026-09-17.md) for current behavior;
+> the descriptions of those paths below are historical.
+
 **Status:** design only, no code changes.
 **Code base:** worktree `C:\Users\sparkles\Projects\Fable_5_testing\dxvk-atmos-v2` at `46f6316a0` (= `origin/atmosphere-hillaire-egsr2020-v2`, RemixProjGroup/dxvk-remix). Every `src/...` citation below is against that commit unless it is explicitly prefixed with a commit hash from the archaeology repo (`C:\Users\sparkles\Projects\Fable_5_testing\dxvk-remix`, git only).
 **Prior art analysed:** `30d20a8f5` ("WIP: archive non-working in-world cloud march", forked from `b94e906dd`, 5 commits behind tip) and branch `numos-world` (`daecda4b0`, `6b9f7f881`, `c5b561e81`, plus `e952f0422`, `dda191127`; merge-base `2522e69a0`, an upstream sync well behind tip).

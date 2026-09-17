@@ -126,11 +126,9 @@ float valueErosion(float value, float erosion) {
 // pass true — the shared sampler is what makes rendered clouds and the shadow grids
 // iso-consistent by construction; see sampleCloudDensityNubis3Coarse below, which
 // is wired only into the three live-tap sites.
-// Mip level that band-limits a detail tap to what a march step of lodStepKm can integrate (fork --
-// 2026-09-17, detail LOD). A tap at freqPerKm volume repeats per km spans freqPerKm * 128 texels per
-// km; a step covering n texels resolves wavelengths of about 2n texels, i.e. mip log2(2n). Every
-// channel is mean 0.5 by the bake normalisation, so a coarser mip fades a band toward neutral
-// rather than shifting coverage. lodStepKm <= 0 keeps full detail (the bakes and the shadow taps).
+// Optional step-based filtering of the detail volume. This filters noise before nonlinear
+// displacement and density gates, so preserving its mean does not preserve cloud coverage.
+// lodStepKm <= 0 selects the unfiltered baseline, including all lighting-grid taps.
 float cloudDetailMip(float freqPerKm, float lodStepKm, float lodBias) {
   if (lodStepKm <= 0.0f) {
     return 0.0f;

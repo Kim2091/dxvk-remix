@@ -135,7 +135,6 @@ namespace dxvk {
         // applyCloudComposite in composite.comp.slang / the doc comment on these slots in
         // composite_binding_indices.h.
         TEXTURE2D(COMPOSITE_ATMOSPHERE_CLOUD_RENDER_INPUT)
-        SAMPLER(COMPOSITE_ATMOSPHERE_CLOUD_RENDER_SAMPLER)
         TEXTURE2D(COMPOSITE_ATMOSPHERE_CLOUD_DEPTH_INPUT)
 
         RW_TEXTURE2D(COMPOSITE_PRIMARY_ALBEDO_INPUT_OUTPUT)
@@ -438,21 +437,11 @@ namespace dxvk {
     // composite.comp.slang for why the composite lives here now instead of in evalSkyRadiance.
     // atmosphere.initialize() is not called here: RtxAtmosphere::bindResources (called earlier, for
     // the G-buffer pass's common ray-tracing bindings) already initialized these resources.
-    // This frame's cloud-history ping-pong swap is resolved earlier still, in
-    // RtxAtmosphere::updateFrame (fork -- moved there 2026-09-06, open issue #2; it used to be
-    // resolved by whichever RT pass bound the common resources first, which made this dependency
-    // an unwritten assumption rather than an ordering guarantee). Composite must read the SAME
-    // resolved Prev/Curr pair, not swap again.
     {
       const Resources::Resource& cloudRenderRT = atmosphere.getCloudRenderRT();
       if (cloudRenderRT.isValid()) {
         ctx->bindResourceView(COMPOSITE_ATMOSPHERE_CLOUD_RENDER_INPUT, cloudRenderRT.view, nullptr);
       }
-      // Clamp-to-edge, not the REPEAT-U sky-view sampler evalSkyRadiance used to share: this RT is
-      // screen-space content, and this pass reads it via a straight full-extent uv (no half-texel
-      // clamp trick), so clamping at the sampler is simpler and equally correct.
-      ctx->bindResourceSampler(COMPOSITE_ATMOSPHERE_CLOUD_RENDER_SAMPLER, linearSampler);
-
       const Resources::Resource& cloudDepthRT = atmosphere.getCloudDepthRT();
       if (cloudDepthRT.isValid()) {
         ctx->bindResourceView(COMPOSITE_ATMOSPHERE_CLOUD_DEPTH_INPUT, cloudDepthRT.view, nullptr);
@@ -499,14 +488,6 @@ namespace dxvk {
     compositeArgs.sparseRenderingArgs = rtOutput.m_raytraceArgs.sparseRenderingArgs;
     compositeArgs.volumeArgs = rtOutput.m_raytraceArgs.volumeArgs;
     compositeArgs.atmosphereArgs = rtOutput.m_raytraceArgs.atmosphereArgs;
-    // Cloud composite parallax reprojection input (fork — 2026-09-05, world-space cloud migration
-    // Stage 4b) — see composite_args.h's doc comment on this field for why it exists outside
-    // AtmosphereArgs. `atmosphere` was already fetched above for the aerial perspective LUT.
-    compositeArgs.cloudAnchorDeltaYUpKm = atmosphere.getCloudAnchor().deltaKm;
-    // Upscaler passthrough probe (fork -- 2026-09-17) -- see composite_args.h's doc comment.
-    // Composite-only; never reaches AtmosphereArgs or a LUT cache key.
-    compositeArgs.cloudDebugInjectMode = float(RtxAtmosphere::cloudDebugInjectPattern());
-    compositeArgs.cloudHistoryDepthTolerance = std::max(RtxAtmosphere::cloudHistoryDepthTolerance(), 0.0f);
     compositeArgs.outputParticleLayer = ctx->useRayReconstruction() && rayReconstruction.useParticleBuffer();
     compositeArgs.outputSecondarySignalToParticleLayer = ctx->useRayReconstruction() && rayReconstruction.preprocessSecondarySignal();
     compositeArgs.enableDemodulateAttenuation = ctx->useRayReconstruction() && rayReconstruction.demodulateAttenuation();
@@ -573,15 +554,6 @@ namespace dxvk {
 
     compositeArgs.domeLightArgs = domeLightArgs;
     compositeArgs.skyBrightness = RtxOptions::skyBrightness();
-    // Cloud-shadow composite application removed 2026-06-19 (fork). The
-    // screen-space PrimaryCloudShadowFactor texture and the pow(factor,
-    // cloudShadowFactorStrength) multiply on post-denoise primary direct radiance
-    // were deleted when the cloud shadow moved onto the sun term in the NEE
-    // (atmosphere_common.slangh). The contrast knob is now populated into
-    // atmosphereArgs (rtx_atmosphere.cpp). composite_args.h::pad2 is the
-    // retired cloudShadowIndirectStrength CB slot; the former pad1 slot (retired
-    // cloudShadowFactorStrength) now carries cloudHistoryClampGamma (fork — 2026-09-06).
-
     const bool sparseRenderingEnabled = rtOutput.m_raytraceArgs.sparseRenderingArgs.mode != SparseRenderingMode::Off;
 
     Rc<DxvkBuffer> cb = getCompositeConstantsBuffer();

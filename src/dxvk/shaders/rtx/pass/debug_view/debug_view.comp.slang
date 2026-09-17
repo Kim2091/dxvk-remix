@@ -196,9 +196,6 @@ SamplerState LinearSampler;
 // fall back to safe no-op stubs in this translation unit, which is
 // correct — the enum-875 case uses the explicit-parameter variant.
 #include "rtx/pass/atmosphere/atmosphere_common.slangh"
-// NV-DXVK start: Use the active camera projection for Numos clouds.
-#include "rtx/pass/atmosphere/cloud_camera.slangh"
-// NV-DXVK end
 
 float4 sampleTexture(Texture2D<float4> texture, ivec2 threadId)
 {
@@ -889,12 +886,11 @@ vec4 loadInput(inout RNG randomState, ivec2 threadId)
   case DEBUG_VIEW_CLOUD_DEPTH:
     {
       // Fork diagnostic (world-space cloud migration, Stage 4b, 2026-09-05). Point-sampled read
-      // (cloudNativeTexel — never bilinear) of the depth companion at THIS pass's own native
+      // (exact per-pixel load) of the depth companion at THIS pass's own native
       // resolution. See the enum's registration comment (rtx_debug_view.cpp) for the channel
       // legend.
-      uint2 cloudDepthDim;
-      DebugViewCloudDepthRT.GetDimensions(cloudDepthDim.x, cloudDepthDim.y);
-      const vec2 depthKm = DebugViewCloudDepthRT[cloudNativeTexel(threadId, cloudDepthDim)].xy;
+
+      const vec2 depthKm = DebugViewCloudDepthRT[threadId].xy;
       const float entryKm = depthKm.x;
       const float meanKm = depthKm.y;
 
@@ -906,9 +902,8 @@ vec4 loadInput(inout RNG randomState, ivec2 threadId)
     {
       // Fork diagnostic (native-scale optimisation, 2026-09-17). .w of the depth companion carries
       // the number of density evaluations this ray performed. Same point-sampled read as 881.
-      uint2 cloudDepthDim;
-      DebugViewCloudDepthRT.GetDimensions(cloudDepthDim.x, cloudDepthDim.y);
-      const float samples = DebugViewCloudDepthRT[cloudNativeTexel(threadId, cloudDepthDim)].w;
+
+      const float samples = DebugViewCloudDepthRT[threadId].w;
       // Scaled to the REAL cap, and saturation painted explicitly (fork -- 2026-09-17, second pass).
       //
       // The first version ramped over a hardcoded 0-128 while marchCloudSlab's iterCap is
@@ -944,9 +939,8 @@ vec4 loadInput(inout RNG randomState, ivec2 threadId)
       vec3 outColor = vec3(0.0f);
       if (!isSkyMiss)
       {
-        uint2 cloudRenderDim;
-        DebugViewCloudRenderRT.GetDimensions(cloudRenderDim.x, cloudRenderDim.y);
-        const float cloudTransmittance = DebugViewCloudRenderRT[cloudNativeTexel(threadId, cloudRenderDim)].a;
+
+        const float cloudTransmittance = DebugViewCloudRenderRT[threadId].a;
         outColor = vec3(saturate(1.0f - cloudTransmittance));
       }
       value = vec4(outColor, 1.0f);
@@ -1287,25 +1281,6 @@ void storeDebugViewOutputStatistics(vec4 value, uint groupIndex)
     InterlockedAddFloat(DebugViewStatistics[3], groupSum.w);
   }
 #endif
-}
-
-// Fork helper (world-space cloud migration Stage 4b, 2026-09-05): maps a G-buffer/composite-
-// resolution pixel coordinate to the NEAREST native texel of the (possibly smaller,
-// cloudRenderResolutionScale-scaled) cloud render RT / depth companion. Mirrors composite.comp.
-// slang's sampleCloudDepthKm exactly (point-sampled, never bilinear -- see that function's header
-// comment for why), duplicated here rather than shared: this pass has its own descriptor set and no
-// common include point with composite for cloud helpers (same reasoning as enum 880's cloudSlabSpan
-// duplication). Zero dims (extent not yet known) falls back to identity, matching every other cloud
-// dimension-ratio fallback in this migration.
-ivec2 cloudNativeTexel(uint2 pixelCoordinate, uint2 rtDim)
-{
-  if (cb.atmosphereArgs.cloudRenderFullDimX == 0u || cb.atmosphereArgs.cloudRenderFullDimY == 0u)
-  {
-    return ivec2(pixelCoordinate);
-  }
-  const vec2 uv = (vec2(pixelCoordinate) + 0.5f)
-                / vec2(float(cb.atmosphereArgs.cloudRenderFullDimX), float(cb.atmosphereArgs.cloudRenderFullDimY));
-  return clamp(ivec2(uv * vec2(rtDim)), ivec2(0), ivec2(rtDim) - ivec2(1));
 }
 
 [shader("compute")]

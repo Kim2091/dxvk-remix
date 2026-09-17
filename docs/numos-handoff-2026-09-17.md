@@ -1,5 +1,9 @@
 # Numos handoff - 2026-09-17
 
+> Screen scaling and cloud temporal reuse were removed on 2026-09-17. See
+> [the native cleanup and LOD evaluation](numos-native-cleanup-2026-09-17.md) for current behavior;
+> the descriptions of those paths below are historical.
+
 Supersedes `numos-handoff-2026-09-14.md` for the cloud performance work; that file still holds the
 alpha-foliage history, the preserved shimmer-fix commits, and the working rules, which are unchanged.
 

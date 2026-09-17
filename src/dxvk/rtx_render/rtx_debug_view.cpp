@@ -1457,11 +1457,6 @@ namespace dxvk {
     // views that don't need them simply ignore the values.
     debugViewArgs.atmosphereArgs = rtOutput.m_raytraceArgs.atmosphereArgs;
     debugViewArgs.isZUp = rtOutput.m_raytraceArgs.isZUp;
-    // Fork: mirrors CompositeArgs::cloudAnchorDeltaYUpKm (world-space cloud migration Stage 4b,
-    // 2026-09-05) so DEBUG_VIEW_CLOUD_REPROJECTION (883) can recompute composite's parallax motion
-    // vector. See that field's doc comment in composite_args.h / debug_view_args.h.
-    debugViewArgs.cloudAnchorDeltaYUpKm = common.metaAtmosphere().getCloudAnchor().deltaKm;
-
     if (displayType() == DebugViewDisplayType::Standard) {
       debugViewArgs.pseudoColorMode = pseudoColorMode();
       debugViewArgs.enableAlphaChannelFlag = m_enableAlphaChannel;
@@ -1664,9 +1659,7 @@ namespace dxvk {
         ctx->bindResourceView(DEBUG_VIEW_BINDING_CLOUD_RENDER_RT_INPUT, cloudRenderRT.view, nullptr);
       }
     }
-    // Fork: cloud depth companion + history frame-id (world-space cloud migration Stage 4b,
-    // 2026-09-05). Read-only diagnostics for DEBUG_VIEW_CLOUD_DEPTH (881),
-    // DEBUG_VIEW_CLOUD_TRANSMITTANCE_ON_GEOMETRY (882) and DEBUG_VIEW_CLOUD_REPROJECTION (883).
+    // Current cloud depth and density-evaluation diagnostics.
     {
       const Resources::Resource& cloudDepthRT = atmosphere.getCloudDepthRT();
       if (cloudDepthRT.isValid()) {

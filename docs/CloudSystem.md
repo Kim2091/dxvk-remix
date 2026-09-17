@@ -43,7 +43,7 @@ plus one consumer wire-in inside the volumetric pass.
    zero-stale grids. The ambient grid integrates each column once
    (`cloudAmbientColumnScan`). The sun grid may re-bake only every
    second or fourth X column per frame (`cloudSunGridInterleaveMode`,
-   default half): neighbouring columns are then at most one period
+   default Quarter): neighbouring columns are then at most one period
    old and the trilinear read blends across them, and any frame the
    grid's inputs cross a re-bake step forces a full bake -- so, unlike
    the old stagger, no frame ever shows the whole grid jump at once.
@@ -78,23 +78,20 @@ plus one consumer wire-in inside the volumetric pass.
    sampling it for a non-primary ray direction would return the
    wrong cloud.
 
-6. **Temporal interleave** (2026-09-16; replaces the cloud history
-   smoother, which was removed on 2026-09-14 for the smear it left
-   behind moving geometry). With `cloudScreenInterleaveMode` at its
-   default (half), each thread of the cloud pass owns a 2x1 cell and
-   ray-marches one pixel of it per frame -- the fresh pixel alternates
-   in a checkerboard -- while the other pixel is reprojected from the
-   previous frame's RT along the camera rotation. A reprojected pixel
-   is accepted only if every bilinear tap resolves the same surface
-   class at a matching distance (the depth companion's `.z`); a
-   silhouette or a moving object fails that and is marched fresh, so
-   there is no blending across edges and nothing older than one
-   period. Full marches run on camera cuts, during lightning, and on
-   any frame the cloud, sun or camera inputs cross a re-bake step.
-   The RT and depth companion are a ping-pong pair for this; the
-   composite reads the current one. Quarter (2x2) is available.
-   The reflection dome has the same option
-   (`cloudSecondaryLutInterleaveMode`, rows instead of pixels).
+6. **Native screen march and lighting-bake interleave** (2026-09-17).
+   Every cloud pixel is marched every frame at the internal (DLSS-input) extent.
+   One color target and one depth/diagnostic companion are loaded at matching pixel coordinates
+   by composite. There is no cloud spatial scaler, upsample, screen interleave, reprojection,
+   or temporal accumulation. Projection jitter matches the primary geometry ray; march jitter
+   remains animated. Sun-grid columns and reflection-dome rows retain independent Quarter
+   interleave, with full refreshes when their inputs change or the dome's camera cuts.
+
+   Detail LOD is optional and defaults off. `cloudDetailLodMode = 2` enables step-based mip
+   filtering for the screen march and reflection dome; old mode 1 remains off. The live menu
+   offers Off / Always and a bias slider. Bias -3 remains available for comparison, but is not
+   equivalent to off: it filters when a step spans more than four detail texels. Filtering
+   noise before nonlinear density evaluation can change cloud shape and coverage. A benefit
+   at native resolution has not been demonstrated; see [the evaluation](numos-native-cleanup-2026-09-17.md).
 
 ## What the clouds shade
 
@@ -305,18 +302,8 @@ future-work item.
 
 ## Limitations
 
-- **Cloud RT resolution.** The cloud RT is written at the downscale
-  (DLSS-input) extent, not full resolution. DLSS / TAA take it from
-  there. Disabling the upscaler exposes the lower-res cloud silhouette
-  at native pixel granularity. Below native scale
-  (`cloudRenderResolutionScale < 1`) the pass marches the unjittered
-  ray with a frozen per-texel march offset, optionally marches more
-  samples per ray (`cloudReducedScaleSampleBoost`, 1 = off), and band-limits the detail noise to
-  its step by sampling the detail volume's mip chain
-  (`cloudDetailLodMode`, 2026-09-17) -- without that, content the step
-  cannot integrate aliases into a screen-locked block pattern that
-  crawls over moving cloud. The composite reconstructs the reduced RT
-  against per-texel surface depth, never blending across a silhouette.
+- **Cloud RT resolution.** The cloud RT matches the internal (DLSS-input) extent exactly.
+  The renderer's selected upscaler still controls the final output resolution.
 - **DLSS / TAA smear cumulus-on-terrain shadows.** Under DLSS / TAA,
   cumulus-on-terrain shadow contrast collapses substantially -- the
   upscalers reproject using terrain motion vectors that say "stationary,"
@@ -363,11 +350,6 @@ future-work item.
 - **Per-direction cloud LUT.** Would let indirect / PSR / reflection
   rays see Nubis Cubed clouds, removing the primary-vs-reflection
   discontinuity.
-- **Half-res reprojection.** Decima paper pp. 174-176 -- a follow-on
-  perf path that would let `cloudViewSamples` rise without proportional
-  cost. The 2026-09-16 temporal interleave is the full-resolution half
-  of this (every pixel still marched, at 1/2 or 1/4 rate); a genuinely
-  reduced-resolution reconstruction remains open.
 - **Runtime-baked NVDF + SDF.** A C-procedural cloud field replacing
   the prebaked FBM noise volume; preserves the macro/micro decoupling
   at cumulus silhouettes that the FBM cannot.

@@ -39,9 +39,6 @@
 #include "rtx/algorithm/volume_composite_helpers.slangh"
 #include "rtx/algorithm/accumulate.slangh"
 #include "rtx/pass/atmosphere/aerial_perspective_camera.slangh"
-// NV-DXVK start: Use the active camera projection for Numos clouds.
-#include "rtx/pass/atmosphere/cloud_camera.slangh"
-// NV-DXVK end
 #include "rtx/pass/sparse_rendering/sparse_rendering.slangh"
 #include "rtx/pass/sparse_rendering/compact_active_pixels.slangh"
 
@@ -727,170 +724,13 @@ void applyAerialPerspective(
 // radiance; that ordering sparkles on geometry and ghosts under ray reconstruction. Nothing here
 // touches SharedRadianceRG/B.
 
-// Bilinear upsample of the cloud render RT, verbatim port of evalSkyRadiance's former primary-ray
-// read (atmosphere_sky.slangh, pre-Stage-4b) onto composite's own CompositeCloudRender /
-// CompositeCloudRenderSampler binding. At cloudRenderResolutionScale = 1.0 the uv lands exactly on
-// texel centers, so this returns bit-identical values to the removed code -- the acceptance
-// invariant for this stage ("sky pixels unchanged"). CompositeCloudRenderSampler is a dedicated
-// clamp-to-edge sampler (composite's own, not the shared REPEAT-U sky-view sampler evalSkyRadiance
-// used) -- this content is screen-space, never spherical, so clamping is simpler and no less
-// correct; the half-texel inset is kept anyway so the sampled uv range matches the removed code's
-// exactly.
-// DEPTH-AWARE at reduced resolution (fork -- 2026-09-07). Plain bilinear stopped being valid the
-// moment the march was clamped at the primary surface: a cloud texel now describes the cloud in
-// front of ONE surface, so blending a texel clamped at a mountain with one clamped at the sky
-// behind it produces a value that describes neither. That is the edge aliasing that appeared on
-// every silhouette as soon as cloudRenderResolutionScale dropped below 1.
-//
-// Each of the four taps keeps its bilinear weight only if the surface it was clamped against
-// matches this pixel's, on the same relative tolerance the history validation uses. All four
-// rejected means every neighbour saw a different surface -- a thin sliver of geometry, typically --
-// and the nearest match in depth is taken rather than a blend of wrong answers.
-//
-// At scale 1 the exact Load path below is taken and this never runs -- true since 2026-09-08,
-// when the gate became an actual resolution comparison (see the gate comment inside).
-//
-// The distance both this pass and the cloud pass mean by "this ray hit nothing" (fork --
-// 2026-09-08, silhouette outline fix). Hoisted to file scope from applyCloudComposite because the
-// upsample below compares tap depths against it, and the cloud pass stores a DIFFERENT sky value
-// (kNoSurfaceKm = 1e9, cloud_march_common.slangh) -- see the clamp at the tap read. Sky uses a
-// fixed far depth rather than a sentinel so sky-vs-sky compares equal under the ordinary relative
-// test while sky-vs-surface is rejected, with no special case anywhere. 60000 km is
-// f16-representable (the history companion packs it) and beyond any reachable slant range.
-static const float kCloudSkyDepthKm = 60000.0f;
-
-struct CloudReconstruction {
-  vec4 value;
-  vec2 depthKm;
-};
-
-CloudReconstruction sampleCloudRenderRT(uint2 pixelCoordinate, AtmosphereArgs args, float surfaceKm)
-{
-  uint2 rtDim;
-  CompositeCloudRender.GetDimensions(rtDim.x, rtDim.y);
-  CloudReconstruction result;
-  if (all(rtDim == uint2(args.cloudRenderFullDimX, args.cloudRenderFullDimY))) {
-    result.value = CompositeCloudRender.Load(int3(pixelCoordinate, 0));
-    result.depthKm = CompositeCloudDepth.Load(int3(pixelCoordinate, 0)).xy;
-    return result;
-  }
-
-  const vec2 uv = (vec2(pixelCoordinate) + 0.5f)
-                / max(vec2(args.cloudRenderFullDimX, args.cloudRenderFullDimY), vec2(1.0f));
-  const vec2 texelF = uv * vec2(rtDim) - 0.5f;
-  const int2 baseTexel = int2(floor(texelF));
-  const int2 maxTexel = int2(rtDim) - int2(1);
-  vec4 sum = vec4(0.0f);
-  float weightSum = 0.0f;
-  float cloudWeightSum = 0.0f;
-  float meanSum = 0.0f;
-  float entryKm = kCloudSkyDepthKm;
-  vec4 nearestValue = vec4(0.0f, 0.0f, 0.0f, 1.0f);
-  vec2 nearestDepth = vec2(-1.0f, 0.0f);
-  float nearestDelta = 1e30f;
-
-  // Only widen the footprint when the bilinear taps contain no matching surface.
-  for (int ring = 0; ring < 2; ++ring) {
-    for (int y = -ring; y <= 1 + ring; ++y) {
-      for (int x = -ring; x <= 1 + ring; ++x) {
-        if (ring != 0 && x >= 0 && x <= 1 && y >= 0 && y <= 1) {
-          continue;
-        }
-        const int2 texel = clamp(baseTexel + int2(x, y), int2(0), maxTexel);
-        const vec4 depth = CompositeCloudDepth.Load(int3(texel, 0));
-        const float tapSurfaceKm = min(depth.z, kCloudSkyDepthKm);
-        const float delta = abs(tapSurfaceKm - surfaceKm);
-        const vec4 value = CompositeCloudRender.Load(int3(texel, 0));
-        if (delta < nearestDelta) {
-          nearestDelta = delta;
-          nearestValue = value;
-          nearestDepth = depth.xy;
-        }
-        const bool sameSurfaceClass = (tapSurfaceKm == kCloudSkyDepthKm) == (surfaceKm == kCloudSkyDepthKm);
-        if (!sameSurfaceClass || delta > cb.cloudHistoryDepthTolerance * max(max(tapSurfaceKm, surfaceKm), 1e-3f)) {
-          continue;
-        }
-        const vec2 distance = abs(vec2(baseTexel + int2(x, y)) - texelF);
-        const vec2 tent = max(vec2(float(ring + 1)) - distance, vec2(0.0f));
-        const float weight = tent.x * tent.y;
-        sum += value * weight;
-        weightSum += weight;
-        // Depth must describe the same cloud taps as color, not a nearest foreground texel.
-        const float cloudWeight = weight * saturate(1.0f - value.a);
-        if (cloudWeight > 0.0f && depth.x >= 0.0f) {
-          cloudWeightSum += cloudWeight;
-          meanSum += depth.y * cloudWeight;
-          entryKm = min(entryKm, depth.x);
-        }
-      }
-    }
-    if (weightSum > 1e-3f) {
-      result.value = sum / weightSum;
-      result.depthKm = cloudWeightSum > 1e-6f
-        ? vec2(entryKm, meanSum / cloudWeightSum) : vec2(-1.0f, 0.0f);
-      return result;
-    }
-  }
-
-  // A thin foreground object may have no representative in the cloud texture.
-  if (nearestDepth.x >= 0.0f && surfaceKm <= nearestDepth.x) {
-    nearestValue = vec4(0.0f, 0.0f, 0.0f, 1.0f);
-    nearestDepth = vec2(-1.0f, 0.0f);
-  }
-  result.value = nearestValue;
-  result.depthKm = nearestDepth;
-  return result;
-}
-
 // Depth-ratio visibility rule (fork — 2026-09-05). Answers "how much of the marched cloud actually
 // sits between the camera and a surface at surfaceKm" using only the depth companion's entry/mean.
 // entryKm < 0 means the march never found any cloud along this ray at all (cloud_render.comp.slang's
 // sentinel) -- 0 visibility, nothing to composite.
 //
-// Since e7298993f this is THE geometry occlusion for the cloud composite, not a safeguard (fork —
-// 2026-09-05, ghosting follow-up; the earlier text here still described it as a no-op left over from
-// Stage 4a's march-side clamp). The march no longer clamps to PrimaryLinearViewZ --
-// cloud_render.comp.slang marches the full reachable span at every pixel so the RT, and the temporal
-// history built on it, stays a pure function of view direction -- so the only thing standing between
-// a marched cloud and the surface in front of it is this ramp, applied per frame AFTER the EMA. A
-// surface at or beyond the transmittance-weighted mean depth gets the full composite, one nearer than
-// the entry gets none, and one in between gets a proportional blend: a soft, depth-uncertain answer,
-// which is the honest one for a volume whose only per-pixel depth summary is (entry, mean). Removing
-// or short-circuiting it would fog every near surface, Pip-Boy included.
-//
-// The feather is now the cloud's own extent (fork -- 2026-09-06, occlusion accuracy). entryKm used
-// to be the geometric slab-entry distance, which made `mean - entry` a distance from an arbitrary
-// geometric boundary rather than a property of the cloud, and the 50 m floor existed to keep that
-// meaningless quantity from collapsing. entryKm is now the first distance at which either layer
-// found real density (see marchCloudLayers), so `mean - entry` is the real span from where the
-// cloud starts to its transmittance-weighted centre: the ramp is extent-proportional by
-// construction, wide for a deep cumulus tower and tight for a thin wisp, with no tuned constant.
-// What remains is a pure divide guard, three orders of magnitude below the old floor so that it
-// binds only on genuinely degenerate spans instead of quietly widening every thin cloud's ramp to
-// 50 m. The eye-inside-the-deck case the old floor also covered is handled by the redefinition
-// itself: with the eye in cloud the first density hit is ~0 and the centroid is well inside the
-// deck, so the span is large, not small.
-// Beer-Lambert rather than a straight line (fork -- 2026-09-06, occlusion naturalness). The ramp
-// used to be linear in depth: saturate((surface - entry) / (mean - entry)). Cloud does not attenuate
-// linearly, it attenuates exponentially, and the difference is exactly the hard flat-looking edge
-// where terrain cuts through the deck -- a linear ramp crosses the whole 0..1 range at a constant
-// rate no matter how dense the cloud is, so the transition reads as a straight-edged wipe instead of
-// a fog that thickens with distance.
-//
-// The cloud is modelled as uniform extinction over the span it actually occupies. Everything needed
-// is already in the depth companion and the render target, so this costs no new storage, no march
-// clamp, and no geometry dependence in the smoothed signal:
-//
-//   span   ~ 2 * (mean - entry)      the weighted centroid sits mid-span for uniform density
-//   sigma  = -log(1 - alpha) / span  total optical depth spread over that span
-//   front  = 1 - exp(-sigma * (surface - entry))
-//   result = front / alpha           the fraction of the cloud lying in front of the surface
-//
-// Exact at both ends -- 0 when the surface is at the cloud's near edge, and 1 when it is at the far
-// edge, where sigma * span is the total optical depth by construction -- so it is continuous with
-// the early-outs and needs no feather constant at all. Dense cloud now saturates early (a wall a
-// short way into thick cloud is already heavily fogged, which is what standing in fog looks like)
-// while thin cloud stays nearly linear, which is what the old ramp approximated for every density.
+// The opaque surface already clamps the march. This depth estimate orders foreground layers
+// within the remaining cloud span; it does not reconstruct or accumulate screen pixels.
 float cloudDepthVisibility(float entryKm, float meanKm, float surfaceKm, float cloudAlpha)
 {
   if (entryKm < 0.0f)
@@ -966,11 +806,11 @@ void applyCloudComposite(
   }
 
   const float kmPerWorldUnit = 1.0f / max(args.worldUnitsPerKm, 1e-6f);
-  const float currentSurfaceKm = primaryMiss ? kCloudSkyDepthKm : (viewDistance * kmPerWorldUnit);
-  const CloudReconstruction reconstructed = sampleCloudRenderRT(pixelCoordinate, args, currentSurfaceKm);
-  const float entryKm = reconstructed.depthKm.x;
-  const float meanKm = reconstructed.depthKm.y;
-  vec4 cloud = vec4(reconstructed.value.rgb, 1.0f - reconstructed.value.a);
+  const vec2 depthKm = CompositeCloudDepth.Load(int3(pixelCoordinate, 0)).xy;
+  const float entryKm = depthKm.x;
+  const float meanKm = depthKm.y;
+  const vec4 cloudSample = CompositeCloudRender.Load(int3(pixelCoordinate, 0));
+  vec4 cloud = vec4(cloudSample.rgb, 1.0f - cloudSample.a);
   // PSR already carries clouds along the reflected ray.
   float opaqueVisibility = performedPSR ? 0.0f : 1.0f;
 
@@ -1037,18 +877,6 @@ void applyCloudComposite(
   // Premultiplied over -- identical operation to the removed evalSkyRadiance code, just relocated.
   // On a sky pixel opaqueVisibility is 1.0 and this is exactly that operation.
   //
-  // The DLSS-RR transparency-layer routing 794ffd716 added here (in-scatter into the NGX particle
-  // layer, transmittance left multiplicative, behind rtx.atmosphere.cloudCompositeRRTransparencyLayer)
-  // was removed 2026-09-06 (fork). Its premise -- RR reprojecting the cloud with the surface's
-  // motion vector as THE cause of the reported smear -- is contradicted by the in-game measurement
-  // that cloudHistoryWeight = 0 removes the smear entirely with that routing enabled: an RR-side
-  // mechanism would not depend on this pass's history weight. With the premise gone, the routing
-  // was a split composite (half the term in the denoised signal, half outside it) carried on no
-  // evidence of benefit; upstream's own screen-static fog (applyFog) goes into radianceOutput the
-  // same way this does. The shared reprojection helper now follows the jittered primary ray; the
-  // alpha-blend coverage weighting below is retained.
-  // If an RR-only artefact ever shows at cloudHistoryWeight = 0, that commit is the reference for
-  // restoring the toggle.
   // In-scatter follows the same foreground throughput as the sky it replaces.
   radianceOutput = radianceOutput * (1.0f - cloud.a * opaqueVisibility)
                  + cloud.rgb * opaqueVisibility * radianceThroughput;
@@ -1392,45 +1220,6 @@ void main(uint2 threadIndex : SV_DispatchThreadID, uint2 localIndex : SV_GroupTh
 
   vec4 particleLayerOutput;
   vec4 finalOutput = compositeResult(pixelCoordinate, pixelIsActive, isDirectActive, isIndirectActive, geometryFlags, primaryLinearViewZ, primaryMiss, particleLayerOutput);
-
-  // Upscaler passthrough probe (fork -- 2026-09-17, DEBUG). See composite_args.h. Placed here, after
-  // everything this pass composites and before FinalOutput, because FinalOutput IS m_compositeOutput
-  // -- the image handed to the upscaler as its unresolved colour. Anything the upscaler does to a
-  // pixel class happens to this pattern.
-  //
-  // Multiplicative rather than a fixed colour so it stays exposure-independent and reads on any
-  // scene brightness; 20:1 is far past what any filter could leave looking like squares.
-  if (cb.cloudDebugInjectMode > 0.5f)
-  {
-    const uint injectMode = uint(cb.cloudDebugInjectMode + 0.5f);
-    // 1-3 static, 4-6 the same three targets animated.
-    const bool animated = injectMode >= 4u;
-    const uint target = animated ? (injectMode - 3u) : injectMode;
-    const bool stampSky = (target == 1u) || (target == 3u);
-    const bool stampGeometry = (target == 2u) || (target == 3u);
-    if (primaryMiss ? stampSky : stampGeometry)
-    {
-      // The static variant alone cannot answer the question it was built for (fork -- 2026-09-17,
-      // second pass). A screen-static checkerboard reprojects exactly onto itself every frame, so a
-      // temporal filter PRESERVES it by construction -- that is not a bug in the filter, it is the
-      // whole point of one. Which means the static probe cannot separate "the upscaler does not
-      // process these pixels" from "it processes them temporally and this pattern is temporally
-      // stable". It is also, precisely, the property that made 5543992b4's frozen blue-noise
-      // survive: the first probe reproduced the bug instead of testing the mechanism.
-      //
-      // The animated variant inverts the checkerboard's PHASE each frame and changes nothing else,
-      // so the two differ only in time: identical spatial frequency, identical contrast, identical
-      // pixel count. Static survives + animated cleaned = the upscaler is temporally filtering these
-      // pixels, and the cloud problem reduces entirely to making march noise decorrelate frame to
-      // frame. Both survive = it is not filtering them and the cloud pass owns antialiasing.
-      //
-      // Judge from a SCREENSHOT, never the live view: an alternating pattern averages out in the eye
-      // at frame rate and looks grey whether or not anything filtered it.
-      const uint phase = animated ? cb.frameIdx : 0u;
-      const bool checker = ((pixelCoordinate.x + pixelCoordinate.y + phase) & 1u) != 0u;
-      finalOutput.rgb *= checker ? 3.0f : 0.15f;
-    }
-  }
 
   FinalOutput[pixelCoordinate] = accumulate(pixelCoordinate, finalOutput, cb.accumulationArgs, true, AccumulatedFinalOutput);
 

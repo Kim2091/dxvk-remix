@@ -110,15 +110,9 @@ SamplerState AtmosphereAerialPerspectiveSampler;
 // applyCloudComposite in composite.comp.slang. CompositeCloudRender / CompositeCloudDepth are the
 // SAME m_cloudRenderRT / m_cloudDepthRT resources RtxAtmosphere writes each frame in
 // dispatchCloudScreenPass (called from injectRTX right after dispatchPathTracing) — bound at new
-// slots here because composite has its own descriptor set. CompositeCloudRender is bilinearly
-// sampled (matches the legacy evalSkyRadiance upsample exactly at cloudRenderResolutionScale = 1);
-// CompositeCloudDepth is read with Load (point-sampled) only — never through this sampler — for the
-// same reason PrimaryLinearViewZ is point-sampled everywhere else: averaging two surfaces' depths
-// across a silhouette produces a value that matches neither.
+// slots here because composite has its own descriptor set. Both use exact per-pixel loads.
 layout(binding = COMPOSITE_ATMOSPHERE_CLOUD_RENDER_INPUT)
 Texture2D<float4> CompositeCloudRender;
-layout(binding = COMPOSITE_ATMOSPHERE_CLOUD_RENDER_SAMPLER)
-SamplerState CompositeCloudRenderSampler;
 layout(binding = COMPOSITE_ATMOSPHERE_CLOUD_DEPTH_INPUT)
 Texture2D<float4> CompositeCloudDepth;
 

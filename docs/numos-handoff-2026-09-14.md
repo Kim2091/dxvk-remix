@@ -1,5 +1,9 @@
 # Numos handoff - 2026-09-14
 
+> Screen scaling and cloud temporal reuse were removed on 2026-09-17. See
+> [the native cleanup and LOD evaluation](numos-native-cleanup-2026-09-17.md) for current behavior;
+> the descriptions of those paths below are historical.
+
 ## 2026-09-17: superseded for performance work
 
 Read `docs/numos-handoff-2026-09-17.md` first; it carries the current deployed state, the measured arc,

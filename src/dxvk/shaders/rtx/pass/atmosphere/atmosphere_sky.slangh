@@ -682,19 +682,7 @@ vec3 evalMoonDisk(vec3 viewDir, uint moonIdx, AtmosphereArgs args, out float dis
 
 // Main evaluation function - computes atmosphere directly instead of using sky view LUT.
 //
-// Cloud-composite relocation (fork — 2026-09-05, world-space cloud migration Stage 4b). This
-// function used to read the AtmosphereCloudRender screen RT and run a temporal EMA against a
-// screen-space cloud history directly in the PRIMARY-ray branch below, before compositing the
-// result into `radiance`. That composite (and its EMA) have moved to composite.comp.slang
-// (applyCloudComposite). Why: this function is called from geometry_resolver.slangh's primary-miss
-// handler, which runs INSIDE dispatchPathTracing — but Stage 4a moved the cloud screen pass
-// (RtxAtmosphere::dispatchCloudScreenPass) to run AFTER dispatchPathTracing, so it can clamp its
-// march against this frame's resolved G-buffer depth (PrimaryLinearViewZ). By the time THIS
-// function ran, the RT it used to read here still held LAST frame's march from last frame's camera
-// basis — Stage 4a's documented one-frame-lag regression. Composite runs after both
-// dispatchPathTracing and dispatchCloudScreenPass, so it is the earliest point in the frame where
-// the cloud RT for THIS frame actually exists.
-//
+// Primary clouds are composited after the surface-clamped screen march has run.
 // The PRIMARY-ray branch below is consequently cloudless. `isPrimaryRay` still matters: it keeps a
 // primary ray from falling through to the secondary dome LUT below (that LUT is keyed for
 // indirect/PSR/reflection directions, not the primary view — sampling it for a primary ray would
@@ -910,16 +898,7 @@ vec3 evalSkyRadiance(
     radiance += (args.cloudSkyBleedStrength * zenithFade) * bleedCloud.rgb;
   }
 
-  // Cloud composite + temporal smoothing RELOCATED (fork — 2026-09-05, world-space cloud migration
-  // Stage 4b). This used to blend cloudLayer against a screen-space history (AtmosphereCloudHistory
-  // Prev/Curr + the frame-id disocclusion guard) before compositing into `radiance` — see this
-  // function's header comment for why that whole mechanism moved to composite.comp.slang
-  // (applyCloudComposite): it only ever ran for primary rays (enableCloudTemporalSmoothing was true
-  // at exactly one call site), and primary rays no longer have a cloud source here at all. What
-  // remains below is just the plain premultiplied-over for cloudLayer, which for a primary ray is a
-  // no-op (cloudLayer == vec4(0) from the branch above) and for a secondary/PSR/indirect ray is the
-  // exact composite this function always did for that path (unaffected by this migration — that LUT
-  // has no history, ordering problem, or EMA to relocate).
+  // Secondary-ray clouds use premultiplied-over; primary cloudLayer is empty here.
   radiance = radiance * (1.0f - cloudLayer.a) + cloudLayer.rgb;
 
   // Star composite (fork). Stars were held out of `radiance` above so they

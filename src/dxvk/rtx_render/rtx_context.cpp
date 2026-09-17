@@ -1710,9 +1710,9 @@ namespace dxvk {
                            : frame.cloudMode == 6 ? "DensityOnlyTightBounds" : "Normal";
           Logger::info(str::format("[Cloud profile] frame=", frame.frameId, " mode=", mode,
             " samples=", frame.cloudSamples, " maxSamples=", frame.cloudSamplesMax,
-            " interleave=", frame.cloudScreenPeriod, "/", frame.cloudSunGridPeriod, "/", frame.cloudDomePeriod,
+            " bakeInterleave=", frame.cloudSunGridPeriod, "/", frame.cloudDomePeriod,
             " extent=", frame.cloudRenderWidth, "x", frame.cloudRenderHeight,
-            " detailLod=", frame.cloudDetailLod, " sampleBoost=", frame.cloudSampleBoost,
+            " detailLod=", frame.cloudDetailLod, " detailLodBias=", frame.cloudDetailLodBias,
             " ms=", milliseconds));
         }
         if (gpuStages()) {
@@ -1721,13 +1721,11 @@ namespace dxvk {
         }
       }
       if (gpuStages()) {
-        // The cloud state the timings above were taken under (fork -- 2026-09-17): screen / sun
-        // grid / dome interleave periods as resolved this frame, the cloud RT extent, and the
-        // screen pass's detail-LOD and sample-boost state.
-        Logger::info(str::format("[GPU stages] frame=", frame.frameId, " stage=CloudConfig interleave=",
-          frame.cloudScreenPeriod, "/", frame.cloudSunGridPeriod, "/", frame.cloudDomePeriod,
+        // Record the resolved bake periods, native extent and live detail-filter settings.
+        Logger::info(str::format("[GPU stages] frame=", frame.frameId, " stage=CloudConfig bakeInterleave=",
+          frame.cloudSunGridPeriod, "/", frame.cloudDomePeriod,
           " extent=", frame.cloudRenderWidth, "x", frame.cloudRenderHeight,
-          " detailLod=", frame.cloudDetailLod, " sampleBoost=", frame.cloudSampleBoost));
+          " detailLod=", frame.cloudDetailLod, " detailLodBias=", frame.cloudDetailLodBias));
         Logger::info(str::format("[GPU stages] frame=", frame.frameId, " stage=MeasuredSequence ms=",
           double(data[frame.count - 1].timestamp.time - data[0].timestamp.time) * scale));
       }
@@ -1767,13 +1765,12 @@ namespace dxvk {
     frame.labels[frame.count++] = label;
     if (std::strcmp(label, "CloudScreen") == 0) {
       const auto& state = m_common->metaAtmosphere().getCloudProfileState();
-      frame.cloudScreenPeriod  = state.screenPeriod;
       frame.cloudSunGridPeriod = state.sunGridPeriod;
       frame.cloudDomePeriod    = state.domePeriod;
       frame.cloudRenderWidth   = state.renderWidth;
       frame.cloudRenderHeight  = state.renderHeight;
       frame.cloudDetailLod     = state.detailLod;
-      frame.cloudSampleBoost   = state.sampleBoost;
+      frame.cloudDetailLodBias = state.detailLodBias;
     }
     writeTimestamp(query);
   }
