@@ -272,6 +272,61 @@ void sharcOnContinuationSampled(inout PathState pathState, bool opaqueMaterial, 
 // RNG stream for re-sampled first bounces; the per-bounce closest-hit offsets stop well below it.
 static const uint kSharcSkyRetryRngOffset = 240;
 
+// Kensler's cycle-walking permutation (Correlated Multi-Jittered Sampling, 2013): a bijection on
+// [0, count) for any count, seeded by seed. One iteration when count is a power of two, about 1.8
+// on average otherwise, and the guard bounds a case that has never needed more than ten.
+uint sharcPermute(uint index, uint count, uint seed)
+{
+  uint w = count - 1;
+  w |= w >> 1; w |= w >> 2; w |= w >> 4; w |= w >> 8; w |= w >> 16;
+  [loop]
+  for (uint guard = 0; guard < 16u; ++guard)
+  {
+    index ^= seed;              index *= 0xe170893du;
+    index ^= seed >> 16;
+    index ^= (index & w) >> 4;
+    index ^= seed >> 8;         index *= 0x0929eb3fu;
+    index ^= seed >> 23;
+    index ^= (index & w) >> 1;  index *= 1u | (seed >> 27);
+                                index *= 0x6935fa69u;
+    index ^= (index & w) >> 11; index *= 0x74dcb303u;
+    index ^= (index & w) >> 2;  index *= 0x9e501cc3u;
+    index ^= (index & w) >> 2;  index *= 0xc860a3dfu;
+    index &= w;
+    index ^= index >> 5;
+    if (index < count)
+    {
+      break;
+    }
+  }
+  // Still in range if the guard ever expires, so the worst case is one imperfect draw.
+  return (index + seed) % count;
+}
+
+// Which pixel inside its tile this update invocation samples this frame.
+//
+// The update dispatch is one thread per tile, so each thread has to pick a source pixel, and over
+// time the tile should see all of them. The previous scheme added frameIdx * 26699 into the same
+// seed that encoded the tile, which made every tile on screen advance by the same step: the whole
+// sampling lattice translated rigidly instead of resampling. Worse by accident, 26699 + 1973 =
+// 28672 = 2^12 * 7, so 26699 == -1973 (mod tileSize^2) for every power-of-two tile size -- 8 and
+// 16 included -- and one frame of time came to exactly one tile of space. The pattern visibly
+// crawled sideways, and a rigid lattice sweeping across regular architecture is the shape of
+// aliasing: a wall of evenly spaced panels can stay in or out of phase with it for many frames.
+//
+// Permuting instead keeps the one property the old scheme had -- every tile visits all
+// tileSize^2 positions exactly once per tileSize^2 frames, so coverage is still stratified rather
+// than random-with-replacement -- while giving each tile its own order, which is what removes the
+// correlation between neighbours and the drift over time.
+uvec2 sharcTileOffset(uvec2 tile, uint tileSize)
+{
+  uint seed = (tile.x * 73856093u) ^ (tile.y * 19349663u);
+  seed ^= seed >> 15; seed *= 0x2c1b3c6du; seed ^= seed >> 12;
+  const uint positions = tileSize * tileSize;
+  const uint slot = sharcPermute(cb.frameIdx % positions, positions, seed);
+  return uvec2(slot % tileSize, slot / tileSize);
+}
+
 // The primary vertex's eligibility, from the G-buffer words the direct pass decodes, through the
 // one predicate secondary hits use. Only the fields sharcRejectReason reads are filled in.
 uint sharcPrimaryRejectReason(uvec2 pixel, bool inMedium, float perceptualRoughness)

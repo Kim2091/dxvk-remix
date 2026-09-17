@@ -84,11 +84,7 @@ bool initPixelCoordinateOnLaunch(inout uvec2 gbufferPixelCoordinate, out bool is
   {
     return false;
   }
-  const uint tileSeed = gbufferPixelCoordinate.x * 1973u
-                      + gbufferPixelCoordinate.y * 9277u
-                      + cb.frameIdx * 26699u;
-  const uvec2 tileOffset = uvec2(tileSeed % tileSize,
-                                 (tileSeed / tileSize) % tileSize);
+  const uvec2 tileOffset = sharcTileOffset(gbufferPixelCoordinate, tileSize);
   gbufferPixelCoordinate = min(gbufferPixelCoordinate * tileSize + tileOffset,
                                cb.camera.resolution - 1u);
   return true;
