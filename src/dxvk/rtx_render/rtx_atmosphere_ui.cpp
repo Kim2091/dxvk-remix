@@ -1113,6 +1113,14 @@ void RtxAtmosphere::showCloudSettings(const WeatherSnapshot* weatherSnapshot) {
       "freezes the jitter below native Cloud Render Scale, which trades the shimmer for fixed-pattern "
       "grain. Higher settles cleaner and lags further behind fast-moving cloud. Resets on camera "
       "cuts, lightning, and any frame the cloud inputs change. Applies live.");
+    RemixGui::DragFloat("Accumulation Depth Tolerance", &RtxAtmosphere::cloudHistoryDepthToleranceObject(),
+      0.005f, 0.0f, 1.0f, "%.3f", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "How far the surface behind a cloud pixel may have moved before its accumulated history is "
+      "thrown away, as a fraction of the larger distance. This is what stops cloud smearing across "
+      "the edge of anything that moves in front of it. Lower rejects more: crisper behind moving "
+      "objects, but grainier at their edges because those pixels lose their history. Raise it if "
+      "cloud looks noisy along geometry silhouettes. Applies live.");
     const char* kCloudInterleaveModes[] = { "Every frame", "Half per frame", "Quarter per frame" };
     RemixGui::Combo("Cloud Temporal Interleave", &RtxAtmosphere::cloudScreenInterleaveModeObject(),
       kCloudInterleaveModes, IM_ARRAYSIZE(kCloudInterleaveModes));
@@ -1203,6 +1211,20 @@ void RtxAtmosphere::showCloudSettings(const WeatherSnapshot* weatherSnapshot) {
       "Writes cloud GPU times and the mode/sample settings to rtx-remix/logs/remix-dxvk.log "
       "every 120 rendered frames. Keep each mode active for at least 10 seconds. "
       "Return to Normal and turn logging off after testing.");
+    const char* kCloudInjectPatterns[] = {
+      "Off", "Sky and cloud pixels", "Geometry pixels", "Both"
+    };
+    RemixGui::Combo("Upscaler Passthrough Probe", &RtxAtmosphere::cloudDebugInjectPatternObject(),
+      kCloudInjectPatterns, IM_ARRAYSIZE(kCloudInjectPatterns));
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Diagnostic only, and deliberately ugly. Stamps a 1-pixel checkerboard into the image at the "
+      "exact point it is handed to the upscaler, so you can see what the upscaler does to a given "
+      "kind of pixel instead of having to reason about it. Nothing survives a 1-pixel checkerboard "
+      "intact: crisp squares mean those pixels were passed straight through, flat grey means they "
+      "were filtered. "
+      "Use 'Both' and look at sky and terrain in the same shot. If the sky keeps its squares while "
+      "the ground goes grey, the upscaler is not touching cloud pixels and no amount of tuning here "
+      "will make it antialias them. Turn this off when you are done. Applies live.");
     RemixGui::DragFloat("Lighting LOD", &RtxAtmosphere::cloudLightingLodThresholdObject(),
       0.002f, 0.0f, 0.25f, "%.3f", sliderFlags);
     RemixGui::SetTooltipToLastWidgetOnHover(
