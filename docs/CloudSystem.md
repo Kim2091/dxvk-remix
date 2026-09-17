@@ -308,7 +308,15 @@ future-work item.
 - **Cloud RT resolution.** The cloud RT is written at the downscale
   (DLSS-input) extent, not full resolution. DLSS / TAA take it from
   there. Disabling the upscaler exposes the lower-res cloud silhouette
-  at native pixel granularity.
+  at native pixel granularity. Below native scale
+  (`cloudRenderResolutionScale < 1`) the pass marches the unjittered
+  ray with a frozen per-texel march offset, halves its sample spacing
+  (`cloudReducedScaleStepScale`), and band-limits the detail noise to
+  its step by sampling the detail volume's mip chain
+  (`cloudDetailLodMode`, 2026-09-17) -- without that, content the step
+  cannot integrate aliases into a screen-locked block pattern that
+  crawls over moving cloud. The composite reconstructs the reduced RT
+  against per-texel surface depth, never blending across a silhouette.
 - **DLSS / TAA smear cumulus-on-terrain shadows.** Under DLSS / TAA,
   cumulus-on-terrain shadow contrast collapses substantially -- the
   upscalers reproject using terrain motion vectors that say "stationary,"

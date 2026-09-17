@@ -1123,6 +1123,27 @@ void RtxAtmosphere::showCloudSettings(const WeatherSnapshot* weatherSnapshot) {
     RemixGui::SetTooltipToLastWidgetOnHover(
       "Re-marches half or a quarter of the reflection dome's rows each frame. A full bake still "
       "runs on camera cuts and whenever the cloud inputs cross a re-bake step. Applies live.");
+    const char* kCloudDetailLodModes[] = { "Off", "Reduced scale only", "Always" };
+    RemixGui::Combo("Cloud Detail LOD", &RtxAtmosphere::cloudDetailLodModeObject(),
+      kCloudDetailLodModes, IM_ARRAYSIZE(kCloudDetailLodModes));
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Samples a coarser copy of the cloud detail noise wherever the ray-march step is too long "
+      "to integrate its finest structure, so that structure is filtered out instead of aliasing. "
+      "Removes the block crawl and flicker of a reduced Cloud Render Scale; costs fine detail the "
+      "step could not resolve anyway. 'Always' applies it at native scale and to reflections too. "
+      "Applies live.");
+    RemixGui::DragFloat("Detail LOD Bias", &RtxAtmosphere::cloudDetailLodBiasObject(),
+      0.05f, -3.0f, 3.0f, "%.2f", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Mip levels added to the detail LOD. Negative keeps more fine detail (and more crawl), "
+      "positive softens further. Applies live.");
+    RemixGui::DragFloat("Reduced-Scale Sample Spacing", &RtxAtmosphere::cloudReducedScaleStepScaleObject(),
+      0.01f, 0.25f, 1.0f, "%.2f x", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Multiplier on Cloud Sample Spacing (and the adaptive step floor) while Cloud Render Scale "
+      "is below 1; Max Cloud Samples grows to match. 0.5 doubles the samples per ray, which a "
+      "quarter-scale target's 16x fewer texels pay for many times over. 1 = native spacing. "
+      "Applies live.");
     RemixGui::DragFloat("Cloud Render Scale", &RtxAtmosphere::cloudRenderResolutionScaleObject(),
       0.05f, 0.25f, 1.0f, "%.2f", sliderFlags);
     RemixGui::SetTooltipToLastWidgetOnHover(

@@ -126,12 +126,29 @@ float valueErosion(float value, float erosion) {
 // pass true — the shared sampler is what makes rendered clouds and the shadow grids
 // iso-consistent by construction; see sampleCloudDensityNubis3Coarse below, which
 // is wired only into the three live-tap sites.
+// Mip level that band-limits a detail tap to what a march step of lodStepKm can integrate (fork --
+// 2026-09-17, detail LOD). A tap at freqPerKm volume repeats per km spans freqPerKm * 128 texels per
+// km; a step covering n texels resolves wavelengths of about 2n texels, i.e. mip log2(2n). Every
+// channel is mean 0.5 by the bake normalisation, so a coarser mip fades a band toward neutral
+// rather than shifting coverage. lodStepKm <= 0 keeps full detail (the bakes and the shadow taps).
+float cloudDetailMip(float freqPerKm, float lodStepKm, float lodBias) {
+  if (lodStepKm <= 0.0f) {
+    return 0.0f;
+  }
+  const float kDetailVolumeTexels = 128.0f;
+  const float texelsPerStep = lodStepKm * freqPerKm * kDetailVolumeTexels;
+  return clamp(log2(max(2.0f * texelsPerStep, 1.0f)) + lodBias, 0.0f, 7.0f);
+}
+
+// detailLodStepKm: the march step this sample stands for, or 0 for full-frequency detail; see
+// cloudDetailMip. The view march passes its step when args.cloudDetailLodEnable is set.
 float sampleCloudDensityNubis3(vec3 worldPosKm,
                                float heightFraction,
                                float typeLocal,
                                float coverageLocal,
                                float densityScale,
                                float cameraDistKm,
+                               float detailLodStepKm,
                                AtmosphereArgs args,
                                Texture3D<float> nvdfSdf,
                                Texture3D<float4> detailNoise,
@@ -357,10 +374,12 @@ float sampleCloudDensityNubis3(vec3 worldPosKm,
   const float midFreq = 1.0f / (6.0f * max(args.nubis3ShapeVarietyWavelengthKm, 0.05f));
   // NV-DXVK start: Break the outline noise's repeat as well as the body tile.
   vec4 noiseMidA = detailNoise.SampleLevel(cloudSampler,
-      frac(boilPosMid * midFreq + vec3(0.71f, 0.29f, 0.53f)), 0);
+      frac(boilPosMid * midFreq + vec3(0.71f, 0.29f, 0.53f)),
+      cloudDetailMip(midFreq, detailLodStepKm, args.cloudDetailLodBias));
   vec4 noiseMidB = detailNoise.SampleLevel(cloudSampler,
       frac(vec3(boilPosMid.z, boilPosMid.y, -boilPosMid.x) * (midFreq * 0.7548777f)
-           + vec3(0.17f, 0.83f, 0.41f)), 0);
+           + vec3(0.17f, 0.83f, 0.41f)),
+      cloudDetailMip(midFreq * 0.7548777f, detailLodStepKm, args.cloudDetailLodBias));
   vec4 noiseMid = saturate(0.5f + (lerp(noiseMidA, noiseMidB, 0.4f) - 0.5f) * 1.3867505f);
   // NV-DXVK end
   float wobbleMid = lerp(noiseMid.r - 0.5f,
@@ -389,7 +408,8 @@ float sampleCloudDensityNubis3(vec3 worldPosKm,
   }
 
   // Two-scale de-tile base taps (see the step-6 header note above).
-  vec4 noiseA = detailNoise.SampleLevel(cloudSampler, frac(boilPos * detailFreq), 0);
+  vec4 noiseA = detailNoise.SampleLevel(cloudSampler, frac(boilPos * detailFreq),
+      cloudDetailMip(detailFreq, detailLodStepKm, args.cloudDetailLodBias));
   vec4 noise;
   if (coarseOd) {
     // De-tile blend dropped for optical-depth taps: noiseA is already mean-0.5 by
@@ -398,7 +418,8 @@ float sampleCloudDensityNubis3(vec3 worldPosKm,
     noise = noiseA;
   } else {
     vec4 noiseB = detailNoise.SampleLevel(cloudSampler,
-        frac(boilPos * (detailFreq * 0.531f) + vec3(0.37f, 0.61f, 0.13f)), 0);
+        frac(boilPos * (detailFreq * 0.531f) + vec3(0.37f, 0.61f, 0.13f)),
+        cloudDetailMip(detailFreq * 0.531f, detailLodStepKm, args.cloudDetailLodBias));
     const vec4 kChannelMean = vec4(0.5f, 0.5f, 0.5f, 0.5f);
     noise = saturate(kChannelMean + (lerp(noiseA, noiseB, 0.4f) - kChannelMean) * 1.35f);
   }
@@ -555,7 +576,8 @@ float sampleCloudDensityNubis3(vec3 worldPosKm,
   if (args.nubis3FineDetailStrength > 0.0f && cameraDistKm < 9.0f) {
     float fineFade = saturate(1.0f - (cameraDistKm - 3.0f) / 6.0f);
     vec4 noiseFine = detailNoise.SampleLevel(cloudSampler,
-        frac(boilPosFine * (detailFreq * 2.11f) + vec3(0.17f, 0.83f, 0.47f)), 0);
+        frac(boilPosFine * (detailFreq * 2.11f) + vec3(0.17f, 0.83f, 0.47f)),
+        cloudDetailMip(detailFreq * 2.11f, detailLodStepKm, args.cloudDetailLodBias));
     float fineWispy     = lerp(noiseFine.r, noiseFine.g, 0.5f);
     float fineBillowy   = lerp(noiseFine.b, noiseFine.a, 0.5f) * 0.3f;
     float fineComposite = lerp(fineWispy, fineBillowy, typeShaped);
@@ -689,7 +711,8 @@ float sampleCloudDensityNubis3(vec3 worldPosKm,
   float sdfUnused;
   float sdfStepUnused;
   return sampleCloudDensityNubis3(worldPosKm, heightFraction, typeLocal, coverageLocal,
-                                  densityScale, 1e6f, args, nvdfSdf, detailNoise, cloudSampler,
+                                  densityScale, 1e6f, /*detailLodStepKm=*/0.0f, args,
+                                  nvdfSdf, detailNoise, cloudSampler,
                                   /*coarseOd=*/false,
                                   profileUnused, detailUnused, sdfUnused, sdfStepUnused);
 }
@@ -712,7 +735,8 @@ float sampleCloudDensityNubis3Coarse(vec3 worldPosKm,
   float sdfUnused;
   float sdfStepUnused;
   return sampleCloudDensityNubis3(worldPosKm, heightFraction, typeLocal, coverageLocal,
-                                  densityScale, 1e6f, args, nvdfSdf, detailNoise, cloudSampler,
+                                  densityScale, 1e6f, /*detailLodStepKm=*/0.0f, args,
+                                  nvdfSdf, detailNoise, cloudSampler,
                                   /*coarseOd=*/true,
                                   profileUnused, detailUnused, sdfUnused, sdfStepUnused);
 }

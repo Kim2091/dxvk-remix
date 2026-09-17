@@ -63,6 +63,7 @@
 #include <rtx_shaders/cloud_nvdf_jfa.h>
 #include <rtx_shaders/cloud_nvdf_resolve.h>
 #include <rtx_shaders/cloud_detail_noise_baker.h>
+#include <rtx_shaders/cloud_detail_noise_mip.h>
 #include "rtx/pass/atmosphere/cloud_nvdf.h"
 #include "../../util/util_once.h"  // ONCE() — one-shot warn when the scene TLAS is unavailable
 
@@ -347,6 +348,17 @@ namespace dxvk {
       END_PARAMETER()
     };
     PREWARM_SHADER_PIPELINE(CloudDetailNoiseBakerShader);
+
+    class CloudDetailNoiseMipShader : public ManagedShader {
+      SHADER_SOURCE(CloudDetailNoiseMipShader, VK_SHADER_STAGE_COMPUTE_BIT, cloud_detail_noise_mip)
+
+      BEGIN_PARAMETER()
+        TEXTURE3D(0)
+        SAMPLER(1)
+        RW_TEXTURE3D(2)
+      END_PARAMETER()
+    };
+    PREWARM_SHADER_PIPELINE(CloudDetailNoiseMipShader);
   }
 
 RtxAtmosphere::RtxAtmosphere(DxvkDevice* device)
@@ -527,6 +539,11 @@ namespace {
     args.cloudSunGridInterleave        = 0u;
     args.cloudDomeInterleave           = 0u;
     args.cloudReprojectDepthTolerance  = 0.0f;
+    // View-march-only detail LOD and step scale (fork -- 2026-09-17); the bakes pass lod 0 themselves.
+    args.cloudDetailLodBias            = 0.0f;
+    args.cloudDetailLodEnable          = 0u;
+    args.cloudScreenStepScale          = 0.0f;
+    args.padCloudLod0                  = 0.0f;
     // BUG FIX (2026-07-16): starRotation was not zeroed anywhere, re-baking the entire LUT cascade every
     // frame at night. Zeroed here in the base so every derived key inherits it.
     args.starBrightness              = 0.0f;
@@ -1306,6 +1323,12 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
     args.cloudSunGridInterleave = packCloudInterleave(m_cloudSunGridPeriodThisFrame, m_cloudRenderFrameIdx);
     args.cloudDomeInterleave    = packCloudInterleave(m_cloudDomePeriodThisFrame, m_cloudRenderFrameIdx);
     args.cloudReprojectDepthTolerance = std::max(RtxAtmosphere::cloudHistoryDepthTolerance(), 0.0f);
+    // Detail LOD defaults (fork -- 2026-09-17): "always" applies to every consumer; the screen pass
+    // resolves mode 1 against its own render scale in dispatchCloudRender.
+    args.cloudDetailLodBias   = RtxAtmosphere::cloudDetailLodBias();
+    args.cloudDetailLodEnable = RtxAtmosphere::cloudDetailLodMode() >= 2 ? 1u : 0u;
+    args.cloudScreenStepScale = 1.0f;
+    args.padCloudLod0         = 0.0f;
   }
 
   // Voxel-grid cloud-on-terrain shadow plumbing (fork — 2026-05-12, C6).
@@ -1702,8 +1725,23 @@ void RtxAtmosphere::createLutResources(Rc<DxvkContext> ctx) {
     0, // imageCreateFlags
     VK_IMAGE_USAGE_STORAGE_BIT, // extraUsageFlags
     VkClearColorValue{}, // clearValue
-    1 // mipLevels
+    kCloudDetailNoise3DMipLevels // mipLevels (fork -- 2026-09-17, detail LOD)
   );
+  {
+    DxvkImageViewCreateInfo viewInfo;
+    viewInfo.type      = VK_IMAGE_VIEW_TYPE_3D;
+    viewInfo.usage     = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+    viewInfo.aspect    = VK_IMAGE_ASPECT_COLOR_BIT;
+    viewInfo.minLayer  = 0;
+    viewInfo.numLayers = 1;
+    viewInfo.format    = VK_FORMAT_R8G8B8A8_UNORM;
+    viewInfo.numLevels = 1;
+    m_cloudDetailNoise3DMipViews.clear();
+    for (uint32_t level = 0; level < kCloudDetailNoise3DMipLevels; ++level) {
+      viewInfo.minLevel = level;
+      m_cloudDetailNoise3DMipViews.push_back(ctx->getDevice()->createImageView(m_cloudDetailNoise3D.image, viewInfo));
+    }
+  }
 
   // Fork (2026-06-10, perf): secondary-ray cloud LUT (256x256 RGBA16F, 512 KB — was 256x128 /
   // 256 KB before Stage 2's full-sphere mapping below doubled the height). Written every frame by
@@ -2797,7 +2835,8 @@ void RtxAtmosphere::dispatchCloudDetailNoiseBake(Rc<DxvkContext> ctx) {
   ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_constantsBuffer);
 
   ctx->bindResourceBuffer(0, DxvkBufferSlice(m_constantsBuffer, 0, m_constantsBuffer->info().size));
-  ctx->bindResourceView(1, m_cloudDetailNoise3D.view, nullptr);
+  // Mip 0 only: a storage descriptor takes a single-level view.
+  ctx->bindResourceView(1, m_cloudDetailNoise3DMipViews[0], nullptr);
 
   ctx->getCommandList()->trackResource<DxvkAccess::Write>(m_cloudDetailNoise3D.image);
 
@@ -2806,6 +2845,36 @@ void RtxAtmosphere::dispatchCloudDetailNoiseBake(Rc<DxvkContext> ctx) {
   // Shader declares [numthreads(8, 8, 8)].
   const uint32_t groups = (kCloudDetailNoise3DSize + 7u) / 8u;
   ctx->dispatch(groups, groups, groups);
+
+  dispatchCloudDetailNoiseMips(ctx);
+}
+
+void RtxAtmosphere::dispatchCloudDetailNoiseMips(Rc<DxvkContext> ctx) {
+  ScopedGpuProfileZone(ctx, "Atmosphere Cloud Detail Noise Mips");
+
+  // A linear tap at each destination texel's centre is the 2x2x2 box over the source level, and
+  // REPEAT wraps the periodic volume's edges into it.
+  DxvkSamplerCreateInfo samplerInfo = {};
+  samplerInfo.magFilter    = VK_FILTER_LINEAR;
+  samplerInfo.minFilter    = VK_FILTER_LINEAR;
+  samplerInfo.mipmapMode   = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+  samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+  samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+  samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+  Rc<DxvkSampler> boxSampler = m_device->createSampler(samplerInfo);
+
+  ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, CloudDetailNoiseMipShader::getShader());
+  ctx->getCommandList()->trackResource<DxvkAccess::Write>(m_cloudDetailNoise3D.image);
+  for (uint32_t level = 1; level < m_cloudDetailNoise3DMipViews.size(); ++level) {
+    nvdfBarrier(ctx);
+    ctx->bindResourceView(0, m_cloudDetailNoise3DMipViews[level - 1], nullptr);
+    ctx->bindResourceSampler(1, boxSampler);
+    ctx->bindResourceView(2, m_cloudDetailNoise3DMipViews[level], nullptr);
+    // Shader declares [numthreads(4, 4, 4)].
+    const uint32_t dim = std::max(kCloudDetailNoise3DSize >> level, 1u);
+    const uint32_t groups = (dim + 3u) / 4u;
+    ctx->dispatch(groups, groups, groups);
+  }
 }
 
 void RtxAtmosphere::dispatchCloudNvdfOccupancy(Rc<DxvkContext> ctx) {
@@ -3352,16 +3421,34 @@ void RtxAtmosphere::dispatchCloudRender(Rc<DxvkContext> ctx, const Resources::Ra
 
   AtmosphereArgs args = getAtmosphereArgs();
   traceCloudPlacement(args);
+  // Reduced-scale policy (fork -- 2026-09-17): detail LOD by mode, and finer steps paid for by the
+  // smaller texel count. Patched on this dispatch's copy only; the dome and the bakes keep theirs.
+  const bool reducedScale = m_cloudRenderExtent.width  < m_cloudRenderFullExtent.width
+                         || m_cloudRenderExtent.height < m_cloudRenderFullExtent.height;
+  const int lodMode = RtxAtmosphere::cloudDetailLodMode();
+  args.cloudDetailLodEnable = (lodMode >= 2 || (lodMode == 1 && reducedScale)) ? 1u : 0u;
+  args.cloudScreenStepScale = reducedScale
+    ? std::min(std::max(RtxAtmosphere::cloudReducedScaleStepScale(), 0.25f), 1.0f) : 1.0f;
+  m_cloudProfileState.screenPeriod  = m_cloudScreenPeriodThisFrame;
+  m_cloudProfileState.sunGridPeriod = m_cloudSunGridPeriodThisFrame;
+  m_cloudProfileState.domePeriod    = m_cloudDomePeriodThisFrame;
+  m_cloudProfileState.renderWidth   = m_cloudRenderExtent.width;
+  m_cloudProfileState.renderHeight  = m_cloudRenderExtent.height;
+  m_cloudProfileState.detailLod     = args.cloudDetailLodEnable;
+  m_cloudProfileState.stepScale     = args.cloudScreenStepScale;
   ctx->updateBuffer(m_constantsBuffer, 0, sizeof(AtmosphereArgs), &args);
   ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_constantsBuffer);
 
   // Linear/REPEAT sampler for the Nubis3 volume + voxel grid taps. REPEAT
   // matches the frac()-tile-wrap convention used everywhere else in the
-  // cloud math (cloudVoxelWorldToUVW and the Nubis3 sampler).
+  // cloud math (cloudVoxelWorldToUVW and the Nubis3 sampler). Mip-capable
+  // (fork -- 2026-09-17): the detail-LOD taps ask for explicit levels of the
+  // detail volume; the single-level grids and SDF are unaffected.
   DxvkSamplerCreateInfo samplerInfo = {};
   samplerInfo.magFilter    = VK_FILTER_LINEAR;
   samplerInfo.minFilter    = VK_FILTER_LINEAR;
-  samplerInfo.mipmapMode   = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+  samplerInfo.mipmapMode   = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+  samplerInfo.mipmapLodMax = VK_LOD_CLAMP_NONE;
   samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
   samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
   samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
@@ -3491,7 +3578,8 @@ void RtxAtmosphere::dispatchCloudSecondaryLut(Rc<DxvkContext> ctx) {
   DxvkSamplerCreateInfo samplerInfo = {};
   samplerInfo.magFilter    = VK_FILTER_LINEAR;
   samplerInfo.minFilter    = VK_FILTER_LINEAR;
-  samplerInfo.mipmapMode   = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+  samplerInfo.mipmapMode   = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+  samplerInfo.mipmapLodMax = VK_LOD_CLAMP_NONE;
   samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
   samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
   samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;

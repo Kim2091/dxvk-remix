@@ -118,6 +118,20 @@ public:
   // supplies clouds to secondary rays (indirect/PSR/reflection).
   const Resources::Resource& getCloudSecondaryLut() const { return m_cloudSecondaryLut; }
 
+  // What the cloud dispatches actually did this frame, for the timing log (fork -- 2026-09-17):
+  // the resolved interleave periods (1 on a forced full update), the RT extent, and the screen
+  // pass's detail-LOD / step-scale state. Filled by dispatchCloudRender.
+  struct CloudProfileState {
+    uint32_t screenPeriod  = 1u;
+    uint32_t sunGridPeriod = 1u;
+    uint32_t domePeriod    = 1u;
+    uint32_t renderWidth   = 0u;
+    uint32_t renderHeight  = 0u;
+    uint32_t detailLod     = 0u;
+    float    stepScale     = 1.0f;
+  };
+  const CloudProfileState& getCloudProfileState() const { return m_cloudProfileState; }
+
   // Recreates the cloud render RT on resize; cheap when extent is unchanged.
   void ensureCloudRenderRT(Rc<DxvkContext> ctx, const VkExtent2D& downscaleExtent);
 
@@ -1356,6 +1370,26 @@ public:
                "at most one period old. A full bake still runs on any frame the cloud inputs cross a "
                "re-bake step or the camera cuts. 0: all rows every frame, 1: half, 2: a quarter.");
 
+    // Detail LOD (fork -- 2026-09-17). The detail volume carries content down to a few texels of
+    // wavelength while the march steps tens to hundreds of metres; at native scale the animated
+    // jitter turns that under-sampling into per-pixel noise the upscaler averages, below native
+    // scale the frozen per-texel jitter turns it into a screen-locked block pattern that crawls
+    // over moving cloud. Sampling the mip the step can integrate removes the error at its source.
+    RTX_OPTION("rtx.atmosphere", int, cloudDetailLodMode, 1,
+               "Band-limit the cloud detail noise to what each ray-march step can integrate, by "
+               "sampling a coarser mip of the detail volume as the step grows. Removes the sampling "
+               "error that reads as crawl or flicker when the cloud render scale is below 1, at the "
+               "cost of fine detail the step could not resolve anyway. 0: off, 1: only when the cloud "
+               "render scale is below 1, 2: always (the reflection dome too).");
+    RTX_OPTION("rtx.atmosphere", float, cloudDetailLodBias, 0.0f,
+               "Mip bias on the cloud detail LOD, in levels. Negative keeps more detail (and more "
+               "aliasing), positive softens further. Applies live.");
+    RTX_OPTION("rtx.atmosphere", float, cloudReducedScaleStepScale, 0.5f,
+               "Multiplier on the cloud sample spacing and adaptive step floor when the cloud render "
+               "scale is below 1; the sample cap grows to match. A quarter-scale target has 16x fewer "
+               "texels, so 0.5 doubles its samples per ray for a fraction of the native cost. "
+               "1 = the native spacing. Applies live.");
+
     // Quantizing wind/camera motion into the voxel-grid cache key bounds staleness to this step size.
     RTX_OPTION("rtx.atmosphere", float, cloudVoxelGridRebakeGranularityKm, 0.1f,
                "Distance (km) the cloud wind scroll or camera must travel "
@@ -1571,6 +1605,7 @@ private:
   bool needsCloudNvdfRebake() const;
   void cacheCloudNvdfBakeInputs();
   void dispatchCloudDetailNoiseBake(Rc<DxvkContext> ctx);  // once at init, fixed pattern
+  void dispatchCloudDetailNoiseMips(Rc<DxvkContext> ctx);  // box chain over the bake, same init
   void dispatchCloudSunDensityGrid(Rc<DxvkContext> ctx);   // round-robin every 8 frames
   void dispatchCloudAmbientDensityGrid(Rc<DxvkContext> ctx);
   // rtOutput supplies PrimaryLinearViewZ for the depth-aware march clamp (fork — 2026-09-05,
@@ -1609,6 +1644,7 @@ private:
 
   // Keep in lockstep with kDetailVolumeSize in cloud_detail_noise_baker.comp.slang.
   static constexpr uint32_t kCloudDetailNoise3DSize = 128;
+  static constexpr uint32_t kCloudDetailNoise3DMipLevels = 8;  // 128 -> 1
 
   static constexpr uint32_t kCloudSecondaryLutWidth  = 256;
   // 128 -> 256 (fork — 2026-09-05, world-space cloud migration Stage 2). cloudDomeDirToUv /
@@ -1660,6 +1696,10 @@ private:
   bool                m_nvdfNominalCoverageValid = false;
   float    m_missLinearViewZ       { 1e9f };
   Resources::Resource m_cloudDetailNoise3D;
+  // One single-level 3D view per mip (fork -- 2026-09-17): storage descriptors take one level, so the
+  // baker writes [0] and the mip pass reads [n-1] / writes [n]; the march samples the full chain.
+  std::vector<Rc<DxvkImageView>> m_cloudDetailNoise3DMipViews;
+  CloudProfileState   m_cloudProfileState;
   // Ping-pong pair (fork -- 2026-09-16, temporal interleave): dispatchCloudRender advances
   // m_cloudRenderCurrent, marches into the new current pair and reprojects from the other. Both
   // halves of each pair are allocated together by ensureCloudRenderRT.

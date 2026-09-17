@@ -226,6 +226,14 @@ namespace dxvk {
       int cloudMode = 0;
       uint32_t cloudSamples = 0;
       uint32_t cloudSamplesMax = 0;
+      // Captured at the CloudScreen timestamp, after every cloud dispatch has resolved its state.
+      uint32_t cloudScreenPeriod = 1;
+      uint32_t cloudSunGridPeriod = 1;
+      uint32_t cloudDomePeriod = 1;
+      uint32_t cloudRenderWidth = 0;
+      uint32_t cloudRenderHeight = 0;
+      uint32_t cloudDetailLod = 0;
+      float cloudStepScale = 1.0f;
       bool pending = false;
     };
     std::array<GpuStageFrame, 4> m_gpuStageFrames;

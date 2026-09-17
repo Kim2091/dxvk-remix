@@ -276,16 +276,21 @@ CloudPixelResult marchCloudPixel(uint2 pixelCoord, vec3 viewDirYUp, float tSurfa
 // any depth; translation parallax on a deck kilometres away is far below a texel. A surface pixel
 // additionally needs every tap to describe the same surface class at a matching distance, else the
 // caller marches the pixel fresh -- silhouettes are always re-marched, never blended across.
-bool reprojectCloudPixel(uint2 pixelCoord, uint2 outputDim, float tSurfaceKm, AtmosphereArgs args,
-                         out CloudPixelResult result) {
+bool reprojectCloudPixel(uint2 pixelCoord, uint2 outputDim, float tSurfaceKm, bool jitterRay,
+                         AtmosphereArgs args, out CloudPixelResult result) {
   result.color = vec4(0.0f, 0.0f, 0.0f, 1.0f);
   result.depth = vec4(-1.0f, 0.0f, tSurfaceKm, 0.0f);
 
   const vec2 uv = (vec2(pixelCoord) + 0.5f) / vec2(outputDim);
-  // Unjittered at both ends. The projection jitter is a sub-pixel term the cloud field cannot
-  // resolve, and dropping it is what makes a camera at rest map every pixel onto exactly itself.
-  const CameraDirections ray = cameraScreenUVToDirection(cloudCamera, uv, /*jitter=*/ false);
-  const vec4 prevClip = mul(cloudCamera.prevWorldToProjection, vec4(ray.worldDirection, 0.0f));
+  // The same jitter choice as the fresh march, at both ends (fork -- 2026-09-17): a native-scale
+  // pixel stands for its jittered ray, which is what the upscaler dejitters, so its previous value
+  // is looked up along that ray through the previous jittered projection; the reduced-scale pass
+  // marches unjittered rays, so it reprojects unjittered ones, and a camera at rest then maps every
+  // texel onto exactly itself.
+  const CameraDirections ray = cameraScreenUVToDirection(cloudCamera, uv, jitterRay);
+  const vec4 prevClip = mul(jitterRay ? cloudCamera.prevWorldToProjectionJittered
+                                      : cloudCamera.prevWorldToProjection,
+                            vec4(ray.worldDirection, 0.0f));
   if (prevClip.w <= 1e-6f) {
     return false;
   }
@@ -430,6 +435,19 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
 
   const bool reducedResolution = outputDim.x < args.cloudRenderFullDimX
                               || outputDim.y < args.cloudRenderFullDimY;
+  // Reduced-scale sampling (fork -- 2026-09-17). Part of the smaller texel count buys finer steps:
+  // the spacing and adaptive floor shrink by cloudScreenStepScale and the cap grows to match, on
+  // this pass's copy of the args only (the dome and the bakes keep their own spacing).
+  if (reducedResolution && args.cloudScreenStepScale > 0.0f && args.cloudScreenStepScale < 1.0f) {
+    args.cloudViewStepKm      *= args.cloudScreenStepScale;
+    args.nubis3AdaptiveStepKm *= args.cloudScreenStepScale;
+    args.cloudViewSamplesMax  /= args.cloudScreenStepScale;
+  }
+  // The projection jitter is a sub-pixel term at native scale but a 1/(2*scale)-texel wobble on
+  // every reduced-scale texel's ray, which flickers a still camera's blocks through the jitter
+  // sequence; the reduced pass marches the unjittered ray instead. The surface clamp still reads
+  // the jittered depth at the texel centre, and the composite reconstructs against that depth.
+  const bool jitterRay = !reducedResolution;
 
   // ===== Static-per-frame shading context (cloud_march_common.slangh) =====
   // Sun/sky radiances, the full per-moon precompute, combined-moon shadow
@@ -444,15 +462,16 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
 // NV-DXVK start: Use the active camera projection for Numos clouds.
     // Normalized UV supports a cloud target smaller than the primary camera resolution.
     const vec2 uv = (vec2(pixelCoord) + 0.5f) / vec2(outputDim);
-    // Match the primary depth ray, including temporal jitter, at geometry silhouettes.
-    const CameraDirections cloudRay = cameraScreenUVToDirection(cloudCamera, uv, /*jitter=*/ true);
+    // At native scale this matches the primary depth ray, including its temporal jitter, at
+    // geometry silhouettes; see jitterRay above for the reduced-scale choice.
+    const CameraDirections cloudRay = cameraScreenUVToDirection(cloudCamera, uv, jitterRay);
 // NV-DXVK end
     // Clamp to the primary surface; composite validates its taps against this depth.
     const float tSurfaceKm = cloudSurfaceDistanceKm(uv, cloudRay, args);
 
     CloudPixelResult result;
     const bool fresh = !historyValid || all(subOffset == freshSub);
-    if (fresh || !reprojectCloudPixel(pixelCoord, outputDim, tSurfaceKm, args, result)) {
+    if (fresh || !reprojectCloudPixel(pixelCoord, outputDim, tSurfaceKm, jitterRay, args, result)) {
       const vec3 viewDirYUp = worldToAtmosphereYUp(
         cloudRay.worldDirection, args.isZUp != 0u, args.flipUpAxis != 0);
       result = marchCloudPixel(pixelCoord, viewDirYUp, tSurfaceKm, reducedResolution, ctx, args);

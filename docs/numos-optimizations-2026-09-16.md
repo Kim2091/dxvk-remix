@@ -120,3 +120,47 @@ span twice the texels and the texture-cache coherence the full bake enjoyed is h
 whole 8-column blocks (or Z slices) would keep the warp footprint contiguous; untested. Quarter per frame
 was not exercised in this capture. Water reflections were not looked at, so the dome interleave is
 measured but not visually checked. Geometry edges and terrain shadows were reported clean, no shimmer.
+
+## Reduced-scale shimmer (2026-09-17)
+
+Diagnosis, from source and the live config rather than a capture (the shimmer is not in any log):
+
+- `cloudDetailScale = 12` makes the detail volume repeat every 1 km, so the two live consumers of its
+  base taps -- erosion at 0.58 (density) and micro-AO at 0.6 (up to +-27% shading) -- carry content from
+  167 m down to 31 m (16 m vertically, the wispy squeeze). The march steps 49 m at the deck base and
+  75-140 m at 3-10 km. Nothing in the sampler prefilters by step; `cameraDistKm` only gates the near HF
+  fold and the (off) fine band. That is 2-4x under-sampled at the fine end, at every render scale.
+- At native scale the per-pixel march jitter is animated and DLSS averages the resulting 1-px noise.
+  `599ad5818` froze the jitter below native scale because animated jitter there flickers whole 4x4
+  blocks; frozen, the same error becomes a screen-locked block pattern that crawls over moving cloud
+  (the walking shimmer), and the DLSS projection jitter still wobbles every texel's ray by 1/8 texel
+  through the Halton sequence (a still-camera flicker). Both are the same under-sampling seen twice.
+- The composite reconstruction (`a79cac79d`) and the temporal smoother's removal (`f8544fa82`) are
+  not the cause and are untouched; no accumulation is reintroduced.
+
+Change, one build:
+
+1. **Detail LOD** (`cloudDetailLodMode`, default 1 = reduced scale only; `cloudDetailLodBias`). The
+   detail volume now has an 8-level box mip chain (`cloud_detail_noise_mip.comp.slang`, built once
+   at init). Each detail tap in the march samples mip `log2(2 * texelsPerStep) + bias`, where
+   texelsPerStep is the current step in that tap's texels -- the Nyquist rule -- so a step that cannot
+   integrate a band gets it filtered toward the channel mean instead of aliased. Bakes and the shadow
+   taps pass lod 0 (grids unchanged). Mode 2 applies it at native scale and to the dome as an A/B.
+2. **Reduced-scale sampling** (`cloudReducedScaleStepScale`, default 0.5): the screen pass halves its
+   step target and adaptive floor and doubles its cap when its RT is below native. 16x fewer texels
+   pay for 2x the samples per ray. The dome and bakes keep their spacing.
+3. **Unjittered rays below native scale**: the reduced pass marches the unjittered camera ray (and
+   reprojects unjittered), so a still camera renders bit-identical frames. The surface clamp still
+   reads the jittered depth at the texel centre. At native scale the reprojection lookup now uses the
+   jittered matrices at both ends, matching what DLSS assumes a pixel's ray is (yesterday's build
+   reprojected unjittered directions into jittered pixels: a half-pixel inconsistency on the
+   reprojected half).
+4. **Labelled timing log**: `[Cloud profile]` and a new `[GPU stages] stage=CloudConfig` line carry
+   `interleave=S/G/D` (resolved screen / sun-grid / dome periods), the cloud RT `extent`, `detailLod`
+   and `stepScale`, so the next capture needs no cluster guessing.
+
+Held: the sun-grid block interleave (cache-coherence fix for its 0.78x) is deferred, not dropped.
+
+Expected, estimated: 25% scale with the defaults ~0.6-0.75 ms screen march (2x samples on 0.31-0.37);
+native scale unchanged in cost and appearance (LOD off there by default). Whether the LOD look at 25%
+reads as acceptable is the user's call; the bias slider trades residual crawl against softness live.
