@@ -375,7 +375,7 @@ namespace dxvk {
     RemixGui::DragInt("Update bounces", &updateBouncesObject(), 1.0f, 1, 8);
     RemixGui::DragInt("Accumulation frames", &accumulationFramesObject(), 1.0f, 1, 64);
     RemixGui::DragInt("Stale frames", &staleFramesObject(), 1.0f, 8, 128);
-    RemixGui::DragFloat("Grid density", &gridScaleObject(), 1.0f, 1.0f, 1000.0f);
+    RemixGui::DragFloat("Grid density (SHARC scene scale)", &gridScaleObject(), 1.0f, 1.0f, 1000.0f);
     RemixGui::DragFloat("Minimum roughness (squared)", &minRoughnessObject(), 0.01f, 0.05f, 1.0f);
     RemixGui::DragFloat("Max emissive luminance", &maxEmissiveLuminanceObject(), 0.001f, 0.0f, 1.0f);
     RemixGui::DragInt("Minimum cell samples", &minSampleCountObject(), 1.0f, 0, 32);
