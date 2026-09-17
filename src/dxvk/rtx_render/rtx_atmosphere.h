@@ -1325,6 +1325,16 @@ public:
                "Disable to use the legacy per-voxel integration.");
 
     // Lighting bakes may reuse unchanged columns or dome rows across frames.
+    RTX_OPTION("rtx.atmosphere", int, cloudScreenInterleaveMode, 0,
+               "Screen cloud march cadence at native internal resolution. Unmarched pixels reuse "
+               "rotation-reprojected history after surface-depth validation; rejected pixels march fresh. "
+               "Input changes, camera cuts and lightning force a full update. No temporal blending. "
+               "0: every frame, 1: half per frame, 2: quarter per frame.");
+    RTX_OPTION_ARGS("rtx.atmosphere", float, cloudHistoryDepthTolerance, 0.1f,
+               "Relative surface-distance tolerance for screen interleave reuse. Lower rejects more "
+               "history near moving geometry. Applies only to Half/Quarter screen interleave.",
+               args.minValue = 0.0f, args.maxValue = 1.0f);
+
     RTX_OPTION("rtx.atmosphere", int, cloudSunGridInterleaveMode, 2,
                "How many columns of the sun-direction cloud lighting grid are re-baked each frame; "
                "the others are at most one period old, and the trilinear read blends across "
@@ -1657,6 +1667,13 @@ private:
   CloudProfileState   m_cloudProfileState;
   Resources::Resource m_cloudRenderRT;
   Resources::Resource m_cloudDepthRT;
+  Resources::Resource m_cloudRenderPrevious;
+  Resources::Resource m_cloudDepthPrevious;
+  bool                m_cloudRenderHistoryValid = false;
+  uint32_t            m_cloudScreenPeriodThisFrame = 1u;
+  uint32_t            m_cloudLastRenderFrame = 0u;
+  uint32_t            m_cloudScreenWindowFrames = 0u;
+  uint32_t            m_cloudScreenFullFrames = 0u;
   // True while the dome was baked last frame, so a row interleave has fresh rows to lean on.
   bool                m_cloudDomeHistoryValid = false;
   // This frame's resolved interleave periods (1 = full update); see resolveCloudInterleave.

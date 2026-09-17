@@ -33,6 +33,20 @@
 //!> CLOUD_TIGHT_DENSITY_BOUNDS=1
 //!variant cloud_render_density_tight_bounds.comp
 //!> CLOUD_TIGHT_DENSITY_BOUNDS=1 CLOUD_PROFILE_DENSITY_ONLY=1
+//!variant cloud_render_interleave.comp
+//!> CLOUD_SCREEN_INTERLEAVE=1
+//!variant cloud_render_no_moon_shadows_interleave.comp
+//!> CLOUD_PROFILE_NO_MOON_SHADOWS=1 CLOUD_SCREEN_INTERLEAVE=1
+//!variant cloud_render_density_only_interleave.comp
+//!> CLOUD_PROFILE_DENSITY_ONLY=1 CLOUD_SCREEN_INTERLEAVE=1
+//!variant cloud_render_wide_interleave.comp
+//!> CLOUD_GROUP_X=16 CLOUD_GROUP_Y=4 CLOUD_SCREEN_INTERLEAVE=1
+//!variant cloud_render_small_interleave.comp
+//!> CLOUD_GROUP_X=8 CLOUD_GROUP_Y=4 CLOUD_SCREEN_INTERLEAVE=1
+//!variant cloud_render_tight_bounds_interleave.comp
+//!> CLOUD_TIGHT_DENSITY_BOUNDS=1 CLOUD_SCREEN_INTERLEAVE=1
+//!variant cloud_render_density_tight_bounds_interleave.comp
+//!> CLOUD_TIGHT_DENSITY_BOUNDS=1 CLOUD_PROFILE_DENSITY_ONLY=1 CLOUD_SCREEN_INTERLEAVE=1
 //!end-variants
 
 // Cloud Render Compute Pass — Nubis Cubed 2023 (fork — 2026-05-12, C4).
@@ -165,6 +179,13 @@ Texture2D<float> PrimaryLinearViewZ;
 layout(binding = 16, rgba32f)
 RWTexture2D<float4> cloudDepthOutput;
 
+#ifdef CLOUD_SCREEN_INTERLEAVE
+layout(binding = 18)
+Texture2D<float4> PrevCloudRender;
+layout(binding = 19)
+Texture2D<float4> PrevCloudDepth;
+#endif
+
 // Include the helper library AFTER the texture globals are declared so the
 // ATMOSPHERE_AVAILABLE-gated helper bodies resolve to our local declarations.
 #include "rtx/pass/atmosphere/atmosphere_common.slangh"
@@ -244,6 +265,94 @@ CloudPixelResult marchCloudPixel(uint2 pixelCoord, vec3 viewDirYUp, float tSurfa
   return result;
 }
 
+#ifdef CLOUD_SCREEN_INTERLEAVE
+bool reprojectCloudPixel(uint2 pixelCoord, uint2 outputDim, float tSurfaceKm, bool jitterRay,
+                         AtmosphereArgs args, out CloudPixelResult result) {
+  result.color = vec4(0.0f, 0.0f, 0.0f, 1.0f);
+  result.depth = vec4(-1.0f, 0.0f, tSurfaceKm, 0.0f);
+
+  const vec2 uv = (vec2(pixelCoord) + 0.5f) / vec2(outputDim);
+  // History and fresh samples both describe jittered primary rays.
+  const CameraDirections ray = cameraScreenUVToDirection(cloudCamera, uv, jitterRay);
+  const vec4 prevClip = mul(jitterRay ? cloudCamera.prevWorldToProjectionJittered
+                                      : cloudCamera.prevWorldToProjection,
+                            vec4(ray.worldDirection, 0.0f));
+  if (!all(isfinite(prevClip)) || prevClip.w <= 1e-6f) {
+    return false;
+  }
+  const vec2 prevUv = cameraNDCToScreenUV(cloudCamera, prevClip.xy / prevClip.w);
+  if (any(prevUv < vec2(0.0f)) || any(prevUv >= vec2(1.0f))) {
+    return false;
+  }
+
+  vec2 texelF = prevUv * vec2(outputDim) - 0.5f;
+  // Float noise from the two matrix products lands a static camera a hair off its own texel;
+  // snapping keeps that case an exact copy instead of a faint four-tap blur every other frame.
+  const vec2 nearest = round(texelF);
+  if (all(abs(texelF - nearest) < 0.01f)) {
+    texelF = nearest;
+  }
+  const int2 baseTexel = int2(floor(texelF));
+  const vec2 f = texelF - vec2(baseTexel);
+  const int2 maxTexel = int2(outputDim) - int2(1);
+  const float weights[4] = {
+    (1.0f - f.x) * (1.0f - f.y), f.x * (1.0f - f.y),
+    (1.0f - f.x) * f.y,          f.x * f.y };
+  const int2 offsets[4] = { int2(0, 0), int2(1, 0), int2(0, 1), int2(1, 1) };
+  const bool currentIsSky = tSurfaceKm >= kNoSurfaceKm;
+
+  vec4 sum = vec4(0.0f);
+  float weightSum = 0.0f;
+  float cloudWeightSum = 0.0f;
+  float meanSum = 0.0f;
+  float entryKm = kNoSurfaceKm;
+  [unroll]
+  for (uint i = 0u; i < 4u; ++i) {
+    const float weight = weights[i];
+    if (weight <= 1e-4f) {
+      continue;
+    }
+    const int2 texel = clamp(baseTexel + offsets[i], int2(0), maxTexel);
+    const vec4 depth = PrevCloudDepth.Load(int3(texel, 0));
+    const bool tapIsSky = depth.z >= kNoSurfaceKm;
+    if (tapIsSky != currentIsSky) {
+      return false;
+    }
+    if (!currentIsSky
+        && abs(depth.z - tSurfaceKm) > args.cloudReprojectDepthTolerance * max(max(depth.z, tSurfaceKm), 1e-3f)) {
+      return false;
+    }
+    const vec4 value = PrevCloudRender.Load(int3(texel, 0));
+    sum += value * weight;
+    weightSum += weight;
+    // Depth must describe the same cloud taps as colour.
+    const float cloudWeight = weight * saturate(1.0f - value.a);
+    if (cloudWeight > 0.0f && depth.x >= 0.0f) {
+      cloudWeightSum += cloudWeight;
+      meanSum += depth.y * cloudWeight;
+      entryKm = min(entryKm, depth.x);
+    }
+  }
+  if (weightSum <= 1e-3f) {
+    return false;
+  }
+  result.color = sum / weightSum;
+  result.depth = cloudWeightSum > 1e-6f
+    ? vec4(entryKm, meanSum / cloudWeightSum, tSurfaceKm, 0.0f)
+    : vec4(-1.0f, 0.0f, tSurfaceKm, 0.0f);
+  return true;
+}
+
+uint2 cloudFreshSubPixel(uint period, uint phase, uint2 cellCoord) {
+  if (period == 2u) {
+    return uint2((cellCoord.y + phase) & 1u, 0u);
+  }
+  const uint2 kQuadOrder[4] = { uint2(0u, 0u), uint2(1u, 1u), uint2(1u, 0u), uint2(0u, 1u) };
+  return kQuadOrder[(phase + ((cellCoord.x + cellCoord.y) & 1u) * 2u) & 3u];
+}
+
+#endif
+
 [shader("compute")]
 [numthreads(CLOUD_GROUP_X, CLOUD_GROUP_Y, 1)]
 void main(uint3 dispatchId : SV_DispatchThreadID) {
@@ -252,8 +361,20 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
 
   AtmosphereArgs args = atmosphereArgs;
 
-  const uint2 pixelCoord = dispatchId.xy;
-  if (any(pixelCoord >= outputDim)) {
+#ifdef CLOUD_SCREEN_INTERLEAVE
+  const uint rawPeriod = args.cloudScreenInterleave & 0xFFu;
+  const uint period = rawPeriod == 4u ? 4u : (rawPeriod == 2u ? 2u : 1u);
+  const uint phase = (args.cloudScreenInterleave >> 8u) & 0xFFu;
+  const bool historyValid = (args.cloudScreenInterleave & 0x10000u) != 0u;
+  const uint2 cellDim = uint2(period >= 2u ? 2u : 1u, period >= 4u ? 2u : 1u);
+  const uint2 freshSub = cloudFreshSubPixel(period, phase, dispatchId.xy);
+#else
+  const uint period = 1u;
+  const uint2 cellDim = uint2(1u, 1u);
+#endif
+  // Each lane owns a whole cell so skipped marches save work across the warp.
+  const uint2 cellOrigin = dispatchId.xy * cellDim;
+  if (any(cellOrigin >= outputDim)) {
     return;
   }
 
@@ -266,8 +387,14 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
     effectiveCoverageMean = max(effectiveCoverageMean, args.cloudLayer2CoverageMean);
   }
   if (args.cloudEnabled < 0.5f || effectiveCoverageMean < 0.01f || args.cloudViewSamples == 0u) {
-    cloudRenderOutput[pixelCoord] = vec4(0.0f, 0.0f, 0.0f, 1.0f);
-    cloudDepthOutput[pixelCoord] = vec4(-1.0f, 0.0f, kNoSurfaceKm, 0.0f);
+    for (uint sub = 0u; sub < period; ++sub) {
+      const uint2 pixelCoord = cellOrigin + uint2(sub & 1u, sub >> 1u);
+      if (any(pixelCoord >= outputDim)) {
+        continue;
+      }
+      cloudRenderOutput[pixelCoord] = vec4(0.0f, 0.0f, 0.0f, 1.0f);
+      cloudDepthOutput[pixelCoord] = vec4(-1.0f, 0.0f, kNoSurfaceKm, 0.0f);
+    }
     return;
   }
 
@@ -289,13 +416,28 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
   // has its own below-horizon clamp and is untouched this stage.
 
   CloudShadeContext ctx = buildCloudShadeContext(args);
-  const vec2 uv = (vec2(pixelCoord) + 0.5f) / vec2(outputDim);
-  // Match the primary surface ray, including projection jitter.
-  const CameraDirections cloudRay = cameraScreenUVToDirection(cloudCamera, uv, true);
-  const float tSurfaceKm = cloudSurfaceDistanceKm(pixelCoord, cloudRay, args);
-  const vec3 viewDirYUp = worldToAtmosphereYUp(
-    cloudRay.worldDirection, args.isZUp != 0u, args.flipUpAxis != 0);
-  const CloudPixelResult result = marchCloudPixel(pixelCoord, viewDirYUp, tSurfaceKm, ctx, args);
-  cloudRenderOutput[pixelCoord] = result.color;
-  cloudDepthOutput[pixelCoord] = result.depth;
+  for (uint sub = 0u; sub < period; ++sub) {
+    const uint2 subOffset = uint2(sub & 1u, sub >> 1u);
+    const uint2 pixelCoord = cellOrigin + subOffset;
+    if (any(pixelCoord >= outputDim)) {
+      continue;
+    }
+    const vec2 uv = (vec2(pixelCoord) + 0.5f) / vec2(outputDim);
+    const CameraDirections cloudRay = cameraScreenUVToDirection(cloudCamera, uv, true);
+    const float tSurfaceKm = cloudSurfaceDistanceKm(pixelCoord, cloudRay, args);
+    CloudPixelResult result;
+#ifdef CLOUD_SCREEN_INTERLEAVE
+    if (historyValid && !all(subOffset == freshSub)
+        && reprojectCloudPixel(pixelCoord, outputDim, tSurfaceKm, true, args, result)) {
+      cloudRenderOutput[pixelCoord] = result.color;
+      cloudDepthOutput[pixelCoord] = result.depth;
+      continue;
+    }
+#endif
+    const vec3 viewDirYUp = worldToAtmosphereYUp(
+      cloudRay.worldDirection, args.isZUp != 0u, args.flipUpAxis != 0);
+    result = marchCloudPixel(pixelCoord, viewDirYUp, tSurfaceKm, ctx, args);
+    cloudRenderOutput[pixelCoord] = result.color;
+    cloudDepthOutput[pixelCoord] = result.depth;
+  }
 }

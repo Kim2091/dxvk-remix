@@ -78,13 +78,18 @@ plus one consumer wire-in inside the volumetric pass.
    sampling it for a non-primary ray direction would return the
    wrong cloud.
 
-6. **Native screen march and lighting-bake interleave** (2026-09-17).
-   Every cloud pixel is marched every frame at the internal (DLSS-input) extent.
-   One color target and one depth/diagnostic companion are loaded at matching pixel coordinates
-   by composite. There is no cloud spatial scaler, upsample, screen interleave, reprojection,
-   or temporal accumulation. Projection jitter matches the primary geometry ray; march jitter
-   remains animated. Sun-grid columns and reflection-dome rows retain independent Quarter
-   interleave, with full refreshes when their inputs change or the dome's camera cuts.
+6. **Native screen march and temporal interleave** (2026-09-17).
+   Clouds render at the internal (DLSS-input) extent, with exact matching-pixel composite loads.
+   Screen Cloud Interleave offers Every frame (default), Half per frame, and Quarter per frame.
+   Half/Quarter march one pixel per cell and reuse rotation-reprojected history for the others.
+   Surface-depth mismatches and newly exposed pixels march fresh. Input changes, camera cuts,
+   lightning, resize and skipped frames force a full refresh. Color and depth use paired targets.
+   There is no cloud spatial scaler, upsample, temporal accumulation blend or history clamp.
+   Projection jitter matches the primary geometry ray; march jitter remains animated.
+   The reuse path has separate compile-time variants, including all profiling modes.
+   Sun-grid columns and reflection-dome rows retain independent Quarter interleave.
+   Screen reprojection remains rotation-only; rapid translation through nearby clouds can
+   expose reuse errors. No new in-game quality or performance result is claimed.
 
    Detail LOD is optional and defaults off. `cloudDetailLodMode = 2` enables step-based mip
    filtering for the screen march and reflection dome; old mode 1 remains off. The live menu

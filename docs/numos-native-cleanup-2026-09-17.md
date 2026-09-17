@@ -1,5 +1,9 @@
 # NuMos native-resolution cleanup and detail LOD evaluation
 
+**Correction:** screen Half/Quarter interleave has been restored at the user's request.
+The removal and memory-saving statements below describe the initial cleanup only; see
+[numos-screen-interleave-2026-09-17.md](numos-screen-interleave-2026-09-17.md) for current behavior.
+
 Supersedes the screen-resolution and temporal-reuse instructions in the September 14/17
 handoffs and the earlier world-space design. Those documents retain historical experiments.
 

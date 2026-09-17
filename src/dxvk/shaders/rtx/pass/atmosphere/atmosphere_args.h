@@ -792,4 +792,10 @@ struct AtmosphereArgs {
   float cloudDetailLodBias;
   uint cloudDetailLodEnable;
 
+  // Screen reuse is independent of accumulation; keep a complete scalar-layout row.
+  uint cloudScreenInterleave;
+  float cloudReprojectDepthTolerance;
+  uint padCloudInterleave0;
+  uint padCloudInterleave1;
+
 };

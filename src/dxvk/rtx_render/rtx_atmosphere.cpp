@@ -51,6 +51,13 @@
 #include <rtx_shaders/cloud_ambient_density_grid.h>
 #include <rtx_shaders/cloud_ambient_density_grid_scan.h>
 #include <rtx_shaders/cloud_render.h>
+#include <rtx_shaders/cloud_render_interleave.h>
+#include <rtx_shaders/cloud_render_no_moon_shadows_interleave.h>
+#include <rtx_shaders/cloud_render_density_only_interleave.h>
+#include <rtx_shaders/cloud_render_wide_interleave.h>
+#include <rtx_shaders/cloud_render_small_interleave.h>
+#include <rtx_shaders/cloud_render_tight_bounds_interleave.h>
+#include <rtx_shaders/cloud_render_density_tight_bounds_interleave.h>
 #include <rtx_shaders/cloud_render_no_moon_shadows.h>
 #include <rtx_shaders/cloud_render_density_only.h>
 #include <rtx_shaders/cloud_render_wide.h>
@@ -264,6 +271,8 @@ namespace dxvk {
         TEXTURE2D(15)
         RW_TEXTURE2D(16)
         CONSTANT_BUFFER(17)
+        TEXTURE2D(18)
+        TEXTURE2D(19)
       END_PARAMETER()
     };
     PREWARM_SHADER_PIPELINE(CloudRenderShader);
@@ -530,6 +539,8 @@ namespace {
     args.lightningFlashIntensity     = 0.0f;
     args.lightningEnvelope           = 0.0f;
     // Interleave words carry this frame's phase (fork -- 2026-09-16); no bake reads them.
+    args.cloudScreenInterleave         = 0u;
+    args.cloudReprojectDepthTolerance  = 0.0f;
     args.cloudSunGridInterleave        = 0u;
     args.cloudDomeInterleave           = 0u;
     // View-march-only detail LOD (fork -- 2026-09-17); the bakes pass lod 0 themselves.
@@ -1289,6 +1300,9 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
     // Secondary-ray cloud LUT gate (fork — 2026-06-10, perf). Lives in the
     // former pad_c5_0 slot so the CB layout is unchanged.
     args.cloudSecondaryLutEnable = RtxAtmosphere::cloudSecondaryLutEnable() ? 1u : 0u;
+    args.cloudScreenInterleave = packCloudInterleave(m_cloudScreenPeriodThisFrame, m_cloudRenderFrameIdx)
+      | (m_cloudRenderHistoryValid ? (1u << 16u) : 0u);
+    args.cloudReprojectDepthTolerance = std::max(RtxAtmosphere::cloudHistoryDepthTolerance(), 0.0f);
     // Lighting-bake interleave periods and phases.
     args.cloudSunGridInterleave = packCloudInterleave(m_cloudSunGridPeriodThisFrame, m_cloudRenderFrameIdx);
     args.cloudDomeInterleave    = packCloudInterleave(m_cloudDomePeriodThisFrame, m_cloudRenderFrameIdx);
@@ -2093,6 +2107,11 @@ void RtxAtmosphere::resolveCloudInterleave(RtxContext& rtx, bool cloudInputsChan
   // The dome is marched from the exact camera position, so a jump moves every texel at once.
   m_cloudDomePeriodThisFrame = (cloudInputsChanged || cameraJumped || !m_cloudDomeHistoryValid)
     ? 1u : cloudInterleavePeriod(RtxAtmosphere::cloudSecondaryLutInterleaveMode());
+  m_cloudScreenPeriodThisFrame = (cloudInputsChanged || cameraJumped || m_lightningEnvelope > 0.0f)
+    ? 1u : cloudInterleavePeriod(RtxAtmosphere::cloudScreenInterleaveMode());
+  if (cloudInputsChanged || cameraJumped || m_lightningEnvelope > 0.0f) {
+    m_cloudRenderHistoryValid = false;
+  }
 
 }
 
@@ -3037,7 +3056,8 @@ void RtxAtmosphere::ensureCloudRenderRT(Rc<DxvkContext> ctx,
 
   const bool extentsMatch = (m_cloudRenderExtent.width  == renderExtent.width)
                          && (m_cloudRenderExtent.height == renderExtent.height);
-  if (extentsMatch && m_cloudRenderRT.isValid() && m_cloudDepthRT.isValid()) {
+  if (extentsMatch && m_cloudRenderRT.isValid() && m_cloudDepthRT.isValid()
+      && m_cloudRenderPrevious.isValid() && m_cloudDepthPrevious.isValid()) {
     return;
   }
 
@@ -3070,6 +3090,35 @@ void RtxAtmosphere::ensureCloudRenderRT(Rc<DxvkContext> ctx,
                                 // cloud_render.comp.slang's unconditional depth-companion write)
     1);                         // mipLevels
 
+  m_cloudRenderPrevious = Resources::createImageResource(
+    ctx,
+    "Atmosphere Cloud Render Previous",
+    extent3D,
+    VK_FORMAT_R16G16B16A16_SFLOAT,
+    1,                          // numLayers
+    VK_IMAGE_TYPE_2D,
+    VK_IMAGE_VIEW_TYPE_2D,
+    0,                          // imageCreateFlags
+    VK_IMAGE_USAGE_STORAGE_BIT, // extraUsageFlags (SAMPLED implied)
+    VkClearColorValue{},        // clearValue (zero -- "no cloud, full transmittance")
+    1);                         // mipLevels
+
+  // Keep cloud depth and diagnostics aligned with the color target at the internal extent.
+  m_cloudDepthPrevious = Resources::createImageResource(
+    ctx,
+    "Atmosphere Cloud Depth Previous",
+    extent3D,
+    VK_FORMAT_R32G32B32A32_SFLOAT,
+    1,                          // numLayers
+    VK_IMAGE_TYPE_2D,
+    VK_IMAGE_VIEW_TYPE_2D,
+    0,                          // imageCreateFlags
+    VK_IMAGE_USAGE_STORAGE_BIT, // extraUsageFlags (SAMPLED implied)
+    VkClearColorValue{},        // clearValue (zero -- overwritten every texel every frame, see
+                                // cloud_render.comp.slang's unconditional depth-companion write)
+    1);                         // mipLevels
+
+  m_cloudRenderHistoryValid = false;
   m_cloudRenderExtent = renderExtent;
   Logger::info(str::format("[Cloud render] extent=", renderExtent.width, "x", renderExtent.height,
     " (internal resolution)"));
@@ -3237,6 +3286,7 @@ void RtxAtmosphere::dispatchCloudScreenPass(RtxContext& ctx, const Resources::Ra
   // leaving this dispatch running so its cost is still paid; debugDispatchCloudRender is the only
   // lever that actually skips it, for an A/B frame-time read.
   if (!RtxAtmosphere::debugDispatchCloudRender() || !m_cloudRenderRT.isValid()) {
+    m_cloudRenderHistoryValid = false;
     return;
   }
 
@@ -3329,6 +3379,12 @@ void RtxAtmosphere::dispatchCloudRender(Rc<DxvkContext> ctx, const Resources::Ra
     return;  // ensureCloudRenderRT hasn't allocated yet (first frame with zero extent)
   }
 
+  if (!m_cloudRenderHistoryValid || m_cloudLastRenderFrame + 1u != m_cloudRenderFrameIdx) {
+    m_cloudRenderHistoryValid = false;
+    m_cloudScreenPeriodThisFrame = 1u;
+  }
+  std::swap(m_cloudRenderRT, m_cloudRenderPrevious);
+  std::swap(m_cloudDepthRT, m_cloudDepthPrevious);
   AtmosphereArgs args = getAtmosphereArgs();
   traceCloudPlacement(args);
   m_cloudProfileState.sunGridPeriod = m_cloudSunGridPeriodThisFrame;
@@ -3393,6 +3449,10 @@ void RtxAtmosphere::dispatchCloudRender(Rc<DxvkContext> ctx, const Resources::Ra
   ctx->bindResourceView(15, rtOutput.m_primaryLinearViewZ.view, nullptr);
   ctx->bindResourceView(16, m_cloudDepthRT.view, nullptr);
   ctx->bindResourceBuffer(17, DxvkBufferSlice(m_cameraBuffer, 0, m_cameraBuffer->info().size));
+  ctx->bindResourceView(18, m_cloudRenderPrevious.view, nullptr);
+  ctx->bindResourceView(19, m_cloudDepthPrevious.view, nullptr);
+  ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_cloudRenderPrevious.image);
+  ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_cloudDepthPrevious.image);
   ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_cloudDSun.image);
   ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_cloudDAmbient.image);
   ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_cloudNvdfSdf[m_cloudNvdfSdfFront].image);
@@ -3408,41 +3468,72 @@ void RtxAtmosphere::dispatchCloudRender(Rc<DxvkContext> ctx, const Resources::Ra
   }
 
   const int profilingMode = RtxAtmosphere::cloudProfilingMode();
+  const bool interleave = m_cloudScreenPeriodThisFrame > 1u;
   switch (profilingMode) {
   case 1:
     ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT,
-      GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, CloudRenderShader, cloud_render_no_moon_shadows));
+      interleave
+        ? GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, CloudRenderShader, cloud_render_no_moon_shadows_interleave)
+        : GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, CloudRenderShader, cloud_render_no_moon_shadows));
     break;
   case 2:
     ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT,
-      GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, CloudRenderShader, cloud_render_density_only));
+      interleave
+        ? GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, CloudRenderShader, cloud_render_density_only_interleave)
+        : GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, CloudRenderShader, cloud_render_density_only));
     break;
   case 3:
     ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT,
-      GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, CloudRenderShader, cloud_render_wide));
+      interleave
+        ? GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, CloudRenderShader, cloud_render_wide_interleave)
+        : GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, CloudRenderShader, cloud_render_wide));
     break;
   case 4:
     ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT,
-      GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, CloudRenderShader, cloud_render_small));
+      interleave
+        ? GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, CloudRenderShader, cloud_render_small_interleave)
+        : GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, CloudRenderShader, cloud_render_small));
     break;
   case 5:
     ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT,
-      GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, CloudRenderShader, cloud_render_tight_bounds));
+      interleave
+        ? GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, CloudRenderShader, cloud_render_tight_bounds_interleave)
+        : GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, CloudRenderShader, cloud_render_tight_bounds));
     break;
   case 6:
     ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT,
-      GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, CloudRenderShader, cloud_render_density_tight_bounds));
+      interleave
+        ? GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, CloudRenderShader, cloud_render_density_tight_bounds_interleave)
+        : GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, CloudRenderShader, cloud_render_density_tight_bounds));
     break;
   default:
-    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, CloudRenderShader::getShader());
+    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, interleave
+      ? GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, CloudRenderShader, cloud_render_interleave)
+      : CloudRenderShader::getShader());
     break;
   }
 
   const uint32_t groupWidth = profilingMode == 3 ? 16u : 8u;
   const uint32_t groupHeight = profilingMode == 3 || profilingMode == 4 ? 4u : 8u;
-  const uint32_t groupsX = (m_cloudRenderExtent.width + groupWidth - 1u) / groupWidth;
-  const uint32_t groupsY = (m_cloudRenderExtent.height + groupHeight - 1u) / groupHeight;
+  const uint32_t cellWidth = interleave ? 2u : 1u;
+  const uint32_t cellHeight = m_cloudScreenPeriodThisFrame == 4u ? 2u : 1u;
+  const uint32_t groupsX = (m_cloudRenderExtent.width + cellWidth * groupWidth - 1u) / (cellWidth * groupWidth);
+  const uint32_t groupsY = (m_cloudRenderExtent.height + cellHeight * groupHeight - 1u) / (cellHeight * groupHeight);
   ctx->dispatch(groupsX, groupsY, 1);
+  m_cloudRenderHistoryValid = true;
+  m_cloudLastRenderFrame = m_cloudRenderFrameIdx;
+  if (RtxAtmosphere::cloudProfilingLog()) {
+    ++m_cloudScreenWindowFrames;
+    m_cloudScreenFullFrames += interleave ? 0u : 1u;
+    if (m_cloudScreenWindowFrames >= 120u) {
+      Logger::info(str::format("[Cloud profile] stage=ScreenInterleave requestedPeriod=",
+        cloudInterleavePeriod(RtxAtmosphere::cloudScreenInterleaveMode()),
+        " resolvedPeriod=", m_cloudScreenPeriodThisFrame,
+        " fullFrames=", m_cloudScreenFullFrames, "/", m_cloudScreenWindowFrames));
+      m_cloudScreenWindowFrames = 0u;
+      m_cloudScreenFullFrames = 0u;
+    }
+  }
 }
 
 void RtxAtmosphere::dispatchCloudSecondaryLut(Rc<DxvkContext> ctx) {

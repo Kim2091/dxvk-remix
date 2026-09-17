@@ -1105,6 +1105,17 @@ void RtxAtmosphere::showCloudSettings(const WeatherSnapshot* weatherSnapshot) {
       "Reduces repeated density work. "
       "Updates every frame when cloud ground shadows are enabled. Applies live.");
     const char* kCloudInterleaveModes[] = { "Every frame", "Half per frame", "Quarter per frame" };
+    RemixGui::Combo("Screen Cloud Interleave", &RtxAtmosphere::cloudScreenInterleaveModeObject(),
+      kCloudInterleaveModes, IM_ARRAYSIZE(kCloudInterleaveModes));
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Marches half or a quarter of native-resolution cloud pixels per frame. Other pixels reuse "
+      "reprojected history, or march fresh if surface-depth validation fails. Input changes, camera "
+      "cuts and lightning force full updates. Fresh samples are never temporally blended. Applies live.");
+    RemixGui::DragFloat("Screen Reuse Depth Tolerance", &RtxAtmosphere::cloudHistoryDepthToleranceObject(),
+      0.005f, 0.0f, 1.0f, "%.3f", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Relative surface-distance tolerance for Half/Quarter reuse. Lower rejects more history "
+      "near moving geometry. Applies live.");
     RemixGui::Combo("Sun Shadow Grid Interleave", &RtxAtmosphere::cloudSunGridInterleaveModeObject(),
       kCloudInterleaveModes, IM_ARRAYSIZE(kCloudInterleaveModes));
     RemixGui::SetTooltipToLastWidgetOnHover(
