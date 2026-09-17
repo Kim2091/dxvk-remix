@@ -1121,12 +1121,12 @@ public:
                "the pixel footprint grows. 0 = the legacy fixed-length "
                "lattice march. Applies live.");
     // Fixed step count undersamples horizon rays (50+ km span); a target step length avoids banding.
-    RTX_OPTION("rtx.atmosphere", float, cloudViewStepKm, 0.15f,
+    RTX_OPTION("rtx.atmosphere", float, cloudViewStepKm, 1.0f,
                "Target cloud sample spacing in km [0..4]. Larger spacing reduces work but can "
                "lose detail or miss thin cloud features. Adaptive mode scales spacing with distance "
                "and respects its step floor; Max Cloud Samples separately caps march iterations. "
                "0 selects the legacy fixed base-count march. Applies live.");
-    RTX_OPTION("rtx.atmosphere", uint32_t, cloudViewSamplesMax, 64,
+    RTX_OPTION("rtx.atmosphere", uint32_t, cloudViewSamplesMax, 32,
                "Main-layer march iteration ceiling per slab crossing [2..256], independent of the base count. "
                "Rays that finish or become opaque earlier do not reach this limit. Adaptive budget "
                "exhaustion adds up to four coarse tail samples; the second layer has its own budget. "

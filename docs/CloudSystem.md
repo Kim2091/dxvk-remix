@@ -91,6 +91,7 @@ plus one consumer wire-in inside the volumetric pass.
    Coherent Sun Shadow Blocks (experimental, default on) groups sun updates into adjacent
    eight-column blocks; its live toggle restores strided updates for timing/quality comparison.
    Log Cloud Timings also exposes actual GPU mean/max view-density evaluations in the menu;
+   Defaults are 1 km Cloud Sample Spacing and 32 Max Cloud Samples.
    Cloud Sample Spacing exposes 0..4 km for live quality/cost comparisons; larger values can
    miss thin cloud features. Zero selects the fixed base-count march.
    Max Cloud Samples is a ceiling, not the number of samples every ray takes. Its live range is
