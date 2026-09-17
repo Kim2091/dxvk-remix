@@ -1104,6 +1104,25 @@ void RtxAtmosphere::showCloudSettings(const WeatherSnapshot* weatherSnapshot) {
       "Samples each vertical cloud column once for ambient lighting. "
       "Reduces repeated density work. "
       "Updates every frame when cloud ground shadows are enabled. Applies live.");
+    const char* kCloudInterleaveModes[] = { "Every frame", "Half per frame", "Quarter per frame" };
+    RemixGui::Combo("Cloud Temporal Interleave", &RtxAtmosphere::cloudScreenInterleaveModeObject(),
+      kCloudInterleaveModes, IM_ARRAYSIZE(kCloudInterleaveModes));
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Marches half or a quarter of the cloud pixels each frame and reprojects the rest from the "
+      "previous frame along the camera rotation, re-marching any pixel whose surface no longer "
+      "matches. Every pixel is still marched within the period. Falls back to a full march on "
+      "camera cuts, lightning, and any frame the cloud or sun inputs change. Applies live.");
+    RemixGui::Combo("Sun Shadow Grid Interleave", &RtxAtmosphere::cloudSunGridInterleaveModeObject(),
+      kCloudInterleaveModes, IM_ARRAYSIZE(kCloudInterleaveModes));
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Re-bakes half or a quarter of the sun-direction lighting grid's columns each frame; the "
+      "rest are at most one period old and the filtered read blends across them. A full bake "
+      "still runs whenever the grid's inputs cross a re-bake step. Applies live.");
+    RemixGui::Combo("Cloud Reflection Interleave", &RtxAtmosphere::cloudSecondaryLutInterleaveModeObject(),
+      kCloudInterleaveModes, IM_ARRAYSIZE(kCloudInterleaveModes));
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Re-marches half or a quarter of the reflection dome's rows each frame. A full bake still "
+      "runs on camera cuts and whenever the cloud inputs cross a re-bake step. Applies live.");
     RemixGui::DragFloat("Cloud Render Scale", &RtxAtmosphere::cloudRenderResolutionScaleObject(),
       0.05f, 0.25f, 1.0f, "%.2f", sliderFlags);
     RemixGui::SetTooltipToLastWidgetOnHover(

@@ -96,12 +96,19 @@ Texture3D<float4> AtmosphereCloudDetailNoise3D;
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void main(uint3 dispatchId : SV_DispatchThreadID) {
-  uint2 pixelCoord = dispatchId.xy;
+  AtmosphereArgs args = atmosphereArgs;
+
+  // Row interleave (fork -- 2026-09-16, perf). With period P the dispatch covers 1/P of the rows
+  // and this thread marches row P * y + phase; the other rows keep the previous frames' values.
+  // Rows rather than a checkerboard because the march is warp-synchronous: a per-lane skip inside
+  // a workgroup would idle lanes while the warp still ran the longest march in it. RtxAtmosphere
+  // forces P = 1 on any frame the cloud inputs change or the camera cuts.
+  const uint period = max(args.cloudDomeInterleave & 0xFFu, 1u);
+  const uint phase = (args.cloudDomeInterleave >> 8u) & 0xFFu;
+  uint2 pixelCoord = uint2(dispatchId.x, dispatchId.y * period + phase);
   uint2 lutDim;
   cloudSecondaryLutOutput.GetDimensions(lutDim.x, lutDim.y);
   if (any(pixelCoord >= lutDim)) return;
-
-  AtmosphereArgs args = atmosphereArgs;
 
   // Clear-sky early-out — mirrors cloud_render so the LUT reads "no cloud,
   // full transmittance" under exactly the conditions the per-pixel pass

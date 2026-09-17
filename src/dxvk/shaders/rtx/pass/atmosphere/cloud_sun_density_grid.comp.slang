@@ -76,9 +76,17 @@ void main(uint3 dispatchId : SV_DispatchThreadID, uint3 groupThreadId : SV_Group
 
   AtmosphereArgs args = atmosphereArgs;
 
+  // Column interleave (fork -- 2026-09-16, perf). With period P the dispatch covers 1/P of the X
+  // columns and this thread bakes column P * x + phase, so neighbouring columns differ in age by at
+  // most P - 1 frames and the trilinear read blends across them. RtxAtmosphere forces P = 1 on any
+  // frame the grid's inputs change, so the interleave only ever spans frames whose bakes agree.
+  const uint period = max(args.cloudSunGridInterleave & 0xFFu, 1u);
+  const uint phase = (args.cloudSunGridInterleave >> 8u) & 0xFFu;
+  const uint3 voxel = uint3(dispatchId.x * period + phase, dispatchId.y, dispatchId.z);
+
   // Voxel center in UVW. The +0.5 puts the sample at the voxel center so
   // adjacent voxels integrate offset positions (no "ringing" between voxels).
-  vec3 uvw = (vec3(dispatchId) + 0.5f) / vec3(float(kGridX), float(kGridY), float(kGridZ));
+  vec3 uvw = (vec3(voxel) + 0.5f) / vec3(float(kGridX), float(kGridY), float(kGridZ));
 
   // UVW -> world (Y-up, km), camera-centered.
   vec3 worldPosYUp = cloudVoxelUVWToWorld(uvw, args);
@@ -89,7 +97,7 @@ void main(uint3 dispatchId : SV_DispatchThreadID, uint3 groupThreadId : SV_Group
   GroupMemoryBarrierWithGroupSync();
 
   // Every lane must reach the barrier, including padding if grid dimensions change.
-  if (any(dispatchId >= uint3(kGridX, kGridY, kGridZ))) {
+  if (any(voxel >= uint3(kGridX, kGridY, kGridZ))) {
     return;
   }
   const vec2 controls = cloudColumnControls[columnIndex];
@@ -102,5 +110,5 @@ void main(uint3 dispatchId : SV_DispatchThreadID, uint3 groupThreadId : SV_Group
       worldPosYUp, sunDirYUp, controls, args, cloudNoise3DSamplerState,
       cloudNvdfSdfSrv, cloudDetailNoiseSrv);
 
-  cloudDSunGridOutput[dispatchId] = opticalDepth;
+  cloudDSunGridOutput[voxel] = opticalDepth;
 }

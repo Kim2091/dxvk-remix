@@ -40,7 +40,13 @@ plus one consumer wire-in inside the volumetric pass.
    after the cumulus-on-terrain shadow visibility fix made the
    staggered bake read as a ~2 Hz shadow stutter at low fps; full
    rate eliminates the stutter at ~8x bake cost. Consumers read
-   zero-stale grids.
+   zero-stale grids. The ambient grid integrates each column once
+   (`cloudAmbientColumnScan`). The sun grid may re-bake only every
+   second or fourth X column per frame (`cloudSunGridInterleaveMode`,
+   default half): neighbouring columns are then at most one period
+   old and the trilinear read blends across them, and any frame the
+   grid's inputs cross a re-bake step forces a full bake -- so, unlike
+   the old stagger, no frame ever shows the whole grid jump at once.
 
 3. **Cloud-sky-transmittance LUT** --
    [`cloud_sky_transmittance_lut.comp.slang`](../src/dxvk/shaders/rtx/pass/atmosphere/cloud_sky_transmittance_lut.comp.slang)
@@ -72,13 +78,23 @@ plus one consumer wire-in inside the volumetric pass.
    sampling it for a non-primary ray direction would return the
    wrong cloud.
 
-6. **Cloud history smoother** -- a two-buffer ping-pong with an
-   R16_UINT frame-id companion buffer (see
-   [`rtx_fork_atmosphere.cpp:230-258`](../src/dxvk/rtx_render/rtx_fork_atmosphere.cpp))
-   accumulates the cloud RT across frames. Per-pixel age tracking
-   lets the shader reject stale history at foreground-occluded
-   slots, killing the bright-trail ghosting that the cloud
-   accumulator would otherwise leave behind moving geometry.
+6. **Temporal interleave** (2026-09-16; replaces the cloud history
+   smoother, which was removed on 2026-09-14 for the smear it left
+   behind moving geometry). With `cloudScreenInterleaveMode` at its
+   default (half), each thread of the cloud pass owns a 2x1 cell and
+   ray-marches one pixel of it per frame -- the fresh pixel alternates
+   in a checkerboard -- while the other pixel is reprojected from the
+   previous frame's RT along the camera rotation. A reprojected pixel
+   is accepted only if every bilinear tap resolves the same surface
+   class at a matching distance (the depth companion's `.z`); a
+   silhouette or a moving object fails that and is marched fresh, so
+   there is no blending across edges and nothing older than one
+   period. Full marches run on camera cuts, during lightning, and on
+   any frame the cloud, sun or camera inputs cross a re-bake step.
+   The RT and depth companion are a ping-pong pair for this; the
+   composite reads the current one. Quarter (2x2) is available.
+   The reflection dome has the same option
+   (`cloudSecondaryLutInterleaveMode`, rows instead of pixels).
 
 ## What the clouds shade
 
@@ -341,7 +357,9 @@ future-work item.
   discontinuity.
 - **Half-res reprojection.** Decima paper pp. 174-176 -- a follow-on
   perf path that would let `cloudViewSamples` rise without proportional
-  cost.
+  cost. The 2026-09-16 temporal interleave is the full-resolution half
+  of this (every pixel still marched, at 1/2 or 1/4 rate); a genuinely
+  reduced-resolution reconstruction remains open.
 - **Runtime-baked NVDF + SDF.** A C-procedural cloud field replacing
   the prebaked FBM noise volume; preserves the macro/micro decoupling
   at cumulus silhouettes that the FBM cannot.

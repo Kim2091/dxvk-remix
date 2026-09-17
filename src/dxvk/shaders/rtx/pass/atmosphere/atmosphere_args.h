@@ -807,4 +807,16 @@ struct AtmosphereArgs {
   // means no local-light shadow rays at all, which leaves lights glowing through walls but costs
   // nothing - the same trade the sun term makes past aerialPerspectiveSceneShadowRange.
   float aerialPerspectiveLocalLightShadowRange;
+
+  // ----- Cloud temporal interleave (fork -- 2026-09-16, perf) -----
+  // One whole vec4 row (CB alignment rule above). Each cloud dispatch that spreads its work across
+  // frames reads its period (bits 0-7: 1, 2 or 4) and this frame's phase (bits 8-15) from one
+  // packed word, so a full update is simply period 1; RtxAtmosphere::resolveCloudInterleave forces
+  // that on any frame the inputs change. The screen word also carries bit 16: the previous frame's
+  // cloud RT pair is valid to reproject from. Per-frame animated, so all four are zeroed in
+  // normalizeForSkyLutCache and never key a bake.
+  uint  cloudScreenInterleave;
+  uint  cloudSunGridInterleave;
+  uint  cloudDomeInterleave;
+  float cloudReprojectDepthTolerance;  // Relative surface-distance tolerance for a reprojected tap.
 };

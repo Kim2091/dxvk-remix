@@ -106,13 +106,13 @@ public:
   const Resources::Resource& getCloudNvdfSdf() const { return m_cloudNvdfSdf[m_cloudNvdfSdfFront]; }
 
   // Screen-space RGBA16F at downscale extent: premultiplied cloud rgb + transmittance alpha, per frame.
-  const Resources::Resource& getCloudRenderRT() const { return m_cloudRenderRT; }
+  const Resources::Resource& getCloudRenderRT() const { return m_cloudRenderRT[m_cloudRenderCurrent]; }
 
   // Depth companion to the cloud render RT (fork — 2026-09-05, world-space cloud migration Stage
   // 4a). Same extent, allocated/resized alongside it (see ensureCloudRenderRT). RG32F: r = entry
   // distance, g = transmittance-weighted mean cloud depth, both in km. Written by
   // dispatchCloudScreenPass; no consumer yet (Stage 4b).
-  const Resources::Resource& getCloudDepthRT() const { return m_cloudDepthRT; }
+  const Resources::Resource& getCloudDepthRT() const { return m_cloudDepthRT[m_cloudRenderCurrent]; }
 
   // 256x256 RGBA16F dome LUT baked per frame (was 256x128 before the Stage 2 full-sphere mapping);
   // supplies clouds to secondary rays (indirect/PSR/reflection).
@@ -1335,6 +1335,27 @@ public:
                "Share vertical density integration across ambient cloud lighting voxels. "
                "Disable to use the legacy per-voxel integration.");
 
+    // Temporal interleave (fork -- 2026-09-16, perf). Each of the three per-frame cloud dispatches
+    // can spread its work over 2 or 4 frames; every one of them falls back to a full update on any
+    // frame its inputs change (see resolveCloudInterleave), so the interleave only ever spans
+    // frames whose full results would have agreed.
+    RTX_OPTION("rtx.atmosphere", int, cloudScreenInterleaveMode, 1,
+               "How many of the screen's cloud pixels are ray-marched each frame. The rest are "
+               "reprojected from the previous frame along the camera rotation, checked against the "
+               "surface the pixel now resolves, and marched fresh wherever that check fails; every "
+               "pixel is still marched at least once per period. A full march runs on any frame the "
+               "cloud, sun or camera inputs cross a re-bake step, on a camera cut, and during a "
+               "lightning flash. 0: every pixel every frame, 1: half (checkerboard), 2: a quarter (2x2).");
+    RTX_OPTION("rtx.atmosphere", int, cloudSunGridInterleaveMode, 1,
+               "How many columns of the sun-direction cloud lighting grid are re-baked each frame; "
+               "the others are at most one period old, and the trilinear read blends across "
+               "neighbouring columns of different age. A full bake still runs on any frame the "
+               "grid's inputs cross a re-bake step. 0: all columns every frame, 1: half, 2: a quarter.");
+    RTX_OPTION("rtx.atmosphere", int, cloudSecondaryLutInterleaveMode, 1,
+               "How many rows of the cloud reflection dome are re-marched each frame; the others are "
+               "at most one period old. A full bake still runs on any frame the cloud inputs cross a "
+               "re-bake step or the camera cuts. 0: all rows every frame, 1: half, 2: a quarter.");
+
     // Quantizing wind/camera motion into the voxel-grid cache key bounds staleness to this step size.
     RTX_OPTION("rtx.atmosphere", float, cloudVoxelGridRebakeGranularityKm, 0.1f,
                "Distance (km) the cloud wind scroll or camera must travel "
@@ -1557,6 +1578,9 @@ private:
   // can no longer run from inside computeLuts.
   void dispatchCloudRender(Rc<DxvkContext> ctx, const Resources::RaytracingOutput& rtOutput);
   void dispatchCloudSecondaryLut(Rc<DxvkContext> ctx);
+  // Decides this frame's interleave period for the screen pass, the sun grid and the reflection
+  // dome; called once per frame from computeLuts before any of the three dispatches reads args.
+  void resolveCloudInterleave(RtxContext& rtx, bool cloudInputsChanged);
 
   static constexpr uint32_t kTransmittanceLutWidth = 512;
   static constexpr uint32_t kTransmittanceLutHeight = 128;
@@ -1636,11 +1660,23 @@ private:
   bool                m_nvdfNominalCoverageValid = false;
   float    m_missLinearViewZ       { 1e9f };
   Resources::Resource m_cloudDetailNoise3D;
-  Resources::Resource m_cloudRenderRT;
+  // Ping-pong pair (fork -- 2026-09-16, temporal interleave): dispatchCloudRender advances
+  // m_cloudRenderCurrent, marches into the new current pair and reprojects from the other. Both
+  // halves of each pair are allocated together by ensureCloudRenderRT.
+  Resources::Resource m_cloudRenderRT[2];
   // Depth companion (fork — 2026-09-05, world-space cloud migration Stage 4a): allocated/resized
   // in lockstep with m_cloudRenderRT by ensureCloudRenderRT, same extent. See getCloudDepthRT's
   // doc comment for the channel layout.
-  Resources::Resource m_cloudDepthRT;
+  Resources::Resource m_cloudDepthRT[2];
+  uint32_t            m_cloudRenderCurrent = 0u;
+  // True once the other pair holds a complete cloud image from the previous frame at this extent.
+  bool                m_cloudRenderHistoryValid = false;
+  // True while the dome was baked last frame, so a row interleave has fresh rows to lean on.
+  bool                m_cloudDomeHistoryValid = false;
+  // This frame's resolved interleave periods (1 = full update); see resolveCloudInterleave.
+  uint32_t            m_cloudScreenPeriodThisFrame  = 1u;
+  uint32_t            m_cloudSunGridPeriodThisFrame = 1u;
+  uint32_t            m_cloudDomePeriodThisFrame    = 1u;
   VkExtent2D          m_cloudRenderExtent = { 0u, 0u };
   VkExtent2D          m_cloudRenderFullExtent = { 0u, 0u };
   RtxMipmap::Resource m_cloudSecondaryLut;

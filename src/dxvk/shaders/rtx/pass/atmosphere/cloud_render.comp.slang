@@ -168,6 +168,15 @@ Texture2D<float> PrimaryLinearViewZ;
 layout(binding = 16, rgba32f)
 RWTexture2D<float4> cloudDepthOutput;
 
+// Previous frame's cloud RT + depth companion (fork -- 2026-09-16, temporal interleave). Read only
+// on the pixels this frame does not march; see reprojectCloudPixel. RtxAtmosphere ping-pongs the
+// two pairs, so these are the images the previous dispatch wrote, never the ones bound at 6 / 16.
+layout(binding = 18)
+Texture2D<float4> PrevCloudRender;
+
+layout(binding = 19)
+Texture2D<float4> PrevCloudDepth;
+
 // Include the helper library AFTER the texture globals are declared so the
 // ATMOSPHERE_AVAILABLE-gated helper bodies resolve to our local declarations.
 #include "rtx/pass/atmosphere/atmosphere_common.slangh"
@@ -191,15 +200,193 @@ RWTexture2D<float4> cloudDepthOutput;
 #define CLOUD_GROUP_Y 8
 #endif
 
+struct CloudPixelResult {
+  vec4 color;  // premultiplied cloud rgb, view-ray transmittance
+  vec4 depth;  // entry km, transmittance-weighted mean km, surface km, unused
+};
+
+// Slant distance to the primary surface this pixel resolved, or kNoSurfaceKm on a sky miss.
+float cloudSurfaceDistanceKm(vec2 uv, CameraDirections cloudRay, AtmosphereArgs args) {
+  uint2 depthDim;
+  PrimaryLinearViewZ.GetDimensions(depthDim.x, depthDim.y);
+  // Mapped through uv rather than assuming a shared grid, so this stays correct when the cloud
+  // pass runs at a reduced resolution.
+  const int2 depthCoord = clamp(int2(uv * vec2(depthDim)), int2(0), int2(depthDim) - int2(1));
+  const float linearViewZ = PrimaryLinearViewZ[depthCoord];
+  // Sky rays carry NRD's miss sentinel. It arrives through the CB rather than as a literal so it
+  // cannot drift from the value NRD actually uses (this pass has no binding for NRD's own CB).
+  if (linearViewZ >= args.cloudMissLinearViewZ) {
+    return kNoSurfaceKm;
+  }
+  // Linear view Z is measured along the camera forward axis; the march needs slant range.
+  const float cosToForward = max(abs(cloudRay.viewDirection.z), 1e-3f);
+  return (abs(linearViewZ) / cosToForward) / max(args.worldUnitsPerKm, 1e-6f);
+}
+
+CloudPixelResult marchCloudPixel(uint2 pixelCoord, vec3 viewDirYUp, float tSurfaceKm,
+                                 bool reducedResolution, CloudShadeContext ctx, AtmosphereArgs args) {
+  float jitterStatic = fastJitter(pixelCoord, 0u).x;
+  // Reduced-resolution texels magnify animated march noise without cloud history accumulation.
+  // Keep camera projection jitter in the caller: it must still match the primary geometry rays.
+  float jitter = reducedResolution ? jitterStatic : fastJitter(pixelCoord, args.cloudRenderFrameIdx).x;
+
+  // ===== View-ray raymarch, both layers (cloud_march_common.slangh) =====
+  // evalNubisCubedSampleCore inside marchCloudSlab uses sigma = args.cloudDensity
+  // (no doubling — Nubis Cubed equations take raw cloudDensity as extinction).
+  // marchCloudLayers sequences layer 1 (cumulus) then the optional layer-2
+  // cirrus deck front-to-back, zeroing the moon coefficients for layer 2.
+  vec3 accumColor = vec3(0.0f);
+  float viewTransmittance = 1.0f;
+  float entryDistanceKm;
+  float meanCloudDepthKm;
+  // Clamped at the primary surface (fork -- 2026-09-07). This restores the one line Stage 4a had
+  // and e7298993f removed, and it is what makes cloud-vs-geometry occlusion EXACT rather than
+  // estimated: the pass integrates [0, tSurface], so what it reports IS the cloud in front of the
+  // surface. Every scalar-correction attempt before this failed because the in-scatter term
+  // C_full * (alphaFront/alphaFull) assumes radiance per unit opacity is constant along the ray;
+  // inside the deck it is not (near samples are shadowed interior, far ones lit edges), so the far
+  // cloud's colour and pattern leaked onto the surface.
+  //
+  // Why this is safe now when it ghosted before: e7298993f blamed the clamp, but the actual defect
+  // was that the temporal history had no way to notice the depth under a pixel had changed. The
+  // design this migration follows always specified BOTH halves (docs/world-space-clouds-design.md
+  // 4.4-B with 4.7) -- Stage 4a shipped only the clamp. The other half, per-tap depth validation,
+  // is what the composite's reduced-scale reconstruction and this pass's reprojection both apply.
+  marchCloudLayers(viewDirYUp, jitter, jitterStatic,
+                   /*tMinClamp=*/0.0f,
+                   /*tMaxClamp=*/tSurfaceKm,
+                   args.cloudViewSamples, ctx, args,
+                   accumColor, viewTransmittance,
+                   entryDistanceKm, meanCloudDepthKm);
+
+  CloudPixelResult result;
+  // Output is premultiplied: rgb = accumulated cloud radiance,
+  // a = view-ray cloud transmittance.
+  result.color = vec4(accumColor, viewTransmittance);
+  // Depth companion (fork — 2026-09-05, world-space cloud migration Stage 4a): r = entry distance,
+  // g = transmittance-weighted mean cloud depth, both km. .z is the surface distance this texel was
+  // clamped at -- what lets the composite's reduced-scale upsample and this pass's own reprojection
+  // pick depth-consistent neighbours. .w retired with the measured-prefix experiment.
+  result.depth = vec4(entryDistanceKm, meanCloudDepthKm, tSurfaceKm, 0.0f);
+  return result;
+}
+
+// Fills `result` from the previous frame's RT along this pixel's world direction (fork --
+// 2026-09-16, temporal interleave). Rotation-exact for sky, because a direction reprojects without
+// any depth; translation parallax on a deck kilometres away is far below a texel. A surface pixel
+// additionally needs every tap to describe the same surface class at a matching distance, else the
+// caller marches the pixel fresh -- silhouettes are always re-marched, never blended across.
+bool reprojectCloudPixel(uint2 pixelCoord, uint2 outputDim, float tSurfaceKm, AtmosphereArgs args,
+                         out CloudPixelResult result) {
+  result.color = vec4(0.0f, 0.0f, 0.0f, 1.0f);
+  result.depth = vec4(-1.0f, 0.0f, tSurfaceKm, 0.0f);
+
+  const vec2 uv = (vec2(pixelCoord) + 0.5f) / vec2(outputDim);
+  // Unjittered at both ends. The projection jitter is a sub-pixel term the cloud field cannot
+  // resolve, and dropping it is what makes a camera at rest map every pixel onto exactly itself.
+  const CameraDirections ray = cameraScreenUVToDirection(cloudCamera, uv, /*jitter=*/ false);
+  const vec4 prevClip = mul(cloudCamera.prevWorldToProjection, vec4(ray.worldDirection, 0.0f));
+  if (prevClip.w <= 1e-6f) {
+    return false;
+  }
+  const vec2 prevUv = cameraNDCToScreenUV(cloudCamera, prevClip.xy / prevClip.w);
+  if (any(prevUv < vec2(0.0f)) || any(prevUv >= vec2(1.0f))) {
+    return false;
+  }
+
+  vec2 texelF = prevUv * vec2(outputDim) - 0.5f;
+  // Float noise from the two matrix products lands a static camera a hair off its own texel;
+  // snapping keeps that case an exact copy instead of a faint four-tap blur every other frame.
+  const vec2 nearest = round(texelF);
+  if (all(abs(texelF - nearest) < 0.01f)) {
+    texelF = nearest;
+  }
+  const int2 baseTexel = int2(floor(texelF));
+  const vec2 f = texelF - vec2(baseTexel);
+  const int2 maxTexel = int2(outputDim) - int2(1);
+  const float weights[4] = {
+    (1.0f - f.x) * (1.0f - f.y), f.x * (1.0f - f.y),
+    (1.0f - f.x) * f.y,          f.x * f.y };
+  const int2 offsets[4] = { int2(0, 0), int2(1, 0), int2(0, 1), int2(1, 1) };
+  const bool currentIsSky = tSurfaceKm >= kNoSurfaceKm;
+
+  vec4 sum = vec4(0.0f);
+  float weightSum = 0.0f;
+  float cloudWeightSum = 0.0f;
+  float meanSum = 0.0f;
+  float entryKm = kNoSurfaceKm;
+  [unroll]
+  for (uint i = 0u; i < 4u; ++i) {
+    const float weight = weights[i];
+    if (weight <= 1e-4f) {
+      continue;
+    }
+    const int2 texel = clamp(baseTexel + offsets[i], int2(0), maxTexel);
+    const vec4 depth = PrevCloudDepth.Load(int3(texel, 0));
+    const bool tapIsSky = depth.z >= kNoSurfaceKm;
+    if (tapIsSky != currentIsSky) {
+      return false;
+    }
+    if (!currentIsSky
+        && abs(depth.z - tSurfaceKm) > args.cloudReprojectDepthTolerance * max(max(depth.z, tSurfaceKm), 1e-3f)) {
+      return false;
+    }
+    const vec4 value = PrevCloudRender.Load(int3(texel, 0));
+    sum += value * weight;
+    weightSum += weight;
+    // Depth must describe the same cloud taps as colour.
+    const float cloudWeight = weight * saturate(1.0f - value.a);
+    if (cloudWeight > 0.0f && depth.x >= 0.0f) {
+      cloudWeightSum += cloudWeight;
+      meanSum += depth.y * cloudWeight;
+      entryKm = min(entryKm, depth.x);
+    }
+  }
+  if (weightSum <= 1e-3f) {
+    return false;
+  }
+  result.color = sum / weightSum;
+  result.depth = cloudWeightSum > 1e-6f
+    ? vec4(entryKm, meanSum / cloudWeightSum, tSurfaceKm, 0.0f)
+    : vec4(-1.0f, 0.0f, tSurfaceKm, 0.0f);
+  return true;
+}
+
+// Which pixel of a cell is marched this frame. Period 2 alternates the x parity per row and per
+// frame (a checkerboard); period 4 walks the 2x2 diagonal-first, offset on alternate cells so the
+// fresh pixels never line up in rows.
+uint2 cloudFreshSubPixel(uint period, uint phase, uint2 cellCoord) {
+  if (period == 2u) {
+    return uint2((cellCoord.y + phase) & 1u, 0u);
+  }
+  const uint2 kQuadOrder[4] = { uint2(0u, 0u), uint2(1u, 1u), uint2(1u, 0u), uint2(0u, 1u) };
+  return kQuadOrder[(phase + ((cellCoord.x + cellCoord.y) & 1u) * 2u) & 3u];
+}
+
 [shader("compute")]
 [numthreads(CLOUD_GROUP_X, CLOUD_GROUP_Y, 1)]
 void main(uint3 dispatchId : SV_DispatchThreadID) {
-  uint2 pixelCoord = dispatchId.xy;
   uint2 outputDim;
   cloudRenderOutput.GetDimensions(outputDim.x, outputDim.y);
-  if (any(pixelCoord >= outputDim)) return;
 
   AtmosphereArgs args = atmosphereArgs;
+
+  // Temporal interleave (fork -- 2026-09-16, perf). Each thread owns a cell of `period` pixels and
+  // marches exactly one of them; the others are reprojected from the previous frame, or marched
+  // too when that fails. Keeping the split per THREAD rather than per pixel is what turns it into
+  // time: this pass is warp-synchronous, so a per-lane skip would only idle lanes while the warp
+  // still ran the longest march in it. RtxAtmosphere sets the period to 1 on any frame the cloud
+  // inputs change, the camera cuts, or lightning is live, and clears the valid bit whenever the
+  // other RT pair does not hold a complete previous frame at this extent.
+  const uint rawPeriod = args.cloudScreenInterleave & 0xFFu;
+  const uint period = rawPeriod == 4u ? 4u : (rawPeriod == 2u ? 2u : 1u);
+  const uint phase = (args.cloudScreenInterleave >> 8u) & 0xFFu;
+  const bool historyValid = (args.cloudScreenInterleave & 0x10000u) != 0u;
+  const uint2 cellDim = uint2(period >= 2u ? 2u : 1u, period >= 4u ? 2u : 1u);
+  const uint2 cellCoord = dispatchId.xy;
+  const uint2 cellOrigin = cellCoord * cellDim;
+  if (any(cellOrigin >= outputDim)) return;
+  const uint2 freshSub = cloudFreshSubPixel(period, phase, cellCoord);
 
   // Trivially-clear sky: no clouds means full transmittance, zero radiance.
   // Effective coverage is layer 1's mean OR layer 2's mean (whichever is
@@ -210,25 +397,19 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
     effectiveCoverageMean = max(effectiveCoverageMean, args.cloudLayer2CoverageMean);
   }
   if (args.cloudEnabled < 0.5f || effectiveCoverageMean < 0.01f || args.cloudViewSamples == 0u) {
-    cloudRenderOutput[pixelCoord] = vec4(0.0f, 0.0f, 0.0f, 1.0f);
-    // Depth companion (fork — 2026-09-05, Stage 4a): (-1, 0) is the same "no entry / no cloud"
-    // sentinel pair marchCloudLayers reports when it finds nothing -- written here too so every
-    // texel of BOTH render targets is defined every frame, matching cloudRenderOutput's coverage.
-    // Visibility 1, not 0: there is no cloud to occlude, and scaling nothing by one is still
-    // nothing. Zero here would be a different kind of "no cloud" from the one loadCurrentCloudOpacity
-    // already applies, for no benefit.
-    cloudDepthOutput[pixelCoord] = vec4(-1.0f, 0.0f, kNoSurfaceKm, 1.0f);
+    for (uint sub = 0u; sub < period; ++sub) {
+      const uint2 pixelCoord = cellOrigin + uint2(sub & 1u, sub >> 1u);
+      if (any(pixelCoord >= outputDim)) continue;
+      cloudRenderOutput[pixelCoord] = vec4(0.0f, 0.0f, 0.0f, 1.0f);
+      // Depth companion (fork — 2026-09-05, Stage 4a): (-1, 0) is the same "no entry / no cloud"
+      // sentinel pair marchCloudLayers reports when it finds nothing -- written here too so every
+      // texel of BOTH render targets is defined every frame, matching cloudRenderOutput's coverage.
+      // Visibility 1, not 0: there is no cloud to occlude, and scaling nothing by one is still
+      // nothing.
+      cloudDepthOutput[pixelCoord] = vec4(-1.0f, 0.0f, kNoSurfaceKm, 1.0f);
+    }
     return;
   }
-
-// NV-DXVK start: Use the active camera projection for Numos clouds.
-  // Normalized UV supports a cloud target smaller than the primary camera resolution.
-  const vec2 uv = (vec2(pixelCoord) + 0.5f) / vec2(outputDim);
-  // Match the primary depth ray, including temporal jitter, at geometry silhouettes.
-  const CameraDirections cloudRay = cameraScreenUVToDirection(cloudCamera, uv, /*jitter=*/ true);
-  const vec3 viewDirYUp = worldToAtmosphereYUp(
-    cloudRay.worldDirection, args.isZUp != 0u, args.flipUpAxis != 0);
-// NV-DXVK end
 
   // No below-horizon early-out (fork — 2026-09-05, world-space cloud migration Stage 1; ported
   // from archaeology commit 30d20a8f5).
@@ -247,81 +428,36 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
   // page-142 ambient term (sampleSkyAmbientForVolume) is unaffected by this removal — that helper
   // has its own below-horizon clamp and is untouched this stage.
 
-  float jitterStatic = fastJitter(pixelCoord, 0u).x;
-  // Reduced-resolution texels magnify animated march noise without cloud history accumulation.
-  // Keep camera projection jitter above: it must still match the primary geometry rays.
   const bool reducedResolution = outputDim.x < args.cloudRenderFullDimX
                               || outputDim.y < args.cloudRenderFullDimY;
-  float jitter = reducedResolution ? jitterStatic : fastJitter(pixelCoord, args.cloudRenderFrameIdx).x;
 
   // ===== Static-per-frame shading context (cloud_march_common.slangh) =====
   // Sun/sky radiances, the full per-moon precompute, combined-moon shadow
-  // direction, and the Wrenninge octave count — all pixel-independent, all
-  // extracted verbatim into buildCloudShadeContext.
+  // direction, and the Wrenninge octave count — all pixel-independent, built once per thread.
   CloudShadeContext ctx = buildCloudShadeContext(args);
 
-  // ===== View-ray raymarch, both layers (cloud_march_common.slangh) =====
-  // evalNubisCubedSampleCore inside marchCloudSlab uses sigma = args.cloudDensity
-  // (no doubling — Nubis Cubed equations take raw cloudDensity as extinction).
-  // marchCloudLayers sequences layer 1 (cumulus) then the optional layer-2
-  // cirrus deck front-to-back, zeroing the moon coefficients for layer 2.
-  // Clamp to the primary surface; composite validates history against this depth.
-  float tSurfaceKm = kNoSurfaceKm;
-  {
-    uint2 depthDim;
-    PrimaryLinearViewZ.GetDimensions(depthDim.x, depthDim.y);
-    // Mapped through uv rather than assuming a shared grid, so this stays correct when the cloud
-    // pass runs at a reduced resolution.
-    const int2 depthCoord = clamp(int2(uv * vec2(depthDim)), int2(0), int2(depthDim) - int2(1));
-    const float linearViewZ = PrimaryLinearViewZ[depthCoord];
-    // Sky rays carry NRD's miss sentinel. It arrives through the CB rather than as a literal so it
-    // cannot drift from the value NRD actually uses (this pass has no binding for NRD's own CB).
-    if (linearViewZ < args.cloudMissLinearViewZ)
-    {
-      // Linear view Z is measured along the camera forward axis; the march needs slant range.
+  for (uint sub = 0u; sub < period; ++sub) {
+    const uint2 subOffset = uint2(sub & 1u, sub >> 1u);
+    const uint2 pixelCoord = cellOrigin + subOffset;
+    if (any(pixelCoord >= outputDim)) continue;
+
 // NV-DXVK start: Use the active camera projection for Numos clouds.
-      const float cosToForward = max(abs(cloudRay.viewDirection.z), 1e-3f);
+    // Normalized UV supports a cloud target smaller than the primary camera resolution.
+    const vec2 uv = (vec2(pixelCoord) + 0.5f) / vec2(outputDim);
+    // Match the primary depth ray, including temporal jitter, at geometry silhouettes.
+    const CameraDirections cloudRay = cameraScreenUVToDirection(cloudCamera, uv, /*jitter=*/ true);
 // NV-DXVK end
-      tSurfaceKm = (abs(linearViewZ) / cosToForward) / max(args.worldUnitsPerKm, 1e-6f);
+    // Clamp to the primary surface; composite validates its taps against this depth.
+    const float tSurfaceKm = cloudSurfaceDistanceKm(uv, cloudRay, args);
+
+    CloudPixelResult result;
+    const bool fresh = !historyValid || all(subOffset == freshSub);
+    if (fresh || !reprojectCloudPixel(pixelCoord, outputDim, tSurfaceKm, args, result)) {
+      const vec3 viewDirYUp = worldToAtmosphereYUp(
+        cloudRay.worldDirection, args.isZUp != 0u, args.flipUpAxis != 0);
+      result = marchCloudPixel(pixelCoord, viewDirYUp, tSurfaceKm, reducedResolution, ctx, args);
     }
+    cloudRenderOutput[pixelCoord] = result.color;
+    cloudDepthOutput[pixelCoord] = result.depth;
   }
-
-  vec3 accumColor = vec3(0.0f);
-  float viewTransmittance = 1.0f;
-  float entryDistanceKm;
-  float meanCloudDepthKm;
-  // Clamped at the primary surface (fork -- 2026-09-07). This restores the one line Stage 4a had
-  // and e7298993f removed, and it is what makes cloud-vs-geometry occlusion EXACT rather than
-  // estimated: the pass integrates [0, tSurface], so what it reports IS the cloud in front of the
-  // surface. Every scalar-correction attempt before this failed because the in-scatter term
-  // C_full * (alphaFront/alphaFull) assumes radiance per unit opacity is constant along the ray;
-  // inside the deck it is not (near samples are shadowed interior, far ones lit edges), so the far
-  // cloud's colour and pattern leaked onto the surface.
-  //
-  // Why this is safe now when it ghosted before: e7298993f blamed the clamp, but the actual defect
-  // was that the temporal history had no way to notice the depth under a pixel had changed. The
-  // design this migration follows always specified BOTH halves (docs/world-space-clouds-design.md
-  // 4.4-B with 4.7) -- Stage 4a shipped only the clamp. The other half, per-tap depth validation in
-  // fetchCloudHistoryBilinear, lands with this change. Rotation reprojection stays exact for a
-  // clamped value, because under rotation with static geometry the surface depth along a world
-  // direction is invariant; what changes it is moving objects and translation parallax, and the
-  // depth test is precisely what rejects the former.
-  marchCloudLayers(viewDirYUp, jitter, jitterStatic,
-                   /*tMinClamp=*/0.0f,
-                   /*tMaxClamp=*/tSurfaceKm,
-                   args.cloudViewSamples, ctx, args,
-                   accumColor, viewTransmittance,
-                   entryDistanceKm, meanCloudDepthKm);
-
-  // Output is premultiplied: rgb = accumulated cloud radiance,
-  // a = view-ray cloud transmittance.
-  cloudRenderOutput[pixelCoord] = vec4(accumColor, viewTransmittance);
-
-  // Depth companion (fork — 2026-09-05, world-space cloud migration Stage 4a): r = entry distance,
-  // g = transmittance-weighted mean cloud depth, both km. Written unconditionally so every texel is
-  // defined every frame, matching cloudRenderOutput's coverage above. No consumer yet -- Stage 4b.
-  // .z is the surface distance this texel was clamped at -- kept because a depth-aware upsample
-  // needs it once the cloud pass runs below full resolution, and it is the natural thing to inspect
-  // when the clamp misbehaves. .w retired with the measured-prefix experiment.
-  cloudDepthOutput[pixelCoord] = vec4(entryDistanceKm, meanCloudDepthKm, tSurfaceKm, 0.0f);
 }

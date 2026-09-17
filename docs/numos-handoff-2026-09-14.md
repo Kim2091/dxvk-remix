@@ -1,5 +1,14 @@
 # Numos handoff - 2026-09-14
 
+## 2026-09-16 update
+
+See `docs/numos-optimizations-2026-09-16.md` for the measured per-pass baseline (from the game's own
+`rtx.profile.gpuStages` log) and the temporal-interleave work that followed it: the screen pass now
+marches half the pixels per frame and reprojects the rest (`cloudScreenInterleaveMode`), the sun grid
+bakes half its columns per frame (`cloudSunGridInterleaveMode`), and the reflection dome marches half
+its rows per frame (`cloudSecondaryLutInterleaveMode`). All three fall back to a full update whenever
+the cloud inputs change. Everything below this section predates that work.
+
 ## Start here
 
 - Actual renderer repo: `C:\Users\sparkles\Projects\Fable_5_testing\wsn3g`, branch `revised-9-10`.
