@@ -2,6 +2,34 @@
 #pragma once
 #include "rtx/pass/sharc/sharc_sdk.slangh"
 #include "rtx/pass/sharc/sharc_binding_indices.h"
+#include "rtx/utility/debug_view_indices.h"
+
+#if SHARC_UPDATE
+// Per-path tally behind DEBUG_VIEW_SHARC_UPDATE_DEPOSIT and _BUDGET. The update stage is the only
+// place the deposit distribution is visible -- the query-side Cached Radiance view shows a cell
+// mean, which is a different and smaller quantity -- and maxDepositLuminance is set against this
+// one. Kept outside the deferred guard so the hook signatures are the same on both backends;
+// only the deferred backend fills it in, which is also the only backend the clamp applies to.
+struct SharcDepositStats {
+  float peakLuminance;  // brightest deposit this path made, measured before the clamp
+  uint clamped;         // how many of its deposits the clamp caught
+  uint deposits;        // how many it made at all
+};
+
+SharcDepositStats sharcDepositStatsInit() {
+  SharcDepositStats stats;
+  stats.peakLuminance = 0.0f;
+  stats.clamped = 0;
+  stats.deposits = 0;
+  return stats;
+}
+
+// cb.debugView is uniform, so this whole tally costs one uniform branch when no view is selected.
+bool sharcUpdateDebugActive() {
+  return cb.debugView == DEBUG_VIEW_SHARC_UPDATE_DEPOSIT || cb.debugView == DEBUG_VIEW_SHARC_UPDATE_BUDGET;
+}
+#endif
+
 
 layout(binding = SHARC_BINDING_HASH)
 RWStructuredBuffer<HashGridKey> SharcHash;

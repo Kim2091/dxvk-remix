@@ -521,6 +521,32 @@ namespace dxvk {
                                                "The resolved cell at the selected vertex: R - frames accumulated, G - frames since the\n"
                                                "last sample (evicted at rtx.sharc.staleFrames), B - sample count. Black - no cell yet.\n"
                                                "Raw values: pick a channel with a pseudo-colour mode and set the max value."},
+        {DEBUG_VIEW_SHARC_CELL_FOOTPRINT,      "SHARC Grid: Cell Footprint at Bounce ROUND(Debug Knob [0])",
+                                               "How large the cache cell at the selected vertex is on screen, which is what rtx.sharc.gridScale\n"
+                                               "is really setting. R - cell width in screen pixels, G - voxel size in world units, B - distance\n"
+                                               "from the camera. Cells are world-space and step in powers of two with distance, so R is the\n"
+                                               "number to watch: far below 1 spends cache entries finer than you can see and starves each of\n"
+                                               "samples; far above 1 reuses one answer across visibly different surfaces and reads as blocky\n"
+                                               "indirect light. Raise gridScale to shrink cells, lower it to grow them.\n"
+                                               "Raw values: pick a channel with a pseudo-colour mode and set the max value."},
+        {DEBUG_VIEW_SHARC_UPDATE_DEPOSIT,      "SHARC Update: Deposit Luminance",
+                                               "Written by the update pass, so one pixel per rtx.sharc.updateTileSize tile is lit and the rest\n"
+                                               "stay black. This is the quantity rtx.sharc.maxDepositLuminance actually bounds, which 'Cached\n"
+                                               "Radiance' is not: that view shows a cell mean, this shows a single deposit.\n"
+                                               "  R - the brightest luminance this path deposited, measured before the clamp\n"
+                                               "  G - how many of its deposits the clamp caught\n"
+                                               "  B - how many deposits it made at all\n"
+                                               "Set the threshold from R: read it over surfaces you want bright, then set maxDepositLuminance\n"
+                                               "above that. If G is non-zero across ordinary surfaces rather than on scattered pixels, the\n"
+                                               "threshold is clipping the signal instead of its tail.\n"
+                                               "Raw values: pick a channel with a pseudo-colour mode and set the max value."},
+        {DEBUG_VIEW_SHARC_UPDATE_BUDGET,       "SHARC Update: Budget Lattice",
+                                               "One pixel per update tile, so the spacing between lit pixels is rtx.sharc.updateTileSize and\n"
+                                               "the whole lattice is the frame's update budget. It shrinks with the *render* resolution, not\n"
+                                               "the output resolution, which is why a lower DLSS preset feeds the cache fewer paths.\n"
+                                               "  Green - the path deposited into at least one cell\n"
+                                               "  Red - it deposited into none: rejected, or it left the scene\n"
+                                               "Black pixels are not failures, they are the 63 of every 64 pixels no path was traced for."},
 
         {DEBUG_VIEW_SSS_DIFFUSION_PROFILE_SAMPLING,       "SSS Diffusion Profile Sampling" },
         {DEBUG_VIEW_NRD_INSTANCE_0_VALIDATION_LAYER,      "NRD Instance 0 Validation Layer", "Requires NRD and \"NRD/Common Settings/Validation Layer\" enabled" },

@@ -263,7 +263,17 @@
 #define DEBUG_VIEW_SHARC_GRID_CELLS 585          // hash-coloured cell at the vertex
 #define DEBUG_VIEW_SHARC_GRID_LEVEL 586          // R level, G voxel size, B last resolve leg
 #define DEBUG_VIEW_SHARC_CELL_AGE 587            // R accumulated frames, G stale frames, B sample count
+#define DEBUG_VIEW_SHARC_CELL_FOOTPRINT 588      // R cell width in screen pixels, G voxel size in world units, B camera distance
 #define DEBUG_VIEW_NRC_IS_OUTSIDE_SCENE_AABB 590
+
+// SHARC update stages (fork, 2026-09-16). Written from the update dispatch rather than the query
+// stages, so they are sparse by construction: the update pass traces one path per
+// rtx.sharc.updateTileSize tile of the *render* target, and each of these lights the one source
+// pixel that tile sampled. That sparsity is the point -- it is the update budget made visible.
+// A second block because 590 belongs to NRC; the shader gates this one on SHARC_UPDATE, so the
+// query stages compile none of it.
+#define DEBUG_VIEW_SHARC_UPDATE_DEPOSIT 591      // R peak deposit luminance before the clamp, G deposits clamped, B deposits made
+#define DEBUG_VIEW_SHARC_UPDATE_BUDGET 592       // green the path fed a cell, red it fed none
 
 #define DEBUG_VIEW_IS_BAKED_TERRAIN 600
 #define DEBUG_VIEW_TERRAIN_MAP  601

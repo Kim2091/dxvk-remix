@@ -326,8 +326,14 @@ namespace dxvk {
               || slot.slot == INTEGRATE_INDIRECT_BINDING_RESTIR_GI_RESERVOIR_OUTPUT
               || slot.slot == INTEGRATE_INDIRECT_BINDING_RESTIR_GI_RADIANCE_OUTPUT
               || slot.slot == INTEGRATE_INDIRECT_BINDING_RESTIR_GI_HIT_GEOMETRY_OUTPUT
-              || slot.slot == INTEGRATE_INDIRECT_BINDING_NEE_CACHE_TASK
-              || slot.slot == BINDING_DEBUG_VIEW_TEXTURE;
+              || slot.slot == INTEGRATE_INDIRECT_BINDING_NEE_CACHE_TASK;
+          // BINDING_DEBUG_VIEW_TEXTURE is deliberately kept. It used to be dropped here because
+          // every debug write in the indirect integrator is guarded by !SHARC_UPDATE, which folds
+          // to false and takes the binding with it. DEBUG_VIEW_SHARC_UPDATE_DEPOSIT and _BUDGET
+          // are the first views written from the update stage, and the update pass is the only
+          // place the deposit distribution and the tile lattice exist at all. The resource is
+          // already bound for every dispatch by bindCommonRayTracingResources, and the writes sit
+          // behind a uniform compare on cb.debugView, so production pays one branch.
         }), slots.end());
         for (auto& slot : slots) {
           if (slot.slot == INTEGRATE_INDIRECT_BINDING_NEE_CACHE_THREAD_TASK) {

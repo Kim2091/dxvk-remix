@@ -88,7 +88,7 @@ bool sharcFootprintValid(float launchPerceptualRoughness, float segmentLength, f
 // contiguous so that one compare covers all of them.
 bool sharcDebugViewActive()
 {
-  return cb.debugView >= DEBUG_VIEW_SHARC_QUERY_OUTCOME && cb.debugView <= DEBUG_VIEW_SHARC_CELL_AGE;
+  return cb.debugView >= DEBUG_VIEW_SHARC_QUERY_OUTCOME && cb.debugView <= DEBUG_VIEW_SHARC_CELL_FOOTPRINT;
 }
 
 // Per-pixel views show one indirect vertex: ROUND(debugKnob.x) selects it, 0 being the first
@@ -135,9 +135,23 @@ void sharcDebugVertex(PathState pathState, SurfaceInteraction surfaceInteraction
   case DEBUG_VIEW_SHARC_GRID_CELLS:
   case DEBUG_VIEW_SHARC_GRID_LEVEL:
   case DEBUG_VIEW_SHARC_CELL_AGE:
+  case DEBUG_VIEW_SHARC_CELL_FOOTPRINT:
   {
     SharcParameters p = makeSharcParameters(pathState.portalSpace);
-    if (cb.debugView == DEBUG_VIEW_SHARC_GRID_CELLS)
+    if (cb.debugView == DEBUG_VIEW_SHARC_CELL_FOOTPRINT)
+    {
+      // What gridScale is really choosing is the cell's size relative to a pixel, not its size in
+      // world units: the grid steps in powers of two with camera distance precisely so that the
+      // ratio stays roughly fixed. One pixel subtends 2 * screenSpacePixelSpreadHalfAngle, so at
+      // distance d it covers about 2 * d * tan(half angle) in world units, and the cell is that
+      // many pixels across.
+      const uint level = HashGridGetLevel(surfaceInteraction.position, p.hashGridParameters);
+      const float voxelSize = HashGridGetVoxelSize(level, p.hashGridParameters);
+      const float distance = length(surfaceInteraction.position - cameraGetWorldPosition(cb.camera));
+      const float pixelSize = 2.0f * distance * tan(cb.screenSpacePixelSpreadHalfAngle);
+      storeInDebugView(pixel, vec4(pixelSize > 0.0f ? voxelSize / pixelSize : 0.0f, voxelSize, distance, 1.0f));
+    }
+    else if (cb.debugView == DEBUG_VIEW_SHARC_GRID_CELLS)
     {
       storeInDebugView(pixel, HashGridDebugColoredHash(surfaceInteraction.position, surfaceInteraction.geometryNormal, p.hashGridParameters));
     }
@@ -345,7 +359,8 @@ void sharcOnPathStart(inout PathState pathState, uvec2 pixel, GeometryFlags geom
 // light plus the weighted sky) and is flushed first, so the retry cannot credit it a second
 // incoming sample.
 void sharcOnSegmentEnd(inout PathState pathState, uvec2 pixel, GeometryFlags geometryFlags,
-  vec3 rayOrigin, float rayConeRadius, uint mediumMaterialIndex, inout uint retriesLeft)
+  vec3 rayOrigin, float rayConeRadius, uint mediumMaterialIndex, inout uint retriesLeft,
+  inout SharcDepositStats stats)
 {
   // A miss at bounce 1 leaves bounceIteration at 0 (integratePathVertex decrements it on a
   // miss) with continuePath false; every other outcome leaves it at 1 or more.
@@ -365,7 +380,7 @@ void sharcOnSegmentEnd(inout PathState pathState, uvec2 pixel, GeometryFlags geo
   }
   --retriesLeft;
 #ifdef SHARC_DEFERRED_UPDATE
-  sharcFlushVertices(pathState.sharcState);
+  sharcFlushVertices(pathState.sharcState, stats);
   pathState.sharcState.count = 0;
 #else
   SharcInit(pathState.sharcState);
@@ -387,6 +402,25 @@ void sharcOnSegmentEnd(inout PathState pathState, uvec2 pixel, GeometryFlags geo
   // A cosine lobe is a diffuse gather.
   pathState.skyGatherEligible = true;
   pathState.continuePath = true;
+}
+
+// Called once per update path, after its final flush. The update dispatch is one path per
+// updateTileSize tile of the render target, so exactly one pixel per tile is written and the rest
+// of the frame stays black -- that lattice is the update budget, drawn to scale.
+void sharcDebugUpdate(uvec2 pixel, SharcDepositStats stats)
+{
+  switch (cb.debugView)
+  {
+  case DEBUG_VIEW_SHARC_UPDATE_DEPOSIT:
+    storeInDebugView(pixel, vec4(stats.peakLuminance, float(stats.clamped), float(stats.deposits), 1.0f));
+    break;
+  case DEBUG_VIEW_SHARC_UPDATE_BUDGET:
+    // Green fed a cell, red fed none. The palette helper lives in the query-only block above.
+    storeInDebugView(pixel, stats.deposits > 0 ? vec3(0.0f, 1.0f, 0.0f) : vec3(1.0f, 0.0f, 0.0f));
+    break;
+  default:
+    break;
+  }
 }
 #endif
 

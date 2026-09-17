@@ -79,7 +79,7 @@ void sharcSeedVertex(inout SharcUpdateState state, vec3 radiance, vec3 weight) {
 // tracer's output but never the value stored here; 0 disables it, as in fireflyFiltering
 // itself.  The running propagated value is deliberately left alone: clamping only the deposit
 // bounds every cell in the chain by the same rule without altering path propagation.
-void sharcFlushVertices(SharcUpdateState state) {
+void sharcFlushVertices(SharcUpdateState state, inout SharcDepositStats stats) {
   SharcParameters p = makeSharcParameters();
   vec3 radiance = vec3(0.0f);
   [unroll]
@@ -88,6 +88,14 @@ void sharcFlushVertices(SharcUpdateState state) {
       radiance = state.radiance[i] + state.weights[i] * radiance;
       const vec3 deposit = fireflyFiltering(radiance, cb.sharcArgs.maxDepositLuminance);
       SharcAddVoxelData(p, state.indices[i], deposit, vec3(1.0f), vec3(0.0f, 0.0f, 1.0f), 0.0f, 1);
+      if (sharcUpdateDebugActive()) {
+        // Measured before the clamp: the point of the view is to show the distribution the
+        // threshold is being chosen against, which clamping would hide.
+        const float luminance = calcBt709Luminance(radiance);
+        stats.peakLuminance = max(stats.peakLuminance, luminance);
+        stats.clamped += (cb.sharcArgs.maxDepositLuminance > 0.0f && luminance > cb.sharcArgs.maxDepositLuminance) ? 1u : 0u;
+        stats.deposits += 1u;
+      }
     }
   }
 }

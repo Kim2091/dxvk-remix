@@ -1491,6 +1491,8 @@ void integrateIndirectPath(
   // above, and it happens whether or not the path launches (see the hook); the retry budget is
   // loop state, not payload.
   uint sharcSkyRetries = (cb.sharcArgs.enabled >> SHARC_UPDATE_SKY_RETRY_SHIFT) & SHARC_UPDATE_SKY_RETRY_MASK;
+  // Debug-view tally only; the sky retry flushes too, so it has to survive across both flushes.
+  SharcDepositStats sharcDepositStats = sharcDepositStatsInit();
   if (cb.enableSecondaryBounces)
   {
     sharcOnPathStart(pathState, gbufferPixelCoordinate, geometryFlags, mediumMaterialIndex, firstHitPerceptualRoughness);
@@ -1540,12 +1542,13 @@ void integrateIndirectPath(
       DEBUG_VIEW_SECONDARY_RAY_AND_UNORDERED_INTERACTIONS,
       (!SHARC_UPDATE && TRUE_OR_CHECK_WHEN_NRC_ENABLED(pathState.isNrcQuery)));
 #if SHARC_UPDATE
-    sharcOnSegmentEnd(pathState, gbufferPixelCoordinate, geometryFlags, rayOrigin, rayConeRadius, mediumMaterialIndex, sharcSkyRetries);
+    sharcOnSegmentEnd(pathState, gbufferPixelCoordinate, geometryFlags, rayOrigin, rayConeRadius, mediumMaterialIndex, sharcSkyRetries, sharcDepositStats);
 #endif
   }
 
 #if SHARC_UPDATE && SHARC_DEFERRED_UPDATE
-  sharcFlushVertices(pathState.sharcState);
+  sharcFlushVertices(pathState.sharcState, sharcDepositStats);
+  sharcDebugUpdate(gbufferPixelCoordinate, sharcDepositStats);
 #endif
 
 #if !SHARC_UPDATE
