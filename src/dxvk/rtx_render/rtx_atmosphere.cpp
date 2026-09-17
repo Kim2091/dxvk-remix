@@ -543,7 +543,7 @@ namespace {
     args.cloudDetailLodBias            = 0.0f;
     args.cloudDetailLodEnable          = 0u;
     args.cloudScreenStepScale          = 0.0f;
-    args.padCloudLod0                  = 0.0f;
+    args.cloudHistoryClampGamma        = 0.0f;
     // BUG FIX (2026-07-16): starRotation was not zeroed anywhere, re-baking the entire LUT cascade every
     // frame at night. Zeroed here in the base so every derived key inherits it.
     args.starBrightness              = 0.0f;
@@ -1359,7 +1359,7 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
     args.cloudDetailLodBias   = RtxAtmosphere::cloudDetailLodBias();
     args.cloudDetailLodEnable = RtxAtmosphere::cloudDetailLodMode() >= 2 ? 1u : 0u;
     args.cloudScreenStepScale = 1.0f;
-    args.padCloudLod0         = 0.0f;
+    args.cloudHistoryClampGamma = std::max(RtxAtmosphere::cloudHistoryClampGamma(), 0.0f);
   }
 
   // Voxel-grid cloud-on-terrain shadow plumbing (fork — 2026-05-12, C6).
@@ -3897,8 +3897,27 @@ AtmosphereArgs RtxAtmosphere::updateFrame(RtxContext& ctx,
     // temporal history (see m_cloudAnchorCutThisFrame there) — the same class of fix
     // RtCamera::isCameraCut() feeds elsewhere in the runtime for denoiser/history state, just built
     // on a signal that actually fires here.
+    // Judged against how fast the anchor has RECENTLY been moving, not against the fixed threshold
+    // alone (fork -- 2026-09-17, flying judder). The absolute test on its own is the same
+    // hysteresis-free positional trigger as the 47 m voxel key, and the CloudHistory counters this
+    // run added caught it doing the same thing: resetCut fired ~10 times per 120 frames in sustained
+    // runs during ordinary play, so history was being destroyed on 8% of frames. That is the
+    // reported "judder where the accumulation resets and the clouds suddenly aren't blurry any more,
+    // then get blurry again over and over" -- reset, sharp, re-converge, reset.
+    //
+    // Whatever makes this anchor jump half a kilometre between frames (it is pushed per-frame by the
+    // game integration rather than derived from a view matrix), a real cut is distinguished from it
+    // by being an OUTLIER against recent motion, not by crossing a fixed distance. Flying steadily
+    // at 0.6 km/frame settles the average at 0.6 and needs ~5 km to trip; standing still needs only
+    // cloudAnchorCutKm, so a teleport out of a stationary camera still registers at once.
+    const float deltaLenKm = length(deltaKm);
+    m_cloudAnchorSpeedEmaKm = m_cloudAnchorSpeedEmaKm <= 0.0f
+      ? deltaLenKm
+      : (0.9f * m_cloudAnchorSpeedEmaKm + 0.1f * deltaLenKm);
+    constexpr float kAnchorCutOutlierFactor = 8.0f;
     m_cloudAnchorCutThisFrame =
-      length(deltaKm) > std::max(RtxAtmosphere::cloudAnchorCutKm(), 0.0f);
+      deltaLenKm > std::max(RtxAtmosphere::cloudAnchorCutKm(), 0.0f)
+      && deltaLenKm > kAnchorCutOutlierFactor * m_cloudAnchorSpeedEmaKm;
 
     m_cloudAnchor.rawWorldUnits         = rawWorldUnits;
     m_cloudAnchor.rawWorldUnitsFreecam  = rawWorldUnitsFreecam;

@@ -203,6 +203,10 @@ Texture2D<float4> PrevCloudDepth;
 struct CloudPixelResult {
   vec4 color;  // premultiplied cloud rgb, view-ray transmittance
   vec4 depth;  // entry km, transmittance-weighted mean km, surface km, unused
+  // Per-channel spread of the history taps this value was reconstructed from, used as the local
+  // signal scale for the neighbourhood clamp. Zero on a freshly marched pixel, which has no
+  // neighbourhood of its own to measure (fork -- 2026-09-17).
+  vec4 sigma;
 };
 
 // Slant distance to the primary surface this pixel resolved, or kNoSurfaceKm on a sky miss.
@@ -268,6 +272,7 @@ CloudPixelResult marchCloudPixel(uint2 pixelCoord, vec3 viewDirYUp, float tSurfa
                    entryDistanceKm, meanCloudDepthKm);
 
   CloudPixelResult result;
+  result.sigma = vec4(0.0f);
   // Output is premultiplied: rgb = accumulated cloud radiance,
   // a = view-ray cloud transmittance.
   result.color = vec4(accumColor, viewTransmittance);
@@ -288,6 +293,7 @@ bool reprojectCloudPixel(uint2 pixelCoord, uint2 outputDim, float tSurfaceKm, bo
                          AtmosphereArgs args, out CloudPixelResult result) {
   result.color = vec4(0.0f, 0.0f, 0.0f, 1.0f);
   result.depth = vec4(-1.0f, 0.0f, tSurfaceKm, 0.0f);
+  result.sigma = vec4(0.0f);
 
   const vec2 uv = (vec2(pixelCoord) + 0.5f) / vec2(outputDim);
   // The same jitter choice as the fresh march, at both ends (fork -- 2026-09-17): a native-scale
@@ -324,6 +330,7 @@ bool reprojectCloudPixel(uint2 pixelCoord, uint2 outputDim, float tSurfaceKm, bo
   const bool currentIsSky = tSurfaceKm >= kNoSurfaceKm;
 
   vec4 sum = vec4(0.0f);
+  vec4 sumSq = vec4(0.0f);
   float weightSum = 0.0f;
   float cloudWeightSum = 0.0f;
   float meanSum = 0.0f;
@@ -346,6 +353,7 @@ bool reprojectCloudPixel(uint2 pixelCoord, uint2 outputDim, float tSurfaceKm, bo
     }
     const vec4 value = PrevCloudRender.Load(int3(texel, 0));
     sum += value * weight;
+    sumSq += value * value * weight;
     weightSum += weight;
     // Depth must describe the same cloud taps as colour.
     const float cloudWeight = weight * saturate(1.0f - value.a);
@@ -359,6 +367,11 @@ bool reprojectCloudPixel(uint2 pixelCoord, uint2 outputDim, float tSurfaceKm, bo
     return false;
   }
   result.color = sum / weightSum;
+  // Local signal scale, free: the same four taps the bilinear fetch already loaded. Four samples is
+  // a coarse variance estimate, but it is measured from real neighbouring cloud, which is all the
+  // clamp needs -- a scale for "how far may this pixel legitimately differ from its surroundings".
+  const vec4 historyMean = result.color;
+  result.sigma = sqrt(max(sumSq / weightSum - historyMean * historyMean, vec4(0.0f)));
   result.depth = cloudWeightSum > 1e-6f
     ? vec4(entryKm, meanSum / cloudWeightSum, tSurfaceKm, 0.0f)
     : vec4(-1.0f, 0.0f, tSurfaceKm, 0.0f);
@@ -384,7 +397,29 @@ bool reprojectCloudPixel(uint2 pixelCoord, uint2 outputDim, float tSurfaceKm, bo
 // the guard only catches gross disagreement. Silhouettes, camera cuts, key changes and lightning
 // never reach here: reprojectCloudPixel rejects on depth class, and RtxAtmosphere clears the
 // history-valid bit for the rest.
-vec4 accumulateCloudHistory(vec4 marched, vec4 history, float weight) {
+vec4 accumulateCloudHistory(vec4 marched, vec4 history, vec4 historySigma,
+                            float weight, float clampGamma) {
+  // Neighbourhood clamp (fork -- 2026-09-17, flying smear). Without this the blend is unbounded: a
+  // history value can be arbitrarily wrong and still be kept at full weight, and each frame folds
+  // that error forward into the next. Flying through the deck is what exposed it, because the
+  // reprojection is rotation-only -- correct to ~0.1 px/frame at walking speed against a deck
+  // kilometres away, and badly wrong once translation, not rotation, is what moves the cloud across
+  // the screen. The history then points somewhere else entirely every frame, and nothing bounded
+  // the result: that is the smear.
+  //
+  // Clamping to the local signal scale is the standard fix and it degrades gracefully, which is the
+  // property that matters here: where the cloud is locally smooth the history must agree closely
+  // with the fresh march, so a mis-aimed reprojection is pulled back rather than accumulated; where
+  // the cloud is genuinely detailed the band is wide and the noise still averages. It bounds the
+  // damage from a wrong motion vector without needing the motion vector to be right, which is why
+  // it comes before any attempt at depth-aware reprojection.
+  //
+  // Applied to alpha as well as colour. Transmittance is where a cloud edge lives, so leaving it
+  // unclamped would let the silhouette smear even with colour held.
+  if (clampGamma > 0.0f) {
+    const vec4 halfWidth = max(historySigma * clampGamma, vec4(1.0e-4f));
+    history = clamp(history, marched - halfWidth, marched + halfWidth);
+  }
   const float kGuardStart = 0.25f;  // transmittance delta below which history is fully trusted
   const float kGuardWidth = 0.35f;  // ... and above start + this, not at all
   const float alphaDelta  = abs(history.a - marched.a);
@@ -540,7 +575,8 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
         cloudRay.worldDirection, args.isZUp != 0u, args.flipUpAxis != 0);
       result = marchCloudPixel(pixelCoord, viewDirYUp, tSurfaceKm, reducedResolution, ctx, args);
       if (haveHistory && args.cloudHistoryWeight > 0.0f) {
-        result.color = accumulateCloudHistory(result.color, history.color, args.cloudHistoryWeight);
+        result.color = accumulateCloudHistory(result.color, history.color, history.sigma,
+                                             args.cloudHistoryWeight, args.cloudHistoryClampGamma);
       }
     } else {
       result = history;

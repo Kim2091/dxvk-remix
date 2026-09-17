@@ -1113,6 +1113,17 @@ void RtxAtmosphere::showCloudSettings(const WeatherSnapshot* weatherSnapshot) {
       "freezes the jitter below native Cloud Render Scale, which trades the shimmer for fixed-pattern "
       "grain. Higher settles cleaner and lags further behind fast-moving cloud. Resets on camera "
       "cuts, lightning, and any frame the cloud inputs change. Applies live.");
+    RemixGui::DragFloat("Accumulation Clamp", &RtxAtmosphere::cloudHistoryClampGammaObject(),
+      0.05f, 0.0f, 4.0f, "%.2f", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "How far an accumulated cloud pixel may drift from what was just marched there, in standard "
+      "deviations of its own neighbourhood. This is the knob that stops smearing. Clouds are "
+      "reprojected along camera rotation only, which is accurate while the deck is far away and "
+      "increasingly wrong as you fly through it; without a clamp a wrong history is kept at full "
+      "weight and folded forward every frame, which is what makes the smear unbounded. "
+      "Lower clamps harder: less smearing when moving through cloud, and less of the sampling noise "
+      "averaged away. 0 turns the clamp off. Try 0.5 if flying still smears, 2 if the image looks "
+      "noisier than it used to. Applies live.");
     RemixGui::DragFloat("Accumulation Depth Tolerance", &RtxAtmosphere::cloudHistoryDepthToleranceObject(),
       0.005f, 0.0f, 1.0f, "%.3f", sliderFlags);
     RemixGui::SetTooltipToLastWidgetOnHover(

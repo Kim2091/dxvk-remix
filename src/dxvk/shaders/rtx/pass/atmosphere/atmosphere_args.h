@@ -834,5 +834,8 @@ struct AtmosphereArgs {
   float cloudDetailLodBias;
   uint  cloudDetailLodEnable;
   float cloudScreenStepScale;
-  float padCloudLod0;
+  // Neighbourhood clamp strength for the cloud accumulation, in standard deviations (fork --
+  // 2026-09-17). Rides the former padCloudLod0 slot, so the CB layout is unchanged. 0 disables the
+  // clamp and restores the unbounded blend. Read only by cloud_render.comp.slang.
+  float cloudHistoryClampGamma;
 };

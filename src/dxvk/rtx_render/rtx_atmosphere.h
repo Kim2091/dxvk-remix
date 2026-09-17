@@ -1346,8 +1346,17 @@ public:
                "before it is discarded, as a fraction of the larger of the two. Lower rejects more "
                "history: sharper behind moving objects, noisier at their edges.",
                args.minValue = 0.0f, args.maxValue = 1.0f);
-    RTX_OPTION("rtx.atmosphere", float, cloudHistoryClampGamma, 0.0f,
-               "Deprecated; cloud temporal smoothing has been removed.");
+    // Revived 2026-09-17 for the cloud-pass accumulator, like cloudHistoryWeight. Its old
+    // composite-side twin is gone; this one clamps in the cloud pass.
+    RTX_OPTION_ARGS("rtx.atmosphere", float, cloudHistoryClampGamma, 1.0f,
+               "How far an accumulated cloud pixel is allowed to differ from what was just marched "
+               "there, measured in standard deviations of its own neighbourhood. This is what keeps "
+               "the accumulation from smearing: cloud reprojects along camera rotation only, which "
+               "is accurate when the deck is far away and increasingly wrong as you move through it, "
+               "and without a clamp a wrong history is kept at full weight and folded forward every "
+               "frame. Lower clamps harder: less smear when flying through cloud, less noise "
+               "averaged away. 0 removes the clamp entirely. Applies live.",
+               args.minValue = 0.0f, args.maxValue = 4.0f);
     // Diagnostic, not a look knob. Two rounds of correct source reading failed to move the image,
     // so this exists to make the upscaler's actual behaviour observable.
     RTX_OPTION_ARGS("rtx.atmosphere", int, cloudDebugInjectPattern, 0,
@@ -1835,6 +1844,9 @@ private:
   uint32_t m_cloudHistoryFullMarch    = 0u;
   uint32_t m_cloudHistoryResetLook    = 0u;
   uint32_t m_cloudHistoryResetCut     = 0u;
+  // Rolling mean of recent per-frame anchor movement (km), the reference an anchor cut is judged an
+  // outlier against. See the cut test in updateFrame.
+  float    m_cloudAnchorSpeedEmaKm    = 0.0f;
   float    m_cachedPlacementCellSizeKm = 0.0f;
   float    m_cachedPlacementTileKm     = 0.0f;
   // Coverage/wind/evolution are NOT keys (sample-time inputs). cloudThickness quantized to 0.25 km
