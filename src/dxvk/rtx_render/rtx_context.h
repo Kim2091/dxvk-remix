@@ -233,7 +233,7 @@ namespace dxvk {
       uint32_t cloudRenderWidth = 0;
       uint32_t cloudRenderHeight = 0;
       uint32_t cloudDetailLod = 0;
-      float cloudStepScale = 1.0f;
+      float cloudSampleBoost = 1.0f;
       bool pending = false;
     };
     std::array<GpuStageFrame, 4> m_gpuStageFrames;

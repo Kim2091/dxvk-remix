@@ -1700,7 +1700,7 @@ namespace dxvk {
             " samples=", frame.cloudSamples, " maxSamples=", frame.cloudSamplesMax,
             " interleave=", frame.cloudScreenPeriod, "/", frame.cloudSunGridPeriod, "/", frame.cloudDomePeriod,
             " extent=", frame.cloudRenderWidth, "x", frame.cloudRenderHeight,
-            " detailLod=", frame.cloudDetailLod, " stepScale=", frame.cloudStepScale,
+            " detailLod=", frame.cloudDetailLod, " sampleBoost=", frame.cloudSampleBoost,
             " ms=", milliseconds));
         }
         if (gpuStages()) {
@@ -1711,11 +1711,11 @@ namespace dxvk {
       if (gpuStages()) {
         // The cloud state the timings above were taken under (fork -- 2026-09-17): screen / sun
         // grid / dome interleave periods as resolved this frame, the cloud RT extent, and the
-        // screen pass's detail-LOD and step-scale state.
+        // screen pass's detail-LOD and sample-boost state.
         Logger::info(str::format("[GPU stages] frame=", frame.frameId, " stage=CloudConfig interleave=",
           frame.cloudScreenPeriod, "/", frame.cloudSunGridPeriod, "/", frame.cloudDomePeriod,
           " extent=", frame.cloudRenderWidth, "x", frame.cloudRenderHeight,
-          " detailLod=", frame.cloudDetailLod, " stepScale=", frame.cloudStepScale));
+          " detailLod=", frame.cloudDetailLod, " sampleBoost=", frame.cloudSampleBoost));
         Logger::info(str::format("[GPU stages] frame=", frame.frameId, " stage=MeasuredSequence ms=",
           double(data[frame.count - 1].timestamp.time - data[0].timestamp.time) * scale));
       }
@@ -1761,7 +1761,7 @@ namespace dxvk {
       frame.cloudRenderWidth   = state.renderWidth;
       frame.cloudRenderHeight  = state.renderHeight;
       frame.cloudDetailLod     = state.detailLod;
-      frame.cloudStepScale     = state.stepScale;
+      frame.cloudSampleBoost   = state.sampleBoost;
     }
     writeTimestamp(query);
   }

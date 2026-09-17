@@ -1137,13 +1137,12 @@ void RtxAtmosphere::showCloudSettings(const WeatherSnapshot* weatherSnapshot) {
     RemixGui::SetTooltipToLastWidgetOnHover(
       "Mip levels added to the detail LOD. Negative keeps more fine detail (and more crawl), "
       "positive softens further. Applies live.");
-    RemixGui::DragFloat("Reduced-Scale Sample Spacing", &RtxAtmosphere::cloudReducedScaleStepScaleObject(),
-      0.01f, 0.25f, 1.0f, "%.2f x", sliderFlags);
+    RemixGui::DragFloat("Reduced-Scale Sample Boost (1 = cheapest)", &RtxAtmosphere::cloudReducedScaleSampleBoostObject(),
+      0.05f, 1.0f, 4.0f, "%.2f x", sliderFlags);
     RemixGui::SetTooltipToLastWidgetOnHover(
-      "Multiplier on Cloud Sample Spacing (and the adaptive step floor) while Cloud Render Scale "
-      "is below 1; Max Cloud Samples grows to match. 0.5 doubles the samples per ray, which a "
-      "quarter-scale target's 16x fewer texels pay for many times over. 1 = native spacing. "
-      "Applies live.");
+      "Extra samples per cloud ray while Cloud Render Scale is below 1, as a multiple of the "
+      "native rate: 1 = native spacing and cost, 2 = twice the samples (roughly twice the "
+      "reduced-scale march cost). Applies live.");
     RemixGui::DragFloat("Cloud Render Scale", &RtxAtmosphere::cloudRenderResolutionScaleObject(),
       0.05f, 0.25f, 1.0f, "%.2f", sliderFlags);
     RemixGui::SetTooltipToLastWidgetOnHover(

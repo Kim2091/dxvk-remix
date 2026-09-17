@@ -310,8 +310,8 @@ future-work item.
   there. Disabling the upscaler exposes the lower-res cloud silhouette
   at native pixel granularity. Below native scale
   (`cloudRenderResolutionScale < 1`) the pass marches the unjittered
-  ray with a frozen per-texel march offset, halves its sample spacing
-  (`cloudReducedScaleStepScale`), and band-limits the detail noise to
+  ray with a frozen per-texel march offset, optionally marches more
+  samples per ray (`cloudReducedScaleSampleBoost`, 1 = off), and band-limits the detail noise to
   its step by sampling the detail volume's mip chain
   (`cloudDetailLodMode`, 2026-09-17) -- without that, content the step
   cannot integrate aliases into a screen-locked block pattern that

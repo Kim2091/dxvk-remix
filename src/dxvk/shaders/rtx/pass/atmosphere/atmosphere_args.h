@@ -823,8 +823,9 @@ struct AtmosphereArgs {
   // ----- Detail LOD + reduced-scale sampling (fork -- 2026-09-17) -----
   // One whole vec4 row. cloudDetailLodEnable is resolved per dispatch by RtxAtmosphere: the screen
   // pass from cloudDetailLodMode against its render scale, the dome from mode 2 only; the grid bakes
-  // never read it. cloudScreenStepScale is applied by cloud_render alone, to its own copy of the
-  // step fields, so the dome and the bakes keep their spacing. All zeroed in normalizeForSkyLutCache.
+  // never read it. cloudScreenStepScale (1 / cloudReducedScaleSampleBoost) is applied by cloud_render
+  // alone, to its own copy of the step fields, so the dome and the bakes keep their spacing. All
+  // zeroed in normalizeForSkyLutCache.
   float cloudDetailLodBias;
   uint  cloudDetailLodEnable;
   float cloudScreenStepScale;

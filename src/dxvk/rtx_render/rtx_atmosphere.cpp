@@ -3421,21 +3421,23 @@ void RtxAtmosphere::dispatchCloudRender(Rc<DxvkContext> ctx, const Resources::Ra
 
   AtmosphereArgs args = getAtmosphereArgs();
   traceCloudPlacement(args);
-  // Reduced-scale policy (fork -- 2026-09-17): detail LOD by mode, and finer steps paid for by the
-  // smaller texel count. Patched on this dispatch's copy only; the dome and the bakes keep theirs.
+  // Reduced-scale policy (fork -- 2026-09-17): detail LOD by mode, and an optional sample boost the
+  // smaller texel count pays for. Patched on this dispatch's copy only; the dome and the bakes keep
+  // theirs. The shader takes the boost as a step multiplier (1 / boost).
   const bool reducedScale = m_cloudRenderExtent.width  < m_cloudRenderFullExtent.width
                          || m_cloudRenderExtent.height < m_cloudRenderFullExtent.height;
   const int lodMode = RtxAtmosphere::cloudDetailLodMode();
   args.cloudDetailLodEnable = (lodMode >= 2 || (lodMode == 1 && reducedScale)) ? 1u : 0u;
-  args.cloudScreenStepScale = reducedScale
-    ? std::min(std::max(RtxAtmosphere::cloudReducedScaleStepScale(), 0.25f), 1.0f) : 1.0f;
+  const float sampleBoost = reducedScale
+    ? std::min(std::max(RtxAtmosphere::cloudReducedScaleSampleBoost(), 1.0f), 4.0f) : 1.0f;
+  args.cloudScreenStepScale = 1.0f / sampleBoost;
   m_cloudProfileState.screenPeriod  = m_cloudScreenPeriodThisFrame;
   m_cloudProfileState.sunGridPeriod = m_cloudSunGridPeriodThisFrame;
   m_cloudProfileState.domePeriod    = m_cloudDomePeriodThisFrame;
   m_cloudProfileState.renderWidth   = m_cloudRenderExtent.width;
   m_cloudProfileState.renderHeight  = m_cloudRenderExtent.height;
   m_cloudProfileState.detailLod     = args.cloudDetailLodEnable;
-  m_cloudProfileState.stepScale     = args.cloudScreenStepScale;
+  m_cloudProfileState.sampleBoost   = sampleBoost;
   ctx->updateBuffer(m_constantsBuffer, 0, sizeof(AtmosphereArgs), &args);
   ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_constantsBuffer);
 

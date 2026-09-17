@@ -435,9 +435,9 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
 
   const bool reducedResolution = outputDim.x < args.cloudRenderFullDimX
                               || outputDim.y < args.cloudRenderFullDimY;
-  // Reduced-scale sampling (fork -- 2026-09-17). Part of the smaller texel count buys finer steps:
-  // the spacing and adaptive floor shrink by cloudScreenStepScale and the cap grows to match, on
-  // this pass's copy of the args only (the dome and the bakes keep their own spacing).
+  // Reduced-scale sample boost (fork -- 2026-09-17), off by default: the spacing and adaptive floor
+  // shrink by cloudScreenStepScale (= 1 / the boost) and the cap grows to match, on this pass's copy
+  // of the args only (the dome and the bakes keep their own spacing).
   if (reducedResolution && args.cloudScreenStepScale > 0.0f && args.cloudScreenStepScale < 1.0f) {
     args.cloudViewStepKm      *= args.cloudScreenStepScale;
     args.nubis3AdaptiveStepKm *= args.cloudScreenStepScale;

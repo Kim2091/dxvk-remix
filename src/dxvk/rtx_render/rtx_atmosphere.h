@@ -128,7 +128,7 @@ public:
     uint32_t renderWidth   = 0u;
     uint32_t renderHeight  = 0u;
     uint32_t detailLod     = 0u;
-    float    stepScale     = 1.0f;
+    float    sampleBoost   = 1.0f;
   };
   const CloudProfileState& getCloudProfileState() const { return m_cloudProfileState; }
 
@@ -1384,11 +1384,14 @@ public:
     RTX_OPTION("rtx.atmosphere", float, cloudDetailLodBias, 0.0f,
                "Mip bias on the cloud detail LOD, in levels. Negative keeps more detail (and more "
                "aliasing), positive softens further. Applies live.");
-    RTX_OPTION("rtx.atmosphere", float, cloudReducedScaleStepScale, 0.5f,
-               "Multiplier on the cloud sample spacing and adaptive step floor when the cloud render "
-               "scale is below 1; the sample cap grows to match. A quarter-scale target has 16x fewer "
-               "texels, so 0.5 doubles its samples per ray for a fraction of the native cost. "
-               "1 = the native spacing. Applies live.");
+    // A boost, not a spacing multiplier (fork -- 2026-09-17, second pass): the first form's minimum
+    // meant 4x the samples, so "everything to lowest" quadrupled the reduced-scale march. Here the
+    // minimum is the cheapest setting and the default.
+    RTX_OPTION("rtx.atmosphere", float, cloudReducedScaleSampleBoost, 1.0f,
+               "Extra ray-march samples per cloud ray when the cloud render scale is below 1, as a "
+               "multiplier on the native sample rate: the spacing and adaptive step floor shrink by it "
+               "and the sample cap grows by it. 1 = the native rate (cheapest); 2 doubles the samples, "
+               "which a quarter-scale target's 16x fewer texels can afford. Applies live.");
 
     // Quantizing wind/camera motion into the voxel-grid cache key bounds staleness to this step size.
     RTX_OPTION("rtx.atmosphere", float, cloudVoxelGridRebakeGranularityKm, 0.1f,

@@ -146,9 +146,10 @@ Change, one build:
    texelsPerStep is the current step in that tap's texels -- the Nyquist rule -- so a step that cannot
    integrate a band gets it filtered toward the channel mean instead of aliased. Bakes and the shadow
    taps pass lod 0 (grids unchanged). Mode 2 applies it at native scale and to the dome as an A/B.
-2. **Reduced-scale sampling** (`cloudReducedScaleStepScale`, default 0.5): the screen pass halves its
-   step target and adaptive floor and doubles its cap when its RT is below native. 16x fewer texels
-   pay for 2x the samples per ray. The dome and bakes keep their spacing.
+2. **Reduced-scale sample boost** (`cloudReducedScaleSampleBoost`, default 1 = off): optionally shrinks
+   the screen pass's step target and adaptive floor and grows its cap by the boost when its RT is below
+   native. The dome and bakes keep their spacing. (Shipped first as `cloudReducedScaleStepScale`, a
+   spacing multiplier defaulting to 0.5 -- see the regression below.)
 3. **Unjittered rays below native scale**: the reduced pass marches the unjittered camera ray (and
    reprojects unjittered), so a still camera renders bit-identical frames. The surface clamp still
    reads the jittered depth at the texel centre. At native scale the reprojection lookup now uses the
@@ -161,6 +162,33 @@ Change, one build:
 
 Held: the sun-grid block interleave (cache-coherence fix for its 0.78x) is deferred, not dropped.
 
-Expected, estimated: 25% scale with the defaults ~0.6-0.75 ms screen march (2x samples on 0.31-0.37);
-native scale unchanged in cost and appearance (LOD off there by default). Whether the LOD look at 25%
-reads as acceptable is the user's call; the bias slider trades residual crawl against softness live.
+Expected, estimated: 25% scale with the defaults ~0.35-0.5 ms screen march (the 0.31-0.37 measured
+plus the mip-sampling cost of the LOD, unmeasured); native scale unchanged in cost and appearance (LOD
+off there by default). Whether the LOD look at 25% reads as acceptable is the user's call; the bias
+slider trades residual crawl against softness live.
+
+### Regression on the first deploy (2026-09-17 00:44 session), measured
+
+The user set the Quality & performance controls to their minimums with the scale at 0.5 and saw ~3.5 ms
+of clouds. The labelled log (`stage=CloudConfig`) shows why: `stepScale=0.25`, i.e. the new spacing
+slider at its minimum, which meant FOUR times the samples per ray (step 37 m, floor 6 m, cap 256), on
+every reduced-scale frame. The numbers agree with that and with nothing else:
+
+| Segment (this session) | CloudScreen | cloud total |
+|---|---|---|
+| native, Half, sky-filled view (GBuffer 0.6 / Indirect 0.35 ms) | 3.3-3.6 | 4.4-4.6 |
+| native, Quarter, same view | 2.12-2.16 | 2.85-3.1 |
+| 25%, Quarter, 4x samples, LOD on | 1.29-1.74 | 2.0-2.5 |
+| 50%, Quarter, 4x samples, LOD on, mixed view | 2.27-2.68 (one 3.87) | 3.0-3.5 |
+
+25% at 4x samples is 0.31-0.37 x 4 = 1.3-1.5, which is what was measured, so the LOD's own cost is
+small against it but not isolated (no `detailLod=0` reduced-scale frame in the capture). The native
+3.5 ms is not a regression: that segment looked almost entirely at sky, the heaviest case for the
+march, and the same view at Quarter cost 2.1. The control was wrong, not the march: its minimum was
+the most expensive setting. Replaced by `cloudReducedScaleSampleBoost` (1 = native rate = cheapest =
+default, up to 4), the stale key was removed from the game's rtx.conf, and the log now prints
+`sampleBoost=` instead of `stepScale=`.
+
+Native Quarter at 0.61x of Half (2.14 vs 3.5 in the same view) is the first clean measurement of that
+mode; it is the full-resolution alternative to a reduced scale, at roughly the cost 50% scale would
+have at Half.
