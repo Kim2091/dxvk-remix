@@ -1463,6 +1463,45 @@ void marchCloudSlab(vec3   viewDirYUp,
     t += stepKm;
   }
 
+  // Budget-exhausted tail (fork -- 2026-09-17, "distant clouds disappear behind a hard line").
+  //
+  // A ray that hit iterCap before tExit used to simply stop, dropping whatever cloud remained along
+  // it. That is invisible while the camera is far from the slab, because only horizon-grazing rays
+  // ever reach the cap. Approach the deck and it becomes the dominant case: near the slab a ray
+  // spends its whole budget on the fine adaptive steps that cross the cloud in front of it, exhausts
+  // the cap a few km out, and deletes everything past that point. Since the exhaustion distance is
+  // roughly the same for every ray in a direction, the deletion has a sharp edge -- a hard line
+  // across the sky that moves as the camera approaches, which is exactly what was reported.
+  //
+  // The cap dropped 256 -> 64 in 4050ab438 and the spacing 0.1 -> 0.15 km, which is what surfaced
+  // this: those are the user's measured performance settings and worth keeping, but they shorten the
+  // budget's reach about fourfold and so pulled the line in from beyond the horizon to inside the
+  // visible sky. The cap should cost DETAIL, not cloud.
+  //
+  // So integrate the remainder coarsely instead of discarding it: a few long Beer-Lambert segments
+  // over [t, tExit]. Four rather than one because a single sample at the tail's midpoint would let
+  // one dense hit turn the entire remaining span opaque -- swapping a hard bright line for a hard
+  // dark one. Only rays that actually exhausted the budget pay for it, and they pay four samples on
+  // top of the cap, so the worst case grows by 4/cloudViewSamplesMax.
+  if (t < tExit && viewTransmittance > kCloudExitTransmittance) {
+    const uint  kTailSamples = 4u;
+    const float tailStepKm   = (tExit - t) / float(kTailSamples);
+    if (tailStepKm > 1e-5f) {
+      for (uint tail = 0u; tail < kTailSamples; ++tail) {
+        if (viewTransmittance < kCloudExitTransmittance) break;
+        const float tSample = t + (float(tail) + 0.5f) * tailStepKm;
+        const float rayFrac = saturate((tSample - tEntry) / max(tExit - tEntry, 1e-6f));
+        integrateCloudSample(tSample, tailStepKm, rayFrac, viewDirYUp,
+                             slabAltitudeKm, slabThicknessKm,
+                             slabTypeMean, slabCoverageMean,
+                             slabDensityScale,
+                             typeNoiseEntry, typeNoiseExit,
+                             coverageNoiseEntry, coverageNoiseExit,
+                             ctx, args, accumColor, viewTransmittance,
+                             sdfStepKm, sumWeightedDistKm, sumWeight, entryDistanceKm);
+      }
+    }
+  }
 }
 
 // =============================================================================
