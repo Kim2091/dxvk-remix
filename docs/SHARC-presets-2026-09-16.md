@@ -64,7 +64,7 @@ Applied at `host:376-427`. Values marked **same** are identical in all three by 
 | `maxEmissiveLuminance` | 0.1 | **0.1** | 0.1 | same. §7. |
 | `footprintGate` | on | **on** | on | same. §7. |
 | `allowSpecularPaths` | on | **on** | on | same. §7. |
-| `updatePrimaryVertex` | on | **on** | on | same. §8 - turning it off saves one hash insert and costs most of the cache's coverage, so it is not a performance lever. |
+| `updatePrimaryVertex` | on | **on** | **off** | **Superseded 2026-09-16 (see the correction below).** It is a lever after all: the user measured it at about 0.1 ms in game, the same order as the whole cache's net benefit, so Performance declines it. Quality and Balanced keep it for the confirmed quality gain. |
 
 Not written by any preset, deliberately: `measureGpuTime`, `collectQueryStats` and
 `logFallbackStats` (diagnostics, about a millisecond, and they say nothing about quality);
@@ -73,6 +73,18 @@ Not written by any preset, deliberately: `measureGpuTime`, `collectQueryStats` a
 
 Four of fourteen move. That is the finding, not a shortfall: most of the SHARC option surface is
 correctness and coverage, and the presets should not pretend otherwise.
+
+> **Correction, 2026-09-16, after this document was written.** The user measured
+> `rtx.sharc.updatePrimaryVertex` at **about 0.1 ms** in game. That falsifies the cost half of the
+> reasoning in this row and in §8: the option *is* a performance lever, and it is the only preset
+> value with a frame-time measurement behind it rather than an estimate. Performance now sets it
+> **off**; Quality and Balanced keep it **on**, because the quality gain is confirmed and 0.1 ms is
+> under one percent of a frame. **Five of fourteen move, not four.** The coverage half of the
+> original reasoning still stands, and the consequence is stated in the Performance tooltip: with
+> the primary deposit off, under open sky most update paths store nothing, so that preset thins the
+> cache to near nothing outdoors while still paying for the update and resolve passes.
+> Reasoning, and why no adaptive controller was built to decide this per scene:
+> [SHARC-adaptive-2026-09-16.md](SHARC-adaptive-2026-09-16.md) §6 and §8.
 
 ## 2. Why the tile size and bounce count are the real levers
 

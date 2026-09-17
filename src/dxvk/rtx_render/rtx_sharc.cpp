@@ -364,18 +364,19 @@ namespace dxvk {
           RtxOptions::enableRussianRoulette() ? "on" : "off");
       }
     }
-    // Three presets along one axis: how much work the update pass does per frame.  Only four
+    // Three presets along one axis: how much work the update pass does per frame.  Five
     // options actually trade along it -- the tile size and bounce count that set the update
-    // budget, the sky retries that spend it outdoors, and the capacity the resolve pass pays
-    // for every frame.  Everything else a preset writes is a correctness or coverage control
-    // that buys artefacts rather than speed when it is loosened, so all three write the same
-    // value for it; docs/SHARC-presets-2026-09-16.md says why each one does or does not move.
+    // budget, the sky retries that spend it outdoors, the primary deposit that spends it on
+    // camera-visible surfaces, and the capacity the resolve pass pays for every frame.
+    // Everything else a preset writes is a correctness or coverage control that buys
+    // artefacts rather than speed when it is loosened, so all three write the same value for
+    // it; docs/SHARC-presets-2026-09-16.md says why each one does or does not move and
+    // docs/SHARC-adaptive-2026-09-16.md says why the primary deposit joined the list.
     // The diagnostic options (Measure SHARC GPU time, Include cache reuse statistics, Log
     // SHARC fallback statistics) and the backend A/B toggles are never part of a preset: they
     // cost about a millisecond and say nothing about quality.
     if (ImGui::BeginCombo("SHARC preset", "Choose to apply...")) {
       auto applyShared = [] {
-        updatePrimaryVertexObject().setDeferred(true);
         allowSpecularPathsObject().setDeferred(true);
         footprintGateObject().setDeferred(true);
         accumulationFramesObject().setDeferred(8);
@@ -386,15 +387,21 @@ namespace dxvk {
         minRoughnessSpecularObject().setDeferred(0.7f);
         maxEmissiveLuminanceObject().setDeferred(0.1f);
       };
-      auto applyUpdateBudget = [](int tileSize, int bounces, int capacity, int skyRetries) {
+      // The primary deposit is the one preset value backed by a frame-time measurement rather
+      // than an estimate: the user read about 0.1 ms for it in game, which is the same order as
+      // the whole cache's measured net benefit.  Quality and Balanced keep it because the user
+      // also confirmed the quality gain; Performance is the preset whose entire purpose is to
+      // spend less, and this is the largest measured item it can decline.
+      auto applyUpdateBudget = [](int tileSize, int bounces, int capacity, int skyRetries, bool primaryVertex) {
         updateTileSizeObject().setDeferred(tileSize);
         updateBouncesObject().setDeferred(bounces);
         capacityLog2Object().setDeferred(capacity);
         updateSkyRetriesObject().setDeferred(skyRetries);
+        updatePrimaryVertexObject().setDeferred(primaryVertex);
       };
       if (ImGui::Selectable("Quality")) {
         applyShared();
-        applyUpdateBudget(4, 8, 22, 2);
+        applyUpdateBudget(4, 8, 22, 2, true);
         m_resetRequested = true;
       }
       RemixGui::SetTooltipToLastWidgetOnHover(
@@ -405,24 +412,30 @@ namespace dxvk {
         "traced segments. Unmeasured.");
       if (ImGui::Selectable("Balanced (default)")) {
         applyShared();
-        applyUpdateBudget(8, 4, 22, 1);
+        applyUpdateBudget(8, 4, 22, 1, true);
         m_resetRequested = true;
       }
       RemixGui::SetTooltipToLastWidgetOnHover(
         "The shipped default, and the configuration tested in Fallout New Vegas. With the primary vertex deposited, "
         "every camera-visible eligible surface is fed by every update tile that lands on it, which is what a "
-        "four-bounce, tile-8 update budget is sized for. Setting nothing in rtx.conf gives you this.");
+        "four-bounce, tile-8 update budget is sized for. That deposit measured about 0.1 ms in game and Balanced "
+        "keeps it, because the quality it buys is confirmed and the time it costs is under a percent of a frame. "
+        "Setting nothing in rtx.conf gives you this.");
       if (ImGui::Selectable("Performance")) {
         applyShared();
-        applyUpdateBudget(12, 3, 20, 0);
+        applyUpdateBudget(12, 3, 20, 0, false);
         m_resetRequested = true;
       }
       RemixGui::SetTooltipToLastWidgetOnHover(
         "About 2.25 times fewer update paths than Balanced, one bounce shallower -- which also drops the update "
-        "shader back to its compact four-slot variant -- no sky retries, and a quarter of the resolve threads. It "
-        "gives up the sparsest cells first: hidden faces, freshly revealed geometry and outdoor relief. Expect "
-        "tenths of a millisecond, not a transformation -- the whole cache measured about 0.1 ms net, so this trims "
-        "the cost side and the benefit side together. Unmeasured.");
+        "shader back to its compact four-slot variant -- no sky retries, a quarter of the resolve threads, and no "
+        "primary-vertex deposit, which is the one item here with a measured price: about 0.1 ms. It gives up the "
+        "sparsest cells first: hidden faces, freshly revealed geometry and outdoor relief. Expect tenths of a "
+        "millisecond, not a transformation -- the whole cache measured about 0.1 ms net, so this trims the cost "
+        "side and the benefit side together. Under open sky, without the primary deposit most update paths exit "
+        "to the sky and store nothing, so the cache thins to near nothing out there; if that is where you play and "
+        "you want the time back, rtx.integrateIndirectMode = 0 is the honest setting rather than this preset. "
+        "Unmeasured except the 0.1 ms.");
       ImGui::EndCombo();
     }
     RemixGui::DragInt("Capacity exponent", &capacityLog2Object(), 1.0f, 18, 22);

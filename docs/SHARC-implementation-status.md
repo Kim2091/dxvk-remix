@@ -619,3 +619,69 @@ Reasoning, per-value justification and the measurement plan:
 passes, `d3d9.dll` 280,177,664 bytes), integration validator all PASS, `RtxOptions.md`
 regenerated. Deployed to both installs, backup suffix `backup-pre-sharc-presets-20260916-203330`.
 Nothing measured in game.
+
+## Can SHARC tune itself? No, and here is the constraint that decides it - 2026-09-16
+
+The question was whether a modder could get a good result without knowing which options to touch:
+either a controller that retunes SHARC from the stats counters, or better defaults. The answer is
+better defaults, and three findings rule out the controller independently.
+
+**Only three of the twenty-two `rtx.sharc` options can change without clearing the cache** -
+`accumulationFrames`, `staleFrames` and `updateTileSize` (`rtx_sharc.cpp:152-154`, absent from the
+clear condition at `:103-108` and from `compatibilityFlags` at `:79-86`). Everything else, including
+both sky options, zeroes all three buffers on change. A controller that retuned them would empty
+1M-4M cells per decision, and a cleared cache needs frames the sparse tail may never get back.
+
+**The signal costs more than the feature and arrives a second late.** The counters are a separate
+shader permutation (60 `*sharc*stats*` blobs), gated behind `measureGpuTime` + `collectQueryStats`
+(about 1 ms, user), read back through an 8-slot GPU-event rotation that silently drops frames
+whose event has not signalled (`rtx_sharc.cpp:254-257`), and published only as a sum over 120
+collected frames (`:263-268`) - mean sample age about a second, fully replaced about every two.
+There is no cheap always-on subset: the one counter that would be nearly free, the sky-exit share,
+says what the cache cannot do rather than what to change, and the miss split - the only line that
+names a remedy - is the one that costs an extra `HashGridFind` on every miss.
+
+**Both movable knobs change their own measurement,** with a settling time no shorter than the
+sampling period, and `staleFrames` and `accumulationFrames` trade the two miss buckets against each
+other. Damping that means acting less than once every few seconds, which is slower than a person
+with the panel open.
+
+**What is already self-limiting, and is the right pattern:** `updateSkyRetries` fires only on a
+first-bounce sky miss (`hooks:352-354`), so it is free indoors with no detection; `footprintGate`
+tests the real lobe per lookup rather than a threshold per title; `minSampleCount` and `staleFrames`
+only bind on cells that are actually starved or idle; and `gridScale` is an angle by construction,
+so it is scene-invariant rather than scene-adapted. Every future "make it adapt" idea should first
+be checked against "can this be a per-sample test in the shader?".
+
+**`updatePrimaryVertex` measured at about 0.1 ms** (user) - the same order as the whole cache's net
+benefit, and the only preset value with a frame-time measurement rather than an estimate. Its cost
+is not purely per-path: the per-path insert shows on `GPU ms: update`, but it also makes every
+camera-visible cell permanently resident, and a live slot runs the whole resolve body where a dead
+one returns after one load (`SDK:838-840`), so part of it should show on `GPU ms: resolve` and that
+part scales with scene openness. Its benefit is likewise two mechanisms, only one of which is about
+the sky: recovering sky-bound paths (outdoors only) and feeding camera-visible surfaces densely
+every frame (everywhere). So there is no clean scene signal that says when to turn it off.
+
+**One change made: the Performance preset now turns `updatePrimaryVertex` off**
+(`rtx_sharc.cpp:395-426`); Quality and Balanced keep it. Performance already declines
+`updateSkyRetries` on the argument that the outdoor frame-time payoff is near zero, and the same
+argument applies with more force to a measured cost - if the preset cannot decline the one item
+with a measurement behind it, it has nothing left to decline. The tooltip states the consequence:
+without the deposit, under open sky most update paths store nothing, so that preset thins the cache
+to near nothing outdoors and `rtx.integrateIndirectMode = 0` is the honest setting there instead.
+
+**The primary-deposit roughness guard was considered and declined.** Applying the footprint gate's
+own criterion to the primary - `segmentLength` is the camera distance, so it cancels against the
+voxel size - gives `sqrt(0.5*alpha^2/(1-alpha^2)) > 1/gridScale`, i.e. alpha > 0.028 at
+`gridScale` 50, which is *below* the `minRoughness` floor of 0.05 the deposit already applies. So
+the spatial criterion calls for no extra guard, the residual worry is angular and that test does not address it, the
+artefact has not been seen by anyone, and `minRoughness` is already the control for it. A
+primary-only floor would be a judgement number of exactly the kind `minRoughnessSpecular` was.
+
+Reasoning, with the option-by-option reset table, the staleness arithmetic and the five alternatives
+to a controller: [SHARC-adaptive-2026-09-16.md](SHARC-adaptive-2026-09-16.md). C++ only, no shader
+recompiled; release build (two synchronous passes, `d3d9.dll` 280,178,176 bytes), integration
+validator 61 PASS. Deployed to Fallout New Vegas, backup suffix
+`backup-pre-perf-preset-primary-20260916-210436`. **Not deployed to Portal RTX** - it was running
+throughout (`NvRemixBridge.exe` holding the DLL), so that install is still on the `ed39787a9` build
+and needs the copy repeating once it is closed.

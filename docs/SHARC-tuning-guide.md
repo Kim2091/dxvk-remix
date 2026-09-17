@@ -28,7 +28,10 @@ rtx.integrateIndirectMode = 3
 
 **In most cases you do not need to paste anything.** The shipped defaults are the Balanced
 preset, which is the profile below, so `rtx.integrateIndirectMode = 3` on its own gets you there.
-The panel also has a **SHARC preset** dropdown with Quality, Balanced and Performance.
+The panel also has a **SHARC preset** dropdown with Quality, Balanced and Performance. Only five
+of the fourteen values a preset writes differ between them — the update tile size, the update
+bounce count, the sky retries, the primary-vertex deposit and the cache capacity. The other nine
+are correctness and coverage controls that all three write identically.
 
 Paste this only if you want the settings written out explicitly, or you are on an older build
 whose defaults predate the presets:
@@ -67,10 +70,13 @@ Why these values, and what each one is protecting you from:
 | `updateBounces` | `4` | 8 was more depth than the cache needed. Note this is *not* `rtx.pathMaxBounces`. |
 | `accumulationFrames` | `8` | Response to lighting changes versus per-cell noise. See §4 before changing it in either direction. |
 
-Two more are **on by default** and matter most where the sky is visible:
-`rtx.sharc.updatePrimaryVertex = True` and `rtx.sharc.updateSkyRetries = 1`. They recover update
-work that would otherwise be thrown away by paths escaping to the sky. **Neither has been measured
-in game** — if you have an open-world title, they are the first thing worth A/B-ing. See §5.
+Two more are **on by default**: `rtx.sharc.updatePrimaryVertex = True` and
+`rtx.sharc.updateSkyRetries = 1`. They recover update work that would otherwise be thrown away by
+paths escaping to the sky, and the retry half matters only where the sky is visible. **Measured**
+(user report): both improve quality, and the primary deposit costs **about 0.1 ms** — the same
+order as the whole cache's net benefit, so treat SHARC as a quality feature with a roughly neutral
+frame-time story rather than a performance one. The scene each figure was read in is not recorded.
+See §5.
 
 **Requirements.** SHARC needs shader Int64, buffer Int64 atomics, FP16, 16-bit storage and
 RayQuery. On a device missing any of them it **silently traces ordinary paths** — no error, no
@@ -247,9 +253,10 @@ Act on the miss split:
   at 4× the update cost.
 - **no cell dominant**: try `capacityLog2 = 22` for one session. If the share does not move,
   capacity is exonerated — go back to 20 and treat it as a density problem instead.
-- Two opt-in options exist specifically for this and are **untested in game**:
+- Two options exist specifically for this and are **on by default**:
   `updatePrimaryVertex` (every path stores something, even sky-bound ones) and `updateSkyRetries`
-  (re-aim a first bounce that missed). See §5.
+  (re-aim a first bounce that missed). Both are confirmed to improve quality (user report); the
+  primary deposit costs about 0.1 ms. See §5.
 
 **But read `Path ends: sky` first.** If it says 66%, terminations are capped near 34% no matter
 what you do, and the cache's product outdoors is *stability*, not speed. Do not spend interior
@@ -537,7 +544,7 @@ samplers.
 > vertices are never inserted and that the feature is untested. Both statements predate the
 > portal-space key change and the Portal RTX session.*
 
-#### `rtx.sharc.updatePrimaryVertex` — default `True`. **Untested in game.**
+#### `rtx.sharc.updatePrimaryVertex` — default `True`. **Measured: about 0.1 ms.**
 
 Normally the cache only stores at *secondary* hits, so an update path whose first bounce flies off
 into the sky stores nothing at all — **measured** FNV desert: two thirds of the update budget,
@@ -545,8 +552,17 @@ wasted. With this on, the path also stores at the camera-visible surface it star
 the direct pass's lighting plus the sampled continuation. Every sky-bound path then contributes
 something, and every camera-visible eligible surface gets fed by every update tile that lands on it.
 
-**Try it in an open-world game.** **Expected**: the no-cell and below-floor shares both fall, hit
-rate climbs toward the high 90s, `Path ends: sky` does not move (it is a query statistic).
+**Leave it on unless you are chasing frame time.** **Measured** (user report): it improves quality,
+and it costs **about 0.1 ms** — which is the same order as the whole cache's measured net benefit,
+so this one option is roughly the price of the feature. That is why the **Performance** preset is
+the only one that turns it off. **Expected, unmeasured**: the no-cell and below-floor shares both
+fall, hit rate climbs toward the high 90s, `Path ends: sky` does not move (it is a query statistic).
+
+It helps for two separate reasons, and only one of them is about the sky: sky-bound update paths
+stop being wasted (outdoors only), *and* every camera-visible eligible surface gets a dense sample
+every frame instead of waiting for a bounce ray to find it (everywhere, including interiors). So
+turning it off outdoors thins the cache to near nothing — at that point
+`rtx.integrateIndirectMode = 0` is the honest setting rather than a thin cache you still pay for.
 
 > **Depends on RTXDI.** What it stores is the direct lighting the direct pass already computed for
 > that pixel — and that pass uses RTXDI when `rtx.useRTXDI` is on and falls back to RIS sampling
@@ -557,12 +573,18 @@ rate climbs toward the high 90s, `Path ends: sky` does not move (it is a query s
 > less out of it than one that is not. And it takes a propagation slot (see `updateBounces`).
 > Changing it clears the cache.
 >
-> **Quality risk, unmeasured:** every primary-deposited sample looks toward the camera, so on a
-> glossy-but-eligible surface a cell can end up averaging the camera's particular view of its
-> specular highlight. Watch for a tint or brightness on cached glossy surfaces that follows the
-> camera. If you see it, this option stays off for that game.
+> **Quality risk, looked for and not seen:** every primary-deposited sample looks toward the
+> camera, so on a glossy-but-eligible surface a cell can end up averaging the camera's particular
+> view of its specular highlight — and unlike a secondary sample, that error does not average out,
+> because every primary sample of a cell uses the same direction. It concentrates on **smooth
+> metals**, whose outgoing radiance is entirely specular. Watch for a tint or brightness on cached
+> glossy surfaces that follows the camera; debug view **583 (Cached Radiance)** shows it directly.
+> The user has looked in Portal RTX and seen none. If you do see it, **raise `minRoughness`** — it
+> already gates the primary deposit through the same test every other surface uses, so the remedy
+> exists and needs no new option. `docs/SHARC-adaptive-2026-09-16.md` §7 works through why a
+> primary-only roughness floor was considered and declined.
 
-#### `rtx.sharc.updateSkyRetries` — default `1`, range 0–4. **Untested in game.**
+#### `rtx.sharc.updateSkyRetries` — default `1`, range 0–4. **Quality confirmed; cost unmeasured.**
 
 When an update path's first bounce exits to the sky, re-aim it from a cosine lobe about the surface
 normal and trace again, up to N times, so the budget lands on geometry more often outdoors.
@@ -732,7 +754,10 @@ performance.
 
 - FNV interiors. Never sampled, at any setting. The recommended profile for them is reasoning, not
   measurement.
-- `updatePrimaryVertex` and `updateSkyRetries`, in any scene.
+- `updateSkyRetries`' cost, in any scene. Its quality benefit is a user report, not a capture.
+- Which scene `updatePrimaryVertex`'s 0.1 ms was read in, and which scene its quality gain was
+  confirmed in. Both are user reports without a title attached, and several conclusions turn on
+  the answer — see `docs/SHARC-adaptive-2026-09-16.md` §6.
 - Any `gridScale` value other than 50.
 - `capacityLog2` 22 versus 20.
 - Frame-time effect of `footprintGate` or `minSampleCount`.
@@ -753,6 +778,9 @@ The reasoning behind all of the above, with `file:line` citations:
   SHARC-with-no-hits differs from plain path tracing.
 - `docs/SHARC-grid-scale-2026-09-16.md` — what `gridScale` is, derived.
 - `docs/SHARC-sky-budget-2026-09-16.md` — the two sky-recovery options and why they are unbiased.
+- `docs/SHARC-adaptive-2026-09-16.md` — why SHARC does not tune itself to the scene, which options
+  could change without clearing the cache (only three), and what `updatePrimaryVertex`'s 0.1 ms is
+  made of.
 - `docs/SHARC-path-correctness-audit-2026-09-15.md` — eligibility, emissive handling, the roughness
   split, the distance guard.
 - `docs/SHARC-portals-investigation-2026-09-15.md` — ray portals (partly superseded by the
