@@ -74,8 +74,10 @@ namespace dxvk {
       m_status = "Ray portals block SHARC: enable Allow SHARC with ray portals below to test; tracing normally";
       return;
     }
+    const uint32_t skyRetries = uint32_t(std::clamp(updateSkyRetries(), 0, 4));
     // Discard cached estimates when the tested feature combination changes.
     const uint32_t compatibilityFlags = (wboit ? 1u : 0u) | (rayPortals ? 2u : 0u)
+      | (updatePrimaryVertex() ? 8192u : 0u) | (skyRetries << 14)
       | (opacityMicromap ? 4u : 0u)
       | (allowRayPortals() ? 16u : 0u)
       | (deferredUpdates() ? 64u : 0u) | (queryRayGeneration() ? 128u : 0u)
@@ -152,7 +154,8 @@ namespace dxvk {
     m_args.updateTileSize = std::clamp(updateTileSize(), 1, 16);
     m_args.updateBounces = updateBounceLimit;
     m_args.radianceScale = 1000.0f;
-    m_args.enabled = 1;
+    m_args.enabled = 1u | (updatePrimaryVertex() ? SHARC_UPDATE_FLAG_PRIMARY_VERTEX : 0u)
+      | (skyRetries << SHARC_UPDATE_SKY_RETRY_SHIFT);
     m_args.allowSpecularPaths = allowSpecularPaths() ? 1u : 0u;
     m_args.footprintGate = footprintGate() ? 1u : 0u;
     args.sharcArgs = m_args;
@@ -314,6 +317,8 @@ namespace dxvk {
       RemixGui::Checkbox("Ray-generation SHARC query", &queryRayGenerationObject());
     }
     RemixGui::Checkbox("Ray-generation SHARC updates", &updateRayGenerationObject());
+    RemixGui::Checkbox("Cache the primary vertex of update paths", &updatePrimaryVertexObject());
+    RemixGui::DragInt("Sky-miss retries per update path", &updateSkyRetriesObject(), 1.0f, 0, 4);
     RemixGui::Checkbox("Reuse rough surfaces in specular paths", &allowSpecularPathsObject());
     if (allowSpecularPaths()) {
       ImGui::TextWrapped("Experimental: wider cache reuse can soften reflected lighting. Roughness and distance limits still apply.");

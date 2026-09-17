@@ -1486,6 +1486,16 @@ void integrateIndirectPath(
     sharcCount(pathState.pixelCoordinate, 0); // Paths that actually launch rays.
   }
 #endif
+#if SHARC_UPDATE
+  // The primary deposit needs the launch throughput final, so it follows the POM attenuation
+  // above, and it happens whether or not the path launches (see the hook); the retry budget is
+  // loop state, not payload.
+  uint sharcSkyRetries = (cb.sharcArgs.enabled >> SHARC_UPDATE_SKY_RETRY_SHIFT) & SHARC_UPDATE_SKY_RETRY_MASK;
+  if (cb.enableSecondaryBounces)
+  {
+    sharcOnPathStart(pathState, gbufferPixelCoordinate, geometryFlags, mediumMaterialIndex, firstHitPerceptualRoughness);
+  }
+#endif
 
   if (cb.enableSecondaryBounces)
   for (; pathState.continuePath; ++pathState.bounceIteration)
@@ -1529,6 +1539,9 @@ void integrateIndirectPath(
       DEBUG_VIEW_SECONDARY_RAY_INTERACTIONS, 
       DEBUG_VIEW_SECONDARY_RAY_AND_UNORDERED_INTERACTIONS,
       (!SHARC_UPDATE && TRUE_OR_CHECK_WHEN_NRC_ENABLED(pathState.isNrcQuery)));
+#if SHARC_UPDATE
+    sharcOnSegmentEnd(pathState, gbufferPixelCoordinate, geometryFlags, rayOrigin, rayConeRadius, mediumMaterialIndex, sharcSkyRetries);
+#endif
   }
 
 #if SHARC_UPDATE && SHARC_DEFERRED_UPDATE

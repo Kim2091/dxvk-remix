@@ -13,6 +13,11 @@ struct SharcArgs {
   uint updateBounces;
   float radianceScale;
   float minRoughness;
+  // Bit 0 is set whenever the cache is active and is read by nothing. The name is kept so
+  // that no shader's debug names change. Bit 1: update paths also deposit their primary
+  // vertex (RTXDI direct light plus the camera-side continuation), so a path that exits to
+  // the sky at its first bounce still feeds one cell. Bits 2..4: how many times a
+  // first-bounce sky miss is re-sampled from a cosine lobe about the primary normal.
   uint enabled;
   uint allowSpecularPaths;
   // Emissive surfaces are excluded because the cache stores reflected radiance and the
@@ -33,6 +38,9 @@ struct SharcArgs {
   // roughness. While set, minRoughnessSpecular is unused and both lobe classes share minRoughness.
   uint footprintGate;
 };
+#define SHARC_UPDATE_FLAG_PRIMARY_VERTEX 2u
+#define SHARC_UPDATE_SKY_RETRY_SHIFT 2u
+#define SHARC_UPDATE_SKY_RETRY_MASK 7u
 #ifdef __cplusplus
 static_assert(sizeof(SharcArgs) == 80);
 #endif

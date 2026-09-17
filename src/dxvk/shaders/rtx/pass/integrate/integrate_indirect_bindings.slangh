@@ -53,6 +53,16 @@ Texture2D<uint> SharedSurfaceIndex;
 layout(rg16ui, binding = INTEGRATE_INDIRECT_BINDING_SHARED_SUBSURFACE_DATA_INPUT)
 Texture2D<uint2> SharedSubsurfaceData;
 
+#if defined(SHARC_UPDATE) && SHARC_UPDATE
+// The update stage judges its primary vertex by the material terms the cache hook applies to
+// secondary hits; opacity and emission live only in these packed words.
+layout(r32ui, binding = INTEGRATE_INDIRECT_BINDING_SHARED_MATERIAL_DATA0_INPUT)
+Texture2D<uint> SharedMaterialData0;
+
+layout(r32ui, binding = INTEGRATE_INDIRECT_BINDING_SHARED_MATERIAL_DATA1_INPUT)
+Texture2D<uint> SharedMaterialData1;
+#endif
+
 // Inputs
 
 layout(r16f, binding = INTEGRATE_INDIRECT_BINDING_PRIMARY_CONE_RADIUS_INPUT)

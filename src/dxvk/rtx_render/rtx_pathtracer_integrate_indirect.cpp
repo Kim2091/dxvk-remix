@@ -319,6 +319,8 @@ namespace dxvk {
         auto slots = IntegrateIndirectSharcBaseShader::getResourceSlots();
         slots.push_back({ SHARC_BINDING_HASH, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_IMAGE_VIEW_TYPE_MAX_ENUM, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT });
         slots.push_back({ SHARC_BINDING_ACCUMULATION, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_IMAGE_VIEW_TYPE_MAX_ENUM, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT });
+        slots.push_back({ INTEGRATE_INDIRECT_BINDING_SHARED_MATERIAL_DATA0_INPUT, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_IMAGE_VIEW_TYPE_2D });
+        slots.push_back({ INTEGRATE_INDIRECT_BINDING_SHARED_MATERIAL_DATA1_INPUT, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_IMAGE_VIEW_TYPE_2D });
         slots.erase(std::remove_if(slots.begin(), slots.end(), [](const auto& slot) {
           return slot.slot == INTEGRATE_INDIRECT_BINDING_INDIRECT_RADIANCE_HIT_DISTANCE_OUTPUT
               || slot.slot == INTEGRATE_INDIRECT_BINDING_RESTIR_GI_RESERVOIR_OUTPUT
@@ -687,6 +689,10 @@ namespace dxvk {
     ctx->bindResourceView(INTEGRATE_INDIRECT_BINDING_SHARED_TEXTURE_COORD_INPUT, rtOutput.m_sharedTextureCoord.view, nullptr);
     ctx->bindResourceView(INTEGRATE_INDIRECT_BINDING_SHARED_SURFACE_INDEX_INPUT, rtOutput.m_sharedSurfaceIndex.view(Resources::AccessType::Read), nullptr);
     ctx->bindResourceView(INTEGRATE_INDIRECT_BINDING_SHARED_SUBSURFACE_DATA_INPUT, rtOutput.m_sharedSubsurfaceData.view, nullptr);
+    if (sharcUpdate) {
+      ctx->bindResourceView(INTEGRATE_INDIRECT_BINDING_SHARED_MATERIAL_DATA0_INPUT, rtOutput.m_sharedMaterialData0.view, nullptr);
+      ctx->bindResourceView(INTEGRATE_INDIRECT_BINDING_SHARED_MATERIAL_DATA1_INPUT, rtOutput.m_sharedMaterialData1.view, nullptr);
+    }
 
     ctx->bindResourceView(INTEGRATE_INDIRECT_BINDING_PRIMARY_CONE_RADIUS_INPUT, rtOutput.m_primaryConeRadius.view, nullptr);
     ctx->bindResourceView(INTEGRATE_INDIRECT_BINDING_SECONDARY_CONE_RADIUS_INPUT, rtOutput.m_secondaryConeRadius.view(Resources::AccessType::Read), nullptr);
@@ -824,7 +830,8 @@ namespace dxvk {
         if (RtxSharc::updateRayGeneration()) {
           DxvkRaytracingPipelineShaders shaders;
           if (RtxSharc::deferredUpdates()) {
-            if (rtOutput.m_raytraceArgs.sharcArgs.updateBounces <= 4) {
+            const uint32_t primarySlot = (rtOutput.m_raytraceArgs.sharcArgs.enabled & SHARC_UPDATE_FLAG_PRIMARY_VERTEX) ? 1u : 0u;
+            if (rtOutput.m_raytraceArgs.sharcArgs.updateBounces + primarySlot <= 4) {
               shaders.addGeneralShader(wboitEnabled
                 ? GET_SHADER_VARIANT(VK_SHADER_STAGE_RAYGEN_BIT_KHR, IntegrateIndirectSharcUpdateShader, integrate_indirect_sharc_update_deferred4_raygen_wboit)
                 : GET_SHADER_VARIANT(VK_SHADER_STAGE_RAYGEN_BIT_KHR, IntegrateIndirectSharcUpdateShader, integrate_indirect_sharc_update_deferred4_raygen));
@@ -1332,7 +1339,7 @@ namespace dxvk {
   Rc<DxvkShader> DxvkPathtracerIntegrateIndirect::getComputeShader(const bool useNeeCache, const bool nrcEnabled, const bool wboitEnabled, const bool sharcUpdate, const bool sharcQuery) const {
     if (sharcUpdate) {
       if (RtxSharc::deferredUpdates()) {
-        if (RtxSharc::updateBounces() <= 4) {
+        if (RtxSharc::updateBounces() + (RtxSharc::updatePrimaryVertex() ? 1 : 0) <= 4) {
           return (wboitEnabled
             ? GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, IntegrateIndirectSharcUpdateShader, integrate_indirect_sharc_update_deferred4_wboit)
             : GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, IntegrateIndirectSharcUpdateShader, integrate_indirect_sharc_update_deferred4));

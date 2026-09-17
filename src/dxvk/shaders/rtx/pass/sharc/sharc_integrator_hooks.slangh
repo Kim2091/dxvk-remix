@@ -254,6 +254,142 @@ void sharcOnContinuationSampled(inout PathState pathState, bool opaqueMaterial, 
 #endif
 }
 
+#if ENABLE_SHARC && SHARC_UPDATE
+// RNG stream for re-sampled first bounces; the per-bounce closest-hit offsets stop well below it.
+static const uint kSharcSkyRetryRngOffset = 240;
+
+// The primary vertex's eligibility, from the G-buffer words the direct pass decodes, through the
+// one predicate secondary hits use. Only the fields sharcRejectReason reads are filled in.
+uint sharcPrimaryRejectReason(uvec2 pixel, bool inMedium, float perceptualRoughness)
+{
+  const uint data0 = SharedMaterialData0[pixel];
+  const uint data1 = SharedMaterialData1[pixel];
+  const bool opaque = ((data0 >> 30) & surfaceMaterialTypeMask) == surfaceMaterialTypeOpaque;
+  const uint8_t flagsAndType = uint8_t(data0 >> 24);
+  const bool thinFilm = (flagsAndType & OPAQUE_SURFACE_MATERIAL_INTERACTION_FLAG_USE_THIN_FILM_LAYER) != 0;
+  const vec3 emissive = gammaToLinearFast(vec3(
+    unorm8ToF32(uint8_t(data0 >> 16)), unorm8ToF32(uint8_t(data1 >> 0)), unorm8ToF32(uint8_t(data1 >> 8))))
+    * uint16BitsToF32(uint16_t(data1 >> 16));
+  OpaqueSurfaceMaterialInteraction material = (OpaqueSurfaceMaterialInteraction)0;
+  // The G-buffer stores either opacity or thin film thickness in this byte, never both.
+  material.opacity = thinFilm ? 1.0f : float(unorm8ToF16(uint8_t(data0 >> 8)));
+  material.isotropicRoughness = calcRoughness(perceptualRoughness);
+  material.subsurfaceMaterialInteraction.maxSampleRadius = uint8_t(SharedSubsurfaceData[pixel].y >> 8);
+  // The camera ray is the arrival: no lobe to classify, so the ordinary roughness floor applies.
+  return sharcRejectReason(opaque, inMedium, material, emissive, true, true);
+}
+
+// Called once per update path after its launch state is final and before the first segment is
+// traced. Deposits the primary vertex when asked to: the direct pass lit this surface (RTXDI)
+// and sampled its continuation, so the vertex's outgoing radiance is that direct light plus the
+// sampled segment's weight times whatever the path gathers from here -- the estimator a
+// secondary vertex gets, with RTXDI standing in for the secondary NEE. Without it a path whose
+// first bounce exits to the sky inserts nothing at all.
+//
+// A path that will not launch still deposits, with the direct light alone. A cell is a mean of
+// its samples, not a sum, so a first-bounce roulette that terminates the path (direct pass,
+// pathMinBounces 0) must land here as a zero-indirect sample: the survivors carry the 1/p
+// compensation, and only with the terminated paths counted does the mean come out at
+// direct + T * L, the pixel's own expectation. The same holds for invalid samples, where the
+// pixel also adds nothing.
+void sharcOnPathStart(inout PathState pathState, uvec2 pixel, GeometryFlags geometryFlags, uint mediumMaterialIndex, float perceptualRoughness)
+{
+  if ((cb.sharcArgs.enabled & SHARC_UPDATE_FLAG_PRIMARY_VERTEX) == 0)
+  {
+    return;
+  }
+  // A PSR pixel's G-buffer surface is the replaced one and its throughput carries the mirror or
+  // glass in front; a translucent primary integrates the surface behind it; a view model moves
+  // with the camera. None is a cell a world-space reader wants.
+  if (!geometryFlags.primarySelectedIntegrationSurface || geometryFlags.performedAnyPSR() || geometryFlags.isViewModel)
+  {
+    return;
+  }
+  const bool inMedium = mediumMaterialIndex != SURFACE_INDEX_INVALID || geometryFlags.insideMedium;
+  if (sharcPrimaryRejectReason(pixel, inMedium, perceptualRoughness) != kSharcRejectNone)
+  {
+    return;
+  }
+  const MinimalSurfaceInteraction primary = minimalSurfaceInteractionReadFromGBuffer(pixel, PrimaryWorldPositionWorldTriangleNormal);
+  // Both lobes, as secondary NEE sums both. The primary's own emission is not in these
+  // textures (the G-buffer pass owns it), which is what the cache requires.
+  const vec3 directLight = PrimaryDirectDiffuseLobeRadianceHitDistance[pixel].xyz + PrimaryDirectSpecularLobeRadianceHitDistance[pixel].xyz;
+  if (!primary.isValid || !isValidValue(directLight))
+  {
+    return;
+  }
+  SharcHitData sharcHit = (SharcHitData)0;
+  sharcHit.positionWorld = primary.position;
+  sharcHit.normalWorld = primary.geometryNormal;
+  // The weight of the segment leaving the primary is the launch throughput the direct pass
+  // stored: BSDF times cosine over the lobe and direction pdfs, plus any POM attenuation.
+  const vec3 segmentWeight = pathState.continuePath ? vec3(pathState.throughput) : vec3(0.0f);
+#ifdef SHARC_DEFERRED_UPDATE
+  const uint countBefore = pathState.sharcState.count;
+  sharcInsertVertex(pathState.sharcState, sharcHit, pathState.portalSpace);
+  if (pathState.sharcState.count > countBefore)
+  {
+    sharcSeedVertex(pathState.sharcState, directLight, segmentWeight);
+  }
+#else
+  SharcUpdateHit(makeSharcParameters(pathState.portalSpace), pathState.sharcState, sharcHit, directLight, 0.0f);
+  SharcSetThroughput(pathState.sharcState, segmentWeight);
+#endif
+}
+
+// Called after every traced segment of an update path. A first bounce that exited to the sky
+// inserted nothing (the primary aside), so the path's budget bought no cell sample; re-sample
+// that bounce from a cosine lobe about the primary normal and trace again. What a cell stores
+// does not depend on how the ray reached it, so this changes which cells get samples, not what
+// they hold. The primary's own sample, if any, is complete here (its slot holds the direct
+// light plus the weighted sky) and is flushed first, so the retry cannot credit it a second
+// incoming sample.
+void sharcOnSegmentEnd(inout PathState pathState, uvec2 pixel, GeometryFlags geometryFlags,
+  vec3 rayOrigin, float rayConeRadius, uint mediumMaterialIndex, inout uint retriesLeft)
+{
+  // A miss at bounce 1 leaves bounceIteration at 0 (integratePathVertex decrements it on a
+  // miss) with continuePath false; every other outcome leaves it at 1 or more.
+  if (retriesLeft == 0 || pathState.continuePath || pathState.bounceIteration != 0)
+  {
+    return;
+  }
+  // The ray that missed may have teleported first; its state no longer describes the primary.
+  if (pathState.portalSpace != geometryFlags.portalSpace)
+  {
+    return;
+  }
+  const MinimalSurfaceInteraction primary = minimalSurfaceInteractionReadFromGBuffer(pixel, PrimaryWorldPositionWorldTriangleNormal);
+  if (!primary.isValid)
+  {
+    return;
+  }
+  --retriesLeft;
+#ifdef SHARC_DEFERRED_UPDATE
+  sharcFlushVertices(pathState.sharcState);
+  pathState.sharcState.count = 0;
+#else
+  SharcInit(pathState.sharcState);
+#endif
+  RNG rng = createRNG(pixel, cb.frameIdx, kSharcSkyRetryRngOffset + retriesLeft * 2u);
+  const vec2 u = vec2(getNextSampleBlueNoise(rng), getNextSampleBlueNoise(rng));
+  float solidAnglePdf;
+  const vec3 local = calcCosineHemisphereDirectionSample(u, solidAnglePdf);
+  vec3 tangent, bitangent;
+  calcOrthonormalBasis(primary.geometryNormal, tangent, bitangent);
+  // Relaunch from the direct pass's offset origin; the miss may have re-traced through cutouts
+  // or media and left the payload's origin and medium somewhere along the way.
+  pathState.origin = rayOrigin;
+  pathState.direction = normalize(tangent * local.x + bitangent * local.y + primary.geometryNormal * local.z);
+  pathState.coneRadius = rayConeRadius;
+  pathState.mediumMaterialIndex = mediumMaterialIndex;
+  pathState.insideMedium = geometryFlags.insideMedium;
+  pathState.solidAnglePdf = solidAnglePdf;
+  // A cosine lobe is a diffuse gather.
+  pathState.skyGatherEligible = true;
+  pathState.continuePath = true;
+}
+#endif
+
 // Called once per resolved opaque vertex, after emissive radiance has been accumulated
 // (the cache stores reflected lighting, so emission must already be live).
 //

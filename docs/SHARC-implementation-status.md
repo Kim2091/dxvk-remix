@@ -553,3 +553,34 @@ inert while the gate is on and is kept only so the previous behaviour can still 
 
 Not measured: frame time for either change. The cache holding more data is a coverage result,
 not a speed one, and the indirect pass was never this frame's bottleneck.
+
+## Sky-bound update paths: two opt-in recoveries - 2026-09-16
+
+In FNV open desert the panel reads "Path ends: sky 65.9%" and 1.01 segments/path. Update and
+query paths of one pixel share the same stored first segment, so that is also the share of
+update paths that insert nothing: vertices are cached only at resolved secondary hits, and a
+path whose first bounce misses has no vertex for the sky to be credited to. Two thirds of the
+update budget outdoors bought no cache sample.
+
+Both recoveries are options under `rtx.sharc`, default off, cache-clearing on change, and
+compiled only into the update stages (query and legacy blobs are byte-identical to the
+previous build):
+
+- `updatePrimaryVertex`: the update path also deposits its primary vertex, valued as the
+  direct pass's RTXDI lighting plus the sampled continuation's weight times whatever the path
+  gathers. Every sky-bound path then writes one sample (`direct + T * L_sky`), and every
+  camera-visible eligible surface is fed by every update tile that lands on it. Excluded:
+  PSR pixels, translucent primaries, view models; eligibility is the same predicate secondary
+  hits use, fed from the G-buffer material words.
+- `updateSkyRetries` (0..4): a first-bounce sky miss is re-sampled from a cosine lobe about the
+  primary normal and traced again. No pdf correction is needed: a cell averages outgoing
+  radiance samples, whose values do not depend on how the ray arrived.
+
+Full reasoning, ranking of the five directions in the brief, and the measurement plan:
+[SHARC-sky-budget-2026-09-16.md](SHARC-sky-budget-2026-09-16.md). Nothing measured in game.
+
+Release build (three passes, DLL 280,173,568 bytes, SHA-256 `d0ec48af...2f563`), integration
+validator 62 PASS with legacy stages byte-identical to the `b74a97ede` DLL, all 41 query blobs
+byte-identical, the 12 update blobs changed. Deployed to both installs, backup suffix
+`backup-pre-sky-budget-20260916-193518`; the FNV file replaced was an intermediate build of this
+same change that had been deployed during the session gap, the Portal file was HEAD.
