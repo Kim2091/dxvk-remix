@@ -126,6 +126,7 @@ public:
     uint32_t screenPeriod = 1u;
     float sampleSpacingKm = 0.0f;
     bool sunCoherentBlocks = false;
+    bool emptySpaceAdvance = false;
     uint32_t sunGridPeriod = 1u;
     uint32_t domePeriod    = 1u;
     uint32_t renderWidth   = 0u;
@@ -1335,6 +1336,11 @@ public:
                "history near moving geometry. Applies only to Half/Quarter screen interleave.",
                args.minValue = 0.0f, args.maxValue = 1.0f);
 
+    RTX_OPTION("rtx.atmosphere", bool, cloudEmptySpaceAdvance, true,
+               "Experimental screen-march optimization: advance the cursor through the conservative "
+               "known-empty interval before the next density evaluation. Keeps spacing, sample cap, "
+               "and density model; sample positions can change. Normal profiling mode only. "
+               "Compare actual GPU evaluation counts, timing, and cloud edges live.");
     RTX_OPTION("rtx.atmosphere", bool, cloudSunGridCoherentBlocks, true,
                "Update contiguous eight-column sun-shadow blocks instead of strided columns at "
                "Half/Quarter cadence. Same voxel integrals and update count; different spatial age "

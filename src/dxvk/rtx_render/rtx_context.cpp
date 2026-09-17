@@ -1715,6 +1715,7 @@ namespace dxvk {
             " spacingKm=", frame.cloudSampleSpacingKm,
             " screenPeriod=", frame.cloudScreenPeriod,
             " sunBlocks=", frame.cloudSunCoherentBlocks,
+          " emptyAdvance=", frame.cloudEmptySpaceAdvance,
             " bakeInterleave=", frame.cloudSunGridPeriod, "/", frame.cloudDomePeriod,
             " extent=", frame.cloudRenderWidth, "x", frame.cloudRenderHeight,
             " detailLod=", frame.cloudDetailLod, " detailLodBias=", frame.cloudDetailLodBias,
@@ -1730,6 +1731,7 @@ namespace dxvk {
         Logger::info(str::format("[GPU stages] frame=", frame.frameId, " stage=CloudConfig bakeInterleave=",
           frame.cloudSunGridPeriod, "/", frame.cloudDomePeriod,
           " sunBlocks=", frame.cloudSunCoherentBlocks,
+          " emptyAdvance=", frame.cloudEmptySpaceAdvance,
           " extent=", frame.cloudRenderWidth, "x", frame.cloudRenderHeight,
           " detailLod=", frame.cloudDetailLod, " detailLodBias=", frame.cloudDetailLodBias));
         Logger::info(str::format("[GPU stages] frame=", frame.frameId, " stage=MeasuredSequence ms=",
@@ -1776,6 +1778,7 @@ namespace dxvk {
       frame.cloudSampleSpacingKm = state.sampleSpacingKm;
       frame.cloudScreenPeriod = state.screenPeriod;
       frame.cloudSunCoherentBlocks = state.sunCoherentBlocks;
+      frame.cloudEmptySpaceAdvance = state.emptySpaceAdvance;
       frame.cloudSunGridPeriod = state.sunGridPeriod;
       frame.cloudDomePeriod    = state.domePeriod;
       frame.cloudRenderWidth   = state.renderWidth;

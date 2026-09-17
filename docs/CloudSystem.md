@@ -96,6 +96,12 @@ plus one consumer wire-in inside the volumetric pass.
    key error is at most 1/2048 and coverage changes within one bin are below 1/1024. Other key
    inputs (including grid mapping and published NVDF state) retain their previous checks.
    Log Cloud Timings reports BakeInterleave full-frame/input-change counts over 120 frames.
+   Empty-Space Advance (experimental, default on) moves the adaptive screen-march cursor
+   through the existing conservative empty interval before sampling again. It is a separate
+   compile-time variant in Normal profiling mode; Off restores the previous march. The
+   density model, sample cap and spacing stay unchanged, but sample positions can change.
+   Compare GPU density counts, CloudScreen timing, and edge stability; logs capture
+   emptyAdvance with submitted settings. A GPU speedup is not yet measured.
    Defaults are 1 km Cloud Sample Spacing and 32 Max Cloud Samples.
    Cloud Sample Spacing exposes 0..4 km for live quality/cost comparisons; larger values can
    miss thin cloud features. Zero selects the fixed base-count march.

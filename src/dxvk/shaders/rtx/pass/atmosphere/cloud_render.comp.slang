@@ -21,6 +21,10 @@
 */
 
 //!variant cloud_render.comp
+//!variant cloud_render_empty_advance.comp
+//!> CLOUD_EMPTY_CURSOR_ADVANCE=1
+//!variant cloud_render_empty_advance_interleave.comp
+//!> CLOUD_EMPTY_CURSOR_ADVANCE=1 CLOUD_SCREEN_INTERLEAVE=1
 //!variant cloud_render_no_moon_shadows.comp
 //!> CLOUD_PROFILE_NO_MOON_SHADOWS=1
 //!variant cloud_render_density_only.comp

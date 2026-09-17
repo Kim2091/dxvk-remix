@@ -229,6 +229,7 @@ namespace dxvk {
       float cloudSampleSpacingKm = 0.0f;
       uint32_t cloudScreenPeriod = 1u;
       bool cloudSunCoherentBlocks = false;
+      bool cloudEmptySpaceAdvance = false;
       // Captured at the CloudScreen timestamp, after every cloud dispatch has resolved its state.
       uint32_t cloudSunGridPeriod = 1;
       uint32_t cloudDomePeriod = 1;

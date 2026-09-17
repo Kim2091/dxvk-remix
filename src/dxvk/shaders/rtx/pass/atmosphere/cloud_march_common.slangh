@@ -1394,6 +1394,7 @@ void marchCloudSlab(vec3   viewDirYUp,
 
     float stepKm = clamp(args.cloudViewStepKm * sqrt(t * (1.0f / kAdaptiveRefDistKm)),
                          args.nubis3AdaptiveStepKm, adaptiveCeilKm);
+#if !defined(CLOUD_EMPTY_CURSOR_ADVANCE)
     if (args.nvdfStepScale > 0.0f) {
       // Inside cloud the conservative empty radius goes <= 0 and max() hands
       // control to the adaptive step — exactly the reference's hybrid.
@@ -1430,6 +1431,7 @@ void marchCloudSlab(vec3   viewDirYUp,
       // this negative and the adaptive step wins, as before.
       stepKm = max(stepKm, (tEmptyUntilKm - t) * args.nvdfStepScale);
     }
+#endif
     stepKm = min(stepKm, tExit - t);  // final-segment Beer length stays exact
     if (stepKm <= 1e-5f) break;       // FP guard: t += denormal would stall
 
@@ -1449,6 +1451,12 @@ void marchCloudSlab(vec3   viewDirYUp,
     // from wherever its cursor is (see above).
     tEmptyUntilKm = tSample + sdfStepKm;
     t += stepKm;
+#if defined(CLOUD_EMPTY_CURSOR_ADVANCE)
+    // Advance only through the remainder of the sample-anchored empty interval.
+    // Feeding this distance into a jittered sample instead re-evaluates known empty air.
+    const float emptyAdvanceKm = max(tEmptyUntilKm - t, 0.0f) * saturate(args.nvdfStepScale);
+    t = min(t + emptyAdvanceKm, tExit);
+#endif
   }
 
   // Budget-exhausted tail (fork -- 2026-09-17, "distant clouds disappear behind a hard line").

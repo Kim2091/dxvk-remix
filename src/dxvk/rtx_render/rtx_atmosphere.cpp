@@ -53,6 +53,8 @@
 #include <rtx_shaders/cloud_ambient_density_grid.h>
 #include <rtx_shaders/cloud_ambient_density_grid_scan.h>
 #include <rtx_shaders/cloud_render.h>
+#include <rtx_shaders/cloud_render_empty_advance.h>
+#include <rtx_shaders/cloud_render_empty_advance_interleave.h>
 #include <rtx_shaders/cloud_render_interleave.h>
 #include <rtx_shaders/cloud_render_no_moon_shadows_interleave.h>
 #include <rtx_shaders/cloud_render_density_only_interleave.h>
@@ -3433,6 +3435,8 @@ void RtxAtmosphere::dispatchCloudRender(Rc<DxvkContext> ctx, const Resources::Ra
   m_cloudProfileState.sampleSpacingKm = args.cloudViewStepKm;
   m_cloudProfileState.screenPeriod = m_cloudScreenPeriodThisFrame;
   m_cloudProfileState.sunCoherentBlocks = RtxAtmosphere::cloudSunGridCoherentBlocks();
+  m_cloudProfileState.emptySpaceAdvance = RtxAtmosphere::cloudEmptySpaceAdvance()
+    && RtxAtmosphere::cloudProfilingMode() == 0;
   m_cloudProfileState.sunGridPeriod = m_cloudSunGridPeriodThisFrame;
   m_cloudProfileState.domePeriod    = m_cloudDomePeriodThisFrame;
   m_cloudProfileState.renderWidth   = m_cloudRenderExtent.width;
@@ -3553,9 +3557,15 @@ void RtxAtmosphere::dispatchCloudRender(Rc<DxvkContext> ctx, const Resources::Ra
         : GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, CloudRenderShader, cloud_render_density_tight_bounds));
     break;
   default:
-    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, interleave
-      ? GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, CloudRenderShader, cloud_render_interleave)
-      : CloudRenderShader::getShader());
+    if (m_cloudProfileState.emptySpaceAdvance) {
+      ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, interleave
+        ? GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, CloudRenderShader, cloud_render_empty_advance_interleave)
+        : GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, CloudRenderShader, cloud_render_empty_advance));
+    } else {
+      ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, interleave
+        ? GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, CloudRenderShader, cloud_render_interleave)
+        : CloudRenderShader::getShader());
+    }
     break;
   }
 
@@ -3607,6 +3617,7 @@ void RtxAtmosphere::dispatchCloudSampleStatistics(Rc<DxvkContext> ctx) {
         " base=", m_cloudStatisticsConfig.samples, " cap=", m_cloudStatisticsConfig.maxSamples,
         " spacingKm=", m_cloudStatisticsConfig.sampleSpacingKm,
         " screenPeriod=", m_cloudStatisticsConfig.screenPeriod,
+        " emptyAdvance=", m_cloudStatisticsConfig.emptySpaceAdvance,
         " meanAll=", m_cloudSamplesMean, " meanEvaluated=", m_cloudSamplesActiveMean,
         " max=", m_cloudSamplesMaximum, " evaluatedPercent=", m_cloudSamplesActivePercent));
     }

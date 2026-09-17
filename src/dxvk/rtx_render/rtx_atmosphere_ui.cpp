@@ -1122,6 +1122,11 @@ void RtxAtmosphere::showCloudSettings(const WeatherSnapshot* weatherSnapshot) {
       "Re-bakes half or a quarter of the sun-direction lighting grid's columns each frame; the "
       "rest are at most one period old and the filtered read blends across them. A full bake "
       "still runs whenever the grid's inputs cross a re-bake step. Applies live.");
+    RemixGui::Checkbox("Empty-Space Advance", &RtxAtmosphere::cloudEmptySpaceAdvanceObject());
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "Experimental: move past known-empty air before sampling again. Uses the existing "
+      "conservative SDF bound and NVDF Step Scale. Adaptive screen march, Normal profiling mode "
+      "only. Off restores the previous march. Compare GPU counts/time and cloud-edge stability.");
     RemixGui::Checkbox("Coherent Sun Shadow Blocks", &RtxAtmosphere::cloudSunGridCoherentBlocksObject());
     RemixGui::SetTooltipToLastWidgetOnHover(
       "Experimental: groups Half/Quarter sun-shadow updates into adjacent eight-column blocks. "
