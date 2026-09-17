@@ -78,6 +78,13 @@ order as the whole cache's net benefit, so treat SHARC as a quality feature with
 frame-time story rather than a performance one. The scene each figure was read in is not recorded.
 See §5.
 
+One is **off by default and is the answer to a specific complaint**: `rtx.sharc.maxDepositLuminance`.
+If `allowSpecularPaths` is giving you **fireflies on reflective materials** — and especially if they
+get worse the lower you set the DLSS preset — that option is the cheap cure, and it is the only one
+that does not cost you cache coverage. It needs a number picked per scene from debug view 583, so it
+is not in the config block above. See §5 and
+[SHARC-specular-fireflies-2026-09-16.md](SHARC-specular-fireflies-2026-09-16.md). **Unmeasured.**
+
 **Requirements.** SHARC needs shader Int64, buffer Int64 atomics, FP16, 16-bit storage and
 RayQuery. On a device missing any of them it **silently traces ordinary paths** — no error, no
 visual difference from mode 0, and the panel says "Unsupported device features".
@@ -464,6 +471,34 @@ them readable.
 
 > **Depends on:** pointless without a matching `accumulationFrames`. **Takes effect live — does not
 > clear the cache.**
+
+#### `rtx.sharc.maxDepositLuminance` — default `0` (off). **Unmeasured.**
+
+Caps the luminance of a single value an update path writes into a cell. The cure for **fireflies on
+reflective materials** with `allowSpecularPaths` on.
+
+A cell is a mean, so one outlier is never averaged away — only divided by the cell's sample count,
+which works out as `L / ((accumulationFrames + 1) * k)` for a cell fed `k` times a frame. And `k`
+falls with the **render** resolution, because the update pass traces one path per `updateTileSize`
+tile of the render target. That is the whole explanation for the two things people notice: fireflies
+get worse the lower the DLSS preset (about **9x** worse at Ultra Performance than at DLAA, at 1440p),
+and lowering `updateTileSize` cures them (4 quarters them). Both move the same divisor, and only one
+of them is free.
+
+**Set it** from debug view **583 (Cached Radiance)**: read the brightest cached radiance you
+legitimately want, then set this comfortably *above* it — 583 shows the cell mean, and this bounds a
+single deposit, which is larger. **Too far down** looks like bright cached areas going flat before
+the fireflies go.
+
+Unlike every other remedy it **costs no coverage**: it refuses no lookup, rejects no surface and
+loses no cell, so it cannot take back the detail `allowSpecularPaths` buys. What it costs instead is
+bias — a cell whose true radiance is above the threshold is stored dark.
+
+> **Depends on:** `rtx.sharc.deferredUpdates` must be on (it is by default); the comparison backend
+> ignores this. **Takes effect live — does not clear the cache**; old values wash out in
+> `accumulationFrames` frames, so you can drag it and watch. Full reasoning, with the arithmetic and
+> the four alternatives that were ranked below it:
+> [SHARC-specular-fireflies-2026-09-16.md](SHARC-specular-fireflies-2026-09-16.md).
 
 ### Budget — what the cache costs
 

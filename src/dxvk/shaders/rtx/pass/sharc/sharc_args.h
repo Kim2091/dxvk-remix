@@ -37,10 +37,18 @@ struct SharcArgs {
   // segment against the voxel, NVIDIA's prescribed check, instead of the hit material's
   // roughness. While set, minRoughnessSpecular is unused and both lobe classes share minRoughness.
   uint footprintGate;
+  // The brightest single deposit an update path may write into a cell, as luminance; 0 lets
+  // any value through, as rtx.fireflyFilteringLuminanceThreshold's own convention does. A cell
+  // is a mean of accumulated samples, so an outlier is not averaged away, only divided by the
+  // sample count -- and that count falls with render resolution because the update dispatch is
+  // one path per tile of the render target. Bounding the deposit is the only remedy that costs
+  // no coverage: it refuses no query, rejects no surface and creates no cell that did not exist.
+  // Applies to the deferred update backend, the shipping one.
+  float maxDepositLuminance;
 };
 #define SHARC_UPDATE_FLAG_PRIMARY_VERTEX 2u
 #define SHARC_UPDATE_SKY_RETRY_SHIFT 2u
 #define SHARC_UPDATE_SKY_RETRY_MASK 7u
 #ifdef __cplusplus
-static_assert(sizeof(SharcArgs) == 80);
+static_assert(sizeof(SharcArgs) == 84);
 #endif

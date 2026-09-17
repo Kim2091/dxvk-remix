@@ -154,6 +154,13 @@ namespace dxvk {
     m_args.updateTileSize = std::clamp(updateTileSize(), 1, 16);
     m_args.updateBounces = updateBounceLimit;
     m_args.radianceScale = 1000.0f;
+    // Deliberately absent from the clear condition above. The threshold only bounds values
+    // deposited from now on; cells already holding an unclamped outlier wash it out within
+    // accumulationFrames frames on their own, so clearing 1M-4M cells to make the change take
+    // effect a tenth of a second sooner would cost far more than it bought. It is therefore one
+    // of the few options that can be dragged live, which is what a threshold found by eye needs.
+    m_args.maxDepositLuminance = (deferredUpdates() && std::isfinite(maxDepositLuminance()))
+      ? std::max(maxDepositLuminance(), 0.0f) : 0.0f;
     m_args.enabled = 1u | (updatePrimaryVertex() ? SHARC_UPDATE_FLAG_PRIMARY_VERTEX : 0u)
       | (skyRetries << SHARC_UPDATE_SKY_RETRY_SHIFT);
     m_args.allowSpecularPaths = allowSpecularPaths() ? 1u : 0u;
@@ -447,6 +454,19 @@ namespace dxvk {
     RemixGui::DragFloat("Minimum roughness (squared)", &minRoughnessObject(), 0.01f, 0.05f, 1.0f);
     RemixGui::DragFloat("Max emissive luminance", &maxEmissiveLuminanceObject(), 0.001f, 0.0f, 1.0f);
     RemixGui::DragInt("Minimum cell samples", &minSampleCountObject(), 1.0f, 0, 32);
+    if (deferredUpdates()) {
+      RemixGui::DragFloat("Max deposit luminance", &maxDepositLuminanceObject(), 0.5f, 0.0f, 1000.0f);
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "0 disables it. Caps the luminance of a single value an update path writes into a cell. A cell is a mean, so "
+        "one outlier is not averaged away, only divided by the cell's sample count -- and that count falls with the "
+        "render resolution, because the update pass traces one path per tile of the render target. That is why "
+        "fireflies on reflective surfaces get worse the lower the DLSS preset, and why lowering the tile size cures "
+        "them: both move the same divisor. This bounds the outlier instead, and unlike every other remedy it costs no "
+        "coverage -- no lookup is refused, no surface rejected, no cell lost. The cost is bias: a cell whose true "
+        "radiance exceeds the threshold is stored dark. Pick the value from debug view 583 (Cached Radiance), not by "
+        "taste, and set it above the brightest cached radiance you legitimately want. Takes effect within "
+        "Accumulation frames without clearing the cache, so it can be dragged live. Unmeasured.");
+    }
     if (allowSpecularPaths() && !footprintGate()) {
       RemixGui::DragFloat("Minimum roughness, specular paths", &minRoughnessSpecularObject(), 0.01f, 0.05f, 1.0f);
     }

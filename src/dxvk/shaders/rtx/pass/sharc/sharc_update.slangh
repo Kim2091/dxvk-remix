@@ -1,6 +1,7 @@
 // Copyright (c) 2026, NVIDIA CORPORATION. SPDX-License-Identifier: MIT
 #pragma once
 #include "rtx/pass/sharc/sharc_bindings.slangh"
+#include "rtx/utility/common.slangh"
 
 #if SHARC_UPDATE && SHARC_DEFERRED_UPDATE
 // Record between cached vertices, then propagate once in reverse. No camera
@@ -67,6 +68,17 @@ void sharcSeedVertex(inout SharcUpdateState state, vec3 radiance, vec3 weight) {
   }
 }
 
+// The one place a deposit enters a cell on the shipping update backend, and therefore the
+// only place an outlier can be bounded at its source.  A cell is a mean, and the resolve
+// pass gives one frame's samples a weight of 1/(accumulationFrames + 1) of it (SDK:924-947),
+// so a single deposit of luminance L moves a cell fed k times per frame by L/((N+1)*k).  k
+// falls with render resolution -- the update dispatch is ceil(resolution / tile) wide
+// (indirect.cpp:788-793) -- which is why one outlier is worth several times more in a cell at
+// a low DLSS preset than at DLAA.  maxDepositLuminance bounds L directly.  It is the cache's
+// own, tighter equivalent of rtx.fireflyFilteringLuminanceThreshold, which clamps the path
+// tracer's output but never the value stored here; 0 disables it, as in fireflyFiltering
+// itself.  The running propagated value is deliberately left alone: clamping only the deposit
+// bounds every cell in the chain by the same rule without altering path propagation.
 void sharcFlushVertices(SharcUpdateState state) {
   SharcParameters p = makeSharcParameters();
   vec3 radiance = vec3(0.0f);
@@ -74,7 +86,8 @@ void sharcFlushVertices(SharcUpdateState state) {
   for (int i = SHARC_PROPAGATION_DEPTH - 1; i >= 0; --i) {
     if (uint(i) < state.count) {
       radiance = state.radiance[i] + state.weights[i] * radiance;
-      SharcAddVoxelData(p, state.indices[i], radiance, vec3(1.0f), vec3(0.0f, 0.0f, 1.0f), 0.0f, 1);
+      const vec3 deposit = fireflyFiltering(radiance, cb.sharcArgs.maxDepositLuminance);
+      SharcAddVoxelData(p, state.indices[i], deposit, vec3(1.0f), vec3(0.0f, 0.0f, 1.0f), 0.0f, 1);
     }
   }
 }

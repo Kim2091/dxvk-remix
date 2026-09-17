@@ -685,3 +685,65 @@ validator 61 PASS. Deployed to Fallout New Vegas, backup suffix
 `backup-pre-perf-preset-primary-20260916-210436`. **Not deployed to Portal RTX** - it was running
 throughout (`NvRemixBridge.exe` holding the DLL), so that install is still on the `ed39787a9` build
 and needs the copy repeating once it is closed.
+
+## Specular fireflies: the update budget scales with render resolution - 2026-09-16
+
+The report was that `allowSpecularPaths` shows far more detail than the other samplers at low DLSS
+presets but produces a lot of fireflies on reflective materials, and that only `updateTileSize`
+helped, at a price. **Those are one fact, not two.**
+
+**The update budget is resolution-dependent, from source.** The update dispatch is
+`ceil(rayDims / tile)` (`indirect.cpp:788-793`) and `rayDims` is `m_compositeOutputExtent`, which is
+`m_downscaledExtent` - the pre-upscale **render** resolution (`rtx_resources.cpp:1161`); the shader's
+launch mapping uses the same `cb.camera.resolution` (`integrate_indirect.slangh:81-86`). So the
+number of update paths falls with the DLSS preset, quadratically in the linear scale factor.
+
+**And the path count is the divisor on every firefly.** The resolve blend pins `accumulatedFrameNum`
+at `accumulationFrames` and renormalises (`SDK:925-948`), whose fixed point is
+`accumulatedSampleNum = (N+1)k` for a cell fed `k` times a frame - so **one deposit of luminance `L`
+moves a cell by `L/((N+1)k)`**. At 1440p, tile 8: 57,600 paths at DLAA against 6,420 at Ultra
+Performance, so **an outlier is worth about 9x more in a cell at Ultra Performance**. Halving the
+tile quadruples `k`, which is exactly why that worked. Both knobs move one denominator.
+
+**`footprintGate` and `minSampleCount` were never tests of this.** `minSampleCount` bounds the sample
+*count*; a cell holding an outlier has `9k` samples and sails past it - a count gate cannot see an
+outlier in a mean. And `footprintGate`'s threshold collapses to a roughness test: voxel size is
+`2^floor(log2 d)/gridScale` (`HashGridCommon.h:153-168`), so for a reflection whose segment length is
+comparable to the hit's camera distance the distance cancels and the gate reduces to
+`alpha > 1/gridScale`, i.e. **a launching perceptual roughness of about 0.17 at gridScale 50** - most
+reflective materials pass. It is a directionality gate, not a variance gate. A third gate of that
+family would not be one either, which is why the fix is not a gate.
+
+**The SHARC SDK ships no outlier handling at all** - nothing disabled by this fork, nothing to
+enable. The only radiance clamps in it are the float16 range clamps at pack time (`SDK:425-427`);
+`SharcAddVoxelData` scales and atomically adds unbounded (`SDK:494-497`). Responsive lighting would
+make it *worse* (a shorter accumulation window is a larger per-frame weight) and cache resampling
+would propagate hot cells.
+
+**One option added: `rtx.sharc.maxDepositLuminance`, default 0 (off)**, clamping the luminance of a
+single deposit in `sharcFlushVertices` (`sharc_update.slangh:82-92`), the one deposit site on the
+shipping deferred backend. It is the only remedy on the list that **costs no coverage** - it refuses
+no lookup, rejects no surface and loses no cell, so it cannot take back the detail the option exists
+for; the price is bias bounded by the threshold. Three ALU on a pass dispatched at 1/64 of the render
+resolution. It is deliberately **not** in the clear condition, so it can be dragged live.
+
+**A resolution-independent update budget was considered and declined.** Feasible in one line
+(`updateTileSize` is one of the three options that do not clear the cache) and sound in principle - a
+world-space cache's fill requirement is set by the scene, not the pixel count. But matching DLAA at
+Ultra Performance means tile 3, about 7x the update pass, which is exactly the cost the user already
+rejected, and it takes frame time away from whoever chose a low preset to get it. The honest form is
+a per-preset `updateTileSize` table in `rtx.conf`, which is in the doc.
+
+Also declined: a specular-only `minSampleCount` (its coverage cost lands precisely on the detail
+being protected, and it bounds `n` rather than variance), a read-side clamp (64x the invocations,
+leaves the cell hot so the artefact becomes a stable patch), an update-pass stats counter (needs a
+new shader permutation family) and a relative clamp against the cell's own mean (a dependent read
+into a 160 MiB buffer per deposit, against a ~0.1 ms budget).
+
+Reasoning, the arithmetic and the ranked alternatives:
+[SHARC-specular-fireflies-2026-09-16.md](SHARC-specular-fireflies-2026-09-16.md). Release build (two
+synchronous passes, `d3d9.dll` 280,213,504 bytes), integration validator 61 PASS, resources validator
+PASS, deferred and estimator validators OK, `RtxOptions.md` regenerated. (`test_graph_documentation`
+fails for missing `GameValueRead*` golden docs - pre-existing and unrelated.) Deployed to **both**
+installs, neither running, backup suffix `backup-pre-deposit-clamp-20260916-213514` - which also
+clears the Portal RTX copy left outstanding by the previous section. **Nothing measured in game.**
