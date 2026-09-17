@@ -1185,16 +1185,17 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
     args.nvdfBodyErosionStrength = std::min(std::max(RtxAtmosphere::nvdfBodyErosionStrength(), 0.0f), 1.5f);
     args.nubis3HFDetailStrength  = std::min(std::max(RtxAtmosphere::nubis3HFDetailStrength(), 0.0f), 3.0f);
     args.nvdfStepScale           = std::min(std::max(RtxAtmosphere::nvdfStepScale(), 0.0f), 0.95f);
-    // Cloud temporal-smoother EMA weight (fork — crispness pass). Composite-
-    // only; zeroed in normalizeForSkyLutCache so slider drags never re-bake.
-    args.cloudHistoryWeight      = 0.0f;
+    // Cloud temporal accumulation weight (fork -- 2026-09-17; the slot was the composite-side
+    // EMA's before f8544fa82 retired that one, and is now the cloud pass's own). Zeroed in
+    // normalizeForSkyLutCache so slider drags never re-bake.
+    args.cloudHistoryWeight      = std::min(std::max(RtxAtmosphere::cloudHistoryWeight(), 0.0f), 0.98f);
     // Anchor-delta camera cut (fork — 2026-09-05, world-space cloud migration Stage 2). Forces a
-    // full one-frame reset of the screen-space cloud temporal history — the same knob the lightning
-    // ghost-suppression fade above already collapses toward zero for exactly this reason (see
-    // atmosphere_sky.slangh's historyWeight blend) — when updateFrame's resolved anchor jumped by
-    // more than cloudAnchorCutKm this frame. m_cloudAnchorCutThisFrame is computed in updateFrame's
-    // anchor block; see its assignment there for why RtCamera::isCameraCut() cannot substitute on
-    // the engine this migration targets.
+    // full one-frame reset of the screen-space cloud temporal history when updateFrame's resolved
+    // anchor jumped by more than cloudAnchorCutKm this frame. m_cloudAnchorCutThisFrame is computed
+    // in updateFrame's anchor block; see its assignment there for why RtCamera::isCameraCut() cannot
+    // substitute on the engine this migration targets. Redundant since 2026-09-17 with
+    // resolveCloudInterleave dropping the history-valid bit on the same condition, and kept because
+    // the two reach the shader by different routes and either alone is a correct reset.
     if (m_cloudAnchorCutThisFrame) {
       args.cloudHistoryWeight = 0.0f;
     }
@@ -2127,8 +2128,18 @@ void RtxAtmosphere::resolveCloudInterleave(RtxContext& rtx, bool cloudInputsChan
   m_cloudDomePeriodThisFrame = (cloudInputsChanged || cameraJumped || !m_cloudDomeHistoryValid)
     ? 1u : cloudInterleavePeriod(RtxAtmosphere::cloudSecondaryLutInterleaveMode());
   // A flash is transient and would otherwise reach only the marched half of the screen.
-  m_cloudScreenPeriodThisFrame = (cloudInputsChanged || cameraJumped || m_lightningEnvelope > 0.0f)
+  const bool screenFullUpdate = cloudInputsChanged || cameraJumped || m_lightningEnvelope > 0.0f;
+  m_cloudScreenPeriodThisFrame = screenFullUpdate
     ? 1u : cloudInterleavePeriod(RtxAtmosphere::cloudScreenInterleaveMode());
+  // Forcing every pixel to re-march is only half a reset once the pass accumulates (fork --
+  // 2026-09-17): a freshly marched pixel still blends toward its history, so a lightning flash or a
+  // changed key would drag the previous cloudscape in behind it. Dropping the history-valid bit is
+  // what makes the full update actually full. dispatchCloudRender raises it again at the end of this
+  // frame's dispatch, so exactly one frame is unaccumulated -- which is the frame whose inputs
+  // changed, and therefore the one with no valid history to average against anyway.
+  if (screenFullUpdate) {
+    m_cloudRenderHistoryValid = false;
+  }
 }
 
 void RtxAtmosphere::dispatchTransmittanceLut(Rc<DxvkContext> ctx) {

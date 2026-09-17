@@ -1327,8 +1327,17 @@ public:
                "pixels (~4x cheaper cloud march); 1.0 = native (legacy, "
                "bit-exact). Applies on the next frame; live-tunable.");
     // Retained config keys for older installations; cloud accumulation has been removed.
-    RTX_OPTION("rtx.atmosphere", float, cloudHistoryWeight, 0.0f,
-               "Deprecated; cloud temporal smoothing has been removed.");
+    // Revived 2026-09-17 as a CLOUD-PASS accumulator (the 2026-09-14 removal took out the
+    // composite-side EMA, which is a different mechanism at a different point in the frame).
+    RTX_OPTION_ARGS("rtx.atmosphere", float, cloudHistoryWeight, 0.85f,
+               "How much of a cloud pixel's previous value is kept when it is re-marched. The cloud "
+               "march jitters each sample by a blue-noise offset, which is what lets it resolve more "
+               "detail than its step size; this is what averages that jitter away again instead of "
+               "leaving it on screen as fine grain or shimmer. 0 disables accumulation and also "
+               "freezes the jitter below native render scale (the pre-2026-09-17 behaviour). 0.85 "
+               "settles in roughly 7 frames at full update rate, 27 at Quarter interleave. Raise for "
+               "a cleaner image, lower if cloud that is moving fast under wind smears.",
+               args.minValue = 0.0f, args.maxValue = 0.98f);
     // Also used to reject mismatched surfaces during spatial upsampling.
     RTX_OPTION_ARGS("rtx.atmosphere", float, cloudHistoryDepthTolerance, 0.1f,
                "How far a cached cloud sample's surface distance may differ from the current pixel's "

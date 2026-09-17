@@ -1104,6 +1104,15 @@ void RtxAtmosphere::showCloudSettings(const WeatherSnapshot* weatherSnapshot) {
       "Samples each vertical cloud column once for ambient lighting. "
       "Reduces repeated density work. "
       "Updates every frame when cloud ground shadows are enabled. Applies live.");
+    RemixGui::DragFloat("Cloud Temporal Accumulation", &RtxAtmosphere::cloudHistoryWeightObject(),
+      0.01f, 0.0f, 0.98f, "%.2f", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "How much of a cloud pixel's previous value is kept when it is re-marched. The march jitters "
+      "each sample so it can resolve detail finer than its own step; this averages that jitter back "
+      "out instead of leaving it on screen as fine grain or shimmer. 0 turns accumulation off and "
+      "freezes the jitter below native Cloud Render Scale, which trades the shimmer for fixed-pattern "
+      "grain. Higher settles cleaner and lags further behind fast-moving cloud. Resets on camera "
+      "cuts, lightning, and any frame the cloud inputs change. Applies live.");
     const char* kCloudInterleaveModes[] = { "Every frame", "Half per frame", "Quarter per frame" };
     RemixGui::Combo("Cloud Temporal Interleave", &RtxAtmosphere::cloudScreenInterleaveModeObject(),
       kCloudInterleaveModes, IM_ARRAYSIZE(kCloudInterleaveModes));

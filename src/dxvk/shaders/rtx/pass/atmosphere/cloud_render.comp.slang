@@ -226,9 +226,17 @@ float cloudSurfaceDistanceKm(vec2 uv, CameraDirections cloudRay, AtmosphereArgs 
 CloudPixelResult marchCloudPixel(uint2 pixelCoord, vec3 viewDirYUp, float tSurfaceKm,
                                  bool reducedResolution, CloudShadeContext ctx, AtmosphereArgs args) {
   float jitterStatic = fastJitter(pixelCoord, 0u).x;
-  // Reduced-resolution texels magnify animated march noise without cloud history accumulation.
+  // Animated unless a reduced-scale pass has no accumulation to average it (fork -- 2026-09-17,
+  // cloud temporal accumulation). fastJitter taps a 128x128 BLUE-NOISE tile, which is
+  // salt-and-pepper by construction; freezing its frame index stamps that same tile into the sky
+  // every frame, magnified by the upsample. A frozen pattern is precisely what a temporal filter
+  // preserves, so neither DLSS-RR nor the accumulation below can remove it -- it is the "powder".
+  // 5543992b4 froze it because nothing averaged the animated alternative: f8544fa82 had removed the
+  // composite EMA that the jitter policy at cloud_march_common.slangh:1386 still cites as existing.
+  // With accumulateCloudHistory restoring that averager, animating is right again at every scale.
   // Keep camera projection jitter in the caller: it must still match the primary geometry rays.
-  float jitter = reducedResolution ? jitterStatic : fastJitter(pixelCoord, args.cloudRenderFrameIdx).x;
+  const bool animateJitter = !reducedResolution || args.cloudHistoryWeight > 0.0f;
+  float jitter = animateJitter ? fastJitter(pixelCoord, args.cloudRenderFrameIdx).x : jitterStatic;
 
   // ===== View-ray raymarch, both layers (cloud_march_common.slangh) =====
   // evalNubisCubedSampleCore inside marchCloudSlab uses sigma = args.cloudDensity
@@ -357,6 +365,33 @@ bool reprojectCloudPixel(uint2 pixelCoord, uint2 outputDim, float tSurfaceKm, bo
   return true;
 }
 
+// Exponential accumulation of a freshly marched pixel toward its reprojected history (fork --
+// 2026-09-17, cloud temporal accumulation). This is the averager the march's animated jitter has
+// been assuming since 2026-09-07 and has not actually had since f8544fa82 deleted the composite's
+// EMA: per-sample march variance is turned into per-frame noise on purpose, and without something
+// averaging it the fork only got to choose which artefact it wore -- frozen jitter reads as fixed
+// "powder", animated jitter as shimmer.
+//
+// Only the colour/transmittance accumulates. The depth companion stays the fresh march's own: it
+// is a geometric quantity the composite validates taps against, and a blend of two entry distances
+// describes no ray that exists.
+//
+// Ghost guard: `weight` is dropped toward zero as the history's view transmittance disagrees with
+// the fresh march's. Same-ray sampling noise perturbs transmittance by a few percent; a cloud edge
+// that has genuinely moved across the texel (wind, or parallax faster than this fork has ever been
+// driven) swings it far more. The band is deliberately generous -- rejecting at the noise scale
+// would switch the filter off exactly in the feathered edges that are the whole problem area, so
+// the guard only catches gross disagreement. Silhouettes, camera cuts, key changes and lightning
+// never reach here: reprojectCloudPixel rejects on depth class, and RtxAtmosphere clears the
+// history-valid bit for the rest.
+vec4 accumulateCloudHistory(vec4 marched, vec4 history, float weight) {
+  const float kGuardStart = 0.25f;  // transmittance delta below which history is fully trusted
+  const float kGuardWidth = 0.35f;  // ... and above start + this, not at all
+  const float alphaDelta  = abs(history.a - marched.a);
+  const float keep        = saturate(1.0f - (alphaDelta - kGuardStart) / kGuardWidth);
+  return lerp(marched, history, saturate(weight) * keep);
+}
+
 // Which pixel of a cell is marched this frame. Period 2 alternates the x parity per row and per
 // frame (a checkerboard); period 4 walks the 2x2 diagonal-first, offset on alternate cells so the
 // fresh pixels never line up in rows.
@@ -448,6 +483,18 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
   // sequence; the reduced pass marches the unjittered ray instead. The surface clamp still reads
   // the jittered depth at the texel centre, and the composite reconstructs against that depth.
   const bool jitterRay = !reducedResolution;
+  // Which projection the HISTORY is looked up through, which is not always the one the fresh ray
+  // is marched along (fork -- 2026-09-17). Without accumulation the RT is a buffer of independent
+  // jittered samples and a carried-forward pixel has to stand for the same jittered ray, so the
+  // lookup is jittered too. With accumulation the RT is a RESOLVED image whose texel means the
+  // texel centre, and the correct TAA convention is to reproject centre-to-centre and blend the
+  // jittered new sample in at the texel. That distinction is not academic here: at native scale the
+  // jittered lookup lands (jitter_prev - jitter_now) off its own texel EVERY frame, so a pixel the
+  // interleave carries forward is bilinearly resampled while the pixel beside it, marched this
+  // frame, is not -- a sharp/soft split that rotates through the cell each frame and is exactly the
+  // shimmer the Half and Quarter interleaves show at 100% render scale. Centre-to-centre snaps a
+  // still camera onto itself and the split disappears.
+  const bool historyJitterRay = jitterRay && args.cloudHistoryWeight <= 0.0f;
 
   // ===== Static-per-frame shading context (cloud_march_common.slangh) =====
   // Sun/sky radiances, the full per-moon precompute, combined-moon shadow
@@ -469,12 +516,24 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
     // Clamp to the primary surface; composite validates its taps against this depth.
     const float tSurfaceKm = cloudSurfaceDistanceKm(uv, cloudRay, args);
 
+    // The history is now fetched for EVERY pixel, not only the ones this frame does not march:
+    // a freshly marched pixel needs it to accumulate against. The extra cost is two bilinear tap
+    // sets on 1/period of the pixels, against a 32-64 sample march on the same pixels.
+    CloudPixelResult history;
+    const bool haveHistory = historyValid
+      && reprojectCloudPixel(pixelCoord, outputDim, tSurfaceKm, historyJitterRay, args, history);
+
     CloudPixelResult result;
     const bool fresh = !historyValid || all(subOffset == freshSub);
-    if (fresh || !reprojectCloudPixel(pixelCoord, outputDim, tSurfaceKm, jitterRay, args, result)) {
+    if (fresh || !haveHistory) {
       const vec3 viewDirYUp = worldToAtmosphereYUp(
         cloudRay.worldDirection, args.isZUp != 0u, args.flipUpAxis != 0);
       result = marchCloudPixel(pixelCoord, viewDirYUp, tSurfaceKm, reducedResolution, ctx, args);
+      if (haveHistory && args.cloudHistoryWeight > 0.0f) {
+        result.color = accumulateCloudHistory(result.color, history.color, args.cloudHistoryWeight);
+      }
+    } else {
+      result = history;
     }
     cloudRenderOutput[pixelCoord] = result.color;
     cloudDepthOutput[pixelCoord] = result.depth;

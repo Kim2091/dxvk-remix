@@ -647,12 +647,17 @@ struct AtmosphereArgs {
   // anti-blobby crispness pass). NEW 16-byte block appended at the struct
   // tail (all former reserve pads are consumed); grow this struct ONLY in
   // full vec4 rows (see the CB-alignment discipline note at the top).
-  float cloudHistoryWeight;  // EMA history weight of the cloud temporal
-                             // smoother in evalSkyRadiance [0..0.98]. Was the
-                             // hardcoded 0.92; lower = crisper/faster response
-                             // but more visible per-frame jitter for DLSS to
-                             // chew on. Zeroed in normalizeForSkyLutCache
-                             // (composite-only — never feeds a bake).
+  float cloudHistoryWeight;  // Cloud-pass temporal accumulation weight
+                             // [0..0.98] (fork -- 2026-09-17). Read by
+                             // cloud_render.comp.slang alone: how much of a
+                             // pixel's reprojected previous value survives when
+                             // it is re-marched, and -- at 0 -- the switch that
+                             // also freezes the march jitter below native scale
+                             // and keeps the history lookup jittered. Held the
+                             // composite-side EMA's weight until f8544fa82
+                             // removed that pass; the slot, not the mechanism,
+                             // is what carried over. Zeroed in
+                             // normalizeForSkyLutCache -- never feeds a bake.
   float nubis3InteriorTexture;  // [0..1] strength of the interior density
                                 // modulation by the raw detail channels
                                 // (Nubis3 Density-Scale-NVDF / iw3xo
