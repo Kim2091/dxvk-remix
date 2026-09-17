@@ -497,10 +497,10 @@ public:
                "every light paying for the brightest one's range. Lower it if bright lights visibly stop affecting "
                "the fog at a fixed radius; raise it to spend less.",
                args.minValue = 0.0f);
-    RTX_OPTION("rtx.atmosphere", bool, aerialPerspectiveSeparateVisibility, false,
+    RTX_OPTION("rtx.atmosphere", bool, aerialPerspectiveSeparateVisibility, true,
                "Compute aerial perspective scene visibility in a separate pass using the same sun samples and sky probes. "
                "May improve GPU scheduling at the cost of an extra visibility volume and dispatch. "
-               "Disabled by default until performance and image parity are verified on the target GPU.");
+               "On by default since 2026-09-17, from the Fallout: New Vegas tuned configuration.");
     RTX_OPTION("rtx.atmosphere", bool, aerialPerspectiveSceneShadow, true,
                "Trace the scene for sun occlusion of the air column the aerial perspective volume integrates.\n"
                "The volume covers the air BETWEEN the camera and a surface. Untraced, it treats that air as fully "
@@ -530,7 +530,7 @@ public:
                "2 = trace, then invert the result. The halo must survive ONLY where a ray found geometry. A "
                "screen that stays uniformly lit means the rays are hitting nothing.",
                args.minValue = 0, args.maxValue = 2);
-    RTX_OPTION_ARGS("rtx.atmosphere", float, aerialPerspectiveSceneShadowRangeMeters, 1000.0f,
+    RTX_OPTION_ARGS("rtx.atmosphere", float, aerialPerspectiveSceneShadowRangeMeters, 4600.0f,
                "How far from the camera, in meters, scene geometry is allowed to shadow the aerial perspective "
                "column. Samples past this trace nothing and are treated as sunlit, which is what the air above the "
                "rooftops actually is - and a ray launched from kilometres out would only pay for a bounds test it "
@@ -552,7 +552,7 @@ public:
                "0 = physical (use sunSize / 2, so shadow softness tracks the visible disc). When > 0 it "
                "overrides the sun light's half-angle WITHOUT changing the visible sun disc — larger = "
                "softer penumbra, for artistic soft shadows under a small sun.");
-    RTX_OPTION("rtx.atmosphere", float, sunIntensity, 1.0f, "Strength of Sun.");
+    RTX_OPTION("rtx.atmosphere", float, sunIntensity, 1.09f, "Strength of Sun.");
     RTX_OPTION("rtx.atmosphere", float, sunElevation, 15.0f,
                "Sun elevation in degrees. Game-drivable per-frame; persists when saved unless overridden by a runtime push.");
     RTX_OPTION("rtx.atmosphere", float, sunRotation, 0.0f,
@@ -842,7 +842,7 @@ public:
                "An existing value is migrated automatically; re-save your config to silence the notice.",
                args.onChangeCallback = &cloudAltitudeOnChange, args.flags = RtxOptionFlags::NoSave);
     RTX_OPTION("rtx.atmosphere", Vector3, cloudColor, Vector3(0.89f, 0.92f, 1.0f), "Base cloud color (albedo).");
-    RTX_OPTION("rtx.atmosphere", float, cloudWindSpeed, 0.0f, "Cloud drift speed in km/s. Clouds scroll with this velocity.");
+    RTX_OPTION("rtx.atmosphere", float, cloudWindSpeed, 0.02f, "Cloud drift speed in km/s. Clouds scroll with this velocity.");
     RTX_OPTION("rtx.atmosphere", float, cloudWindDirection, 45.0f, "Cloud wind direction in degrees (0 = +X, 90 = +Z).");
     // Detail motion (fork -- 2026-09-07, reworked). These two used to scroll the detail field along
     // two hardcoded directions unrelated to the wind, which made every cloud's surface slide the
@@ -851,7 +851,8 @@ public:
     // Neither touches the body SDF, so neither invalidates the NVDF bake.
     // Beyond this distance the march stops animating its per-sample jitter (fork -- 2026-09-07).
     // Nubis freezes it past 250 m because the voxel clouds there had no temporal filter; we have
-    // the composite EMA and DLSS-RR, both of which need per-frame noise to average. A frozen hash
+    // the cloud pass's own accumulator (cloudHistoryWeight), which needs per-frame noise to average.
+    // The composite EMA this used to name alongside it was removed on 2026-09-14. A frozen hash
     // instead makes the sampling error a fixed pattern that survives both filters as speckle.
     RTX_OPTION_ARGS("rtx.atmosphere", float, nubis3JitterAnimateKm, 1.0e9f,
                "Distance in km beyond which cloud march jitter stops animating. Effectively infinite "
@@ -925,7 +926,7 @@ public:
                "shading contrast, lower = brighter, flatter body fill. (Doc fixed "
                "2026-07-14; the old text had the direction inverted.)");
 
-    RTX_OPTION("rtx.atmosphere", float, cloudTypeMean, 1.0f,
+    RTX_OPTION("rtx.atmosphere", float, cloudTypeMean, 0.0f,
                "Mean cloud type across the sky [0,1]: 0=stratus, 0.5=stratocumulus, 1=cumulus.");
     RTX_OPTION("rtx.atmosphere", float, cloudTypeSpread, 0.54f,
                "Spatial variation amplitude for cloud type [0,1]. 0=uniform, 1=full range across the sky.");
@@ -933,7 +934,7 @@ public:
                "Region size frequency for type noise. Numerically smaller = larger spatial features. "
                "Capped at 0.0034 in the UI because faster variation puts visible 2D-noise cell "
                "structure at sub-cumulus scales (regular grid of cumulus blobs).");
-    RTX_OPTION("rtx.atmosphere", float, cloudCoverageMean, 0.44f,
+    RTX_OPTION("rtx.atmosphere", float, cloudCoverageMean, 0.54f,
                "Mean cloud coverage across the sky [0,1]: 0=clear, 1=overcast.");
     RTX_OPTION("rtx.atmosphere", float, cloudCoverageSpread, 0.0f,
                "Spatial variation amplitude for coverage [0,1]. 0=uniform, 1=full range.");
@@ -1122,23 +1123,23 @@ public:
                "the pixel footprint grows. 0 = the legacy fixed-length "
                "lattice march. Applies live.");
     // Fixed step count undersamples horizon rays (50+ km span); a target step length avoids banding.
-    RTX_OPTION("rtx.atmosphere", float, cloudViewStepKm, 0.1f,
+    RTX_OPTION("rtx.atmosphere", float, cloudViewStepKm, 0.15f,
                "Distance between cloud samples along each view ray, in km "
                "[0.1..1]. Fixes the horizontal banding near the horizon "
                "(sightlines there cross 50+ km of cloud layer, which the "
                "legacy fixed 32-sample march could not resolve). "
                "PERFORMANCE: cost scales with samples per ray — overhead "
                "views are unchanged, horizon-heavy views can cost up to "
-               "cloudViewSamplesMax/32 times more cloud time (8x at "
+               "cloudViewSamplesMax/32 times more cloud time (2x at "
                "defaults). Raise the spacing or lower the cap to trade "
                "quality for speed; 0 = legacy fixed count (banding "
                "returns). Applies live.");
-    RTX_OPTION("rtx.atmosphere", uint32_t, cloudViewSamplesMax, 256,
+    RTX_OPTION("rtx.atmosphere", uint32_t, cloudViewSamplesMax, 64,
                "Hard cap on cloud samples per ray [32..256] — the "
-               "performance governor for cloudViewStepKm. At fixed 0.1 km "
-               "spacing, 256 spans ~25 km; adaptive stepping varies this. Lower costs "
-               "less but lets some banding back in at the far horizon. "
-               "32 = legacy cost ceiling. Applies live.");
+               "performance governor for cloudViewStepKm. At the default 0.15 km "
+               "spacing, 64 spans ~9.6 km before the cap bites; adaptive stepping varies this, "
+               "and only horizon-grazing rays reach it. Raise it if far horizon cloud visibly "
+               "thins; lower it to spend less. 32 = legacy cost ceiling. Applies live.");
     RTX_OPTION("rtx.atmosphere", float, cloudUndersideLightSigma, 1.5f,
                "Extinction of the light filtering down through each cloud, "
                "per km of overlying water. Drives the analytic "
@@ -1321,11 +1322,12 @@ public:
                "sin(sun elevation) at which the sunset ambient effect smooth-fades to zero. "
                "Default 0.4 (~24 degrees above horizon). Effect is at full strength when sun is at the horizon.");
 
-    RTX_OPTION("rtx.atmosphere", float, cloudRenderResolutionScale, 1.0f,
+    RTX_OPTION("rtx.atmosphere", float, cloudRenderResolutionScale, 0.5f,
                "Resolution scale of the cloud render target relative to the "
-               "internal (DLSS-input) resolution [0.25..1]. 0.5 = quarter the "
-               "pixels (~4x cheaper cloud march); 1.0 = native (legacy, "
-               "bit-exact). Applies on the next frame; live-tunable.");
+               "internal (DLSS-input) resolution [0.25..1]. 0.5 (the default) = quarter the "
+               "pixels, which measured ~4x cheaper on the cloud march; 1.0 = native. "
+               "Below 1 the march is reconstructed against the full-resolution depth, so "
+               "silhouettes stay sharp. Applies on the next frame; live-tunable.");
     // Retained config keys for older installations; cloud accumulation has been removed.
     // Revived 2026-09-17 as a CLOUD-PASS accumulator (the 2026-09-14 removal took out the
     // composite-side EMA, which is a different mechanism at a different point in the frame).
@@ -1379,12 +1381,12 @@ public:
                "pixel is still marched at least once per period. A full march runs on any frame the "
                "cloud, sun or camera inputs cross a re-bake step, on a camera cut, and during a "
                "lightning flash. 0: every pixel every frame, 1: half (checkerboard), 2: a quarter (2x2).");
-    RTX_OPTION("rtx.atmosphere", int, cloudSunGridInterleaveMode, 1,
+    RTX_OPTION("rtx.atmosphere", int, cloudSunGridInterleaveMode, 2,
                "How many columns of the sun-direction cloud lighting grid are re-baked each frame; "
                "the others are at most one period old, and the trilinear read blends across "
                "neighbouring columns of different age. A full bake still runs on any frame the "
                "grid's inputs cross a re-bake step. 0: all columns every frame, 1: half, 2: a quarter.");
-    RTX_OPTION("rtx.atmosphere", int, cloudSecondaryLutInterleaveMode, 1,
+    RTX_OPTION("rtx.atmosphere", int, cloudSecondaryLutInterleaveMode, 2,
                "How many rows of the cloud reflection dome are re-marched each frame; the others are "
                "at most one period old. A full bake still runs on any frame the cloud inputs cross a "
                "re-bake step or the camera cuts. 0: all rows every frame, 1: half, 2: a quarter.");
@@ -1400,9 +1402,16 @@ public:
                "error that reads as crawl or flicker when the cloud render scale is below 1, at the "
                "cost of fine detail the step could not resolve anyway. 0: off, 1: only when the cloud "
                "render scale is below 1, 2: always (the reflection dome too).");
-    RTX_OPTION("rtx.atmosphere", float, cloudDetailLodBias, 0.0f,
-               "Mip bias on the cloud detail LOD, in levels. Negative keeps more detail (and more "
-               "aliasing), positive softens further. Applies live.");
+    // -3 is the slider minimum, i.e. the detail LOD barely filters at all. That is a deliberate
+    // pairing rather than a mistake: the LOD exists to band-limit detail the march step cannot
+    // integrate, and since 2026-09-17 the cloud pass accumulates jittered samples across frames,
+    // which averages that same under-sampling instead of discarding the detail that caused it.
+    // Keep the detail, average the noise. Raise this toward 0 if reduced-scale cloud crawls or
+    // flickers with accumulation turned off.
+    RTX_OPTION("rtx.atmosphere", float, cloudDetailLodBias, -3.0f,
+               "Mip bias on the cloud detail LOD, in levels. Negative keeps more detail (and relies "
+               "on cloudHistoryWeight to average the resulting sampling noise), positive softens "
+               "further. Applies live.");
     // A boost, not a spacing multiplier (fork -- 2026-09-17, second pass): the first form's minimum
     // meant 4x the samples, so "everything to lowest" quadrupled the reduced-scale march. Here the
     // minimum is the cheapest setting and the default.
