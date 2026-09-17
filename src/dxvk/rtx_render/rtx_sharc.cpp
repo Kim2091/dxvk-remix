@@ -310,7 +310,7 @@ namespace dxvk {
     }
     RemixGui::Checkbox("Log SHARC fallback statistics", &logFallbackStatsObject());
     RemixGui::Checkbox("Allow SHARC with ray portals", &allowRayPortalsObject());
-    ImGui::TextWrapped("Ray portal support is untested: the world-space cache may not be valid across a portal transform. WBOIT and opacity micromaps need no override; SHARC has dedicated variants for the first and sets the micromap pipeline flag for the second.");
+    ImGui::TextWrapped("Portal space is part of the cache key, so a vertex reached through a portal occupies its own cell and portal-only geometry is cached instead of left to brute-force paths; confirmed in a Portal RTX session with portals open. The split cells raise occupancy against the fixed capacity. WBOIT and opacity micromaps need no override; SHARC has dedicated variants for the first and sets the micromap pipeline flag for the second.");
     RemixGui::Checkbox("Batch SHARC cache writes", &deferredUpdatesObject());
     RemixGui::Checkbox("TraceRay SHARC query", &queryTraceRayObject());
     if (!queryTraceRay()) {
@@ -364,11 +364,66 @@ namespace dxvk {
           RtxOptions::enableRussianRoulette() ? "on" : "off");
       }
     }
-    if (ImGui::Button("Performance preset (fewer updates)")) {
-      updateTileSizeObject().setDeferred(8);
-      updateBouncesObject().setDeferred(4);
-      capacityLog2Object().setDeferred(20);
-      m_resetRequested = true;
+    // Three presets along one axis: how much work the update pass does per frame.  Only four
+    // options actually trade along it -- the tile size and bounce count that set the update
+    // budget, the sky retries that spend it outdoors, and the capacity the resolve pass pays
+    // for every frame.  Everything else a preset writes is a correctness or coverage control
+    // that buys artefacts rather than speed when it is loosened, so all three write the same
+    // value for it; docs/SHARC-presets-2026-09-16.md says why each one does or does not move.
+    // The diagnostic options (Measure SHARC GPU time, Include cache reuse statistics, Log
+    // SHARC fallback statistics) and the backend A/B toggles are never part of a preset: they
+    // cost about a millisecond and say nothing about quality.
+    if (ImGui::BeginCombo("SHARC preset", "Choose to apply...")) {
+      auto applyShared = [] {
+        updatePrimaryVertexObject().setDeferred(true);
+        allowSpecularPathsObject().setDeferred(true);
+        footprintGateObject().setDeferred(true);
+        accumulationFramesObject().setDeferred(8);
+        staleFramesObject().setDeferred(32);
+        gridScaleObject().setDeferred(50.0f);
+        minSampleCountObject().setDeferred(2);
+        minRoughnessObject().setDeferred(0.05f);
+        minRoughnessSpecularObject().setDeferred(0.7f);
+        maxEmissiveLuminanceObject().setDeferred(0.1f);
+      };
+      auto applyUpdateBudget = [](int tileSize, int bounces, int capacity, int skyRetries) {
+        updateTileSizeObject().setDeferred(tileSize);
+        updateBouncesObject().setDeferred(bounces);
+        capacityLog2Object().setDeferred(capacity);
+        updateSkyRetriesObject().setDeferred(skyRetries);
+      };
+      if (ImGui::Selectable("Quality")) {
+        applyShared();
+        applyUpdateBudget(4, 8, 22, 2);
+        m_resetRequested = true;
+      }
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "Four times the update paths of Balanced and twice the sky retries, so the cells Balanced leaves sparse -- "
+        "hidden faces, surfaces off screen, distant relief -- are fed as well as the camera-visible ones, and update "
+        "paths run to the full eight bounces so cells hold more of the multi-bounce tail. The update pass is the "
+        "price and it is a large one: with the deeper bounce limit on top, roughly eight times Balanced's "
+        "traced segments. Unmeasured.");
+      if (ImGui::Selectable("Balanced (default)")) {
+        applyShared();
+        applyUpdateBudget(8, 4, 22, 1);
+        m_resetRequested = true;
+      }
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "The shipped default, and the configuration tested in Fallout New Vegas. With the primary vertex deposited, "
+        "every camera-visible eligible surface is fed by every update tile that lands on it, which is what a "
+        "four-bounce, tile-8 update budget is sized for. Setting nothing in rtx.conf gives you this.");
+      if (ImGui::Selectable("Performance")) {
+        applyShared();
+        applyUpdateBudget(12, 3, 20, 0);
+        m_resetRequested = true;
+      }
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "About 2.25 times fewer update paths than Balanced, one bounce shallower -- which also drops the update "
+        "shader back to its compact four-slot variant -- no sky retries, and a quarter of the resolve threads. It "
+        "gives up the sparsest cells first: hidden faces, freshly revealed geometry and outdoor relief. Expect "
+        "tenths of a millisecond, not a transformation -- the whole cache measured about 0.1 ms net, so this trims "
+        "the cost side and the benefit side together. Unmeasured.");
+      ImGui::EndCombo();
     }
     RemixGui::DragInt("Capacity exponent", &capacityLog2Object(), 1.0f, 18, 22);
     RemixGui::DragInt("Update tile size", &updateTileSizeObject(), 1.0f, 1, 16);

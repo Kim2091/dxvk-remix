@@ -584,3 +584,38 @@ validator 62 PASS with legacy stages byte-identical to the `b74a97ede` DLL, all 
 byte-identical, the 12 update blobs changed. Deployed to both installs, backup suffix
 `backup-pre-sky-budget-20260916-193518`; the FNV file replaced was an intermediate build of this
 same change that had been deployed during the session gap, the Portal file was HEAD.
+
+## Three settings presets, and Balanced as the shipped default - 2026-09-16
+
+The single "Performance preset (fewer updates)" button is replaced by a Quality / Balanced /
+Performance combo in the panel's existing preset idiom. Only four options trade along the
+quality-speed axis and move between presets - `updateTileSize` (4 / 8 / 12), `updateBounces`
+(8 / 4 / 3), `updateSkyRetries` (2 / 1 / 0) and `capacityLog2` (22 / 22 / 20). The other ten a
+preset writes are correctness and coverage controls that buy artefacts rather than speed when
+loosened, so all three write the same value for them; the diagnostics and the backend A/B
+toggles are never written.
+
+Nine `RTX_OPTION` defaults were moved so a user who sets nothing gets Balanced, which is the
+user's tested FNV configuration: `allowSpecularPaths` and `updatePrimaryVertex` to true,
+`updateSkyRetries` 0 to 1, `capacityLog2` 21 to 22, `updateTileSize` 5 to 8, `updateBounces`
+8 to 4, `maxEmissiveLuminance` 0 to 0.1, `minRoughnessSpecular` 0.5 to 0.7, `minRoughness`
+0.8 to 0.05. Both games' confs already set most of these, so neither install changes behaviour.
+
+On the capacity question: with the primary deposit on, the outdoor live set is estimated at
+1.5-3 x 10^5 cells against 2^20 slots, and an insert fails only when sixteen consecutive slots
+are held, so 22 is very probably still inert for occupancy - but it is not inert for cost,
+because the resolve dispatches one thread per slot every frame. Performance therefore drops to
+20. Unmeasured; the panel's "no cell" miss share at 22 versus 20 is what settles it.
+
+Three stale texts corrected in the same files: the `allowRayPortals` description and its panel
+tooltip still described the insertion gate that `7c337eb39` replaced with portal-space keying,
+and called the feature untested when `:405-418` above records it confirmed in Portal RTX; debug
+view 581's legend still called the emissive test "any non-zero emissive radiance" when
+`9c464b31a` made it a luminance threshold. The identical stale comment at
+`sharc_integrator_hooks.slangh:22` was left alone rather than recompile every SHARC stage.
+
+Reasoning, per-value justification and the measurement plan:
+[SHARC-presets-2026-09-16.md](SHARC-presets-2026-09-16.md). Release build (four synchronous
+passes, `d3d9.dll` 280,177,664 bytes), integration validator all PASS, `RtxOptions.md`
+regenerated. Deployed to both installs, backup suffix `backup-pre-sharc-presets-20260916-203330`.
+Nothing measured in game.
