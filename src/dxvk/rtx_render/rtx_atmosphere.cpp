@@ -684,6 +684,33 @@ namespace {
     args.milkyWayDustColor            = vec3(0.0f, 0.0f, 0.0f);
   }
 
+  // The voxel key with every term that merely tracks WHERE AND WHEN we are removed, leaving only
+  // what the cloudscape actually looks like (fork -- 2026-09-17, accumulation reset fix).
+  //
+  // normalizeForVoxelGridKey exists to decide when to RE-BAKE the lighting grids, so it
+  // deliberately keeps camera position (snapped to a ~47 m voxel), wind scroll, boil phase and the
+  // evolution offsets in the key: the grid genuinely goes stale as any of those advance. Reusing
+  // that same key to decide whether to KEEP ACCUMULATED HISTORY was the defect. Those four terms
+  // change constantly in normal play -- the camera one is a bare floor() with no hysteresis, so a
+  // player walking near a 47 m boundary (or just bobbing across one) flips it every frame -- and
+  // each flip was throwing the entire cloud history away. That is the "temporal smoother resets
+  // randomly with camera movement" the user reported.
+  //
+  // A grid re-bake is a reason to re-march, not a reason to forget: it shifts cloud lighting by at
+  // most one quantization step, which is exactly the kind of small continuous change accumulation
+  // should be smoothing rather than resetting on. Only a genuine change of cloudscape -- a slider
+  // drag, a weather change, layer toggles -- invalidates what the history describes, and that is
+  // what survives into this key.
+  void normalizeForCloudLookKey(AtmosphereArgs& args) {
+    normalizeForVoxelGridKey(args);
+    args.cameraWorldPosYUpKm   = vec3(0.0f, 0.0f, 0.0f);
+    args.cloudWindOffset       = vec2(0.0f, 0.0f);
+    args.cloudBoilPhase        = 0.0f;
+    args.cloudEvolutionOffsetX = 0.0f;
+    args.cloudEvolutionOffsetY = 0.0f;
+    args.cloudEvolutionOffsetZ = 0.0f;
+  }
+
   // Interleave option value -> period in frames (fork -- 2026-09-16).
   uint32_t cloudInterleavePeriod(int mode) {
     return mode <= 0 ? 1u : (mode == 1 ? 2u : 4u);
@@ -2058,7 +2085,19 @@ void RtxAtmosphere::computeLuts(RtxContext& rtx) {
     memset(&m_cachedVoxelGridKey, 0, sizeof(m_cachedVoxelGridKey));
   }
 
-  resolveCloudInterleave(rtx, voxelKeyChanged);
+  // Separate from voxelKeyChanged on purpose (fork -- 2026-09-17): that key moves with the camera
+  // and the clock, this one only with the cloudscape. See normalizeForCloudLookKey.
+  bool cloudLookKeyChanged = false;
+  {
+    AtmosphereArgs lookKey = getAtmosphereArgs();
+    normalizeForCloudLookKey(lookKey);
+    cloudLookKeyChanged = memcmp(&lookKey, &m_cachedCloudLookKey, sizeof(AtmosphereArgs)) != 0;
+    if (cloudLookKeyChanged) {
+      m_cachedCloudLookKey = lookKey;
+    }
+  }
+
+  resolveCloudInterleave(rtx, voxelKeyChanged, cloudLookKeyChanged);
 
   if (cloudsEnabled && RtxAtmosphere::debugDispatchCloudVoxelGrids() && voxelGridsDirty) {
     ctx->emitMemoryBarrier(0,
@@ -2119,7 +2158,7 @@ void RtxAtmosphere::computeLuts(RtxContext& rtx) {
     VK_ACCESS_SHADER_READ_BIT);
 }
 
-void RtxAtmosphere::resolveCloudInterleave(RtxContext& rtx, bool cloudInputsChanged) {
+void RtxAtmosphere::resolveCloudInterleave(RtxContext& rtx, bool cloudInputsChanged, bool cloudLookChanged) {
   // isCameraCut never fires on an engine that keeps translation out of the view matrix (see the
   // anchor block in updateFrame), which is why the anchor-delta cut is tested alongside it.
   const bool cameraJumped = m_cloudAnchorCutThisFrame || rtx.getSceneManager().getCamera().isCameraCut();
@@ -2146,8 +2185,39 @@ void RtxAtmosphere::resolveCloudInterleave(RtxContext& rtx, bool cloudInputsChan
   // raw march noise exactly when the cloud is brightest. getAtmosphereArgs scales the weight down by
   // m_lightningHistoryFade instead -- the suppression term that already exists for this, with its own
   // decay tau, so history returns as the flash does.
-  if (cloudInputsChanged || cameraJumped) {
+  //
+  // cloudLookChanged, NOT cloudInputsChanged (fork -- 2026-09-17). cloudInputsChanged is the
+  // voxel-grid re-bake key, which moves every time the camera crosses a ~47 m grid line or the boil
+  // phase steps -- constantly, during ordinary play, with no hysteresis on the floor() that snaps
+  // it. Wiring the history reset to it meant the accumulation was being thrown away every few
+  // seconds of walking and every frame while standing near a boundary, which is what the user saw
+  // as the smoother "resetting randomly with camera movement". A re-bake still forces the full
+  // march above; it just no longer forgets. See normalizeForCloudLookKey.
+  if (cloudLookChanged || cameraJumped) {
     m_cloudRenderHistoryValid = false;
+  }
+
+  // Make all of this visible (fork -- 2026-09-17). A history reset costs no measurable frame time
+  // and leaves no trace in any existing counter -- this defect was only findable because a user
+  // described it -- so count the resets and say why, on the same 120-frame cadence as the rest of
+  // the cloud profiling.
+  if (RtxAtmosphere::cloudProfilingLog()) {
+    ++m_cloudHistoryWindowFrames;
+    m_cloudHistoryFullMarch += (m_cloudScreenPeriodThisFrame == 1u) ? 1u : 0u;
+    m_cloudHistoryResetLook += cloudLookChanged ? 1u : 0u;
+    m_cloudHistoryResetCut  += cameraJumped ? 1u : 0u;
+    if (m_cloudHistoryWindowFrames >= 120u) {
+      Logger::info(str::format(
+        "[Cloud profile] stage=CloudHistory window=", m_cloudHistoryWindowFrames,
+        " fullMarch=", m_cloudHistoryFullMarch,
+        " resetLook=", m_cloudHistoryResetLook,
+        " resetCut=", m_cloudHistoryResetCut,
+        " weight=", RtxAtmosphere::cloudHistoryWeight()));
+      m_cloudHistoryWindowFrames = 0u;
+      m_cloudHistoryFullMarch    = 0u;
+      m_cloudHistoryResetLook    = 0u;
+      m_cloudHistoryResetCut     = 0u;
+    }
   }
 }
 

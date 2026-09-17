@@ -482,7 +482,15 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
   // every reduced-scale texel's ray, which flickers a still camera's blocks through the jitter
   // sequence; the reduced pass marches the unjittered ray instead. The surface clamp still reads
   // the jittered depth at the texel centre, and the composite reconstructs against that depth.
-  const bool jitterRay = !reducedResolution;
+  // Jittered at native scale always, and below it too once there is an accumulator (fork --
+  // 2026-09-17). 5543992b4 dropped the projection jitter below native scale because a still camera
+  // cycled through the jitter sequence and flickered its blocks -- true with nothing averaging the
+  // sequence, and the reason the jitter went away rather than the flicker. The offset itself is
+  // benign: the matrix carries about +-0.5 PRIMARY pixels, and a cloud texel at scale s is 1/s
+  // primary pixels wide, so in texel terms it is +-0.5*s -- a quarter texel at 0.5, an eighth at
+  // 0.25. Averaged, that is sub-texel supersampling, and it buys back some of the resolution the
+  // reduced scale gave away rather than costing stability.
+  const bool jitterRay = !reducedResolution || args.cloudHistoryWeight > 0.0f;
   // Which projection the HISTORY is looked up through, which is not always the one the fresh ray
   // is marched along (fork -- 2026-09-17). Without accumulation the RT is a buffer of independent
   // jittered samples and a carried-forward pixel has to stand for the same jittered ray, so the

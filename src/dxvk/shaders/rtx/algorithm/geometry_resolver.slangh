@@ -1984,6 +1984,21 @@ void geometryResolverVertex(
     {
       PrimaryScreenSpaceMotionVectorDLSSRR[geometryResolverState.pixelCoordinate] = calcMotionVectorForRayMiss(geometryResolverState.pixelCoordinate);
       PrimaryDepthDLSSRR[geometryResolverState.pixelCoordinate] = cb.clearColorDepth;
+      // The normal guide was the one RR input a miss never defined (fork -- 2026-09-17). Every
+      // other buffer in this block, and the sibling roughness zeroed in geometryResolverOutputMiss
+      // under the comment "RR requires zeroed out input guide buffers for misses", is written on
+      // the miss path; PrimaryWorldShadingNormalDLSSRR is written only by the three SURFACE paths
+      // (the material serialize above, the PSR transmission replacement, the material-memory
+      // restore). It is a dedicated unaliased image when RR is on and nothing clears it per frame,
+      // so every sky pixel was handing RR whatever normal last occupied that texel -- a stale
+      // geometry normal that persists until something moves under it, and changes as the camera
+      // sweeps geometry across the sky line. RR is a normal-guided denoiser; a guide that is
+      // garbage at exactly the pixels the clouds live in is not a signal it can filter coherently.
+      //
+      // clearColorNormal, not zero, to match writeMissToGBuffer's own missNormal for the NRD-facing
+      // normal buffer (gbuffer_helpers.slangh) -- a valid unit vector rather than a degenerate one,
+      // and above all the same value every frame, which is the property that was missing.
+      PrimaryWorldShadingNormalDLSSRR[geometryResolverState.pixelCoordinate] = vec4(cb.clearColorNormal, 0.0f);
     }
 
     return;

@@ -1627,7 +1627,10 @@ private:
   void dispatchCloudSecondaryLut(Rc<DxvkContext> ctx);
   // Decides this frame's interleave period for the screen pass, the sun grid and the reflection
   // dome; called once per frame from computeLuts before any of the three dispatches reads args.
-  void resolveCloudInterleave(RtxContext& rtx, bool cloudInputsChanged);
+  // cloudInputsChanged decides whether every pixel RE-MARCHES this frame; cloudLookChanged decides
+  // whether the accumulated history is DISCARDED. They are deliberately different questions and
+  // deliberately different keys -- see normalizeForCloudLookKey.
+  void resolveCloudInterleave(RtxContext& rtx, bool cloudInputsChanged, bool cloudLookChanged);
 
   static constexpr uint32_t kTransmittanceLutWidth = 512;
   static constexpr uint32_t kTransmittanceLutHeight = 128;
@@ -1801,6 +1804,15 @@ private:
   AtmosphereArgs m_cachedTransmittanceMsKey = {};
   // Zero-init forces a first-frame bake; cloud-noise re-bakes also zero it to force same-frame refresh.
   AtmosphereArgs m_cachedVoxelGridKey = {};
+  // The same key with camera position, wind, boil and evolution stripped out: "has the cloudscape
+  // itself changed", which is the only thing that should invalidate accumulated history.
+  AtmosphereArgs m_cachedCloudLookKey = {};
+  // Rolling counters behind rtx.atmosphere.cloudProfilingLog (fork -- 2026-09-17). History resets
+  // are invisible in a frame time and were only found from a user describing them, so count them.
+  uint32_t m_cloudHistoryWindowFrames = 0u;
+  uint32_t m_cloudHistoryFullMarch    = 0u;
+  uint32_t m_cloudHistoryResetLook    = 0u;
+  uint32_t m_cloudHistoryResetCut     = 0u;
   float    m_cachedPlacementCellSizeKm = 0.0f;
   float    m_cachedPlacementTileKm     = 0.0f;
   // Coverage/wind/evolution are NOT keys (sample-time inputs). cloudThickness quantized to 0.25 km
