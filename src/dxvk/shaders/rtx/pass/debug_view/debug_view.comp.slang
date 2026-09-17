@@ -902,6 +902,18 @@ vec4 loadInput(inout RNG randomState, ivec2 threadId)
       value = vec4(outColor, entryKm);
     }
     break;
+  case DEBUG_VIEW_CLOUD_SAMPLE_COUNT:
+    {
+      // Fork diagnostic (native-scale optimisation, 2026-09-17). .w of the depth companion carries
+      // the number of density evaluations this ray performed. Same point-sampled read as 881.
+      uint2 cloudDepthDim;
+      DebugViewCloudDepthRT.GetDimensions(cloudDepthDim.x, cloudDepthDim.y);
+      const float samples = DebugViewCloudDepthRT[cloudNativeTexel(threadId, cloudDepthDim)].w;
+      // Turbo over 0-128 for the picture; raw count in alpha so the debug view's statistics tools
+      // report exact numbers, the same convention 881 uses for entry distance.
+      value = vec4(turboColormap(saturate(samples * (1.0f / 128.0f))), samples);
+    }
+    break;
   case DEBUG_VIEW_CLOUD_TRANSMITTANCE_ON_GEOMETRY:
     {
       // Fork diagnostic (world-space cloud migration, Stage 4b, 2026-09-05). Sky / miss pixels

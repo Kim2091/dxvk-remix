@@ -264,6 +264,7 @@ CloudPixelResult marchCloudPixel(uint2 pixelCoord, vec3 viewDirYUp, float tSurfa
   // design this migration follows always specified BOTH halves (docs/world-space-clouds-design.md
   // 4.4-B with 4.7) -- Stage 4a shipped only the clamp. The other half, per-tap depth validation,
   // is what the composite's reduced-scale reconstruction and this pass's reprojection both apply.
+  g_cloudMarchSamples = 0u;
   marchCloudLayers(viewDirYUp, jitter, jitterStatic,
                    /*tMinClamp=*/0.0f,
                    /*tMaxClamp=*/tSurfaceKm,
@@ -280,7 +281,10 @@ CloudPixelResult marchCloudPixel(uint2 pixelCoord, vec3 viewDirYUp, float tSurfa
   // g = transmittance-weighted mean cloud depth, both km. .z is the surface distance this texel was
   // clamped at -- what lets the composite's reduced-scale upsample and this pass's own reprojection
   // pick depth-consistent neighbours. .w retired with the measured-prefix experiment.
-  result.depth = vec4(entryDistanceKm, meanCloudDepthKm, tSurfaceKm, 0.0f);
+  // .w carries this ray's density-evaluation count (fork -- 2026-09-17). The channel has been free
+  // since the measured-prefix experiment was retired, and nothing composites it --
+  // DEBUG_VIEW_CLOUD_SAMPLE_COUNT is its only reader.
+  result.depth = vec4(entryDistanceKm, meanCloudDepthKm, tSurfaceKm, float(g_cloudMarchSamples));
   return result;
 }
 
@@ -489,7 +493,7 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
       // texel of BOTH render targets is defined every frame, matching cloudRenderOutput's coverage.
       // Visibility 1, not 0: there is no cloud to occlude, and scaling nothing by one is still
       // nothing.
-      cloudDepthOutput[pixelCoord] = vec4(-1.0f, 0.0f, kNoSurfaceKm, 1.0f);
+      cloudDepthOutput[pixelCoord] = vec4(-1.0f, 0.0f, kNoSurfaceKm, 0.0f);
     }
     return;
   }

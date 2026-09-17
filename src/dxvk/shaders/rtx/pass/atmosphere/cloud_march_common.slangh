@@ -1206,6 +1206,14 @@ static const float kNoSurfaceKm = 1e9f;
 // already opaque, by at most 1% of the background.
 static const float kCloudExitTransmittance = 0.01f;
 
+// Density-evaluation counter (fork -- 2026-09-17, native-scale optimisation). Per-thread static, so
+// counting costs no signature changes anywhere in the march. The screen pass zeroes it before
+// marchCloudLayers and writes the total into the depth companion's free .w channel, where
+// DEBUG_VIEW_CLOUD_SAMPLE_COUNT renders it. Lighting is only ~17% of the march, so the march is
+// dominated by density evaluation and the question that chooses every optimisation from here is
+// where those evaluations actually go -- which rays spend their budget, and on what. Measure first.
+static uint g_cloudMarchSamples;
+
 void marchCloudSlab(vec3   viewDirYUp,
                     float  pixelJitter,
                     float  pixelJitterStatic,
@@ -1326,6 +1334,7 @@ void marchCloudSlab(vec3   viewDirYUp,
       float t = tEntry + stepLen * (float(i) + pixelJitter);
       float rayFrac = (float(i) + pixelJitter) / float(effSampleCount);
       float sdfStepKm;
+      ++g_cloudMarchSamples;
       bool sampled = integrateCloudSample(t, stepLen, rayFrac, viewDirYUp,
                                           slabAltitudeKm, slabThicknessKm,
                                           slabTypeMean, slabCoverageMean,
@@ -1449,6 +1458,7 @@ void marchCloudSlab(vec3   viewDirYUp,
     float hash    = t < kJitterAnimateKm ? pixelJitter : pixelJitterStatic;
     float tSample = t + hash * stepKm;
     float rayFrac = saturate((tSample - tEntry) / (tExit - tEntry));
+    ++g_cloudMarchSamples;
     integrateCloudSample(tSample, stepKm, rayFrac, viewDirYUp,
                          slabAltitudeKm, slabThicknessKm,
                          slabTypeMean, slabCoverageMean,
@@ -1491,6 +1501,7 @@ void marchCloudSlab(vec3   viewDirYUp,
         if (viewTransmittance < kCloudExitTransmittance) break;
         const float tSample = t + (float(tail) + 0.5f) * tailStepKm;
         const float rayFrac = saturate((tSample - tEntry) / max(tExit - tEntry, 1e-6f));
+        ++g_cloudMarchSamples;
         integrateCloudSample(tSample, tailStepKm, rayFrac, viewDirYUp,
                              slabAltitudeKm, slabThicknessKm,
                              slabTypeMean, slabCoverageMean,

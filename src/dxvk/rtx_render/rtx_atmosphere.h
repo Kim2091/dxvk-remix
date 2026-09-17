@@ -1322,7 +1322,7 @@ public:
                "sin(sun elevation) at which the sunset ambient effect smooth-fades to zero. "
                "Default 0.4 (~24 degrees above horizon). Effect is at full strength when sun is at the horizon.");
 
-    RTX_OPTION("rtx.atmosphere", float, cloudRenderResolutionScale, 0.5f,
+    RTX_OPTION("rtx.atmosphere", float, cloudRenderResolutionScale, 1.0f,
                "Resolution scale of the cloud render target relative to the "
                "internal (DLSS-input) resolution [0.25..1]. 0.5 (the default) = quarter the "
                "pixels, which measured ~4x cheaper on the cloud march; 1.0 = native. "
@@ -1331,7 +1331,7 @@ public:
     // Retained config keys for older installations; cloud accumulation has been removed.
     // Revived 2026-09-17 as a CLOUD-PASS accumulator (the 2026-09-14 removal took out the
     // composite-side EMA, which is a different mechanism at a different point in the frame).
-    RTX_OPTION_ARGS("rtx.atmosphere", float, cloudHistoryWeight, 0.85f,
+    RTX_OPTION_ARGS("rtx.atmosphere", float, cloudHistoryWeight, 0.0f,
                "How much of a cloud pixel's previous value is kept when it is re-marched. The cloud "
                "march jitters each sample by a blue-noise offset, which is what lets it resolve more "
                "detail than its step size; this is what averages that jitter away again instead of "
@@ -1348,7 +1348,7 @@ public:
                args.minValue = 0.0f, args.maxValue = 1.0f);
     // Revived 2026-09-17 for the cloud-pass accumulator, like cloudHistoryWeight. Its old
     // composite-side twin is gone; this one clamps in the cloud pass.
-    RTX_OPTION_ARGS("rtx.atmosphere", float, cloudHistoryClampGamma, 1.0f,
+    RTX_OPTION_ARGS("rtx.atmosphere", float, cloudHistoryClampGamma, 0.0f,
                "How far an accumulated cloud pixel is allowed to differ from what was just marched "
                "there, measured in standard deviations of its own neighbourhood. This is what keeps "
                "the accumulation from smearing: cloud reprojects along camera rotation only, which "
@@ -1386,7 +1386,7 @@ public:
     // can spread its work over 2 or 4 frames; every one of them falls back to a full update on any
     // frame its inputs change (see resolveCloudInterleave), so the interleave only ever spans
     // frames whose full results would have agreed.
-    RTX_OPTION("rtx.atmosphere", int, cloudScreenInterleaveMode, 1,
+    RTX_OPTION("rtx.atmosphere", int, cloudScreenInterleaveMode, 0,
                "How many of the screen's cloud pixels are ray-marched each frame. The rest are "
                "reprojected from the previous frame along the camera rotation, checked against the "
                "surface the pixel now resolves, and marched fresh wherever that check fails; every "
@@ -1408,7 +1408,7 @@ public:
     // jitter turns that under-sampling into per-pixel noise the upscaler averages, below native
     // scale the frozen per-texel jitter turns it into a screen-locked block pattern that crawls
     // over moving cloud. Sampling the mip the step can integrate removes the error at its source.
-    RTX_OPTION("rtx.atmosphere", int, cloudDetailLodMode, 1,
+    RTX_OPTION("rtx.atmosphere", int, cloudDetailLodMode, 2,
                "Band-limit the cloud detail noise to what each ray-march step can integrate, by "
                "sampling a coarser mip of the detail volume as the step grows. Removes the sampling "
                "error that reads as crawl or flicker when the cloud render scale is below 1, at the "
@@ -1420,7 +1420,7 @@ public:
     // which averages that same under-sampling instead of discarding the detail that caused it.
     // Keep the detail, average the noise. Raise this toward 0 if reduced-scale cloud crawls or
     // flickers with accumulation turned off.
-    RTX_OPTION("rtx.atmosphere", float, cloudDetailLodBias, -3.0f,
+    RTX_OPTION("rtx.atmosphere", float, cloudDetailLodBias, 0.0f,
                "Mip bias on the cloud detail LOD, in levels. Negative keeps more detail (and relies "
                "on cloudHistoryWeight to average the resulting sampling noise), positive softens "
                "further. Applies live.");

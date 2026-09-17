@@ -265,6 +265,18 @@ namespace dxvk {
                                 "same four colours interpolate as a continuous ramp (fading toward black\n"
                                 "past 5 km) so any pixel's approximate distance reads at a glance, not\n"
                                 "just the exact ring positions. Sky / miss pixels are painted black."},
+        {DEBUG_VIEW_CLOUD_SAMPLE_COUNT, "Atmosphere: Cloud Density Evaluations Per Ray",
+                                "Fork diagnostic (native-scale optimisation, 2026-09-17).\n"
+                                "How many density evaluations each cloud ray performed. The march is\n"
+                                "dominated by density evaluation - lighting measured only ~17% of it -\n"
+                                "so reducing work means reducing these, and this shows where they go.\n"
+                                "RGB: Turbo colormap over 0-128 samples (blue = cheap, red = at or past\n"
+                                "the cap). Flat red over a region means those rays are exhausting\n"
+                                "cloudViewSamplesMax and their remainder is being integrated by the\n"
+                                "coarse tail rather than marched.\n"
+                                "Alpha: the raw count, for the per-channel statistics tools.\n"
+                                "Reads the depth companion's .w channel, free since the measured-prefix\n"
+                                "experiment was retired; nothing composites it."},
         {DEBUG_VIEW_CLOUD_DEPTH, "Atmosphere: Cloud Depth Companion (World-Space Stage 4b)",
                                 "Fork diagnostic (world-space cloud migration, Stage 4b, 2026-09-05).\n"
                                 "Visualizes AtmosphereCloudDepth (produced by cloud_render.comp.slang /\n"
@@ -1508,6 +1520,7 @@ namespace dxvk {
       // isSkyMiss test, and the other two are grouped in for consistency (harmless for the cases
       // that don't end up reading cb.nrd at all).
       case DEBUG_VIEW_CLOUD_DEPTH:
+      case DEBUG_VIEW_CLOUD_SAMPLE_COUNT:
       case DEBUG_VIEW_CLOUD_TRANSMITTANCE_ON_GEOMETRY:
       case DEBUG_VIEW_CLOUD_REPROJECTION:
         debugViewArgs.nrd = common.metaPrimaryDirectLightDenoiser().getNrdArgs();

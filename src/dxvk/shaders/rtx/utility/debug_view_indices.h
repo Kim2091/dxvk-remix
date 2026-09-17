@@ -403,6 +403,10 @@
 //   B (0..1, saturated) = |rotation + parallax motion vector| in pixels / 8. Black while the deck
 //     visibly moves under a pan means no motion vector is being produced at all.
 #define DEBUG_VIEW_CLOUD_REPROJECTION 883
+// Cloud density-evaluation count per ray (fork -- 2026-09-17, native-scale optimisation). The march
+// is dominated by density evaluation -- lighting measured ~17% of it -- so the question that chooses
+// every optimisation is where those evaluations go. This is that map.
+#define DEBUG_VIEW_CLOUD_SAMPLE_COUNT 912
 
 // Cloud calibration rings (fork — world-space cloud migration, Stage 0,
 // 2026-09-05). Iso-distance rings painted on resolved geometry at 0.5 / 1 /
