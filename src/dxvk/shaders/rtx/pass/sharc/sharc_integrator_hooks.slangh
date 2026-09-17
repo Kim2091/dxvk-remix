@@ -412,11 +412,12 @@ void sharcDebugUpdate(uvec2 pixel, SharcDepositStats stats)
   switch (cb.debugView)
   {
   case DEBUG_VIEW_SHARC_UPDATE_DEPOSIT:
-    storeInDebugView(pixel, vec4(stats.peakLuminance, float(stats.clamped), float(stats.deposits), 1.0f));
+    // ...FromUpdatePath, because storeInDebugView is compiled to nothing in these stages.
+    storeInDebugViewFromUpdatePath(pixel, vec4(stats.peakLuminance, float(stats.clamped), float(stats.deposits), 1.0f));
     break;
   case DEBUG_VIEW_SHARC_UPDATE_BUDGET:
     // Green fed a cell, red fed none. The palette helper lives in the query-only block above.
-    storeInDebugView(pixel, stats.deposits > 0 ? vec3(0.0f, 1.0f, 0.0f) : vec3(1.0f, 0.0f, 0.0f));
+    storeInDebugViewFromUpdatePath(pixel, stats.deposits > 0 ? vec3(0.0f, 1.0f, 0.0f) : vec3(1.0f, 0.0f, 0.0f));
     break;
   default:
     break;

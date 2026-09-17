@@ -67,8 +67,19 @@ def check(name: str, text: str) -> None:
             raise RuntimeError(f"{name}: expected hash/accumulation strides 8/16, got {sorted(s)}")
         if "Int64Atomics" not in text or "OpAtomic" not in text:
             raise RuntimeError(f"{name}: expected Int64Atomics capability and atomic operation")
-        if "OpImageWrite" in text:
-            raise RuntimeError(f"{name}: unexpected image output write")
+        # The property that matters is that an update stage writes no render output. Banning the
+        # OpImageWrite opcode outright was a proxy for that, and it is the wrong one: the deposit
+        # and budget debug views are produced by the update pass because no query stage can see
+        # the values, so they write the debug image on purpose. Resolve each write back to the
+        # variable it loaded and name what is allowed instead, which also states the invariant
+        # more precisely than the opcode ban did.
+        loads = dict(re.findall(r"(%\w+)\s*=\s*OpLoad\s+%\w+\s+(%\w+)", text))
+        for image in re.findall(r"OpImageWrite\s+(%\w+)", text):
+            target = loads.get(image, image)
+            if target != "%DebugView":
+                raise RuntimeError(f"{name}: writes image {target}, only %DebugView is permitted")
+        if 190 in b:
+            raise RuntimeError(f"{name}: must not bind the final indirect image")
     elif name.startswith("query"):
         required = {230, 232}
         if not required <= b:
