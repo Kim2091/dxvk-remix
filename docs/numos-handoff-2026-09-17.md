@@ -3,6 +3,82 @@
 Supersedes `numos-handoff-2026-09-14.md` for the cloud performance work; that file still holds the
 alpha-foliage history, the preserved shimmer-fix commits, and the working rules, which are unchanged.
 
+
+## DECISION 2026-09-17 (late): back to native scale. Read this before proposing reduced scale again.
+
+The user's call, after seven sessions: *"the spatial resolution scaling led to literally all of these
+issues, so we just need to find a way to optimize it while keeping that at 1x. temporal accumulation
+isn't even needed with that. we're wasting performance while chasing performance in the wrong way."*
+
+It is the right call, and the evidence is this run's own findings. **One decision produced three
+layers of compensation, and each layer produced the next round's bug:**
+
+1. `5543992b4` froze the march jitter's frame index below native scale (`cloud_render.comp.slang`).
+   `fastJitter` taps a 128x128 **blue-noise** tile -- salt-and-pepper by construction -- so freezing
+   its index stamps the same tile into the sky every frame, magnified by the upsample.
+2. A frozen pattern is exactly what a temporal filter **preserves**, so DLSS-RR reconstructed it
+   faithfully. That is the "powder" at 0.5 and the static 4x4 blocks at 0.25: the same defect at two
+   magnifications, not two bugs.
+3. Animating the jitter needs an averager, and `f8544fa82` had deleted the composite EMA the jitter
+   policy still cites (`cloud_march_common.slangh`, "we have two [temporal filters]"). So the cloud
+   pass grew its own accumulator (`cloudHistoryWeight`).
+4. An unbounded accumulator smears when the camera translates, because cloud reprojection is
+   rotation-only. So it grew a neighbourhood clamp (`cloudHistoryClampGamma`).
+5. The clamp measured its box from **history** taps, which are already temporally smoothed, so in
+   smooth cloud the box collapsed and switched the accumulator off -- leaving raw animated march
+   noise. The user: *"it shimmers greatly when accumulation clamp is on at all."*
+
+Cutting at the root removes all of it. Nothing was deleted -- every path is still reachable from its
+slider -- but the defaults are now native scale with no screen-space temporal reuse.
+
+### Defaults as of `fc1906291`
+
+| Option | Now | Why |
+|---|---|---|
+| `cloudRenderResolutionScale` | 1.0 | the root cause |
+| `cloudScreenInterleaveMode` | every frame | no screen-space temporal reuse |
+| `cloudHistoryWeight` | 0 | not needed at 1x |
+| `cloudHistoryClampGamma` | 0 | only existed to bound the accumulator |
+| `cloudDetailLodMode` | always | mode 1 is inert at 1x; band-limiting is still correct |
+| `cloudDetailLodBias` | 0 | -3 was justified by pairing with the accumulator; that is gone |
+| `cloudSunGridInterleaveMode` | 2 (quarter) | **kept** -- a lighting bake, never caused an artifact, ~0.4 ms |
+| `cloudSecondaryLutInterleaveMode` | 2 (quarter) | **kept**, same reasoning |
+
+The game's `rtx.conf` had five stale overrides that would have beaten these; they were removed
+(backup `rtx.conf.backup-pre-native-pivot-20260917-0500`).
+
+### The price, measured
+
+This hands back roughly **2.5 ms**. Native scale, every frame: screen march **2.58-2.95 ms**, bakes
+**~1.05 ms**, total **3.8-4.1 ms**, against the **1.2-1.5 ms** the reduced-scale configuration ran
+at. Recovering that algorithmically is hard and is not guaranteed. Optimisations from here must be
+real reductions in work, not quality traded away spatially or temporally -- that trade is what this
+whole arc was.
+
+### Where to look, and the rule
+
+Lighting measured only **~17%** of the march, so the march is dominated by **density evaluation**.
+That points at fewer evaluations, not cheaper ones: empty-space skipping against the NVDF SDF
+(`nvdfStepScale`, the conservative empty radius), where the adaptive step actually goes, early
+termination, coarse-to-fine slab entry/exit, and thread-group shape (the 16x4 / 8x4
+`cloudProfilingMode` variants have not been compared since the march changed).
+
+**Instrument before optimising.** `DEBUG_VIEW_CLOUD_SAMPLE_COUNT` (912) maps density evaluations per
+ray. This is not a style preference -- reasoning lost to counters twice in one run: the stale RR
+normal guide, and the anchor cut I had argued could not fire and which the `stage=CloudHistory`
+counters showed firing on ~8% of frames.
+
+### Parked, closed by this decision -- not unresolved
+
+- **The upscaler passthrough probe** (`cloudDebugInjectPattern`, static + animated). Two iterations
+  both measured their own construction: the static pattern is temporally stable so a temporal filter
+  preserves it by design, and the animated one survived perfectly even on **geometry** under DLSS-SR,
+  which should be impossible and means the control failed. Confirmed along the way, from the log
+  rather than inference: the live upscaler really is DLSS-RR, and both SR and RR read
+  `m_compositeOutput` as `pUnresolvedColor`, so the injection does land in the upscaler's input.
+  Unresolved and now moot.
+- **Depth-aware cloud reprojection.** Entirely moot: there is no reprojection at 1x every-frame.
+
 ## Start here
 
 - Renderer repo: `C:\Users\sparkles\Projects\Fable_5_testing\wsn3g`, branch `revised-9-10`. All work is
