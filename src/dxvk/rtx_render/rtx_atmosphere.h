@@ -1346,6 +1346,16 @@ public:
                args.minValue = 0.0f, args.maxValue = 1.0f);
     RTX_OPTION("rtx.atmosphere", float, cloudHistoryClampGamma, 0.0f,
                "Deprecated; cloud temporal smoothing has been removed.");
+    // Diagnostic, not a look knob. Two rounds of correct source reading failed to move the image,
+    // so this exists to make the upscaler's actual behaviour observable.
+    RTX_OPTION_ARGS("rtx.atmosphere", int, cloudDebugInjectPattern, 0,
+               "DEBUG. Stamps a 1-pixel checkerboard into the final composite, immediately before "
+               "the upscaler runs. 0 = off, 1 = sky and cloud pixels only, 2 = geometry pixels only, "
+               "3 = both. A 1-pixel checkerboard cannot survive any temporal or spatial filter "
+               "intact, so whatever reaches the screen says what the upscaler did to that class of "
+               "pixel: crisp squares mean it was passed through untouched, flat grey means it was "
+               "filtered. Use 3 to compare sky against geometry in one frame. Applies live.",
+               args.minValue = 0, args.maxValue = 3);
 
     RTX_OPTION("rtx.atmosphere", bool, cloudSecondaryLutEnable, true,
                "Supply clouds to secondary rays (indirect bounces, PSR, "

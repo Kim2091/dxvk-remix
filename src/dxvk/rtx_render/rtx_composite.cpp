@@ -503,10 +503,9 @@ namespace dxvk {
     // Stage 4b) — see composite_args.h's doc comment on this field for why it exists outside
     // AtmosphereArgs. `atmosphere` was already fetched above for the aerial perspective LUT.
     compositeArgs.cloudAnchorDeltaYUpKm = atmosphere.getCloudAnchor().deltaKm;
-    // Cloud temporal-EMA neighbourhood clip strength (fork — 2026-09-06, EMA rectification) -- see
-    // composite_args.h's doc comment on the field and applyCloudComposite in composite.comp.slang.
-    // Composite-only like cloudHistoryWeight; never reaches AtmosphereArgs or a LUT cache key.
-    compositeArgs.cloudHistoryClampGamma = 0.0f;
+    // Upscaler passthrough probe (fork -- 2026-09-17) -- see composite_args.h's doc comment.
+    // Composite-only; never reaches AtmosphereArgs or a LUT cache key.
+    compositeArgs.cloudDebugInjectMode = float(RtxAtmosphere::cloudDebugInjectPattern());
     compositeArgs.cloudHistoryDepthTolerance = std::max(RtxAtmosphere::cloudHistoryDepthTolerance(), 0.0f);
     compositeArgs.outputParticleLayer = ctx->useRayReconstruction() && rayReconstruction.useParticleBuffer();
     compositeArgs.outputSecondarySignalToParticleLayer = ctx->useRayReconstruction() && rayReconstruction.preprocessSecondarySignal();

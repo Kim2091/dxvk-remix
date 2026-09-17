@@ -433,6 +433,18 @@ namespace dxvk {
     // Release resources when switching upscalers
     m_currentUpscaler = getCurrentFrameUpscaler();
     if (m_currentUpscaler != m_previousUpscaler) {
+      // Say which upscaler actually won (fork -- 2026-09-17). getCurrentFrameUpscaler gates DLSS and
+      // DLSS-RR on isActive(), so an option set to DLSS can still resolve to FSR, NIS or None if NGX
+      // never came up -- and nothing logged the resolved choice, so it had to be inferred from option
+      // defaults. That inference was wrong once already. Log what was chosen, not what was asked for.
+      {
+        static const char* const kUpscalerNames[7] = { "None", "DLSS-SR", "NIS", "TAA-U", "XeSS", "FSR", "DLSS-RR" };
+        const uint32_t idx = static_cast<uint32_t>(m_currentUpscaler);
+        Logger::info(str::format("[RTX] Active upscaler resolved to: ",
+          idx < 7u ? kUpscalerNames[idx] : "?",
+          " (useRayReconstruction=", useRayReconstruction() ? "true" : "false",
+          ", upscalerType option=", static_cast<int>(RtxOptions::upscalerType()), ")"));
+      }
       // Need to wait before the previous frame is executed.
       getDevice()->waitForIdle();
 

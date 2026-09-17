@@ -1393,6 +1393,25 @@ void main(uint2 threadIndex : SV_DispatchThreadID, uint2 localIndex : SV_GroupTh
   vec4 particleLayerOutput;
   vec4 finalOutput = compositeResult(pixelCoordinate, pixelIsActive, isDirectActive, isIndirectActive, geometryFlags, primaryLinearViewZ, primaryMiss, particleLayerOutput);
 
+  // Upscaler passthrough probe (fork -- 2026-09-17, DEBUG). See composite_args.h. Placed here, after
+  // everything this pass composites and before FinalOutput, because FinalOutput IS m_compositeOutput
+  // -- the image handed to the upscaler as its unresolved colour. Anything the upscaler does to a
+  // pixel class happens to this pattern.
+  //
+  // Multiplicative rather than a fixed colour so it stays exposure-independent and reads on any
+  // scene brightness; 20:1 is far past what any filter could leave looking like squares.
+  if (cb.cloudDebugInjectMode > 0.5f)
+  {
+    const uint injectMode = uint(cb.cloudDebugInjectMode + 0.5f);
+    const bool stampSky = (injectMode == 1u) || (injectMode == 3u);
+    const bool stampGeometry = (injectMode == 2u) || (injectMode == 3u);
+    if (primaryMiss ? stampSky : stampGeometry)
+    {
+      const bool checker = ((pixelCoordinate.x + pixelCoordinate.y) & 1u) != 0u;
+      finalOutput.rgb *= checker ? 3.0f : 0.15f;
+    }
+  }
+
   FinalOutput[pixelCoordinate] = accumulate(pixelCoordinate, finalOutput, cb.accumulationArgs, true, AccumulatedFinalOutput);
 
   // Note: we only debug output for active pixels

@@ -115,12 +115,16 @@ struct CompositeArgs {
   float alphaBlendSurfacePackMult; // for packing/unpacking hitT into Float16 in AlphaBlendSurface
   float postFilterThreshold;
   uint writeRayReconstructionHitDistance;
-  // Cloud temporal-EMA neighbourhood clip strength (fork — 2026-09-06, EMA rectification): the
-  // reprojected history is clipped to mean +- cloudHistoryClampGamma * stddev of the current frame's
-  // 3x3 cloud neighbourhood before the blend (see applyCloudComposite in composite.comp.slang). 0
-  // disables the clip (A/B only). Rides the former pad1 slot; CB layout unchanged. Mirrors
-  // rtx.atmosphere.cloudHistoryClampGamma. Composite-only, never a bake or LUT cache-key input.
-  float cloudHistoryClampGamma;
+  // Upscaler passthrough probe (fork -- 2026-09-17). Was cloudHistoryClampGamma, dead since the EMA
+  // it clipped was removed; same slot, so the CB layout is unchanged.
+  //
+  // Stamps a 1-pixel checkerboard onto the composite output -- the last thing written before the
+  // upscaler runs -- so that what the upscaler does to a given class of pixel can be SEEN instead of
+  // argued about. 0 off, 1 sky/cloud pixels only, 2 geometry pixels only, 3 both. Mode 3 is the one
+  // that matters: the same pattern, the same frame, the same filter, over both pixel classes at once,
+  // so "is sky treated differently from geometry" is answered by one look rather than by reasoning
+  // about guide buffers. A 1-px checkerboard cannot survive any temporal or spatial filter intact.
+  float cloudDebugInjectMode;
 
   // Cloud composite parallax reprojection (fork — 2026-09-05, world-space cloud migration Stage 4b).
   // This frame's cloud-anchor world-space motion, Y-up km (RtxAtmosphere::getCloudAnchor().deltaKm
