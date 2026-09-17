@@ -120,10 +120,13 @@ struct CompositeArgs {
   //
   // Stamps a 1-pixel checkerboard onto the composite output -- the last thing written before the
   // upscaler runs -- so that what the upscaler does to a given class of pixel can be SEEN instead of
-  // argued about. 0 off, 1 sky/cloud pixels only, 2 geometry pixels only, 3 both. Mode 3 is the one
-  // that matters: the same pattern, the same frame, the same filter, over both pixel classes at once,
-  // so "is sky treated differently from geometry" is answered by one look rather than by reasoning
-  // about guide buffers. A 1-px checkerboard cannot survive any temporal or spatial filter intact.
+  // argued about. 0 off; 1/2/3 static over sky, geometry, both; 4/5/6 the same three with the
+  // checkerboard's phase inverted every frame.
+  //
+  // The static/animated pair is the actual measurement -- see the block comment at the injection
+  // site in composite.comp.slang. A static pattern is temporally stable and therefore survives a
+  // temporal filter by design, so static alone cannot tell "not processed" from "processed, but
+  // temporally stable". Animating the phase changes only the time axis.
   float cloudDebugInjectMode;
 
   // Cloud composite parallax reprojection (fork — 2026-09-05, world-space cloud migration Stage 4b).

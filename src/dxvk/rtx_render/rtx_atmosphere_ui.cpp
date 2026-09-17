@@ -1212,19 +1212,27 @@ void RtxAtmosphere::showCloudSettings(const WeatherSnapshot* weatherSnapshot) {
       "every 120 rendered frames. Keep each mode active for at least 10 seconds. "
       "Return to Normal and turn logging off after testing.");
     const char* kCloudInjectPatterns[] = {
-      "Off", "Sky and cloud pixels", "Geometry pixels", "Both"
+      "Off",
+      "Static - sky and cloud", "Static - geometry", "Static - both",
+      "Animated - sky and cloud", "Animated - geometry", "Animated - both"
     };
     RemixGui::Combo("Upscaler Passthrough Probe", &RtxAtmosphere::cloudDebugInjectPatternObject(),
       kCloudInjectPatterns, IM_ARRAYSIZE(kCloudInjectPatterns));
     RemixGui::SetTooltipToLastWidgetOnHover(
       "Diagnostic only, and deliberately ugly. Stamps a 1-pixel checkerboard into the image at the "
       "exact point it is handed to the upscaler, so you can see what the upscaler does to a given "
-      "kind of pixel instead of having to reason about it. Nothing survives a 1-pixel checkerboard "
-      "intact: crisp squares mean those pixels were passed straight through, flat grey means they "
-      "were filtered. "
-      "Use 'Both' and look at sky and terrain in the same shot. If the sky keeps its squares while "
-      "the ground goes grey, the upscaler is not touching cloud pixels and no amount of tuning here "
-      "will make it antialias them. Turn this off when you are done. Applies live.");
+      "kind of pixel instead of having to reason about it. "
+      "The measurement is the PAIR: take one screenshot on 'Static - both', then one on "
+      "'Animated - both'. They are the same pattern at the same contrast and differ only in whether "
+      "it holds still or inverts every frame. If the animated shot comes out smooth while the static "
+      "shot keeps its checkerboard, the upscaler is temporally filtering those pixels and the cloud "
+      "fix is to make the cloud noise change every frame. If both shots keep the pattern, the "
+      "upscaler is not filtering them at all and clouds must be cleaned up before they reach it. "
+      "A static pattern survives a temporal filter by design, so a static shot on its own proves "
+      "nothing. "
+      "Use screenshots, not the live view: a pattern that inverts every frame averages out in your "
+      "eye and looks smooth whether or not anything actually filtered it. "
+      "Turn this off when you are done. Applies live.");
     RemixGui::DragFloat("Lighting LOD", &RtxAtmosphere::cloudLightingLodThresholdObject(),
       0.002f, 0.0f, 0.25f, "%.3f", sliderFlags);
     RemixGui::SetTooltipToLastWidgetOnHover(

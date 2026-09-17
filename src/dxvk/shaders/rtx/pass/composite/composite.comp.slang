@@ -1403,11 +1403,31 @@ void main(uint2 threadIndex : SV_DispatchThreadID, uint2 localIndex : SV_GroupTh
   if (cb.cloudDebugInjectMode > 0.5f)
   {
     const uint injectMode = uint(cb.cloudDebugInjectMode + 0.5f);
-    const bool stampSky = (injectMode == 1u) || (injectMode == 3u);
-    const bool stampGeometry = (injectMode == 2u) || (injectMode == 3u);
+    // 1-3 static, 4-6 the same three targets animated.
+    const bool animated = injectMode >= 4u;
+    const uint target = animated ? (injectMode - 3u) : injectMode;
+    const bool stampSky = (target == 1u) || (target == 3u);
+    const bool stampGeometry = (target == 2u) || (target == 3u);
     if (primaryMiss ? stampSky : stampGeometry)
     {
-      const bool checker = ((pixelCoordinate.x + pixelCoordinate.y) & 1u) != 0u;
+      // The static variant alone cannot answer the question it was built for (fork -- 2026-09-17,
+      // second pass). A screen-static checkerboard reprojects exactly onto itself every frame, so a
+      // temporal filter PRESERVES it by construction -- that is not a bug in the filter, it is the
+      // whole point of one. Which means the static probe cannot separate "the upscaler does not
+      // process these pixels" from "it processes them temporally and this pattern is temporally
+      // stable". It is also, precisely, the property that made 5543992b4's frozen blue-noise
+      // survive: the first probe reproduced the bug instead of testing the mechanism.
+      //
+      // The animated variant inverts the checkerboard's PHASE each frame and changes nothing else,
+      // so the two differ only in time: identical spatial frequency, identical contrast, identical
+      // pixel count. Static survives + animated cleaned = the upscaler is temporally filtering these
+      // pixels, and the cloud problem reduces entirely to making march noise decorrelate frame to
+      // frame. Both survive = it is not filtering them and the cloud pass owns antialiasing.
+      //
+      // Judge from a SCREENSHOT, never the live view: an alternating pattern averages out in the eye
+      // at frame rate and looks grey whether or not anything filtered it.
+      const uint phase = animated ? cb.frameIdx : 0u;
+      const bool checker = ((pixelCoordinate.x + pixelCoordinate.y + phase) & 1u) != 0u;
       finalOutput.rgb *= checker ? 3.0f : 0.15f;
     }
   }

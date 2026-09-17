@@ -1352,12 +1352,15 @@ public:
     // so this exists to make the upscaler's actual behaviour observable.
     RTX_OPTION_ARGS("rtx.atmosphere", int, cloudDebugInjectPattern, 0,
                "DEBUG. Stamps a 1-pixel checkerboard into the final composite, immediately before "
-               "the upscaler runs. 0 = off, 1 = sky and cloud pixels only, 2 = geometry pixels only, "
-               "3 = both. A 1-pixel checkerboard cannot survive any temporal or spatial filter "
-               "intact, so whatever reaches the screen says what the upscaler did to that class of "
-               "pixel: crisp squares mean it was passed through untouched, flat grey means it was "
-               "filtered. Use 3 to compare sky against geometry in one frame. Applies live.",
-               args.minValue = 0, args.maxValue = 3);
+               "the upscaler runs. 0 = off; 1/2/3 = static over sky, geometry, both; 4/5/6 = the "
+               "same three with the checkerboard inverted every frame. Compare a static mode against "
+               "its animated twin: they have identical spatial frequency and contrast and differ "
+               "only in time, so if the animated one is cleaned up while the static one survives, "
+               "the upscaler is temporally filtering those pixels. A static pattern survives a "
+               "temporal filter by design, so a static mode alone proves nothing. Judge from a "
+               "screenshot, never the live view -- an alternating pattern averages out in the eye at "
+               "frame rate whether or not anything filtered it. Applies live.",
+               args.minValue = 0, args.maxValue = 6);
 
     RTX_OPTION("rtx.atmosphere", bool, cloudSecondaryLutEnable, true,
                "Supply clouds to secondary rays (indirect bounces, PSR, "
