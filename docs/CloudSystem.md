@@ -91,7 +91,9 @@ plus one consumer wire-in inside the volumetric pass.
    Coherent Sun Shadow Blocks (experimental, default on) groups sun updates into adjacent
    eight-column blocks; its live toggle restores strided updates for timing/quality comparison.
    Log Cloud Timings also exposes actual GPU mean/max view-density evaluations in the menu;
-   Max Cloud Samples is a ceiling, not the number of samples every ray takes.
+   Max Cloud Samples is a ceiling, not the number of samples every ray takes. Its live range is
+   2..256 and it can go below the base count; adaptive exhaustion still adds up to four coarse
+   tail samples. Zero spacing retains the fixed base-count march and ignores this ceiling.
    See [the experiment and diagnostics](numos-sun-blocks-2026-09-17.md).
    Screen reprojection remains rotation-only; rapid translation through nearby clouds can
    expose reuse errors. No new in-game quality or performance result is claimed.

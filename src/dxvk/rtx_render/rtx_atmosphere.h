@@ -1133,7 +1133,7 @@ public:
                "quality for speed; 0 = legacy fixed count (banding "
                "returns). Applies live.");
     RTX_OPTION("rtx.atmosphere", uint32_t, cloudViewSamplesMax, 64,
-               "Main-layer march iteration ceiling per slab crossing, floored by cloudViewSamples. "
+               "Main-layer march iteration ceiling per slab crossing [2..256], independent of the base count. "
                "Rays that finish or become opaque earlier do not reach this limit. Adaptive budget "
                "exhaustion adds up to four coarse tail samples; the second layer has its own budget. "
                "0 spacing selects the base fixed-count march and ignores this ceiling. Applies live.");

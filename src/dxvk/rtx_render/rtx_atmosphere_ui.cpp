@@ -1152,9 +1152,9 @@ void RtxAtmosphere::showCloudSettings(const WeatherSnapshot* weatherSnapshot) {
       "distance and stops at its floor. Max Cloud Samples only limits rays that reach the cap. "
       "0 selects the legacy fixed base-count march. Applies live.");
     RemixGui::DragInt("Max Cloud Samples", &RtxAtmosphere::cloudViewSamplesMaxObject(),
-      1.0f, 32, 256, "%d", sliderFlags);
+      1.0f, 2, 256, "%d", sliderFlags);
     RemixGui::SetTooltipToLastWidgetOnHover(
-      "Main-layer iteration ceiling per slab crossing, floored by the base count. Changing this "
+      "Main-layer iteration ceiling per slab crossing [2..256]. Changing this "
       "does nothing to rays that finish or become opaque below the ceiling. Adaptive exhaustion "
       "adds up to four coarse tail samples. The second layer has a separate budget. "
       "Ignored at zero spacing. Enable Log Cloud Timings for actual GPU evaluation counts.");

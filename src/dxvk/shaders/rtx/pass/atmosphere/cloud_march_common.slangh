@@ -1280,15 +1280,15 @@ void marchCloudSlab(vec3   viewDirYUp,
   // jitter + temporal EMA render as soft horizontal BANDS, concentrated
   // exactly where the sky compresses toward the horizon. Hold a target
   // step LENGTH instead: count = span / cloudViewStepKm, floored at the
-  // configured base count (zenith cost unchanged) and capped at
+  // configured base count when the cap allows it, and capped at
   // cloudViewSamplesMax (perf bound; the column model's pre-tap early-outs
   // keep the added steps cheap where the slab is empty).
   // cloudViewStepKm = 0 reproduces the legacy fixed count exactly.
   uint effSampleCount = sampleCount;
   if (args.cloudViewStepKm > 0.001f) {
     uint wanted = uint(ceil((tExit - tEntry) / args.cloudViewStepKm));
-    uint maxSamples = max(uint(args.cloudViewSamplesMax), sampleCount);
-    effSampleCount = clamp(wanted, sampleCount, maxSamples);
+    uint maxSamples = max(uint(args.cloudViewSamplesMax), 2u);
+    effSampleCount = clamp(wanted, min(sampleCount, maxSamples), maxSamples);
   }
 
   float stepLen = (tExit - tEntry) / float(effSampleCount);
@@ -1382,7 +1382,7 @@ void marchCloudSlab(vec3   viewDirYUp,
   // Animated by default so sampling error does not become a fixed screen-space pattern.
   const float kJitterAnimateKm   = args.nubis3JitterAnimateKm;
   float adaptiveCeilKm = max(4.0f * args.cloudViewStepKm, args.nubis3AdaptiveStepKm);
-  uint  iterCap = max(uint(args.cloudViewSamplesMax), sampleCount);
+  uint  iterCap = max(uint(args.cloudViewSamplesMax), 2u);
   float t = tEntry;
   float sdfStepKm = 0.0f;  // previous sample's conservative empty radius
   // Far end of the previous sample's guaranteed-empty interval, as a distance along the ray

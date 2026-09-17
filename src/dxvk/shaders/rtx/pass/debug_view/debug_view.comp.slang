@@ -917,8 +917,9 @@ vec4 loadInput(inout RNG randomState, ivec2 threadId)
       // that reached the cap is painted WHITE rather than left to be inferred from a colour. The
       // one question that decides where the work goes is "are these rays running out of budget",
       // and it is now answered by a colour that no choice of ramp can disguise.
-      const float iterCap = max(cb.atmosphereArgs.cloudViewSamplesMax,
-                                float(cb.atmosphereArgs.cloudViewSamples));
+      const float iterCap = cb.atmosphereArgs.cloudViewStepKm > 0.001f
+        ? max(cb.atmosphereArgs.cloudViewSamplesMax, 2.0f)
+        : float(cb.atmosphereArgs.cloudViewSamples);
       const bool saturated = samples >= iterCap;
       const vec3 outColor = saturated
         ? vec3(1.0f, 1.0f, 1.0f)
