@@ -97,3 +97,26 @@ baseline. These are estimates from the work fraction; the measured numbers go in
   is on in the game's rtx.conf) give CloudScreen / AtmosphereCloudSunGrid / AtmosphereCloudSecondaryLut
   per 120 frames; each of the three modes can be flipped live between Every frame and Half per frame in
   Atmosphere -> Clouds -> Quality & performance for an A/B in one session.
+
+## Measured in game (2026-09-17 00:00 session, 38 sampled frames, scale 1.0, 32/64 samples)
+
+Same GPU clock as the baseline session: PostProcessing 0.399 / Upscaling 4.19 / ambient grid 0.172 ms all
+match. Sun static (sunElevation 38.01, time cycle off, wind 0), so key-forced full updates were rare; the
+interleave settings themselves are not logged, so clusters are attributed by their bimodal timing.
+
+| Pass | Every frame (measured) | Half per frame (measured) | Ratio | Estimate was |
+|---|---|---|---|---|
+| Reflection dome | 0.371-0.383 (n=4) | 0.209-0.240, median 0.223 (n=31) | 0.59x | 0.41 -> 0.22 (met) |
+| Sun grid | 0.850-0.894 (n=5) | 0.582-0.719, median 0.688 (n=29) | 0.78x | 0.50 -> 0.26 (missed) |
+| Screen march, camera still | 3.11-3.17 (n=2, full-march frames) | 1.51-1.53 (n=7) | 0.48x | 0.5x (met) |
+| Screen march, camera moving | not isolated | 0.55-1.40 and a 1.85-2.19 cluster | - | view-dependent |
+
+Cloud total at the defaults: 1.8-3.1 ms across the session (2.6-2.8 with the camera still), against the
+3.8-4.1 ms baseline in a different view yesterday; the sun grid's every-frame cost is 1.7x yesterday's in
+this location, so only within-session ratios are trustworthy for it.
+
+The sun grid under-delivers: half the threads, but each bakes columns two voxels apart, so a warp's taps
+span twice the texels and the texture-cache coherence the full bake enjoyed is halved. Interleaving
+whole 8-column blocks (or Z slices) would keep the warp footprint contiguous; untested. Quarter per frame
+was not exercised in this capture. Water reflections were not looked at, so the dome interleave is
+measured but not visually checked. Geometry edges and terrain shadows were reported clean, no shimmer.
