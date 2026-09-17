@@ -1420,7 +1420,7 @@ public:
     // which averages that same under-sampling instead of discarding the detail that caused it.
     // Keep the detail, average the noise. Raise this toward 0 if reduced-scale cloud crawls or
     // flickers with accumulation turned off.
-    RTX_OPTION("rtx.atmosphere", float, cloudDetailLodBias, 0.0f,
+    RTX_OPTION("rtx.atmosphere", float, cloudDetailLodBias, -3.0f,
                "Mip bias on the cloud detail LOD, in levels. Negative keeps more detail (and relies "
                "on cloudHistoryWeight to average the resulting sampling noise), positive softens "
                "further. Applies live.");
