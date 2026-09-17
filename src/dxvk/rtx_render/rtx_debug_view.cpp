@@ -494,7 +494,7 @@ namespace dxvk {
                                                "  Green - inside a medium / medium on the path\n"
                                                "  Blue - opacity below 1\n"
                                                "  Yellow - subsurface material\n"
-                                               "  Magenta - emissive (any non-zero emissive radiance)\n"
+                                               "  Magenta - emissive luminance above rtx.sharc.maxEmissiveLuminance\n"
                                                "  Cyan - reached by a non-diffuse lobe (rtx.sharc.allowSpecularPaths off)\n"
                                                "  White - roughness below rtx.sharc.minRoughness"},
         {DEBUG_VIEW_SHARC_TOO_CLOSE,           "SHARC Query: Too Close Guard at Bounce ROUND(Debug Knob [0])",
