@@ -1696,6 +1696,10 @@ private:
   // This frame's resolved interleave periods (1 = full update); see resolveCloudInterleave.
   uint32_t            m_cloudSunGridPeriodThisFrame = 1u;
   uint32_t            m_cloudDomePeriodThisFrame    = 1u;
+  uint32_t            m_cloudBakeWindowFrames = 0u;
+  uint32_t            m_cloudBakeInputChanges = 0u;
+  uint32_t            m_cloudSunFullFrames = 0u;
+  uint32_t            m_cloudDomeFullFrames = 0u;
   VkExtent2D          m_cloudRenderExtent = { 0u, 0u };
   RtxMipmap::Resource m_cloudSecondaryLut;
   bool m_cachedAmbientColumnScan = false;

@@ -91,6 +91,11 @@ plus one consumer wire-in inside the volumetric pass.
    Coherent Sun Shadow Blocks (experimental, default on) groups sun updates into adjacent
    eight-column blocks; its live toggle restores strided updates for timing/quality comparison.
    Log Cloud Timings also exposes actual GPU mean/max view-density evaluations in the menu;
+   The voxel refresh key rounds coverage to 1/1024 steps so slow weather coverage drift does
+   not force full sun-grid/dome refreshes every frame. Shader coverage stays continuous; the
+   key error is at most 1/2048 and coverage changes within one bin are below 1/1024. Other key
+   inputs (including grid mapping and published NVDF state) retain their previous checks.
+   Log Cloud Timings reports BakeInterleave full-frame/input-change counts over 120 frames.
    Defaults are 1 km Cloud Sample Spacing and 32 Max Cloud Samples.
    Cloud Sample Spacing exposes 0..4 km for live quality/cost comparisons; larger values can
    miss thin cloud features. Zero selects the fixed base-count march.

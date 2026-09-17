@@ -627,6 +627,10 @@ namespace {
                               args.cloudEvolutionOffsetZ);
     normalizeForSkyViewLutKey(args);
 
+    // Weather coverage drifts every frame. Bound cache-key error to half a 1/1024 step
+    // instead of treating sub-per-mille density changes as a full-grid invalidation.
+    args.cloudCoverageMean = quantizeDirComponent(args.cloudCoverageMean, 1.0f / 1024.0f);
+
     const float stepKm = std::max(RtxAtmosphere::cloudVoxelGridRebakeGranularityKm(), 1e-5f);
     args.cloudWindOffset.x     = quantizeDirComponent(windKm.x, stepKm);
     args.cloudWindOffset.y     = quantizeDirComponent(windKm.y, stepKm);
@@ -2124,6 +2128,30 @@ void RtxAtmosphere::resolveCloudInterleave(RtxContext& rtx, bool cloudInputsChan
     m_cloudRenderHistoryValid = false;
   }
 
+  if (RtxAtmosphere::cloudProfilingLog()) {
+    ++m_cloudBakeWindowFrames;
+    m_cloudBakeInputChanges += cloudInputsChanged ? 1u : 0u;
+    m_cloudSunFullFrames += m_cloudSunGridPeriodThisFrame == 1u ? 1u : 0u;
+    m_cloudDomeFullFrames += m_cloudDomePeriodThisFrame == 1u ? 1u : 0u;
+    if (m_cloudBakeWindowFrames >= 120u) {
+      Logger::info(str::format("[Cloud profile] stage=BakeInterleave requestedPeriod=",
+        cloudInterleavePeriod(RtxAtmosphere::cloudSunGridInterleaveMode()), "/",
+        cloudInterleavePeriod(RtxAtmosphere::cloudSecondaryLutInterleaveMode()),
+        " resolvedPeriod=", m_cloudSunGridPeriodThisFrame, "/", m_cloudDomePeriodThisFrame,
+        " sunFullFrames=", m_cloudSunFullFrames, " domeFullFrames=", m_cloudDomeFullFrames,
+        " inputChanges=", m_cloudBakeInputChanges, " windowFrames=", m_cloudBakeWindowFrames,
+        " coverageKey=", m_cachedVoxelGridKey.cloudCoverageMean));
+      m_cloudBakeWindowFrames = 0u;
+      m_cloudBakeInputChanges = 0u;
+      m_cloudSunFullFrames = 0u;
+      m_cloudDomeFullFrames = 0u;
+    }
+  } else {
+    m_cloudBakeWindowFrames = 0u;
+    m_cloudBakeInputChanges = 0u;
+    m_cloudSunFullFrames = 0u;
+    m_cloudDomeFullFrames = 0u;
+  }
 }
 
 void RtxAtmosphere::dispatchTransmittanceLut(Rc<DxvkContext> ctx) {
