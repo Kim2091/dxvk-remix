@@ -45,10 +45,24 @@ struct SharcArgs {
   // no coverage: it refuses no query, rejects no surface and creates no cell that did not exist.
   // Applies to the deferred update backend, the shipping one.
   float maxDepositLuminance;
+  // Every struct in RaytraceArgs must be a whole number of 16B rows, and this pad is what keeps
+  // that true here. The shader lays the block out with scalar rules (-fvk-use-scalar-layout) and
+  // pads nothing; the C++ struct it is memcpy'd from carries alignas(16) on vec4 and mat4. The
+  // two agree only while no C++ padding appears: at 84 bytes this struct pushed
+  // renderTargetCamera, the first alignas(16) member after it, 12 bytes past where every shader
+  // reads it, and with it frameIdx, pathMaxBounces, secondaryRayMaxInteractions and
+  // numActiveRayPortals -- path-tracer loop bounds read as garbage, which hangs the GPU.
+  uint pad0;
+  uint pad1;
+  uint pad2;
 };
 #define SHARC_UPDATE_FLAG_PRIMARY_VERTEX 2u
 #define SHARC_UPDATE_SKY_RETRY_SHIFT 2u
 #define SHARC_UPDATE_SKY_RETRY_MASK 7u
 #ifdef __cplusplus
-static_assert(sizeof(SharcArgs) == 84);
+static_assert(sizeof(SharcArgs) == 96);
+// The invariant the size above exists to hold. Keep both: the first catches an unintended
+// change, the second explains which change is never allowed.
+static_assert(sizeof(SharcArgs) % 16 == 0,
+              "SharcArgs must be a whole number of 16B rows; see the comment on pad0.");
 #endif

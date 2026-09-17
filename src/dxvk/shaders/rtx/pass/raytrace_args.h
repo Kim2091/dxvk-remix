@@ -23,6 +23,7 @@
 
 #include "rtx/utility/shader_types.h"
 #ifdef __cplusplus
+#include <cstddef>
 #include "rtx/concept/camera/camera.h"
 #include "rtx/concept/ray_portal/ray_portal.h"
 #else
@@ -432,3 +433,16 @@ struct RaytraceArgs {
   // NOTE: Add structs to the top section of RaytraceArgs, not the bottom.
   // NOTE: bool does not work in debug builds, use uint instead.
 };
+
+#ifdef __cplusplus
+// Every struct in the section above must be a whole number of 16B rows. The shader compiler
+// lays this block out with scalar rules (-fvk-use-scalar-layout) and pads nothing, while the
+// C++ struct the bytes are copied from carries alignas(16) on vec4 and mat4. They describe the
+// same bytes only while no C++ padding appears. renderTargetCamera is the first alignas(16)
+// member after the struct section, so it is where that padding lands: a struct above it whose
+// size is not a multiple of 16 moves it, and every field from there to the end of the block,
+// in the C++ view alone. Those fields include pathMaxBounces, secondaryRayMaxInteractions and
+// numActiveRayPortals, so the symptom is not a subtle shading difference but a GPU hang.
+static_assert(offsetof(RaytraceArgs, renderTargetCamera) % 16 == 0,
+              "A struct above renderTargetCamera in RaytraceArgs is not a multiple of 16 bytes.");
+#endif
