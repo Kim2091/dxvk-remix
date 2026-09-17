@@ -909,9 +909,28 @@ vec4 loadInput(inout RNG randomState, ivec2 threadId)
       uint2 cloudDepthDim;
       DebugViewCloudDepthRT.GetDimensions(cloudDepthDim.x, cloudDepthDim.y);
       const float samples = DebugViewCloudDepthRT[cloudNativeTexel(threadId, cloudDepthDim)].w;
-      // Turbo over 0-128 for the picture; raw count in alpha so the debug view's statistics tools
-      // report exact numbers, the same convention 881 uses for entry distance.
-      value = vec4(turboColormap(saturate(samples * (1.0f / 128.0f))), samples);
+      // Scaled to the REAL cap, and saturation painted explicitly (fork -- 2026-09-17, second pass).
+      //
+      // The first version ramped over a hardcoded 0-128 while marchCloudSlab's iterCap is
+      // max(cloudViewSamplesMax, cloudViewSamples) -- 64 by default. The most a ray could report was
+      // 64 plus the 4-sample tail, which lands at 0.53 on a 0-128 ramp: mid-GREEN. Red was
+      // unreachable by construction, so "nothing is red" meant nothing, and a screen of green read
+      // as comfortable mid-range when it actually meant every ray was pinned at the cap. An
+      // instrument that cannot produce the alarming answer cannot be trusted when it fails to.
+      //
+      // So the ramp now follows the cap the march actually uses, and -- more importantly -- a ray
+      // that reached the cap is painted WHITE rather than left to be inferred from a colour. The
+      // one question that decides where the work goes is "are these rays running out of budget",
+      // and it is now answered by a colour that no choice of ramp can disguise.
+      const float iterCap = max(cb.atmosphereArgs.cloudViewSamplesMax,
+                                float(cb.atmosphereArgs.cloudViewSamples));
+      const bool saturated = samples >= iterCap;
+      const vec3 outColor = saturated
+        ? vec3(1.0f, 1.0f, 1.0f)
+        : turboColormap(saturate(samples / max(iterCap, 1.0f)));
+      // Raw count in alpha so Output Statistics Mode reports exact numbers, the same convention 881
+      // uses for entry distance.
+      value = vec4(outColor, samples);
     }
     break;
   case DEBUG_VIEW_CLOUD_TRANSMITTANCE_ON_GEOMETRY:
