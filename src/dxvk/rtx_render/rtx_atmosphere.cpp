@@ -1189,6 +1189,9 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
     // EMA's before f8544fa82 retired that one, and is now the cloud pass's own). Zeroed in
     // normalizeForSkyLutCache so slider drags never re-bake.
     args.cloudHistoryWeight      = std::min(std::max(RtxAtmosphere::cloudHistoryWeight(), 0.0f), 0.98f);
+    // A flash is a transient the accumulation would otherwise average most of the way out of
+    // existence. m_lightningHistoryFade is that suppression, already decaying on its own tau.
+    args.cloudHistoryWeight     *= std::max(0.0f, 1.0f - m_lightningHistoryFade);
     // Anchor-delta camera cut (fork — 2026-09-05, world-space cloud migration Stage 2). Forces a
     // full one-frame reset of the screen-space cloud temporal history when updateFrame's resolved
     // anchor jumped by more than cloudAnchorCutKm this frame. m_cloudAnchorCutThisFrame is computed
@@ -2128,16 +2131,22 @@ void RtxAtmosphere::resolveCloudInterleave(RtxContext& rtx, bool cloudInputsChan
   m_cloudDomePeriodThisFrame = (cloudInputsChanged || cameraJumped || !m_cloudDomeHistoryValid)
     ? 1u : cloudInterleavePeriod(RtxAtmosphere::cloudSecondaryLutInterleaveMode());
   // A flash is transient and would otherwise reach only the marched half of the screen.
-  const bool screenFullUpdate = cloudInputsChanged || cameraJumped || m_lightningEnvelope > 0.0f;
-  m_cloudScreenPeriodThisFrame = screenFullUpdate
+  m_cloudScreenPeriodThisFrame = (cloudInputsChanged || cameraJumped || m_lightningEnvelope > 0.0f)
     ? 1u : cloudInterleavePeriod(RtxAtmosphere::cloudScreenInterleaveMode());
   // Forcing every pixel to re-march is only half a reset once the pass accumulates (fork --
-  // 2026-09-17): a freshly marched pixel still blends toward its history, so a lightning flash or a
-  // changed key would drag the previous cloudscape in behind it. Dropping the history-valid bit is
+  // 2026-09-17): a freshly marched pixel still blends toward its history, so a changed key or a
+  // camera cut would drag the previous cloudscape in behind it. Dropping the history-valid bit is
   // what makes the full update actually full. dispatchCloudRender raises it again at the end of this
-  // frame's dispatch, so exactly one frame is unaccumulated -- which is the frame whose inputs
-  // changed, and therefore the one with no valid history to average against anyway.
-  if (screenFullUpdate) {
+  // frame's dispatch, so exactly one frame is unaccumulated -- the frame whose inputs changed, which
+  // had no history worth averaging against anyway.
+  //
+  // Lightning is deliberately NOT in this list even though it forces a full march. A flash does not
+  // invalidate the history geometrically, it only makes it briefly too dim, and clearing the bit for
+  // every frame of a multi-frame envelope would strip the accumulation off the whole strike and show
+  // raw march noise exactly when the cloud is brightest. getAtmosphereArgs scales the weight down by
+  // m_lightningHistoryFade instead -- the suppression term that already exists for this, with its own
+  // decay tau, so history returns as the flash does.
+  if (cloudInputsChanged || cameraJumped) {
     m_cloudRenderHistoryValid = false;
   }
 }

@@ -520,8 +520,10 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
     // a freshly marched pixel needs it to accumulate against. The extra cost is two bilinear tap
     // sets on 1/period of the pixels, against a 32-64 sample march on the same pixels.
     CloudPixelResult history;
-    const bool haveHistory = historyValid
-      && reprojectCloudPixel(pixelCoord, outputDim, tSurfaceKm, historyJitterRay, args, history);
+    bool haveHistory = false;
+    if (historyValid) {
+      haveHistory = reprojectCloudPixel(pixelCoord, outputDim, tSurfaceKm, historyJitterRay, args, history);
+    }
 
     CloudPixelResult result;
     const bool fresh = !historyValid || all(subOffset == freshSub);
