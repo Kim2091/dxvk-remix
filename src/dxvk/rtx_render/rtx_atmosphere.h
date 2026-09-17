@@ -1122,16 +1122,10 @@ public:
                "lattice march. Applies live.");
     // Fixed step count undersamples horizon rays (50+ km span); a target step length avoids banding.
     RTX_OPTION("rtx.atmosphere", float, cloudViewStepKm, 0.15f,
-               "Distance between cloud samples along each view ray, in km "
-               "[0.1..1]. Fixes the horizontal banding near the horizon "
-               "(sightlines there cross 50+ km of cloud layer, which the "
-               "legacy fixed 32-sample march could not resolve). "
-               "PERFORMANCE: cost scales with samples per ray — overhead "
-               "views are unchanged, horizon-heavy views can cost up to "
-               "cloudViewSamplesMax/32 times more cloud time (2x at "
-               "defaults). Raise the spacing or lower the cap to trade "
-               "quality for speed; 0 = legacy fixed count (banding "
-               "returns). Applies live.");
+               "Target cloud sample spacing in km [0..4]. Larger spacing reduces work but can "
+               "lose detail or miss thin cloud features. Adaptive mode scales spacing with distance "
+               "and respects its step floor; Max Cloud Samples separately caps march iterations. "
+               "0 selects the legacy fixed base-count march. Applies live.");
     RTX_OPTION("rtx.atmosphere", uint32_t, cloudViewSamplesMax, 64,
                "Main-layer march iteration ceiling per slab crossing [2..256], independent of the base count. "
                "Rays that finish or become opaque earlier do not reach this limit. Adaptive budget "

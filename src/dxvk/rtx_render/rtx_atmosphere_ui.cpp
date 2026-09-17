@@ -1146,7 +1146,7 @@ void RtxAtmosphere::showCloudSettings(const WeatherSnapshot* weatherSnapshot) {
       "Mip levels added to the detail LOD. Negative keeps more detail, "
       "positive softens further. Bias -3 is a comparison setting, not equivalent to Off. Applies live.");
     RemixGui::DragFloat("Cloud Sample Spacing", &RtxAtmosphere::cloudViewStepKmObject(),
-      0.01f, 0.0f, 1.0f, "%.2f km", sliderFlags);
+      0.01f, 0.0f, 4.0f, "%.2f km", sliderFlags);
     RemixGui::SetTooltipToLastWidgetOnHover(
       "Controls actual march spacing. Larger is cheaper/coarser; adaptive mode scales it with "
       "distance and stops at its floor. Max Cloud Samples only limits rays that reach the cap. "
