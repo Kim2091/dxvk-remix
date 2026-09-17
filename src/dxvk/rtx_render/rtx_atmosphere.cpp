@@ -1359,7 +1359,42 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
     args.cloudDetailLodBias   = RtxAtmosphere::cloudDetailLodBias();
     args.cloudDetailLodEnable = RtxAtmosphere::cloudDetailLodMode() >= 2 ? 1u : 0u;
     args.cloudScreenStepScale = 1.0f;
-    args.cloudHistoryClampGamma = std::max(RtxAtmosphere::cloudHistoryClampGamma(), 0.0f);
+    // Velocity-gated (fork -- 2026-09-17, second pass). The clamp shipped unconditional and the
+    // user reported "it shimmers greatly when accumulation clamp is on at all" -- at ANY gamma,
+    // which is the signature of over-clipping rather than of a badly chosen width. The box is built
+    // from the spread of the HISTORY taps, and history is already temporally smoothed, so in smooth
+    // cloud its local spread tends to zero, the box collapses to the 1e-4 floor, and clamping to
+    // +-0.0001 of the fresh march does not weaken accumulation -- it disables it. What is left is
+    // the raw per-frame march noise, which is animated now, so it reads as shimmer instead of the
+    // static powder it used to be. Tightening gamma made it worse, which is why "at all" fits.
+    //
+    // Two changes. The shader floors the box at the march's own noise scale so it can never clip
+    // signal that is legitimately noisy (see accumulateCloudHistory). And the clamp now engages only
+    // when it is needed at all: reprojection error is a TRANSLATION artefact -- rotation reprojects
+    // a distant deck exactly -- while over-clipping costs accumulation always. So scale the width by
+    // this frame's parallax, the ratio of anchor movement to deck distance, which is the angle the
+    // cloud actually slid by. A stationary or turning camera opens the box wide and accumulates
+    // freely, which is the case that already worked; flying closes it to gamma, which is the case
+    // the clamp was added for. When depth-aware reprojection lands and the motion vector stops being
+    // wrong, this same term relaxes on its own.
+    //
+    // Zeroed in normalizeForSkyLutCache, which normalizeForVoxelGridKey and normalizeForCloudLookKey
+    // both reach, so making this per-frame cannot flip a cache key -- the failure this run has
+    // already fixed twice.
+    {
+      const float userGamma = std::max(RtxAtmosphere::cloudHistoryClampGamma(), 0.0f);
+      // Vertical separation from the deck, floored so a camera inside the slab cannot divide by ~0
+      // and declare every frame a high-parallax one.
+      const float deckDistKm = std::max(std::abs(args.cloudAltitude - m_cameraWorldPosYUpKm.y), 1.0f);
+      const float parallaxRad = length(m_cloudAnchor.deltaKm) / deckDistKm;
+      // ~2.6 px at this fork's usual FOV and internal width; below it the history still lands on
+      // very nearly the right texel and needs no clamping.
+      constexpr float kParallaxRefRad = 2.0e-3f;
+      const float velocityFactor = std::min(parallaxRad / kParallaxRefRad, 1.0f);
+      args.cloudHistoryClampGamma = userGamma <= 0.0f
+        ? 0.0f
+        : std::min(userGamma / std::max(velocityFactor, 1.0e-4f), 1.0e4f);
+    }
   }
 
   // Voxel-grid cloud-on-terrain shadow plumbing (fork — 2026-05-12, C6).

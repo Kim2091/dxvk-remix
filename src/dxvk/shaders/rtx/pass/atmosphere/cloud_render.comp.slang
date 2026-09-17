@@ -417,7 +417,15 @@ vec4 accumulateCloudHistory(vec4 marched, vec4 history, vec4 historySigma,
   // Applied to alpha as well as colour. Transmittance is where a cloud edge lives, so leaving it
   // unclamped would let the silhouette smear even with colour held.
   if (clampGamma > 0.0f) {
-    const vec4 halfWidth = max(historySigma * clampGamma, vec4(1.0e-4f));
+    // Floored at the march's own noise scale (fork -- 2026-09-17, second pass). historySigma is the
+    // spread of the HISTORY taps, and history is already temporally smoothed, so in smooth cloud it
+    // tends to zero -- the box then collapsed to the old 1e-4 floor, which pins history to the fresh
+    // march and switches the accumulator off exactly where it is working hardest. Never clip nearer
+    // than the sampling noise the accumulator exists to average; a quarter of the local value is
+    // comfortably above that noise and still bounds a mis-aimed history to a quarter of the signal
+    // per frame rather than to nothing.
+    const vec4 noiseFloor = max(abs(marched) * 0.25f, vec4(1.0e-3f));
+    const vec4 halfWidth = max(historySigma * clampGamma, noiseFloor);
     history = clamp(history, marched - halfWidth, marched + halfWidth);
   }
   const float kGuardStart = 0.25f;  // transmittance delta below which history is fully trusted
