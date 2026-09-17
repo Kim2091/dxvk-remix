@@ -1,5 +1,10 @@
 # Numos handoff - 2026-09-14
 
+## 2026-09-17: superseded for performance work
+
+Read `docs/numos-handoff-2026-09-17.md` first; it carries the current deployed state, the measured arc,
+and the unverified items. This file remains the record for everything else.
+
 ## 2026-09-16 update
 
 See `docs/numos-optimizations-2026-09-16.md` for the measured per-pass baseline (from the game's own

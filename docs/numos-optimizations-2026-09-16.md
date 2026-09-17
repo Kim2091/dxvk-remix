@@ -192,3 +192,13 @@ default, up to 4), the stale key was removed from the game's rtx.conf, and the l
 Native Quarter at 0.61x of Half (2.14 vs 3.5 in the same view) is the first clean measurement of that
 mode; it is the full-resolution alternative to a reduced scale, at roughly the cost 50% scale would
 have at Half.
+
+### Final numbers (2026-09-17 01:02 session, measured)
+
+Scale 0.5, interleave Quarter on all three, `detailLod=1` with `cloudDetailLodBias = -3`, `sampleBoost=1`,
+42 clean samples: screen 0.47-0.77 (median 0.65; forced full frames 0.80), sun grid 0.37-0.43 (0.41), dome
+0.16-0.18 (0.17), ambient 0.15-0.17 (0.17), cloud total 1.2-1.5 (median 1.41). The user reported about
+1 ms and is satisfied with the cost. Detail LOD cost: the two `detailLod=0` frames marched at 0.68-0.71
+against 0.46-0.67 on the neighbouring `detailLod=1` frames -- no measurable cost. The look was not
+reported, the session never ran 0.25, and bias -3 mostly disables the LOD at 0.5 -- see the handoff's
+unverified list. Against the 3.8-4.1 ms baseline that is roughly 2.7x cheaper, in a different view.
