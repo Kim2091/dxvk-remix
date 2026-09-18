@@ -402,6 +402,14 @@ namespace dxvk {
         minRoughnessObject().setDeferred(0.05f);
         minRoughnessSpecularObject().setDeferred(0.7f);
         maxEmissiveLuminanceObject().setDeferred(0.1f);
+        updateRoughnessClampObject().setDeferred(0.25f);
+        // Deposit bounds are shared by every preset because they are not a budget: they decide what a
+        // cell is allowed to hold, not how much work is spent filling it. The relative ceiling replaced
+        // an absolute one that had to be set below the dimmest cell worth keeping and so darkened the
+        // scene at any value low enough to catch an outlier; the absolute cap stays available at 0.
+        maxDepositRatioObject().setDeferred(20.0f);
+        minDepositCeilingObject().setDeferred(2.0f);
+        maxDepositLuminanceObject().setDeferred(0.0f);
       };
       // The primary deposit is the one preset value backed by a frame-time measurement rather
       // than an estimate: the user read about 0.1 ms for it in game, which is the same order as
@@ -421,31 +429,33 @@ namespace dxvk {
         m_resetRequested = true;
       }
       RemixGui::SetTooltipToLastWidgetOnHover(
-        "Four times the update paths of Balanced and twice the sky retries, so the cells Balanced leaves sparse -- "
-        "hidden faces, surfaces off screen, distant relief -- are fed as well as the camera-visible ones, and update "
-        "paths run to the full eight bounces so cells hold more of the multi-bounce tail. The update pass is the "
-        "price and it is a large one: with the deeper bounce limit on top, roughly eight times Balanced's "
-        "traced segments. Unmeasured.");
+        "About 1.6 times the update paths of Balanced and twice the sky retries, so the cells Balanced leaves sparse -- "
+        "hidden faces, surfaces off screen, distant relief -- are fed better, and update paths run to the full eight "
+        "bounces so cells hold more of the multi-bounce tail. That depth is the real cost rather than the tile size: "
+        "it more than doubles the traced segments per path and drops back to the eight-slot update shader, which "
+        "Balanced avoids. Unmeasured.");
       if (ImGui::Selectable("Balanced (default)")) {
         applyShared();
-        applyUpdateBudget(8, 4, 22, 1, true);
+        applyUpdateBudget(5, 3, 22, 1, true);
         m_resetRequested = true;
       }
       RemixGui::SetTooltipToLastWidgetOnHover(
-        "The shipped default, and the configuration tested in Fallout New Vegas. With the primary vertex deposited, "
-        "every camera-visible eligible surface is fed by every update tile that lands on it, which is what a "
-        "four-bounce, tile-8 update budget is sized for. That deposit measured about 0.1 ms in game and Balanced "
-        "keeps it, because the quality it buys is confirmed and the time it costs is under a percent of a frame. "
-        "Setting nothing in rtx.conf gives you this.");
+        "The shipped default, tuned in Half-Life 2 RTX until cache boiling sat level with NRC. Tile 5 is NVIDIA's own "
+        "recommended update downscale; the earlier tile 8 starved the cells that are reached only by a bounce, which "
+        "is what boiled. Three bounces rather than four is most of what pays for that: with the primary vertex "
+        "deposited it fits the compact four-slot update shader, where four bounces forced the eight-slot one and its "
+        "register cost. The primary deposit itself measured about 0.1 ms in game and Balanced keeps it, because the "
+        "quality it buys is confirmed and the time it costs is under a percent of a frame. Setting nothing in "
+        "rtx.conf gives you this.");
       if (ImGui::Selectable("Performance")) {
         applyShared();
         applyUpdateBudget(12, 3, 20, 0, false);
         m_resetRequested = true;
       }
       RemixGui::SetTooltipToLastWidgetOnHover(
-        "About 2.25 times fewer update paths than Balanced, one bounce shallower -- which also drops the update "
-        "shader back to its compact four-slot variant -- no sky retries, a quarter of the resolve threads, and no "
-        "primary-vertex deposit, which is the one item here with a measured price: about 0.1 ms. It gives up the "
+        "About 5.8 times fewer update paths than Balanced, no sky retries, a quarter of the resolve threads, and no "
+        "primary-vertex deposit, which is the one item here with a measured price: about 0.1 ms. Bounce depth already "
+        "matches Balanced, so the compact four-slot update shader is not something this preset buys. It gives up the "
         "sparsest cells first: hidden faces, freshly revealed geometry and outdoor relief. Expect tenths of a "
         "millisecond, not a transformation -- the whole cache measured about 0.1 ms net, so this trims the cost "
         "side and the benefit side together. Under open sky, without the primary deposit most update paths exit "
