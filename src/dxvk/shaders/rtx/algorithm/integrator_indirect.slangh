@@ -600,6 +600,13 @@ void integratePathVertex(
     float restirHitT = kMissHitDistance;
     updateReSTIRGIHitDistance(oldLuminance, calcBt709Luminance(pathState.radiance), restirHitT, pathState.accumulatedHitDistance);
     
+    // Roughen the material for the cache's benefit before anything reads it. Both the continuation
+    // sampled below and the NEE evaluated further down decode their material from this one, so this is
+    // the single point that covers both, and it is past the cache's own eligibility test by design.
+#if ENABLE_SHARC && SHARC_UPDATE
+    sharcClampUpdateRoughness(polymorphicSurfaceMaterialInteraction, materialType);
+#endif
+
     const bool oldInsideMedium = pathState.insideMedium;
     vec3 continuationThroughput = vec3(1.0);
     uint8_t continuationLobe = 0;
