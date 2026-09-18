@@ -681,8 +681,10 @@ void integratePathVertex(
       uint16_t lightIdx = kInvalidLightIdx;
       // Sample stealing needs the primary RTXDI reservoir buffer. Stages without
       // RAB_HAS_RTXDI_RESERVOIRS load an empty reservoir, so the steal always fails,
-      // and a failed steal skips the NEE cache / RIS fallback below. SHARC stages
-      // never bind the reservoir, so they must not enter this branch at all.
+      // and a failed steal skips the NEE cache / RIS fallback below -- no shadow ray and
+      // no direct light at that vertex. SHARC stages do bind and define it now, so this
+      // guard is inert for them; it stays as the safety net for any future variant that
+      // does not, since silently losing NEE is far worse than losing the steal.
 #if ENABLE_SHARC && !defined(RAB_HAS_RTXDI_RESERVOIRS)
       if (false)
 #else
