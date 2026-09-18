@@ -425,11 +425,11 @@ namespace dxvk {
       };
       if (ImGui::Selectable("Quality")) {
         applyShared();
-        applyUpdateBudget(4, 8, 22, 2, true);
+        applyUpdateBudget(3, 8, 22, 2, true);
         m_resetRequested = true;
       }
       RemixGui::SetTooltipToLastWidgetOnHover(
-        "About 1.6 times the update paths of Balanced and twice the sky retries, so the cells Balanced leaves sparse -- "
+        "About 2.8 times the update paths of Balanced and twice the sky retries, so the cells Balanced leaves sparse -- "
         "hidden faces, surfaces off screen, distant relief -- are fed better, and update paths run to the full eight "
         "bounces so cells hold more of the multi-bounce tail. That depth is the real cost rather than the tile size: "
         "it more than doubles the traced segments per path and drops back to the eight-slot update shader, which "
