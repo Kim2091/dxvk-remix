@@ -146,6 +146,13 @@ struct SentryShutdownOnExit {
 
 bool gOverwriteConditionAlreadyActive = false;
 
+// Surfaces locked by the first part of an upload whose last part has not arrived yet (IDirect3DSurface9_UnlockRect).
+struct PendingSurfaceLock {
+  IDirect3DSurface9* pSurface;
+  D3DLOCKED_RECT lockedRect;
+};
+std::unordered_map<uint32_t, PendingSurfaceLock> gPendingSurfaceLocks;
+
 // Mapping between client and server pointer addresses
 std::unordered_map<uint32_t, IDirect3DDevice9*> gpD3DDevices;
 std::unordered_map<uint32_t, IDirect3DResource9*> gpD3DResources; // For Textures, Buffers, and Surfaces
@@ -2615,42 +2622,92 @@ void ProcessDeviceCommandQueue() {
         PULL_D(IncomingPitch);
         const D3DFORMAT format = (D3DFORMAT) dFormat;
         const size_t rowSize = bridge_util::calcRowSize(width, format);
-        void* pData = nullptr;
-        // If we're using the shared heap, then pData will be pointing
-        // to the equivalent of a fully allocated pitch line. If we're
-        // using the data queue then we've only allocated just enough 
-        // space as the requested rect would fill. 
-        const bool useSharedHeap = Commands::IsDataInSharedHeap(rpcHeader.flags);
-        if (useSharedHeap) {
+        // An empty rect has no rows in the data queue.
+        const uint32_t numRows = rowSize != 0 ? bridge_util::calcStride(height, format) : 0;
+
+        // With the shared heap, all rows are in a buffer with the surface's full pitch, and one command carries them.
+        if (Commands::IsDataInSharedHeap(rpcHeader.flags)) {
           PULL_U(allocId);
           const size_t byteOffset = bridge_util::calcImageByteOffset(IncomingPitch, *pRect, format);
-          pData = SharedHeap::getBuf(allocId) + byteOffset;
-        } else {
-          size_t pulledSize = DeviceBridge::get_data(&pData);
-          const size_t numRows = bridge_util::calcStride(height, format);
-          assert(pulledSize == numRows * IncomingPitch);
-        }
-
-        // The surface is null when its create failed without a response.
-        if (pSurface == nullptr) {
+          const uint8_t* const pHeapData = SharedHeap::getBuf(allocId) + byteOffset;
+          // The surface is null when its create failed without a response.
+          if (pSurface == nullptr) {
+            break;
+          }
+          D3DLOCKED_RECT lockedRect;
+          auto hresult = pSurface->LockRect(OUT & lockedRect, IN pRect, IN Flags);
+          assert(S_OK == hresult);
+          if (SUCCEEDED(hresult)) {
+            FOR_EACH_RECT_ROW(lockedRect, height, format,
+              memcpy(ptr, pHeapData + y * IncomingPitch, rowSize);
+            )
+            hresult = pSurface->UnlockRect();
+            assert(SUCCEEDED(hresult));
+            if (bridge_util::perf::enabled()) {
+              bridge_util::perf::noteUpload(uint64_t(rowSize) * numRows);
+            }
+          }
           break;
         }
 
-        // Now lock the rect so we can copy the data into it
-        D3DLOCKED_RECT lockedRect;
-        auto hresult = pSurface->LockRect(OUT & lockedRect, IN pRect, IN Flags);
-        assert(S_OK == hresult);
-        if (SUCCEEDED(hresult)) {
-          FOR_EACH_RECT_ROW(lockedRect, height, format,
-            memcpy(ptr, (PBYTE) pData + y * IncomingPitch, rowSize);
-          )
-          hresult = pSurface->UnlockRect();
-          assert(SUCCEEDED(hresult));
-          if (bridge_util::perf::enabled()) {
-            bridge_util::perf::noteUpload(uint64_t(rowSize) * bridge_util::calcStride(height, format));
+        // Without it, the rows travel in one or more parts (util_uploadparts.h). Each part names its rows and carries
+        // them as blobs of whole rows, IncomingPitch bytes apart. The surface stays locked from the first part to the
+        // last one. A surface whose create failed has no server object, and its rows are read and dropped.
+        PULL_U(firstRow);
+        PULL_U(partRows);
+        if (firstRow == 0) {
+          if (const auto stale = gPendingSurfaceLocks.find(pHandle); stale != gPendingSurfaceLocks.end()) {
+            Logger::warn(format_string("IDirect3DSurface9_UnlockRect: surface 0x%x starts a new upload before the last one "
+                                       "ended.", (uint32_t) pHandle));
+            if (stale->second.pSurface == pSurface) {
+              pSurface->UnlockRect();
+            }
+            gPendingSurfaceLocks.erase(stale);
+          }
+          if (pSurface != nullptr) {
+            D3DLOCKED_RECT lockedRect;
+            const auto hresult = pSurface->LockRect(OUT & lockedRect, IN pRect, IN Flags);
+            assert(S_OK == hresult);
+            if (SUCCEEDED(hresult)) {
+              gPendingSurfaceLocks[pHandle] = { pSurface, lockedRect };
+            }
           }
         }
+        const auto pending = gPendingSurfaceLocks.find(pHandle);
+        const bool locked = pending != gPendingSurfaceLocks.end() && pending->second.pSurface == pSurface;
 
+        uint32_t row = firstRow;
+        const uint32_t endRow = firstRow + partRows;
+        while (row < endRow) {
+          void* pChunk = nullptr;
+          const size_t chunkSize = DeviceBridge::get_data(&pChunk);
+          const uint32_t chunkRows = IncomingPitch != 0 ? (uint32_t) (chunkSize / IncomingPitch) : 0;
+          if (pChunk == nullptr || chunkRows == 0 || chunkRows > endRow - row || chunkSize % IncomingPitch != 0) {
+            Logger::err(format_string("IDirect3DSurface9_UnlockRect: a blob of %zu bytes does not hold whole rows of %u bytes "
+                                      "for the %u of %u rows still expected in this part.",
+                                      chunkSize, (uint32_t) IncomingPitch, endRow - row, partRows));
+            break;
+          }
+          if (locked) {
+            const D3DLOCKED_RECT& lockedRect = pending->second.lockedRect;
+            for (uint32_t r = 0; r < chunkRows && row + r < numRows; ++r) {
+              memcpy((PBYTE) lockedRect.pBits + size_t(row + r) * lockedRect.Pitch,
+                     (const uint8_t*) pChunk + size_t(r) * IncomingPitch, rowSize);
+            }
+          }
+          row += chunkRows;
+        }
+
+        if (endRow >= numRows && pending != gPendingSurfaceLocks.end()) {
+          if (locked) {
+            const auto hresult = pSurface->UnlockRect();
+            assert(SUCCEEDED(hresult));
+            if (bridge_util::perf::enabled()) {
+              bridge_util::perf::noteUpload(uint64_t(rowSize) * numRows);
+            }
+          }
+          gPendingSurfaceLocks.erase(pending);
+        }
         break;
       }
       case IDirect3DSurface9_GetDC:

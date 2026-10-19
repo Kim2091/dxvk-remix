@@ -34,7 +34,7 @@ tests += executable(
     win_subsystem : 'console')
 
 # Bridge Logic Tests
-logic_tests = [ 'sent_state', 'query_results', 'ipc_queue_wait' ]
+logic_tests = [ 'sent_state', 'query_results', 'ipc_queue_wait', 'upload_parts' ]
 foreach name : logic_tests
   logic_exe = executable(
       'test_' + name + '_' + name_suff,  files('test_' + name + '.cpp'),
