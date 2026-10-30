@@ -46,6 +46,8 @@
 #include "rtx_fork_light_bvh_pass.h"
 #include "rtx_fork_shadow_rays.h"
 #include "rtx_fork_d3d9_alpha.h"
+#include "rtx_fork_d3d9_identity.h"
+#include "rtx_fork_d3d9_identity_trace.h"
 #include "rtx_ray_reconstruction.h"
 #include "rtx_reflex.h"
 #include "rtx_xess.h"
@@ -64,14 +66,17 @@
 #include "rtx/utility/gpu_printing.h"
 #include "rtx_nrd_settings.h"
 #include "rtx_scene_manager.h"
+#include "rtx_retained_v2.h"
 #include "rtx_frontend_interface.h"
 #include "rtx_retained_scene.h"
 #include "rtx_scene_transient.h"
 #include "rtx_sparse_rendering.h"
 
+#include "../d3d9/d3d9_state.h"
+#include "../d3d9/d3d9_spec_constants.h"
+
 #include "../util/log/metrics.h"
 #include "../util/util_defer.h"
-#include "../util/util_stress.h"
 #include "../util/util_global_time.h"
 
 #include "rtx_imgui.h"
@@ -311,8 +316,8 @@ namespace dxvk {
     uint32_t renderSize[] = { downscaleExtent.width, downscaleExtent.height };
     uint32_t displaySize[] = { upscaleExtent.width, upscaleExtent.height };
 
-    DxvkNeuralUplift& dlssnr = m_common->metaNeuralUplift();
-    dlssnr.setNeuralUpliftSettings(displaySize);
+    DlssNeuralRendering& dlssnr = m_common->metaDlssNeuralRendering();
+    dlssnr.setDlssNeuralRenderingSettings(displaySize);
 
     // Set resolution to cameras for jittering
     for (int i = 0; i < CameraType::Count; i++) {
@@ -515,9 +520,9 @@ namespace dxvk {
   // Hooked into D3D9 presentImage (same place HUD rendering is)
   void RtxContext::injectRTX(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targetImage) {
     ScopedCpuProfileZone();
-    // Retained commands queued before the injection was emitted (e.g. in a frame without DrawRetainedInstances)
-    // reach the scene before it is rendered; later ones wait for their own drain.
-    drainSceneCommands(m_injectionSceneCommandBound);
+    // rtx.scene.commandQueue: anything the API threads queued since the last drain (e.g. a frame without
+    // DrawRetainedInstances) reaches the scene before it is rendered.
+    drainSceneCommands();
 #ifdef REMIX_DEVELOPMENT
     m_currentPassStage = RtxFramePassStage::FrameBegin;
 #endif
@@ -553,6 +558,11 @@ namespace dxvk {
     common->getRtxInitializer().refreshPrewarm();
     const auto isRaytracingEnabled = RtxOptions::enableRaytracing();
     const auto asyncShaderCompilationActive = RtxOptions::Shader::enableAsyncCompilation() && common->pipelineManager().remixShaderCompilationCount() > 0;
+
+    // REMIXAPI_CAMERA_FRAME_EVENT_FALLBACK: a frame whose draws set no Main camera takes the host's.
+    if (m_frameLastInjected != m_device->getCurrentFrameId()) {
+      getSceneManager().applyFallbackMainCamera();
+    }
 
     // Whether a ray-traced scene is actually being rendered this frame.
     const bool isCameraValid = getSceneManager().getCamera().isValid(m_device->getCurrentFrameId());
@@ -671,6 +681,13 @@ namespace dxvk {
         takeScreenshot("orgImage", targetImage);
       }
 
+      // rtx.retained.replayAtInjection: the replay the host sent after the previous frame's injection runs
+      // here, ahead of scene preparation and its replacement-instance garbage collection.
+      if (m_retainedReplayDeferred) {
+        m_retainedReplayDeferred = false;
+        replayRetainedExternalGeometry(m_retainedDeferredOrigin);
+      }
+
       RtxParticleSystemManager& particles = m_device->getCommon()->metaParticleSystem();
       particles.submitDrawState(this);
 
@@ -722,7 +739,7 @@ namespace dxvk {
         frameTimingScenePrepMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - scenePrepStart).count();
       }
       recordGpuStageTiming("ScenePreparation");
-
+      
       // Cone map work for the height maps this frame's materials registered, ahead of any ray tracing.
       m_common->metaPomConeMaps().update(*this);
       recordGpuStageTiming("PomConeMaps");
@@ -921,6 +938,9 @@ namespace dxvk {
           blitImageHelper(this, srcImage, targetImage, VkFilter::VK_FILTER_NEAREST);
         }
 
+        // Thumbnails are of the frame without the game's interface, which is drawn after this.
+        m_common->metaScreenshot().captureThumbnail(this, targetImage);
+
         // Log stats when an image is taken
         if (captureScreenImage) {
           getSceneManager().logStatistics();
@@ -960,6 +980,30 @@ namespace dxvk {
       }
       m_perfCpu = RtxPerfLog::CpuFrame();
       m_perfCpuActive = m_perfLog.active();
+      m_framesWithoutValidScene = 0;
+    } else {
+      // If raytracing is only disabled because we don't have shaders available, we don't want to clear the scene.
+      // This frequently happens for a single frame when a cached shader is being fetched, and causes the Logic 
+      // graph state to be reset - which is problematic since Logic graphs often trigger shader fetches.
+      // It might be safe to remove this clear entirely - it was added before we had any garbage collection
+      // in the scene manager, so it may not be needed anymore.
+      if (!isRaytracingEnabled || !isCameraValid) {
+        m_framesWithoutValidScene++;
+        // Some games may have invalid cameras for a brief period during camera cuts, but clearing the scene
+        // during these cuts causes all textures to need to be reloaded, which is slow.
+        // rtx.scene.noImplicitClears: an API host's scene stays (no camera this frame only skips rendering).
+        if (m_framesWithoutValidScene > RtxOptions::sceneKeepAliveFrames()) {
+          D3d9IdentityTrace::recordInvalidCamera(m_device->getCurrentFrameId()); // rtx.d3d9Identity.traceFrames
+        }
+        if (m_framesWithoutValidScene > RtxOptions::sceneKeepAliveFrames() && getSceneManager().implicitClearsAllowed()) {
+          // Only perform Wait For Idle on the first clear to avoid expensive GPU sync on every frame
+          const bool needWfi = (m_framesWithoutValidScene == RtxOptions::sceneKeepAliveFrames() + 1);
+          D3d9Identity::setPendingClearReason(D3d9Identity::ClearReason::InvalidCamera); // rtx.d3d9Identity.log
+          getSceneManager().clear(this, needWfi);
+        }
+      } else {
+        m_framesWithoutValidScene = 0;
+      }
     }
 
     onInjectRtxFrameEnd(raytracedThisFrame);
@@ -969,6 +1013,8 @@ namespace dxvk {
 
     // apply changes to RtxOptions after the frame has ended
     RtxOptionManager::applyPendingValues(m_device.ptr(), /* forceOnChange */ false);
+    // rtx.scene.directTransient applies from the next frame's draws on.
+    getSceneManager().retainedScene().transient().applyOption(scene::Options::directTransient());
 
     // Update stats
     updateMetrics(gpuIdleTimeMilliseconds);
@@ -1051,11 +1097,220 @@ namespace dxvk {
     Metrics::logFloat(Metric::dxvk_frame_count, static_cast<float>(m_device->getCurrentFrameId()));
   }
 
+  void RtxContext::setConstantBuffers(const uint32_t vsFixedFunctionConstants, const uint32_t psSharedStateConstants, Rc<DxvkBuffer> vertexCaptureCB) {
+    m_rtState.vsFixedFunctionCB = m_rc[vsFixedFunctionConstants].bufferSlice.buffer();
+    m_rtState.psSharedStateCB = m_rc[psSharedStateConstants].bufferSlice.buffer();
+    m_rtState.vertexCaptureCB = vertexCaptureCB;
+  }
+
+  void RtxContext::addLights(const D3DLIGHT9* pLights, const uint32_t numLights) {
+    getSceneManager().getLightManager().beginGameLightList();
+    for (uint32_t i = 0; i < numLights; i++) {
+      getSceneManager().addLight(pLights[i]);
+    }
+  }
+
+  void RtxContext::commitGeometryToRT(const DrawParameters& params, DrawCallState& drawCallState){
+    ScopedCpuProfileZone();
+
+    // [PerfCpu] d3d9Commit / d3d9.* (rtx.profile.detailedLogging only).
+    if (m_perfCpuActive) {
+      using Clock = std::chrono::steady_clock;
+      const auto toMs = [](Clock::time_point a, Clock::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+      const Clock::time_point start = Clock::now();
+      D3D9CommitTiming timing;
+      SceneManager& sceneManager = getSceneManager();
+      sceneManager.m_timeApiDraws = true;
+      sceneManager.m_timeD3D9Submit = true;
+      commitGeometryToRTImpl(params, drawCallState, &timing);
+      sceneManager.m_timeApiDraws = false;
+      sceneManager.m_timeD3D9Submit = false;
+      const Clock::time_point end = Clock::now();
+      perf::countD3D9(perf::D3D9Ctr::Commits);
+      m_perfCpu.d3d9Commits++;
+      m_perfCpu.d3d9CommitMs += toMs(start, end);
+      m_perfCpu.d3d9FutureWaitMs += timing.futureWaitMs;
+      m_perfCpu.d3d9SkyTerrainMs += timing.skyTerrainMs;
+      m_perfCpu.d3d9SubmitMs += timing.submitMs;
+      m_perfCpu.d3d9PreserveMs += sceneManager.m_d3d9PreserveMs;
+      m_perfCpu.d3d9DynamicMs += sceneManager.m_d3d9DynamicMs;
+      m_perfCpu.d3d9GeometryMs += sceneManager.m_apiDrawGeometryMs;
+      m_perfCpu.d3d9InstanceMs += sceneManager.m_apiDrawInstanceMs;
+      sceneManager.m_d3d9PreserveMs = 0.0;
+      sceneManager.m_d3d9DynamicMs = 0.0;
+      sceneManager.m_apiDrawGeometryMs = 0.0;
+      sceneManager.m_apiDrawInstanceMs = 0.0;
+      return;
+    }
+    commitGeometryToRTImpl(params, drawCallState, nullptr);
+  }
+
+  void RtxContext::commitGeometryToRTImpl(const DrawParameters& params, DrawCallState& drawCallState, D3D9CommitTiming* pTiming) {
+    const MaterialData* overrideMaterialData = nullptr;
+    if (!prepareGeometryForRTImpl(params, drawCallState, overrideMaterialData, pTiming)) {
+      return;
+    }
+    using Clock = std::chrono::steady_clock;
+    const auto msSince = [](Clock::time_point a) { return std::chrono::duration<double, std::milli>(Clock::now() - a).count(); };
+    const Clock::time_point phaseStart = pTiming ? Clock::now() : Clock::time_point();
+    submitPreparedGeometry(drawCallState, overrideMaterialData);
+    if (pTiming) {
+      pTiming->submitMs = msSince(phaseStart);
+    }
+  }
+
+  bool RtxContext::prepareGeometryForRT(const DrawParameters& params, DrawCallState& drawCallState, const MaterialData*& overrideMaterialData,
+                                        CameraType::Enum skinningCamera) {
+    overrideMaterialData = nullptr;
+    return prepareGeometryForRTImpl(params, drawCallState, overrideMaterialData, nullptr, skinningCamera);
+  }
+
+  void RtxContext::submitPreparedGeometry(DrawCallState& drawCallState, const MaterialData* overrideMaterialData) {
+    getSceneManager().submitDrawState(this, drawCallState, overrideMaterialData);
+  }
+
+  bool RtxContext::prepareGeometryForRTImpl(const DrawParameters& params, DrawCallState& drawCallState,
+                                            const MaterialData*& overrideMaterialData, D3D9CommitTiming* pTiming,
+                                            CameraType::Enum skinningCamera) {
+    using Clock = std::chrono::steady_clock;
+    const auto msSince = [](Clock::time_point a) { return std::chrono::duration<double, std::milli>(Clock::now() - a).count(); };
+    Clock::time_point phaseStart = pTiming ? Clock::now() : Clock::time_point();
+
+    const RasterGeometry& geoData = drawCallState.getGeometryData();
+    DrawCallTransforms& transformData = drawCallState.modifyTransformData();
+
+    assert(geoData.futureGeometryHashes.valid() || geoData.hashesPrecomputed);
+    assert(geoData.positionBuffer.defined());
+
+    const auto fusedMode = RtxOptions::fusedWorldViewMode();
+    if (unlikely(fusedMode != FusedWorldViewMode::None)) {
+      if (fusedMode == FusedWorldViewMode::View) {
+        // Set World from WorldView transform
+        transformData.objectToWorld = transformData.objectToView;
+        // Set camera to identity
+        transformData.worldToView = Matrix4();
+      } else if (fusedMode == FusedWorldViewMode::World) {
+        // Nothing to do...
+      }
+    }
+
+    auto& cameraManager = getSceneManager().getCameraManager();
+
+    // TODO: a last camera is used to finalize skinning...
+    // processCameraData can be called only after finalizePendingFutures,
+    // as we need geometry hash to check sky geometries
+    const CameraType::Enum skinningCameraType = skinningCamera < CameraType::Count ? skinningCamera : cameraManager.getLastSetCameraType();
+    const RtCamera* lastCamera =
+      cameraManager.isCameraValid(skinningCameraType)
+        ? &cameraManager.getCamera(skinningCameraType)
+        : nullptr;
+
+    // Sync any pending work with geometry processing threads
+    const bool futuresValid = drawCallState.finalizePendingFutures(lastCamera);
+    if (pTiming) {
+      pTiming->futureWaitMs = msSince(phaseStart);
+      phaseStart = Clock::now();
+    }
+    if (!futuresValid) {
+      return false;
+    }
+    {
+      // rtx.worldOrigin.enable: a host origin published for a D3D9 camera lands here, ahead of the
+      // frame's Main camera update (see SceneManager::applyPendingHostWorldOrigin). No-op when none is pending.
+      getSceneManager().applyPendingHostWorldOrigin();
+      drawCallState.cameraType = cameraManager.processCameraData(drawCallState);
+
+      if (drawCallState.cameraType == CameraType::Unknown) {
+        if (RtxOptions::skipObjectsWithUnknownCamera()) {
+          return false;
+        }
+        // fallback
+        drawCallState.cameraType = CameraType::Enum::Main;
+      }
+
+      if (tryHandleSky(&params, &drawCallState) == TryHandleSkyResult::SkipSubmit) {
+        return false;
+      }
+
+      // Bake the terrain
+      bakeTerrain(params, drawCallState, &overrideMaterialData);
+      if (pTiming) {
+        pTiming->skyTerrainMs = msSince(phaseStart);
+      }
+
+    
+      // An attempt to resolve cases where games pre-combine view and world matrices
+      if (RtxOptions::resolvePreCombinedMatrices() &&
+        isIdentityExact(drawCallState.getTransformData().worldToView)) {
+        const auto* referenceCamera = &cameraManager.getCamera(drawCallState.cameraType);
+        // Note: we may accept a data even from a prev frame, as we need any information to restore;
+        // but if camera data is stale, it introduces an scene object transform's lag
+        if (!referenceCamera->isValid(m_device->getCurrentFrameId()) &&
+          !referenceCamera->isValid(m_device->getCurrentFrameId() - 1)) {
+          referenceCamera = &cameraManager.getCamera(CameraType::Main);
+        }
+        transformData.objectToWorld = referenceCamera->getViewToWorld(false) * drawCallState.getTransformData().objectToView;
+        transformData.worldToView = referenceCamera->getWorldToView(false);
+      }
+      
+      // Apply free camera transform when view space texGenMode is used.
+      // Note: TerrainBaking already applies this transform for TexGenMode::CascadedViewPositions 
+      if ((transformData.texgenMode == TexGenMode::ViewPositions
+           || transformData.texgenMode == TexGenMode::ViewNormals)
+          && RtCamera::enableFreeCamera()) {
+        if (cameraManager.isCameraValid(CameraType::Main)) {
+          const RtCamera& camera = cameraManager.getMainCamera();
+          // Revert the main camera's viewToWorld transform and then apply the free camera's one
+          transformData.textureTransform *= camera.getViewToWorldToFreeCamViewToWorld();
+        } else {
+          ONCE(Logger::warn(str::format("[RTX] Tried to update surface transform with Free Camera's transform "
+                                        "but main camera has not been processed this frame yet. Skipping the transform update")));
+        }
+      }
+
+    }
+    return true;
+  }
+
+  bool RtxContext::prepareSkyboxGeometry(DrawCallState& drawCallState) {
+    // prepareGeometryForRTImpl's first part, rtx.fusedWorldViewMode's fix-up included.
+    if (RtxOptions::fusedWorldViewMode() == FusedWorldViewMode::View) {
+      DrawCallTransforms& transformData = drawCallState.modifyTransformData();
+      transformData.objectToWorld = transformData.objectToView;
+      transformData.worldToView = Matrix4();
+    }
+    auto& cameraManager = getSceneManager().getCameraManager();
+    const RtCamera* lastCamera =
+      cameraManager.isCameraValid(cameraManager.getLastSetCameraType())
+        ? &cameraManager.getCamera(cameraManager.getLastSetCameraType())
+        : nullptr;
+    if (!drawCallState.finalizePendingFutures(lastCamera)) {
+      return false;
+    }
+    drawCallState.cameraType = cameraManager.processCameraData(drawCallState);
+    return drawCallState.cameraType == CameraType::Sky;
+  }
+
+  const MaterialData* RtxContext::bakeTerrainDraw(const DrawParameters& params, DrawCallState& drawCallState) {
+    auto& cameraManager = getSceneManager().getCameraManager();
+    const RtCamera* lastCamera =
+      cameraManager.isCameraValid(cameraManager.getLastSetCameraType())
+        ? &cameraManager.getCamera(cameraManager.getLastSetCameraType())
+        : nullptr;
+    // The bake registers the mesh's bounds (TerrainBaker::registerTerrainMesh), so the futures must be final.
+    if (!drawCallState.finalizePendingFutures(lastCamera)) {
+      return nullptr;
+    }
+    const MaterialData* overrideMaterialData = nullptr;
+    bakeTerrain(params, drawCallState, &overrideMaterialData);
+    return overrideMaterialData;
+  }
+
   void RtxContext::commitExternalGeometryToRT(std::unique_ptr<ExternalDrawState> state) {
-    // The scene's transient lane takes the draw, or declines it (unchanged state).
+    // rtx.scene.directTransient: the scene's transient lane takes the draw, or declines it (unchanged state).
     TransientLane& transient = getSceneManager().retainedScene().transient();
     if (!m_perfWindow.started && !m_perfCpuActive) {
-      if (!transient.draw(this, *state)) {
+      if (!transient.enabled() || !transient.draw(this, *state)) {
         getSceneManager().submitExternalDraw(this, std::move(state));
       }
       return;
@@ -1063,7 +1318,7 @@ namespace dxvk {
     const auto start = std::chrono::steady_clock::now();
     SceneManager& sceneManager = getSceneManager();
     sceneManager.m_timeApiDraws = m_perfCpuActive;
-    if (!transient.draw(this, *state)) {
+    if (!transient.enabled() || !transient.draw(this, *state)) {
       sceneManager.submitExternalDraw(this, std::move(state));
     }
     sceneManager.m_timeApiDraws = false;
@@ -1078,61 +1333,15 @@ namespace dxvk {
     sceneManager.m_apiDrawInstanceMs = 0.0;
   }
 
-  uint64_t sceneCommandsIssued(DxvkDevice& device) {
-    return device.getCommon()->getSceneManager().retainedScene().queue().issued();
-  }
-
-  void RtxContext::drainSceneCommands(uint64_t bound) {
-    stress::delay(stress::Site::SceneCommands);
+  void RtxContext::drainSceneCommands() {
     scene::SceneCommandQueue& queue = getSceneManager().retainedScene().queue();
+    // The scene manager hands each command to whichever implementation owns the retained instances when it runs.
     frontend::SceneInterface sceneInterface { *this };
-    bound = std::max(bound, m_sceneCommandsApplied);
-    m_sceneCommandsApplied = bound;
-    // One retained frame per device frame: a frame marker queued behind this frame's waits, with everything behind
-    // it, for the next device frame. A frame that starts by applying a held-over marker may apply one more, so a host
-    // that marks twice per frame does not fall further behind.
-    const uint32_t deviceFrame = m_device->getCurrentFrameId();
-    if (m_sceneFrameMarkerFrame != deviceFrame) {
-      if (m_sceneFrameMarkerFrame != UINT32_MAX) {
-        ++m_sceneFrameMarkerCounts[std::min(m_sceneFrameMarkers, 2u)];
-        const uint32_t counted = m_sceneFrameMarkerCounts[0] + m_sceneFrameMarkerCounts[1] + m_sceneFrameMarkerCounts[2];
-        if (counted >= 600) {
-          // A host that calls DrawRetainedInstances once per frame shows every drained frame under "1".
-          Logger::info(str::format("[SceneQueue] last ", counted, " drained device frames by retained frames applied: 0=",
-                                   m_sceneFrameMarkerCounts[0], " 1=", m_sceneFrameMarkerCounts[1], " 2+=",
-                                   m_sceneFrameMarkerCounts[2], " | applied up to batch ", m_sceneCommandsApplied));
-          m_sceneFrameMarkerCounts[0] = m_sceneFrameMarkerCounts[1] = m_sceneFrameMarkerCounts[2] = 0;
-        }
-      }
-      m_sceneFrameMarkerFrame = deviceFrame;
-      m_sceneFrameMarkers = 0;
-      m_sceneFrameMarkerLimit = m_sceneFrameMarkerHeld ? 2u : 1u;
-    }
-    const auto ready = [this](const scene::SceneCommandBatch& batch) {
-      for (const scene::SceneCommand& command : batch.commands) {
-        if (command.type == scene::SceneCommand::Type::Frame && m_sceneFrameMarkers >= m_sceneFrameMarkerLimit) {
-          m_sceneFrameMarkerHeld = true;
-          return false;
-        }
-      }
-      return true;
-    };
-    while (std::unique_ptr<scene::SceneCommandBatch> batch = queue.popUpTo(bound, ready)) {
+    while (std::unique_ptr<scene::SceneCommandBatch> batch = queue.popBatch()) {
       for (scene::SceneCommand& command : batch->commands) {
         switch (command.type) {
         case scene::SceneCommand::Type::Create:
-          // A create names a new handle, and an update of a description names a live one.
-          if (sceneInterface.hasInstance(command.handle)) {
-            getSceneManager().sceneInput().add(SceneInput::LiveInstance);
-            break;
-          }
-          sceneInterface.describeInstance(command.handle, std::move(command.instance));
-          break;
         case scene::SceneCommand::Type::Describe:
-          if (!sceneInterface.hasInstance(command.handle)) {
-            getSceneManager().sceneInput().add(SceneInput::UnknownInstance);
-            break;
-          }
           sceneInterface.describeInstance(command.handle, std::move(command.instance));
           break;
         case scene::SceneCommand::Type::Update:
@@ -1147,8 +1356,6 @@ namespace dxvk {
           sceneInterface.destroyInstance(command.handle);
           break;
         case scene::SceneCommand::Type::Frame:
-          ++m_sceneFrameMarkers;
-          m_sceneFrameMarkerHeld = false;
           sceneInterface.drawRetainedInstances(frontend::FrameInfo { command.origin });
           break;
         }
@@ -1157,21 +1364,81 @@ namespace dxvk {
   }
 
   void RtxContext::commitRetainedExternalGeometry(const Vector3& sceneOrigin) {
+    // A replay that arrives after this frame's injection (a D3D9 host whose HUD triggered it) stamps its
+    // instances after the frame was traced; the next injection's replacement-instance GC then sees them as
+    // unseen. rtx.retained.replayAtInjection holds it for the start of that injection instead.
+    const bool afterInjection = m_frameLastInjected == m_device->getCurrentFrameId();
+    const uint32_t diagFrames = RtxOptions::Retained::diagnosticFrames();
+    if (diagFrames != 0) {
+      ++m_retainedDiagReplays;
+      m_retainedDiagLate += afterInjection ? 1 : 0;
+    }
+    if (afterInjection && RtxOptions::Retained::replayAtInjection()) {
+      m_retainedReplayDeferred = true;
+      m_retainedDeferredOrigin = sceneOrigin;
+      m_retainedDiagDeferred += diagFrames != 0 ? 1 : 0;
+    } else {
+      m_retainedReplayDeferred = false;
+      replayRetainedExternalGeometry(sceneOrigin);
+    }
+    if (diagFrames != 0) {
+      const uint32_t frame = m_device->getCurrentFrameId();
+      if (frame - m_retainedDiagLastLogFrame >= diagFrames) {
+        m_retainedDiagLastLogFrame = frame;
+        getSceneManager().logRetainedDiagnostics(m_retainedDiagReplays, m_retainedDiagLate, m_retainedDiagDeferred);
+        m_retainedDiagReplays = 0;
+        m_retainedDiagLate = 0;
+        m_retainedDiagDeferred = 0;
+      }
+    }
+  }
+
+  void RtxContext::replayRetainedExternalGeometry(const Vector3& sceneOrigin) {
     const auto start = std::chrono::steady_clock::now();
     SceneManager& sceneManager = getSceneManager();
+    // rtx.worldOrigin.enable: a pending D3D9-camera host origin shifts instance history before these
+    // instances are stamped at the new origin, not after (see SceneManager::applyPendingHostWorldOrigin).
+    sceneManager.applyPendingHostWorldOrigin();
+    // rtx.retained.useV2: switching hands the registered instances over first (timed with the replay).
+    sceneManager.selectRetainedImplementation(RtxOptions::Retained::useV2());
     SceneManager::RetainedReplayStats stats;
-    // The scene's direct lane first, then the legacy lane replays what it kept.
-    RetainedScene::FrameStats direct;
-    sceneManager.retainedScene().frame(this, sceneOrigin, direct);
-    m_perfCpu.sceneDirect += direct.direct;
-    m_perfCpu.sceneLegacy += direct.legacy;
-    m_perfCpu.sceneCreated += direct.created;
-    m_perfCpu.sceneSettled += direct.settled;
-    m_perfCpu.sceneOmmPending += direct.ommPending;
-    m_perfCpu.sceneServiced += direct.serviced;
-    m_perfCpu.retainedMoved += direct.moved;
-    sceneManager.setRetainedSceneOrigin(sceneOrigin);
-    sceneManager.submitRetainedExternalDraws(this, m_perfCpuActive ? &stats : nullptr);
+    if (sceneManager.retainedV2Active()) {
+      RetainedInstanceStore::FrameStats v2;
+      v2.timeFullReplays = m_perfCpuActive;
+      sceneManager.retainedV2().replay(this, sceneOrigin, v2);
+      // Same [PerfCpu] fields as the first implementation, plus the v2-only ones. Held entries count as
+      // preserved, steady and pinned.
+      stats.fullMs = v2.fullMs;
+      stats.full = v2.full;
+      stats.preserved = v2.validated + v2.held;
+      stats.skipped = v2.hidden;
+      stats.steady = v2.held;
+      stats.pinned = v2.held;
+      m_perfCpu.retainedV2Replays++;
+      m_perfCpu.retainedMoved += v2.moved;
+      m_perfCpu.retainedAwake += v2.awake;
+      m_perfCpu.retainedReleased += v2.released;
+    } else {
+      // rtx.scene.directRetained: the scene's direct lane first, then the first implementation replays what it kept.
+      sceneManager.selectSceneImplementation(scene::Options::directRetained());
+      if (sceneManager.retainedScene().active()) {
+        RetainedScene::FrameStats direct;
+        sceneManager.retainedScene().frame(this, sceneOrigin, direct);
+        m_perfCpu.retainedV3Replays++;
+        m_perfCpu.sceneDirect += direct.direct;
+        m_perfCpu.sceneLegacy += direct.legacy;
+        m_perfCpu.sceneCreated += direct.created;
+        m_perfCpu.sceneSettled += direct.settled;
+        m_perfCpu.sceneOmmPending += direct.ommPending;
+        m_perfCpu.sceneServiced += direct.serviced;
+        m_perfCpu.retainedMoved += direct.moved;
+      } else {
+        // Geometry the scene built before it was switched off is freed once nothing links it.
+        sceneManager.retainedScene().collectGeometry();
+      }
+      sceneManager.setRetainedSceneOrigin(sceneOrigin);
+      sceneManager.submitRetainedExternalDraws(this, m_perfCpuActive ? &stats : nullptr);
+    }
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     if (m_perfWindow.started) {
       m_perfWindow.retainedMs += ms;
@@ -1590,6 +1857,7 @@ namespace dxvk {
     constants.psrRayMaxInteractions = RtxOptions::psrRayMaxInteractions();
     constants.secondaryRayMaxInteractions = RtxOptions::secondaryRayMaxInteractions();
     constants.resolveFinalInteractionSkipsNonOpaque = RtxOptions::resolveFinalInteractionSkipsNonOpaque() ? 1u : 0u;
+    constants.resolveKeepsCoplanarSurfaces = RtxOptions::resolveKeepsCoplanarSurfaces() ? 1u : 0u;
     // Cheaper foliage in secondary rays (rtx.foliageRays.*).
     constants.foliageRaysCullNonOpaqueFromBounce =
       RtxOptions::cullNonOpaqueFromBounce() < 0 ? 0xFFu : static_cast<uint32_t>(RtxOptions::cullNonOpaqueFromBounce());
@@ -1762,6 +2030,9 @@ namespace dxvk {
     constants.pomSccrShellMaxPrisms = SccrShellManager::maxPrisms();
     constants.pomSccrShellMaxSteps = std::max(SccrShellManager::maxSteps(), 1u);
     constants.pomSccrShellFlags = SccrShellManager::marchFlags(m_common->metaPomConeMaps().conesConservative());
+    // This packs the blended terrain march's layer cap and live-weight flag.
+    constants.pomSccrTerrainArgs = (std::min(RtxOptions::Displacement::terrainMaxLayers(), 8u) & POM_SCCR_TERRAIN_MAX_LAYERS_MASK) |
+                                   (RtxOptions::Displacement::terrainLiveWeights() ? POM_SCCR_TERRAIN_FLAG_LIVE_WEIGHTS : 0u);
 
     constants.totalMipBias = getSceneManager().getTotalMipBias(); 
     constants.hairCardMipBias = RtxOptions::hairCardMipBias();
@@ -1870,10 +2141,10 @@ namespace dxvk {
       constants.debugKnob = debugView.debugKnob();
       constants.forceFirstHitInGBufferPass = debugView.showFirstGBufferHit();
       constants.enableDlssNrControlMask =
-        m_common->metaNeuralUplift().useNeuralUplift();
+        m_common->metaDlssNeuralRendering().useDlssNeuralRendering();
       constants.enableDlssNrVolumetricControlMask =
         constants.enableDlssNrControlMask &&
-        DxvkNeuralUplift::enableVolumetricControlMask();
+        DlssNeuralRendering::enableVolumetricControlMask();
 
       constants.gpuPrintThreadIndex = u16vec2 { kInvalidThreadIndex, kInvalidThreadIndex };
       constants.gpuPrintElementIndex = frameIdx % kMaxFramesInFlight;
@@ -1919,6 +2190,9 @@ namespace dxvk {
     OpaqueMaterialOptions::fillShaderParams(constants.opaqueMaterialArgs);
     constants.opaqueMaterialArgs.legacySpecularLevel = std::clamp(LegacyMaterialDefaults::specularLevel(), 0.0f, 1.0f);
     constants.opaqueMaterialArgs.legacyFresnelGrazing = std::clamp(LegacyMaterialDefaults::fresnelGrazing(), 0.0f, 1.0f);
+    // Normal-alpha gloss roughness range.
+    constants.opaqueMaterialArgs.fnvGlossRoughnessMin = std::clamp(FnvMaterialProtocol::glossRoughnessMin(), 0.0f, 1.0f);
+    constants.opaqueMaterialArgs.fnvGlossRoughnessMax = std::clamp(FnvMaterialProtocol::glossRoughnessMax(), 0.0f, 1.0f);
     TranslucentMaterialOptions::fillShaderParams(constants.translucentMaterialArgs);
     ViewDistanceOptions::fillShaderParams(constants.viewDistanceArgs, RtxOptions::getMeterToWorldUnitScale());
     constants.alphaBlendSurfacePackMult = RtxOptions::getMeterToWorldUnitScale();
@@ -2614,8 +2888,8 @@ namespace dxvk {
   bool RtxContext::dispatchDlssNR(const Resources::RaytracingOutput& rtOutput) {
     ScopedCpuProfileZone();
 
-    auto& dlssNr = m_common->metaNeuralUplift();
-    if (!dlssNr.useNeuralUplift()) {
+    auto& dlssNr = m_common->metaDlssNeuralRendering();
+    if (!dlssNr.useDlssNeuralRendering()) {
       return false;
     }
 
@@ -3090,14 +3364,15 @@ namespace dxvk {
     const bool dlfg = isDLFGEnabled();
     const bool fsrfg = !dlfg && isFSRFGEnabled();
     if (!dlfg && !fsrfg) {
+      // Restores the saved V-Sync choice after frame generation is turned off.
+      if (RtxOptions::enableVsync() != EnableVsync::WaitingForImplicitSwapchain) {
+        RtxOptions::enableVsyncState = RtxOptions::enableVsync();
+      }
       return;
     }
 
-    // force vsync off if frame generation is enabled, as we don't properly support FG + vsync
-    if (RtxOptions::enableVsyncState != EnableVsync::Off) {
-      RtxOptions::enableVsync.setDeferred(EnableVsync::Off);
-      RtxOptions::enableVsyncState = EnableVsync::Off;
-    }
+    // Frame generation does not support V-Sync, so it is off while frame generation runs. The saved choice is kept.
+    RtxOptions::enableVsyncState = EnableVsync::Off;
 
     Resources::RaytracingOutput& rtOutput = getResourceManager().getRaytracingOutput();
 
@@ -3218,6 +3493,9 @@ namespace dxvk {
     ScopedCpuProfileZone();
     const auto flushStart = std::chrono::steady_clock::now();
 
+    // flush the residue
+    tryHandleSky(nullptr, nullptr);
+
     m_cmd->perfInfo().injectRtx = m_cmd->perfInfo().injectRtx || m_submitContainsInjectRtx; // [GpuStall] context
 
     Rc<DxvkCommandList> recorded = this->endRecording();
@@ -3313,27 +3591,104 @@ namespace dxvk {
     return RtxOptions::upscalerType() == UpscalerType::XeSS;
   }
 
-  void RtxContext::rasterizeToSkyMatte(const frontend::RasterDrawInfo& info, const std::function<void(const frontend::RasterPass&)>& draw,
-                                       frontend::RasterPass& pass) {
+  D3D9RtxVertexCaptureData& RtxContext::allocAndMapVertexCaptureConstantBuffer() {
+    DxvkBufferSliceHandle slice = m_rtState.vertexCaptureCB->allocSlice();
+    invalidateBuffer(m_rtState.vertexCaptureCB, slice);
+
+    return *static_cast<D3D9RtxVertexCaptureData*>(slice.mapPtr);
+  }
+
+  D3D9FixedFunctionVS& RtxContext::allocAndMapFixedFunctionVSConstantBuffer() {
+    DxvkBufferSliceHandle slice = m_rtState.vsFixedFunctionCB->allocSlice();
+    invalidateBuffer(m_rtState.vsFixedFunctionCB, slice);
+
+    return *static_cast<D3D9FixedFunctionVS*>(slice.mapPtr);
+  }
+  D3D9SharedPS& RtxContext::allocAndMapPSSharedStateConstantBuffer() {
+    DxvkBufferSliceHandle slice = m_rtState.psSharedStateCB->allocSlice();
+    invalidateBuffer(m_rtState.psSharedStateCB, slice);
+
+    return *static_cast<D3D9SharedPS*>(slice.mapPtr);
+  }
+
+  void RtxContext::rasterizeToSkyMatte(const DrawParameters& params, const DrawCallState& drawCallState) {
     ScopedGpuProfileZone(this, "rasterizeToSkyMatte");
 
     const RtCamera& camera = getSceneManager().getCamera();
+    const uint32_t* renderResolution = camera.m_renderResolution;
+
+    union UnifiedCB {
+      D3D9RtxVertexCaptureData programmablePipeline;
+      D3D9FixedFunctionVS fixedFunction;
+
+      UnifiedCB() { }
+    };
+
+    UnifiedCB prevCB;
+
+    if (drawCallState.usesVertexShader) {
+      prevCB.programmablePipeline = *static_cast<D3D9RtxVertexCaptureData*>(m_rtState.vertexCaptureCB->mapPtr(0));
+    } else {
+      prevCB.fixedFunction = *static_cast<D3D9FixedFunctionVS*>(m_rtState.vsFixedFunctionCB->mapPtr(0));
+    }
 
     auto skyMatteView = getResourceManager().getSkyMatte(this, m_skyColorFormat).view;
     const auto skyMatteExt = skyMatteView->mipLevelExtent(0);
+
+    // Update spec constants
+    int prevClipSpaceJitterEnabled = -1;
+    {
+      if (drawCallState.usesVertexShader) {
+        prevClipSpaceJitterEnabled = getSpecConstantsInfo(VK_PIPELINE_BIND_POINT_GRAPHICS)
+          .specConstants[D3D9SpecConstantId::ClipSpaceJitterEnabled]
+            ? 1
+            : 0;
+        // Enable, to use clipSpaceJitter, see notes below
+        setSpecConstant(VK_PIPELINE_BIND_POINT_GRAPHICS, D3D9SpecConstantId::ClipSpaceJitterEnabled, true);
+      }
+    }
 
     {
       VkViewport viewport { 0.5f, static_cast<float>(skyMatteExt.height) + 0.5f,
        static_cast<float>(skyMatteExt.width),
        -static_cast<float>(skyMatteExt.height),
-       info.minDepth,
-       info.maxDepth
+       drawCallState.minZ,
+       drawCallState.maxZ
       };
       VkRect2D scissor {
         { 0, 0 },
         { skyMatteExt.width, skyMatteExt.height }
       };
       setViewports(1, &viewport, &scissor);
+    }
+
+    if (drawCallState.usesVertexShader) {
+      D3D9RtxVertexCaptureData modified = prevCB.programmablePipeline;
+      {
+        // Jittered clip space for DLSS
+        // Note: we can't jitter the projection matrix, as a game might calculate
+        // its gl_Position by different methods (e.g. without projection matrix at all);
+        // so apply jitter directly on gl_Position
+        float ratioX = Sign(drawCallState.getTransformData().viewToProjection[2][3]);
+        float ratioY = -Sign(drawCallState.getTransformData().viewToProjection[2][3]);
+        Vector2 clipSpaceJitter = camera.calcClipSpaceJitter(camera.calcPixelJitter(m_device->getCurrentFrameId()), ratioX, ratioY);
+        modified.jitterX = clipSpaceJitter.x;
+        modified.jitterY = clipSpaceJitter.y;
+      }
+
+      // Ensure that memcpy can be used for fewer memory interactions
+      static_assert(std::is_trivially_copyable_v<D3D9RtxVertexCaptureData>);
+      allocAndMapVertexCaptureConstantBuffer() = modified;
+    } else {
+      D3D9FixedFunctionVS modified = prevCB.fixedFunction;
+      {
+        // Jittered projection for DLSS
+        camera.applyJitterTo(modified.Projection,
+                             m_device->getCurrentFrameId());
+      }
+      // Ensure that memcpy can be used for fewer memory interactions
+      static_assert(std::is_trivially_copyable_v<D3D9FixedFunctionVS>);
+      allocAndMapFixedFunctionVSConstantBuffer() = modified;
     }
 
     DxvkRenderTargets skyRt;
@@ -3345,12 +3700,22 @@ namespace dxvk {
       DxvkContext::clearRenderTarget(skyMatteView, VK_IMAGE_ASPECT_COLOR_BIT, m_skyClearValue);
     }
 
-    // The matte is jittered like the ray traced frame, for DLSS. The jitter is applied in clip space, since a draw may
-    // compute its clip-space position without a projection matrix.
-    pass.kind = frontend::RasterPassKind::SkyMatte;
-    pass.index = 0;
-    pass.clipJitter = camera.calcClipSpaceJitter(camera.calcPixelJitter(m_device->getCurrentFrameId()), 1.f, -1.f);
-    draw(pass);
+    if (params.indexCount == 0) {
+      DxvkContext::draw(params.vertexCount, params.instanceCount, params.vertexOffset, 0);
+    } else {
+      DxvkContext::drawIndexed(params.indexCount, params.instanceCount, params.firstIndex, params.vertexOffset, 0);
+    }
+
+    // Restore state
+    if (prevClipSpaceJitterEnabled >= 0) {
+      assert(prevClipSpaceJitterEnabled == 0 || prevClipSpaceJitterEnabled == 1);
+      setSpecConstant(VK_PIPELINE_BIND_POINT_GRAPHICS, D3D9SpecConstantId::ClipSpaceJitterEnabled, prevClipSpaceJitterEnabled);
+    }
+    if (drawCallState.usesVertexShader) {
+      allocAndMapVertexCaptureConstantBuffer() = prevCB.programmablePipeline;
+    } else {
+      allocAndMapFixedFunctionVSConstantBuffer() = prevCB.fixedFunction;
+    }
   }
 
   void RtxContext::initSkyProbe() {
@@ -3377,20 +3742,34 @@ namespace dxvk {
     }
   }
 
-  void RtxContext::rasterizeToSkyProbe(const frontend::RasterDrawInfo& info, const std::function<void(const frontend::RasterPass&)>& draw,
-                                       frontend::RasterPass& pass) {
+  void RtxContext::rasterizeToSkyProbe(const DrawParameters& params, const DrawCallState& drawCallState) {
     ScopedGpuProfileZone(this, "rasterizeToSkyProbe");
 
     // Lazy init
     initSkyProbe();
 
-    // The faces are placed at the draw's camera position, and their projection keeps the draw's off-diagonal terms.
-    const Vector3 camPos = inverse(info.worldToView).data[3].xyz();
-    Matrix4 faceProjection = info.viewToProjection;
-    faceProjection[0][0] = 1.f;
-    faceProjection[1][1] = 1.f;
-    faceProjection[2][2] = 1.f;
-    faceProjection[2][3] = 1.f;
+    // Grab transforms
+    
+    union UnifiedCB {
+      D3D9RtxVertexCaptureData programmablePipeline;
+      D3D9FixedFunctionVS fixedFunction;
+
+      UnifiedCB() { }
+    };
+
+    UnifiedCB prevCB;
+
+    if (drawCallState.usesVertexShader) {
+      prevCB.programmablePipeline = *static_cast<D3D9RtxVertexCaptureData*>(m_rtState.vertexCaptureCB->mapPtr(0));
+    } else {
+      prevCB.fixedFunction = *static_cast<D3D9FixedFunctionVS*>(m_rtState.vsFixedFunctionCB->mapPtr(0));
+    }
+
+    const Matrix4& worldToView = drawCallState.usesVertexShader ? drawCallState.getTransformData().worldToView : prevCB.fixedFunction.View;
+    const Matrix4& viewToProj  = drawCallState.usesVertexShader ? drawCallState.getTransformData().viewToProjection : prevCB.fixedFunction.Projection;
+
+    // Figure out camera position
+    const Vector3 camPos = inverse(worldToView).data[3].xyz();
 
     const DxvkRsInfo &ri = m_state.gp.state.rs;
 
@@ -3411,6 +3790,19 @@ namespace dxvk {
       // Set cull mode to none
       newRs.cullMode = VK_CULL_MODE_NONE;
       setRasterizerState(newRs);
+    }
+
+
+    // Update spec constants
+    int prevCustomVertexTransformEnabled = -1;
+    {
+      if (drawCallState.usesVertexShader) {
+        prevCustomVertexTransformEnabled = getSpecConstantsInfo(VK_PIPELINE_BIND_POINT_GRAPHICS)
+          .specConstants[D3D9SpecConstantId::CustomVertexTransformEnabled]
+            ? 1
+            : 0;
+        setSpecConstant(VK_PIPELINE_BIND_POINT_GRAPHICS, D3D9SpecConstantId::CustomVertexTransformEnabled, true);
+      }
     }
 
     const auto& skyProbeExt = m_skyProbeImage->info().extent;
@@ -3436,6 +3828,34 @@ namespace dxvk {
     for (uint32_t plane = 0; plane < 6; plane++) {
       Rc<DxvkImageView>* skyRenderTarget = &m_skyProbeCubePlanes[plane];
 
+      if (drawCallState.usesVertexShader) {
+        D3D9RtxVertexCaptureData& newState = allocAndMapVertexCaptureConstantBuffer();
+        newState = prevCB.programmablePipeline;
+
+        // Create cube plane projection
+        Matrix4 proj = viewToProj;
+        proj[0][0] = 1.f;
+        proj[1][1] = 1.f;
+        proj[2][2] = 1.f;
+        proj[2][3] = 1.f;
+
+        newState.customWorldToProjection = proj * makeViewMatrixForCubePlane(plane, camPos);
+      } else {
+        // Push new state to the fixed function constants
+        D3D9FixedFunctionVS& newState = allocAndMapFixedFunctionVSConstantBuffer();
+        newState = prevCB.fixedFunction;
+        const Matrix4 view = makeViewMatrixForCubePlane(plane, camPos);
+
+        // Set to identity, as we use custom matrices that transform from world to cube side projection
+        newState.View      = view;
+        newState.WorldView = view * prevCB.fixedFunction.World;
+        // And cube plane projection
+        newState.Projection[0][0] = 1.f;
+        newState.Projection[1][1] = 1.f;
+        newState.Projection[2][2] = 1.f;
+        newState.Projection[2][3] = 1.f;
+      }
+
       DxvkRenderTargets skyRt;
       skyRt.color[0].view   = *skyRenderTarget;
       skyRt.color[0].layout = VK_IMAGE_LAYOUT_GENERAL;
@@ -3446,64 +3866,111 @@ namespace dxvk {
         DxvkContext::clearRenderTarget(*skyRenderTarget, VK_IMAGE_ASPECT_COLOR_BIT, m_skyClearValue);
       }
 
-      pass.kind = frontend::RasterPassKind::SkyProbeFace;
-      pass.index = plane;
-      pass.worldToView = makeViewMatrixForCubePlane(plane, camPos);
-      pass.viewToProjection = faceProjection;
-      draw(pass);
+      if (params.indexCount > 0) {
+        DxvkContext::drawIndexed(params.indexCount, params.instanceCount, params.firstIndex, params.vertexOffset, 0);
+      } else {
+        DxvkContext::draw(params.vertexCount, params.instanceCount, params.vertexOffset, 0);
+      }
     }
 
     // Restore state
     setRasterizerState(prevRasterizerState);
+    if (prevCustomVertexTransformEnabled >= 0) {
+      assert(prevCustomVertexTransformEnabled == 0 || prevCustomVertexTransformEnabled == 1);
+      setSpecConstant(VK_PIPELINE_BIND_POINT_GRAPHICS, D3D9SpecConstantId::CustomVertexTransformEnabled, prevCustomVertexTransformEnabled);
+    }
+    if (drawCallState.usesVertexShader) {
+      allocAndMapVertexCaptureConstantBuffer() = prevCB.programmablePipeline;
+    } else {
+      allocAndMapFixedFunctionVSConstantBuffer() = prevCB.fixedFunction;
+    }
   }
 
-  void RtxContext::bakeTerrain(const frontend::RasterDrawInfo& info, const std::function<void(const frontend::RasterPass&)>& draw,
-                               frontend::RasterResult& result) {
-    TerrainBaker& terrainBaker = getSceneManager().getTerrainBaker();
-    if (!terrainBaker.enableBaking()) {
+  void RtxContext::bakeTerrain(const DrawParameters& params, DrawCallState& drawCallState, const MaterialData** outOverrideMaterialData) {
+    if (!getSceneManager().getTerrainBaker().enableBaking() ||
+        !drawCallState.testCategoryFlags(InstanceCategories::Terrain)) {
       return;
     }
 
+    DrawCallTransforms& transformData = drawCallState.modifyTransformData();
+
+    // Terrain Baker (may) update bound color textures, so preserve the views
+    Rc<DxvkImageView> previousColorView;
+    Rc<DxvkImageView> previousSecondaryColorView;
+
     OpaqueMaterialData* opaqueReplacementMaterial = nullptr;
+    TerrainBaker& terrainBaker = getSceneManager().getTerrainBaker();
 
     if (!TerrainBaker::debugDisableBaking()) {
 
       // Retrieve the replacement material
-      std::shared_ptr<MaterialData> replacementMaterial = getSceneManager().getAssetReplacer()->getReplacementMaterial(info.materialKey);
+      std::shared_ptr<MaterialData> replacementMaterial = getSceneManager().getAssetReplacer()->getReplacementMaterial(drawCallState.getMaterialData().getHash());
 
       if (replacementMaterial) {
         if (replacementMaterial->getType() == MaterialDataType::Opaque) {
           opaqueReplacementMaterial = &replacementMaterial->getOpaqueMaterialData();
+
+          // Original 0th colour texture slot
+          const uint32_t colorTextureSlot = drawCallState.getMaterialData().colorTextureSlot[0];
+
+          // Save current color texture first
+          if (colorTextureSlot < m_rc.size() && m_rc[colorTextureSlot].imageView != nullptr) {
+            previousColorView = m_rc[colorTextureSlot].imageView;
+          }          
+          
         } else {
           ONCE(Logger::warn(str::format("[RTX Texture Baker] Only opaque replacement materials are supported for terrain baking. Texture hash ",
-                                        info.materialKey,
+                                        drawCallState.getMaterialData().getHash(),
                                         " has a non-opaque replacement material set. Baking the texture with legacy material instead.")));
         }
       }
     }
 
     // Bake the material
-    Matrix4 textureTransform;
-    const bool isBaked = terrainBaker.bakeDrawCall(this, m_state, info, draw, opaqueReplacementMaterial, textureTransform);
+    const bool isBaked = terrainBaker.bakeDrawCall(this, m_state, m_rtState, params, drawCallState, opaqueReplacementMaterial, transformData.textureTransform);
 
-    if (!TerrainBaker::debugDisableBinding()) {
-      result.textureTransform = textureTransform;
-      if (isBaked) {
-        result.material = terrainBaker.getMaterialData();
-        result.sampler = terrainBaker.getTerrainSampler();
+    if (isBaked) {
+      // Bind the baked terrain texture to the mesh
+      if (!TerrainBaker::debugDisableBinding()) {
+
+        // Set the terrain's baked material data
+        *outOverrideMaterialData = terrainBaker.getMaterialData();
+
+        // Generate texcoords in the RT shader
+        transformData.texgenMode = TexGenMode::CascadedViewPositions;
+
+        // Update the legacy material data with legacy value defaults as well as set the color textur since some of its data 
+        // is still used through the Rt pipeline even though overrideMaterialData is specifide. 
+        // Also SceneManager uses sampler associated with the color texture to patch samplers for the textures in the opaque material.
+        LegacyMaterialData overrideMaterial;
+        overrideMaterial.colorTextures[0] = (*outOverrideMaterialData)->getOpaqueMaterialData().getAlbedoOpacityTexture();
+        overrideMaterial.samplers[0] = terrainBaker.getTerrainSampler();
+        overrideMaterial.updateCachedHash();
+        drawCallState.modifyMaterialData() = overrideMaterial;
+      }
+
+      // Restore state modified during baking
+      if (!TerrainBaker::debugDisableBaking()) {
+
+        // Restore bound color texture views
+        if (previousColorView != nullptr) {
+          bindResourceView(drawCallState.getMaterialData().colorTextureSlot[0], previousColorView, nullptr);
+        }
       }
     }
-    result.cascadesChanged = terrainBaker.cascadeCompositionChangedThisFrame();
   }
 
-  void RtxContext::rasterizeSky(const frontend::RasterDrawInfo& info, const std::function<void(const frontend::RasterPass&)>& draw) {
-    initSkyTargets();
+  void RtxContext::rasterizeSky(const DrawParameters& params, const DrawCallState& drawCallState) {
+    if (RtxOptions::skyMode() == SkyMode::Numos) {
+      return;
+    }
 
-    // Grab the replacement texture if any.
+    // Grab and apply replacement texture if any
     // NOTE: only the original color texture will be replaced with albedo-opacity texture
-    std::shared_ptr<MaterialData> replacementMaterial = getSceneManager().getAssetReplacer()->getReplacementMaterial(info.materialKey);
+    std::shared_ptr<MaterialData> replacementMaterial = getSceneManager().getAssetReplacer()->getReplacementMaterial(drawCallState.getMaterialData().getHash());
     bool replacemenIsLDR = false;
-    frontend::RasterPass pass;
+    Rc<DxvkImageView> replacementTexture = {};
+    uint32_t replacementTextureSlot = UINT32_MAX;
 
     if (replacementMaterial && replacementMaterial->getType() == MaterialDataType::Opaque) {
       // Must pull a ref because we will modify it for loading purposes below.
@@ -3514,11 +3981,23 @@ namespace dxvk {
         getSceneManager().trackTexture(albedoOpacity, textureIndex, true, false);
 
         if (!albedoOpacity.isImageEmpty()) {
-          pass.texture = albedoOpacity.getImageView();
+          replacementTextureSlot = drawCallState.getMaterialData().colorTextureSlot[0];
+          replacementTexture = albedoOpacity.getImageView();
           replacemenIsLDR = TextureUtils::isLDR(albedoOpacity.getImageView()->info().format);
         } else {
           ONCE(Logger::warn("A replacement texture for sky was specified, but it could not be loaded."));
         }
+      }
+    }
+    
+    Rc<DxvkImageView> curColorView = {};
+    if (replacementTextureSlot < m_rc.size())
+    {
+      if (m_rc[replacementTextureSlot].imageView != nullptr && replacementTexture != nullptr) {
+        // Save currently bound texture to restore later
+        curColorView = m_rc[replacementTextureSlot].imageView;
+        // Bind a replacement texture
+        bindResourceView(replacementTextureSlot, replacementTexture, nullptr);
       }
     }
 
@@ -3534,8 +4013,8 @@ namespace dxvk {
     const uint32_t curViewportCount = m_state.gp.state.rs.viewportCount();
     const DxvkViewportState curVp = m_state.vp;
 
-    rasterizeToSkyMatte(info, draw, pass);
-    rasterizeToSkyProbe(info, draw, pass);
+    rasterizeToSkyMatte(params, drawCallState);
+    rasterizeToSkyProbe(params, drawCallState);
 
     m_skyClearDirty = false;
 
@@ -3544,6 +4023,11 @@ namespace dxvk {
 
     // Restore RTs
     bindRenderTargets(curRts);
+
+    // Restore color texture
+    if (curColorView != nullptr) {
+      bindResourceView(drawCallState.getMaterialData().colorTextureSlot[0], curColorView, nullptr);
+    }
   }
 
   void RtxContext::clearRenderTarget(const Rc<DxvkImageView>& imageView,
@@ -3599,6 +4083,37 @@ namespace dxvk {
     default:
       Logger::err("Invalid SIMD state");
       break;
+    }
+  }
+
+  const DxvkScInfo& RtxContext::getSpecConstantsInfo(VkPipelineBindPoint pipeline) const {
+    return
+      pipeline == VK_PIPELINE_BIND_POINT_GRAPHICS
+      ? m_state.gp.state.sc
+      : pipeline == VK_PIPELINE_BIND_POINT_COMPUTE
+      ? m_state.cp.state.sc
+      : m_state.rp.state.sc;
+  }
+
+  void RtxContext::setSpecConstantsInfo(
+    VkPipelineBindPoint pipeline,
+    const DxvkScInfo& newSpecConstantInfo) {
+    DxvkScInfo& specConstantInfo =
+      pipeline == VK_PIPELINE_BIND_POINT_GRAPHICS
+      ? m_state.gp.state.sc
+      : pipeline == VK_PIPELINE_BIND_POINT_COMPUTE
+      ? m_state.cp.state.sc
+      : m_state.rp.state.sc;
+
+    if (specConstantInfo != newSpecConstantInfo) {
+      specConstantInfo = newSpecConstantInfo;
+
+      m_flags.set(
+        pipeline == VK_PIPELINE_BIND_POINT_GRAPHICS
+        ? DxvkContextFlag::GpDirtyPipelineState
+        : pipeline == VK_PIPELINE_BIND_POINT_COMPUTE
+          ? DxvkContextFlag::CpDirtyPipelineState
+          : DxvkContextFlag::RpDirtyPipelineState);
     }
   }
 

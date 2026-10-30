@@ -1434,9 +1434,10 @@ void integrateIndirectPath(
 
   pathState.continuePath &= any(pathState.throughput > 0.0f);
 
+
   if (pathState.continuePath)
   {
-    if (NEE_CACHE_ENABLE && cb.neeCacheArgs.enable) 
+    if (NEE_CACHE_ENABLE && cb.neeCacheArgs.enable)
     {
       RAB_RandomSamplerState rtxdiRNG = RAB_InitRandomSampler(pathState.pixelCoordinate, cb.frameIdx, pathState.bounceIteration);
       uint jitter = sampleUniformIntRng(rtxdiRNG);

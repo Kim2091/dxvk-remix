@@ -199,9 +199,6 @@ namespace dxvk {
     uint32_t                  m_frameLatencyCap   = 0;
     Rc<sync::Fence>           m_frameLatencySignal;
 
-    // The Present in progress ends the scene frame (D3D9DeviceEx::IsSceneOutput).
-    bool                      m_presentsScene = true;
-
     bool                      m_dirty    = true;
 
     // HDR10 output (rtx.tonemap.hdrEnabled when the back buffers were created): the back buffers are
@@ -314,9 +311,6 @@ namespace dxvk {
     void HookWindowProc(HWND window);
     // NV-DXVK end
   };
-
-  // Whether the external presenter draws the Remix GUI into the final colour. remixapi_StartupInfo sets it.
-  extern bool g_combineGuiInFinalColor;
 
   class D3D9SwapchainExternal final : public D3D9SwapChainEx {
     Rc<RtxSemaphore> m_frameEndSemaphore;

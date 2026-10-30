@@ -2,8 +2,6 @@
 #include "d3d11_device.h"
 #include "d3d11_gdi.h"
 
-#include <d3d9types.h>
-
 #include "../util/util_gdi.h"
 
 namespace dxvk {

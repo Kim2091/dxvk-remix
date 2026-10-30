@@ -33,17 +33,10 @@ namespace dxvk {
     struct SceneCommandBatch {
       std::atomic<SceneCommandBatch*> next { nullptr };
       std::vector<SceneCommand> commands;
-      // Position in push order, from 1 (SceneCommandQueue::issued).
-      uint64_t sequence = 0;
     };
 
     // Multi-producer, single-consumer queue of command batches (Vyukov's intrusive MPSC queue). Any API thread pushes
     // without a lock; only the render (CS) thread pops. Batches from one thread stay in that thread's order.
-    //
-    // A batch reaches the scene only at a drain bounded by a sequence number taken on the API thread when the drain
-    // was emitted on the command stream (issued()), so retained commands apply in the stream's order: after the
-    // CreateMesh, SetupCamera, DrawInstance and D3D9 calls made before them and before the calls made after them,
-    // however far the render thread runs behind.
     class SceneCommandQueue {
     public:
       SceneCommandQueue() {
@@ -52,7 +45,6 @@ namespace dxvk {
       }
 
       ~SceneCommandQueue() {
-        m_next.reset();
         while (popBatch() != nullptr) {
         }
       }
@@ -60,30 +52,9 @@ namespace dxvk {
       SceneCommandQueue(const SceneCommandQueue&) = delete;
       SceneCommandQueue& operator=(const SceneCommandQueue&) = delete;
 
-      // API thread.
       void push(std::unique_ptr<SceneCommandBatch> batch) {
-        batch->sequence = m_issued.fetch_add(1, std::memory_order_acq_rel) + 1;
         pushNode(batch.release());
         m_pushed.fetch_add(1, std::memory_order_relaxed);
-      }
-
-      // API thread: the sequence number of the last batch pushed so far. A drain emitted now applies batches up to it.
-      uint64_t issued() const { return m_issued.load(std::memory_order_acquire); }
-
-      // Render thread: the next batch with a sequence number up to `bound` that `ready` accepts, or null. A batch past
-      // the bound, or one `ready` declines, stays first in line with every batch behind it, so order is kept.
-      template<typename Ready>
-      std::unique_ptr<SceneCommandBatch> popUpTo(uint64_t bound, const Ready& ready) {
-        if (!m_next) {
-          m_next = popBatch();
-          if (!m_next) {
-            return nullptr;
-          }
-        }
-        if (m_next->sequence > bound || !ready(*m_next)) {
-          return nullptr;
-        }
-        return std::move(m_next);
       }
 
       // Null when empty, or when a producer is between its two stores (the batch arrives with the next pop).
@@ -128,8 +99,6 @@ namespace dxvk {
       SceneCommandBatch* m_tail;  // consumer only
       SceneCommandBatch m_stub;
       std::atomic<uint64_t> m_pushed { 0 };
-      std::atomic<uint64_t> m_issued { 0 };
-      std::unique_ptr<SceneCommandBatch> m_next;  // consumer only: popped, waiting for its drain
     };
 
   } // namespace scene

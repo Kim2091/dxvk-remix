@@ -323,7 +323,7 @@ namespace dxvk {
   uint32_t CoreMaterialBuilder::getTableIndex() const {
     const uint32_t frame = m_device->getCurrentFrameId();
     // A slot acquired this frame is not in this frame's bindless table (built before the surface-material upload).
-    if (!m_tableValid || m_bindlessIndex == UINT32_MAX ||
+    if (!RtxOptions::CoreMaterial::build() || !m_tableValid || m_bindlessIndex == UINT32_MAX ||
         frame <= m_acquireFrame || m_finishedFrame != frame) {
       return UINT32_MAX;
     }
@@ -511,7 +511,12 @@ namespace dxvk {
     m_surfaceCount = surfaceCount;
     m_tableValid = true;
 
-    writeLegacyRecords(ctx, scene);
+    // Legacy records (option off: nothing computed, nothing kept).
+    if (RtxOptions::CoreMaterial::legacyRecord()) {
+      writeLegacyRecords(ctx, scene);
+    } else {
+      releaseLegacy(scene);
+    }
   }
 
   void CoreMaterialBuilder::writeLegacyRecords(const Rc<RtxContext>& ctx, SceneManager& scene) {
@@ -653,7 +658,7 @@ namespace dxvk {
 
   uint32_t CoreMaterialBuilder::getLegacyTableIndex() const {
     const uint32_t frame = m_device->getCurrentFrameId();
-    if (getTableIndex() == UINT32_MAX || !m_legacyRecordsValid ||
+    if (getTableIndex() == UINT32_MAX || !RtxOptions::CoreMaterial::legacyRecord() || !m_legacyRecordsValid ||
         m_legacyBindlessIndex == UINT32_MAX || frame <= m_legacyAcquireFrame) {
       return UINT32_MAX;
     }
@@ -661,7 +666,7 @@ namespace dxvk {
   }
 
   bool CoreMaterialBuilder::getLegacyBits(bool& anyLegacy, bool& anyTextureOps, bool& anyEye) const {
-    if (!m_legacyStateValid || !m_tableValid ||
+    if (!RtxOptions::CoreMaterial::legacyRecord() || !m_legacyStateValid || !m_tableValid ||
         m_finishedFrame != m_device->getCurrentFrameId()) {
       return false;
     }
@@ -692,7 +697,7 @@ namespace dxvk {
     const uint32_t frame = m_device->getCurrentFrameId();
     m_finishedFrame = frame;
     const uint32_t surfaceCount = uint32_t(scene.m_accelManager.getOrderedInstances().size());
-    const bool legacyStale = !m_legacyStateValid;
+    const bool legacyStale = RtxOptions::CoreMaterial::legacyRecord() ? !m_legacyStateValid : m_legacyStateValid;
     if (m_writtenFrame != frame && (!tableCurrent(surfaceCount) || legacyStale)) {
       // The old upload was skipped (scene unchanged) but the table does not describe these surfaces yet.
       beginMaterialGpuWriteBatch();

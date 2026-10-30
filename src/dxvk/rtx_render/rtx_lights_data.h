@@ -51,20 +51,14 @@
 struct remixapi_LightInfoUSDEXT;
 
 namespace dxvk {
-  namespace frontend {
-    struct FixedFunctionLight;
-  }
-
   struct LightData {
-    // Converts a game's fixed-function light. Its hash stays the one D3D9 light conversion has always made, which
-    // light replacements are keyed by.
-    static std::optional<LightData> tryCreate(const frontend::FixedFunctionLight& light);
+    static std::optional<LightData> tryCreate(const D3DLIGHT9& light);
     static std::optional<LightData> tryCreate(const pxr::UsdPrim& lightPrim, const pxr::GfMatrix4f* pLocalToRoot, const bool isOverrideLight, const bool absoluteTransform);
     static std::optional<LightData> tryCreate(const remixapi_LightInfoUSDEXT& src);
 
     RtLight toRtLight() const;
 
-    void merge(const frontend::FixedFunctionLight& light);
+    void merge(const D3DLIGHT9& light);
 
     static bool isSupportedUsdLight(const pxr::UsdPrim& lightPrim);
 
@@ -91,8 +85,8 @@ namespace dxvk {
 
     explicit LightData(LightType lightType, bool isOverrideLight = false, bool absoluteTransform = true);
 
-    static LightData createFromDirectional(const frontend::FixedFunctionLight& light);
-    static LightData createFromPointSpot(const frontend::FixedFunctionLight& light);
+    static LightData createFromDirectional(const D3DLIGHT9& light);
+    static LightData createFromPointSpot(const D3DLIGHT9& light);
 
     void merge(const LightData& input);
 

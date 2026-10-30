@@ -50,10 +50,9 @@ namespace dxvk {
   private:
     void dispatchDownsampleStep(
       Rc<DxvkContext> ctx,
-      const Rc<DxvkSampler>& linearSampler,
+      const Rc<DxvkSampler>& borderSampler,
       const Resources::Resource& inputBuffer,
-      const Resources::Resource& outputBuffer,
-      bool initial);
+      const Resources::Resource& outputBuffer);
 
     void dispatchUpsampleStep(
       Rc<DxvkContext> ctx,
@@ -78,15 +77,21 @@ namespace dxvk {
     // Each image is 1/2 resolution of the previous.
     Resources::Resource m_bloomBuffer[MaxBloomSteps] = {};
 
+    // Energy-conserving bloom after Froyok (Lena Piquet): no threshold, levels lerped together, and the scene
+    // lerped towards the bloom rather than having it added. See shaders/rtx/pass/bloom/bloom.h.
     RTX_OPTION_ENV("rtx.bloom", bool, enable, true, "RTX_BLOOM_ENABLE", "Enable bloom - glowing halos around intense, bright areas.");
-    RTX_OPTION("rtx.bloom", float, burnIntensity, 1.0f, "Amount of bloom to add to the final image.");
-    RTX_OPTION("rtx.bloom", float, luminanceThreshold, 0.25f,
-               "Adjust the bloom threshold to suppress blooming of the dim areas. "
-               "Pixels with luminance lower than the threshold are multiplied by "
-               "the weight value that smoothly transitions from 1.0 (at luminance=threshold) to 0.0 (at luminance=0).");
-    RTX_OPTION_ARGS("rtx.bloom", int, steps, 5,
-                    "Number of downsampling steps to perform [1..8]. A higher value produces a wider blooming radius.",
-                    args.minValue = 1,
+    RTX_OPTION("rtx.bloom", float, intensity, 0.1f,
+               "How far the image is blended towards the bloom, 0 to 1. The bloom is a lerp, not an addition, so it "
+               "spreads light from bright areas into their surroundings without adding energy and needs no threshold. "
+               "0.1 is subtle, 0.3 strong, and above 0.5 the image turns blurry.");
+    RTX_OPTION("rtx.bloom", float, radius, 0.8f,
+               "The bloom's spread, 0 to 1: how much each wider level counts against the narrower one below it. Higher "
+               "values give a wider, softer glow with a long tail, lower values a tight glow. 0.7 to 0.85 is close to "
+               "a Gaussian.");
+    RTX_OPTION_ARGS("rtx.bloom", int, steps, 8,
+                    "Number of downsampling steps, each half the size of the previous, [2..8]. More steps reach further "
+                    "from bright areas, which matters at higher resolutions.",
+                    args.minValue = 2,
                     args.maxValue = MaxBloomSteps);
   };
   

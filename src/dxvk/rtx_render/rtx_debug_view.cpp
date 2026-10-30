@@ -136,7 +136,7 @@ namespace dxvk {
         {DEBUG_VIEW_ANISOTROPIC_ROUGHNESS, "Anisotropic Roughness"},
         {DEBUG_VIEW_OPACITY, "Opacity"},
         {DEBUG_VIEW_CUTOUT_DIAGNOSIS, "Cutout Diagnosis",
-                                "Diagnostic: why a primary surface shows where its texture is transparent.\n"
+                                "Diagnoses why a primary surface shows where its texture is transparent.\n"
                                 "R = the albedo texel under the hit has alpha < 0.5, G = the surface is flagged fully opaque,\n"
                                 "B = an alpha test is set. YELLOW = transparent texel on a surface without its alpha state\n"
                                 "(submitted without the test). MAGENTA = test set, texel transparent, kept anyway (resolver).\n"

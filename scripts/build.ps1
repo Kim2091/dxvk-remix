@@ -4,8 +4,8 @@
   Build the dxvk-remix runtime (64-bit d3d9.dll) reliably.
 
 .DESCRIPTION
-  Runs runtime builds in place of upstream build_common.ps1::PerformBuild.
-  Discovers Visual Studio via vswhere, calls vcvarsall.bat
+  Replaces invoking upstream build_common.ps1::PerformBuild for fork-side
+  runtime builds. Discovers Visual Studio via vswhere, calls vcvarsall.bat
   by full path, runs meson setup + compile + install in a single isolated
   cmd.exe shell so VS env stays consistent. Streams output to the
   PowerShell pipeline so progress and errors are visible. Throws on any
@@ -38,7 +38,7 @@
   (no virtual memory for the PCH), or slangc can exit 0xC0000005 silently.
 
 .PARAMETER RegCheck
-  After a successful build, run tools/regprobe/regcheck.py on the build's hot compute shaders and fail on
+  After a successful build, run tools/regprobe/regcheck.py on the build's hot compute shaders (Phase 5 F2) and fail on
   REGCHECK FAIL (an occupancy tier lost, new spills, a variant removed). Needs an NVIDIA GPU and tools/regprobe/regprobe.exe
   (tools/regprobe/build.bat); minutes with a cold cache. Off by default.
 
@@ -50,11 +50,6 @@
   Extra meson options, for example '-Drelease_build=true'. They go to meson setup on a fresh dir and to meson configure
   on an existing one.
 
-.PARAMETER ApiOnly
-  Build the API-only module (enable_d3d9_frontend=false, with D3D11 and DXGI) in _Comp64ApiOnly unless -BuildDir says
-  otherwise. It compiles and links only: nothing is installed into _output and nothing is deployed. It proves the
-  backend and the Remix API build without the D3D9 frontend.
-
 .EXAMPLE
   .\scripts\build.ps1
   .\scripts\build.ps1 -Flavor debugoptimized
@@ -62,7 +57,6 @@
   .\scripts\build.ps1 -RegCheck
   .\scripts\build.ps1 -Jobs 6
   .\scripts\build.ps1 -BuildDir _Comp64Rel -MesonArgs '-Denable_d3d11=true','-Denable_dxgi=true','-Drelease_build=true','-Dbuild_tag=t01'
-  .\scripts\build.ps1 -ApiOnly
 #>
 [CmdletBinding()]
 param(
@@ -80,9 +74,7 @@ param(
 
     [string]$BuildDir = '',
 
-    [string[]]$MesonArgs = @(),
-
-    [switch]$ApiOnly
+    [string[]]$MesonArgs = @()
 )
 
 $ErrorActionPreference = 'Stop'
@@ -93,10 +85,7 @@ $flavorTag = switch ($Flavor) {
     'debug'          { 'Debug' }
     'debugoptimized' { 'DebugOptimized' }
 }
-if ($ApiOnly) {
-    $MesonArgs = @('-Denable_d3d9_frontend=false', '-Denable_d3d11=true', '-Denable_dxgi=true') + $MesonArgs
-}
-$buildDir = if ($BuildDir) { $BuildDir } elseif ($ApiOnly) { '_Comp64ApiOnly' } else { "_Comp64$flavorTag" }
+$buildDir = if ($BuildDir) { $BuildDir } else { "_Comp64$flavorTag" }
 $mesonExtra = ($MesonArgs | ForEach-Object { "`"$_`"" }) -join ' '
 $tracyFlag = if ($EnableTracy) { 'true' } else { 'false' }
 
@@ -173,14 +162,12 @@ if ($alreadyConfigured -and $toolsetMinor -and (Test-Path $compilersJson)) {
     }
 }
 
-# The API-only build is a compile-and-link check: installing it would replace the normal runtime in _output.
-$install = if ($ApiOnly) { '' } else { ' && meson install' }
 if ($alreadyConfigured) {
     # meson auto-reconfigures from inside the build dir if meson.build changed
     $configure = if ($MesonArgs.Count -gt 0) { "meson configure $mesonExtra $buildDir && " } else { '' }
-    $chain = "call `"$vcvars`" x64 >nul 2>&1 && $configure" + "cd $buildDir && meson compile -v -j $Jobs$install"
+    $chain = "call `"$vcvars`" x64 >nul 2>&1 && $configure" + "cd $buildDir && meson compile -v -j $Jobs && meson install"
 } else {
-    $chain = "call `"$vcvars`" x64 >nul 2>&1 && meson setup --buildtype $Flavor --backend ninja -Denable_tracy=$tracyFlag $mesonExtra $buildDir && cd $buildDir && meson compile -v -j $Jobs$install"
+    $chain = "call `"$vcvars`" x64 >nul 2>&1 && meson setup --buildtype $Flavor --backend ninja -Denable_tracy=$tracyFlag $mesonExtra $buildDir && cd $buildDir && meson compile -v -j $Jobs && meson install"
 }
 
 $buildStart = Get-Date
@@ -202,9 +189,7 @@ if ($exit -ne 0) {
 # Sanity-check artifacts so the caller can trust exit 0
 $artifacts = @{
     "$buildDir/src/d3d9/d3d9.dll" = 'runtime DLL (build dir)'
-}
-if (-not $ApiOnly) {
-    $artifacts['_output/d3d9.dll'] = 'runtime DLL (deploy)'
+    '_output/d3d9.dll'            = 'runtime DLL (deploy)'
 }
 
 $missing = @()
@@ -260,7 +245,7 @@ if ($RegCheck) {
 #     'I:\path\to\game\.trex'
 #   )
 $autoDeployScript = Join-Path $PSScriptRoot 'auto-deploy.local.ps1'
-if (-not $ApiOnly -and (Test-Path $autoDeployScript)) {
+if (Test-Path $autoDeployScript) {
     $AutoDeployTargets = @()
     . $autoDeployScript
     if ($AutoDeployTargets.Count -gt 0) {

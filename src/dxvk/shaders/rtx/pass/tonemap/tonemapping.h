@@ -116,7 +116,7 @@ struct ToneMappingApplyToneMappingArgs {
   uint pad1;
   uint pad2;
 
-  // Color grade (48 bytes).
+  // Colour grade (48 bytes).
   ToneMappingGradeArgs grade;
 };
 
@@ -132,7 +132,7 @@ struct FastToneMappingArgs {
   //   .z/.w = exposed LDR max-channel shoulder range
   vec4 highlightRecoveryThresholds;
 
-  // Tone curve selection and color grade, as in ToneMappingApplyToneMappingArgs.
+  // Tone curve selection and colour grade, as in ToneMappingApplyToneMappingArgs.
   uint tonemapPrimaries;
   uint pad1;
   uint pad2;

@@ -503,7 +503,8 @@ namespace dxvk {
       rtxdiRayQuery.enableRayTracedBiasCorrection.setDeferred(false);
       restirGiRayQuery.biasCorrectionMode.setDeferred(ReSTIRGIBiasCorrection::BRDF);
       restirGiRayQuery.useReflectionReprojection.setDeferred(false);
-      common->metaComposite().enableStochasticAlphaBlend.setDeferred(false);
+      // Alpha-blended surfaces in the primary TLAS (hair cards, glass) stay translucent only with stochastic alpha blend.
+      common->metaComposite().enableStochasticAlphaBlend.setDeferred(true);
       postFx.enable.setDeferred(false);
     };
 
@@ -614,6 +615,9 @@ namespace dxvk {
 
       lowGraphicsPresetCommonSettings();
 
+      // One indirect bounce. SHARC still adds the further bounces from its cache at that vertex.
+      pathMaxBounces.setDeferred(1);
+
       russianRouletteMaxContinueProbability.setDeferred(0.7f);
       russianRoulette1stBounceMinContinueProbability.setDeferred(0.4f);
 
@@ -623,6 +627,12 @@ namespace dxvk {
       SccrShellManager::setQualityLevel(SccrShellManager::Quality::Low);
       SparseRendering::Options::enableSparseRendering.setDeferred(isRayReconstruction);
       SparseRendering::Options::samplingRate.setDeferred(0.357f);
+    } else if (graphicsPreset() == GraphicsPreset::Custom && !isSharcVendor) {
+      // The Derived layer sits above the default and rtx.conf, either of which may select SHARC,
+      // and below the User layer, so a mode the user picks in the menu still wins.
+      RtxOptions::integrateIndirectMode.setImmediately(IntegrateIndirectMode::ReSTIRGI, RtxOptionLayer::getDerivedLayer());
+      Logger::info(str::format("[RTX] Custom preset indirect lighting default: ReSTIR GI (SHARC is off on this GPU vendor, vendor ID 0x",
+                               std::hex, deviceVendorID, ")."));
     }
 
     // Ensure we are using auto DLSS profile since we will be relying on quality downgrades for Medium/Low settings

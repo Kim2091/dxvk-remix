@@ -60,11 +60,6 @@ namespace dxvk {
     D3D9Multithread(
       BOOL                  Protected);
 
-    // Makes every later AcquireLock take the lock, as D3DCREATE_MULTITHREADED does.
-    void EnableProtection() {
-      m_protected = TRUE;
-    }
-
     D3D9DeviceLock AcquireLock() {
       return m_protected
         ? D3D9DeviceLock(m_mutex)

@@ -144,26 +144,28 @@ namespace dxvk {
     constexpr uint32_t kSplitRecordIdleFrames = 120;
   }
 
-  // The direct variant table (rtx_fork_variant_tables.h). Derived from the slim
+  // rtx.shader.variantTables, the direct table (rtx_fork_variant_tables.h). Derived from the slim
   // shader defines, independently of selectSlimLevel, which stays as the check.
   namespace {
     using DirectSlimLevel = DxvkPathtracerIntegrateDirect::SlimLevel;
 
     enum DirectVariantKeyBit : uint32_t {
-      kDirKeyNotValidating       = 1u << 0, // rtx.frameFeatures.validate off
-      kDirKeyTranslucentShadows  = 1u << 1, // rtx.enableDirectTranslucentShadows: translucent hits through the option's mask
-      kDirKeyCoreTable           = 1u << 2, // RaytraceArgs::coreMaterialTable is set this frame
-      kDirKeyLegacyTable         = 1u << 3, // RaytraceArgs::legacySurfaceTable is set this frame
-      kDirKeyNoDebugView         = 1u << 4, // no debug view (the core path writes none)
+      kDirKeySlimOption          = 1u << 0, // rtx.integrateDirect.slimVariants
+      kDirKeyNotValidating       = 1u << 1, // rtx.frameFeatures.validate off
+      kDirKeyTranslucentShadows  = 1u << 2, // rtx.enableDirectTranslucentShadows: translucent hits through the option's mask
+      kDirKeyCoreOption          = 1u << 3, // rtx.integrateDirect.coreMaterial with rtx.coreMaterial.build and legacyRecord
+      kDirKeyCoreTable           = 1u << 4, // RaytraceArgs::coreMaterialTable is set this frame
+      kDirKeyLegacyTable         = 1u << 5, // RaytraceArgs::legacySurfaceTable is set this frame
+      kDirKeyNoDebugView         = 1u << 6, // no debug view (the core path writes none)
     };
     const char* const kDirKeyNames[] = {
-      "notValidating", "translucentShadows", "coreTable", "legacyTable", "noDebugView",
+      "slimOption", "notValidating", "translucentShadows", "coreOption", "coreTable", "legacyTable", "noDebugView",
     };
-    constexpr uint32_t kDirKeyRequired = kDirKeyNotValidating;
-    constexpr uint32_t kDirKeyCore = kDirKeyRequired | kDirKeyCoreTable | kDirKeyNoDebugView;
+    constexpr uint32_t kDirKeyRequired = kDirKeySlimOption | kDirKeyNotValidating;
+    constexpr uint32_t kDirKeyCore = kDirKeyRequired | kDirKeyCoreOption | kDirKeyCoreTable | kDirKeyNoDebugView;
     constexpr uint32_t kDirRemovesLean =
       RtFrameFeatures::kSceneSssTlas | RtFrameFeatures::kSceneTranslucentDynamic | RtFrameFeatures::kSceneThinOpaque;
-    // VISIBILITY_CORE_MATERIAL: no POM code, no eye override, and the legacy record's ray portal / raytraced-render-target
+    // VISIBILITY_CORE_MATERIAL: no POM code, no eye override, and the old path's ray portal / raytraced-render-target
     // materials are not decoded.
     constexpr uint32_t kDirRemovesCoreExclusions = RtFrameFeatures::kScenePom | RtFrameFeatures::kSceneEye |
       RtFrameFeatures::kScenePortalMaterial | RtFrameFeatures::kSceneRaytracedRenderTarget;
@@ -192,10 +194,17 @@ namespace dxvk {
       kDirKeyNames, (uint32_t) (sizeof(kDirKeyNames) / sizeof(kDirKeyNames[0])),
     };
 
+    bool directCoreMaterialOptionKey() {
+      return DxvkPathtracerIntegrateDirect::coreMaterial() && RtxOptions::CoreMaterial::build() &&
+             RtxOptions::CoreMaterial::legacyRecord();
+    }
+
     uint32_t directVariantModeKey(const RtFrameFeatures& f, const bool coreTableValid, const bool legacyTableValid) {
       uint32_t key = 0;
+      key |= DxvkPathtracerIntegrateDirect::slimVariants() ? kDirKeySlimOption : 0u;
       key |= !RtxOptions::FrameFeatures::validate() ? kDirKeyNotValidating : 0u;
       key |= f.hasMode(RtFrameFeatures::kModeDirectTranslucentShadows) ? kDirKeyTranslucentShadows : 0u;
+      key |= directCoreMaterialOptionKey() ? kDirKeyCoreOption : 0u;
       key |= coreTableValid ? kDirKeyCoreTable : 0u;
       key |= legacyTableValid ? kDirKeyLegacyTable : 0u;
       key |= !f.hasMode(RtFrameFeatures::kModeDebugView) ? kDirKeyNoDebugView : 0u;
@@ -205,8 +214,10 @@ namespace dxvk {
     // The mode key configured at startup. The tables and the debug view are per frame, taken as available.
     uint32_t directConfiguredVariantModeKey() {
       uint32_t key = kDirKeyCoreTable | kDirKeyLegacyTable | kDirKeyNoDebugView;
+      key |= DxvkPathtracerIntegrateDirect::slimVariants() ? kDirKeySlimOption : 0u;
       key |= !RtxOptions::FrameFeatures::validate() ? kDirKeyNotValidating : 0u;
       key |= RtxOptions::enableDirectTranslucentShadows() ? kDirKeyTranslucentShadows : 0u;
+      key |= directCoreMaterialOptionKey() ? kDirKeyCoreOption : 0u;
       return key;
     }
   }
@@ -229,14 +240,17 @@ namespace dxvk {
       }
       // Dedicated-sun variant (rtx.lightSampling.bvhDedicatedSunSample).
       GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, IntegrateDirectRayGenShader, integrate_direct_sun_rayquery);
-      // The slim levels.
+      // The slim levels (rtx.integrateDirect.slimVariants).
       GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, IntegrateDirectRayGenShader, integrate_direct_nosss_rayquery);
       GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, IntegrateDirectRayGenShader, integrate_direct_sun_nosss_rayquery);
       getSplitShadeShader(false);
       getSplitShadeShader(true);
       getSplitTraceShader(SlimLevel::Lean);
-      getSplitTraceShader(SlimLevel::LeanCore);
-      getSplitTraceShader(SlimLevel::LeanLegacy);
+      // The core forms only with rtx.integrateDirect.coreMaterial on, so the set is unchanged while it is off.
+      if (coreMaterialOptionActive()) {
+        getSplitTraceShader(SlimLevel::LeanCore);
+        getSplitTraceShader(SlimLevel::LeanLegacy);
+      }
     } else {
       // Note: The getter for OMM enabled also checks if OMMs are supported, so we do not need to check for that manually.
       const bool ommEnabled = RtxOptions::getEnableOpacityMicromap();
@@ -246,15 +260,19 @@ namespace dxvk {
       switch (RtxOptions::renderPassIntegrateDirectRaytraceMode()) {
       case RaytraceMode::RayQuery:
         prewarmLevel(deferredNrcTrainingSetup, SlimLevel::Full);
-        // Which slim level a frame takes depends on the scene, so warm all of them, the core forms included (which
-        // one a frame takes depends on its legacy state).
-        prewarmLevel(deferredNrcTrainingSetup, SlimLevel::NoSss);
-        prewarmLevel(deferredNrcTrainingSetup, SlimLevel::Lean);
-        prewarmLevel(deferredNrcTrainingSetup, SlimLevel::LeanCore);
-        prewarmLevel(deferredNrcTrainingSetup, SlimLevel::LeanLegacy);
-        // Every variant table entry of the configured mode key plus Full. These are the kernels above today, and the
-        // loop follows the table when entries are added.
-        {
+        // Which slim level a frame takes depends on the scene, so warm all of them.
+        if (slimVariants()) {
+          prewarmLevel(deferredNrcTrainingSetup, SlimLevel::NoSss);
+          prewarmLevel(deferredNrcTrainingSetup, SlimLevel::Lean);
+          // The configured core forms (which one a frame takes depends on its legacy state).
+          if (coreMaterialOptionActive()) {
+            prewarmLevel(deferredNrcTrainingSetup, SlimLevel::LeanCore);
+            prewarmLevel(deferredNrcTrainingSetup, SlimLevel::LeanLegacy);
+          }
+        }
+        // rtx.shader.variantTables: every entry of the configured mode key plus Full. These are the kernels above today,
+        // and the loop follows the table when entries are added.
+        if (RtxOptions::Shader::variantTables()) {
           const uint32_t key = directConfiguredVariantModeKey();
           for (const VariantTableEntry& entry : kDirectVariantEntries) {
             if (variantEntryMatchesModeKey(entry, key)) {
@@ -370,12 +388,14 @@ namespace dxvk {
     case RaytraceMode::RayQuery:
     {
       SlimLevel slimLevel = selectSlimLevel(ctx->getFrameFeatures());
-      // The core forms (Lean only).
+      // rtx.integrateDirect.coreMaterial (Lean only; unchanged while the option is off).
       const bool coreTableValid = rtOutput.m_raytraceArgs.coreMaterialTable != UINT32_MAX;
       const bool legacyTableValid = rtOutput.m_raytraceArgs.legacySurfaceTable != UINT32_MAX;
       slimLevel = selectCoreMaterialLevel(ctx->getFrameFeatures(), slimLevel, coreTableValid, legacyTableValid);
-      // The variant table picks the level; the rules above still run as the check.
-      slimLevel = selectVariantTableLevel(ctx, deferredNrcTrainingSetup, slimLevel, coreTableValid, legacyTableValid);
+      // rtx.shader.variantTables picks the level; the rules above still run as the check.
+      if (RtxOptions::Shader::variantTables()) {
+        slimLevel = selectVariantTableLevel(ctx, deferredNrcTrainingSetup, slimLevel, coreTableValid, legacyTableValid);
+      }
       // The Lean levels run as a shade dispatch and a trace dispatch over the per-pixel record. Deferred NRC setup binds
       // its one kernel at every level.
       if (isSplitLevel(slimLevel) && !deferredNrcTrainingSetup &&
@@ -430,7 +450,7 @@ namespace dxvk {
 
   DxvkPathtracerIntegrateDirect::SlimLevel DxvkPathtracerIntegrateDirect::selectSlimLevel(const RtFrameFeatures& features) {
     // rtx.frameFeatures.validate runs the Full kernels.
-    if (RtxOptions::FrameFeatures::validate()) {
+    if (!slimVariants() || RtxOptions::FrameFeatures::validate()) {
       return SlimLevel::Full;
     }
 
@@ -465,16 +485,20 @@ namespace dxvk {
     return "?";
   }
 
+  bool DxvkPathtracerIntegrateDirect::coreMaterialOptionActive() {
+    return coreMaterial() && RtxOptions::CoreMaterial::build() && RtxOptions::CoreMaterial::legacyRecord();
+  }
+
   DxvkPathtracerIntegrateDirect::SlimLevel DxvkPathtracerIntegrateDirect::selectCoreMaterialLevel(
     const RtFrameFeatures& features, const SlimLevel level, const bool coreTableValid, const bool legacyTableValid) {
     // The core forms exist for Lean only, and read the core record (so it must describe this frame)
     // and, for surfaces with texture ops or other legacy state, the legacy record.
-    if (level != SlimLevel::Lean || !coreTableValid ||
+    if (level != SlimLevel::Lean || !coreMaterialOptionActive() || !coreTableValid ||
         features.hasMode(RtFrameFeatures::kModeDebugView)) {
       return level;
     }
     // POM moves texture coordinates, an eye overrides the opacity, and ray portal and raytraced-render-target materials
-    // keep the legacy material path.
+    // keep the old path.
     if (features.has(RtFrameFeatures::kScenePom) || features.has(RtFrameFeatures::kSceneEye) ||
         features.has(RtFrameFeatures::kScenePortalMaterial) || features.has(RtFrameFeatures::kSceneRaytracedRenderTarget)) {
       return level;

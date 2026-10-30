@@ -130,6 +130,30 @@ namespace dxvk {
     return desiredProfile;
   }
 
+  void DxvkDLSS::logRenderSize(const char* upscaler, DLSSProfile profile, const uint32_t displaySize[2],
+                               const uint32_t optimalSize[2], const uint32_t minSize[2], const uint32_t maxSize[2]) {
+    float usualScale = 1.f;
+    switch (profile) {
+    case DLSSProfile::UltraPerf: usualScale = 1.f / 3.f; break;
+    case DLSSProfile::MaxPerf: usualScale = 0.5f; break;
+    case DLSSProfile::Balanced: usualScale = 0.58f; break;
+    case DLSSProfile::MaxQuality: usualScale = 2.f / 3.f; break;
+    default: break;
+    }
+
+    const std::string sizes = str::format(upscaler, " ", dlssProfileToString(profile), " for ", displaySize[0], "x", displaySize[1],
+                                          ": NGX render size ", optimalSize[0], "x", optimalSize[1],
+                                          " (allowed ", minSize[0], "x", minSize[1], " to ", maxSize[0], "x", maxSize[1], ")");
+    const bool overridden = usualScale < 1.f && float(optimalSize[0]) > (usualScale + 0.1f) * float(displaySize[0]);
+    if (overridden) {
+      Logger::warn(str::format("[DLSS] ", sizes, ", far above the profile's usual ", int(usualScale * 100.f + 0.5f),
+                               "% scale. A driver-level DLSS override (NVIDIA App DLSS Override, NVIDIA Profile Inspector or a",
+                               " DLSS tweak DLL) sets the render size, so the quality setting in the Remix menu has no effect."));
+    } else {
+      Logger::info(str::format("[DLSS] ", sizes));
+    }
+  }
+
   void DxvkDLSS::setSetting(const uint32_t displaySize[2], const DLSSProfile profile, uint32_t outRenderSize[2]) {
     ScopedCpuProfileZone();
     // Handle the "auto" case, this is the param we'll pass to determine optimal resolution setting
@@ -158,6 +182,8 @@ namespace dxvk {
       m_dlssContext = m_device->getCommon()->metaNGXContext().createDLSSContext();
     }
     const auto optimalSettings = m_dlssContext->queryOptimalSettings(displaySize, perfQuality);
+    logRenderSize("DLSS", mActualProfile, displaySize, optimalSettings.optimalRenderSize,
+                  optimalSettings.minRenderSize, optimalSettings.maxRenderSize);
 
     mInputSize[0] = outRenderSize[0] = optimalSettings.optimalRenderSize[0];
     mInputSize[1] = outRenderSize[1] = optimalSettings.optimalRenderSize[1];

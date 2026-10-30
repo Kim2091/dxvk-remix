@@ -396,7 +396,7 @@ namespace dxvk {
       NrcOptions::terminationHeuristicThreshold.setImmediately(0.1f);
       NrcOptions::smallestResolvableFeatureSizeMeters.setImmediately(0.01f);
       NrcOptions::targetNumTrainingIterations.setImmediately(4);
-      // 9 and higher resulted in no scene illumination loss in tested content
+      // 9 and higher resulted in no scene illumination loss in Portal RTX
       trainingMaxPathBounces.setImmediately(9);
 
     } else if (NrcOptions::qualityPreset() == QualityPreset::High) {

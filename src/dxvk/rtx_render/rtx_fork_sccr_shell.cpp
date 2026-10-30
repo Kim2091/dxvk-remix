@@ -29,6 +29,7 @@
 
 #include "rtx_context.h"
 #include "rtx_fork_pom_cone_map.h"
+#include "rtx_fork_sccr_tess.h"
 #include "rtx_instance_manager.h"
 #include "rtx_materials.h"
 #include "rtx_options.h"
@@ -160,6 +161,21 @@ namespace dxvk {
     return enable() && RtxOptions::Displacement::mode() == DisplacementMode::SCCR;
   }
 
+  bool SccrShellManager::isSolidOpaque(const RtInstance& instance) {
+    const uint32_t flags = instance.getVkInstance().flags;
+    // Opaque in the opaque TLAS (the "all other fully opaques" branch of the instance manager's flag update): no opacity
+    // micromap, alpha test, blending or clip plane applies, so replacing its triangles with real relief changes nothing
+    // else. Not a view or player model.
+    if (!instance.surface.alphaState.isFullyOpaque || instance.surface.isClipPlaneEnabled) {
+      return false;
+    }
+    if (instance.getGeometryFlags() != VK_GEOMETRY_OPAQUE_BIT_KHR ||
+        (flags & VK_GEOMETRY_INSTANCE_FORCE_NO_OPAQUE_BIT_KHR) != 0 || instance.usesUnorderedApproximations()) {
+      return false;
+    }
+    return !instance.isViewModel() && !instance.isPlayerModelInstance();
+  }
+
   size_t SccrShellManager::DataKeyHash::operator()(const DataKey& key) const {
     uint64_t h = key.positionHash;
     h ^= key.indexHash + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
@@ -176,15 +192,32 @@ namespace dxvk {
     return key;
   }
 
-  SccrShellManager::Eligibility SccrShellManager::classifyMaterial(const RtSurfaceMaterial* material) {
+  SccrShellManager::Eligibility SccrShellManager::classifyMaterial(const SceneManager& sceneManager,
+                                                                   const RtSurfaceMaterial* material) {
     if (material == nullptr) {
       return Eligibility::NoMaterial;
     }
     if (material->getType() != RtSurfaceMaterialType::Opaque) {
       return Eligibility::NotOpaque;
     }
-    if (!material->getOpaqueSurfaceMaterial().hasValidDisplacement()) {
+    const RtOpaqueSurfaceMaterial& opaque = material->getOpaqueSurfaceMaterial();
+    if (!opaque.hasValidDisplacement()) {
       return Eligibility::NotDisplaced;
+    }
+    // No shell data for blended terrain: large, gently varying triangles
+    // (little flat-plane error) and the most expensive samples. The shader then finds no shell buffer and keeps the
+    // terrain march. Blended means the march blends layer heights: the terrain-layers entry has a height material
+    // (pomHeightSourceCreate). A terrain-layers entry alone is not terrain: the FNV wrapper gives every API static with
+    // a normal map a one-layer entry (weight 1, no layer heights) for the RGB tangent-space decode and per-layer gloss,
+    // and its own height map is marched like any mesh's, so such an entry stays eligible.
+    const uint32_t terrainLayersIndex = opaque.getTerrainLayersMaterialIndex();
+    if (terrainLayersIndex != SURFACE_INDEX_INVALID) {
+      const RtSurfaceMaterial* layers = sceneManager.getSurfaceMaterialExtensionOrNull(terrainLayersIndex);
+      // An entry that cannot be read is treated as terrain (no data rather than a march on the wrong heights).
+      if (layers == nullptr || layers->getType() != RtSurfaceMaterialType::TerrainLayers ||
+          layers->getTerrainLayersMaterial().getHeightMaterialIndex() != SURFACE_INDEX_INVALID) {
+        return Eligibility::Terrain;
+      }
     }
     return Eligibility::Eligible;
   }
@@ -206,7 +239,7 @@ namespace dxvk {
       return Eligibility::NoGeometry;
     }
     const Eligibility material =
-      classifyMaterial(sceneManager.getSurfaceMaterialOrNull(instance.surface.surfaceMaterialIndex));
+      classifyMaterial(sceneManager, sceneManager.getSurfaceMaterialOrNull(instance.surface.surfaceMaterialIndex));
     if (material != Eligibility::Eligible) {
       return material;
     }
@@ -249,22 +282,68 @@ namespace dxvk {
     const uint32_t slot = slotFor(instance);
     const uint32_t value = slot < kSurfaceInvalidBufferIndex ? slot : kSurfaceInvalidBufferIndex;
     std::memcpy(record + kSurfaceGPUSize - sizeof(uint32_t), &value, sizeof(value));
+    // SCCR real geometry: a bound instance's record points at its tessellated mesh instead (and has no shell slot).
+    m_device->getCommon()->metaSccrTess().patchSurfaceRecord(record, instance);
+  }
+
+  bool SccrShellManager::isRealGeometryCandidate(const SceneManager& sceneManager, const RtInstance& instance) {
+    if (classify(sceneManager, instance) != Eligibility::Eligible) {
+      return false;
+    }
+    if (!isSolidOpaque(instance)) {
+      return false;
+    }
+    const RtSurface& surface = instance.surface;
+    // The tessellator reads the buffer's texture coordinates as they are and keeps the record's texture transform, so
+    // only an identity transform keeps heights and shading on the same coordinates.
+    return surface.instancesToObject == nullptr && instance.getBlas()->buildGeometries.size() == 1 &&
+           surface.texgenMode == TexGenMode::None && surface.spriteSheetFPS == 0 && surface.textureTransform == Matrix4();
+  }
+
+  Rc<DxvkBuffer> SccrShellManager::shellBufferFor(const RtInstance& instance) const {
+    if (!m_frameActive || classify(m_device->getCommon()->getSceneManager(), instance) != Eligibility::Eligible) {
+      return nullptr;
+    }
+    const RaytraceGeometry& geometry = instance.getBlas()->modifiedGeometryData;
+    const SccrShellGeometryMemo& memo = geometry.shellMemo;
+    const DataKey key = keyOf(geometry);
+    if (memo.entry != nullptr && memo.generation == m_generation && memo.positionHash == key.positionHash &&
+        memo.indexHash == key.indexHash && memo.vertexCount == key.vertexCount && memo.primitiveCount == key.primitiveCount) {
+      return memo.entry->buffer;
+    }
+    const auto found = m_cache.find(key);
+    return found != m_cache.end() ? found->second->buffer : nullptr;
   }
 
   void SccrShellManager::scanInstances(SceneManager& sceneManager) {
     ++m_scanSerial;
     // The frame's counts, written over m_frameStats' walk fields at the end (the rest is prepareFrame's).
     Stats counts;
+    // SCCR real geometry: every instance's flag is rewritten here, before mergeInstancesIntoBlas keys its bucket.
+    // Candidates get their own TLAS entry (RtInstance::isRealGeometry, read by the BLAS routing): once their mesh is
+    // built the bumps are real, and until then plain shell tracing shows them.
+    const bool flagRealGeometry = SccrTessManager::active();
+    bool flagsChanged = false;
     for (RtInstance* instance : sceneManager.getInstanceTable()) {
       ++counts.instances;
       const Eligibility eligibility =
         instance != nullptr ? classify(sceneManager, *instance) : Eligibility::NoGeometry;
+      if (instance != nullptr) {
+        const bool realGeometry = flagRealGeometry && eligibility == Eligibility::Eligible &&
+          isRealGeometryCandidate(sceneManager, *instance) &&
+          m_device->getCommon()->metaSccrTess().acceptsMesh(*instance->getBlas());
+        if (instance->isRealGeometry != realGeometry) {
+          instance->isRealGeometry = realGeometry;
+          flagsChanged = true;
+        }
+      }
       switch (eligibility) {
       case Eligibility::Eligible: break;
       case Eligibility::NoGeometry: ++counts.noGeometry; break;
       case Eligibility::NoMaterial: ++counts.noMaterial; break;
       case Eligibility::NotOpaque: ++counts.notOpaque; break;
       case Eligibility::NotDisplaced: ++counts.notDisplaced; break;
+      case Eligibility::Terrain: ++counts.terrain; break;
       case Eligibility::Skinned: ++counts.skinnedSurfaces; break;
       case Eligibility::Animated: ++counts.animatedSurfaces; break;
       }
@@ -324,10 +403,18 @@ namespace dxvk {
     m_frameStats.noMaterial = counts.noMaterial;
     m_frameStats.notOpaque = counts.notOpaque;
     m_frameStats.notDisplaced = counts.notDisplaced;
+    m_frameStats.terrain = counts.terrain;
     m_frameStats.skinnedSurfaces = counts.skinnedSurfaces;
     m_frameStats.animatedSurfaces = counts.animatedSurfaces;
     m_frameStats.unsupportedSurfaces = counts.unsupportedSurfaces;
     m_frameStats.instances = counts.instances;
+    m_flagsSet = m_flagsSet || flagRealGeometry;
+    // The flag is part of the merged-BLAS bucket key, but nothing else marks the scene changed when only it moves (an
+    // option toggled, an instance turning dynamic): without this the unchanged-scene path would keep the old buckets
+    // and AccelManager's dirty scan would never see the new key.
+    if (flagsChanged) {
+      sceneManager.notifyAccelSceneChanged();
+    }
   }
 
   SccrShellManager::Cache::iterator SccrShellManager::eraseEntry(SceneManager& sceneManager, Cache::iterator it) {
@@ -406,6 +493,16 @@ namespace dxvk {
       return;
     }
     SceneManager& sceneManager = m_device->getCommon()->getSceneManager();
+    if (!active() && m_flagsSet) {
+      // Shell tracing off: the walk below does not run, so drop the real geometry flags here, once.
+      for (RtInstance* instance : sceneManager.getInstanceTable()) {
+        if (instance != nullptr) {
+          instance->isRealGeometry = false;
+        }
+      }
+      m_flagsSet = false;
+      sceneManager.notifyAccelSceneChanged();
+    }
     if (!active()) {
       if (m_wasActive) {
         const size_t released = m_cache.size();
@@ -474,7 +571,7 @@ namespace dxvk {
                                   uint64_t(s.cachedBuffers), uint64_t(s.dynamicSurfaces), uint64_t(m_sessionBuilds),
                                   uint64_t(m_sessionEvicted), uint64_t(m_sessionCancelled), uint64_t(s.noGeometry),
                                   uint64_t(s.noMaterial), uint64_t(s.notOpaque), uint64_t(s.notDisplaced),
-                                  uint64_t(s.unsupportedSurfaces) }) {
+                                  uint64_t(s.terrain), uint64_t(s.unsupportedSurfaces) }) {
       signature = (signature ^ value) * 0x100000001B3ull;
     }
     const bool buildRunOver = m_builtSinceReport > 0 && !builtAny;
@@ -562,7 +659,7 @@ namespace dxvk {
                              " (0 turns displacement off in the shaders). Of ", s.instances,
                              " instances walked, without shell data because: no geometry ", s.noGeometry,
                              ", no material ", s.noMaterial, ", not opaque ", s.notOpaque, ", not displaced ",
-                             s.notDisplaced, ", skinned ", s.skinnedSurfaces,
+                             s.notDisplaced, ", blended terrain ", s.terrain, ", skinned ", s.skinnedSurfaces,
                              ", vertices animated ", s.animatedSurfaces, ", mesh unsupported ", s.unsupportedSurfaces,
                              "."));
     m_builtSinceReport = 0;

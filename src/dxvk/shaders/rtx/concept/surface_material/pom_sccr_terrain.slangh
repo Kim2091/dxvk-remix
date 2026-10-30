@@ -1,0 +1,623 @@
+/*
+* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+#pragma once
+
+// SCCR (rtx.displacement.mode = SCCR) for the blended terrain-layer height field of PomHeightSource (terrain POM).
+// opaque_surface_material_interaction.slangh includes this file right after pom_sccr.slangh, whose march it reuses.
+//
+// Each layer height map is a conservative derived height+cone texture (PomConeMapManager::ConeVariant::Conservative),
+// marked by the layer's bit in PomHeightSource::coneMask. The weights w_i are held fixed for the march, as
+// PomHeightSource holds them. W is the sum of every layer weight, and layers without a height map are flat at depth 0.
+// From each layer's conservative cone c_i at the march position p, the blended depth D = sum_i w_i D_i / W satisfies
+//   D(q) >= D(p) - |q - p| * sum_i (w_i / W) / c_i,
+// so 1 / (sum_i (w_i / W) / c_i) is a conservative cone of the blend. It is a weighted harmonic mean of the layer
+// cones, diluted by flat layers, and never below their minimum. Relaxed cones give no such bound, which is why the
+// conservative variant is used. A layer with a weight but no cone makes the cone 0, which gives a linear step.
+// That happens when G is 0 because the cone is not generated yet, or when the layer has no derived texture.
+// tests/rtx/unit/test_pom_cone_map.cpp checks this combination against a brute-force cone of the blended field.
+
+// The cap of the blended cone ratio in UV per unit of depth. A blend diluted by flat layers can pass the per-layer cap
+// of 1, and the step tends to the remaining gap as the ratio grows, so this only keeps the arithmetic finite.
+static const float kPomLayeredConeMaxRatio = 16.0f;
+
+// The blended terrain-layer field of a PomHeightSource as an IPomConeField. Each sample fetches each active layer once,
+// reading height (R) and cone (G) together. lod is the mip sampled. It is 0 except for coarse self-shadows, which then
+// clear source.coneMask because the cones bound mip 0 only.
+struct PomLayeredConeField : IPomConeField
+{
+  PomHeightSource source;
+  float lod;
+
+  float2 sampleDepthCone(float2 uv)
+  {
+    float depth = 0.0f;
+    float slope = 0.0f; // sum_i w_i / c_i
+    bool linear = false;
+    [unroll]
+    for (uint i = 0; i < TERRAIN_LAYERS_MATERIAL_MAX_LAYERS; ++i)
+    {
+      if ((source.layerMask & (1u << i)) == 0u)
+      {
+        continue;
+      }
+      const float2 heightCone = textures[nonuniformEXT(uint(source.layerHeightTextureIndices[i]))].SampleLevel(
+        samplers[nonuniformEXT(uint(source.samplerIndex))], uv, lod).rg;
+      depth += source.layerWeights[i] * (1.0f - heightCone.x);
+      // Without a derived texture G is not a cone.
+      const float cone = (source.coneMask & (1u << i)) != 0u ? heightCone.y * heightCone.y : 0.0f;
+      if (cone > 0.0f)
+      {
+        slope += source.layerWeights[i] / cone;
+      }
+      else
+      {
+        linear = true;
+      }
+    }
+    slope *= source.invWeightSum;
+    float coneRatio = 0.0f;
+    if (!linear)
+    {
+      coneRatio = slope * kPomLayeredConeMaxRatio > 1.0f ? rcp(slope) : kPomLayeredConeMaxRatio;
+    }
+    return float2(depth * source.invWeightSum, coneRatio);
+  }
+};
+
+PomLayeredConeField pomLayeredConeFieldCreate(PomHeightSource heightSource)
+{
+  PomLayeredConeField field;
+  field.source = heightSource;
+  field.lod = 0.0f;
+  return field;
+}
+
+// Keeps at most N layer height maps per march, where N = cb.pomSccrTerrainArgs & POM_SCCR_TERRAIN_MAX_LAYERS_MASK
+// (rtx.displacement.terrainMaxLayers, 0 keeps all). The kept layers have the largest weights at the march's start,
+// with ties going to the lower layer index, and stay fixed for the whole march like the weights.
+// A dropped layer leaves the blend. W loses its weight while flat layers keep theirs, so the kept layers' shares grow
+// to fill it. Height and cone are both computed from the reduced source, so the field marched is the blend of the kept
+// layers with fixed weights. Its cone, the weighted harmonic mean of the kept layers' conservative cones under the
+// same W, is sound for it by the argument at the top of this file, and the unit test checks reduced blends too.
+// The field differs from the full blend by at most the dropped weights' share of their layers' depth differences.
+// Where the rank of two layers swaps across a pixel boundary (two equal weights below the top N-1), neighboring pixels
+// march different sets. Reducing the layers also limits the GetDimensions calls of pomLayeredTexelSize to the kept ones.
+void sccrTerrainReduceLayers(inout PomHeightSource source)
+{
+  const uint maxLayers = cb.pomSccrTerrainArgs & POM_SCCR_TERRAIN_MAX_LAYERS_MASK;
+  if (maxLayers == 0u || countbits(source.layerMask) <= maxLayers)
+  {
+    return;
+  }
+  uint keep = 0u;
+  float droppedWeight = 0.0f;
+  [unroll]
+  for (uint i = 0; i < TERRAIN_LAYERS_MATERIAL_MAX_LAYERS; ++i)
+  {
+    if ((source.layerMask & (1u << i)) == 0u)
+    {
+      continue;
+    }
+    // The number of active layers ranked before layer i.
+    uint rank = 0u;
+    [unroll]
+    for (uint j = 0; j < TERRAIN_LAYERS_MATERIAL_MAX_LAYERS; ++j)
+    {
+      const bool heavier = source.layerWeights[j] > source.layerWeights[i] ||
+                           (source.layerWeights[j] == source.layerWeights[i] && j < i);
+      if (j != i && (source.layerMask & (1u << j)) != 0u && heavier)
+      {
+        rank++;
+      }
+    }
+    if (rank < maxLayers)
+    {
+      keep |= 1u << i;
+    }
+    else
+    {
+      droppedWeight += source.layerWeights[i];
+    }
+  }
+  const float weightSum = source.invWeightSum > 0.0f ? rcp(source.invWeightSum) - droppedWeight : 0.0f;
+  source.layerMask = keep;
+  source.coneMask &= keep;
+  source.invWeightSum = weightSum > 1e-5f ? rcp(weightSum) : 0.0f;
+}
+
+// Returns the finest texel of the active layer height maps in UV, for the self-shadow step LOD (sccrStepLod).
+// Returns 0 when no layer is active.
+float pomLayeredTexelSize(PomHeightSource source)
+{
+  uint finest = 0u;
+  [unroll]
+  for (uint i = 0; i < TERRAIN_LAYERS_MATERIAL_MAX_LAYERS; ++i)
+  {
+    if ((source.layerMask & (1u << i)) == 0u)
+    {
+      continue;
+    }
+    uint width, height, mipLevels;
+    textures[nonuniformEXT(uint(source.layerHeightTextureIndices[i]))].GetDimensions(0, width, height, mipLevels);
+    finest = max(finest, max(width, height));
+  }
+  return finest > 0u ? rcp(float(finest)) : 0.0f;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Live weights (rtx.displacement.terrainLiveWeights, cb.pomSccrTerrainArgs & POM_SCCR_TERRAIN_FLAG_LIVE_WEIGHTS).
+//
+// PomLayeredConeField holds the weights of the march's start, the hit's texcoord p, for the whole march. The field the
+// march sees is then D_p(q) = sum_i w_i(p) D_i(q) / W(p), which depends on where the view ray met the mesh. When the
+// camera moves, the ray that reaches a given relief texel q meets the mesh at another p, so the depth at q changes and
+// the relief slides and morphs. The albedo and normals (forkTerrainLayersBlend, at the displaced texcoord) stay with q.
+// Terrain weights can change from one land vertex to the next, and a march at grazing angles travels a
+// large part of that distance, so the field at q can be off by half of its layers' depth differences. Camera rotation
+// alone keeps every p, which is why only moving shows it. Shell tracing does not help, because it excludes terrain and
+// would march the same frozen field.
+//
+// PomLiveLayeredConeField reads the weights at every sample instead: D(q) = sum_i w_i(q) D_i(q) / W(q). This is one
+// fixed field whatever the view, and the same one the albedo blend uses. It costs two more fetches per sample, of the
+// two small weight maps.
+//
+// The layers kept for the march (terrainMaxLayers, as in sccrTerrainReduceLayers) are ranked by their largest weight
+// at the probes: the start, the hit and the end of the march segment. A layer that only fills the far end of the march
+// is therefore not dropped. Height layers outside the kept set leave the blend, so W never counts them, while flat
+// layers without a height map stay in it. The kept set is chosen per march, so where more than N layers overlap,
+// neighboring pixels can march different sets. 0 keeps every height layer. A layer whose weight is 0 at a sample is
+// not fetched there.
+//
+// The cone with varying weights uses the shares s_i = w_i / W over the blend's layers, which sum to 1 with flat layers
+// at depth 0, and layer depths in [0, 1]:
+//   D(q) - D(p) = sum_i s_i(q) (D_i(q) - D_i(p)) + sum_i (s_i(q) - s_i(p)) D_i(p)
+// The first sum is bounded by the layer cones as at the top of this file, with the shares of the sample. A second-order
+// term in the change of the shares over the step is ignored. Since the share changes sum to 0, the second sum is at
+// least -TV/2, where TV = sum_i |s_i(q) - s_i(p)| is the total variation of the shares. So a cone 1 / (1/c + G) is
+// sound when G bounds TV/2 per UV of travel. G is estimated per march as the share variation between the probes over
+// their distance, times kSccrTerrainWeightSlopeSafety. The weights are bilinear in a small texture, so they are smooth
+// over a march segment, which is usually shorter than a land quad. An underestimate cannot miss a thin feature,
+// because the weights vary over meters. At worst a step passes a wide, shallow rise of the blend by a small part of the
+// depth. The live-weights cases in test_pom_cone_map check that G passes no more crossings than the frozen field's
+// layer cones already allow.
+// ---------------------------------------------------------------------------------------------------------------------
+
+static const float kSccrTerrainWeightSlopeSafety = 1.0f;
+
+// The two RGBA weight maps of a terrain-layers entry at one point, unnormalized, for layers 0-3 and 4-7.
+struct SccrTerrainWeights
+{
+  float4 w0123;
+  float4 w4567;
+};
+
+float sccrTerrainWeight(SccrTerrainWeights weights, uint layer)
+{
+  return max(layer < 4u ? weights.w0123[layer & 3u] : weights.w4567[layer & 3u], 0.0f);
+}
+
+struct PomLiveLayeredConeField : IPomConeField
+{
+  uint16_t samplerIndex;        // Samples the layer height maps.
+  uint16_t weightTextureIndex0; // Weights of layers 0-3.
+  uint16_t weightTextureIndex1; // Weights of layers 4-7.
+  uint16_t weightSamplerIndex;
+  float2 weightUvScale;
+  float2 weightUvOffset;
+  uint blendMask;               // Layers counted in W, which is every layer of the entry except the dropped height layers.
+  uint layerMask;               // The kept height layers.
+  uint coneMask;                // The layers of layerMask whose texture has conservative cones, 0 for coarse shadows.
+  uint16_t layerHeightTextureIndices[TERRAIN_LAYERS_MATERIAL_MAX_LAYERS];
+  float weightSlope;            // G, a bound on half the share variation per UV of travel.
+  float lod;                    // The mip of the layer height maps, above 0 only for coarse self-shadows.
+
+  SccrTerrainWeights sampleWeights(float2 uv)
+  {
+    const float2 weightUv = uv * weightUvScale + weightUvOffset;
+    SccrTerrainWeights weights;
+    weights.w0123 = float4(0.0f);
+    weights.w4567 = float4(0.0f);
+    if (weightTextureIndex0 != BINDING_INDEX_INVALID)
+    {
+      weights.w0123 = textures[nonuniformEXT(uint(weightTextureIndex0))].SampleLevel(
+        samplers[nonuniformEXT(uint(weightSamplerIndex))], weightUv, 0);
+    }
+    if (weightTextureIndex1 != BINDING_INDEX_INVALID)
+    {
+      weights.w4567 = textures[nonuniformEXT(uint(weightTextureIndex1))].SampleLevel(
+        samplers[nonuniformEXT(uint(weightSamplerIndex))], weightUv, 0);
+    }
+    return weights;
+  }
+
+  float2 sampleDepthCone(float2 uv)
+  {
+    const SccrTerrainWeights weights = sampleWeights(uv);
+    float weightSum = 0.0f;
+    float depth = 0.0f;
+    float slope = 0.0f; // sum_i w_i / c_i
+    bool linear = false;
+    [unroll]
+    for (uint i = 0; i < TERRAIN_LAYERS_MATERIAL_MAX_LAYERS; ++i)
+    {
+      const float w = sccrTerrainWeight(weights, i);
+      if ((blendMask & (1u << i)) == 0u || w <= 0.0f)
+      {
+        continue;
+      }
+      weightSum += w;
+      if ((layerMask & (1u << i)) == 0u)
+      {
+        continue; // A flat layer has depth 0.
+      }
+      const float2 heightCone = textures[nonuniformEXT(uint(layerHeightTextureIndices[i]))].SampleLevel(
+        samplers[nonuniformEXT(uint(samplerIndex))], uv, lod).rg;
+      depth += w * (1.0f - heightCone.x);
+      const float cone = (coneMask & (1u << i)) != 0u ? heightCone.y * heightCone.y : 0.0f;
+      if (cone > 0.0f)
+      {
+        slope += w / cone;
+      }
+      else
+      {
+        linear = true;
+      }
+    }
+    // A point without any weight is flat.
+    const float invWeightSum = weightSum > 1e-5f ? rcp(weightSum) : 0.0f;
+    slope = slope * invWeightSum + weightSlope;
+    float coneRatio = 0.0f;
+    if (!linear)
+    {
+      coneRatio = slope * kPomLayeredConeMaxRatio > 1.0f ? rcp(slope) : kPomLayeredConeMaxRatio;
+    }
+    return float2(depth * invWeightSum, coneRatio);
+  }
+};
+
+// Returns the total variation of the blend's shares between two weight samples, each normalized over blendMask.
+// A point without any weight has no shares.
+float sccrTerrainShareVariation(uint blendMask, SccrTerrainWeights a, SccrTerrainWeights b)
+{
+  float sumA = 0.0f;
+  float sumB = 0.0f;
+  [unroll]
+  for (uint i = 0; i < TERRAIN_LAYERS_MATERIAL_MAX_LAYERS; ++i)
+  {
+    if ((blendMask & (1u << i)) != 0u)
+    {
+      sumA += sccrTerrainWeight(a, i);
+      sumB += sccrTerrainWeight(b, i);
+    }
+  }
+  const float invA = sumA > 1e-5f ? rcp(sumA) : 0.0f;
+  const float invB = sumB > 1e-5f ? rcp(sumB) : 0.0f;
+  float variation = 0.0f;
+  [unroll]
+  for (uint i = 0; i < TERRAIN_LAYERS_MATERIAL_MAX_LAYERS; ++i)
+  {
+    if ((blendMask & (1u << i)) != 0u)
+    {
+      variation += abs(sccrTerrainWeight(a, i) * invA - sccrTerrainWeight(b, i) * invB);
+    }
+  }
+  return variation;
+}
+
+// Creates the live field of a terrain-layers material for a march along the texture coordinates probe0 -> probe1 ->
+// probe2. The weights are read at each probe, at probe0 and probe2 only where they differ from probe1.
+// Returns false when the material has no layer heights, and the caller then uses PomLayeredConeField instead.
+bool sccrTerrainLiveFieldCreate(
+  OpaqueSurfaceMaterial opaqueSurfaceMaterial,
+  float2 probe0,
+  float2 probe1,
+  float2 probe2,
+  out PomLiveLayeredConeField field)
+{
+  field.samplerIndex = opaqueSurfaceMaterial.samplerIndex;
+  field.weightTextureIndex0 = BINDING_INDEX_INVALID;
+  field.weightTextureIndex1 = BINDING_INDEX_INVALID;
+  field.weightSamplerIndex = opaqueSurfaceMaterial.samplerIndex;
+  field.weightUvScale = float2(1.0f, 1.0f);
+  field.weightUvOffset = float2(0.0f, 0.0f);
+  field.blendMask = 0u;
+  field.layerMask = 0u;
+  field.coneMask = 0u;
+  [unroll]
+  for (uint i = 0; i < TERRAIN_LAYERS_MATERIAL_MAX_LAYERS; ++i)
+  {
+    field.layerHeightTextureIndices[i] = BINDING_INDEX_INVALID;
+  }
+  field.weightSlope = 0.0f;
+  field.lod = 0.0f;
+
+  const uint terrainLayersMaterialIndex = opaqueSurfaceMaterialTerrainLayersIndex(opaqueSurfaceMaterial);
+  if (terrainLayersMaterialIndex == SURFACE_INDEX_INVALID)
+  {
+    return false;
+  }
+  const TerrainLayersMaterial terrainLayers =
+    terrainLayersMaterialCreate(surfaceMaterialExtensions[terrainLayersMaterialIndex]);
+  const uint heightMaterialIndex = uint(terrainLayers.heightMaterialIndex);
+  if (heightMaterialIndex == SURFACE_INDEX_INVALID)
+  {
+    return false;
+  }
+  const TerrainLayersHeightMaterial layerHeights =
+    terrainLayersHeightMaterialCreate(surfaceMaterialExtensions[heightMaterialIndex]);
+
+  field.weightTextureIndex0 = terrainLayers.weightTextureIndex0;
+  field.weightTextureIndex1 = terrainLayers.weightTextureIndex1;
+  field.weightSamplerIndex = terrainLayers.weightSamplerIndex;
+  field.weightUvScale = float2(terrainLayers.weightUvScaleX, terrainLayers.weightUvScaleY);
+  field.weightUvOffset = float2(terrainLayers.weightUvOffsetX, terrainLayers.weightUvOffsetY);
+
+  const uint layerCount = min(uint(terrainLayers.layerCount), uint(TERRAIN_LAYERS_MATERIAL_MAX_LAYERS));
+  const uint countMask = (1u << layerCount) - 1u;
+  const uint heightMask = uint(layerHeights.layerMask) & countMask;
+
+  const float length01 = length(probe1 - probe0);
+  const float length12 = length(probe2 - probe1);
+  const SccrTerrainWeights weights1 = field.sampleWeights(probe1);
+  SccrTerrainWeights weights0 = weights1;
+  if (length01 > 1e-6f)
+  {
+    weights0 = field.sampleWeights(probe0);
+  }
+  SccrTerrainWeights weights2 = weights1;
+  if (length12 > 1e-6f)
+  {
+    weights2 = field.sampleWeights(probe2);
+  }
+
+  // Keeps the N height layers with the largest weight at any probe, with ties going to the lower index.
+  const uint maxLayers = cb.pomSccrTerrainArgs & POM_SCCR_TERRAIN_MAX_LAYERS_MASK;
+  uint keep = heightMask;
+  if (maxLayers != 0u && countbits(heightMask) > maxLayers)
+  {
+    float scores[TERRAIN_LAYERS_MATERIAL_MAX_LAYERS];
+    [unroll]
+    for (uint i = 0; i < TERRAIN_LAYERS_MATERIAL_MAX_LAYERS; ++i)
+    {
+      scores[i] = max(sccrTerrainWeight(weights0, i), max(sccrTerrainWeight(weights1, i), sccrTerrainWeight(weights2, i)));
+    }
+    keep = 0u;
+    [unroll]
+    for (uint i = 0; i < TERRAIN_LAYERS_MATERIAL_MAX_LAYERS; ++i)
+    {
+      if ((heightMask & (1u << i)) == 0u)
+      {
+        continue;
+      }
+      uint rank = 0u;
+      [unroll]
+      for (uint j = 0; j < TERRAIN_LAYERS_MATERIAL_MAX_LAYERS; ++j)
+      {
+        const bool heavier = scores[j] > scores[i] || (scores[j] == scores[i] && j < i);
+        if (j != i && (heightMask & (1u << j)) != 0u && heavier)
+        {
+          rank++;
+        }
+      }
+      if (rank < maxLayers)
+      {
+        keep |= 1u << i;
+      }
+    }
+  }
+  field.layerMask = keep;
+  field.blendMask = countMask & ~(heightMask & ~keep);
+  field.coneMask = uint(layerHeights.coneMask) & keep;
+  [unroll]
+  for (uint i = 0; i < TERRAIN_LAYERS_MATERIAL_MAX_LAYERS; ++i)
+  {
+    if ((keep & (1u << i)) != 0u)
+    {
+      field.layerHeightTextureIndices[i] = layerHeights.heightTextureIndices[i];
+    }
+  }
+
+  // G comes from the share variation between the probes.
+  float shareSlope = 0.0f;
+  if (length01 > 1e-6f)
+  {
+    shareSlope = max(shareSlope, sccrTerrainShareVariation(field.blendMask, weights0, weights1) / length01);
+  }
+  if (length12 > 1e-6f)
+  {
+    shareSlope = max(shareSlope, sccrTerrainShareVariation(field.blendMask, weights1, weights2) / length12);
+  }
+  field.weightSlope = kSccrTerrainWeightSlopeSafety * 0.5f * shareSlope;
+  return true;
+}
+
+// Returns pomLayeredTexelSize for the kept layers of a live field.
+float pomLiveLayeredTexelSize(PomLiveLayeredConeField field)
+{
+  uint finest = 0u;
+  [unroll]
+  for (uint i = 0; i < TERRAIN_LAYERS_MATERIAL_MAX_LAYERS; ++i)
+  {
+    if ((field.layerMask & (1u << i)) == 0u)
+    {
+      continue;
+    }
+    uint width, height, mipLevels;
+    textures[nonuniformEXT(uint(field.layerHeightTextureIndices[i]))].GetDimensions(0, width, height, mipLevels);
+    finest = max(finest, max(width, height));
+  }
+  return finest > 0u ? rcp(float(finest)) : 0.0f;
+}
+
+bool sccrTerrainLiveWeights()
+{
+  return (cb.pomSccrTerrainArgs & POM_SCCR_TERRAIN_FLAG_LIVE_WEIGHTS) != 0u;
+}
+
+// Runs the primary march of sccrTerrainCalculateTexcoord over either field, with frozen or live weights.
+float3 sccrTerrainMarch<Field : IPomConeField>(
+  Field field,
+  SccrPrimaryRay ray,
+  SurfaceInteraction surfaceInteraction,
+  float3 viewDir,
+  inout uint iterations)
+{
+  const float numSamples = pomGetNumSamples(viewDir);
+  // As in sccrCalculateTexcoord, the step LOD follows the pixel footprint over the march's depth range.
+  const float marchDepth = 1.0f - ray.start.z;
+  const SccrStepLod lod = sccrStepLod(length(ray.dirUv) * marchDepth, sccrViewFootprint(surfaceInteraction, ray.dirUv),
+                                      marchDepth, rcp(numSamples));
+  if (lod.skip)
+  {
+    iterations = 1;
+    return ray.start + float3(ray.dirUv, 1.0f) * (field.sampleDepthCone(surfaceInteraction.textureCoordinates).x - ray.start.z);
+  }
+  bool crossed;
+  return pomConeStepMarchRefined(
+    field, ray.start, ray.dirUv, lod.minStep, cb.pomConeSteps, cb.pomConeSteps + uint(ceil(marchDepth / lod.minStep)) + 1u,
+    cb.pomBinarySteps, lod.refinePrecision, 1.0f, crossed, iterations);
+}
+
+// sccrCalculateTexcoord for a layered PomHeightSource (heightSource.layered). It uses the same primary ray
+// (sccrPrimaryRay), with world-unit depth from the terrain's own UV density and the curvature correction where the
+// terrain mesh has vertex normals. The layer height maps tile with the base texture coordinates the march moves in.
+// With live weights, the default, the field reads the weights at every sample (PomLiveLayeredConeField).
+// Otherwise the weights are held at the hit's.
+float3 sccrTerrainCalculateTexcoord(
+  OpaqueSurfaceMaterial opaqueSurfaceMaterial,
+  PomHeightSource heightSource,
+  SurfaceInteraction surfaceInteraction,
+  float3 viewDir,
+  inout uint iterations)
+{
+  iterations = 0;
+  SccrPrimaryRay ray;
+  if (!sccrPrimaryRay(opaqueSurfaceMaterial, surfaceInteraction, viewDir, ray))
+  {
+    return float3(surfaceInteraction.textureCoordinates, 0.0f);
+  }
+  if (sccrTerrainLiveWeights())
+  {
+    // The probes are where the march starts, the hit, and where the march ends. The hit lies on the segment because
+    // the march passes the mesh there.
+    const float marchDepth = 1.0f - ray.start.z;
+    PomLiveLayeredConeField liveField;
+    if (sccrTerrainLiveFieldCreate(opaqueSurfaceMaterial, ray.start.xy, surfaceInteraction.textureCoordinates,
+                                   ray.start.xy + ray.dirUv * marchDepth, liveField))
+    {
+      SccrCurvedField<PomLiveLayeredConeField> field;
+      field.field = liveField;
+      field.curve = ray.curve;
+      return sccrTerrainMarch(field, ray, surfaceInteraction, viewDir, iterations);
+    }
+  }
+  // Height and cone both use the kept layers (sccrTerrainReduceLayers).
+  PomHeightSource reducedSource = heightSource;
+  sccrTerrainReduceLayers(reducedSource);
+  SccrCurvedField<PomLayeredConeField> field;
+  field.field = pomLayeredConeFieldCreate(reducedSource);
+  field.curve = ray.curve;
+  return sccrTerrainMarch(field, ray, surfaceInteraction, viewDir, iterations);
+}
+
+// Runs the self-shadow march of sccrTerrainSampleVisibility over either field, already set to the footprint's mip.
+float sccrTerrainVisibilityMarch<Field : IPomConeField>(
+  Field field,
+  float2 texcoord,
+  float2 dirUv,
+  float texelUv,
+  SccrShadowFootprint footprint,
+  float3 rayDirection)
+{
+  const float texelDepth = field.sampleDepthCone(texcoord).x;
+  if (texelDepth <= 0.0f)
+  {
+    return 1.0f;
+  }
+  const float numSamples = pomGetNumSamples(rayDirection);
+  const SccrStepLod lod = footprint.coarse ?
+    sccrFootprintLod(length(dirUv) * texelDepth, footprint.footprintUv, texelDepth, rcp(numSamples), 1.0f) :
+    sccrStepLod(length(dirUv) * texelDepth, texelUv, texelDepth, rcp(numSamples));
+  if (lod.skip)
+  {
+    return 1.0f;
+  }
+  const float minStep = lod.minStep;
+  const float refinePrecision = lod.refinePrecision > 0.0f ? 0.125f * minStep : 0.0f;
+  const float3 start = float3(texcoord - dirUv * texelDepth, 0.0f);
+  uint iterations = 0;
+  // As in sccrSampleVisibility, a crossing within half a step of the texel is the texel itself.
+  return pomConeStepVisibility(
+    field, start, dirUv, minStep, cb.pomConeShadowSteps,
+    cb.pomConeShadowSteps + uint(ceil(texelDepth / minStep)) + 1u, footprint.coarse ? 0u : cb.pomBinarySteps,
+    refinePrecision, texelDepth, iterations);
+}
+
+// sccrSampleVisibility for a layered PomHeightSource (heightSource.layered), with the primary march's world-unit depth
+// scale. Indirect-light queries pass a footprint (sccrIndirectShadowFootprint), and kSccrFullShadow means full detail.
+// With live weights it marches the same field as the primary march, so the texel's depth matches the primary hit's
+// and there is no acne.
+float sccrTerrainSampleVisibility(
+  OpaqueSurfaceMaterial opaqueSurfaceMaterial,
+  PomHeightSource heightSource,
+  float2 texcoord,
+  float3 rayDirection,
+  float depthScale = 1.0f,
+  float footprintUv = kSccrFullShadow)
+{
+  const float totalHeight = (abs(float(opaqueSurfaceMaterial.displaceIn)) + float(opaqueSurfaceMaterial.displaceOut)) * depthScale;
+  if (totalHeight <= 0.0f)
+  {
+    return 1.0f;
+  }
+  const float2 dirUv = -rayDirection.xy / max(rayDirection.z, 1e-4f) * totalHeight;
+  if (sccrTerrainLiveWeights())
+  {
+    // The probes are the top of the field, where the deepest possible texel's light ray enters it, and the texel.
+    // The texel's own depth is only known from the field.
+    PomLiveLayeredConeField liveField;
+    if (sccrTerrainLiveFieldCreate(opaqueSurfaceMaterial, texcoord - dirUv, texcoord - dirUv, texcoord, liveField))
+    {
+      const float texelUv = pomLiveLayeredTexelSize(liveField);
+      const SccrShadowFootprint footprint = sccrShadowFootprint(footprintUv, texelUv, length(dirUv));
+      liveField.lod = footprint.lod;
+      if (footprint.lod > 0.0f)
+      {
+        liveField.coneMask = 0u;
+      }
+      return sccrTerrainVisibilityMarch(liveField, texcoord, dirUv, texelUv, footprint, rayDirection);
+    }
+  }
+  // Height, cone and texel size all use the kept layers (sccrTerrainReduceLayers).
+  PomHeightSource reducedSource = heightSource;
+  sccrTerrainReduceLayers(reducedSource);
+  // As in sccrSampleVisibility, the step LOD follows the finest layer texel, and coarse queries use their footprint
+  // at its mip. The mip is relative to the finest layer, so coarser layers get a finer mip than their own texel gives.
+  const float texelUv = pomLayeredTexelSize(reducedSource);
+  const SccrShadowFootprint footprint = sccrShadowFootprint(footprintUv, texelUv, length(dirUv));
+  PomLayeredConeField field = pomLayeredConeFieldCreate(reducedSource);
+  field.lod = footprint.lod;
+  if (footprint.lod > 0.0f)
+  {
+    field.source.coneMask = 0u;
+  }
+  return sccrTerrainVisibilityMarch(field, texcoord, dirUv, texelUv, footprint, rayDirection);
+}

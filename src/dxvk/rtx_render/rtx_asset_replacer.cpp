@@ -347,7 +347,7 @@ uint32_t AssetReplacer::applyTextureRefreshes() {
   return refreshed;
 }
 
-bool AssetReplacer::registerExternalMesh(remixapi_MeshHandle handle, std::vector<RasterGeometry>&& submeshes,
+void AssetReplacer::registerExternalMesh(remixapi_MeshHandle handle, std::vector<RasterGeometry>&& submeshes,
                                          bool refreshGeometry) {
   auto existing = m_extMeshes.find(handle);
   if (existing != m_extMeshes.end()) {
@@ -360,7 +360,8 @@ bool AssetReplacer::registerExternalMesh(remixapi_MeshHandle handle, std::vector
     // its submesh loop), so an in-flight reader finishes against the geometry it started with.
     // The old buffers stay alive through the last holder and DXVK's lifetime tracking.
     if (!refreshGeometry || existing->second->size() != submeshes.size()) {
-      return false;
+      //Logger::info("Ignoring repeated mesh registration (handle=" + tostr(handle) + ") ");
+      return;
     }
 
     for (size_t i = 0; i < submeshes.size(); i++) {
@@ -382,7 +383,7 @@ bool AssetReplacer::registerExternalMesh(remixapi_MeshHandle handle, std::vector
     existing->second = std::make_shared<std::vector<RasterGeometry>>(std::move(submeshes));
     ++m_externalAssetEpoch;
     noteChangedExternalAsset(reinterpret_cast<uint64_t>(handle));
-    return true;
+    return;
   }
 
   // Tag each submesh with the external mesh handle so capture + runtime
@@ -392,10 +393,6 @@ bool AssetReplacer::registerExternalMesh(remixapi_MeshHandle handle, std::vector
   }
 
   m_extMeshes.emplace(handle, std::make_shared<std::vector<RasterGeometry>>(std::move(submeshes)));
-  // Retained commands reach the scene through their own queue, so an instance can be built before the command
-  // stream registers its mesh. Such an entry waits under this handle (RetainedScene::buildDirect) and is rebuilt now.
-  noteChangedExternalAsset(reinterpret_cast<uint64_t>(handle));
-  return true;
 }
 
 std::shared_ptr<const std::vector<RasterGeometry>> AssetReplacer::accessExternalMesh(remixapi_MeshHandle handle) const {

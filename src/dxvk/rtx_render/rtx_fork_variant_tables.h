@@ -2,16 +2,16 @@
 
 // Per-pass shader variant tables.
 //
-// Each slim-capable pass (G-buffer, direct, SHARC update / integration, indirect assembly) has
+// rtx.shader.variantTables: each slim-capable pass (G-buffer, direct, SHARC update / integration, indirect assembly) has
 // one static table of { name, mode key, removes, level } entries, slimmest first, Full last. `removes` is the set of
 // RtFrameFeatures scene bits the variant compiles out; the mode key is a per-pass bit set built from this frame's
 // options and mode bits. Selection: the first entry whose mode key matches and with (removes & scene) == 0. Full has an
 // empty mode mask and removes nothing, so it always matches. The entry's level goes to the pass's existing getter.
 //
-// The legacy selectors still run as the check. Every disagreement is logged ([VariantTable] mismatch), and an
+// With the option on the legacy selectors still run. Every disagreement is logged ([VariantTable] mismatch), and an
 // exhaustive check over every mask the selectors read runs whenever the options they read change.
 //
-// rtx.shader.slimFallbackWhileCompiling: a compute pass binds the chosen entry only if its
+// rtx.shader.slimFallbackWhileCompiling (needs variantTables): a compute pass binds the chosen entry only if its
 // pipeline is already compiled; otherwise it requests it (the getter queues the async compile) and binds the next
 // matching entry, which compiles in a superset of the chosen one.
 
@@ -76,7 +76,7 @@ namespace dxvk {
                                   uint32_t modeKey, uint32_t scene, uint32_t frameId);
 
   // Exhaustive check (every scene mask and every mode input the selectors read, at the current option values). Runs when
-  // the options read by the selectors change; called from the selection sites.
+  // the options read by the selectors change while rtx.shader.variantTables is on; called from the selection sites.
   void variantTablesSelfCheckIfNeeded();
 
   struct VariantTableSelfCheckResult {
@@ -87,7 +87,7 @@ namespace dxvk {
   void reportVariantTableSelfCheckMismatch(VariantTablePass pass, VariantTableSelfCheckResult& result, const char* tableEntry,
                                            const char* legacyLevel, const std::string& inputs);
 
-  // rtx.shader.slimFallbackWhileCompiling is on and an asynchronous compile path exists.
+  // rtx.shader.slimFallbackWhileCompiling with rtx.shader.variantTables, and an asynchronous compile path exists.
   bool variantFallbackActive(RtxContext& ctx);
   // Whether the compute pipeline of `shader` is compiled. Never waits for a compile in progress (reported as not ready).
   bool isVariantComputeShaderReady(RtxContext& ctx, const Rc<DxvkShader>& shader);
@@ -95,7 +95,7 @@ namespace dxvk {
   // warning when one pass keeps falling back for 300 frames.
   void noteVariantFallback(VariantTablePass pass, const char* chosen, const char* bound, uint32_t frameId);
 
-  // Dev menu (Shader Variants): the fallback checkbox.
+  // Dev menu (Rendering > Pathtracing > Resolver): the two checkboxes.
   void showVariantTablesImguiSettings();
 
 } // namespace dxvk

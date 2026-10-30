@@ -20,16 +20,17 @@
 * DEALINGS IN THE SOFTWARE.
 */
 #include "rtx_draw_call_cache.h"
+#include "../d3d9/d3d9_state.h"
 
 namespace dxvk 
 {
 
 namespace {
   // Material part of the BlasEntry identity. API instances with a per-instance material override
-  // (SceneDraw::materialIndependentGeometry) are matched on their geometry share key instead. That key
+  // (DrawCallState::materialIndependentGeometry) are matched on their geometry share key instead. That key
   // is equal for every opaque material and carries the material hash for alpha-tested or blended ones,
   // so one mesh drawn with several opaque materials keeps one BLAS. Mixed pairs compare material hashes.
-  bool materialIdentityMatches(const SceneDraw& drawCall, const SceneDraw& blasInput) {
+  bool materialIdentityMatches(const DrawCallState& drawCall, const DrawCallState& blasInput) {
     if (drawCall.materialIndependentGeometry && blasInput.materialIndependentGeometry) {
       return drawCall.geometryShareKey == blasInput.geometryShareKey;
     }
@@ -39,7 +40,7 @@ namespace {
   uint64_t s_crossMaterialShares = 0;
   uint64_t s_nextCrossMaterialLog = 1;
 
-  void countCrossMaterialShare(const SceneDraw& drawCall, const BlasEntry& blas) {
+  void countCrossMaterialShare(const DrawCallState& drawCall, const BlasEntry& blas) {
     if (!drawCall.materialIndependentGeometry ||
         drawCall.getMaterialData().getHash() == blas.input.getMaterialData().getHash()) {
       return;
@@ -51,7 +52,7 @@ namespace {
     }
   }
 
-  bool exactMatch(const SceneDraw& drawCall, BlasEntry& blas) {
+  bool exactMatch(const DrawCallState& drawCall, BlasEntry& blas) {
     auto isSky = [](CameraType::Enum t) {
       return t == CameraType::Sky;
     };
@@ -71,7 +72,7 @@ DrawCallCache::DrawCallCache(DxvkDevice* device) : CommonDeviceObject(device) {
 }
 DrawCallCache::~DrawCallCache() {}
 
-DrawCallCache::CacheState DrawCallCache::get(const SceneDraw& drawCall, BlasEntry** out) {
+DrawCallCache::CacheState DrawCallCache::get(const DrawCallState& drawCall, BlasEntry** out) {
   // First, find the right bucket:
   const XXH64_hash_t hash = drawCall.getGeometryData().getHashForRule<rules::TopologicalHash>();
   auto range = m_entries.equal_range(hash);
@@ -158,7 +159,7 @@ DrawCallCache::CacheState DrawCallCache::get(const SceneDraw& drawCall, BlasEntr
 
 }
 
-BlasEntry* DrawCallCache::allocateEntry(XXH64_hash_t hash, const SceneDraw& drawCall) {
+BlasEntry* DrawCallCache::allocateEntry(XXH64_hash_t hash, const DrawCallState& drawCall) {
   auto iter = m_entries.emplace(hash, drawCall);
   BlasEntry* result = &iter->second;
   result->frameCreated = m_device->getCurrentFrameId();

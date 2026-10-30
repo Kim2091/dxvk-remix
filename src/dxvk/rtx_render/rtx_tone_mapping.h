@@ -118,32 +118,28 @@ namespace dxvk {
     RTX_OPTION("rtx.tonemap", float, exposureBias, 0.f, "The exposure value to use for the global tonemapper when auto exposure is disabled, or a bias multiplier on top of the auto exposure's calculated exposure value.");
     RTX_OPTION("rtx.tonemap", bool, tonemappingEnabled, true, "A flag to enable or disable the global tonemapper.");
     RTX_OPTION("rtx.tonemap", TonemapPrimaries, primaries, TonemapPrimaries::Custom1,
-               "The color basis the tone curve runs in. 0 = Primaries 1, 1 = Primaries 2, 2 = BT.709 (the "
-               "curve per channel, with no basis change, so bright saturated colors skew towards the primaries).");
+               "The colour basis the tone curve runs in. 0 = Custom Primaries 1, 1 = Custom Primaries 2, 2 = BT.709 (the "
+               "curve per channel, with no basis change, so bright saturated colours skew towards the primaries).");
 
     // HDR10 output settings.
-    RTX_OPTION_ARGS("rtx.tonemap", bool, hdrEnabled, true,
-                    "Allows HDR10 output (BT.2020 primaries, ST.2084 PQ, 10-bit swap chain). The output follows Windows by "
-                    "itself: when the game creates its swap chain, HDR10 is used if Windows has HDR on for that display, "
-                    "and plain SDR otherwise. In HDR the image is tone mapped to rtx.tonemap.hdrPeakNits, the scene's "
-                    "mid-tones sit at rtx.tonemap.hdrPaperWhiteNits and the game's UI at rtx.tonemap.hdrUiNits. Set False "
-                    "to always output SDR.",
-                    args.flags = RtxOptionFlags::UserSetting);
-    RTX_OPTION_ARGS("rtx.tonemap", float, hdrPeakNits, 1000.0f,
-                    "HDR output: the display's peak brightness, in nits. The tone curve rolls highlights off towards it. "
-                    "Set it to the peak the display reports (for example in the Windows HDR Calibration app). Range 80 to "
-                    "10000.",
-                    args.flags = RtxOptionFlags::UserSetting);
-    RTX_OPTION_ARGS("rtx.tonemap", float, hdrPaperWhiteNits, 203.0f,
-                    "HDR output: paper white, in nits. The brightness of the scene's SDR white: mid-tones are scaled to it. "
-                    "203 is the BT.2408 reference. Raise it for a brighter scene. The UI has its own rtx.tonemap.hdrUiNits. "
-                    "Range 80 to 1000, and at most rtx.tonemap.hdrPeakNits.",
-                    args.flags = RtxOptionFlags::UserSetting);
-    RTX_OPTION_ARGS("rtx.tonemap", float, hdrUiNits, 203.0f,
-                    "HDR output: the brightness of the game's UI and HUD (and the Remix menu), in nits, as the nits of UI "
-                    "white. Independent of rtx.tonemap.hdrPaperWhiteNits, so the UI can be dimmer than the scene. Range 80 "
-                    "to 1000.",
-                    args.flags = RtxOptionFlags::UserSetting);
+    RTX_OPTION("rtx.tonemap", bool, hdrEnabled, true,
+               "Allows HDR10 output (BT.2020 primaries, ST.2084 PQ, 10-bit swap chain). The output follows Windows by "
+               "itself: when the game creates its swap chain, HDR10 is used if Windows has HDR on for that display, "
+               "and plain SDR otherwise. In HDR the image is tone mapped to rtx.tonemap.hdrPeakNits, the scene's "
+               "mid-tones sit at rtx.tonemap.hdrPaperWhiteNits and the game's UI at rtx.tonemap.hdrUiNits. Set False "
+               "to always output SDR.");
+    RTX_OPTION("rtx.tonemap", float, hdrPeakNits, 1000.0f,
+               "HDR output: the display's peak brightness, in nits. The tone curve rolls highlights off towards it. "
+               "Set it to the peak the display reports (for example in the Windows HDR Calibration app). Range 80 to "
+               "10000.");
+    RTX_OPTION("rtx.tonemap", float, hdrPaperWhiteNits, 203.0f,
+               "HDR output: paper white, in nits. The brightness of the scene's SDR white: mid-tones are scaled to it. "
+               "203 is the BT.2408 reference. Raise it for a brighter scene. The UI has its own rtx.tonemap.hdrUiNits. "
+               "Range 80 to 1000, and at most rtx.tonemap.hdrPeakNits.");
+    RTX_OPTION("rtx.tonemap", float, hdrUiNits, 203.0f,
+               "HDR output: the brightness of the game's UI and HUD (and the Remix menu), in nits, as the nits of UI "
+               "white. Independent of rtx.tonemap.hdrPaperWhiteNits, so the UI can be dimmer than the scene. Range 80 "
+               "to 1000.");
 
     // Dithering settings.
     RTX_OPTION("rtx.tonemap", DitherMode, ditherMode, DitherMode::SpatialTemporal,

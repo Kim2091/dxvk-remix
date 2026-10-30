@@ -188,12 +188,6 @@ namespace dxvk {
      */
     void submit(
             DxvkSubmitInfo      submitInfo);
-
-    // Queues a command list like submit. The submission thread sets the status once it has submitted the command list
-    // to the Vulkan queue, so synchronizeSubmission can wait for that.
-    void submit(
-            DxvkSubmitInfo      submitInfo,
-            DxvkSubmitStatus*   status);
     
     /**
      * \brief Presents an image synchronously

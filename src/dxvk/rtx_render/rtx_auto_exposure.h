@@ -69,7 +69,7 @@ namespace dxvk {
     // The adapted exposure the tonemapper multiplies in (1x1 R32F).
     Resources::Resource m_exposure;
 
-    // One float4 (sum w*log, sum w, surface center weight, total center weight) per 16x16 tile, and the
+    // One float4 (sum w*log, sum w, surface centre weight, total centre weight) per 16x16 tile, and the
     // adapted exposure + "has metered" flag carried between frames (the addon's meterState).
     Resources::Resource m_haloPartials;
     Resources::Resource m_haloState;
@@ -82,7 +82,7 @@ namespace dxvk {
     RTX_OPTION("rtx.autoExposure", bool, enabled, true,
                "Adjusts exposure automatically, so the image is neither too bright nor too dark. The meter is the "
                "incident-light meter of the Halo CE path tracer addon by halocedlaart (rtx.autoExposure.halo.*): a "
-               "center-weighted mean of each pixel's lighting channel average, with albedo divided out and the view "
+               "centre-weighted mean of each pixel's lighting channel average, with albedo divided out and the view "
                "model excluded, limited in EV and adapted at the same speed at any frame rate. "
                "rtx.tonemap.exposureBias adds an EV offset on top.");
 
@@ -99,7 +99,7 @@ namespace dxvk {
     RTX_OPTION("rtx.autoExposure.halo", float, centreWeight, 0.75f,
                "Halo Meter: how much more the middle of the frame counts than the edges. 0 meters the whole frame "
                "evenly, 1 ignores the edges entirely. The falloff is a circle in units of half the frame height, "
-               "centered 10% of the frame height below the middle so the sky at the top counts less.");
+               "centred 10% of the frame height below the middle so the sky at the top counts less.");
     RTX_OPTION("rtx.autoExposure.halo", float, minEv, -16.0f,
                "Halo Meter: the lowest exposure, in stops. The addon allows -24 to 0.");
     RTX_OPTION("rtx.autoExposure.halo", float, maxEv, 4.0f,

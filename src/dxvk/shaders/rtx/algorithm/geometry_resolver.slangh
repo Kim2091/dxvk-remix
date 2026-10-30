@@ -1541,7 +1541,9 @@ void geometryResolverVertexOutputDebugView(
       const MemoryPolymorphicSurfaceMaterial memoryPolymorphicSurfaceMaterial = surfaceMaterials[uint(rayInteraction.surfaceIndex)];
       OpaqueSurfaceMaterial opaqueSurfaceMaterial = opaqueSurfaceMaterialCreate(memoryPolymorphicSurfaceMaterial);
       if (opaqueSurfaceMaterial.hasValidDisplacement()) {
-        heightMapValue = 1.f - pomSampleHeight(opaqueSurfaceMaterial.heightTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction.textureCoordinates);
+        // The blended terrain-layer height field where there is one.
+        heightMapValue = 1.f - pomHeightSourceSample(
+          pomHeightSourceCreate(opaqueSurfaceMaterial, surfaceInteraction.textureCoordinates), surfaceInteraction.textureCoordinates);
       }
     }
     
@@ -1936,6 +1938,29 @@ void geometryResolverStorePsrAerialSurfaceDistance(uvec2 pixelCoordinate, float 
   AtmosphereForeground[pixelCoordinate] = foreground;
 }
 
+// Folds emission added to AtmosphereForeground.rgb at distanceWorld into AtmosphereForegroundEmissionDepth,
+// the luminance-weighted mean depth of that emission. storedLuminance is the luminance of the emission
+// the foreground held before this addition, after any attenuation applied to it in the same step.
+// The composite fades the foreground emission by the air up to this depth rather than up to the nearest contributor.
+void geometryResolverAccumulateForegroundEmissionDepth(
+  uvec2 pixelCoordinate, float storedLuminance, vec3 addedEmission, float distanceWorld)
+{
+  const float addedLuminance = calcBt709Luminance(max(addedEmission, vec3(0.0f)));
+  if (!(addedLuminance > 0.0f) || !(distanceWorld < floatMax))
+  {
+    return;
+  }
+
+  const float depthKm = max(skyProviderWorldToKm(distanceWorld), 1e-5f);
+  float meanDepthKm = depthKm;
+  if (storedLuminance > 0.0f)
+  {
+    meanDepthKm = (AtmosphereForegroundEmissionDepth[pixelCoordinate] * storedLuminance + depthKm * addedLuminance) /
+                  (storedLuminance + addedLuminance);
+  }
+  AtmosphereForegroundEmissionDepth[pixelCoordinate] = meanDepthKm;
+}
+
 // Returns true when the deferred decal kernel resolves the primary rays' unordered particles (geometryResolverDeferredUnorderedParticles).
 // Returns false in the PSR passes, whose segments are not camera rays.
 bool gbufferDeferUnorderedParticles()
@@ -1992,6 +2017,7 @@ void geometryResolverVertex(
   vec3 decalEmissiveRadiance = vec3(0.0f);
   int surfaceIndex = -1;
   float nearestContributorDistance = floatMax;
+  float unorderedEmissionDistance = floatMax;
   // When deferred, the walk runs once per pixel in the deferred decal kernel,
   // and this vertex starts from no attenuation and no emission.
   if (!gbufferDeferUnorderedParticles())
@@ -2004,8 +2030,10 @@ void geometryResolverVertex(
       geometryResolverState.pixelCoordinate,
       geometryResolverState.accumulatedRotation, geometryResolverState.accumulatedHitDistance, 1.0f,
       radianceAttenuation, emissiveRadiance,
-      numUnorderedInteractions, surfaceIndex, nearestContributorDistance);
+      numUnorderedInteractions, surfaceIndex, nearestContributorDistance, unorderedEmissionDistance);
   }
+  // resolveVertex adds the hit's own emission to emissiveRadiance, after the unordered particles' emission.
+  const vec3 unorderedEmissiveRadiance = emissiveRadiance;
 
   if (GBUFFER_FEATURE_DEBUG_VIEW && cb.debugView == DEBUG_VIEW_PRIMARY_DECAL_ALBEDO)
   {
@@ -2155,8 +2183,18 @@ void geometryResolverVertex(
   // Handle attenuation and emissive radiance from the Resolve function
 
   // Note: Emissive radiance handled first so objects with opacity do not attenuate themselves.
+  const vec3 previousRadiance = geometryResolverState.radiance;
   geometryResolverState.radiance += emissiveRadiance * geometryResolverState.attenuation;
   if (cb.skyMode == 1) {
+    const float storedForegroundLuminance = calcBt709Luminance(max(previousRadiance, vec3(0.0f)));
+    const vec3 unorderedEmission = unorderedEmissiveRadiance * geometryResolverState.attenuation;
+    const vec3 hitEmission = (emissiveRadiance - unorderedEmissiveRadiance) * geometryResolverState.attenuation;
+    geometryResolverAccumulateForegroundEmissionDepth(geometryResolverState.pixelCoordinate,
+      storedForegroundLuminance, unorderedEmission, unorderedEmissionDistance);
+    geometryResolverAccumulateForegroundEmissionDepth(geometryResolverState.pixelCoordinate,
+      storedForegroundLuminance + calcBt709Luminance(max(unorderedEmission, vec3(0.0f))), hitEmission,
+      rayInteractionHasHit(rayInteraction) ? geometryResolverState.accumulatedHitDistance : floatMax);
+
     vec4 foreground = AtmosphereForeground[geometryResolverState.pixelCoordinate];
     foreground.rgb = geometryResolverState.radiance;
     if (nearestContributorDistance < floatMax) {
@@ -2255,6 +2293,7 @@ void geometryResolverVertex(
       // so the guide is a valid unit vector that stays the same every frame.
       PrimaryWorldShadingNormalDLSSRR[geometryResolverState.pixelCoordinate] = vec4(cb.clearColorNormal, 0.0f);
     }
+
 
     return;
   }
@@ -2597,6 +2636,7 @@ void geometryResolverVertex(
     geometryResolverState.directionAltered, geometryResolverState.portalSpace,
     geometryResolverState.accumulatedHitDistance,
     isRaytracedRenderTarget);
+
 }
 
 
@@ -3478,6 +3518,7 @@ void geometryResolverDeferredUnorderedParticles(ivec2 pixelCoordinate, bool isMi
   uint numUnorderedInteractions = 0;
   int surfaceIndex = -1;
   float nearestContributorDistance = floatMax;
+  float emissionDistance = floatMax;
   resolveVertexUnorderedParticles<
     RAY_FLAG_CULL_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES>(
     resolveMode, unorderedResolveRay,
@@ -3486,7 +3527,7 @@ void geometryResolverDeferredUnorderedParticles(ivec2 pixelCoordinate, bool isMi
     u16vec2(pixelCoordinate),
     getIdentityQuaternion(), 0.0f, 1.0f,
     radianceAttenuation, emissiveRadiance,
-    numUnorderedInteractions, surfaceIndex, nearestContributorDistance);
+    numUnorderedInteractions, surfaceIndex, nearestContributorDistance, emissionDistance);
 
   const bool emits = any(emissiveRadiance > 0.0f);
   if (numUnorderedInteractions == 0 || (!emits && all(radianceAttenuation >= 1.0f)))
@@ -3507,9 +3548,12 @@ void geometryResolverDeferredUnorderedParticles(ivec2 pixelCoordinate, bool isMi
 
   // The atmosphere foreground that geometryResolverVertex keeps in sky mode 1 gets the same transform on its radiance,
   // the nearest particle as a contributor depth, and the hit depth when particles touched a hit pixel.
+  // The particles' emission joins the foreground's emission depth.
   if (cb.skyMode == 1)
   {
     vec4 foreground = AtmosphereForeground[pixelCoordinate];
+    geometryResolverAccumulateForegroundEmissionDepth(uvec2(pixelCoordinate),
+      calcBt709Luminance(max(radianceAttenuation * foreground.rgb, vec3(0.0f))), emissiveRadiance, emissionDistance);
     foreground.rgb = emissiveRadiance + radianceAttenuation * foreground.rgb;
     if (nearestContributorDistance < floatMax)
     {

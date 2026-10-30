@@ -37,6 +37,14 @@ exe = executable('test_external_effect_manifest', files('test_external_effect_ma
 test('test_external_effect_manifest', exe, env: test_env, args: [ join_paths(global_src_root_norm, 'examples', 'remixfx') ])
 tests += exe
 
+# Disabled: 681c6de9a ("Rebuild RemixFX into a multi-pass effect format") added this
+# entry but never committed test_external_effect_image.cpp, which breaks configure for
+# the whole tree. The file does not exist in any commit on any branch. Restore both the
+# source and these three lines together.
+# exe = executable('test_external_effect_image', files('test_external_effect_image.cpp'), include_directories : test_include_path, dependencies : [ test_unit_deps, d3d9_dep ], link_with: [ d3d9_dll, dxvk_lib ], win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
+# test('test_external_effect_image', exe, env: test_env)
+# tests += exe
+
 exe = executable('fastop_minmax',  files('test_fastop_minmax.cpp'),  dependencies : test_unit_deps, win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
 test('fastop_minmax', exe, env: test_env)
 tests += exe
@@ -129,14 +137,12 @@ exe = executable('test_sccr_shell',  files('test_sccr_shell.cpp', '../../../src/
 test('test_sccr_shell', exe, env: test_env)
 tests += exe
 
-# SCCR shell tracing: the prism march against plain POM and a brute-force reference (self-contained).
-exe = executable('test_sccr_shell_march',  files('test_sccr_shell_march.cpp'),  dependencies : test_unit_deps, win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
-test('test_sccr_shell_march', exe, env: test_env, timeout: 120)
+# The baker and its file formats on small meshes.
 tests += exe
 
-# The input checks of the scene interface boundary (self-contained, no runtime link).
-exe = executable('test_scene_input',  files('test_scene_input.cpp'),  dependencies : test_unit_deps, win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
-test('test_scene_input', exe, env: test_env)
+# The prism march against plain POM and a brute-force reference (self-contained).
+exe = executable('test_sccr_shell_march',  files('test_sccr_shell_march.cpp'),  dependencies : test_unit_deps, win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
+test('test_sccr_shell_march', exe, env: test_env, timeout: 120)
 tests += exe
 
 exe = executable('test_legacy_material_fresnel', files('test_legacy_material_fresnel.cpp'),

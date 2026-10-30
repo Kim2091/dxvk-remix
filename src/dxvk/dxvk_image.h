@@ -395,14 +395,6 @@ namespace dxvk {
       return m_image.memory.memory();
     }
 
-    uint32_t getMemoryTypeIndex() const {
-      return m_image.memory.memoryTypeIndex();
-    }
-
-    VkDeviceSize getMemoryOffset() const {
-      return m_image.memory.offset();
-    }
-
     /**
      * \brief Get full subresource range of the image
      * 

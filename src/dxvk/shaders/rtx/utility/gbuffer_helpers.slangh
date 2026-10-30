@@ -166,7 +166,7 @@ void polymorphicSurfaceMaterialInteractionWriteToGBuffer(
   RWTexture2D<float4> baseReflectivityTexture,
   RWTexture2D<uint> data0Texture,
   RWTexture2D<uint> data1Texture,
-  RWTexture2D<float4> sharedTextureCoords,
+  RWTexture2D<float4> sharedTextureCoords, // RGBA32F, sccrSharedTextureCoord
   RWTexture2D<uint> surfaceIndexTexture,
   RWTexture2D<uint2> subsurfaceDataTexture,
   RWTexture2D<uint2> subsurfaceDiffusionProfileDataTexture)
@@ -225,6 +225,7 @@ void polymorphicSurfaceMaterialInteractionWriteToGBuffer(
     // Only write sharedTextureCoords if the material has a height texture, or the material has subsurface texture(s)
     if (polymorphicSurfaceMaterialInteractionHasHeightTexture(polymorphicSurfaceMaterialInteraction))
     {
+      // Plus the SCCR depth scale and triangle normal in zw (0 in the other modes).
       sharedTextureCoords[position] = sccrSharedTextureCoord(surfaceInteraction);
     }
 

@@ -28,10 +28,7 @@ namespace dxvk {
   namespace frontend_ui {
 
     enum class Group : unsigned {
-      Geometry,        // Developer > Frontend and Scene Paths, under the frontend's own node
-      Heuristics,      // Parameter Tuning > Heuristics, before the backend's heuristics
-      TuningSections,  // Parameter Tuning, the frontends' own sections before View Model
-      SelfChecks,      // Developer > Self-Checks and Logs, at the end
+      Geometry,  // Rendering > Geometry, after the D3D9 draw path controls
       Count
     };
 

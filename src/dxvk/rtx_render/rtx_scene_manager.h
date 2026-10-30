@@ -39,7 +39,6 @@
 #include "rtx_globals.h"
 #include "rtx_retained_buffer_table.h"
 #include "rtx_types.h"
-#include "rtx_frontend_interface.h"
 #include "rtx_fork_material_derivation.h" // ExternalDrawState alpha / legacy descriptions
 #include "rtx_common_object.h"
 #include "rtx_camera_manager.h"
@@ -55,6 +54,7 @@
 #include "rtx_mod_manager.h"
 #include "graph/rtx_graph_manager.h"
 #include "rtx_particle_system.h"
+#include <d3d9types.h>
 
 namespace dxvk 
 {
@@ -65,29 +65,8 @@ struct AssetReplacer;
 class OpacityMicromapManager;
 class CoreMaterialBuilder;
 class TerrainBaker;
+class RetainedInstanceStore;
 class RetainedScene;
-class GameLights;
-
-// What a surface material takes from the draw it is created for.
-struct SurfaceMaterialInputs {
-  const Rc<DxvkSampler>* sampler = nullptr;   // the draw's sampler, or null for none
-  const Rc<DxvkSampler>* sampler2 = nullptr;  // the second sampler of a ray portal, or null for none
-  bool hasTexcoords = false;
-  bool eye = false;                           // SceneDraw::isEye
-  bool raytracedRenderTarget = false;
-  bool hairCards = false;
-
-  static SurfaceMaterialInputs of(const SceneDraw& drawCall) {
-    SurfaceMaterialInputs inputs;
-    inputs.sampler = &drawCall.getMaterialData().getSampler();
-    inputs.sampler2 = &drawCall.getMaterialData().getSampler2();
-    inputs.hasTexcoords = drawCall.hasTextureCoordinates();
-    inputs.eye = drawCall.isEye();
-    inputs.raytracedRenderTarget = drawCall.isUsingRaytracedRenderTarget;
-    inputs.hairCards = drawCall.testCategoryFlags(InstanceCategories::HairCards);
-    return inputs;
-  }
-};
 
 // The resource cache can be *searched* by other users
 class ResourceCache {
@@ -130,7 +109,7 @@ protected:
 };
 
 struct ExternalDrawState {
-  SceneDraw drawCall {};
+  DrawCallState drawCall {};
   remixapi_MeshHandle mesh {};
   CameraType::Enum cameraType {};
   CategoryFlags categories {};
@@ -149,9 +128,6 @@ struct ExternalDrawState {
   std::shared_ptr<const std::vector<RasterGeometry>> inlineSubmeshes {};
   std::shared_ptr<const MaterialData> resolvedMaterial {};
   bool frontendResolved = false;
-  // The keys the asset resolver looks this object's mesh replacement up by. Only with frontendResolved and one inline
-  // submesh, the original geometry: RetainedScene::buildNow expands a replacement it finds into submeshes and parts.
-  std::optional<frontend::AssetKeys> assetKeys {};
   // A frontend MaterialTranslator's alpha state and legacy surface
   // state for this draw. Only with frontendResolved; when set, InstanceManager uses them instead of deriving them from
   // drawCall (same functions, so the values match: [MaterialTranslator] parity).
@@ -168,9 +144,6 @@ struct ExternalDrawState {
     bool meshReplacement = true;
     // The replacement prim's own particle system, which the scene's particle service spawns from this submesh.
     std::optional<RtxParticleSystemDesc> particleSystem;
-    // A USD point instancer prim's placements in object space (AssetReplacement::instancesToObject), or null.
-    // The submesh is drawn once per placement, at objectToWorld * submeshToObject * instancesToObject[n].
-    std::shared_ptr<const std::vector<Matrix4>> instancesToObject;
   };
   std::shared_ptr<const std::vector<SubmeshPart>> inlineSubmeshParts {};
   // The geometry changes from description to description (CPU skinning, rewritten or dynamic buffers).
@@ -194,23 +167,16 @@ struct ExternalDrawState {
   XXH64_hash_t computeExternalDrawIdentityHash() const;
 };
 
-// Declared here so SceneManager can befriend the hook, which uses m_drawCallMeta.
-class SceneManager;
-namespace fork_hooks {
-  void externalDrawObjectPicking(
-    DxvkDevice& device,
-    SceneDraw& drawCall,
-    XXH64_hash_t textureHash,
-    SceneManager& scene);
-}
-
 // Scene manager is a super manager, it's the interface between rendering and world state
 // along with managing the operation of other caches, scene manager also manages the cache
 // directly for "SceneObject"'s - which are "unique meshes/geometry", which map 1-to-1 with
 // BLAS entries in raytracing terminology.
 class SceneManager : public CommonDeviceObject, public ResourceCache {
   friend class ImGUI;
-  // The scene's own retained instances build and keep RT instances themselves.
+  // rtx.retained.useV2: the second retained-instance implementation drives the same preserve and
+  // external-draw machinery the first one uses.
+  friend class RetainedInstanceStore;
+  // rtx.scene.directRetained: the scene's own retained instances build and keep RT instances themselves.
   friend class RetainedScene;
   friend class TransientLane;
   friend class CoreMaterialBuilder;
@@ -219,8 +185,6 @@ class SceneManager : public CommonDeviceObject, public ResourceCache {
     "Updates UV-only animation of compatible fixed-function geometry without a BLAS refit, which saves GPU time. Shader "
     "capture, skinning, smooth normals and active opacity micromaps keep the refit. Turn it off to always refit "
     "animated geometry.");
-  friend void fork_hooks::externalDrawObjectPicking(
-    DxvkDevice&, SceneDraw&, XXH64_hash_t, SceneManager&);
 
 public:
   SceneManager(SceneManager const&) = delete;
@@ -234,20 +198,29 @@ public:
 
   void onDestroy();
 
-  void submitDrawState(Rc<DxvkContext> ctx, const SceneDraw& input, const MaterialData* overrideMaterialData);
+  void submitDrawState(Rc<DxvkContext> ctx, const DrawCallState& input, const MaterialData* overrideMaterialData);
   void submitExternalDraw(const Rc<DxvkContext>& ctx, std::unique_ptr<ExternalDrawState> state);
 
-  // One fog state of a frontend's frame (frontend::FrameInfo::fog), in draw order. The first one without a replacement
-  // is rendered. A replaced fog starts the camera in its medium material, which is created with the inputs of a draw
-  // with that fog. Without them, a replaced fog is left undiscovered for this frame.
-  void discoverFog(const FogState& fog, const SurfaceMaterialInputs* draw);
-  // The parts of submitDrawState a frontend needs for draws it describes to the scene instead of submitting: the render
-  // material of a legacy material (material replacement, ray portal or legacy conversion) and the scene clears so far.
-  MaterialData resolveDrawMaterial(const LegacyMaterialData& material) { return determineMaterialData(nullptr, material); }
+  // D3D9 frontend: the parts of submitDrawState a frontend needs for draws it describes to
+  // the scene instead of submitting. Fog discovery for one draw (what submitDrawState does first); whether the draw's
+  // asset hashes (active rule, then the legacy rules) have USD mesh replacements, without tracking them; its render
+  // material (material replacement, ray portal or legacy conversion); scene clears so far.
+  void discoverFogState(const DrawCallState& input);
+  // rtx.d3d9v2.frameEvents: fog discovery from the frontend's frame order. input: a draw of that fog for a
+  // fog replacement material (null: a replaced fog is left undiscovered for this frame). While the frontend discovers
+  // fog, submitDrawState does not.
+  void discoverFog(const FogState& fog, const DrawCallState* input);
+  void setFrontendFogDiscovery(bool on) { m_frontendFogDiscovery = on; }
+  bool hasMeshReplacements(const DrawCallState& input) const;
+  MaterialData resolveDrawMaterial(const DrawCallState& input) { return determineMaterialData(nullptr, input); }
   uint64_t clearEpoch() const { return m_clearEpoch; }
-  // The USD mesh replacements for a frontend's asset keys, in the order submitDrawState looks them up, or null.
-  // *matchedKey is the index of the key that matched (frontend::ReplacementQuery::matchedKey). Nothing is tracked.
-  std::shared_ptr<const ReplacementBucket> findMeshReplacements(const frontend::AssetKeys& keys, uint32_t* matchedKey) const;
+  // The USD mesh replacements submitDrawState would draw for this draw (same
+  // hashes, same order: the active asset hash, then the legacy rules), null if none; *matchedRule is 0 (active hash),
+  // 1 or 2 (legacy hash 0 / 1). Nothing is tracked.
+  std::shared_ptr<const ReplacementBucket> findMeshReplacements(const DrawCallState& input, uint32_t* matchedRule) const;
+  // While set, submitDrawState marks the replacement instance it matches as handed to the scene
+  // (ReplacementInstance::handedToScene); every other submission clears that mark.
+  void setSubmittingHandedOver(bool handedOver) { m_submittingHandedOver = handedOver; }
 
   // Host-retained draws (after doodlum/dxvk-remix 5e39a218a). A host that
   // describes its scene through the API would otherwise re-send every
@@ -272,6 +245,12 @@ public:
     uint32_t full = 0, preserved = 0, skipped = 0, steady = 0, pinned = 0;
   };
   void submitRetainedExternalDraws(const Rc<DxvkContext>& ctx, RetainedReplayStats* stats = nullptr);
+  // rtx.retained.diagnosticFrames: called after a retained entry's full replay (either implementation)
+  // with what that replay recorded; counts what went wrong with it. logRetainedDiagnostics writes and
+  // resets the counts (lateReplays: replays that arrived after the frame's RTX injection).
+  void noteRetainedFullReplay(uint64_t handle, remixapi_MeshHandle mesh, XXH64_hash_t identity,
+                              bool redescribed, bool visible);
+  void logRetainedDiagnostics(uint32_t replays, uint32_t lateReplays, uint32_t deferredReplays);
   size_t retainedExternalDrawCount() const { return m_retainedExternalDraws.size(); }
   // Registered transforms are absolute; the replay subtracts this, so the
   // host keeps stable coordinates while the scene stays near the origin.
@@ -282,22 +261,46 @@ public:
   // (render position + origin = world position), so this frame's draws move them from there and motion
   // vectors see no jump. Called before the Main camera update, ahead of the frame's draws.
   void applyWorldOrigin(const Vector3& origin);
+  // rtx.worldOrigin.enable, D3D9 camera path: a host whose camera arrives as D3D9 transforms publishes
+  // __mcrtx.world_origin.* with remixapi_SetGameValue, which records it here through the command stream, in
+  // order with the host's draws. applyPendingHostWorldOrigin runs ahead of each draw's camera processing and,
+  // before the frame's Main camera update, does what SetupCamera does for an API camera: applyWorldOrigin plus
+  // the Main camera's history shift. Held over to the next frame when the Main camera was already updated;
+  // ignored for a host that sends its origin through SetupCamera.
+  void setPendingHostWorldOrigin(const Vector3& origin) {
+    m_pendingHostWorldOrigin = origin;
+    m_pendingHostWorldOriginValid = true;
+  }
+  void applyPendingHostWorldOrigin();
+  // REMIXAPI_CAMERA_FRAME_EVENT_FALLBACK: at the frame's ray tracing, when no draw set the Main camera
+  // this frame, the host's held fallback camera becomes it -- through the D3D9 draw path's own steps (pending
+  // host origin, then CameraManager::applyFrameCamera), so it is the camera a world draw would have given.
+  void applyFallbackMainCamera();
 
-  // The scene owns the retained instances (rtx_retained_scene.h), so the retained commands above go to it.
-  // It keeps what needs per-frame work on the legacy lane (the *Legacy functions).
+  // rtx.retained.useV2: the second retained-instance implementation (rtx_retained_v2.h). Exactly one
+  // implementation owns the registered instances at a time. selectRetainedImplementation hands them
+  // (with what their last replay produced) to the other one when the option changed; it runs at the
+  // start of a DrawRetainedInstances replay. The retained commands above pass each command on to the
+  // implementation that owns the instances, so commands queued around a switch land where the instances are.
+  void selectRetainedImplementation(bool useV2);
+  bool retainedV2Active() const { return m_retainedV2Active; }
+  RetainedInstanceStore& retainedV2() { return *m_retainedV2; }
+
+  // rtx.scene.directRetained (rtx_retained_scene.h). While the scene owns the retained instances, the retained
+  // commands above go to it; it keeps what needs per-frame work on the first implementation (the *Legacy functions).
+  // selectSceneImplementation runs at the start of a DrawRetainedInstances replay, after selectRetainedImplementation.
+  void selectSceneImplementation(bool direct);
   RetainedScene& retainedScene() { return *m_retainedScene; }
-  // The game lights frontends send (rtx_game_lights.h).
-  GameLights& gameLights() { return *m_gameLights; }
-  // The counters of the scene interface's input checks ([SceneInput]). Any thread may count.
-  SceneInputStats& sceneInput() { return m_sceneInput; }
-  // The last camera cut, which kept the scene, or kNoKeptCut. Lifetime never keeps an object unseen since before it
-  // (translator::LifetimeFrame::keptCutFrame).
+  // rtx.scene.noImplicitClears: false for an API host (external meshes registered) while the option is on; a camera
+  // cut or a frame without a valid camera then only resets temporal history. rtx.scene.d3d9CutAsEvent: the same for
+  // every other game.
+  bool implicitClearsAllowed() const;
+  // The last camera cut that kept the scene (implicitClearsAllowed false), or kNoKeptCut. Lifetime never keeps an
+  // object unseen since before it (translator::LifetimeFrame::keptCutFrame).
   static constexpr uint32_t kNoKeptCut = ~0u;
   uint32_t m_lastKeptCutFrame = kNoKeptCut;
-  // A camera cut that counts once the next frame confirms it, or kNoKeptCut, and the camera position before it.
-  uint32_t m_pendingCutFrame = kNoKeptCut;
-  Vector3 m_pendingCutFrom;
   uint64_t m_clearEpoch = 0;  // clear() calls (clearEpoch)
+  bool m_submittingHandedOver = false;  // See setSubmittingHandedOver
   // External-draw preserve-path accounting; see the definition for why it is worth having.
   void reportExternalPreserveOutcome(bool preserved);
   uint64_t m_externalDrawsPreserved = 0;
@@ -337,10 +340,18 @@ public:
   const RtSurfaceMaterial* getSurfaceMaterialOrNull(uint32_t index) const {
     return index < m_surfaceMaterialCache.getTotalCount() ? &m_surfaceMaterialCache.getObjectTable()[index] : nullptr;
   }
+  // The same for the surface-material extension cache (terrain-layers entries: SccrShellManager tells blended terrain
+  // from a one-layer static by the entry's height material).
+  const RtSurfaceMaterial* getSurfaceMaterialExtensionOrNull(uint32_t index) const {
+    return index < m_surfaceMaterialExtensionCache.getTotalCount() ? &m_surfaceMaterialExtensionCache.getObjectTable()[index] : nullptr;
+  }
   // For SccrShellManager: a bindless buffer slot of its own for each cached shell buffer, held from its build until the
   // cache drops it, independent of any geometry's slots.
   uint32_t acquireBufferSlot(const RaytraceBuffer& buffer) { return m_bufferCache.acquire(buffer); }
   void releaseBufferSlot(uint32_t slot) { m_bufferCache.release(slot); }
+  // RtInstance::isRealGeometry changed on some instance (it decides AccelManager's BLAS routing), or a real geometry
+  // binding changed: the next mergeInstancesIntoBlas must not take the unchanged-scene path.
+  void notifyAccelSceneChanged() { m_instanceManager.notifySceneChanged(); }
   
   const InstanceManager& getInstanceManager() const { return m_instanceManager; }
   const AccelManager& getAccelManager() const { return m_accelManager; }
@@ -348,7 +359,7 @@ public:
   // is created while rtx.subsurface.enableThinOpaque is on. Until then no surface can be thin-opaque.
   bool hasCreatedThinOpaqueMaterial() const { return m_thinOpaqueMaterialCreated.load(std::memory_order_relaxed); }
   // Sticky, set once any opaque material with the thin-film layer enabled / any ray portal material
-  // is created. Until then no surface can carry a material thin film / be a portal (the G-buffer slim levels read it).
+  // is created. Until then no surface can carry a material thin film / be a portal (rtx.gbuffer.slimVariants).
   bool hasCreatedThinFilmMaterial() const { return m_thinFilmMaterialCreated.load(std::memory_order_relaxed); }
   bool hasCreatedRayPortalMaterial() const { return m_rayPortalMaterialCreated.load(std::memory_order_relaxed); }
   const LightManager& getLightManager() const { return m_lightManager; }
@@ -358,13 +369,13 @@ public:
   OpacityMicromapManager* getOpacityMicromapManager() const { return m_opacityMicromapManager.get(); }
   // Bindless index of the per-surface software micromap table, UINT32_MAX = none.
   uint32_t getSoftwareOmmTableIndex() const;
-  // RaytraceArgs::coreMaterialTable, UINT32_MAX while the table is not current.
+  // RaytraceArgs::coreMaterialTable, UINT32_MAX while rtx.coreMaterial.build is off or the table is not current.
   uint32_t getCoreMaterialTableIndex() const;
   // RaytraceArgs::coreMaterialExtTable, and the core table's surfaces per class (false while not current).
   uint32_t getCoreMaterialExtTableIndex() const;
   bool getCoreMaterialClassCounts(uint32_t (&counts)[4]) const;
   // RaytraceArgs::legacySurfaceTable, and whether any surface has legacy state / the eye (false while
-  // the records are not current).
+  // rtx.coreMaterial.legacyRecord is off or the records are not current).
   uint32_t getLegacySurfaceTableIndex() const;
   bool getCoreMaterialLegacyBits(bool& anyLegacy, bool& anyTextureOps, bool& anyEye) const;
   LightManager& getLightManager() { return m_lightManager; }
@@ -381,6 +392,8 @@ public:
   static Vector3 worldToSceneOrientedVector(const Vector3& worldVector); 
 
   static Vector3 sceneToWorldOrientedVector(const Vector3& sceneVector);
+
+  void addLight(const D3DLIGHT9& light);
 
   const CameraManager& getCameraManager() const { return m_cameraManager; }
   CameraManager& getCameraManager() { return m_cameraManager; }
@@ -407,7 +420,7 @@ public:
   void garbageCollection();
   void prepareSceneData(Rc<RtxContext> ctx, class DxvkBarrierSet& execBarriers);
 
-  // CPU time of prepareSceneData by phase, summed since the last call, for [Perf].
+  // CPU time of prepareSceneData by phase, summed since the last call, for [FrameTiming].
   // The first 9 partition prepareSceneData; the merge.* ones (from AccelManager) are nested
   // inside mergeInstancesIntoBlas and must not be added to the others.
   static constexpr uint32_t kPrepTopPhaseCount = 9;
@@ -522,23 +535,18 @@ private:
   };
   // Handles conversion of geometry data coming from a draw call, to the data used by the raytracing backend
   template<bool isNew>
-  ObjectCacheState processGeometryInfo(Rc<DxvkContext> ctx, const SceneDraw& drawCallState, BlasEntry* pBlas);
+  ObjectCacheState processGeometryInfo(Rc<DxvkContext> ctx, const DrawCallState& drawCallState, BlasEntry* pBlas);
 
   // Consumes a draw call state and updates the scene state accordingly
   RtInstance* processDrawCallState(const Rc<DxvkContext>& ctx, 
-                                   const SceneDraw& blasInput, 
+                                   const DrawCallState& blasInput, 
                                    const MaterialData& materialData,
                                    ReplacementInstance& replacementInstance,
                                    RtInstance* existingInstance = nullptr,
                                    const RtxParticleSystemDesc* pParticleSystemDesc = nullptr);
 
   const RtSurfaceMaterial& createSurfaceMaterial(const MaterialData& renderMaterialData,
-                                                 const SceneDraw& drawCallState,
-                                                 uint32_t* out_indexInCache = nullptr) {
-    return createSurfaceMaterial(renderMaterialData, SurfaceMaterialInputs::of(drawCallState), out_indexInCache);
-  }
-  const RtSurfaceMaterial& createSurfaceMaterial(const MaterialData& renderMaterialData,
-                                                 const SurfaceMaterialInputs& draw,
+                                                 const DrawCallState& drawCallState,
                                                  uint32_t* out_indexInCache = nullptr);
 
   // Retain / release all resources associated with the surface material at the given cache index:
@@ -560,11 +568,6 @@ private:
   // currently-linked instances.
   void syncLinkedInstances(BlasEntry* pBlas);
 
-  // Gives `to`, built this frame, the current positions of `from` as its previous positions, for geometry that takes
-  // over another's object (RetainedScene::inheritHistory).
-  // Returns false when the two vertex layouts differ.
-  bool inheritPreviousPositions(const Rc<DxvkContext>& ctx, BlasEntry& to, const BlasEntry& from);
-
   // Release all buffer-cache slots held by geo. Called when a BlasEntry is GC'd.
   void unregisterGeometryBuffers(RaytraceGeometry& geo);
 
@@ -573,31 +576,32 @@ private:
   void verifyAndReleaseBufferCache();
 
   // Called whenever a new BLAS scene object is added to the cache
-  ObjectCacheState onSceneObjectAdded(Rc<DxvkContext> ctx, const SceneDraw& drawCallState, BlasEntry* pBlas);
+  ObjectCacheState onSceneObjectAdded(Rc<DxvkContext> ctx, const DrawCallState& drawCallState, BlasEntry* pBlas);
   // Called whenever a BLAS scene object is updated
   // rebuildTopologyInPlace (RetainedScene's owner-keyed geometry): the entry is rebuilt in place when the draw's
-  // topology differs from the one it holds, or when dropHistory is set. A rebuilt entry has no previous positions, and
-  // its instances lose their opacity micromap data (OpacityMicromapManager::onInstanceTopologyChanged).
-  ObjectCacheState onSceneObjectUpdated(Rc<DxvkContext> ctx, const SceneDraw& drawCallState, BlasEntry* pBlas,
-                                        bool rebuildTopologyInPlace = false, bool dropHistory = false);
+  // topology differs from the one it holds. Its instances then lose their opacity micromap data
+  // (OpacityMicromapManager::onInstanceTopologyChanged).
+  ObjectCacheState onSceneObjectUpdated(Rc<DxvkContext> ctx, const DrawCallState& drawCallState, BlasEntry* pBlas,
+                                        bool rebuildTopologyInPlace = false);
   // Called whenever a new instance has been added to the database
   void onInstanceAdded(RtInstance& instance);
   // Called whenever instance metadata is updated
-  void onInstanceUpdated(RtInstance& instance, const SceneDraw& drawCall, const MaterialData* material, const bool hasTransformChanged, const bool hasVerticesdChanged, const bool isFirstUpdateThisFrame);
+  void onInstanceUpdated(RtInstance& instance, const DrawCallState& drawCall, const MaterialData* material, const bool hasTransformChanged, const bool hasVerticesdChanged, const bool isFirstUpdateThisFrame);
   // Called whenever an instance has been removed from the database
   void onInstanceDestroyed(RtInstance& instance);
 
-  void drawReplacements(Rc<DxvkContext> ctx, const SceneDraw* input, const std::shared_ptr<const ReplacementBucket>& pReplacements, MaterialData& renderMaterialData, ReplacementInstance* replacementInstance);
+  void drawReplacements(Rc<DxvkContext> ctx, const DrawCallState* input, const std::shared_ptr<const ReplacementBucket>& pReplacements, MaterialData& renderMaterialData, ReplacementInstance* replacementInstance);
 
-  // Build the per-replacement SceneDraw used by both the dynamic (drawReplacements) and
+  // Build the per-replacement DrawCallState used by both the dynamic (drawReplacements) and
   // preserve (syncPreservedReplacementMeshesState) paths so they always feed the same input
   // into the BlasEntry / processDrawCallState. Returns std::nullopt for replacement types
   // that don't drive a mesh draw (lights, graphs).
+  // Static member so the friendship of SceneManager with DrawCallState carries through.
   // Host (Remix API) GPU instancing on the input carries over to the replacement: every host
   // placement draws the replacement (see composeHostInstancesForReplacement). owner/index/frameId
   // key the cache of composed transform lists.
-  static std::optional<SceneDraw> buildReplacementMeshDrawCallState(
-      const SceneDraw& input,
+  static std::optional<DrawCallState> buildReplacementMeshDrawCallState(
+      const DrawCallState& input,
       const AssetReplacement& replacement,
       const ReplacementInstance* owner,
       size_t index,
@@ -621,30 +625,38 @@ private:
   // via processRayPortalData on the cached RtSurfaceMaterial.
   void preserveInstance(
       RtInstance& instance,
-      const SceneDraw* pInput = nullptr);
+      const DrawCallState* pInput = nullptr);
 
   // Lights and graph prims for mesh replacements (drawReplacements / dynamic path).
-  void processReplacementLights(const SceneDraw* input, const ReplacementBucket* pReplacements, ReplacementInstance* replacementInstance);
-  void processReplacementGraphs(Rc<DxvkContext> ctx, const SceneDraw* input, const ReplacementBucket* pReplacements, ReplacementInstance* replacementInstance);
+  void processReplacementLights(const DrawCallState* input, const ReplacementBucket* pReplacements, ReplacementInstance* replacementInstance);
+  void processReplacementGraphs(Rc<DxvkContext> ctx, const DrawCallState* input, const ReplacementBucket* pReplacements, ReplacementInstance* replacementInstance);
 
   // Preserve path: minimal work to keep replacement meshes, lights, and graphs alive (buffer cache, textures, light touch, bbox).
   // Returns `input` (the draw state to keep reading from).
-  const SceneDraw& preserveReplacementInstance(
+  const DrawCallState& preserveReplacementInstance(
       Rc<DxvkContext> ctx,
-      const SceneDraw& input,
+      const DrawCallState& input,
       const std::shared_ptr<const ReplacementBucket>& pReplacements,
       ReplacementInstance* replacementInstance);
 
-  void trackObjectPickingMeta(const SceneDraw& drawCallState, ObjectPickingValue objectPickingValue);
+  void trackObjectPickingMeta(const DrawCallState& drawCallState, ObjectPickingValue objectPickingValue);
+  void trackObjectPickingMeta(ObjectPickingValue objectPickingValue, XXH64_hash_t textureHash, XXH64_hash_t textureHash2 = kEmptyHash);
+
+  // Remix API draws: the picking value of the draw's instances -- the host's
+  // (remixapi_InstanceInfoObjectPickingEXT) when it gave one, else the replacement instance's own
+  // (ReplacementInstance::externalPickingValue, assigned on first use).
+  ObjectPickingValue externalObjectPickingValue(const DrawCallState& drawCall, ReplacementInstance& replacementInstance);
 
   // Refreshes BlasEntry::input and per-instance draw state on the preserve path (matches drawReplacements'
-  // SceneDraw wiring).
+  // DrawCallState wiring).
   void syncPreservedReplacementMeshesState(
-      const SceneDraw& input,
+      const DrawCallState& input,
       const ReplacementBucket* pReplacements,
       ReplacementInstance* replacementInstance);
 
-  void createEffectLight(Rc<DxvkContext> ctx, const SceneDraw& input, const RtInstance* instance);
+  void createEffectLight(Rc<DxvkContext> ctx, const DrawCallState& input, const RtInstance* instance);
+  // The materials that have made an effect light, each logged once.
+  std::unordered_set<XXH64_hash_t> m_effectLightMaterialsLogged;
 
   // Print all RtInstances for debugging
   void printAllRtInstances();
@@ -653,10 +665,11 @@ private:
   // and how fragmented the device-local heap's chunks are.
   void logAccelMemoryBreakdown();
   
-  MaterialData determineMaterialData(const MaterialData* overrideMaterialData, const LegacyMaterialData& legacyMaterial);
+  MaterialData determineMaterialData(const MaterialData* overrideMaterialData, const DrawCallState& input);
   
   const uint32_t kInvalidMaterialCacheIndex = UINT32_MAX;
   uint32_t m_beginUsdExportFrameNum = -1;
+  bool m_enqueueDelayedClear = false;
   bool m_previousFrameSceneAvailable = false;
 
   RtxGlobals m_globals;
@@ -672,7 +685,7 @@ private:
   RayPortalManager m_rayPortalManager;
   BindlessResourceManager m_bindlessResourceManager;
   std::unique_ptr<OpacityMicromapManager> m_opacityMicromapManager;
-  std::unique_ptr<CoreMaterialBuilder> m_coreMaterials; // null until the first frame's scene preparation
+  std::unique_ptr<CoreMaterialBuilder> m_coreMaterials; // rtx.coreMaterial.build, null while off
 
   DrawCallCache m_drawCallCache;
 
@@ -684,6 +697,7 @@ private:
 
   FogState m_fog;
   fast_unordered_cache<FogState> m_fogStates;
+  bool m_frontendFogDiscovery = false;
   std::mutex m_startInMediumMaterialMutex;
   std::optional<MaterialData> m_pendingStartInMediumMaterial;
   bool m_pendingClearStartInMediumMaterial = false;
@@ -722,6 +736,9 @@ private:
     uint8_t ticker {};
     dxvk::mutex mutex {};
   } m_drawCallMeta {};
+  // externalObjectPickingValue: the next value handed out (in the upper half of the range, which
+  // the D3D9 per-frame draw call IDs never reach).
+  uint32_t m_nextExternalPickingValue = 0;
 
   // TODO: expand to many different
   Rc<DxvkSampler> m_externalSampler = nullptr;
@@ -802,10 +819,20 @@ private:
   Vector3 m_retainedSceneOrigin { 0.f, 0.f, 0.f };
   Vector3 m_worldOrigin { 0.f, 0.f, 0.f };
   bool m_worldOriginValid = false;
+  Vector3 m_pendingHostWorldOrigin { 0.f, 0.f, 0.f };
+  bool m_pendingHostWorldOriginValid = false;
 
   // Identity hash computed by the most recent submitExternalDraw (0 when it bailed
   // out before computing one); the retained replay records it per entry.
   XXH64_hash_t m_lastExternalDrawIdentityHash = 0;
+
+  // rtx.retained.diagnosticFrames: per-window counts of full replays that went wrong, by reason.
+  struct RetainedDiag {
+    enum Reason : uint32_t { NoMesh, NoIdentity, NoReplacement, Recreated, NoInstance, Hidden, MarkedForGC, Count };
+    uint32_t fullReplays = 0;
+    uint32_t counts[Count] = {};
+    uint64_t examples[Count][4] = {};
+  } m_retainedDiag;
 
   // rtx.retainedPinSteadyEntries: per entry (same index as m_retainedExternalDraws), the instance,
   // geometry and replacement instance a pinned entry keeps alive each frame; all null = not pinned.
@@ -836,6 +863,11 @@ public:
   bool m_timeApiDraws = false;
   double m_apiDrawGeometryMs = 0.0;
   double m_apiDrawInstanceMs = 0.0;
+  // [PerfCpu] d3d9.preserve / d3d9.dynamic: submitDrawState time split by path, while m_timeD3D9Submit
+  // is set by RtxContext::commitGeometryToRT (detailed logging only). Drained by RtxContext.
+  bool m_timeD3D9Submit = false;
+  double m_d3d9PreserveMs = 0.0;
+  double m_d3d9DynamicMs = 0.0;
 private:
   // rtx.trackHashUsageOnlyWhenNeeded
   mutable std::atomic<bool> m_hashUsageConsumerSeen { false };
@@ -888,10 +920,12 @@ private:
                                                      std::shared_ptr<MaterialData>& keepAlive);
   void setRetainedExternalDrawHiddenFromTlas(RetainedExternalDraw& entry, bool hidden);
 
-  // The scene's legacy lane.
+  // rtx.retained.useV2 (see selectRetainedImplementation).
+  std::unique_ptr<RetainedInstanceStore> m_retainedV2;
+  bool m_retainedV2Active = false;
+
+  // rtx.scene.directRetained: the first implementation's side of the scene's legacy lane.
   std::unique_ptr<RetainedScene> m_retainedScene;
-  std::unique_ptr<GameLights> m_gameLights;
-  SceneInputStats m_sceneInput;
   void setRetainedExternalDrawLegacy(uint64_t handle, ExternalDrawState&& state);
   void setRetainedExternalDrawTransformLegacy(uint64_t handle, const Matrix4& objectToWorld);
   void setRetainedExternalDrawVisibleLegacy(uint64_t handle, bool visible);
@@ -899,6 +933,9 @@ private:
   // Removes the entry and its RT instances now (collected before this frame's TLAS), so another lane can take
   // the handle in the same frame without a duplicate or a gap.
   void dropRetainedExternalDrawNow(uint64_t handle);
+  void listRetainedExternalDrawsLegacy(std::vector<std::pair<uint64_t, bool>>& out) const;
+  // The registered description with its current absolute transform; false if the handle is not registered.
+  bool copyRetainedExternalDrawLegacy(uint64_t handle, ExternalDrawState& out) const;
 };
 
 }  // namespace nvvk

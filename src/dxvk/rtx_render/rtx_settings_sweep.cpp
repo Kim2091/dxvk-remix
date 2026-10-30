@@ -299,7 +299,7 @@ namespace dxvk {
 
     table.push_back({ "baseline", "user settings", {}, kNeedsNothing });
 
-    // Each indirect mode with each indirect ray tracing mode.
+    // Each indirect mode with each indirect ray tracing mode, plus the reduced shader variants that apply to it.
     // The steps of one mode run together, so each mode's pipelines compile once.
     struct IndirectMode {
       IntegrateIndirectMode mode;
@@ -313,15 +313,20 @@ namespace dxvk {
       { IntegrateIndirectMode::NeuralRadianceCache, "NRC", kNeedsNrc },
     };
     for (const IndirectMode& mode : indirectModes) {
+      const bool sharc = mode.mode == IntegrateIndirectMode::Sharc;
+      const std::string slimOption = sharc ? "rtx.integrateIndirect.slimVariants" : "rtx.integrateIndirect.slimNonSharc";
       const Override modeOverride = { "rtx.integrateIndirectMode", enumValue(mode.mode) };
       const Override traceRay = { "rtx.renderPassIntegrateIndirectRaytraceMode", enumValue(RenderPassIntegrateIndirectRaytraceMode::TraceRay) };
       const Override rayQuery = { "rtx.renderPassIntegrateIndirectRaytraceMode", enumValue(RenderPassIntegrateIndirectRaytraceMode::RayQuery) };
 
-      table.push_back({ "integrator", str::format(mode.name, ", indirect TraceRay, no translucent shadows"),
-                        { customRaytraceModes, modeOverride, traceRay, { "rtx.enableIndirectTranslucentShadows", kFalse } },
+      table.push_back({ "integrator", str::format(mode.name, ", indirect TraceRay, slim shaders, no translucent shadows"),
+                        { customRaytraceModes, modeOverride, traceRay, { slimOption, kTrue }, { "rtx.enableIndirectTranslucentShadows", kFalse } },
                         mode.requirements });
-      table.push_back({ "integrator", str::format(mode.name, ", indirect TraceRay, translucent shadows"),
-                        { customRaytraceModes, modeOverride, traceRay, { "rtx.enableIndirectTranslucentShadows", kTrue } },
+      table.push_back({ "integrator", str::format(mode.name, ", indirect TraceRay, slim shaders, translucent shadows"),
+                        { customRaytraceModes, modeOverride, traceRay, { slimOption, kTrue }, { "rtx.enableIndirectTranslucentShadows", kTrue } },
+                        mode.requirements });
+      table.push_back({ "integrator", str::format(mode.name, ", indirect TraceRay, full shaders"),
+                        { customRaytraceModes, modeOverride, traceRay, { slimOption, kFalse } },
                         mode.requirements });
       table.push_back({ "integrator", str::format(mode.name, ", indirect RayQuery"),
                         { customRaytraceModes, modeOverride, rayQuery },

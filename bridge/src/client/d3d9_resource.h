@@ -85,7 +85,8 @@ public:
     if (ppDevice == nullptr) {
       return D3DERR_INVALIDCALL;
     }
-    m_pDevice->reportDevice(ppDevice);
+    m_pDevice->AddRef();
+    (*ppDevice) = m_pDevice;
     return S_OK;
   }
 

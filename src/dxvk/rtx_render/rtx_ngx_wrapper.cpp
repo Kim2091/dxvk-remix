@@ -27,10 +27,6 @@
 #include <Winternl.h>
 #include <d3dkmthk.h>
 #include <d3dkmdt.h>
-#include <winver.h>
-
-// GetFileVersionInfoW and VerQueryValueW, used to log the DLSS-NR library version.
-#pragma comment(lib, "version.lib")
 
 #include "rtx_ngx_wrapper.h"
 #include "rtx_matrix_helpers.h"
@@ -87,6 +83,32 @@ namespace {
 namespace dxvk
 {
   namespace {
+#ifdef _M_X64
+    NVSDK_NGX_Result queryDlssNeuralRenderingVramAllocation(
+        NVSDK_NGX_Parameter* pParameters,
+        unsigned long long* pVramAllocationBytes) {
+      // Invoke the stats callback directly to avoid the generic helper's D3D header dependency.
+      void* pCallback = nullptr;
+      NVSDK_NGX_Result result = NVSDK_NGX_Parameter_GetVoidPointer(
+        pParameters, NVSDK_NGX_Parameter_DLSSNRGetStatsCallback, &pCallback);
+      if (NVSDK_NGX_FAILED(result)) {
+        return result;
+      }
+
+      if (pCallback == nullptr) {
+        return NVSDK_NGX_Result_FAIL_OutOfDate;
+      }
+
+      const auto pStatsCallback = reinterpret_cast<PFN_NVSDK_NGX_DLSSNR_GetStatsCallback>(pCallback);
+      result = pStatsCallback(pParameters);
+      if (NVSDK_NGX_FAILED(result)) {
+        return result;
+      }
+
+      return NVSDK_NGX_Parameter_GetULL(pParameters, NVSDK_NGX_Parameter_SizeInBytes, pVramAllocationBytes);
+    }
+#endif
+
     std::string resultToString(NVSDK_NGX_Result result) {
       char buf[1024];
       snprintf(buf, sizeof(buf), "(code: 0x%08x, info: %ls)", result, GetNGXResultAsString(result));
@@ -170,55 +192,12 @@ namespace dxvk
       Logger::warn(str::format("Unsupported extended-length NGX feature path: ", featureDirectory));
     }
     const std::wstring featureDirectoryWide = str::tows(featureDirectory.c_str());
-
-    // NGX searches these directories in order for feature DLLs such as nvngx_dlssnr.dll. The runtime directory comes
-    // first, so the DLLs installed with the runtime are used even when the game ships older copies of its own.
-    // Replacing a DLL in the runtime directory swaps it for a different build.
-    // The game's directory is the executable's directory.
-    // When the executable lives in the runtime directory, as the bridge server does, it is the working directory instead.
-    const auto trimSeparators = [](std::wstring path) {
-      while (!path.empty() && (path.back() == L'\\' || path.back() == L'/')) {
-        path.pop_back();
-      }
-      return path;
-    };
-
-    m_featureSearchPaths.clear();
-    const auto addFeatureSearchPath = [this](const std::wstring& path) {
-      if (path.empty()) {
-        return;
-      }
-      for (const std::wstring& existing : m_featureSearchPaths) {
-        if (_wcsicmp(existing.c_str(), path.c_str()) == 0) {
-          return;
-        }
-      }
-      m_featureSearchPaths.push_back(path);
-    };
-
-    wchar_t workingDirectory[MAX_PATH] = {};
-    const DWORD workingDirectoryLength = GetCurrentDirectoryW(MAX_PATH, workingDirectory);
-    const std::wstring workingDirectoryWide = (workingDirectoryLength > 0 && workingDirectoryLength < MAX_PATH)
-      ? trimSeparators(workingDirectory)
-      : std::wstring();
-    const std::wstring exeDirectoryWide = trimSeparators(logFolder);
-    const std::wstring runtimeDirectoryWide = trimSeparators(featureDirectoryWide);
-
-    addFeatureSearchPath(runtimeDirectoryWide);
-    if (_wcsicmp(exeDirectoryWide.c_str(), runtimeDirectoryWide.c_str()) != 0) {
-      addFeatureSearchPath(exeDirectoryWide);
-    }
-    addFeatureSearchPath(workingDirectoryWide);
-
-    std::vector<const wchar_t*> featureSearchPaths;
-    for (const std::wstring& path : m_featureSearchPaths) {
-      featureSearchPaths.push_back(path.c_str());
-    }
+    const wchar_t* featureSearchPath = featureDirectoryWide.c_str();
 
     NVSDK_NGX_FeatureCommonInfo featureCommonInfo{};
-    if (!featureSearchPaths.empty()) {
-      featureCommonInfo.PathListInfo.Path = featureSearchPaths.data();
-      featureCommonInfo.PathListInfo.Length = static_cast<unsigned int>(featureSearchPaths.size());
+    if (!featureDirectoryWide.empty()) {
+      featureCommonInfo.PathListInfo.Path = &featureSearchPath;
+      featureCommonInfo.PathListInfo.Length = 1;
     }
 
     // Note: Enable DLSS logging for debugging in debug mode. Note this will disable all other DLSS logging sinks to ensure all logging
@@ -257,7 +236,6 @@ namespace dxvk
 
     m_supportsDlssNeuralRendering = checkDlssNeuralRenderingSupport(tempParams);
     m_dlssNeuralRenderingSupportChecked = true;
-    logDlssNeuralRenderingLibrary();
     
 #if defined(NVSDK_NGX_Parameter_SuperSampling_NeedsUpdatedDriver)        \
     && defined (NVSDK_NGX_Parameter_SuperSampling_MinDriverVersionMajor) \
@@ -304,8 +282,9 @@ namespace dxvk
     // Check DLSS-RR Support
     NVSDK_NGX_FeatureCommonInfo ci = {};
     memset(&ci, 0, sizeof(ci));
-    ci.PathListInfo.Path = featureSearchPaths.empty() ? nullptr : featureSearchPaths.data();
-    ci.PathListInfo.Length = static_cast<unsigned int>(featureSearchPaths.size());
+    const wchar_t* paths[] = { featureDirectoryWide.c_str(), logFolder.c_str(), L"." };
+    ci.PathListInfo.Path = paths + (featureDirectoryWide.empty() ? 1 : 0);
+    ci.PathListInfo.Length = featureDirectoryWide.empty() ? 2 : 3;
     ci.InternalData = nullptr;
     ci.LoggingInfo.LoggingCallback = nullptr;
     ci.LoggingInfo.MinimumLoggingLevel = NVSDK_NGX_LOGGING_LEVEL_OFF;
@@ -406,68 +385,6 @@ namespace dxvk
     }
 
     return std::make_unique<NGXNeuralRenderingContext>(m_device);
-  }
-
-  std::string NGXContext::getFeatureSearchPathText() const {
-    std::string text;
-    for (const std::wstring& path : m_featureSearchPaths) {
-      if (!text.empty()) {
-        text += ", then ";
-      }
-      text += str::fromws(path.c_str());
-    }
-    return text;
-  }
-
-  void NGXContext::logDlssNeuralRenderingLibrary() const {
-    constexpr wchar_t kLibraryName[] = L"nvngx_dlssnr.dll";
-
-    // The module NGX loaded, when it has loaded one by now.
-    // Otherwise the first copy in the search order, which is the one NGX picks from these directories.
-    std::wstring libraryPath;
-    const char* origin = "not found in the feature search path";
-    if (const HMODULE module = GetModuleHandleW(kLibraryName)) {
-      wchar_t modulePath[MAX_PATH] = {};
-      const DWORD length = GetModuleFileNameW(module, modulePath, MAX_PATH);
-      if (length > 0 && length < MAX_PATH) {
-        libraryPath = modulePath;
-        origin = "loaded by NGX";
-      }
-    }
-
-    if (libraryPath.empty()) {
-      for (const std::wstring& directory : m_featureSearchPaths) {
-        const std::wstring candidate = directory + L"\\" + kLibraryName;
-        const DWORD attributes = GetFileAttributesW(candidate.c_str());
-        if (attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY)) {
-          libraryPath = candidate;
-          origin = "first in the feature search path";
-          break;
-        }
-      }
-    }
-
-    std::string version = "unknown";
-    if (!libraryPath.empty()) {
-      DWORD handle = 0;
-      const DWORD size = GetFileVersionInfoSizeW(libraryPath.c_str(), &handle);
-      if (size > 0) {
-        std::vector<uint8_t> versionInfo(size);
-        VS_FIXEDFILEINFO* pFixedInfo = nullptr;
-        UINT fixedInfoSize = 0;
-        if (GetFileVersionInfoW(libraryPath.c_str(), 0, size, versionInfo.data()) &&
-            VerQueryValueW(versionInfo.data(), L"\\", reinterpret_cast<void**>(&pFixedInfo), &fixedInfoSize) &&
-            pFixedInfo != nullptr && fixedInfoSize >= sizeof(VS_FIXEDFILEINFO)) {
-          version = str::format(HIWORD(pFixedInfo->dwFileVersionMS), ".", LOWORD(pFixedInfo->dwFileVersionMS), ".",
-                                HIWORD(pFixedInfo->dwFileVersionLS), ".", LOWORD(pFixedInfo->dwFileVersionLS));
-        }
-      }
-    }
-
-    Logger::info(str::format(
-      "[DLSS-NR] NGX reports DLSS-NR as ", m_supportsDlssNeuralRendering ? "available" : "unavailable",
-      ". nvngx_dlssnr.dll: ", libraryPath.empty() ? std::string("none") : str::fromws(libraryPath.c_str()),
-      " (", origin, ", version ", version, "). Search path: ", getFeatureSearchPathText(), "."));
   }
 
   bool NGXContext::checkDLSSSupport(NVSDK_NGX_Parameter* params) {
@@ -1203,27 +1120,24 @@ namespace dxvk
     releaseNGXFeature();
   }
 
-  void NGXNeuralRenderingContext::initialize(Rc<DxvkContext> renderContext, const uint32_t displaySize[2], uint32_t preset) {
+  void NGXNeuralRenderingContext::initialize(Rc<DxvkContext> renderContext, const uint32_t displaySize[2], uint32_t preset, bool queryVramAllocation) {
 #ifndef _M_X64
     // DLSS-NR (ngx_sdk_dlnr) has no arm64 package yet; NGXContext::checkDlssNeuralRenderingSupport
     // always reports unsupported on this platform, so this context should never be constructed.
     static_cast<void>(preset);
+    static_cast<void>(queryVramAllocation);
     m_initialized = false;
 #else
     if (m_neuralRenderingFeature) {
       renderContext->getDevice()->waitForIdle();
-      releaseNGXFeature();
     }
-
-    m_initialized = false;
-
-    // Set before the create helper runs: that helper only writes Width/Height into the parameter
-    // block, so the hint set here is what CreateFeature reads.
-    m_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_Hint_Render_Preset, static_cast<int>(preset));
+    releaseNGXFeature();
 
     NVSDK_NGX_DLSSNR_Create_Params createParams = {};
     createParams.Width = displaySize[0];
     createParams.Height = displaySize[1];
+
+    NVSDK_NGX_Parameter_SetI(m_parameters, NVSDK_NGX_Parameter_DLSSNR_Hint_Render_Preset, static_cast<int>(preset));
 
     const VkCommandBuffer vkCommandBuffer = renderContext->getCommandList()->getCmdBuffer(dxvk::DxvkCmdBuffer::ExecBuffer);
     const NVSDK_NGX_Result result =
@@ -1233,6 +1147,17 @@ namespace dxvk
       Logger::err(str::format("Failed to create DLSS-NR feature: ", resultToString(result)));
       releaseNGXFeature();
       return;
+    }
+
+    if (queryVramAllocation) {
+      unsigned long long vramAllocationBytes = 0;
+      const NVSDK_NGX_Result statsResult = NGX_CALL(queryDlssNeuralRenderingVramAllocation(m_parameters, &vramAllocationBytes));
+      if (NVSDK_NGX_FAILED(statsResult)) {
+        Logger::warn(str::format("Failed to query DLSS-NR VRAM allocation: ", resultToString(statsResult)));
+      } else {
+        m_vramAllocationBytes = vramAllocationBytes;
+        m_hasVramAllocation = true;
+      }
     }
 
     m_initialized = true;
@@ -1282,7 +1207,9 @@ namespace dxvk
     neuralRenderingEvalParams.InIntensity = settings.intensity;
     neuralRenderingEvalParams.InLocalToneStrength = settings.toneStrength;
     neuralRenderingEvalParams.InLocalStructureStrength = settings.structuralStrength;
-    neuralRenderingEvalParams.InMaskBlendMode = static_cast<NVSDK_NGX_DLSSNR_Mask_Blend_Mode>(settings.maskBlendMode);
+    neuralRenderingEvalParams.InMaskBlendMode = settings.useAutoMask
+      ? NVSDK_NGX_DLSSNR_Mask_Blend_Mode_Min
+      : NVSDK_NGX_DLSSNR_Mask_Blend_Mode_None;
     neuralRenderingEvalParams.InStyle = settings.model;
     neuralRenderingEvalParams.InUseAutoMask = settings.useAutoMask ? 1 : 0;
     neuralRenderingEvalParams.InSkinStructureStrength = settings.skinStructureStrength;
@@ -1314,6 +1241,8 @@ namespace dxvk
 
   void NGXNeuralRenderingContext::releaseNGXFeature() {
     m_initialized = false;
+    m_hasVramAllocation = false;
+    m_vramAllocationBytes = 0;
 
     if (m_neuralRenderingFeature) {
       NGX_CALL(NVSDK_NGX_VULKAN_ReleaseFeature(m_neuralRenderingFeature));

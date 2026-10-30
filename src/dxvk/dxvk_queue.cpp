@@ -74,11 +74,6 @@ namespace dxvk {
 
   
   void DxvkSubmissionQueue::submit(DxvkSubmitInfo submitInfo) {
-    submit(std::move(submitInfo), nullptr);
-  }
-
-
-  void DxvkSubmissionQueue::submit(DxvkSubmitInfo submitInfo, DxvkSubmitStatus* status) {
     ScopedCpuProfileZone();
     std::unique_lock<dxvk::mutex> lock(m_mutex);
 
@@ -87,7 +82,6 @@ namespace dxvk {
     });
 
     DxvkSubmitEntry entry = { };
-    entry.status = status;
     entry.submit = std::move(submitInfo);
 
     m_pending += 1;

@@ -214,8 +214,6 @@ dxvk_src = files([
   'rtx_render/rtx_perf_log.h',
   'rtx_render/rtx_pipeline_stats.cpp',
   'rtx_render/rtx_pipeline_stats.h',
-  'rtx_render/rtx_stress.cpp',
-  'rtx_render/rtx_stress.h',
   'rtx_render/rtx_gpu_breadcrumbs.cpp',
   'rtx_render/rtx_gpu_breadcrumbs.h',
   'rtx_render/rtx_gpu_crash.cpp',
@@ -231,6 +229,8 @@ dxvk_src = files([
   'rtx_render/rtx_dlfg.h',
   'rtx_render/rtx_dlss.cpp', 
   'rtx_render/rtx_dlss.h',
+  'rtx_render/rtx_dlss_neural_rendering.cpp',
+  'rtx_render/rtx_dlss_neural_rendering.h',
   'rtx_render/rtx_draw_call_cache.cpp',
   'rtx_render/rtx_draw_call_cache.h',
   'rtx_render/rtx_draw_call_tracker.cpp',
@@ -254,12 +254,17 @@ dxvk_src = files([
   'rtx_render/rtx_fork_capture.cpp',
   'rtx_render/rtx_fork_d3d9_alpha.cpp',
   'rtx_render/rtx_fork_d3d9_alpha.h',
-  'rtx_render/rtx_frame_export.cpp',
-  'rtx_render/rtx_frame_export.h',
+  'rtx_render/rtx_fork_d3d9_identity.cpp',
+  'rtx_render/rtx_fork_d3d9_identity.h',
+  'rtx_render/rtx_fork_d3d9_identity_trace.cpp',
+  'rtx_render/rtx_fork_d3d9_identity_trace.h',
+  'rtx_render/rtx_fork_d3d9_identity_trace_format.h',
   'rtx_render/rtx_frontend_interface.cpp',
   'rtx_render/rtx_frontend_interface.h',
   'rtx_render/rtx_frontend_ui.cpp',
   'rtx_render/rtx_frontend_ui.h',
+  'rtx_render/rtx_fork_fnv_material.cpp',
+  'rtx_render/rtx_fork_fnv_material.h',
   'rtx_render/rtx_fork_fsr.cpp',
   'rtx_render/rtx_fork_fsr.h',
   'rtx_render/rtx_fork_fsr_framegen.cpp',
@@ -277,6 +282,8 @@ dxvk_src = files([
   'rtx_render/rtx_fork_pom_cone_map.h',
   'rtx_render/rtx_fork_sccr_shell.cpp',
   'rtx_render/rtx_fork_sccr_shell.h',
+  'rtx_render/rtx_fork_sccr_tess.cpp',
+  'rtx_render/rtx_fork_sccr_tess.h',
   'rtx_render/rtx_fork_shadow_rays.cpp',
   'rtx_render/rtx_fork_shadow_rays.h',
   'rtx_render/rtx_fork_material_derivation.cpp',
@@ -298,8 +305,6 @@ dxvk_src = files([
   'rtx_render/rtx_game_capturer.cpp',
   'rtx_render/rtx_game_capturer.h',
   'rtx_render/rtx_game_capturer_utils.h',
-  'rtx_render/rtx_game_lights.cpp',
-  'rtx_render/rtx_game_lights.h',
   'rtx_render/rtx_geometry_utils.cpp',
   'rtx_render/rtx_geometry_utils.h',
   'rtx_render/rtx_global_volumetrics.cpp',
@@ -345,8 +350,6 @@ dxvk_src = files([
   'rtx_render/rtx_nee_cache.h',
   'rtx_render/rtx_neural_radiance_cache.cpp',
   'rtx_render/rtx_neural_radiance_cache.h',
-  'rtx_render/rtx_neural_uplift.cpp',
-  'rtx_render/rtx_neural_uplift.h',
   'rtx_render/rtx_ngx_wrapper.cpp',
   'rtx_render/rtx_ngx_wrapper.h',
   'rtx_render/rtx_nis.cpp',
@@ -401,10 +404,11 @@ dxvk_src = files([
   'rtx_render/rtx_restir_gi_rayquery.h',
   'rtx_render/rtx_retained_scene.cpp',
   'rtx_render/rtx_retained_scene.h',
+  'rtx_render/rtx_retained_v2.cpp',
+  'rtx_render/rtx_retained_v2.h',
   'rtx_render/rtx_rtxdi_rayquery.cpp',
   'rtx_render/rtx_rtxdi_rayquery.h',
   'rtx_render/rtx_scene_command_queue.h',
-  'rtx_render/rtx_scene_input.h',
   'rtx_render/rtx_scene_interface.h',
   'rtx_render/rtx_scene_manager.cpp',
   'rtx_render/rtx_scene_manager.h',
@@ -424,7 +428,6 @@ dxvk_src = files([
   'rtx_render/rtx_numos_weather.h',
   'rtx_render/rtx_numos_ui.cpp',
   'rtx_render/rtx_numos_ui.h',
-  'rtx_render/translator/rtx_translator_lifetime.cpp',
   'rtx_render/translator/rtx_translator_lifetime.h',
   'rtx_render/rtx_semaphore.cpp',
   'rtx_render/rtx_semaphore.h',
@@ -448,10 +451,10 @@ dxvk_src = files([
   'rtx_render/rtx_vram_budget.cpp',
   'rtx_render/rtx_vram_budget.h',
   'rtx_render/rtx_color_grade.cpp',
+  'rtx_render/rtx_color_grade_api.cpp',
   'rtx_render/rtx_tone_mapping.cpp',
   'rtx_render/rtx_tone_mapping.h',
   'rtx_render/rtx_types.cpp',
-  'rtx_render/rtx_scene_types.h',
   'rtx_render/rtx_types.h',
   'rtx_render/rtx_utils.h',
   'rtx_render/rtx_xess.cpp',
@@ -619,15 +622,33 @@ rtx_shaders = custom_target(
 # NV-DXVK start: NUMOS sky provider (submodules/numos): the CPU library, and its passes built with
 # this tree's slangc and checked against the library's pass table (passes.inc changes whenever a
 # submodule bump changes a shader, which re-runs the build).
+
+# A release build also runs spirv-opt over the passes, which changes their hashes, so the library is
+# compiled against a pass table generated from the optimised SPIR-V. That needs a NUMOS library that
+# includes its pass table through NUMOS_PASS_TABLE_FILE; with an older one the passes stay unoptimised,
+# since the library would reject the optimised hashes.
+numos_takes_pass_table = fs.read('../../submodules/numos/src/shaders.cpp').contains('NUMOS_PASS_TABLE_FILE')
+numos_optimize_passes = release_build and numos_takes_pass_table
+numos_shader_outputs = ['_numos_shaders.txt']
+numos_shader_command = [ python_interpreter, numos_shader_script, 'build', numos_root, slang_compiler.full_path(), numos_spirv_dir, '@OUTPUT0@' ]
+numos_lib_args = dxvk_is_msvc ? ['/D_CRT_SECURE_NO_WARNINGS'] : []
+if numos_optimize_passes
+  numos_shader_outputs += ['numos_passes_release.inc']
+  numos_shader_command += [ '--spirv-opt', spirv_opt.full_path(), '--spirv-val', spirv_val.full_path(), '--table', '@OUTPUT1@' ]
+  numos_release_table = fs.as_posix(join_paths(meson.current_build_dir(), 'numos_passes_release.inc'))
+  numos_lib_args += [ '-DNUMOS_PASS_TABLE_FILE="' + numos_release_table + '"' ]
+endif
+
 numos_shaders = custom_target(
   'numos_shaders',
   build_by_default: true,
-  output: ['_numos_shaders.txt'],
-  depend_files: files('../../submodules/numos/src/generated/passes.inc'),
-  command: [ python_interpreter, numos_shader_script, 'build', numos_root, slang_compiler.full_path(), numos_spirv_dir, '@OUTPUT@' ]
+  output: numos_shader_outputs,
+  depend_files: files('../../submodules/numos/src/generated/passes.inc', '../../scripts-common/numos_shaders.py'),
+  command: numos_shader_command
 )
 
-numos_lib = static_library('numos', files([
+# The release pass table must exist before the library compiles.
+numos_lib = static_library('numos', numos_optimize_passes ? [numos_shaders] : [], files([
     '../../submodules/numos/src/celestial.cpp',
     '../../submodules/numos/src/ground_field.cpp',
     '../../submodules/numos/src/layout.cpp',
@@ -641,7 +662,7 @@ numos_lib = static_library('numos', files([
   ]),
   include_directories : include_directories('../../submodules/numos/include', '../../submodules/numos/shaders', '../../submodules/numos/src'),
   override_options    : ['cpp_std='+dxvk_cpp_std],
-  cpp_args            : dxvk_is_msvc ? ['/D_CRT_SECURE_NO_WARNINGS'] : []
+  cpp_args            : numos_lib_args
 )
 
 numos_dep = declare_dependency(
@@ -672,6 +693,7 @@ dxvk_deps += [ fsr3_dep ]
 # NV-DXVK end
 
 dxvk_deps += [ numos_dep ]
+
 
 if enable_rtxio
   dxvk_deps += rtxio_dep

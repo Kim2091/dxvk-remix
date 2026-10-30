@@ -80,7 +80,7 @@ public:
 
   bool isCreatedThisFrame(uint32_t frameIndex) const { return frameIndex == m_frameCreated; }
   uint32_t getFrameCreated() const { return m_frameCreated; }
-  // Young cluster buckets (rtx.accel.clusterYoungFrames).
+  // rtx.accel.staticClusters young buckets.
   bool isCreatedWithinFrames(uint32_t frameIndex, uint32_t frames) const {
     return m_frameCreated != kInvalidFrameIndex && m_frameCreated <= frameIndex && frameIndex - m_frameCreated < frames;
   }
@@ -227,16 +227,29 @@ uint32_t getFirstBillboardIndex() const { return m_firstBillboard; }
     m_retainedPinGeneration = generation;
   }
 
-  // The retained handle of the scene entry that owns this instance (0 = none). Only
+  // rtx.retained.useV2: tag of the retained-v2 entry that holds this instance (slot and hold serial,
+  // see RetainedInstanceStore). A tag whose serial no longer matches the entry's means "not held";
+  // only RetainedInstanceStore interprets it. Not copied by copyInstanceDataFrom.
+  uint64_t getRetainedV2Tag() const { return m_retainedV2Tag; }
+  void setRetainedV2Tag(uint64_t tag) { m_retainedV2Tag = tag; }
+
+  // rtx.scene.directRetained: the retained handle of the scene entry that owns this instance (0 = none). Only
   // RetainedScene reads or writes it; not copied by copyInstanceDataFrom.
   uint64_t getSceneOwnedHandle() const { return m_sceneOwnedHandle; }
   void setSceneOwnedHandle(uint64_t handle) { m_sceneOwnedHandle = handle; }
+
+  // rtx.accel.originTranslation: true when RetainedScene moves this instance with the scene origin. Only RetainedScene
+  // sets it; not copied by copyInstanceDataFrom.
+  bool followsSceneOrigin() const { return m_followsSceneOrigin; }
+  void setFollowsSceneOrigin(bool follows) { m_followsSceneOrigin = follows; }
 
 private:
   uint64_t m_accelBucketUid = 0;
   uint64_t m_retainedPinHandle = 0;
   uint64_t m_retainedPinGeneration = 0;
+  uint64_t m_retainedV2Tag = 0;
   uint64_t m_sceneOwnedHandle = 0;
+  bool m_followsSceneOrigin = false;
 
   Matrix4 calcFirstInstanceObjectToWorld() {
     if (surface.instancesToObject) {
@@ -312,6 +325,11 @@ private:
 
 public:
   bool isFrontFaceFlipped = false;
+  // Written every frame by SccrShellManager's instance
+  // walk (before mergeInstancesIntoBlas): the instance may use a tessellated mesh
+  // (SccrShellManager::isRealGeometryCandidate), so it gets its own TLAS entry (never a merged bucket). Sits in the
+  // padding after isFrontFaceFlipped.
+  bool isRealGeometry = false;
 
   std::vector<uint32_t> billboardIndices;
   std::vector<uint32_t> indexOffsets;
@@ -328,7 +346,7 @@ struct InstanceEventHandler {
   // The MaterialData pointer is non-null on the dynamic update path and null on the
   // preserve path (RtInstance::surface.isPreservePath is set iff the pointer is null).
   // Handlers must null-check or short-circuit on isPreservePath before reading material.
-  std::function<void(RtInstance&, const SceneDraw& drawCall, const MaterialData*, bool, bool, bool)> onInstanceUpdatedCallback;
+  std::function<void(RtInstance&, const DrawCallState& drawCall, const MaterialData*, bool, bool, bool)> onInstanceUpdatedCallback;
   // Callback triggered whenever an instance has been removed from the database
   std::function<void(RtInstance&)> onInstanceDestroyedCallback;
 
@@ -358,7 +376,7 @@ struct IntersectionBillboard {
 // InstanceManager is responsible for maintaining the active set of scene instances
 //  and the GPU buffers which are required by VK for instancing.
 class InstanceManager : public CommonDeviceObject {
-  // RetainedScene predicts the alpha state (unordered / decal) before it creates an instance.
+  // rtx.scene.directRetained: predicts the alpha state (unordered / decal) before it creates an instance.
   friend class RetainedScene;
   friend class TransientLane;
 public:
@@ -370,7 +388,7 @@ public:
 
   // For frontends: the alpha state an instance of this draw would get (unordered / decal),
   // before handing the draw to the scene.
-  static RtSurface::AlphaState predictAlphaState(const SceneDraw& drawCall, const MaterialData& materialData) {
+  static RtSurface::AlphaState predictAlphaState(const DrawCallState& drawCall, const MaterialData& materialData) {
     return calculateAlphaState(drawCall, materialData);
   }
 
@@ -410,23 +428,30 @@ public:
   // categories, so a caller that wants it to stay hidden must re-apply it.
   void setInstanceHiddenExternally(RtInstance& instance, bool hidden);
 
-  // A transform-only change of an instance whose draw state is otherwise unchanged.
+  // rtx.retained.useV2: a transform-only change of an instance whose draw state is otherwise unchanged.
   // Does for the instance what updateInstance does when only objectToWorld differs -- history (the
   // previous transform becomes the old current one), the static flag, the BLAS-dirty flag, the
   // moved-geometry frame and the scene generation (only if the transform really changed) -- without
   // re-deriving material, flags, mask or billboards. The instance is left off the preserve path for
   // this frame, as updateInstance leaves it, so the next preserve re-syncs its history.
   // Refuses (returns false, changes nothing) when the result would differ from updateInstance in
-  // anything else: a world-space UI background offset, a mirroring change, or an instance already
-  // updated this frame. A host-instanced (point instancer) instance is accepted: its per-instance
-  // transforms are relative to objectToWorld and read per frame by the point-instancer batches.
-  // worldSpaceUiOffset is RtxOptions::worldSpaceUiBackgroundOffset(), read once by the caller.
-  // notifyScene=false leaves the scene-generation bump to the caller (one bump for a batch; *outMoved
-  // says whether one is due). Touches only the instance and its BlasEntry's frameLastInstanceMoved
-  // (same value from every caller), so distinct instances may be relocated on different threads with
-  // notifyScene=false.
+  // anything else: a GPU-instanced (point instancer) draw, a world-space UI background offset, a
+  // mirroring change, or an instance already updated this frame. worldSpaceUiOffset is
+  // RtxOptions::worldSpaceUiBackgroundOffset(), read once by the caller. notifyScene=false leaves the
+  // scene-generation bump to the caller (one bump for a batch; *outMoved says whether one is due).
+  // Touches only the instance and its BlasEntry's frameLastInstanceMoved (same value from every
+  // caller), so distinct instances may be relocated on different threads with notifyScene=false.
   bool relocateExternally(RtInstance& instance, const Matrix4& objectToWorld, CameraType::Enum cameraType,
                           float worldSpaceUiOffset, bool notifyScene, bool* outMoved);
+  // rtx.scene.directRetained: the same for a host-instanced (point instancer) instance. Its per-instance
+  // transforms are relative to objectToWorld and read per frame by the point-instancer batches (current and previous
+  // objectToWorld), so a transform-only change needs nothing else.
+  bool relocateInstancerExternally(RtInstance& instance, const Matrix4& objectToWorld, CameraType::Enum cameraType,
+                                   float worldSpaceUiOffset, bool notifyScene, bool* outMoved);
+private:
+  bool relocate(RtInstance& instance, const Matrix4& objectToWorld, CameraType::Enum cameraType,
+                float worldSpaceUiOffset, bool notifyScene, bool* outMoved, bool allowInstancer);
+public:
 
   void onFrameEnd();
 
@@ -452,7 +477,7 @@ public:
   // ExternalDrawState), replace the alpha state and legacy surface state derived from drawCall.
   RtInstance* processSceneObject(
     const CameraManager& cameraManager, const RayPortalManager& rayPortalManager,
-    BlasEntry& blas, const SceneDraw& drawCall, const MaterialData& materialData, RtInstance* existingInstance,
+    BlasEntry& blas, const DrawCallState& drawCall, const MaterialData& materialData, RtInstance* existingInstance,
     const RtSurface::AlphaState* alphaOverride = nullptr, const LegacySurfaceDesc* legacyOverride = nullptr);
 
   // Binds a raytracing material to the specified instance.
@@ -468,7 +493,7 @@ public:
   // onInstanceUpdatedCallback's contract above for the null-handling requirement.
   void preserveInstance(
       RtInstance& instance,
-      const SceneDraw& drawCall,
+      const DrawCallState& drawCall,
       const MaterialData* materialData,
       bool hasTransformChanged = false,
       bool hasPreviousPositions = false,
@@ -560,7 +585,7 @@ private:
   std::vector<uint8_t> m_gcMarkedScratch; // rtx.parallelScenePrepScans
 
   // Handles the case of when two (or more) identical geometries+textures draw calls have been submitted in a single frame (typically used for two-pass rendering in FF)
-  void mergeInstanceHeuristics(RtInstance& instanceToModify, const SceneDraw& drawCall, const RtSurface::AlphaState& alphaState) const;
+  void mergeInstanceHeuristics(RtInstance& instanceToModify, const DrawCallState& drawCall, const RtSurface::AlphaState& alphaState) const;
 
   void registerViewModelCandidate(RtInstance& instance);
 
@@ -573,15 +598,15 @@ private:
 
   void updateInstance(
       RtInstance& currentInstance, const CameraManager& cameraManager,
-      const BlasEntry& blas, const SceneDraw& drawCall, const MaterialData* materialData,
+      const BlasEntry& blas, const DrawCallState& drawCall, const MaterialData* materialData,
       const RtSurface::AlphaState* alphaOverride = nullptr, const LegacySurfaceDesc* legacyOverride = nullptr);
 
   void removeInstance(RtInstance* instance);
 
-  static RtSurface::AlphaState calculateAlphaState(const SceneDraw& drawCall, const MaterialData& materialData);
+  static RtSurface::AlphaState calculateAlphaState(const DrawCallState& drawCall, const MaterialData& materialData);
 
   // Modifies an instance given active developer options. Returns true if the instance was modified
-  bool applyDeveloperOptions(RtInstance& currentInstance, const SceneDraw& drawCall);
+  bool applyDeveloperOptions(RtInstance& currentInstance, const DrawCallState& drawCall);
 
   void createBillboards(RtInstance& instance, const Vector3& cameraViewDirection);
 

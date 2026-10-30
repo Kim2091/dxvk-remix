@@ -21,6 +21,9 @@
 #include "rtx_scene_manager.h"            // SceneManager::requestVramCompaction, requestTextureVramFree
 #include "rtx_asset_replacer.h"           // AssetReplacer::noteTextureReplaced
 
+#include "../../d3d9/d3d9_device.h"       // D3D9DeviceEx, LockDevice, EmitCs, GetDXVKDevice
+#include "../../d3d9/d3d9_texture.h"      // D3D9CommonTexture, GetCommonTexture
+
 #include "../../util/xxHash/xxhash.h"     // XXH64_hash_t
 
 #include <remix/remix_c.h>                // remixapi_ErrorCode, REMIXAPI_ERROR_CODE_*
@@ -42,8 +45,10 @@ extern "C" {
 #include <atomic>
 #include <cstdint>
 #include <cstring>                        // memcpy
+#include <mutex>
 #include <optional>
 #include <string>
+#include <unordered_map>
 
 namespace dxvk {
 namespace {
@@ -59,6 +64,15 @@ namespace {
   };
 
   std::optional<PendingScreenOverlay> s_pendingScreenOverlay;
+
+  // API-created textures by hash. createTexture registers every API texture here (in its EmitCs lambda) and
+  // destroyTexture removes it, so a "0x<hash>" material path resolves to an API texture whatever RtxTextureManager
+  // currently holds. Its table is emptied by clear() on scene transitions and by RequestTextureVramFree, after which a
+  // table scan would miss the texture forever. Written and read on the CS thread.
+  // Heap-allocated and never freed, because its image views must not be released by static destruction after the
+  // Vulkan device is gone.
+  std::mutex s_apiTexturesMutex;
+  std::unordered_map<uint64_t, TextureRef>& s_apiTextures = *new std::unordered_map<uint64_t, TextureRef>();
 
   // These hold the bridge's frame callbacks and whether a frame is open.
   // s_inFrame is atomic because a multi-threaded host can draw and present concurrently.
@@ -88,6 +102,15 @@ namespace fork_hooks {
       const uint64_t hash = std::stoull(pathStr, nullptr, 16);
       if (hash == 0) {
         return false;
+      }
+      // The direct API texture map survives RtxTextureManager::clear().
+      {
+        std::lock_guard lock { s_apiTexturesMutex };
+        const auto it = s_apiTextures.find(hash);
+        if (it != s_apiTextures.end()) {
+          outRef = it->second;
+          return true;
+        }
       }
       // API-created and imported textures use their hash as the unique key, so the cache's map finds them.
       // This runs for every texture slot of every host material, so it must not scan the table.
@@ -258,6 +281,43 @@ namespace fork_hooks {
     remixDevice->EmitCs([uiType](DxvkContext* ctx) {
       ctx->getCommonObjects()->getImgui().switchMenu(uiType);
     });
+    return REMIXAPI_ERROR_CODE_SUCCESS;
+  }
+
+  // Only hosts in external-swapchain mode (dxvk_CreateD3D9 with forceNoVkSwapchain) call this.
+  remixapi_ErrorCode getSharedD3D11TextureHandle(
+      RemixApiDevice* remixDevice,
+      void**        out_sharedHandle,
+      uint32_t*     out_width,
+      uint32_t*     out_height) {
+    if (!remixDevice) {
+      return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
+    }
+    if (!out_sharedHandle || !out_width || !out_height) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    return REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+  }
+
+  remixapi_ErrorCode dxvkGetTextureHash(
+      IDirect3DTexture9* texture,
+      uint64_t*          out_hash) {
+    if (!texture || !out_hash) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+
+    D3D9CommonTexture* commonTexture = GetCommonTexture(texture);
+    if (!commonTexture) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+
+    const Rc<DxvkImage>& image = commonTexture->GetImage();
+    if (image == nullptr) {
+      // The texture may live in system memory.
+      return REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+    }
+
+    *out_hash = image->getHash();
     return REMIXAPI_ERROR_CODE_SUCCESS;
   }
 
@@ -450,12 +510,23 @@ namespace fork_hooks {
         textureManager.addTexture(textureRef, 0, false, textureIndex);
       }
 
+      // Direct hash -> texture entry for "0x<hash>" material paths (see s_apiTextures).
+      {
+        std::lock_guard lock { s_apiTexturesMutex };
+        s_apiTextures[cHash] = textureRef;
+      }
+
       // Flag 1 (kTextureFlagsDefault) lets the texture be assigned to categories in the UI.
       ctx->getCommonObjects()->getImgui().AddTexture(cHash, cImageView, 1);
     });
 
     *out_handle = handle;
     return REMIXAPI_ERROR_CODE_SUCCESS;
+  }
+
+  void registerApiTexture(uint64_t hash, const TextureRef& ref) {
+    std::lock_guard lock { s_apiTexturesMutex };
+    s_apiTextures[hash] = ref;
   }
 
   remixapi_ErrorCode destroyTexture(
@@ -476,6 +547,11 @@ namespace fork_hooks {
       // The ImGui texture catalog holds its own reference from createTexture's AddTexture.
       // Release it too, or the image is never freed.
       ctx->getCommonObjects()->getImgui().ReleaseTexture(cHash);
+
+      {
+        std::lock_guard lock { s_apiTexturesMutex };
+        s_apiTextures.erase(cHash);
+      }
 
       // CreateTexture and ImportD3D11Texture register under the hash as the unique key, so look it up directly.
       // A host can release hundreds of textures at once, so the table scan below is only a fallback

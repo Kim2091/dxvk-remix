@@ -15,6 +15,12 @@ namespace dxvk {
   // (every NUMOS setting, with a search).
   void showNumosSetup(DxvkContext* ctx);
 
+  // The user menu's haze and cloud controls, with player-facing tooltips. They change only the settings
+  // rtx_numos_settings.cpp flags as user settings, so the changes save to user.conf.
+  void showNumosUserHaze(DxvkContext* ctx);
+  void showNumosUserClouds(DxvkContext* ctx);
+  void showNumosUserNight(DxvkContext* ctx);
+
   // The Weather tab's summary of the weather presets (rtx_numos_weather.h): what shows, and the button
   // that opens the Weather Presets window.
   void showWeatherPresetSummary(DxvkContext* ctx);
@@ -22,10 +28,4 @@ namespace dxvk {
   // The Weather Presets window: the preset editor (preset files, live preview, revert, weathers) and the
   // seed tools. Call it once per frame while the developer menu shows. It draws nothing while closed.
   void showWeatherPresetWindow(DxvkContext* ctx);
-
-  // The user menu's haze and cloud controls, with player-facing tooltips. They change only the settings
-  // rtx_numos_settings.cpp flags as user settings, so the changes save to user.conf.
-  void showNumosUserHaze(DxvkContext* ctx);
-  void showNumosUserClouds(DxvkContext* ctx);
-  void showNumosUserNight(DxvkContext* ctx);
 }

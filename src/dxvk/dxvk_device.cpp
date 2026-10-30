@@ -488,24 +488,6 @@ namespace dxvk {
   }
   
   
-  void DxvkDevice::submitCommandListWithStatus(
-    const Rc<DxvkCommandList>&      commandList,
-          DxvkSubmitStatus*         status) {
-    ScopedCpuProfileZone();
-    DxvkSubmitInfo submitInfo;
-    submitInfo.cmdList  = commandList;
-    submitInfo.waitSync = VK_NULL_HANDLE;
-    submitInfo.wakeSync = VK_NULL_HANDLE;
-    submitInfo.insertReflexRenderMarkers = false;
-    submitInfo.cachedReflexFrameId = 0;
-    m_submissionQueue.submit(submitInfo, status);
-
-    std::lock_guard<sync::Spinlock> statLock(m_statLock);
-    m_statCounters.merge(commandList->statCounters());
-    m_statCounters.addCtr(DxvkStatCounter::QueueSubmitCount, 1);
-  }
-
-
   VkResult DxvkDevice::waitForSubmission(DxvkSubmitStatus* status) {
     VkResult result = status->result.load();
 
@@ -619,7 +601,7 @@ namespace dxvk {
     m_referenceDenoiserSecondLobe2(device, DenoiserType::Reference),
     m_dlss(device),
     m_rayReconstruction(device),
-    m_neuralUplift(device),
+    m_dlssNeuralRendering(device),
     m_nis(device),
     m_taa(device),
     m_xess(device),
@@ -648,9 +630,10 @@ namespace dxvk {
 
     metaGeometryUtils().onDestroy();
     getSceneManager().onDestroy();
-    // The SCCR shell manager's scratch allocator holds a device reference.
+    // NV-DXVK start: SCCR shell tracing (its scratch allocator holds a device reference)
     metaSccrShell().onDestroy();
-    metaFrameExport().onDestroy();
+    metaSccrTess().onDestroy();
+    // NV-DXVK end
 
     m_primaryDirectLightDenoiser.get().onDestroy();
     m_primaryIndirectLightDenoiser.get().onDestroy();
@@ -660,7 +643,7 @@ namespace dxvk {
     m_referenceDenoiserSecondLobe1.get().onDestroy();
     m_referenceDenoiserSecondLobe2.get().onDestroy();
     m_rayReconstruction.get().onDestroy();
-    m_neuralUplift.get().onDestroy();
+    m_dlssNeuralRendering.get().onDestroy();
     m_dlss.get().onDestroy();
     m_dlfg.get().onDestroy();
     m_fsrFrameGen.get().onDestroy();

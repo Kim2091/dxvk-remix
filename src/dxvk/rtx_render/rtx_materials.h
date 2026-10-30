@@ -22,6 +22,8 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
+#include <cstddef>
 #include <memory>
 #include <variant>
 
@@ -36,7 +38,9 @@
 #include "rtx/pass/common_binding_indices.h"
 #include "rtx/pass/instance_definitions.h"
 #include "rtx/concept/surface_material/core_surface_material_shared.h"
+#include "../../dxso/dxso_util.h"
 #include "rtx_material_data.h"
+#include "rtx_fork_fnv_material.h"
 #include "../../lssusd/mdl_helpers.h"
 #include "rtx/pass/particles/particle_system_common.h"
 #include "dxvk_constant_state.h"
@@ -519,6 +523,10 @@ struct LegacyMaterialDefaults {
              "The grazing-angle Fresnel reflectivity (F90) of non-replaced legacy materials, from 0 to 1. 1 keeps "
              "standard Schlick Fresnel, and lower values reduce the white sheen at glancing angles. Replacement "
              "materials keep their standard Fresnel response.");
+  RTX_OPTION("rtx.legacyMaterial", bool, applyToApiMaterials, false,
+             "Shade materials created through the Remix API with the legacy material defaults above (specularLevel, "
+             "fresnelGrazing), as the D3D9 route's legacy materials are. For a host that converts its game materials to API "
+             "materials, so both routes look the same. Also applies to replacement assets. Read when a material is built.");
   RTX_OPTION("rtx.legacyMaterial", float, anisotropy, 0.f,
                   "The default roughness anisotropy to use for non-replaced \"legacy\" materials. "
                   "Should be in the range -1 to 1, where 0 is isotropic.");
@@ -692,6 +700,10 @@ enum class RtSurfaceMaterialType {
 
   // Extensions
   Subsurface,
+  // Terrain-layers extension (RtTerrainLayersMaterial), stored in the extension cache.
+  TerrainLayers,
+  // Per-layer height maps of a terrain-layers entry (RtTerrainLayersHeightMaterial).
+  TerrainLayersHeight,
 
   Count
 };
@@ -717,7 +729,11 @@ struct RtOpaqueSurfaceMaterial {
     bool albedoTextureIsSrgb = false, bool emissiveTextureIsSrgb = false,
     bool skyLitParticle = false, bool usesLegacyDefaults = false,
     uint16_t hostEncodingFlags = 0, float roughnessFloor = 0.0f,
-    uint32_t specularMetalPacked = 0
+    uint32_t specularMetalPacked = 0,
+    // FNV material protocol v2 and terrain-layers extension, see shared_constants.h.
+    bool normalRgbTangentSpace = false, bool roughnessFromNormalAlpha = false, bool emissiveTextureTinted = false,
+    uint32_t terrainLayersMaterialIndex = SURFACE_INDEX_INVALID,
+    bool normalAlphaIsGloss = false
   ) :
     m_albedoOpacityTextureIndex{ albedoOpacityTextureIndex }, m_secondaryTextureIndex{secondaryTextureIndex}, m_normalTextureIndex{ normalTextureIndex },
     m_tangentTextureIndex { tangentTextureIndex }, m_heightTextureIndex { heightTextureIndex }, m_roughnessTextureIndex{ roughnessTextureIndex },
@@ -738,7 +754,10 @@ struct RtOpaqueSurfaceMaterial {
     m_albedoTextureIsSrgb{ albedoTextureIsSrgb }, m_emissiveTextureIsSrgb{ emissiveTextureIsSrgb },
     m_skyLitParticle{ skyLitParticle }, m_usesLegacyDefaults{ usesLegacyDefaults },
     m_hostEncodingFlags{ hostEncodingFlags }, m_roughnessFloor{ roughnessFloor },
-    m_specularMetalPacked{ specularMetalPacked }
+    m_specularMetalPacked{ specularMetalPacked },
+    m_normalRgbTangentSpace{ normalRgbTangentSpace }, m_roughnessFromNormalAlpha{ roughnessFromNormalAlpha },
+    m_emissiveTextureTinted{ emissiveTextureTinted }, m_normalAlphaIsGloss{ normalAlphaIsGloss },
+    m_terrainLayersMaterialIndex{ terrainLayersMaterialIndex }
   {
     updateCachedData();
     updateCachedHash();
@@ -795,6 +814,13 @@ struct RtOpaqueSurfaceMaterial {
     // Already OPAQUE_SURFACE_MATERIAL_FLAG_* bits (host texture encodings).
     flags |= m_hostEncodingFlags;
 
+    // FNV features share data[27] and data[30-31]
+    // with the host encodings above, marked by OPAQUE_SURFACE_MATERIAL_FLAG_FNV_LAYOUT (see shared_constants.h).
+    if (usesFnvLayout()) {
+      flags |= OPAQUE_SURFACE_MATERIAL_FLAG_FNV_LAYOUT;
+    } else if (m_hostEncodingFlags != 0 && (fnvFlagsWord() != 0 || m_terrainLayersMaterialIndex != SURFACE_INDEX_INVALID)) {
+      ONCE(Logger::warn("[RTX] A material has both host texture encodings and FNV material features; the FNV features are ignored."));
+    }
     if (hasValidDisplacement()) {
       flags |= OPAQUE_SURFACE_MATERIAL_FLAG_HAS_DISPLACEMENT;
     }
@@ -865,12 +891,19 @@ struct RtOpaqueSurfaceMaterial {
 
     // data[26]
     writeGPUHelperExplicit<2>(data, offset, m_samplerFeedbackStamp);
-    writeGPUHelper(data, offset, glm::packHalf1x16(m_roughnessFloor));
+    // data[27]: roughnessFloor, or the FNV flags word on an FNV-layout material.
+    if (usesFnvLayout()) {
+      writeGPUHelper(data, offset, fnvFlagsWord());
+    } else {
+      writeGPUHelper(data, offset, glm::packHalf1x16(m_roughnessFloor));
+    }
 
     writeGPUHelper(data, offset, m_cachedDLSSControlMask);
 
-    // data[30-31]: specularMetalParams, specularMetalTint (see surface_material.h)
-    writeGPUHelper(data, offset, m_specularMetalPacked);
+    // data[30-31]: specularMetalParams, specularMetalTint (see surface_material.h), or on an FNV-layout
+    // material the terrain-layers extension index (SURFACE_INDEX_INVALID when unused).
+    assert(m_terrainLayersMaterialIndex == SURFACE_INDEX_INVALID || m_terrainLayersMaterialIndex <= SURFACE_INDEX_MAX_VALUE);
+    writeGPUHelper(data, offset, usesFnvLayout() ? m_terrainLayersMaterialIndex : m_specularMetalPacked);
     assert(offset - oldOffset == kSurfaceMaterialGPUSize);
   }
 
@@ -946,8 +979,17 @@ struct RtOpaqueSurfaceMaterial {
     return m_heightTextureIndex;
   }
 
-  // The height texture is a derived height+cone texture (PomConeMapManager). Not hashed: only a derived texture's index
-  // can carry it, so it follows from the height texture index.
+  // The authored depths, before the displacement factors writeGPUData applies.
+  float getDisplaceIn() const {
+    return m_displaceIn;
+  }
+
+  float getDisplaceOut() const {
+    return m_displaceOut;
+  }
+
+  // The height texture is a derived height+cone texture (PomConeMapManager). Not hashed: only a derived
+  // texture's index can carry it, so it follows from heightTextureIndex.
   void setPomConeAvailable(bool pomConeAvailable) {
     m_pomConeAvailable = pomConeAvailable;
   }
@@ -1005,6 +1047,26 @@ struct RtOpaqueSurfaceMaterial {
     return m_isRaytracedRenderTarget;
   }
 
+  // The index of the RtTerrainLayersMaterial entry in the extension cache, or SURFACE_INDEX_INVALID.
+  uint32_t getTerrainLayersMaterialIndex() const {
+    return m_terrainLayersMaterialIndex;
+  }
+
+  // The legacy-protocol flags word (OPAQUE_SURFACE_MATERIAL_FLAG_NORMAL_RGB_TANGENT_SPACE etc., shared_constants.h).
+  uint16_t fnvFlagsWord() const {
+    return uint16_t((m_normalRgbTangentSpace ? OPAQUE_SURFACE_MATERIAL_FLAG_NORMAL_RGB_TANGENT_SPACE : 0) |
+                    (m_roughnessFromNormalAlpha ? OPAQUE_SURFACE_MATERIAL_FLAG_ROUGHNESS_FROM_NORMAL_ALPHA : 0) |
+                    (m_emissiveTextureTinted ? OPAQUE_SURFACE_MATERIAL_FLAG_EMISSIVE_TEXTURE_TINTED : 0) |
+                    // NORMAL_ALPHA_IS_GLOSS only qualifies ROUGHNESS_FROM_NORMAL_ALPHA.
+                    (m_roughnessFromNormalAlpha && m_normalAlphaIsGloss ? OPAQUE_SURFACE_MATERIAL_FLAG_NORMAL_ALPHA_IS_GLOSS : 0));
+  }
+
+  // These features are written in the alternate layout (OPAQUE_SURFACE_MATERIAL_FLAG_FNV_LAYOUT).
+  // Host-encoded materials keep the default layout and drop them.
+  bool usesFnvLayout() const {
+    return m_hostEncodingFlags == 0 && (fnvFlagsWord() != 0 || m_terrainLayersMaterialIndex != SURFACE_INDEX_INVALID);
+  }
+
   // Read-only access to fields writeGPUData encodes, for the live counts and the material census.
   bool getEnableThinFilm() const { return m_enableThinFilm; }
   bool getIsHairCard() const { return m_isHairCard; }
@@ -1029,7 +1091,8 @@ struct RtOpaqueSurfaceMaterial {
 private:
   void updateCachedHash() {
     static_assert(
-      sizeof(*this) == 160,
+      // FO4 host-encoding members + FNV protocol/terrain-layers members (both hashed below).
+      sizeof(*this) == 168,
       "add new member for hashing if needed: add a MEMBER into the struct + add a VALUE into the list-init"
     );
     struct HashStruct {
@@ -1067,6 +1130,8 @@ private:
       uint32_t hostEncodingFlags;
       float roughnessFloor;
       uint32_t specularMetalPacked;
+      uint32_t forkFnvFlags;              // normalRgbTangentSpace | roughnessFromNormalAlpha << 1 | emissiveTextureTinted << 2 | normalAlphaIsGloss << 3
+      uint32_t terrainLayersMaterialIndex;
       // NOTE: There must be NO padding between members, as the struct is used for hashing
     };
     HashStruct hashData = HashStruct{
@@ -1104,6 +1169,9 @@ private:
       m_hostEncodingFlags,
       m_roughnessFloor,
       m_specularMetalPacked,
+      (m_normalRgbTangentSpace ? 1u : 0u) | (m_roughnessFromNormalAlpha ? 2u : 0u) | (m_emissiveTextureTinted ? 4u : 0u) |
+        (m_normalAlphaIsGloss ? 8u : 0u),
+      m_terrainLayersMaterialIndex,
     };
     m_cachedHash = hashStructByMemory<HashStruct,
       &HashStruct::albedoOpacityTextureIndex,
@@ -1139,7 +1207,9 @@ private:
       &HashStruct::usesLegacyDefaults,
       &HashStruct::hostEncodingFlags,
       &HashStruct::roughnessFloor,
-      &HashStruct::specularMetalPacked>(hashData);
+      &HashStruct::specularMetalPacked,
+      &HashStruct::forkFnvFlags,
+      &HashStruct::terrainLayersMaterialIndex>(hashData);
   }
 
   void updateCachedData() {
@@ -1213,6 +1283,12 @@ private:
   uint16_t m_samplerFeedbackStamp;
   // Sits in padding, so sizeof is unchanged.
   bool m_pomConeAvailable = false;
+
+  bool m_normalRgbTangentSpace;
+  bool m_roughnessFromNormalAlpha;
+  bool m_emissiveTextureTinted;
+  bool m_normalAlphaIsGloss;
+  uint32_t m_terrainLayersMaterialIndex;
 
   XXH64_hash_t m_cachedHash;
 
@@ -1810,6 +1886,218 @@ private:
   XXH64_hash_t m_cachedHash;
 };
 
+// Terrain-layers extension (remixapi_MaterialInfoTerrainLayersEXT). Side-load data of an opaque material, stored
+// in the surface-material extension cache and referenced by RtOpaqueSurfaceMaterial::m_terrainLayersMaterialIndex.
+// GPU layout: TerrainLayersMaterial in surface_material.h. Blend: forkTerrainLayersBlend in
+// opaque_surface_material_interaction.slangh.
+struct RtTerrainLayersMaterial {
+  static constexpr uint32_t kMaxLayers = TERRAIN_LAYERS_MATERIAL_MAX_LAYERS;
+
+  RtTerrainLayersMaterial(
+    uint32_t layerCount,
+    const std::array<uint32_t, kMaxLayers>& albedoTextureIndices,
+    const std::array<uint32_t, kMaxLayers>& normalTextureIndices,
+    uint32_t weightTextureIndex0, uint32_t weightTextureIndex1, uint32_t tintTextureIndex,
+    uint32_t weightSamplerIndex,
+    const Vector2& weightUvScale, const Vector2& weightUvOffset,
+    bool normalsRgbTangentSpace,
+    uint32_t layerGlossMask = 0,
+    const std::array<uint32_t, kMaxLayers>* heightTextureIndices = nullptr,
+    uint32_t heightMaterialIndex = SURFACE_INDEX_INVALID) :
+    m_layerCount { std::min(layerCount, kMaxLayers) },
+    m_albedoTextureIndices { albedoTextureIndices },
+    m_normalTextureIndices { normalTextureIndices },
+    m_weightTextureIndex0 { weightTextureIndex0 },
+    m_weightTextureIndex1 { weightTextureIndex1 },
+    m_tintTextureIndex { tintTextureIndex },
+    m_weightSamplerIndex { weightSamplerIndex },
+    m_weightUvScale { weightUvScale },
+    m_weightUvOffset { weightUvOffset },
+    m_normalsRgbTangentSpace { normalsRgbTangentSpace ? 1u : 0u },
+    m_layerGlossMask { layerGlossMask & ((1u << kMaxLayers) - 1u) },
+    m_heightMaterialIndex { heightMaterialIndex } {
+    if (heightTextureIndices) {
+      m_heightTextureIndices = *heightTextureIndices;
+    } else {
+      m_heightTextureIndices.fill(kSurfaceMaterialInvalidTextureIndex);
+    }
+    updateCachedHash();
+  }
+
+  void writeGPUData(unsigned char* data, std::size_t& offset) const {
+    [[maybe_unused]] const std::size_t oldOffset = offset;
+
+    const uint16_t flags = uint16_t(
+      (m_normalsRgbTangentSpace ? TERRAIN_LAYERS_MATERIAL_FLAG_NORMALS_RGB_TANGENT_SPACE : 0) |
+      (m_layerGlossMask << TERRAIN_LAYERS_MATERIAL_FLAG_LAYER_GLOSS_SHIFT));
+
+    // data[0-1]
+    writeGPUHelperExplicit<2>(data, offset, flags);
+    writeGPUHelperExplicit<2>(data, offset, m_layerCount);
+    // data[2-9]
+    for (uint32_t i = 0; i < kMaxLayers; ++i) {
+      writeGPUHelperExplicit<2>(data, offset, m_albedoTextureIndices[i]);
+    }
+    // data[10-17]
+    for (uint32_t i = 0; i < kMaxLayers; ++i) {
+      writeGPUHelperExplicit<2>(data, offset, m_normalTextureIndices[i]);
+    }
+    // data[18-21]
+    writeGPUHelperExplicit<2>(data, offset, m_weightTextureIndex0);
+    writeGPUHelperExplicit<2>(data, offset, m_weightTextureIndex1);
+    writeGPUHelperExplicit<2>(data, offset, m_tintTextureIndex);
+    writeGPUHelperExplicit<2>(data, offset, m_weightSamplerIndex);
+    // data[22-29]
+    writeGPUHelper(data, offset, m_weightUvScale.x);
+    writeGPUHelper(data, offset, m_weightUvScale.y);
+    writeGPUHelper(data, offset, m_weightUvOffset.x);
+    writeGPUHelper(data, offset, m_weightUvOffset.y);
+    // data[30-31]: terrain POM, index of the RtTerrainLayersHeightMaterial entry or SURFACE_INDEX_INVALID
+    assert(m_heightMaterialIndex == SURFACE_INDEX_INVALID || m_heightMaterialIndex <= SURFACE_INDEX_MAX_VALUE);
+    writeGPUHelper(data, offset, m_heightMaterialIndex);
+
+    assert(offset - oldOffset == kSurfaceMaterialGPUSize);
+  }
+
+  bool operator==(const RtTerrainLayersMaterial& r) const {
+    return m_cachedHash == r.m_cachedHash;
+  }
+
+  bool validate() const {
+    return m_layerCount >= 1 && m_layerCount <= kMaxLayers;
+  }
+
+  XXH64_hash_t getHash() const {
+    return m_cachedHash;
+  }
+
+  // The RtTerrainLayersHeightMaterial entry, SURFACE_INDEX_INVALID when no layer has a height
+  // map. Only then does the march blend layer heights (pomHeightSourceCreate); otherwise the owning opaque material's own
+  // heightTextureIndex is marched, as for any mesh (FNV API statics use a one-layer entry just for the normal decode).
+  uint32_t getHeightMaterialIndex() const {
+    return m_heightMaterialIndex;
+  }
+
+  template<typename Fn>
+  void forEachTextureIndex(Fn&& fn) const {
+    for (uint32_t i = 0; i < kMaxLayers; ++i) {
+      fn(m_albedoTextureIndices[i]);
+      fn(m_normalTextureIndices[i]);
+    }
+    fn(m_weightTextureIndex0);
+    fn(m_weightTextureIndex1);
+    fn(m_tintTextureIndex);
+    // The height maps live in the RtTerrainLayersHeightMaterial entry the GPU data points at,
+    // but texture residency follows this entry (the only one the owning opaque material references).
+    for (uint32_t i = 0; i < kMaxLayers; ++i) {
+      fn(m_heightTextureIndices[i]);
+    }
+  }
+
+private:
+  void updateCachedHash() {
+    static_assert(sizeof(*this) == 152,
+      "add new member for hashing if needed: the hash covers every member before m_cachedHash");
+    // All members before m_cachedHash are 4-byte scalars/arrays with no padding between them (144 = 8-aligned,
+    // so no tail padding is hashed either).
+    static_assert(offsetof(RtTerrainLayersMaterial, m_cachedHash) == 144);
+    m_cachedHash = XXH3_64bits(this, offsetof(RtTerrainLayersMaterial, m_cachedHash));
+  }
+
+  uint32_t m_layerCount;
+  std::array<uint32_t, kMaxLayers> m_albedoTextureIndices;
+  std::array<uint32_t, kMaxLayers> m_normalTextureIndices;
+  uint32_t m_weightTextureIndex0;
+  uint32_t m_weightTextureIndex1;
+  uint32_t m_tintTextureIndex;
+  uint32_t m_weightSamplerIndex;
+  Vector2 m_weightUvScale;
+  Vector2 m_weightUvOffset;
+  uint32_t m_normalsRgbTangentSpace;
+  uint32_t m_layerGlossMask; // bit i: layer i's normal alpha is gloss (TERRAIN_LAYERS_MATERIAL_FLAG_LAYER_GLOSS_SHIFT)
+  // Per-layer height texture indices (CPU side, residency) and the GPU height entry.
+  std::array<uint32_t, kMaxLayers> m_heightTextureIndices;
+  uint32_t m_heightMaterialIndex;
+
+  XXH64_hash_t m_cachedHash;
+};
+
+// Per-layer height maps of a terrain-layers entry, in their own extension entry because the
+// TerrainLayersMaterial GPU entry is full. Referenced by RtTerrainLayersMaterial's data[30-31]; GPU layout:
+// TerrainLayersHeightMaterial in surface_material.h; read by pomHeightSourceCreate in
+// opaque_surface_material_interaction.slangh.
+struct RtTerrainLayersHeightMaterial {
+  static constexpr uint32_t kMaxLayers = TERRAIN_LAYERS_MATERIAL_MAX_LAYERS;
+
+  // coneMask (SCCR terrain): bit i = heightTextureIndices[i] is a conservative height+cone texture
+  // (PomConeMapManager::ConeVariant::Conservative); masked to the layers that have a height map.
+  explicit RtTerrainLayersHeightMaterial(const std::array<uint32_t, kMaxLayers>& heightTextureIndices,
+                                         uint32_t coneMask = 0) :
+    m_heightTextureIndices { heightTextureIndices } {
+    m_layerMask = 0;
+    for (uint32_t i = 0; i < kMaxLayers; ++i) {
+      if (m_heightTextureIndices[i] != kSurfaceMaterialInvalidTextureIndex) {
+        m_layerMask |= 1u << i;
+      }
+    }
+    m_coneMask = coneMask & m_layerMask;
+    updateCachedHash();
+  }
+
+  void writeGPUData(unsigned char* data, std::size_t& offset) const {
+    [[maybe_unused]] const std::size_t oldOffset = offset;
+
+    // data[0-1]: layerMask, coneMask
+    writeGPUHelperExplicit<2>(data, offset, m_layerMask);
+    writeGPUHelperExplicit<2>(data, offset, m_coneMask);
+    // data[2-9]
+    for (uint32_t i = 0; i < kMaxLayers; ++i) {
+      writeGPUHelperExplicit<2>(data, offset, m_heightTextureIndices[i]);
+    }
+    // data[10-31]
+    writeGPUPadding<44>(data, offset);
+
+    assert(offset - oldOffset == kSurfaceMaterialGPUSize);
+  }
+
+  bool operator==(const RtTerrainLayersHeightMaterial& r) const {
+    return m_cachedHash == r.m_cachedHash;
+  }
+
+  bool validate() const {
+    return m_layerMask != 0;
+  }
+
+  XXH64_hash_t getHash() const {
+    return m_cachedHash;
+  }
+
+  uint32_t getLayerMask() const {
+    return m_layerMask;
+  }
+
+  template<typename Fn>
+  void forEachTextureIndex(Fn&& fn) const {
+    for (uint32_t i = 0; i < kMaxLayers; ++i) {
+      fn(m_heightTextureIndices[i]);
+    }
+  }
+
+private:
+  void updateCachedHash() {
+    static_assert(sizeof(*this) == 48,
+      "add new member for hashing if needed: the hash covers every member before m_cachedHash");
+    static_assert(offsetof(RtTerrainLayersHeightMaterial, m_cachedHash) == 40);
+    m_cachedHash = XXH3_64bits(this, offsetof(RtTerrainLayersHeightMaterial, m_cachedHash));
+  }
+
+  std::array<uint32_t, kMaxLayers> m_heightTextureIndices;
+  uint32_t m_layerMask;
+  uint32_t m_coneMask = 0; // SCCR terrain. Hashed: it changes the GPU data
+
+  XXH64_hash_t m_cachedHash;
+};
+
 struct RtSurfaceMaterial {
   RtSurfaceMaterial(const RtOpaqueSurfaceMaterial& opaqueSurfaceMaterial) :
     m_type{ RtSurfaceMaterialType::Opaque },
@@ -1826,6 +2114,16 @@ struct RtSurfaceMaterial {
   RtSurfaceMaterial(const RtSubsurfaceMaterial& subsurfaceMaterial) :
     m_type { RtSurfaceMaterialType::Subsurface },
     m_subsurfaceMaterial { subsurfaceMaterial } {}
+
+  // Terrain-layers extension entry.
+  RtSurfaceMaterial(const RtTerrainLayersMaterial& terrainLayersMaterial) :
+    m_type { RtSurfaceMaterialType::TerrainLayers },
+    m_terrainLayersMaterial { terrainLayersMaterial } {}
+
+  // Terrain-layers height entry (terrain POM).
+  RtSurfaceMaterial(const RtTerrainLayersHeightMaterial& terrainLayersHeightMaterial) :
+    m_type { RtSurfaceMaterialType::TerrainLayersHeight },
+    m_terrainLayersHeightMaterial { terrainLayersHeightMaterial } {}
 
   RtSurfaceMaterial(const RtSurfaceMaterial& surfaceMaterial) :
     m_type{ surfaceMaterial.m_type } {
@@ -1845,6 +2143,12 @@ struct RtSurfaceMaterial {
       break;
     case RtSurfaceMaterialType::Subsurface:
       new (&m_subsurfaceMaterial) RtSubsurfaceMaterial { surfaceMaterial.m_subsurfaceMaterial };
+      break;
+    case RtSurfaceMaterialType::TerrainLayers:
+      new (&m_terrainLayersMaterial) RtTerrainLayersMaterial { surfaceMaterial.m_terrainLayersMaterial };
+      break;
+    case RtSurfaceMaterialType::TerrainLayersHeight:
+      new (&m_terrainLayersHeightMaterial) RtTerrainLayersHeightMaterial { surfaceMaterial.m_terrainLayersHeightMaterial };
       break;
     }
   }
@@ -1867,6 +2171,12 @@ struct RtSurfaceMaterial {
     case RtSurfaceMaterialType::Subsurface:
       m_subsurfaceMaterial.~RtSubsurfaceMaterial();
       break;
+    case RtSurfaceMaterialType::TerrainLayers:
+      m_terrainLayersMaterial.~RtTerrainLayersMaterial();
+      break;
+    case RtSurfaceMaterialType::TerrainLayersHeight:
+      m_terrainLayersHeightMaterial.~RtTerrainLayersHeightMaterial();
+      break;
     }
   }
 
@@ -1887,6 +2197,12 @@ struct RtSurfaceMaterial {
       break;
     case RtSurfaceMaterialType::Subsurface:
       m_subsurfaceMaterial.writeGPUData(data, offset);
+      break;
+    case RtSurfaceMaterialType::TerrainLayers:
+      m_terrainLayersMaterial.writeGPUData(data, offset);
+      break;
+    case RtSurfaceMaterialType::TerrainLayersHeight:
+      m_terrainLayersHeightMaterial.writeGPUData(data, offset);
       break;
     }
   }
@@ -1938,7 +2254,7 @@ struct RtSurfaceMaterial {
     offset += CORE_MATERIAL_EXT_SIZE;
   }
 
-  // The 64 B core record of one surface (core_surface_material_shared.h). It reads this material,
+  // The 64 B core record of one surface (rtx.coreMaterial.build, core_surface_material_shared.h). It reads this material,
   // the final per-surface state and the extension table, so call it in the same material GPU write batch as
   // writeGPUData. It never feeds a hash.
   // coreExtensionIndex is this material's core side table entry (SURFACE_INDEX_INVALID = none), stored in the tail.
@@ -2026,6 +2342,10 @@ struct RtSurfaceMaterial {
       return m_rayPortalSurfaceMaterial.validate();
     case RtSurfaceMaterialType::Subsurface:
       return m_subsurfaceMaterial.validate();
+    case RtSurfaceMaterialType::TerrainLayers:
+      return m_terrainLayersMaterial.validate();
+    case RtSurfaceMaterialType::TerrainLayersHeight:
+      return m_terrainLayersHeightMaterial.validate();
     }
 
     return false;
@@ -2052,6 +2372,12 @@ struct RtSurfaceMaterial {
       case RtSurfaceMaterialType::Subsurface:
         m_subsurfaceMaterial = rtSurfaceMaterial.m_subsurfaceMaterial;
         break;
+      case RtSurfaceMaterialType::TerrainLayers:
+        m_terrainLayersMaterial = rtSurfaceMaterial.m_terrainLayersMaterial;
+        break;
+      case RtSurfaceMaterialType::TerrainLayersHeight:
+        m_terrainLayersHeightMaterial = rtSurfaceMaterial.m_terrainLayersHeightMaterial;
+        break;
       }
     }
 
@@ -2077,6 +2403,10 @@ struct RtSurfaceMaterial {
       return m_rayPortalSurfaceMaterial == rhs.m_rayPortalSurfaceMaterial;
     case RtSurfaceMaterialType::Subsurface:
       return m_subsurfaceMaterial == rhs.m_subsurfaceMaterial;
+    case RtSurfaceMaterialType::TerrainLayers:
+      return m_terrainLayersMaterial == rhs.m_terrainLayersMaterial;
+    case RtSurfaceMaterialType::TerrainLayersHeight:
+      return m_terrainLayersHeightMaterial == rhs.m_terrainLayersHeightMaterial;
     }
   }
 
@@ -2094,6 +2424,10 @@ struct RtSurfaceMaterial {
       return m_rayPortalSurfaceMaterial.getHash();
     case RtSurfaceMaterialType::Subsurface:
       return m_subsurfaceMaterial.getHash();
+    case RtSurfaceMaterialType::TerrainLayers:
+      return m_terrainLayersMaterial.getHash();
+    case RtSurfaceMaterialType::TerrainLayersHeight:
+      return m_terrainLayersHeightMaterial.getHash();
     }
   }
 
@@ -2125,6 +2459,13 @@ struct RtSurfaceMaterial {
     return m_subsurfaceMaterial;
   }
 
+  // An entry of the surface-material extension cache.
+  const RtTerrainLayersMaterial& getTerrainLayersMaterial() const {
+    assert(m_type == RtSurfaceMaterialType::TerrainLayers);
+
+    return m_terrainLayersMaterial;
+  }
+
   template<typename Fn>
   void forEachTextureIndex(Fn&& fn) const {
     switch (m_type) {
@@ -2144,6 +2485,12 @@ struct RtSurfaceMaterial {
     case RtSurfaceMaterialType::Subsurface:
       m_subsurfaceMaterial.forEachTextureIndex(fn);
       break;
+    case RtSurfaceMaterialType::TerrainLayers:
+      m_terrainLayersMaterial.forEachTextureIndex(fn);
+      break;
+    case RtSurfaceMaterialType::TerrainLayersHeight:
+      m_terrainLayersHeightMaterial.forEachTextureIndex(fn);
+      break;
     }
   }
 
@@ -2156,6 +2503,8 @@ private:
     RtTranslucentSurfaceMaterial m_translucentSurfaceMaterial;
     RtRayPortalSurfaceMaterial m_rayPortalSurfaceMaterial;
     RtSubsurfaceMaterial m_subsurfaceMaterial;
+    RtTerrainLayersMaterial m_terrainLayersMaterial;
+    RtTerrainLayersHeightMaterial m_terrainLayersHeightMaterial;
   };
 };
 
@@ -2207,16 +2556,6 @@ enum class MaterialDataType {
   Invalid
 };
 
-// A fixed-function material's colours, each as r, g, b, a, and its specular power. The layout is D3D9's material
-// record.
-struct FixedFunctionMaterial {
-  Vector4 diffuse;
-  Vector4 ambient;
-  Vector4 specular;
-  Vector4 emissive;
-  float power = 0.f;
-};
-
 // Note: For use with "Legacy" D3D9 material information
 struct LegacyMaterialData {
   static OpaqueMaterialData createDefault();
@@ -2224,14 +2563,13 @@ struct LegacyMaterialData {
   LegacyMaterialData()
   { }
 
-  // The legacy material of a draw shaded with the terrain bake's material: the baked albedo as its colour texture,
-  // read with the bake's sampler, and defaults otherwise.
-  static LegacyMaterialData fromBakedAlbedo(const TextureRef& albedo, const Rc<DxvkSampler>& sampler) {
-    LegacyMaterialData material;
-    material.colorTextures[0] = albedo;
-    material.samplers[0] = sampler;
-    material.updateCachedHash();
-    return material;
+  LegacyMaterialData(const TextureRef& colorTexture, const TextureRef& colorTexture2, const D3DMATERIAL9 material)
+    : d3dMaterial{ material }
+  {
+    // Note: Texture required to be populated for hashing to function
+    assert(!colorTexture.isImageEmpty());
+
+    updateCachedHash();
   }
 
   const XXH64_hash_t getHash() const {
@@ -2257,8 +2595,8 @@ struct LegacyMaterialData {
     return samplers[1];
   }
 
-  const FixedFunctionMaterial& getFixedFunctionMaterial() const {
-    return fixedFunctionMaterial;
+  const D3DMATERIAL9& getLegacyMaterial() const {
+    return d3dMaterial;
   }
 
   inline const bool usesTexture() const {
@@ -2293,6 +2631,11 @@ struct LegacyMaterialData {
       "  textureAlphaArg2Source: ", static_cast<int>(textureAlphaArg2Source), "\n",
       "  textureAlphaOperation: ", static_cast<int>(textureAlphaOperation), "\n",
       "  tFactor: ", tFactor, "\n",
+      // "  m_d3dMaterial.Diffuse: ", m_d3dMaterial.Diffuse, "\n",
+      // "  m_d3dMaterial.Ambient: ", m_d3dMaterial.Ambient, "\n",
+      // "  m_d3dMaterial.Specular: ", m_d3dMaterial.Specular, "\n",
+      // "  m_d3dMaterial.Emissive: ", m_d3dMaterial.Emissive, "\n",
+      // "  m_d3dMaterial.Power: ", m_d3dMaterial.Power, "\n",
       std::hex, "  m_colorTexture: 0x", colorTextures[0].getImageHash(), "\n",
       "  m_colorTexture2: 0x", colorTextures[1].getImageHash(), "\n",
       "  m_cachedHash: 0x", m_cachedHash, std::dec));
@@ -2318,23 +2661,24 @@ struct LegacyMaterialData {
   RtTextureArgSource textureAlphaArg2Source = RtTextureArgSource::None;
   DxvkRtTextureOperation textureAlphaOperation = DxvkRtTextureOperation::SelectArg1;
   uint32_t tFactor = 0xffffffff;  // Value for D3DRS_TEXTUREFACTOR, default value of is opaque white
-  FixedFunctionMaterial fixedFunctionMaterial;
+  D3DMATERIAL9 d3dMaterial = {};
   bool isTextureFactorBlend = false;
   bool isVertexColorBakedLighting = true;
+
+  // FNV legacy material protocol v2 capture (see rtx_fork_fnv_material.h). Inactive (modifier == 0) unless
+  // the draw set render state 149; does not participate in getHash() (replacement / texture-category key).
+  FnvLegacyProtocol fnvProtocol;
 
   void setHashOverride(XXH64_hash_t hash) {
     m_cachedHash = hash;
   }
 
-  const static uint32_t kMaxSupportedTextures = 2;
-
-  // Sets the colour texture at index and its sampler.
-  // resourceSlot is the frontend's binding slot of the texture, 0 when it has none.
-  void setColorTexture(uint32_t index, const TextureRef& texture, const Rc<DxvkSampler>& sampler, uint32_t resourceSlot) {
-    colorTextures[index] = texture;
-    samplers[index] = sampler;
-    colorTextureSlot[index] = resourceSlot;
-  }
+private:
+  friend class RtxContext;
+  friend struct D3D9Rtx;
+  friend class TerrainBaker;
+  friend class SceneManager;
+  friend struct FrontendSceneSeam;
 
   void updateCachedHash() {
     // Note: Currently only based on the color texture's data hash. This may have to be changed later to
@@ -2344,16 +2688,11 @@ struct LegacyMaterialData {
     m_cachedHash = colorTextures[0].getImageHash();
   }
 
-private:
-  friend class RtxContext;
-  friend class TerrainBaker;
-  friend class SceneManager;
-  friend struct FrontendSceneSeam;
-
+  const static uint32_t kMaxSupportedTextures = 2;
   TextureRef colorTextures[kMaxSupportedTextures] = {};
   Rc<DxvkSampler> samplers[kMaxSupportedTextures] = {};
-  // The frontend's binding slot of each texture, 0 for none.
-  uint32_t colorTextureSlot[kMaxSupportedTextures] = {};
+  static_assert(kInvalidResourceSlot == 0 && "Below initialization of all array members is only valid for a value of 0.");
+  uint32_t colorTextureSlot[kMaxSupportedTextures] = { kInvalidResourceSlot };
 
   XXH64_hash_t m_cachedHash = kEmptyHash;
 };

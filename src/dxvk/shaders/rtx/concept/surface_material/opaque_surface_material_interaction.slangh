@@ -254,6 +254,121 @@ float pomSampleHeight(uint16_t idx, uint16_t samplerIndex, float2 texcoord)
   return 1.0f - textures[nonuniformEXT(uint(idx))].SampleLevel(samplers[nonuniformEXT(uint(samplerIndex))], texcoord, 0).r;
 }
 
+// What a POM march samples. Either the material's own height map, or -- for an opaque material
+// whose terrain-layers entry carries per-layer height maps (TerrainLayersMaterial::heightMaterialIndex) -- the blended
+// height field of its layers:
+//   depth(uv) = sum_i w_i * (1 - height_i(uv).r) / sum_i w_i
+// with the same (unnormalised) layer weights as forkTerrainLayersBlend. A layer without a height map counts as flat
+// (depth 0 = white = the undisplaced surface, the convention of a missing height), so it pulls the blend towards the
+// surface in proportion to its weight. Approximation: the weights are read ONCE, at the weightUV of the texcoord the
+// march starts from, and held for the whole march (the weight maps vary over metres, a POM offset is a few
+// centimetres, and it keeps each step at one fetch per height layer instead of re-reading two weight maps).
+// The blended field has no max-filtered mip chain, so it always takes the raymarch, whatever rtx.displacement.mode;
+// in SCCR mode it marches its layered cone field instead (PomLayeredConeField, pom_sccr_terrain.slangh).
+struct PomHeightSource
+{
+  uint16_t samplerIndex;
+  uint16_t heightTextureIndex; // single-texture source
+  bool layered;                // blended terrain-layer source
+  uint layerMask;              // layered: layers with a height map and a weight > 0 at the start texcoord
+  uint coneMask;               // layered, SCCR terrain: those of layerMask whose texture has conservative cones
+  float invWeightSum;          // layered: 1 / sum of all layer weights (0 when none)
+  uint16_t layerHeightTextureIndices[TERRAIN_LAYERS_MATERIAL_MAX_LAYERS];
+  float layerWeights[TERRAIN_LAYERS_MATERIAL_MAX_LAYERS];
+};
+
+PomHeightSource pomHeightSourceCreate(OpaqueSurfaceMaterial opaqueSurfaceMaterial, float2 texcoord)
+{
+  PomHeightSource source;
+  source.samplerIndex = opaqueSurfaceMaterial.samplerIndex;
+  source.heightTextureIndex = opaqueSurfaceMaterial.heightTextureIndex;
+  source.layered = false;
+  source.layerMask = 0u;
+  source.coneMask = 0u;
+  source.invWeightSum = 0.0f;
+  [unroll]
+  for (uint i = 0; i < TERRAIN_LAYERS_MATERIAL_MAX_LAYERS; ++i)
+  {
+    source.layerHeightTextureIndices[i] = BINDING_INDEX_INVALID;
+    source.layerWeights[i] = 0.0f;
+  }
+
+  const uint terrainLayersMaterialIndex = opaqueSurfaceMaterialTerrainLayersIndex(opaqueSurfaceMaterial);
+  if (terrainLayersMaterialIndex == SURFACE_INDEX_INVALID)
+  {
+    return source;
+  }
+  const TerrainLayersMaterial terrainLayers =
+    terrainLayersMaterialCreate(surfaceMaterialExtensions[terrainLayersMaterialIndex]);
+  const uint heightMaterialIndex = uint(terrainLayers.heightMaterialIndex);
+  if (heightMaterialIndex == SURFACE_INDEX_INVALID)
+  {
+    return source;
+  }
+  const TerrainLayersHeightMaterial layerHeights =
+    terrainLayersHeightMaterialCreate(surfaceMaterialExtensions[heightMaterialIndex]);
+  source.layered = true;
+
+  const vec2 weightUv = texcoord * vec2(terrainLayers.weightUvScaleX, terrainLayers.weightUvScaleY) +
+                        vec2(terrainLayers.weightUvOffsetX, terrainLayers.weightUvOffsetY);
+  vec4 w0123 = vec4(0.0f);
+  vec4 w4567 = vec4(0.0f);
+  if (terrainLayers.weightTextureIndex0 != BINDING_INDEX_INVALID)
+  {
+    w0123 = textures[nonuniformEXT(uint(terrainLayers.weightTextureIndex0))].SampleLevel(
+      samplers[nonuniformEXT(uint(terrainLayers.weightSamplerIndex))], weightUv, 0);
+  }
+  if (terrainLayers.weightTextureIndex1 != BINDING_INDEX_INVALID)
+  {
+    w4567 = textures[nonuniformEXT(uint(terrainLayers.weightTextureIndex1))].SampleLevel(
+      samplers[nonuniformEXT(uint(terrainLayers.weightSamplerIndex))], weightUv, 0);
+  }
+
+  const uint layerCount = min(uint(terrainLayers.layerCount), uint(TERRAIN_LAYERS_MATERIAL_MAX_LAYERS));
+  const uint heightMask = uint(layerHeights.layerMask);
+  const uint coneMask = uint(layerHeights.coneMask);
+  float weightSum = 0.0f;
+  [unroll]
+  for (uint i = 0; i < TERRAIN_LAYERS_MATERIAL_MAX_LAYERS; ++i)
+  {
+    const float w = i < 4 ? w0123[i & 3] : w4567[i & 3];
+    if (i >= layerCount || w <= 0.0f)
+    {
+      continue;
+    }
+    weightSum += w;
+    if ((heightMask & (1u << i)) != 0)
+    {
+      source.layerMask |= 1u << i;
+      source.layerWeights[i] = w;
+      source.layerHeightTextureIndices[i] = layerHeights.heightTextureIndices[i];
+      source.coneMask |= coneMask & (1u << i);
+    }
+  }
+  source.invWeightSum = weightSum > 1e-5f ? 1.0f / weightSum : 0.0f;
+  return source;
+}
+
+// Same convention as pomSampleHeight: 0 = top of the height field (white), 1 = its bottom.
+float pomHeightSourceSample(PomHeightSource source, float2 texcoord)
+{
+  if (!source.layered)
+  {
+    return pomSampleHeight(source.heightTextureIndex, source.samplerIndex, texcoord);
+  }
+
+  float depth = 0.0f;
+  [unroll]
+  for (uint i = 0; i < TERRAIN_LAYERS_MATERIAL_MAX_LAYERS; ++i)
+  {
+    if ((source.layerMask & (1u << i)) != 0)
+    {
+      depth += source.layerWeights[i] * pomSampleHeight(source.layerHeightTextureIndices[i], source.samplerIndex, texcoord);
+    }
+  }
+  return depth * source.invWeightSum;
+}
+
 float2 pomGetStep(float3 direction, float layerSize, float totalHeight)
 {
   // convert tangent space direction to texcoord
@@ -270,6 +385,8 @@ float pomGetNumSamples(float3 direction)
 }
 
 #include "rtx/concept/surface_material/pom_sccr.slangh"
+// SCCR for blended terrain layers (PomHeightSource).
+#include "rtx/concept/surface_material/pom_sccr_terrain.slangh"
 
 float3 pomCalculateTexcoord(
   OpaqueSurfaceMaterial opaqueSurfaceMaterial,
@@ -278,6 +395,11 @@ float3 pomCalculateTexcoord(
   inout uint iterations)
 {
   if (cb.pomMode == DisplacementMode::SCCR) {
+    // Blended terrain layers march their layered cone field.
+    const PomHeightSource sccrHeightSource = pomHeightSourceCreate(opaqueSurfaceMaterial, surfaceInteraction.textureCoordinates);
+    if (sccrHeightSource.layered) {
+      return sccrTerrainCalculateTexcoord(opaqueSurfaceMaterial, sccrHeightSource, surfaceInteraction, viewDir, iterations);
+    }
     return sccrCalculateTexcoord(opaqueSurfaceMaterial, surfaceInteraction, viewDir, iterations);
   }
   // The sign bit of displaceIn marks a height texture with a cone channel (SCCR), so its magnitude is the depth.
@@ -286,7 +408,9 @@ float3 pomCalculateTexcoord(
   // TODO if the ray origin is below the displaceOut height, bad results happen.
   // need to account for that case.
   float3 direction = -float3(viewDir.xy, viewDir.z / totalHeight);
-  if (cb.pomMode == DisplacementMode::RaymarchPOM) {
+  // Blended terrain-layer heights, or the material's own height map.
+  const PomHeightSource heightSource = pomHeightSourceCreate(opaqueSurfaceMaterial, surfaceInteraction.textureCoordinates);
+  if (cb.pomMode == DisplacementMode::RaymarchPOM || (heightSource.layered && cb.pomMode != DisplacementMode::Off)) {
     float numLayers = pomGetNumSamples(viewDir);
     float layerSize = rcp(numLayers);
     float2 step = pomGetStep(viewDir, layerSize, totalHeight);
@@ -294,7 +418,7 @@ float3 pomCalculateTexcoord(
     float2 currTexcoord = surfaceInteraction.textureCoordinates;
 
     currTexcoord = currTexcoord + (step * numLayers * (1.f - neutralHeight));
-    float currHeight = pomSampleHeight(opaqueSurfaceMaterial.heightTextureIndex, opaqueSurfaceMaterial.samplerIndex, currTexcoord);
+    float currHeight = pomHeightSourceSample(heightSource, currTexcoord);
 
     // raymarch to find intersection
     float currDepth = 0.0f, prevHeight = 0.0f;
@@ -304,7 +428,7 @@ float3 pomCalculateTexcoord(
       iterations++;
       currTexcoord -= step;
       prevHeight = currHeight;
-      currHeight = pomSampleHeight(opaqueSurfaceMaterial.heightTextureIndex, opaqueSurfaceMaterial.samplerIndex, currTexcoord);
+      currHeight = pomHeightSourceSample(heightSource, currTexcoord);
       currDepth += layerSize;
     }
 
@@ -327,17 +451,21 @@ float3 pomCalculateTexcoord(
   return float3(surfaceInteraction.textureCoordinates, 1.f);
 }
 
-// depthScale (the world-unit depth scale of the primary march, sccrDepthScale) and shadowFootprintUv (the footprint of a
-// coarse indirect-light query, sccrIndirectShadowFootprint, or kSccrFullShadow for full detail) are read in SCCR mode
-// only.
 float pomSampleVisibility(
   OpaqueSurfaceMaterial opaqueSurfaceMaterial,
   float2 texcoord,
   float3 rayDirection,
+  // World-unit depth scale of the primary march (sccrDepthScale), and the footprint of a coarse
+  // indirect-light query (sccrIndirectShadowFootprint; kSccrFullShadow: full detail); the other modes ignore both.
   float depthScale = 1.0f,
   float shadowFootprintUv = kSccrFullShadow)
 {
   if (cb.pomMode == DisplacementMode::SCCR) {
+    // Blended terrain layers march their layered cone field.
+    const PomHeightSource sccrHeightSource = pomHeightSourceCreate(opaqueSurfaceMaterial, texcoord);
+    if (sccrHeightSource.layered) {
+      return sccrTerrainSampleVisibility(opaqueSurfaceMaterial, sccrHeightSource, texcoord, rayDirection, depthScale, shadowFootprintUv);
+    }
     return sccrSampleVisibility(opaqueSurfaceMaterial, texcoord, rayDirection, depthScale, shadowFootprintUv);
   }
   // Don't actually care about neutral height here - this function just checks if a ray from a texcoord successfully exits
@@ -346,7 +474,9 @@ float pomSampleVisibility(
   // NOTE: pomTraceRay could be used here, but testing found it was more expensive and had worse artifacts when
   // doing visibility testing.
   float2 currTexcoord = texcoord;
-  float currHeight = pomSampleHeight(opaqueSurfaceMaterial.heightTextureIndex, opaqueSurfaceMaterial.samplerIndex, currTexcoord);
+  // Blended terrain-layer heights, or the material's own height map.
+  const PomHeightSource heightSource = pomHeightSourceCreate(opaqueSurfaceMaterial, texcoord);
+  float currHeight = pomHeightSourceSample(heightSource, currTexcoord);
   float currDepth = currHeight;
   float numLayers = pomGetNumSamples(rayDirection);
   float layerSize = rcp(numLayers);
@@ -356,7 +486,7 @@ float pomSampleVisibility(
   while (currDepth > 0.0f)
   {
     currTexcoord += step;
-    currHeight = pomSampleHeight(opaqueSurfaceMaterial.heightTextureIndex, opaqueSurfaceMaterial.samplerIndex, currTexcoord);
+    currHeight = pomHeightSourceSample(heightSource, currTexcoord);
     currDepth -= layerSize;
 
     if (currHeight < currDepth)
@@ -631,6 +761,25 @@ void overrideMaterialInteractionForEye(
     opaqueSurfaceMaterial.emissiveIntensity * cb.preExposure;
 }
 
+// The per-material albedo tint from the surface material extension entry (remixapi_MaterialInfoOpaqueAlbedoTintEXT),
+// or 1. It multiplies encoded (gamma) albedo, which gives the same result as a host multiplying 8-bit texels; for an
+// sRGB albedo texture, which is already linear when sampled, the tint is linearized to match.
+vec3 opaqueSurfaceMaterialAlbedoTint(OpaqueSurfaceMaterial opaqueSurfaceMaterial)
+{
+  if (opaqueSurfaceMaterial.subsurfaceMaterialIndex != SURFACE_INDEX_INVALID)
+  {
+    const SubsurfaceMaterial extensionMaterial =
+      subsurfaceMaterialCreate(surfaceMaterialExtensions[opaqueSurfaceMaterial.subsurfaceMaterialIndex]);
+    if (extensionMaterial.flags & SURFACE_MATERIAL_EXTENSION_FLAG_ALBEDO_TINT)
+    {
+      const vec3 albedoTint = vec3(extensionMaterial.albedoTint);
+      return (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_ALBEDO_TEXTURE_IS_SRGB) ? gammaToLinear(albedoTint)
+                                                                                               : albedoTint;
+    }
+  }
+  return vec3(1.0f);
+}
+
 // The albedo/opacity load and the texture operations of opaqueSurfaceMaterialInteractionCreate, shared with
 // opaqueSurfaceMaterialInteractionCalcOpacity so both run the same code.
 
@@ -658,24 +807,8 @@ void opaqueSurfaceMaterialLoadAlbedoOpacity(
   {
     albedo = albedoOpacitySample.rgb;
 
-    // The per-material albedo tint from the surface material extension entry (remixapi_MaterialInfoOpaqueAlbedoTintEXT).
-    // It multiplies the texture's encoded values in gamma space, before gammaToLinear below, which gives the same result
-    // as a host multiplying 8-bit texels. An sRGB texture is already linear here, so the tint is linearized to match.
-    // Alpha is untouched.
-    if (opaqueSurfaceMaterial.subsurfaceMaterialIndex != SURFACE_INDEX_INVALID)
-    {
-      const SubsurfaceMaterial extensionMaterial =
-        subsurfaceMaterialCreate(surfaceMaterialExtensions[opaqueSurfaceMaterial.subsurfaceMaterialIndex]);
-      if (extensionMaterial.flags & SURFACE_MATERIAL_EXTENSION_FLAG_ALBEDO_TINT)
-      {
-        vec3 albedoTint = vec3(extensionMaterial.albedoTint);
-        if (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_ALBEDO_TEXTURE_IS_SRGB)
-        {
-          albedoTint = gammaToLinear(albedoTint);
-        }
-        albedo *= albedoTint;
-      }
-    }
+    // The albedo tint, before gammaToLinear below. Alpha is untouched.
+    albedo *= opaqueSurfaceMaterialAlbedoTint(opaqueSurfaceMaterial);
 
     // Note: Thin film thickness and opacity deriving their values from the alpha channel are mutually exclusive, set the appropriate
     // one based on the specified flags, and set the opposing variable to a default value (the "default" value must match how the material is decoded from the
@@ -795,6 +928,117 @@ float opaqueSurfaceMaterialInteractionCalcOpacity(
   return opacity;
 }
 
+// Tangent-space normal decode. rgbTangentSpace selects the
+// RGB (0.5-biased, DirectX convention) encoding instead of Remix's native unsigned octahedral one.
+vec3 forkDecodeTangentNormal(vec4 normalSample, bool rgbTangentSpace, float strength)
+{
+  if (rgbTangentSpace)
+  {
+    vec3 n = vec3(normalSample.xyz) * 2.0f - 1.0f;
+    n.xy *= strength;
+    // Block compression can push z slightly negative; keep the normal in the upper hemisphere.
+    n.z = abs(n.z);
+    const float len = length(n);
+    return len > 1e-5f ? n / len : vec3(0.0f, 0.0f, 1.0f);
+  }
+
+  return unsignedOctahedralToHemisphereDirection(vec2(normalSample.xy), strength);
+}
+
+// Normal-map alpha read as gloss (inverted perceptual roughness, NVR / texture-pack convention),
+// remapped into [rtx.fnvProtocol.glossRoughnessMin, glossRoughnessMax].
+float forkGlossToRoughness(float gloss)
+{
+  return lerp(cb.opaqueMaterialArgs.fnvGlossRoughnessMin, cb.opaqueMaterialArgs.fnvGlossRoughnessMax, 1.0f - saturate(gloss));
+}
+
+// Terrain-layers blend (remixapi_MaterialInfoTerrainLayersEXT). Per hit:
+//   w0123 = weightTextures[0](uv * scale + offset), w4567 = weightTextures[1](...)
+//   albedo = sum_i w_i * albedoTextures[i](uv)   (no renormalisation, matching FNV's pixel shader)
+//   albedo *= tint(uv * scale + offset).rgb       (when a tint texture is present)
+//   albedo = max(albedo, 0)                       (float layers may be signed)
+//   normal = normalize(sum_i w_i * decode(normalTextures[i](uv)))   (missing layer normal = (0,0,1))
+//   roughness = sum_i w_i * r_i / sum_i w_i, r_i = gloss(normal_i.a) for layers flagged LAYER_GLOSS, else roughnessConstant
+//               (normalised: the FNV weights need not sum to 1, and roughness is not a colour)
+// Returns the blended albedo (same encoding as the layer textures), the blended tangent-space normal and roughness.
+void forkTerrainLayersBlend(
+  TerrainLayersMaterial terrainLayers,
+  uint16_t samplerIndex,
+  SurfaceInteraction surfaceInteraction,
+  float lodBias,
+  float roughnessConstant,
+  inout vec3 albedo,
+  out vec3 tangentNormal,
+  out float roughness)
+{
+  SurfaceInteraction weightInteraction = surfaceInteraction;
+  const vec2 weightUvScale = vec2(terrainLayers.weightUvScaleX, terrainLayers.weightUvScaleY);
+  const vec2 weightUvOffset = vec2(terrainLayers.weightUvOffsetX, terrainLayers.weightUvOffsetY);
+  weightInteraction.textureCoordinates = surfaceInteraction.textureCoordinates * weightUvScale + weightUvOffset;
+  weightInteraction.textureGradientX = surfaceInteraction.textureGradientX * weightUvScale;
+  weightInteraction.textureGradientY = surfaceInteraction.textureGradientY * weightUvScale;
+
+  vec4 w0123 = vec4(0.0f);
+  vec4 w4567 = vec4(0.0f);
+  surfaceMaterialInteractionTextureReadHelper(terrainLayers.weightTextureIndex0, terrainLayers.weightSamplerIndex, weightInteraction, w0123);
+  surfaceMaterialInteractionTextureReadHelper(terrainLayers.weightTextureIndex1, terrainLayers.weightSamplerIndex, weightInteraction, w4567);
+
+  const bool rgbNormals = (terrainLayers.flags & TERRAIN_LAYERS_MATERIAL_FLAG_NORMALS_RGB_TANGENT_SPACE) != 0;
+  const uint layerCount = min(uint(terrainLayers.layerCount), uint(TERRAIN_LAYERS_MATERIAL_MAX_LAYERS));
+
+  const uint layerGlossMask = (uint(terrainLayers.flags) >> TERRAIN_LAYERS_MATERIAL_FLAG_LAYER_GLOSS_SHIFT) & 0xFFu;
+
+  vec3 blendedAlbedo = vec3(0.0f);
+  vec3 blendedNormal = vec3(0.0f);
+  float blendedRoughness = 0.0f;
+  float weightSum = 0.0f;
+
+  for (uint i = 0; i < layerCount; ++i)
+  {
+    // Note: & 3 keeps both (possibly eagerly evaluated) ternary operands in bounds.
+    const float w = i < 4 ? w0123[i & 3] : w4567[i & 3];
+    if (w <= 0.0f)
+    {
+      continue;
+    }
+
+    vec4 layerAlbedo;
+    if (surfaceMaterialInteractionTextureReadHelper(terrainLayers.albedoTextureIndices[i], samplerIndex, surfaceInteraction, layerAlbedo, lodBias))
+    {
+      blendedAlbedo += w * layerAlbedo.rgb;
+    }
+
+    vec4 layerNormalSample;
+    vec3 layerNormal = vec3(0.0f, 0.0f, 1.0f);
+    float layerRoughness = roughnessConstant;
+    if (surfaceMaterialInteractionTextureReadHelper(terrainLayers.normalTextureIndices[i], samplerIndex, surfaceInteraction, layerNormalSample, lodBias))
+    {
+      layerNormal = forkDecodeTangentNormal(layerNormalSample, rgbNormals, cb.opaqueMaterialArgs.normalIntensity);
+      if ((layerGlossMask & (1u << i)) != 0)
+      {
+        layerRoughness = forkGlossToRoughness(layerNormalSample.a);
+      }
+    }
+    blendedNormal += w * layerNormal;
+    blendedRoughness += w * layerRoughness;
+    weightSum += w;
+  }
+
+  roughness = weightSum > 1e-5f ? blendedRoughness / weightSum : roughnessConstant;
+
+  vec4 tintSample;
+  if (surfaceMaterialInteractionTextureReadHelper(terrainLayers.tintTextureIndex, terrainLayers.weightSamplerIndex, weightInteraction, tintSample))
+  {
+    blendedAlbedo *= tintSample.rgb;
+  }
+
+  // A layer with signed texels (a float offset layer) can take the sum below zero, and the gamma decode needs it non-negative.
+  albedo = max(blendedAlbedo, vec3(0.0f));
+
+  const float normalLength = length(blendedNormal);
+  tangentNormal = normalLength > 1e-5f ? blendedNormal / normalLength : vec3(0.0f, 0.0f, 1.0f);
+}
+
 // Opaque Surface Material Interaction Functions
 
 OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
@@ -851,9 +1095,9 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
     const vec2 pomTextureCoordinates = pomHit.xy;
 
 #if defined(RAY_TRACING_PRIMARY_RAY)
-    // Depth and motion vectors at the SCCR relief point (geometry_resolver.slangh). Computed before the texture
-    // coordinates move, since the march's start depends on the mesh's own.
-    if (cb.pomMode == DisplacementMode::SCCR && cb.pomSccrDepthOffset)
+    // Depth and motion vectors at the relief point (geometry_resolver.slangh). Computed before
+    // the texture coordinates move: the march's start depends on the mesh's own.
+    if (cb.pomMode == DisplacementMode::SCCR && cb.pomSccrDepthOffset != 0u)
     {
       surfaceInteraction.pomDepthOffset = sccrDepthOffset(
         opaqueSurfaceMaterial, surfaceInteraction, viewDirTextureSpace, length(viewDirFrame), pomHit.z);
@@ -908,9 +1152,12 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
 
   if (emissiveColorLoaded)
   {
-    emissiveColor = emissiveColorSample.xyz;
+    // Glow map tinted by the emittance color carried in emissiveColorConstant.
+    emissiveColor = (opaqueSurfaceMaterialFnvFlags(opaqueSurfaceMaterial) & OPAQUE_SURFACE_MATERIAL_FLAG_EMISSIVE_TEXTURE_TINTED) != 0 ?
+      emissiveColorSample.xyz * opaqueSurfaceMaterial.emissiveColorConstant :
+      emissiveColorSample.xyz;
   }
-  
+
   // Load Albedo/Opacity
 
   vec3 albedo;
@@ -926,6 +1173,22 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
 
   opaqueSurfaceMaterialLoadAlbedoOpacity(opaqueSurfaceMaterial, thinFilmEnabled, albedoOpacityLoaded, albedoOpacitySample,
     albedo, opacity, thinFilmThickness);
+
+  // Terrain-layers extension replaces the albedo (opacity keeps coming from the base albedo texture) and,
+  // further below, the shading normal.
+  const uint terrainLayersMaterialIndex = opaqueSurfaceMaterialTerrainLayersIndex(opaqueSurfaceMaterial);
+  const bool terrainLayersActive = terrainLayersMaterialIndex != SURFACE_INDEX_INVALID;
+  vec3 terrainTangentNormal = vec3(0.0f, 0.0f, 1.0f);
+  float terrainRoughness = opaqueSurfaceMaterial.roughnessConstant;
+  if (terrainLayersActive)
+  {
+    const TerrainLayersMaterial terrainLayers =
+      terrainLayersMaterialCreate(surfaceMaterialExtensions[terrainLayersMaterialIndex]);
+    forkTerrainLayersBlend(terrainLayers, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, materialLodBias,
+                           opaqueSurfaceMaterial.roughnessConstant, albedo, terrainTangentNormal, terrainRoughness);
+    // The blend replaces the tinted base albedo, so the tint applies to the blended albedo as well.
+    albedo *= opaqueSurfaceMaterialAlbedoTint(opaqueSurfaceMaterial);
+  }
 
 #if defined(RAY_TRACING_PRIMARY_RAY)
   if (cb.debugView == DEBUG_VIEW_RAW_ALBEDO) 
@@ -979,12 +1242,22 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   // Note: Defaults to 0 as this indicates no normal detail (which should be the case when a normal map is not present).
   float normalDetail = 0.0f;
 
-  if (normalLoaded)
+  // RGB tangent-space normal maps instead of octahedral.
+  const bool normalIsRgbTangentSpace = (opaqueSurfaceMaterialFnvFlags(opaqueSurfaceMaterial) & OPAQUE_SURFACE_MATERIAL_FLAG_NORMAL_RGB_TANGENT_SPACE) != 0;
+
+  if (terrainLayersActive)
+  {
+    // Blended terrain-layer normal replaces the base normal map.
+    const f16mat3 tangentToWorld = transpose(worldToTangent);
+    normal = normalize(mul(tangentToWorld, terrainTangentNormal));
+    normalDetail = 1.0f - terrainTangentNormal.z;
+  }
+  else if (normalLoaded)
   {
     vec3 tangentNormal;
 
     // Terrain baker produces decoded tangentNormal and (first) normal.
-    if (isBakedTerrain)  
+    if (isBakedTerrain)
     {
       // REMIX-2224: Normals blended during terrain baking using programmable shaders can sometimes end up being invalid so we sanitize them at this point
       tangentNormal = sanitize(normalSample.xyz, cb.isZUp ? vec3(0.f, 0.f, 1.f) : vec3(0.f, 1.f, 0.f));
@@ -992,9 +1265,11 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
     else // Decode encoded normal sample
     {
       // Note: Using f16 from texture to decode from is fine as the original texture is only 8 bits of precision.
-      tangentNormal = normalIsTangentXY
-        ? unsignedTangentXYToHemisphereDirection(vec2(normalSample.xy), cb.opaqueMaterialArgs.normalIntensity)
-        : unsignedOctahedralToHemisphereDirection(vec2(normalSample.xy), cb.opaqueMaterialArgs.normalIntensity);
+      tangentNormal = normalIsRgbTangentSpace
+        ? forkDecodeTangentNormal(normalSample, true, cb.opaqueMaterialArgs.normalIntensity)
+        : normalIsTangentXY
+          ? unsignedTangentXYToHemisphereDirection(vec2(normalSample.xy), cb.opaqueMaterialArgs.normalIntensity)
+          : unsignedOctahedralToHemisphereDirection(vec2(normalSample.xy), cb.opaqueMaterialArgs.normalIntensity);
     }
     
     const f16mat3 tangentToWorld = transpose(worldToTangent);
@@ -1015,10 +1290,12 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
 
     if (secondNormalLoaded)
     {
-      vec3 tangentNormal2 = normalIsTangentXY
-        ? unsignedTangentXYToHemisphereDirection(vec2(secondNormalSample.xy), cb.opaqueMaterialArgs.normalIntensity)
-        : unsignedOctahedralToHemisphereDirection(vec2(secondNormalSample.xy), cb.opaqueMaterialArgs.normalIntensity);
-      
+      vec3 tangentNormal2 = normalIsRgbTangentSpace
+        ? forkDecodeTangentNormal(secondNormalSample, true, cb.opaqueMaterialArgs.normalIntensity)
+        : normalIsTangentXY
+          ? unsignedTangentXYToHemisphereDirection(vec2(secondNormalSample.xy), cb.opaqueMaterialArgs.normalIntensity)
+          : unsignedOctahedralToHemisphereDirection(vec2(secondNormalSample.xy), cb.opaqueMaterialArgs.normalIntensity);
+
       tangentNormal2 = normalBlendRNM(tangentNormal2, tangentNormal);
       normal = normalize(mul(tangentToWorld, tangentNormal2));
 
@@ -1047,8 +1324,23 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
     {
       const float smoothness = (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_SMOOTHNESS_IN_GREEN)
         ? roughnessSample.y : roughnessSample.x;
-      roughness = max(1.0f - smoothness, float(opaqueSurfaceMaterial.roughnessFloor));
+      roughness = max(1.0f - smoothness, f16tof32(uint(opaqueSurfaceMaterial.roughnessFloorBits)));
     }
+  }
+
+  // Roughness from the normal-map alpha. NORMAL_ALPHA_IS_GLOSS (rtx.fnvProtocol.normalAlphaMode = 1,
+  // set only when the normal texture has an alpha channel): alpha is gloss, roughness = lerp(min, max, 1 - a).
+  // Otherwise (legacy mode 0) alpha is a specular mask and unmasked texels become fully rough.
+  if (terrainLayersActive)
+  {
+    // Terrain-layers blend (per-layer gloss or the roughness constant).
+    roughness = terrainRoughness;
+  }
+  else if (normalLoaded && !isBakedTerrain && (opaqueSurfaceMaterialFnvFlags(opaqueSurfaceMaterial) & OPAQUE_SURFACE_MATERIAL_FLAG_ROUGHNESS_FROM_NORMAL_ALPHA) != 0)
+  {
+    roughness = (opaqueSurfaceMaterialFnvFlags(opaqueSurfaceMaterial) & OPAQUE_SURFACE_MATERIAL_FLAG_NORMAL_ALPHA_IS_GLOSS) != 0 ?
+      forkGlossToRoughness(float(normalSample.a)) :
+      lerp(1.0f, roughness, saturate(float(normalSample.a)));
   }
 
 #if defined(RAY_TRACING_PRIMARY_RAY)

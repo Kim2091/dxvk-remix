@@ -21,13 +21,13 @@
 */
 
 #include "rtx_lights_data.h"
-#include "rtx_frontend_interface.h"
 #include "rtx_light_utils.h"
 #include "rtx_light_manager.h"
 #include "rtx_options.h"
 
 #include <remix/remix_c.h>
 
+#include <d3d9types.h>
 #include <regex>
 #include <cassert>
 
@@ -119,7 +119,7 @@ namespace dxvk {
     }
   }
 
-  void LightData::merge(const frontend::FixedFunctionLight& light) {
+  void LightData::merge(const D3DLIGHT9& light) {
     // Special case, dont do any merging if we know we dont need to
     if (m_dirty != m_allDirty) {
       std::optional<LightData> input = tryCreate(light);
@@ -130,7 +130,7 @@ namespace dxvk {
 
     // Merge in the light type if it's currently unknown
     if (m_lightType == LightType::Unknown) {
-      switch (light.type) {
+      switch (light.Type) {
       // Note: An invalid light type may be passed in and may not be sanitized properly by DXVK (unsure, it may actually be
       // handled properly), so this case ensures it can be caught for debugging purposes and that it falls back to some other
       // light type. Do note since this case is potentially expected at runtime this is no an "unreachable"-style assert, more
@@ -140,11 +140,11 @@ namespace dxvk {
         assert(false);
 
         [[fallthrough]];
-      case frontend::FixedFunctionLight::Type::Point:
-      case frontend::FixedFunctionLight::Type::Spot:
+      case D3DLIGHT_POINT:
+      case D3DLIGHT_SPOT:
         m_lightType = LightType::Sphere;
         break;
-      case frontend::FixedFunctionLight::Type::Directional:
+      case D3DLIGHT_DIRECTIONAL:
         m_lightType = LightType::Distant;
         break;
       }
@@ -170,17 +170,15 @@ namespace dxvk {
     }
   }
 
-  std::optional<LightData> LightData::tryCreate(const frontend::FixedFunctionLight& light) {
-    // Ensure the fixed-function light is of a valid type
+  std::optional<LightData> LightData::tryCreate(const D3DLIGHT9& light) {
+    // Ensure the D3D9 Light is of a valid type
     // Note: This is done as some games will pass invalid data to various D3D9 calls and since the RtLight
     // requires a valid light type for construction it needs to be checked in advance to avoid issues.
 
-    const uint32_t type = static_cast<uint32_t>(light.type);
-    if (type < static_cast<uint32_t>(frontend::FixedFunctionLight::Type::Point) ||
-        type > static_cast<uint32_t>(frontend::FixedFunctionLight::Type::Directional)) {
+    if (light.Type < D3DLIGHT_POINT || light.Type > D3DLIGHT_DIRECTIONAL) {
       Logger::err(str::format(
         "Attempted to convert a fixed function light with invalid light type: ",
-        type
+        light.Type
       ));
       ONCE(assert(false));
 
@@ -189,17 +187,17 @@ namespace dxvk {
 
     // Construct and return the light
 
-    switch (light.type) {
+    switch (light.Type) {
     // Note: This case is checked for before, but just to make sure this default case is asserted against as it is
     // intended to be unreachable.
     default:
       assert(false);
 
       [[fallthrough]];
-    case frontend::FixedFunctionLight::Type::Point:
-    case frontend::FixedFunctionLight::Type::Spot:
+    case D3DLIGHT_POINT:
+    case D3DLIGHT_SPOT:
       return std::optional<LightData>(std::in_place, createFromPointSpot(light));
-    case frontend::FixedFunctionLight::Type::Directional:
+    case D3DLIGHT_DIRECTIONAL:
       return std::optional<LightData>(std::in_place, createFromDirectional(light));
     }
     return {};
@@ -278,7 +276,7 @@ namespace dxvk {
       Logger::warn(str::format("Failed to recognize a light type on \'", lightPrim.GetName().GetString(), "\'"));
       return {};
     }
-    // Note: LightType::Unknown is a valid case, as it's meant to be replaced by a corresponding game light
+    // Note: LightType::Unknown is a valid case, as it's meant to be replaced by a corresponding D3DLIGHT9
 
     auto l = LightData { lightType, isOverrideLight, absoluteTransform };
     {
@@ -346,10 +344,10 @@ namespace dxvk {
     m_isRelativeTransform { !absoluteTransform && !isOverrideLight } {
   }
 
-  LightData LightData::createFromDirectional(const frontend::FixedFunctionLight& light) {
+  LightData LightData::createFromDirectional(const D3DLIGHT9& light) {
     auto output = LightData{ Distant };
 
-    const Vector3 originalDirection = light.direction;
+    const Vector3 originalDirection { light.Direction.x, light.Direction.y, light.Direction.z };
 
     // Note: D3D9 Directional lights have no requirement on if the direction is normalized or not,
     // so it must be normalized here for usage in the rendering (as m_direction is assumed to be normalized).
@@ -357,7 +355,7 @@ namespace dxvk {
     // Z axis in this case.
     output.m_zAxis = safeNormalize(originalDirection, Vector3(0.0f, 0.0f, 1.0f));
     output.m_AngleRadians = LightManager::lightConversionDistantLightFixedAngle();
-    output.m_Color = Vector3{ light.diffuse.x, light.diffuse.y, light.diffuse.z };
+    output.m_Color = Vector3{ light.Diffuse.r, light.Diffuse.g, light.Diffuse.b };
     output.m_Intensity = LightManager::lightConversionDistantLightFixedIntensity();
 
     // Note: Changing this code will alter "stable" light hashes from D3D9 and potentially break replacement assets.
@@ -365,7 +363,7 @@ namespace dxvk {
     // Note: Stable version used for D3D9 light conversion path to ensure stable hashing regardless of code changes.
     // Also note the Rect Light type is intentionally used here instead of the Distant Light type. This is done due to
     // a mistake originating from a refactoring on 09-26-2023. Little to no previous content was affected by this bug
-    // as directional light replacements are not common and were not used in the first shipped Remix content, plus the lack of public usage
+    // as directional light replacements are not common and were not used in Portal RTX, plus the lack of public usage
     // of Remix. As such, it is left this way to not break replacements created by users after the toolkit launch
     // (since the public launch included this bug and "fixing" it would probably be cause more harm than good).
     output.m_cachedHash = (XXH64_hash_t) RtLightType::Rect;
@@ -376,7 +374,7 @@ namespace dxvk {
     const float legacyStableHalfAngle = 0.0349f / 2.0f;
 
     // Note: Takes specific arguments to calculate a stable hash which does not change due to other changes in the light's code.
-    // Expects an un-altered direction directly from the game light's direction (a legacy artifact caused by not normalizing this in
+    // Expects an un-altered direction directly from the D3DLIGHT9 Direction (a legacy artifact caused by not normalizing this in
     // our initial implementation).
     // Note: Radiance not included to somewhat uniquely identify lights when constructed from D3D9 Lights.
     output.m_cachedHash = XXH64(&originalDirection[0], sizeof(originalDirection), output.m_cachedHash);
@@ -385,21 +383,21 @@ namespace dxvk {
     return output;
   }
 
-  LightData LightData::createFromPointSpot(const frontend::FixedFunctionLight& light) {
+  LightData LightData::createFromPointSpot(const D3DLIGHT9& light) {
     auto output = LightData{ Sphere };
 
-    const Vector3 originalPosition = light.position;
-    const float originalBrightness = std::max(light.diffuse.x, std::max(light.diffuse.y, light.diffuse.z));
+    const Vector3 originalPosition { light.Position.x, light.Position.y, light.Position.z };
+    const float originalBrightness = std::max(light.Diffuse.r, std::max(light.Diffuse.g, light.Diffuse.b));
 
     output.m_position = originalPosition;
     output.m_Radius = LightManager::lightConversionSphereLightFixedRadius() * RtxOptions::sceneScale();
     output.m_Intensity = LightUtils::calculateIntensity(light, output.m_Radius);
-    output.m_Color = Vector3(light.diffuse.x, light.diffuse.y, light.diffuse.z) / originalBrightness;
+    output.m_Color = Vector3(light.Diffuse.r, light.Diffuse.g, light.Diffuse.b) / originalBrightness;
 
     XXH64_hash_t shapingHash = 0;
 
-    if (light.type == frontend::FixedFunctionLight::Type::Spot) {
-      const Vector3 originalDirection = light.direction;
+    if (light.Type == D3DLIGHT_SPOT) {
+      const Vector3 originalDirection { light.Direction.x, light.Direction.y, light.Direction.z };
 
       // Set the Sphere Light's shaping
 
@@ -416,10 +414,10 @@ namespace dxvk {
       // duplicating the light shaping to get a variant with the "original" stable hash).
 
       // ConeAngle is the outer angle of the spotlight
-      output.m_ConeAngleRadians = light.phi / 2.0f;
+      output.m_ConeAngleRadians = light.Phi / 2.0f;
       // ConeSoftness is how far in the transition region reaches
-      output.m_ConeSoftness = std::cos(light.theta / 2.0f) - std::cos(output.m_ConeAngleRadians);
-      output.m_Focus = light.falloff;
+      output.m_ConeSoftness = std::cos(light.Theta / 2.0f) - std::cos(output.m_ConeAngleRadians);
+      output.m_Focus = light.Falloff;
 
       // Set the Stable Light Shaping Hash
       // NOTE: This is broken out of the original light shaping hash code to maintain hash stability with
@@ -440,8 +438,8 @@ namespace dxvk {
     const float legacyStableRadius = 4.0f;
 
     // Note: Takes specific arguments to calculate a stable hash which does not change due to other changes in the light's code.
-    // Expects an un-altered position directly from the game light's position, and a Stable Light Shaping structure with its primaryAxis member
-    // directly derived from the game light's direction (again a legacy artifact caused by not normalizing this in our initial implementation).
+    // Expects an un-altered position directly from the D3DLIGHT9 Position, and a Stable Light Shaping structure with its primaryAxis member
+    // directly derived from the D3DLIGHT9 Direction (again a legacy artifact caused by not normalizing this in our initial implementation).
     // Note: Radiance not included to somewhat uniquely identify lights when constructed from D3D9 Lights.
     output.m_cachedHash = XXH64(&originalPosition[0], sizeof(originalPosition), output.m_cachedHash);
     output.m_cachedHash = XXH64(&legacyStableRadius, sizeof(legacyStableRadius), output.m_cachedHash);
@@ -452,7 +450,7 @@ namespace dxvk {
 
   // When a light is being overridden in USD, we may not always get the light type.
   // For these lights we rely on the prim path (which is standardized for captured lights)
-  //  and use the light determined by the game at runtime [See: merge(const frontend::FixedFunctionLight&)]
+  //  and use the light determined by the game at runtime [See: merge(D3DLIGHT9)]
   // Expanded: ^/RootNode/lights/light_[0-9A-Fa-f]{16}$
   static const std::regex s_unknownLightPattern("^" + lss::gRootNodePath.GetAsString() + "/" + lss::gTokLights.GetString() + "/" + lss::prefix::light + "[0-9A-Fa-f]{16}$");
 

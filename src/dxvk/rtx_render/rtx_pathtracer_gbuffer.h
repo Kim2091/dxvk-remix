@@ -42,7 +42,7 @@ namespace dxvk {
     };
 
     // Which compile-time slice of the RayQuery G-buffer kernels a frame can use
-    // (see gbuffer_rayquery_slim.comp.slang).
+    // (rtx.gbuffer.slimVariants, see gbuffer_rayquery_slim.comp.slang).
     enum class SlimLevel {
       Full = 0, // everything compiled in
       Slim,     // no POM, no thin film, no ray portal resolve
@@ -55,7 +55,7 @@ namespace dxvk {
     // Why selectSlimLevel returned Full, printed on the [GBuffer] slim level log line.
     enum class SlimFullReason {
       None = 0,                    // a slim level was selected
-      NotRayQuery,                 // not RayQuery mode
+      OptionOff,                   // rtx.gbuffer.slimVariants off, or not RayQuery mode
       NoWboit,                     // WBOIT off
       FeatureSet,                  // not psr_prepare (with or without stochastic alpha) without NRC / psr_inline with NRC
                                    // (inline PSR with stochastic alpha, RT render targets, debug, PSR off)
@@ -70,6 +70,17 @@ namespace dxvk {
       FrameFeaturesValidate,       // rtx.frameFeatures.validate forces the Full kernels
     };
     static const char* slimFullReasonToString(SlimFullReason reason);
+
+    RTX_OPTION("rtx.gbuffer", bool, slimVariants, true,
+               "Uses reduced G-buffer shaders (primary rays, PSR, PSR prepare and deferred decals) that leave out "
+               "features the current frame cannot use: displacement, thin-film materials, ray portals and subsurface "
+               "materials. Saves GPU time. The image is the same. Only in ray query mode with WBOIT, and with PSR "
+               "prepare or with inline PSR and NRC. Other configurations use the full shaders.");
+    RTX_OPTION("rtx.gbuffer", bool, compactPsr, true,
+               "The reflection and transmission PSR passes run only on the pixels that need them, from lists that PSR "
+               "prepare builds, instead of on every pixel. Saves GPU time. The image is the same. Only in ray query "
+               "mode with PSR prepare, and not with NRC, ray traced render targets or debug views. Uses two lists of 4 "
+               "bytes per pixel.");
 
     explicit DxvkPathtracerGbuffer(DxvkDevice* device);
     ~DxvkPathtracerGbuffer() = default;
@@ -95,7 +106,7 @@ namespace dxvk {
       const bool wboitEnabled,
       const SlimLevel slimLevel = SlimLevel::Full) const;
 
-    // Reads this frame's feature mask (built from its RaytraceArgs and the scene manager)
+    // rtx.gbuffer.slimVariants. Reads this frame's feature mask (built from its RaytraceArgs and the scene manager)
     // and the pass's own feature set.
     static SlimLevel selectSlimLevel(const RtFrameFeatures& features, const uint32_t rayQueryFeatureVariant,
                                      const bool nrcEnabled, const bool wboitEnabled, const bool includePortals, SlimFullReason& fullReason);
@@ -103,12 +114,12 @@ namespace dxvk {
                       const bool compactPsrActive, const uint32_t frameId,
                       const std::string& variantInfo);
     int32_t m_loggedSlimLevel = -1;
-    std::string m_loggedVariantInfo; // variant table entry text, empty outside ray query mode
+    std::string m_loggedVariantInfo; // rtx.shader.variantTables entry text, empty while off
     int32_t m_loggedSlimFullReason = -1;
     int32_t m_loggedCompactPsr = -1;
     uint32_t m_lastSlimLogFrame = UINT32_MAX;
 
-    // Compact PSR: two pixel lists (m_compactPsrCapacity entries each) and the indirect
+    // rtx.gbuffer.compactPsr. Two pixel lists (m_compactPsrCapacity entries each) and the indirect
     // dispatch args / counts (GBUFFER_COMPACT_PSR_ARGS_*). Grown to the frame's pixel count, released while the option is off.
     bool prepareCompactPsrBuffers(const uint32_t pixelCount);
     Rc<DxvkBuffer> m_compactPsrList;

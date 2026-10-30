@@ -10,14 +10,13 @@
 // collected while it is off.
 
 #include <cstdint>
-#include <vector>
 
 #include "rtx_option.h"
+#include "../../util/xxHash/xxhash.h"
 
 namespace dxvk {
 
   class OpacityMicromapManager;
-  class RtInstance;
 
   class D3d9Alpha {
   public:
@@ -26,6 +25,8 @@ namespace dxvk {
                "drawn more than once, such as repeated foliage and fences) use an opacity micromap, when every instance "
                "asks for the same one (same source hash, texture factor and colour flags). Unknown micro-triangles keep "
                "the exact alpha test, so the result is the same as for single-instance geometry.");
+    RTX_OPTION("rtx", uint32_t, trackerCreationLogTopN, 8,
+               "[D3d9Alpha] log: how many topology hashes with the most instance creations to list. 0 = none.");
 
     // Counters, collected only while detailed performance logging is on.
     static bool statsActive();
@@ -35,22 +36,16 @@ namespace dxvk {
     static void noteSharedBlasOmm(SharedOmmOutcome outcome, uint32_t instanceCount);
     static void noteFrame();
 
-    // AccelManager: one call per per-geometry BLAS group that holds a point instancer. bindTried says whether the
-    // group asked for a micromap (one instance, or a compatible shared BLAS), bound whether it got one. The counters
-    // are split by lane: direct (scene-owned instances) and legacy.
-    static void notePointInstancerGroup(const std::vector<RtInstance*>& instances, const OpacityMicromapManager& omm,
-                                        bool bindTried, bool bound);
-    // OpacityMicromapManager: a bake found the instance's texel footprints missing while the instance was not updated
-    // this frame, so the instance was unlinked from its micromap requests.
-    static void noteOmmUnlinkedIdle(const RtInstance& instance);
-    // OpacityMicromapManager::processOmmCandidates: the step a point-instancer candidate stopped at this frame.
-    enum class OmmGate : uint8_t {
-      NoBlas, NewInstance, RetryWait, Throttled, NoBudget, NotUser, TexturesNotResident, Blacklisted, StatsFull,
-      BelowFilter, RegisterFailed, Registered, Count
+    // DrawCallTracker: why a new replacement instance was created (Level 3).
+    enum class TrackerCreateReason : uint8_t {
+      NewTopology,      // no previous instance of this topology at all
+      MaterialMismatch, // an unmatched previous instance in range, but with another material
+      NoneInRange,      // none unmatched in range: moved further than uniqueObjectDistance, or more draws than before
+      Count
     };
-    static void noteOmmCandidateGate(const RtInstance& instance, OmmGate gate);
+    static void noteTrackerCreation(TrackerCreateReason reason, XXH64_hash_t topologyHash, XXH64_hash_t materialHash);
 
-    // Writes and resets the [D3d9Alpha] lines (rtx perf log, after [OmmChurn]).
+    // Writes and resets the [D3d9Alpha] line (rtx perf log, after [OmmChurn]).
     static void logStats(const OpacityMicromapManager* omm);
   };
 

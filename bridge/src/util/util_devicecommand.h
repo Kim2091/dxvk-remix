@@ -30,7 +30,7 @@
 using DeviceBridge = Bridge<BridgeId::Device>;
 using ClientMessage = DeviceBridge::Command;
 using ServerMessage = DeviceBridge::Command;
-// A state setter as a record of the open state packet (client only)
+// A3b: a state setter as a record of the open state packet (client only)
 using StateMessage = DeviceBridge::StateMessage;
 static void initDeviceBridge() {
   DeviceBridge::init("Device",
@@ -49,6 +49,6 @@ static void initDeviceBridge() {
                      GlobalOptions::getClientCmdQueueSize(),
                      GlobalOptions::getClientDataQueueSize());
 #endif
-  // Non-blocking query results: mapped by both sides, like the channels.
+  // Non-blocking query results (A4): mapped by both sides, like the channels.
   bridge_util::QueryResults::init();
 }

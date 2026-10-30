@@ -288,6 +288,23 @@ void resolveVertexFinalContinue<T : IBasePayloadState>(
   }
 }
 
+// Continues past a cut-out or see-through texel of an opaque-material hit. The origin is pushed through the surface as in
+// resolveVertexFinalContinue, which is what the TraceRay path uses. The ray query loop instead traces from the near side
+// of the hit and skips the hit triangle (g_resolveCoplanarContinue), so a coplanar surface behind the texel is kept.
+void resolveVertexFinalContinueCutout<T : IBasePayloadState>(
+  Ray ray, SurfaceInteraction surfaceInteraction,
+  bool teleport, mat4 teleportMatrix,
+  inout T resolveVertexState)
+{
+  resolveVertexFinalContinue(ray, surfaceInteraction, teleport, teleportMatrix, resolveVertexState);
+
+  if (!teleport)
+  {
+    g_resolveCoplanarContinue = true;
+    g_resolveCoplanarOrigin = rayOffsetSurfaceOriginHelper(surfaceInteraction, false);
+  }
+}
+
 // Handles updating of the resolve state after an iteration when resolving is intended to stop on a hit.
 void resolveVertexFinalHit<T : IBasePayloadState>(inout T resolveVertexState)
 {
@@ -431,9 +448,11 @@ void resolveVertex<T: IBasePayloadState>(
     const OpaqueSurfaceMaterial opaqueSurfaceMaterial = opaqueSurfaceMaterialCreate(memoryPolymorphicSurfaceMaterial);
 
 #if defined(RAY_TRACING_PRIMARY_RAY) && defined(OPAQUE_MATERIAL_USE_POM)
-    // The SCCR shell march of displaced primary and PSR hits (sccr_shell_march.slangh). It re-frames the surface
-    // interaction to the triangle the march ends in and marks it, so the material interaction below skips its own POM
-    // march. The hand-off distance is measured from the camera along the resolved ray.
+    // The prism march of displaced primary and PSR hits (sccr_shell_march.slangh). It
+    // re-frames the surface interaction to the triangle the march ends in and marks it so the material interaction
+    // below skips its own POM march. The hand-off distance is measured from the camera along the resolved ray. A relief
+    // hit is used; an exit gets plain SCCR at the hit (the view ray is never restarted from a shell exit, and the exit
+    // point is never shaded).
     sccrShellResolve(
       opaqueSurfaceMaterial, surface, rayInteraction,
       length(ray.origin - cameraGetWorldPosition(camera)) + rayInteraction.hitDistance,
@@ -530,7 +549,7 @@ void resolveVertex<T: IBasePayloadState>(
       if (approximationHandled)
       {
         // Note: Must call resolve final on any return which expects resolving to continue.
-        resolveVertexFinalContinue(ray, surfaceInteraction, teleport, teleportMatrix, resolveVertexState);
+        resolveVertexFinalContinueCutout(ray, surfaceInteraction, teleport, teleportMatrix, resolveVertexState);
 
         return;
       }
@@ -553,7 +572,7 @@ void resolveVertex<T: IBasePayloadState>(
     if (opacity <= cb.resolveTransparencyThreshold || handleStochasticAlphaBlend)
     {
       // Note: Must call resolve final on any return which expects resolving to continue.
-      resolveVertexFinalContinue(ray, surfaceInteraction, teleport, teleportMatrix, resolveVertexState);
+      resolveVertexFinalContinueCutout(ray, surfaceInteraction, teleport, teleportMatrix, resolveVertexState);
 
       return;
     }
@@ -624,8 +643,8 @@ void resolveVertex<T: IBasePayloadState>(
       const float ringTransparency =
         saturate(1.0f - rayPortalSurfaceMaterialInteraction.mask.a) *
         (rayPortalSurfaceMaterialInteraction.isInsidePortal ? saturate(1.0f - tFactor) : 1.0f);
-      // Hack: A fixed 0.5 scale dims the portal emission. Existing content is tuned to it, so it stays for now,
-      // but it should be removed some day.
+      // Hack: Lingering 0.5 from earlier in the project to make the Portal less bright before it had its own material, too late to remove this now for
+      // Portal RTX, but this should be removed some day.
       const float hackPortalEmissiveIntensity = 0.5f;
 
       emissiveRadiance +=
@@ -837,10 +856,14 @@ void resolveVertexUnorderedParticles<
   inout vec3 radianceAttenuation, inout vec3 emissiveRadiance,
   out uint numInteractions,
   out int surfaceIndex,
-  out float nearestContributorDistance)
+  out float nearestContributorDistance,
+  // The luminance-weighted mean distance of the emitting interactions.
+  // It is floatMax when no interaction emits.
+  out float emissionDistance)
 {
   surfaceIndex = -1;
   nearestContributorDistance = floatMax;
+  emissionDistance = floatMax;
 
   const bool separateUnorderedApproximations = packedFlagGet(resolveMode, resolveModeSeparateUnorderedApproximations);
 
@@ -870,6 +893,8 @@ void resolveVertexUnorderedParticles<
   }
 
   numInteractions = 0;
+  float emissionDistanceSum = 0.0f;
+  float emissionLuminanceSum = 0.0f;
 
 #ifdef UNORDERED_RESOLVE_WBOIT
   float3 alphaColorSum = 0..xxx;
@@ -1078,6 +1103,10 @@ void resolveVertexUnorderedParticles<
     if (any(currentEmissiveRadiance > 0.0f))
     {
       surfaceIndex = rayInteraction.surfaceIndex;
+
+      const float emissionLuminance = calcBt709Luminance(currentEmissiveRadiance);
+      emissionDistanceSum += emissionLuminance * (accumulatedHitDistance + rayInteraction.hitDistance);
+      emissionLuminanceSum += emissionLuminance;
     }
 
 #ifdef UNORDERED_RESOLVE_WBOIT
@@ -1131,6 +1160,11 @@ void resolveVertexUnorderedParticles<
   if (numInteractions == 0)
   {
     return;
+  }
+
+  if (emissionLuminanceSum > 0.0f)
+  {
+    emissionDistance = emissionDistanceSum / emissionLuminanceSum;
   }
 
 #ifdef UNORDERED_RESOLVE_WBOIT

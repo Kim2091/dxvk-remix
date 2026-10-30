@@ -4,7 +4,7 @@
   Build the Remix Bridge (32-bit client + 64-bit server) reliably.
 
 .DESCRIPTION
-  An alternative to bridge/build_bridge_*.bat.
+  Replaces upstream bridge/build_bridge_*.bat for fork-side builds.
   Discovers Visual Studio via vswhere, calls vcvarsall.bat by full
   path, runs meson setup + compile per arch in isolated cmd.exe shells
   (no env contamination between x64 and x86). Streams output to the

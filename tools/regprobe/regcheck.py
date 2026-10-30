@@ -1,4 +1,4 @@
-"""regcheck: register report of the build's hot compute shaders as a build check.
+"""regcheck: register report of the build's hot compute shaders as a build check (Phase 5 F2).
 
 Input is the build's own SPIR-V (<build dir>/src/dxvk/rtx_shaders/*.spv, exactly what ships), filtered by scope.txt; nothing
 is recompiled except the `proxy:` entries of scope.txt (ray tracing bodies compiled as compute through probe.py).

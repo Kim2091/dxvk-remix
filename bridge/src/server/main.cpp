@@ -42,6 +42,7 @@
 #include "util_sharedheap.h"
 #include "util_sharedmemory.h"
 #include "util_texture_and_volume.h"
+#include "util_texdiag.h"
 #include "util_version.h"
 
 #include "log/log.h"
@@ -60,6 +61,8 @@
 #include <atomic>
 #include <array>
 #include <vector>
+#include <limits>
+#include <string>
 
 using namespace Commands;
 using namespace bridge_util;
@@ -108,7 +111,7 @@ using namespace remixapi::util;
             const DWORD& name = rpcHeader.pHandle;
 #define GET_RES(name, map) \
             GET_HND(name##Handle); \
-            const auto name = findOrNull(map, name##Handle); \
+            const auto& name = map[name##Handle]; \
             assert(name != NULL)
 
 // NOTE: MSDN states HWNDs are safe to cross x86-->x64 boundary, and that a truncating cast should be used:
@@ -170,39 +173,6 @@ std::unordered_map<uint32_t, IDirect3DSwapChain9*> gpD3DSwapChains;
 std::unordered_map<uint32_t, IDirect3DQuery9*> gpD3DQuery;
 std::unordered_map<uint32_t, void*> gMapRemixApi;
 
-namespace {
-  // Returns the server object for a client handle, or null when there is none. A miss inserts nothing.
-  template<typename Map>
-  typename Map::mapped_type findOrNull(const Map& map, const uint32_t handle) {
-    const auto it = map.find(handle);
-    return it != map.end() ? it->second : nullptr;
-  }
-
-  // The device of the last device lookup. Consecutive commands and state records almost always name the same device.
-  // Every change to gpD3DDevices calls forgetDeviceLookup().
-  struct DeviceLookup {
-    bool valid = false;
-    uint32_t handle = 0;
-    IDirect3DDevice9* pDevice = nullptr;
-  } gLastDeviceLookup;
-
-  IDirect3DDevice9* findOrNull(const std::unordered_map<uint32_t, IDirect3DDevice9*>& map, const uint32_t handle) {
-    if (&map == &gpD3DDevices && gLastDeviceLookup.valid && gLastDeviceLookup.handle == handle) {
-      return gLastDeviceLookup.pDevice;
-    }
-    const auto it = map.find(handle);
-    IDirect3DDevice9* const pDevice = it != map.end() ? it->second : nullptr;
-    if (&map == &gpD3DDevices && pDevice != nullptr) {
-      gLastDeviceLookup = { true, handle, pDevice };
-    }
-    return pDevice;
-  }
-
-  void forgetDeviceLookup() {
-    gLastDeviceLookup = {};
-  }
-}
-
 // Global state
 bool gbBridgeRunning = true;
 HANDLE hWait;
@@ -217,6 +187,267 @@ static void deserializeFromQueue(SerializableT& serializableT) {
   assert(size == dslz.size());
   dslz.deserialize();
   serializableT = std::move(dslz);
+}
+
+// One remixapi_InstanceInfo as the client's sendInstanceInfo() sends it, with
+// the extensions it chains. The extensions live next to the info so a batch of
+// them can be pulled before the runtime is called.
+struct PulledInstance {
+  serialize::InstanceInfo info;
+  struct Extensions {
+    serialize::InstanceInfoObjectPicking objectPicking;
+    serialize::InstanceInfoBlend blend;
+    serialize::InstanceInfoTransforms boneXforms;
+    serialize::InstanceInfoParticleSystem particleSystem;
+    serialize::InstanceInfoMaterialOverride materialOverride;
+    serialize::InstanceInfoGpuInstancing gpuInstancing;
+  } exts;
+  bool meshValid = false;
+};
+
+// Pulls an instance info and its extension chain, mapping the mesh (and a
+// material override's material) from bridge handles to runtime handles.
+static void pullInstanceInfo(PulledInstance& out, const char* fnName) {
+  // Rather than allocate deserialized struct extensions on the heap, keep
+  // them in `out`, since only one of each is supported per instance.
+  memset(&out.exts, 0, sizeof(PulledInstance::Extensions));
+  auto& instInfo = out.info;
+  auto& exts = out.exts;
+
+  const auto instSType = remixapi::pullSType();
+  assert(instSType == REMIXAPI_STRUCT_TYPE_INSTANCE_INFO);
+  deserializeFromQueue(instInfo);
+
+  MeshHandle meshHandle(instInfo.mesh);
+  out.meshValid = meshHandle.isValid();
+  if (out.meshValid) {
+    instInfo.mesh = meshHandle;
+  } else {
+    Logger::err(format_string("[%s] Invalid mesh handle!", fnName));
+  }
+
+  instInfo.pNext = nullptr;
+
+  bool bInstExtExists = remixapi::pullBool();
+  auto* pInfoProto = &getInfoProto(instInfo);
+  while (bInstExtExists) {
+    const auto extSType = remixapi::pullSType();
+    switch (extSType) {
+      case REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_OBJECT_PICKING_EXT:
+      {
+        assert(!exts.objectPicking.pNext);
+        deserializeFromQueue(exts.objectPicking);
+        pInfoProto->pNext = &(exts.objectPicking);
+        pInfoProto = &getInfoProto(exts.objectPicking);
+        break;
+      }
+      case REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BLEND_EXT:
+      {
+        assert(!exts.blend.pNext);
+        deserializeFromQueue(exts.blend);
+        pInfoProto->pNext = &(exts.blend);
+        pInfoProto = &getInfoProto(exts.blend);
+        break;
+      }
+      case REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BONE_TRANSFORMS_EXT:
+      {
+        assert(!exts.boneXforms.pNext);
+        deserializeFromQueue(exts.boneXforms);
+        pInfoProto->pNext = &(exts.boneXforms);
+        pInfoProto = &getInfoProto(exts.boneXforms);
+        break;
+      }
+      case REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_PARTICLE_SYSTEM_EXT:
+      {
+        assert(!exts.particleSystem.pNext);
+        deserializeFromQueue(exts.particleSystem);
+        pInfoProto->pNext = &(exts.particleSystem);
+        pInfoProto = &getInfoProto(exts.particleSystem);
+        break;
+      }
+      case REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_MATERIAL_OVERRIDE_EXT:
+      {
+        // Map the material; a handle the server doesn't know (its
+        // CreateMaterial failed, or it was destroyed) becomes null, which the
+        // runtime reads as "keep the mesh's own material".
+        assert(!exts.materialOverride.pNext);
+        deserializeFromQueue(exts.materialOverride);
+        const auto uid = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(exts.materialOverride.material));
+        const auto it = MaterialHandle::s_handleMap.find(uid);
+        exts.materialOverride.material = (uid != 0 && it != MaterialHandle::s_handleMap.cend()) ? it->second : nullptr;
+        pInfoProto->pNext = &(exts.materialOverride);
+        pInfoProto = &getInfoProto(exts.materialOverride);
+        break;
+      }
+      case REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_GPU_INSTANCING_EXT:
+      {
+        assert(!exts.gpuInstancing.pNext);
+        deserializeFromQueue(exts.gpuInstancing);
+        pInfoProto->pNext = &(exts.gpuInstancing);
+        pInfoProto = &getInfoProto(exts.gpuInstancing);
+        break;
+      }
+      default:
+      {
+        Logger::warn(format_string("[%s] Unknown sType. Skipping.", fnName));
+        break;
+      }
+    }
+    bInstExtExists = remixapi::pullBool();
+  }
+}
+
+// Retained instances. The runtime's exports are optional, so they are
+// resolved by name from the runtime module the server loaded, not taken from
+// remixapi_Interface. A missing export is logged once and its calls dropped.
+struct RetainedExports {
+  bool resolved = false;
+  PFN_remixapi_CreateRetainedInstance   create = nullptr;
+  PFN_remixapi_CreateRetainedInstances  createBatch = nullptr;
+  PFN_remixapi_UpdateRetainedInstance   update = nullptr;
+  PFN_remixapi_UpdateRetainedInstances  updateBatch = nullptr;
+  PFN_remixapi_DestroyRetainedInstances destroy = nullptr;
+  PFN_remixapi_DrawRetainedInstances    draw = nullptr;
+};
+
+static RetainedExports& retainedExports() {
+  static RetainedExports s;
+  if (!s.resolved && remixapi::g_remix_dll) {
+    s.resolved = true;
+    const HMODULE m = remixapi::g_remix_dll;
+    s.create = (PFN_remixapi_CreateRetainedInstance) GetProcAddress(m, "remixapi_CreateRetainedInstance");
+    s.createBatch = (PFN_remixapi_CreateRetainedInstances) GetProcAddress(m, "remixapi_CreateRetainedInstances");
+    s.update = (PFN_remixapi_UpdateRetainedInstance) GetProcAddress(m, "remixapi_UpdateRetainedInstance");
+    s.updateBatch = (PFN_remixapi_UpdateRetainedInstances) GetProcAddress(m, "remixapi_UpdateRetainedInstances");
+    s.destroy = (PFN_remixapi_DestroyRetainedInstances) GetProcAddress(m, "remixapi_DestroyRetainedInstances");
+    s.draw = (PFN_remixapi_DrawRetainedInstances) GetProcAddress(m, "remixapi_DrawRetainedInstances");
+    Logger::info(format_string("[RemixApi] Retained-instance exports: create=%d createBatch=%d update=%d "
+                               "updateBatch=%d destroy=%d draw=%d",
+                               s.create != nullptr, s.createBatch != nullptr, s.update != nullptr,
+                               s.updateBatch != nullptr, s.destroy != nullptr, s.draw != nullptr));
+  }
+  return s;
+}
+
+// True when fn is usable; otherwise logs (once per call site) and returns false.
+static bool haveRetainedExport(const void* fn, bool& warned, const char* name) {
+  if (fn) {
+    return true;
+  }
+  if (!warned) {
+    warned = true;
+    Logger::err(format_string("[RemixApi] The runtime does not export %s; the call is dropped.", name));
+  }
+  return false;
+}
+
+// D3D9 texture import. Optional runtime export, resolved by name like
+// the retained ones; null when the runtime predates it.
+static PFN_remixapi_ImportD3D9Texture importD3D9TextureExport() {
+  static bool s_resolved = false;
+  static PFN_remixapi_ImportD3D9Texture s_fn = nullptr;
+  if (!s_resolved && remixapi::g_remix_dll) {
+    s_resolved = true;
+    s_fn = (PFN_remixapi_ImportD3D9Texture) GetProcAddress(remixapi::g_remix_dll, "remixapi_ImportD3D9Texture");
+    Logger::info(format_string("[RemixApi] D3D9 texture import export: %d", s_fn != nullptr));
+  }
+  return s_fn;
+}
+
+// Host settings. Optional runtime exports, resolved by name like the
+// retained ones; the client asks once (RemixApi_QueryHostSettings) whether all
+// five are there and sends nothing more when they aren't.
+struct HostSettingsExports {
+  bool resolved = false;
+  PFN_remixapi_RegisterHostSetting       reg = nullptr;
+  PFN_remixapi_GetHostSettingsGeneration generation = nullptr;
+  PFN_remixapi_GetHostSettingValue       get = nullptr;
+  PFN_remixapi_SetHostSettingValue       set = nullptr;
+  PFN_remixapi_ClearHostSettings         clear = nullptr;
+
+  bool complete() const {
+    return reg && generation && get && set && clear;
+  }
+};
+
+static HostSettingsExports& hostSettingsExports() {
+  static HostSettingsExports s;
+  if (!s.resolved && remixapi::g_remix_dll) {
+    s.resolved = true;
+    const HMODULE m = remixapi::g_remix_dll;
+    s.reg = (PFN_remixapi_RegisterHostSetting) GetProcAddress(m, "remixapi_RegisterHostSetting");
+    s.generation = (PFN_remixapi_GetHostSettingsGeneration) GetProcAddress(m, "remixapi_GetHostSettingsGeneration");
+    s.get = (PFN_remixapi_GetHostSettingValue) GetProcAddress(m, "remixapi_GetHostSettingValue");
+    s.set = (PFN_remixapi_SetHostSettingValue) GetProcAddress(m, "remixapi_SetHostSettingValue");
+    s.clear = (PFN_remixapi_ClearHostSettings) GetProcAddress(m, "remixapi_ClearHostSettings");
+    if (s.complete()) {
+      Logger::info("[RemixApi] Host-settings exports: present");
+    } else {
+      Logger::err(format_string("[RemixApi] The runtime lacks host-settings exports (register=%d generation=%d "
+                                "get=%d set=%d clear=%d); host-settings calls are dropped.",
+                                s.reg != nullptr, s.generation != nullptr, s.get != nullptr, s.set != nullptr,
+                                s.clear != nullptr));
+    }
+  }
+  return s;
+}
+
+// Client host-setting handle -> runtime handle. Several client handles may
+// name one runtime handle (the runtime keeps a key's handle on re-register).
+std::unordered_map<uint32_t, remixapi_HostSettingHandle> gHostSettingHandles;
+
+// Set by the first RemixApi_PollHostSettings. The generation is published from then on.
+static bool gHostSettingsPolled = false;
+
+// Writes the runtime's host-settings generation where the client's remixapi_PollHostSettings reads it without a
+// round trip (util_queryresults.h).
+static void publishHostSettingsGeneration() {
+  auto* pBlock = bridge_util::QueryResults::block();
+  if (!gHostSettingsPolled || pBlock == nullptr) {
+    return;
+  }
+  const auto& fns = hostSettingsExports();
+  if (fns.generation == nullptr) {
+    return;
+  }
+  pBlock->hostSettingsGeneration.store(static_cast<uint32_t>(fns.generation()), std::memory_order_relaxed);
+  pBlock->hostSettingsPublished.store(1, std::memory_order_release);
+}
+
+// A string the client sent with its terminating NUL.
+static std::string pullHostString() {
+  void* p = nullptr;
+  const uint32_t len = DeviceBridge::get_data(&p);
+  std::string s = p ? std::string(static_cast<const char*>(p), len) : std::string();
+  while (!s.empty() && s.back() == '\0') {
+    s.pop_back();
+  }
+  return s;
+}
+
+static double pullDouble() {
+  double* p = nullptr;
+  const uint32_t len = DeviceBridge::get_data((void**) &p);
+  return (p && len == sizeof(double)) ? *p : 0.0;
+}
+
+// Client retained handle -> runtime retained handle. A client handle whose
+// create failed has no entry, and every later call naming it is dropped.
+std::unordered_map<uint64_t, uint64_t> gRetainedHandles;
+
+static uint64_t pullU64() {
+  uint64_t* p = nullptr;
+  const uint32_t len = DeviceBridge::get_data((void**) &p);
+  return (p && len == sizeof(uint64_t)) ? *p : 0;
+}
+
+static bool lookupRetained(uint64_t clientHandle, uint64_t& runtimeHandle) {
+  const auto it = gRetainedHandles.find(clientHandle);
+  if (it == gRetainedHandles.cend()) {
+    return false;
+  }
+  runtimeHandle = it->second;
+  return true;
 }
 }
 
@@ -423,7 +654,7 @@ void ProcessDeviceCommandQueue() {
         Logger::info("Device Processing: " + toString(rpcHeader.command) + " UID: " + std::to_string(currentUID));
       }
 #endif
-      // The per-command handlers, as a lambda so a Bridge_StatePacket can run them once per record (with the
+      // A3b: the per-command handlers, as a lambda so a Bridge_StatePacket can run them once per record (with the
       // record's command and the packet's device handle and UID). The handlers read their arguments from the data
       // ring, where a record carries them exactly as the stand-alone command would.
       const auto dispatch = [&](const Header& rpcHeader, const uint32_t currentUID) {
@@ -452,7 +683,6 @@ void ProcessDeviceCommandQueue() {
         } else {
           Logger::info("Server side D3D9 DeviceEx created successfully!");
           gpD3DDevices[pHandle] = pD3DDevice;
-          forgetDeviceLookup();
           if(GlobalOptions::getExposeRemixApi()) {
             remixapi::g_device = pD3DDevice;
             remixapi::g_remix.dxvk_RegisterD3D9Device(remixapi::g_device);
@@ -488,7 +718,6 @@ void ProcessDeviceCommandQueue() {
         } else {
           Logger::info("Server side D3D9 Device created successfully!");
           gpD3DDevices[pHandle] = (IDirect3DDevice9Ex*) pD3DDevice;
-          forgetDeviceLookup();
           if(GlobalOptions::getExposeRemixApi()) {
             remixapi::g_device = (IDirect3DDevice9Ex*) pD3DDevice;
             remixapi::g_remix.dxvk_RegisterD3D9Device(remixapi::g_device);
@@ -627,7 +856,6 @@ void ProcessDeviceCommandQueue() {
         GET_RES(pD3DDevice, gpD3DDevices);
         safeDestroy(pD3DDevice, pD3DDeviceHandle);
         gpD3DDevices.erase(pD3DDeviceHandle);
-        forgetDeviceLookup();
         break;
       }
       case IDirect3DDevice9Ex_TestCooperativeLevel:
@@ -706,7 +934,7 @@ void ProcessDeviceCommandQueue() {
         PULL_U(pHandle);
         IDirect3DSurface9* pCursorBitmap = nullptr;
         if (pHandle != NULL) {
-          pCursorBitmap = (IDirect3DSurface9*) findOrNull(gpD3DResources, pHandle);
+          pCursorBitmap = (IDirect3DSurface9*) gpD3DResources[pHandle];
         }
         const auto hresult = pD3DDevice->SetCursorProperties(XHotSpot, YHotSpot, pCursorBitmap);
         SEND_OPTIONAL_SERVER_RESPONSE(hresult, currentUID);
@@ -725,9 +953,11 @@ void ProcessDeviceCommandQueue() {
       {
         GET_RES(pD3DDevice, gpD3DDevices);
         PULL(BOOL, bShow);
-        // The client tracks the previous visibility itself and waits only with sendAllServerResponses.
         const BOOL prevShow = pD3DDevice->ShowCursor(bShow);
-        SEND_OPTIONAL_SERVER_RESPONSE(prevShow, currentUID);
+        {
+          ServerMessage c(Commands::Bridge_Response, currentUID);
+          c.send_data(prevShow);
+        }
         break;
       }
       case IDirect3DDevice9Ex_CreateAdditionalSwapChain:
@@ -838,6 +1068,7 @@ void ProcessDeviceCommandQueue() {
           Logger::trace("Present semaphore released successfully.");
 #endif
         }
+        publishHostSettingsGeneration();
         DeviceBridge::perfOnFrame();
         break;
       }
@@ -1020,9 +1251,9 @@ void ProcessDeviceCommandQueue() {
         PULL_OBJ(RECT, pSourceRect);
         PULL_HND(pDestHandle);
         PULL_OBJ(POINT, pDestPoint);
-        const auto& pSourceSurface = (IDirect3DSurface9*) findOrNull(gpD3DResources, pSourceHandle);
+        const auto& pSourceSurface = (IDirect3DSurface9*) gpD3DResources[pSourceHandle];
         assert(pSourceSurface != nullptr);
-        const auto& pDestinationSurface = (IDirect3DSurface9*) findOrNull(gpD3DResources, pDestHandle);
+        const auto& pDestinationSurface = (IDirect3DSurface9*) gpD3DResources[pDestHandle];
         assert(pDestinationSurface != nullptr);
         if (pSourceSurface != nullptr && pDestinationSurface != nullptr) {
           hresult = pD3DDevice->UpdateSurface(IN pSourceSurface, IN pSourceRect, IN pDestinationSurface, IN pDestPoint);
@@ -1037,9 +1268,9 @@ void ProcessDeviceCommandQueue() {
         GET_RES(pD3DDevice, gpD3DDevices);
         PULL_HND(pSourceTextureHandle);
         PULL_HND(pDestinationTextureHandle);
-        const auto& pSourceTexture = (IDirect3DBaseTexture9*) findOrNull(gpD3DResources, pSourceTextureHandle);
+        const auto& pSourceTexture = (IDirect3DBaseTexture9*) gpD3DResources[pSourceTextureHandle];
         assert(pSourceTexture != nullptr);
-        const auto& pDestinationTexture = (IDirect3DBaseTexture9*) findOrNull(gpD3DResources, pDestinationTextureHandle);
+        const auto& pDestinationTexture = (IDirect3DBaseTexture9*) gpD3DResources[pDestinationTextureHandle];
         assert(pDestinationTexture != nullptr);
         if (pSourceTexture != nullptr && pDestinationTexture != nullptr) {
           hresult = pD3DDevice->UpdateTexture(IN pSourceTexture, IN pDestinationTexture);
@@ -1053,8 +1284,8 @@ void ProcessDeviceCommandQueue() {
         GET_RES(pD3DDevice, gpD3DDevices);
         PULL_HND(pRenderTargetHandle);
         PULL_HND(pDestSurfaceHandle);
-        const auto& pRenderTarget = (IDirect3DSurface9*) findOrNull(gpD3DResources, pRenderTargetHandle);
-        const auto& pDestSurface = (IDirect3DSurface9*) findOrNull(gpD3DResources, pDestSurfaceHandle);
+        const auto& pRenderTarget = (IDirect3DSurface9*) gpD3DResources[pRenderTargetHandle];
+        const auto& pDestSurface = (IDirect3DSurface9*) gpD3DResources[pDestSurfaceHandle];
         auto hresult = pD3DDevice->GetRenderTargetData(IN pRenderTarget, IN pDestSurface);
         hresult = ReturnSurfaceDataToClient(pDestSurface, hresult, currentUID);
         assert(SUCCEEDED(hresult));
@@ -1065,7 +1296,7 @@ void ProcessDeviceCommandQueue() {
         GET_RES(pD3DDevice, gpD3DDevices);
         PULL(uint32_t, iSwapChain);
         PULL_HND(pDestSurfaceHandle);
-        const auto& pDestSurface = (IDirect3DSurface9*) findOrNull(gpD3DResources, pDestSurfaceHandle);
+        const auto& pDestSurface = (IDirect3DSurface9*) gpD3DResources[pDestSurfaceHandle];
         IDirect3DSurface9* pBackbuffer = nullptr;
         auto hresult = pD3DDevice->GetFrontBufferData(IN iSwapChain, IN pDestSurface);
         hresult = ReturnSurfaceDataToClient(pDestSurface, hresult, currentUID);
@@ -1080,8 +1311,8 @@ void ProcessDeviceCommandQueue() {
         PULL_HND(pDestHandle);
         PULL_OBJ(RECT, pDestRect);
         PULL(D3DTEXTUREFILTERTYPE, Filter);
-        const auto& pSourceSurface = (IDirect3DSurface9*) findOrNull(gpD3DResources, pSourceHandle);
-        const auto& pDestSurface = (IDirect3DSurface9*) findOrNull(gpD3DResources, pDestHandle);
+        const auto& pSourceSurface = (IDirect3DSurface9*) gpD3DResources[pSourceHandle];
+        const auto& pDestSurface = (IDirect3DSurface9*) gpD3DResources[pDestHandle];
         const auto hresult = pD3DDevice->StretchRect(IN pSourceSurface, IN pSourceRect, IN pDestSurface, IN pDestRect, IN Filter);
         assert(SUCCEEDED(hresult));
         SEND_OPTIONAL_SERVER_RESPONSE(hresult, currentUID);
@@ -1093,7 +1324,7 @@ void ProcessDeviceCommandQueue() {
         PULL_HND(pHandle);
         PULL_OBJ(RECT, pRect);
         PULL_OBJ(D3DCOLOR, color);
-        const auto& pSurface = (IDirect3DSurface9*) findOrNull(gpD3DResources, pHandle);
+        const auto& pSurface = (IDirect3DSurface9*) gpD3DResources[pHandle];
         const auto hresult = pD3DDevice->ColorFill(IN pSurface, IN pRect, IN * color);
         assert(SUCCEEDED(hresult));
         SEND_OPTIONAL_SERVER_RESPONSE(hresult, currentUID);
@@ -1124,7 +1355,7 @@ void ProcessDeviceCommandQueue() {
         PULL_U(pHandle);
         IDirect3DSurface9* pRenderTarget = nullptr;
         if (pHandle != NULL) {
-          pRenderTarget = (IDirect3DSurface9*) findOrNull(gpD3DResources, pHandle);
+          pRenderTarget = (IDirect3DSurface9*) gpD3DResources[pHandle];
         }
         assert((pHandle != 0 && pRenderTarget != 0) || pHandle == 0);
         if ((pHandle != 0 && pRenderTarget != 0) || pHandle == 0) {
@@ -1155,7 +1386,7 @@ void ProcessDeviceCommandQueue() {
         PULL_U(pHandle);
         IDirect3DSurface9* pDepthStencil = nullptr;
         if (pHandle != NULL) {
-          pDepthStencil = (IDirect3DSurface9*) findOrNull(gpD3DResources, pHandle);
+          pDepthStencil = (IDirect3DSurface9*) gpD3DResources[pHandle];
         }
         assert((pHandle != 0 && pDepthStencil != 0) || pHandle == 0);
         if ((pHandle != 0 && pDepthStencil != 0) || pHandle == 0) {
@@ -1346,7 +1577,7 @@ void ProcessDeviceCommandQueue() {
         PULL_U(pHandle);
         IDirect3DBaseTexture9* pTexture = nullptr;
         if (pHandle != NULL) {
-          pTexture = (IDirect3DBaseTexture9*) findOrNull(gpD3DResources, pHandle);
+          pTexture = (IDirect3DBaseTexture9*) gpD3DResources[pHandle];
           assert(pTexture != nullptr);
         }
         const auto hresult = pD3DDevice->SetTexture(IN Stage, IN pTexture);
@@ -1494,8 +1725,8 @@ void ProcessDeviceCommandQueue() {
         PULL_HND(pVertexDeclHandle);
         PULL(DWORD, Flags);
 
-        const auto& pVertexDecl = findOrNull(gpD3DVertexDeclarations, pVertexDeclHandle);
-        const auto& pDestBuffer = (IDirect3DVertexBuffer9*) findOrNull(gpD3DResources, pVertexBufferHandle);
+        const auto& pVertexDecl = gpD3DVertexDeclarations[pVertexDeclHandle];
+        const auto& pDestBuffer = (IDirect3DVertexBuffer9*) gpD3DResources[pVertexBufferHandle];
 
         const auto hresult = pD3DDevice->ProcessVertices(SrcStartIndex, DestIndex, VertexCount, pDestBuffer, pVertexDecl, Flags);
         assert(SUCCEEDED(hresult));
@@ -1524,7 +1755,7 @@ void ProcessDeviceCommandQueue() {
         PULL_U(pHandle);
         IDirect3DVertexDeclaration9* pVertexDecl = nullptr;
         if (pHandle != NULL) {
-          pVertexDecl = (IDirect3DVertexDeclaration9*) findOrNull(gpD3DVertexDeclarations, pHandle);
+          pVertexDecl = (IDirect3DVertexDeclaration9*) gpD3DVertexDeclarations[pHandle];
         }
         const auto hresult = pD3DDevice->SetVertexDeclaration(IN pVertexDecl);
         assert(SUCCEEDED(hresult));
@@ -1566,7 +1797,7 @@ void ProcessDeviceCommandQueue() {
         PULL_U(pHandle);
         IDirect3DVertexShader9* pShader = nullptr;
         if (pHandle != NULL) {
-          pShader = findOrNull(gpD3DVertexShaders, pHandle);
+          pShader = gpD3DVertexShaders[pHandle];
         }
         const auto hresult = pD3DDevice->SetVertexShader(IN pShader);
         assert(SUCCEEDED(hresult));
@@ -1626,7 +1857,7 @@ void ProcessDeviceCommandQueue() {
         PULL_U(Stride);
         IDirect3DVertexBuffer9* pStreamData = nullptr;
         if (pHandle != NULL) {
-          pStreamData = (IDirect3DVertexBuffer9*) findOrNull(gpD3DResources, pHandle);
+          pStreamData = (IDirect3DVertexBuffer9*) gpD3DResources[pHandle];
         }
         const auto hresult = pD3DDevice->SetStreamSource(IN StreamNumber, IN pStreamData, IN OffsetInBytes, IN Stride);
         assert(SUCCEEDED(hresult));
@@ -1653,7 +1884,7 @@ void ProcessDeviceCommandQueue() {
         PULL_U(pHandle);
         IDirect3DIndexBuffer9* pIndexData = NULL;
         if (pHandle != NULL) {
-          pIndexData = (IDirect3DIndexBuffer9*) findOrNull(gpD3DResources, pHandle);
+          pIndexData = (IDirect3DIndexBuffer9*) gpD3DResources[pHandle];
         }
         const auto hresult = pD3DDevice->SetIndices(IN pIndexData);
         assert(SUCCEEDED(hresult));
@@ -1684,7 +1915,7 @@ void ProcessDeviceCommandQueue() {
         PULL_U(pHandle);
         IDirect3DPixelShader9* pShader = nullptr;
         if (pHandle != NULL) {
-          pShader = findOrNull(gpD3DPixelShaders, pHandle);
+          pShader = gpD3DPixelShaders[pHandle];
         }
         const auto hresult = pD3DDevice->SetPixelShader(IN pShader);
         assert(SUCCEEDED(hresult));
@@ -1774,11 +2005,11 @@ void ProcessDeviceCommandQueue() {
         PULL(D3DCOMPOSERECTSOP, Operation);
         PULL(int, Xoffset);
         PULL(int, Yoffset);
-        const auto& srcSurface = (IDirect3DSurface9*) findOrNull(gpD3DResources, pSrcSurface);
-        const auto& destSurface = (IDirect3DSurface9*) findOrNull(gpD3DResources, pDestSurface);
+        const auto& srcSurface = (IDirect3DSurface9*) gpD3DResources[pSrcSurface];
+        const auto& destSurface = (IDirect3DSurface9*) gpD3DResources[pDestSurface];
 
-        const auto& srcVertexBuffer = (IDirect3DVertexBuffer9*) findOrNull(gpD3DResources, pSrcRect);
-        const auto& destVertexBuffer = (IDirect3DVertexBuffer9*) findOrNull(gpD3DResources, pDestRect);
+        const auto& srcVertexBuffer = (IDirect3DVertexBuffer9*) gpD3DResources[pSrcRect];
+        const auto& destVertexBuffer = (IDirect3DVertexBuffer9*) gpD3DResources[pDestRect];
 
         const auto hresult = ((IDirect3DDevice9Ex*) pD3DDevice)->ComposeRects(IN srcSurface, IN destSurface, IN srcVertexBuffer, IN NumRects, IN destVertexBuffer, IN Operation, IN Xoffset, IN Yoffset);
         SEND_OPTIONAL_SERVER_RESPONSE(hresult, currentUID);
@@ -1819,7 +2050,7 @@ void ProcessDeviceCommandQueue() {
       case IDirect3DStateBlock9_Destroy:
       {
         GET_HND(pHandle);
-        const auto& pSB = findOrNull(gpD3DStateBlocks, pHandle);
+        const auto& pSB = gpD3DStateBlocks[pHandle];
         safeDestroy(pSB, pHandle);
         gpD3DStateBlocks.erase(pHandle);
         break;
@@ -1829,7 +2060,7 @@ void ProcessDeviceCommandQueue() {
       case IDirect3DStateBlock9_Capture:
       {
         GET_HND(pHandle);
-        const auto& pSB = findOrNull(gpD3DStateBlocks, pHandle);
+        const auto& pSB = gpD3DStateBlocks[pHandle];
         const auto hresult = pSB->Capture();
         assert(SUCCEEDED(hresult));
         break;
@@ -1837,7 +2068,7 @@ void ProcessDeviceCommandQueue() {
       case IDirect3DStateBlock9_Apply:
       {
         GET_HND(pHandle);
-        const auto& pSB = findOrNull(gpD3DStateBlocks, pHandle);
+        const auto& pSB = gpD3DStateBlocks[pHandle];
         assert(pSB != nullptr);
         const auto hresult = pSB->Apply();
         assert(SUCCEEDED(hresult));
@@ -1854,7 +2085,7 @@ void ProcessDeviceCommandQueue() {
       case IDirect3DSwapChain9_Destroy:
       {
         GET_HND(pHandle);
-        const auto& pSwapChain = findOrNull(gpD3DSwapChains, pHandle);
+        const auto& pSwapChain = gpD3DSwapChains[pHandle];
         safeDestroy(pSwapChain, pHandle);
         gpD3DSwapChains.erase(pHandle);
         break;
@@ -1889,6 +2120,7 @@ void ProcessDeviceCommandQueue() {
           Logger::trace("Present semaphore released successfully.");
 #endif
         }
+        publishHostSettingsGeneration();
         DeviceBridge::perfOnFrame();
         break;
       }
@@ -1896,7 +2128,7 @@ void ProcessDeviceCommandQueue() {
       {
         GET_RES(pSwapChain, gpD3DSwapChains);
         PULL_HND(pDestSurfaceHandle);
-        const auto& pDestSurface = (IDirect3DSurface9*) findOrNull(gpD3DResources, pDestSurfaceHandle);
+        const auto& pDestSurface = (IDirect3DSurface9*) gpD3DResources[pDestSurfaceHandle];
         auto hresult = pSwapChain->GetFrontBufferData(pDestSurface);
         if (SUCCEEDED(hresult)) {
           gpD3DResources[pDestSurfaceHandle] = pDestSurface;
@@ -1949,7 +2181,7 @@ void ProcessDeviceCommandQueue() {
       {
         GET_HND(pHandle);
         PULL(DWORD, PriorityNew);
-        const auto& pResource = findOrNull(gpD3DResources, pHandle);
+        const auto& pResource = gpD3DResources[pHandle];
         assert(pResource != nullptr);
         pResource->SetPriority(PriorityNew);
         break;
@@ -1959,7 +2191,7 @@ void ProcessDeviceCommandQueue() {
       case IDirect3DResource9_PreLoad:
       {
         GET_HND(pHandle);
-        const auto& pResource = findOrNull(gpD3DResources, pHandle);
+        const auto& pResource = gpD3DResources[pHandle];
         assert(pResource != nullptr);
         pResource->PreLoad();
         break;
@@ -1975,14 +2207,14 @@ void ProcessDeviceCommandQueue() {
       case IDirect3DVertexDeclaration9_AddRef:
       {
         GET_HND(pHandle);
-        const auto& pVertexDeclaration = findOrNull(gpD3DVertexDeclarations, pHandle);
+        const auto& pVertexDeclaration = gpD3DVertexDeclarations[pHandle];
         pVertexDeclaration->AddRef();
         break;
       }
       case IDirect3DVertexDeclaration9_Destroy:
       {
         GET_HND(pHandle);
-        const auto& pVertexDeclaration = findOrNull(gpD3DVertexDeclarations, pHandle);
+        const auto& pVertexDeclaration = gpD3DVertexDeclarations[pHandle];
         safeDestroy(pVertexDeclaration, pHandle);
         gpD3DVertexDeclarations.erase(pHandle);
         break;
@@ -2000,14 +2232,14 @@ void ProcessDeviceCommandQueue() {
       case IDirect3DVertexShader9_AddRef:
       {
         GET_HND(pHandle);
-        const auto& pVertexShader = findOrNull(gpD3DVertexShaders, pHandle);
+        const auto& pVertexShader = gpD3DVertexShaders[pHandle];
         pVertexShader->AddRef();
         break;
       }
       case IDirect3DVertexShader9_Destroy:
       {
         GET_HND(pHandle);
-        const auto& pVertexShader = findOrNull(gpD3DVertexShaders, pHandle);
+        const auto& pVertexShader = gpD3DVertexShaders[pHandle];
         safeDestroy(pVertexShader, pHandle);
         gpD3DVertexShaders.erase(pHandle);
         break;
@@ -2025,14 +2257,14 @@ void ProcessDeviceCommandQueue() {
       case IDirect3DPixelShader9_AddRef:
       {
         GET_HND(pHandle);
-        const auto& pPixelShader = findOrNull(gpD3DPixelShaders, pHandle);
+        const auto& pPixelShader = gpD3DPixelShaders[pHandle];
         pPixelShader->AddRef();
         break;
       }
       case IDirect3DPixelShader9_Destroy:
       {
         GET_HND(pHandle);
-        const auto& pPixelShader = findOrNull(gpD3DPixelShaders, pHandle);
+        const auto& pPixelShader = gpD3DPixelShaders[pHandle];
         safeDestroy(pPixelShader, pHandle);
         gpD3DPixelShaders.erase(pHandle);
         break;
@@ -2071,7 +2303,7 @@ void ProcessDeviceCommandQueue() {
       {
         GET_HND(pHandle);
         PULL(DWORD, LODNew);
-        const auto& pResource = findOrNull(gpD3DResources, pHandle);
+        const auto& pResource = gpD3DResources[pHandle];
         if (pResource != nullptr) {
           ((IDirect3DBaseTexture9*) pResource)->SetLOD(LODNew);
         }
@@ -2087,7 +2319,7 @@ void ProcessDeviceCommandQueue() {
         HRESULT hresult = D3DERR_INVALIDCALL;
         GET_HND(pHandle);
         PULL(D3DTEXTUREFILTERTYPE, FilterType);
-        const auto& pResource = findOrNull(gpD3DResources, pHandle);
+        const auto& pResource = gpD3DResources[pHandle];
         if (pResource != nullptr) {
           hresult = ((IDirect3DBaseTexture9*) pResource)->SetAutoGenFilterType(FilterType);
           SEND_OPTIONAL_SERVER_RESPONSE(hresult, currentUID);
@@ -2100,7 +2332,7 @@ void ProcessDeviceCommandQueue() {
       case IDirect3DBaseTexture9_GenerateMipSubLevels:
       {
         GET_HND(pHandle);
-        const auto& pResource = findOrNull(gpD3DResources, pHandle);
+        const auto& pResource = gpD3DResources[pHandle];
         if (pResource != nullptr) {
           ((IDirect3DBaseTexture9*) pResource)->GenerateMipSubLevels();
         }
@@ -2116,14 +2348,14 @@ void ProcessDeviceCommandQueue() {
       case IDirect3DTexture9_AddRef:
       {
         GET_HND(pHandle);
-        const auto& pTexture = (IDirect3DTexture9*) findOrNull(gpD3DResources, pHandle);
+        const auto& pTexture = (IDirect3DTexture9*) gpD3DResources[pHandle];
         pTexture->AddRef();
         break;
       }
       case IDirect3DTexture9_Destroy:
       {
         GET_HND(pHandle);
-        const auto& pTexture = (IDirect3DTexture9*) findOrNull(gpD3DResources, pHandle);
+        const auto& pTexture = (IDirect3DTexture9*) gpD3DResources[pHandle];
         safeDestroy(pTexture, pHandle);
         gpD3DResources.erase(pHandle);
         break;
@@ -2152,7 +2384,7 @@ void ProcessDeviceCommandQueue() {
       {
         GET_HND(pHandle);
         PULL_D(orig_cnt);
-        const auto& pTexture = (IDirect3DTexture9*) findOrNull(gpD3DResources, pHandle);
+        const auto& pTexture = (IDirect3DTexture9*) gpD3DResources[pHandle];
         const auto cnt = pTexture->GetLevelCount();
         assert(orig_cnt == cnt);
         break;
@@ -2168,7 +2400,7 @@ void ProcessDeviceCommandQueue() {
         GET_HND(pHandle);
         PULL_OBJ(D3DSURFACE_DESC, orig_desc);
         PULL_U(Level);
-        const auto& pTexture = (IDirect3DTexture9*) findOrNull(gpD3DResources, pHandle);
+        const auto& pTexture = (IDirect3DTexture9*) gpD3DResources[pHandle];
         D3DSURFACE_DESC pDesc;
         const auto hresult = pTexture->GetLevelDesc(Level, &pDesc);
         assert(SUCCEEDED(hresult));
@@ -2179,7 +2411,7 @@ void ProcessDeviceCommandQueue() {
         GET_HND(pTextureHandle);
         PULL_U(Level);
         PULL_HND(pSurfaceHandle);
-        const auto& pTexture = (IDirect3DTexture9*) findOrNull(gpD3DResources, pTextureHandle);
+        const auto& pTexture = (IDirect3DTexture9*) gpD3DResources[pTextureHandle];
         LPDIRECT3DSURFACE9 pSurfaceLevel;
         const auto hresult = pTexture->GetSurfaceLevel(IN Level, OUT & pSurfaceLevel);
         if (SUCCEEDED(hresult)) {
@@ -2202,7 +2434,7 @@ void ProcessDeviceCommandQueue() {
       {
         GET_HND(pHandle);
         PULL_OBJ(RECT, pDirtyRect);
-        const auto& pTexture = (IDirect3DTexture9*) findOrNull(gpD3DResources, pHandle);
+        const auto& pTexture = (IDirect3DTexture9*) gpD3DResources[pHandle];
         const auto hresult = pTexture->AddDirtyRect(IN pDirtyRect);
         SEND_OPTIONAL_SERVER_RESPONSE(hresult, currentUID);
         assert(SUCCEEDED(hresult));
@@ -2217,14 +2449,14 @@ void ProcessDeviceCommandQueue() {
       case IDirect3DVolumeTexture9_AddRef:
       {
         GET_HND(pHandle);
-        const auto& pVolumeTexture = (IDirect3DVolumeTexture9*) findOrNull(gpD3DResources, pHandle);
+        const auto& pVolumeTexture = (IDirect3DVolumeTexture9*) gpD3DResources[pHandle];
         pVolumeTexture->AddRef();
         break;
       }
       case IDirect3DVolumeTexture9_Destroy:
       {
         GET_HND(pHandle);
-        const auto& pVolumeTexture = (IDirect3DVolumeTexture9*) findOrNull(gpD3DResources, pHandle);
+        const auto& pVolumeTexture = (IDirect3DVolumeTexture9*) gpD3DResources[pHandle];
         safeDestroy(pVolumeTexture, pHandle);
         gpD3DResources.erase(pHandle);
         break;
@@ -2253,7 +2485,7 @@ void ProcessDeviceCommandQueue() {
       {
         GET_HND(pHandle);
         PULL_D(orig_cnt);
-        const auto& pVolumeTexture = (IDirect3DVolumeTexture9*) findOrNull(gpD3DResources, pHandle);
+        const auto& pVolumeTexture = (IDirect3DVolumeTexture9*) gpD3DResources[pHandle];
         const auto cnt = pVolumeTexture->GetLevelCount();
         assert(orig_cnt == cnt);
         break;
@@ -2269,7 +2501,7 @@ void ProcessDeviceCommandQueue() {
         GET_HND(pHandle);
         PULL_OBJ(D3DVOLUME_DESC, orig_desc);
         PULL_U(Level);
-        const auto& pVolumeTexture = (IDirect3DVolumeTexture9*) findOrNull(gpD3DResources, pHandle);
+        const auto& pVolumeTexture = (IDirect3DVolumeTexture9*) gpD3DResources[pHandle];
         D3DVOLUME_DESC pDesc;
         const auto hresult = pVolumeTexture->GetLevelDesc(Level, &pDesc);
         assert(SUCCEEDED(hresult));
@@ -2280,7 +2512,7 @@ void ProcessDeviceCommandQueue() {
         GET_HND(pVolumeTextureHandle);
         PULL_U(Level);
         PULL_HND(pVolumeLevelHandle);
-        const auto& pVolumeTexture = (IDirect3DVolumeTexture9*) findOrNull(gpD3DResources, pVolumeTextureHandle);
+        const auto& pVolumeTexture = (IDirect3DVolumeTexture9*) gpD3DResources[pVolumeTextureHandle];
         LPDIRECT3DVOLUME9 pVolumeLevel;
         const auto hresult = pVolumeTexture->GetVolumeLevel(IN Level, OUT & pVolumeLevel);
         if (SUCCEEDED(hresult)) {
@@ -2300,7 +2532,7 @@ void ProcessDeviceCommandQueue() {
         PULL_U(Level);
         PULL_OBJ(D3DBOX, pBox);
         PULL_D(Flags);
-        const auto& pVolumeTexture = (IDirect3DVolumeTexture9*) findOrNull(gpD3DResources, pHandle);
+        const auto& pVolumeTexture = (IDirect3DVolumeTexture9*) gpD3DResources[pHandle];
         // Now lock the box so we can copy the data into it
         D3DLOCKED_BOX lockedVolume = {};
         HRESULT hresult = E_FAIL;
@@ -2320,7 +2552,7 @@ void ProcessDeviceCommandQueue() {
         GET_HND(pHandle);
         PULL_U(Level);
         PULL_OBJ(D3DBOX, pBox);
-        const auto& pVolumeTexture = (IDirect3DVolumeTexture9*) findOrNull(gpD3DResources, pHandle);
+        const auto& pVolumeTexture = (IDirect3DVolumeTexture9*) gpD3DResources[pHandle];
         const auto hresult = pVolumeTexture->AddDirtyBox(IN pBox);
         SEND_OPTIONAL_SERVER_RESPONSE(hresult, currentUID);
         assert(SUCCEEDED(hresult));
@@ -2335,14 +2567,14 @@ void ProcessDeviceCommandQueue() {
       case IDirect3DCubeTexture9_AddRef:
       {
         GET_HND(pHandle);
-        const auto& pCubeTexture = (IDirect3DCubeTexture9*) findOrNull(gpD3DResources, pHandle);
+        const auto& pCubeTexture = (IDirect3DCubeTexture9*) gpD3DResources[pHandle];
         pCubeTexture->AddRef();
         break;
       }
       case IDirect3DCubeTexture9_Destroy:
       {
         GET_HND(pHandle);
-        const auto& pCubeTexture = (IDirect3DCubeTexture9*) findOrNull(gpD3DResources, pHandle);
+        const auto& pCubeTexture = (IDirect3DCubeTexture9*) gpD3DResources[pHandle];
         safeDestroy(pCubeTexture, pHandle);
         gpD3DResources.erase(pHandle);
         break;
@@ -2371,7 +2603,7 @@ void ProcessDeviceCommandQueue() {
       {
         GET_HND(pHandle);
         PULL_D(orig_cnt);
-        const auto& pCubeTexture = (IDirect3DCubeTexture9*) findOrNull(gpD3DResources, pHandle);
+        const auto& pCubeTexture = (IDirect3DCubeTexture9*) gpD3DResources[pHandle];
         const auto cnt = pCubeTexture->GetLevelCount();
         assert(orig_cnt == cnt);
         break;
@@ -2387,7 +2619,7 @@ void ProcessDeviceCommandQueue() {
         PULL_OBJ(D3DSURFACE_DESC, orig_desc);
         PULL_U(Level);
         GET_HND(pHandle);
-        const auto& pCubeTexture = (IDirect3DCubeTexture9*) findOrNull(gpD3DResources, pHandle);
+        const auto& pCubeTexture = (IDirect3DCubeTexture9*) gpD3DResources[pHandle];
         D3DSURFACE_DESC pDesc;
         const auto hresult = pCubeTexture->GetLevelDesc(Level, &pDesc);
         assert(SUCCEEDED(hresult));
@@ -2399,7 +2631,7 @@ void ProcessDeviceCommandQueue() {
         PULL_U(Level);
         GET_HND(pCubeTextureHandle);
         PULL_HND(pCubeMapSurfaceHandle);
-        const auto& pCubeTexture = (IDirect3DCubeTexture9*) findOrNull(gpD3DResources, pCubeTextureHandle);
+        const auto& pCubeTexture = (IDirect3DCubeTexture9*) gpD3DResources[pCubeTextureHandle];
         LPDIRECT3DSURFACE9 pCubeMapSurface;
         const auto hresult = pCubeTexture->GetCubeMapSurface(IN FaceType, IN Level, OUT & pCubeMapSurface);
         if (SUCCEEDED(hresult)) {
@@ -2423,7 +2655,7 @@ void ProcessDeviceCommandQueue() {
         GET_HND(pCubeTextureHandle);
         PULL(D3DCUBEMAP_FACES, FaceType);
         PULL_OBJ(RECT, pDirtyRect);
-        const auto& pCubeTexture = (IDirect3DCubeTexture9*) findOrNull(gpD3DResources, pCubeTextureHandle);
+        const auto& pCubeTexture = (IDirect3DCubeTexture9*) gpD3DResources[pCubeTextureHandle];
         const auto hresult = pCubeTexture->AddDirtyRect(IN FaceType, IN pDirtyRect);
         SEND_OPTIONAL_SERVER_RESPONSE(hresult, currentUID);
         assert(SUCCEEDED(hresult));
@@ -2438,14 +2670,14 @@ void ProcessDeviceCommandQueue() {
       case IDirect3DVertexBuffer9_AddRef:
       {
         GET_HND(pHandle);
-        const auto& pVertexBuffer = (IDirect3DVertexBuffer9*) findOrNull(gpD3DResources, pHandle);
+        const auto& pVertexBuffer = (IDirect3DVertexBuffer9*) gpD3DResources[pHandle];
         pVertexBuffer->AddRef();
         break;
       }
       case IDirect3DVertexBuffer9_Destroy:
       {
         GET_HND(pHandle);
-        const auto& pVertexBuffer = (IDirect3DVertexBuffer9*) findOrNull(gpD3DResources, pHandle);
+        const auto& pVertexBuffer = (IDirect3DVertexBuffer9*) gpD3DResources[pHandle];
         safeDestroy(pVertexBuffer, pHandle);
         gpD3DResources.erase(pHandle);
         break;
@@ -2480,7 +2712,7 @@ void ProcessDeviceCommandQueue() {
         PULL_U(OffsetToLock);
         PULL_U(SizeToLock);
         PULL_D(Flags);
-        const auto pVertexBuffer = (IDirect3DVertexBuffer9*) findOrNull(gpD3DResources, pHandle);
+        const auto pVertexBuffer = (IDirect3DVertexBuffer9*) gpD3DResources[pHandle];
 
         // Locate the data first: it must be consumed from the queue even when the upload is skipped
         void* data = nullptr;
@@ -2519,7 +2751,7 @@ void ProcessDeviceCommandQueue() {
       {
         GET_HND(pHandle);
         PULL_OBJ(D3DVERTEXBUFFER_DESC, orig_desc);
-        const auto& pVertexBuffer = (IDirect3DVertexBuffer9*) findOrNull(gpD3DResources, pHandle);
+        const auto& pVertexBuffer = (IDirect3DVertexBuffer9*) gpD3DResources[pHandle];
         D3DVERTEXBUFFER_DESC pDesc;
         const auto hresult = pVertexBuffer->GetDesc(OUT & pDesc);
         assert(SUCCEEDED(hresult));
@@ -2534,14 +2766,14 @@ void ProcessDeviceCommandQueue() {
       case IDirect3DIndexBuffer9_AddRef:
       {
         GET_HND(pHandle);
-        const auto& pIndexBuffer = (IDirect3DIndexBuffer9*) findOrNull(gpD3DResources, pHandle);
+        const auto& pIndexBuffer = (IDirect3DIndexBuffer9*) gpD3DResources[pHandle];
         pIndexBuffer->AddRef();
         break;
       }
       case IDirect3DIndexBuffer9_Destroy:
       {
         GET_HND(pHandle);
-        const auto& pIndexBuffer = (IDirect3DIndexBuffer9*) findOrNull(gpD3DResources, pHandle);
+        const auto& pIndexBuffer = (IDirect3DIndexBuffer9*) gpD3DResources[pHandle];
         safeDestroy(pIndexBuffer, pHandle);
         gpD3DResources.erase(pHandle);
         break;
@@ -2576,7 +2808,7 @@ void ProcessDeviceCommandQueue() {
         PULL_U(OffsetToLock);
         PULL_U(SizeToLock);
         PULL_D(Flags);
-        const auto pIndexBuffer = (IDirect3DIndexBuffer9*) findOrNull(gpD3DResources, pHandle);
+        const auto pIndexBuffer = (IDirect3DIndexBuffer9*) gpD3DResources[pHandle];
 
         // Locate the data first: it must be consumed from the queue even when the upload is skipped
         void* data = nullptr;
@@ -2614,7 +2846,7 @@ void ProcessDeviceCommandQueue() {
       {
         GET_HND(pHandle);
         PULL_OBJ(D3DINDEXBUFFER_DESC, orig_desc);
-        const auto& pIndexBuffer = (IDirect3DIndexBuffer9*) findOrNull(gpD3DResources, pHandle);
+        const auto& pIndexBuffer = (IDirect3DIndexBuffer9*) gpD3DResources[pHandle];
         D3DINDEXBUFFER_DESC pDesc;
         const auto hresult = pIndexBuffer->GetDesc(OUT & pDesc);
         assert(SUCCEEDED(hresult));
@@ -2629,14 +2861,14 @@ void ProcessDeviceCommandQueue() {
       case IDirect3DSurface9_AddRef:
       {
         GET_HND(pHandle);
-        const auto& pSurface = (IDirect3DSurface9*) findOrNull(gpD3DResources, pHandle);
+        const auto& pSurface = (IDirect3DSurface9*) gpD3DResources[pHandle];
         pSurface->AddRef();
         break;
       }
       case IDirect3DSurface9_Destroy:
       {
         GET_HND(pHandle);
-        const auto& pSurface = (IDirect3DSurface9*) findOrNull(gpD3DResources, pHandle);
+        const auto& pSurface = (IDirect3DSurface9*) gpD3DResources[pHandle];
         safeDestroy(pSurface, pHandle);
         gpD3DResources.erase(pHandle);
         break;
@@ -2663,7 +2895,7 @@ void ProcessDeviceCommandQueue() {
       {
         GET_HND(pHandle);
         PULL_OBJ(D3DSURFACE_DESC, orig_desc);
-        const auto& pSurface = (IDirect3DSurface9*) findOrNull(gpD3DResources, pHandle);
+        const auto& pSurface = (IDirect3DSurface9*) gpD3DResources[pHandle];
         D3DSURFACE_DESC pDesc;
         const auto hresult = pSurface->GetDesc(OUT & pDesc);
         assert(SUCCEEDED(hresult));
@@ -2673,7 +2905,7 @@ void ProcessDeviceCommandQueue() {
       {
         // Currently we only recieve calls for LockRect in cases where backbuffer data is to be copied for screenshots
         GET_HND(pHandle);
-        const auto pSurface = (IDirect3DSurface9*) findOrNull(gpD3DResources, pHandle);
+        const auto pSurface = (IDirect3DSurface9*) gpD3DResources[pHandle];
         HRESULT hresult = ReturnSurfaceDataToClient(pSurface, S_OK, currentUID);
         assert(SUCCEEDED(hresult));
         break;
@@ -2683,7 +2915,7 @@ void ProcessDeviceCommandQueue() {
         GET_HND(pHandle);
         PULL_OBJ(RECT, pRect);
         PULL_D(Flags);
-        const auto pSurface = (IDirect3DSurface9*) findOrNull(gpD3DResources, pHandle);
+        const auto pSurface = (IDirect3DSurface9*) gpD3DResources[pHandle];
         const uint32_t width = pRect->right - pRect->left;
         const uint32_t height = pRect->bottom - pRect->top;
         PULL_D(dFormat);
@@ -2739,6 +2971,20 @@ void ProcessDeviceCommandQueue() {
           }
         }
 
+        // [TexDiag] (util_texdiag.h): fingerprint the rows as the surface received them; pairs with the client's line for this uid.
+        if (const uint32_t diagMinWidth = GlobalOptions::getTextureUploadDiagnostics();
+            diagMinWidth != 0 && width >= diagMinWidth) {
+          if (locked) {
+            const auto stats = bridge_util::texdiag::analyzeRows((const uint8_t*) lockedRect.pBits, (size_t) lockedRect.Pitch,
+                                                                 rowSize, numRows);
+            bridge_util::texdiag::logRowStats("server", (uint32_t) currentUID, (uint32_t) pHandle, (uint32_t) format,
+                                              pRect->left, pRect->top, pRect->right, pRect->bottom, Flags, rowSize, stats);
+          } else if (pSurface == nullptr) {
+            Logger::warn(bridge_util::format_string("[TexDiag] server uid=%u surf=0x%x: no server surface, upload skipped",
+                                                    (uint32_t) currentUID, (uint32_t) pHandle));
+          }
+        }
+
         if (locked) {
           hresult = pSurface->UnlockRect();
           assert(SUCCEEDED(hresult));
@@ -2762,14 +3008,14 @@ void ProcessDeviceCommandQueue() {
       case IDirect3DVolume9_AddRef:
       {
         GET_HND(pHandle);
-        const auto& pVolume = findOrNull(gpD3DVolumes, pHandle);
+        const auto& pVolume = gpD3DVolumes[pHandle];
         pVolume->AddRef();
         break;
       }
       case IDirect3DVolume9_Destroy:
       {
         GET_HND(pHandle);
-        const auto& pVolume = findOrNull(gpD3DVolumes, pHandle);
+        const auto& pVolume = gpD3DVolumes[pHandle];
         safeDestroy(pVolume, pHandle);
         gpD3DVolumes.erase(pHandle);
         break;
@@ -2788,7 +3034,7 @@ void ProcessDeviceCommandQueue() {
       {
         GET_HND(pHandle);
         PULL_OBJ(D3DVOLUME_DESC, orig_desc);
-        const auto& pVolume = findOrNull(gpD3DVolumes, pHandle);
+        const auto& pVolume = gpD3DVolumes[pHandle];
         D3DVOLUME_DESC pDesc;
         const auto hresult = pVolume->GetDesc(OUT & pDesc);
         assert(SUCCEEDED(hresult));
@@ -2804,7 +3050,7 @@ void ProcessDeviceCommandQueue() {
         GET_HND(pHandle);
         PULL_OBJ(D3DBOX, pBox);
         PULL_D(Flags);
-        const auto& pVolume = findOrNull(gpD3DVolumes, pHandle);
+        const auto& pVolume = gpD3DVolumes[pHandle];
         // Now lock the box so we can copy the data into it
         D3DLOCKED_BOX lockedVolume = {};
         HRESULT hresult = E_FAIL;
@@ -2830,7 +3076,7 @@ void ProcessDeviceCommandQueue() {
       case IDirect3DQuery9_Destroy:
       {
         GET_HND(pHandle);
-        const auto& pQuery = (IDirect3DQuery9*) findOrNull(gpD3DQuery, pHandle);
+        const auto& pQuery = (IDirect3DQuery9*) gpD3DQuery[pHandle];
         safeDestroy(pQuery, pHandle);
         gpD3DQuery.erase(pHandle);
         break;
@@ -2845,10 +3091,10 @@ void ProcessDeviceCommandQueue() {
       {
         GET_HND(pHandle);
         PULL(DWORD, dwIssueFlags);
-        const auto pQuery = findOrNull(gpD3DQuery, pHandle);
+        const auto pQuery = gpD3DQuery[pHandle];
         // A query whose (async) create failed has no server object (counted at the create).
         const HRESULT hresult = (pQuery != nullptr) ? pQuery->Issue(dwIssueFlags) : D3DERR_INVALIDCALL;
-        // The client answers event queries itself once this Issue has been executed (util_queryresults.h).
+        // A4: the client answers event queries itself once this Issue has been executed (util_queryresults.h).
         // Issues are processed in order, so one counter serves every query.
         if (auto* pQueryBlock = bridge_util::QueryResults::block()) {
           pQueryBlock->issuedProcessedUid.store((uint32_t) currentUID, std::memory_order_release);
@@ -2861,15 +3107,13 @@ void ProcessDeviceCommandQueue() {
         GET_HND(pHandle);
         PULL(DWORD, dwSize);
         PULL(DWORD, dwGetDataFlags);
-        const auto pQuery = findOrNull(gpD3DQuery, pHandle);
-        // Games poll queries every frame, so the zero-filled result buffer keeps its storage between calls.
-        static thread_local std::vector<uint8_t> data;
-        data.assign(dwSize, 0);
+        const auto pQuery = gpD3DQuery[pHandle];
+        std::vector<uint8_t> data(dwSize);
         void* pData = dwSize > 0 ? data.data() : nullptr;
         const HRESULT hresult = (pQuery != nullptr) ? pQuery->GetData(pData, dwSize, dwGetDataFlags) : D3DERR_INVALIDCALL;
 
         if (Commands::IsAsyncResult(rpcHeader.flags)) {
-          // No response. Write the answer to the client's slot, then publish the request's sequence number.
+          // A4: no response. Write the answer to the client's slot, then publish the request's sequence number.
           PULL_U(slotIndex);
           PULL_U(requestSeq);
           auto* pQueryBlock = bridge_util::QueryResults::block();
@@ -2963,6 +3207,8 @@ void ProcessDeviceCommandQueue() {
           serialize::MaterialInfoOpaqueSubsurface opaqueSubsurface;
           serialize::MaterialInfoTranslucent translucent;
           serialize::MaterialInfoPortal portal;
+          serialize::MaterialInfoTerrainLayers terrainLayers;
+          serialize::MaterialInfoOpaqueAlbedoTint albedoTint;
         } exts;
         memset(&exts, 0, sizeof(MaterialExtensions));
 
@@ -3010,6 +3256,24 @@ void ProcessDeviceCommandQueue() {
               pInfoProto = &getInfoProto(exts.portal);
               break;
             }
+            case REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_TERRAIN_LAYERS_EXT:
+            {
+              // FNV terrain layers.
+              assert(!exts.terrainLayers.pNext);
+              deserializeFromQueue(exts.terrainLayers);
+              pInfoProto->pNext = &(exts.terrainLayers);
+              pInfoProto = &getInfoProto(exts.terrainLayers);
+              break;
+            }
+            case REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_ALBEDO_TINT_EXT:
+            {
+              // Per-material albedo tint.
+              assert(!exts.albedoTint.pNext);
+              deserializeFromQueue(exts.albedoTint);
+              pInfoProto->pNext = &(exts.albedoTint);
+              pInfoProto = &getInfoProto(exts.albedoTint);
+              break;
+            }
             default:
             {
               Logger::warn("[Api_CreateMaterial] Unknown sType. Skipping.");
@@ -3044,31 +3308,47 @@ void ProcessDeviceCommandQueue() {
 
       case RemixApi_CreateTexture:
       {
-        // Plain words, as the client sends them (cl/remix_api.cpp remixapi_CreateTexture); the 64-bit hash as lo / hi.
-        PULL(remixapi_StructType, sType);
-        PULL_U(hashLo);
-        PULL_U(hashHi);
-        const uint64_t hash = (uint64_t(hashHi) << 32) | uint64_t(hashLo);
-        PULL(uint32_t, width);
-        PULL(uint32_t, height);
-        PULL(uint32_t, depth);
-        PULL(uint32_t, mipLevels);
-        PULL(remixapi_Format, format);
-        PULL(uint32_t, dataSize);
+        // The client sends every field with send<T>(), i.e. as a SIZED data
+        // item (length word + payload), not as a raw DataT word. PULL reads one
+        // raw word, which here returned the length and shifted every following
+        // field -- the upload was garbage and the queue fell out of sync.
+        PULL_OBJ(remixapi_StructType, sType);
+        PULL_OBJ(uint64_t, hash);
+        PULL_OBJ(uint32_t, width);
+        PULL_OBJ(uint32_t, height);
+        PULL_OBJ(uint32_t, depth);
+        PULL_OBJ(uint32_t, mipLevels);
+        PULL_OBJ(remixapi_Format, format);
+        PULL_OBJ(uint32_t, hostEncoding);
+        PULL_OBJ(uint32_t, hostVkFormat);
+        PULL_OBJ(uint32_t, hostFlags);
+        PULL_OBJ(uint64_t, dataSize);
         void* data = nullptr;
-        PULL_DATA(dataSize, data);
+        PULL_DATA(*dataSize, data);
         const auto bridgeHandle = DeviceBridge::get_data();
 
+        // The client sends zeros when it had no remixapi_TextureInfoHostImportEXT.
+        remixapi_TextureInfoHostImportEXT hostImport = {};
+        hostImport.sType = REMIXAPI_STRUCT_TYPE_TEXTURE_INFO_HOST_IMPORT_EXT;
+        hostImport.encoding = hostEncoding ? *hostEncoding : 0u;
+        hostImport.vkFormat = hostVkFormat ? *hostVkFormat : 0u;
+        hostImport.flags = hostFlags ? *hostFlags : 0u;
+        const bool chainHostImport = hostImport.encoding || hostImport.vkFormat || hostImport.flags;
+
         remixapi_TextureInfo info = {};
-        info.sType     = sType;
-        info.hash      = hash;
-        info.width     = width;
-        info.height    = height;
-        info.depth     = depth;
-        info.mipLevels = mipLevels;
-        info.format    = format;
-        info.data      = data;
-        info.dataSize  = dataSize;
+        if (sType && hash && width && height && depth && mipLevels && format && dataSize && data &&
+            data_len == *dataSize) {
+          info.pNext     = chainHostImport ? &hostImport : nullptr;
+          info.sType     = *sType;
+          info.hash      = *hash;
+          info.width     = *width;
+          info.height    = *height;
+          info.depth     = *depth;
+          info.mipLevels = *mipLevels;
+          info.format    = *format;
+          info.data      = data;
+          info.dataSize  = *dataSize;
+        }
 
         remixapi_TextureHandle remixApiHandle = nullptr;
         if (info.sType == REMIXAPI_STRUCT_TYPE_TEXTURE_INFO &&
@@ -3111,6 +3391,32 @@ void ProcessDeviceCommandQueue() {
           surf.material = matHandle;
         }
 
+        // The client forwards MeshInfoRefreshGeometryEXT (a data-less
+        // extension) as one flag.
+        remixapi_MeshInfoRefreshGeometryEXT refreshGeometry = {};
+        if (remixapi::pullBool()) {
+          refreshGeometry.sType = REMIXAPI_STRUCT_TYPE_MESH_INFO_REFRESH_GEOMETRY_EXT;
+          refreshGeometry.pNext = nullptr;
+          meshInfo.pNext = &refreshGeometry;
+        }
+
+        // AssetKeyEXT: a flag, then the key, the alias count and each alias.
+        remixapi_AssetKeyEXT assetKey = {};
+        std::vector<uint64_t> assetKeyAliases;
+        if (remixapi::pullBool()) {
+          assetKey.sType = REMIXAPI_STRUCT_TYPE_ASSET_KEY_EXT;
+          assetKey.key = pullU64();
+          const uint32_t aliasCount = DeviceBridge::get_data();
+          assetKeyAliases.reserve(aliasCount);
+          for (uint32_t i = 0; i < aliasCount; ++i) {
+            assetKeyAliases.push_back(pullU64());
+          }
+          assetKey.aliases_values = assetKeyAliases.data();
+          assetKey.aliases_count = aliasCount;
+          assetKey.pNext = meshInfo.pNext;
+          meshInfo.pNext = &assetKey;
+        }
+
         auto bridgeHandle = DeviceBridge::get_data();
         remixapi_MeshHandle remixApiHandle = nullptr;
         if(remixapi::g_remix.CreateMesh(&meshInfo, &remixApiHandle) == REMIXAPI_ERROR_CODE_SUCCESS) {
@@ -3136,81 +3442,385 @@ void ProcessDeviceCommandQueue() {
 
       case RemixApi_DrawInstance:
       {
-        // Rather than allocate deserialized struct extensions on the heap,
-        // allocate them locally, since we know only one instance will be
-        // supported at a time
-        struct InstanceExtensions {
-          serialize::InstanceInfoObjectPicking objectPicking;
-          serialize::InstanceInfoBlend blend;
-          serialize::InstanceInfoTransforms boneXforms;
-          serialize::InstanceInfoParticleSystem particleSystem;
-        } exts;
-        memset(&exts, 0, sizeof(InstanceExtensions));
+        PulledInstance inst;
+        pullInstanceInfo(inst, "RemixApi_DrawInstance");
 
-        const auto instSType = remixapi::pullSType();
-        assert(instSType == REMIXAPI_STRUCT_TYPE_INSTANCE_INFO);
-        serialize::InstanceInfo instInfo;
-        deserializeFromQueue(instInfo);
-        
-        MeshHandle meshHandle(instInfo.mesh);
-        if(meshHandle.isValid()) {
-          instInfo.mesh = meshHandle;
-        } else {
-          Logger::err("[RemixApi_DrawInstance] Invalid mesh handle!" );
-        }
-
-        instInfo.pNext = nullptr;
-        
-        bool bInstExtExists = remixapi::pullBool();
-        auto* pInfoProto = &getInfoProto(instInfo);
-        while(bInstExtExists) {
-          const auto extSType = remixapi::pullSType();
-          switch (extSType) {
-            case REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_OBJECT_PICKING_EXT:
-            {
-              assert(!exts.objectPicking.pNext);
-              deserializeFromQueue(exts.objectPicking);
-              pInfoProto->pNext = &(exts.objectPicking);
-              pInfoProto = &getInfoProto(exts.objectPicking);
-              break;
-            }
-            case REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BLEND_EXT:
-            {
-              assert(!exts.blend.pNext);
-              deserializeFromQueue(exts.blend);
-              pInfoProto->pNext = &(exts.blend);
-              pInfoProto = &getInfoProto(exts.blend);
-              break;
-            }
-            case REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BONE_TRANSFORMS_EXT:
-            {
-              assert(!exts.boneXforms.pNext);
-              deserializeFromQueue(exts.boneXforms);
-              pInfoProto->pNext = &(exts.boneXforms);
-              pInfoProto = &getInfoProto(exts.boneXforms);
-              break;
-            }
-            case REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_PARTICLE_SYSTEM_EXT:
-            {
-              assert(!exts.particleSystem.pNext);
-              deserializeFromQueue(exts.particleSystem);
-              pInfoProto->pNext = &(exts.particleSystem);
-              pInfoProto = &getInfoProto(exts.particleSystem);
-              break;
-            }
-            default:
-            {
-              Logger::warn("[RemixApi_DrawInstance] Unknown sType. Skipping.");
-              break;
-            }
-          }
-          bInstExtExists = remixapi::pullBool();
-        }
-
-        if(remixapi::g_remix.DrawInstance(&instInfo) != REMIXAPI_ERROR_CODE_SUCCESS) {
+        if(remixapi::g_remix.DrawInstance(&inst.info) != REMIXAPI_ERROR_CODE_SUCCESS) {
           Logger::err("[RemixApi_DrawInstance] Remix API call failed!");
         }
 
+        break;
+      }
+
+      /*
+       * Retained instances. See the client's remix_api.cpp.
+       */
+      case RemixApi_CreateRetainedInstance:
+      {
+        PulledInstance inst;
+        pullInstanceInfo(inst, "RemixApi_CreateRetainedInstance");
+        const uint64_t clientHandle = pullU64();
+
+        static bool s_warned = false;
+        auto& fns = retainedExports();
+        if (!haveRetainedExport(fns.create, s_warned, "remixapi_CreateRetainedInstance") ||
+            !inst.meshValid || clientHandle == 0) {
+          break;
+        }
+        uint64_t runtimeHandle = 0;
+        if (fns.create(&inst.info, &runtimeHandle) == REMIXAPI_ERROR_CODE_SUCCESS && runtimeHandle) {
+          gRetainedHandles[clientHandle] = runtimeHandle;
+        } else {
+          Logger::err("[RemixApi_CreateRetainedInstance] Remix API call failed!");
+        }
+        break;
+      }
+
+      case RemixApi_CreateRetainedInstances:
+      {
+        const uint32_t count = DeviceBridge::get_data();
+        std::vector<std::unique_ptr<PulledInstance>> pulled;
+        std::vector<uint64_t> clientHandles;
+        pulled.reserve(count);
+        clientHandles.reserve(count);
+        for (uint32_t i = 0; i < count; ++i) {
+          auto inst = std::make_unique<PulledInstance>();
+          pullInstanceInfo(*inst, "RemixApi_CreateRetainedInstances");
+          const uint64_t clientHandle = pullU64();
+          // The runtime creates nothing when one info of the batch is invalid:
+          // leave out the ones whose mesh never reached it.
+          if (inst->meshValid && clientHandle != 0) {
+            pulled.push_back(std::move(inst));
+            clientHandles.push_back(clientHandle);
+          }
+        }
+        if (pulled.empty()) {
+          break;
+        }
+
+        static bool s_warned = false;
+        auto& fns = retainedExports();
+        std::vector<uint64_t> runtimeHandles(pulled.size(), 0);
+        if (fns.createBatch) {
+          // The batch takes a contiguous array of infos.
+          std::vector<remixapi_InstanceInfo> infos;
+          infos.reserve(pulled.size());
+          for (const auto& p : pulled) {
+            infos.push_back(static_cast<const remixapi_InstanceInfo&>(p->info));
+          }
+          if (fns.createBatch(infos.data(), static_cast<uint32_t>(infos.size()), runtimeHandles.data()) != REMIXAPI_ERROR_CODE_SUCCESS) {
+            Logger::err("[RemixApi_CreateRetainedInstances] Remix API call failed!");
+            break;
+          }
+        } else if (haveRetainedExport(fns.create, s_warned, "remixapi_CreateRetainedInstance(s)")) {
+          for (size_t i = 0; i < pulled.size(); ++i) {
+            if (fns.create(&pulled[i]->info, &runtimeHandles[i]) != REMIXAPI_ERROR_CODE_SUCCESS) {
+              runtimeHandles[i] = 0;
+              Logger::err("[RemixApi_CreateRetainedInstances] Remix API call failed!");
+            }
+          }
+        }
+        for (size_t i = 0; i < pulled.size(); ++i) {
+          if (runtimeHandles[i]) {
+            gRetainedHandles[clientHandles[i]] = runtimeHandles[i];
+          }
+        }
+        break;
+      }
+
+      case RemixApi_UpdateRetainedInstance:
+      {
+        const uint64_t clientHandle = pullU64();
+        PulledInstance inst;
+        pullInstanceInfo(inst, "RemixApi_UpdateRetainedInstance");
+
+        static bool s_warned = false;
+        auto& fns = retainedExports();
+        uint64_t runtimeHandle = 0;
+        if (!haveRetainedExport(fns.update, s_warned, "remixapi_UpdateRetainedInstance") ||
+            !inst.meshValid || !lookupRetained(clientHandle, runtimeHandle)) {
+          break;
+        }
+        if (fns.update(runtimeHandle, &inst.info) != REMIXAPI_ERROR_CODE_SUCCESS) {
+          Logger::err("[RemixApi_UpdateRetainedInstance] Remix API call failed!");
+        }
+        break;
+      }
+
+      case RemixApi_UpdateRetainedInstances:
+      {
+        const uint32_t count = DeviceBridge::get_data();
+        std::vector<remixapi_RetainedInstanceUpdate> updates;
+        updates.reserve(count);
+        for (uint32_t i = 0; i < count; ++i) {
+          // Field by field, as sendRetainedUpdate() sends them.
+          remixapi_RetainedInstanceUpdate u = {};
+          const uint64_t clientHandle = pullU64();
+          float* matrix = nullptr;
+          const uint32_t matrixLen = DeviceBridge::get_data((void**) &matrix);
+          u.flags = DeviceBridge::get_data();
+          u.visible = DeviceBridge::get_data();
+          if (matrix && matrixLen == sizeof(u.transform.matrix)) {
+            memcpy(&u.transform.matrix[0][0], matrix, sizeof(u.transform.matrix));
+          } else {
+            u.flags &= ~REMIXAPI_RETAINED_UPDATE_TRANSFORM;
+          }
+          if (lookupRetained(clientHandle, u.handle)) {
+            updates.push_back(u);
+          }
+        }
+
+        static bool s_warned = false;
+        auto& fns = retainedExports();
+        if (updates.empty() || !haveRetainedExport(fns.updateBatch, s_warned, "remixapi_UpdateRetainedInstances")) {
+          break;
+        }
+        if (fns.updateBatch(updates.data(), static_cast<uint32_t>(updates.size())) != REMIXAPI_ERROR_CODE_SUCCESS) {
+          Logger::err("[RemixApi_UpdateRetainedInstances] Remix API call failed!");
+        }
+        break;
+      }
+
+      case RemixApi_DestroyRetainedInstances:
+      {
+        const uint32_t count = DeviceBridge::get_data();
+        uint64_t* clientHandles = nullptr;
+        const uint32_t len = DeviceBridge::get_data((void**) &clientHandles);
+        std::vector<uint64_t> doomed;
+        if (clientHandles && len == count * sizeof(uint64_t)) {
+          doomed.reserve(count);
+          for (uint32_t i = 0; i < count; ++i) {
+            const auto it = gRetainedHandles.find(clientHandles[i]);
+            if (it != gRetainedHandles.cend()) {
+              doomed.push_back(it->second);
+              gRetainedHandles.erase(it);
+            }
+          }
+        }
+
+        static bool s_warned = false;
+        auto& fns = retainedExports();
+        if (doomed.empty() || !haveRetainedExport(fns.destroy, s_warned, "remixapi_DestroyRetainedInstances")) {
+          break;
+        }
+        if (fns.destroy(doomed.data(), static_cast<uint32_t>(doomed.size())) != REMIXAPI_ERROR_CODE_SUCCESS) {
+          Logger::err("[RemixApi_DestroyRetainedInstances] Remix API call failed!");
+        }
+        break;
+      }
+
+      case RemixApi_DrawRetainedInstances:
+      {
+        const bool hasOrigin = remixapi::pullBool();
+        float* origin = nullptr;
+        const uint32_t len = DeviceBridge::get_data((void**) &origin);
+
+        static bool s_warned = false;
+        auto& fns = retainedExports();
+        if (!haveRetainedExport(fns.draw, s_warned, "remixapi_DrawRetainedInstances")) {
+          break;
+        }
+        float sceneOrigin[3] = { 0.f, 0.f, 0.f };
+        const bool useOrigin = hasOrigin && origin && len == sizeof(sceneOrigin);
+        if (useOrigin) {
+          memcpy(sceneOrigin, origin, sizeof(sceneOrigin));
+        }
+        if (fns.draw(useOrigin ? sceneOrigin : nullptr) != REMIXAPI_ERROR_CODE_SUCCESS) {
+          Logger::err("[RemixApi_DrawRetainedInstances] Remix API call failed!");
+        }
+        break;
+      }
+
+      case RemixApi_QueryD3D9TextureImport:
+      {
+        // The client asks once whether imports can work at all: the runtime's
+        // null-argument probe (export present, device registered, option on).
+        const auto fn = importD3D9TextureExport();
+        const remixapi_ErrorCode result = fn ? fn(nullptr, 0, 0, 0, nullptr) : REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+        ServerMessage c(Commands::Bridge_Response, currentUID);
+        c.send_data(static_cast<uint32_t>(result));
+        break;
+      }
+
+      case RemixApi_QueryHostSettings:
+      {
+        ServerMessage c(Commands::Bridge_Response, currentUID);
+        c.send_data(static_cast<uint32_t>(hostSettingsExports().complete() ? 1 : 0));
+        break;
+      }
+
+      case RemixApi_RegisterHostSetting:
+      {
+        const uint32_t clientHandle = DeviceBridge::get_data();
+        const uint32_t type = DeviceBridge::get_data();
+        const uint32_t flags = DeviceBridge::get_data();
+        const double minValue = pullDouble();
+        const double maxValue = pullDouble();
+        const double step = pullDouble();
+        const double defaultValue = pullDouble();
+        const double currentValue = pullDouble();
+        const std::string key = pullHostString();
+        const std::string label = pullHostString();
+        const std::string section = pullHostString();
+        const std::string tooltip = pullHostString();
+        const uint32_t enumCount = DeviceBridge::get_data();
+        std::vector<std::string> enumLabels;
+        enumLabels.reserve(enumCount);
+        for (uint32_t i = 0; i < enumCount; ++i) {
+          enumLabels.push_back(pullHostString());
+        }
+
+        const auto& fns = hostSettingsExports();
+        if (!fns.complete()) {
+          break;
+        }
+        std::vector<const char*> labelPtrs;
+        labelPtrs.reserve(enumLabels.size());
+        for (const auto& l : enumLabels) {
+          labelPtrs.push_back(l.c_str());
+        }
+        remixapi_HostSettingInfo info = {};
+        info.structSize = sizeof(info);
+        info.key = key.c_str();
+        info.label = label.c_str();
+        info.section = section.c_str();
+        info.tooltip = tooltip.c_str();
+        info.type = static_cast<remixapi_HostSettingType>(type);
+        info.flags = flags;
+        info.minValue = minValue;
+        info.maxValue = maxValue;
+        info.step = step;
+        info.defaultValue = defaultValue;
+        info.currentValue = currentValue;
+        info.enumLabels = labelPtrs.empty() ? nullptr : labelPtrs.data();
+        info.enumCount = static_cast<uint32_t>(labelPtrs.size());
+        remixapi_HostSettingHandle runtimeHandle = 0;
+        const remixapi_ErrorCode result = fns.reg(&info, &runtimeHandle);
+        if (result == REMIXAPI_ERROR_CODE_SUCCESS && runtimeHandle) {
+          gHostSettingHandles[clientHandle] = runtimeHandle;
+        } else {
+          gHostSettingHandles.erase(clientHandle);
+          static uint32_t s_failures = 0;
+          if (++s_failures <= 16) {
+            Logger::err(format_string("[RemixApi_RegisterHostSetting] Register of '%s' failed: error %d",
+                                      key.c_str(), static_cast<int>(result)));
+          }
+        }
+        break;
+      }
+
+      case RemixApi_GetHostSettingsGeneration:
+      {
+        const auto& fns = hostSettingsExports();
+        const uint64_t generation = fns.generation ? fns.generation() : 0;
+        ServerMessage c(Commands::Bridge_Response, currentUID);
+        c.send_data(sizeof(generation), &generation);
+        break;
+      }
+
+      case RemixApi_GetHostSettingValue:
+      {
+        const uint32_t clientHandle = DeviceBridge::get_data();
+        const auto& fns = hostSettingsExports();
+        const auto it = gHostSettingHandles.find(clientHandle);
+        double value = 0.0;
+        remixapi_ErrorCode result = REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+        if (!fns.get) {
+          result = REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+        } else if (it != gHostSettingHandles.cend()) {
+          result = fns.get(it->second, &value);
+        }
+        ServerMessage c(Commands::Bridge_Response, currentUID);
+        c.send_data(static_cast<uint32_t>(result));
+        c.send_data(sizeof(value), &value);
+        break;
+      }
+
+      case RemixApi_SetHostSettingValue:
+      {
+        const uint32_t clientHandle = DeviceBridge::get_data();
+        const double value = pullDouble();
+        const auto& fns = hostSettingsExports();
+        const auto it = gHostSettingHandles.find(clientHandle);
+        if (fns.set && it != gHostSettingHandles.cend()) {
+          fns.set(it->second, value);
+        }
+        break;
+      }
+
+      case RemixApi_ClearHostSettings:
+      {
+        const auto& fns = hostSettingsExports();
+        if (fns.clear) {
+          fns.clear();
+        }
+        gHostSettingHandles.clear();
+        break;
+      }
+
+      case RemixApi_PollHostSettings:
+      {
+        const uint64_t lastGeneration = pullU64();
+        const uint32_t count = DeviceBridge::get_data();
+        std::vector<uint32_t> handles;
+        if (count) {
+          const uint32_t* p = nullptr;
+          const uint32_t len = DeviceBridge::get_data((void**) &p);
+          if (p && len == count * sizeof(uint32_t)) {
+            handles.assign(p, p + count);
+          }
+        }
+        const auto& fns = hostSettingsExports();
+        const uint64_t generation = fns.generation ? fns.generation() : lastGeneration;
+        gHostSettingsPolled = true;
+
+        ServerMessage c(Commands::Bridge_Response, currentUID);
+        c.send_data(sizeof(generation), &generation);
+        if (generation == lastGeneration || !fns.get || handles.size() != count || count == 0) {
+          c.send_data(0u);
+          break;
+        }
+        std::vector<double> values(count, std::numeric_limits<double>::quiet_NaN());
+        for (uint32_t i = 0; i < count; ++i) {
+          const auto it = gHostSettingHandles.find(handles[i]);
+          double v = 0.0;
+          if (it != gHostSettingHandles.cend() && fns.get(it->second, &v) == REMIXAPI_ERROR_CODE_SUCCESS) {
+            values[i] = v;
+          }
+        }
+        c.send_data(count);
+        c.send_data(count * static_cast<uint32_t>(sizeof(double)), values.data());
+        break;
+      }
+
+      case RemixApi_ImportD3D9Texture:
+      {
+        const uint32_t textureId = DeviceBridge::get_data();
+        PULL_OBJ(uint64_t, hash);
+        PULL_OBJ(uint32_t, flags);
+        PULL_OBJ(uint32_t, encoding);
+        const auto bridgeHandle = DeviceBridge::get_data();
+
+        const auto fn = importD3D9TextureExport();
+        const auto it = gpD3DResources.find(textureId);
+        IDirect3DResource9* const resource = (it != gpD3DResources.cend()) ? it->second : nullptr;
+        remixapi_TextureHandle remixApiHandle = nullptr;
+        remixapi_ErrorCode result = REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+        if (!fn) {
+          result = REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+        } else if (resource && resource->GetType() == D3DRTYPE_TEXTURE && hash && flags && encoding) {
+          result = fn(static_cast<IDirect3DTexture9*>(resource), *hash, *flags, *encoding, &remixApiHandle);
+        }
+        if (result == REMIXAPI_ERROR_CODE_SUCCESS && remixApiHandle) {
+          TextureHandle(bridgeHandle, remixApiHandle);
+        } else {
+          static uint32_t s_failures = 0;
+          if (++s_failures <= 16) {
+            Logger::err(format_string("[RemixApi_ImportD3D9Texture] Import of texture %u (hash 0x%016llX) failed: "
+                                      "error %d%s", textureId, hash ? static_cast<unsigned long long>(*hash) : 0ull,
+                                      static_cast<int>(result), resource ? "" : " (unknown texture)"));
+          }
+        }
         break;
       }
 
@@ -3336,6 +3946,106 @@ void ProcessDeviceCommandQueue() {
           remixapi::g_remix.DrawLightInstance(handle);
         } else {
           Logger::err("[RemixApi_DrawLightInstance] Invalid light handle!" );
+        }
+        break;
+      }
+
+      case RemixApi_SetupCamera:
+      {
+        // Read exactly what the client's remixapi_SetupCamera wrote, whatever is used of it.
+        remixapi_CameraInfo info = {};
+        info.sType = REMIXAPI_STRUCT_TYPE_CAMERA_INFO;
+        info.type = static_cast<remixapi_CameraType>(DeviceBridge::get_data());
+        float* view = nullptr;
+        const uint32_t viewLen = DeviceBridge::get_data((void**) &view);
+        float* projection = nullptr;
+        const uint32_t projectionLen = DeviceBridge::get_data((void**) &projection);
+        const uint32_t hasParams = DeviceBridge::get_data();
+        float* paramValues = nullptr;
+        const uint32_t paramLen = DeviceBridge::get_data((void**) &paramValues);
+        const uint32_t hasEvents = DeviceBridge::get_data();
+        const uint32_t eventFlags = DeviceBridge::get_data();
+        float* originShift = nullptr;
+        const uint32_t originShiftLen = DeviceBridge::get_data((void**) &originShift);
+
+        if (!view || viewLen != sizeof(info.view) || !projection || projectionLen != sizeof(info.projection)) {
+          Logger::err("[RemixApi_SetupCamera] Malformed camera matrices; call dropped.");
+          break;
+        }
+        memcpy(&info.view[0][0], view, sizeof(info.view));
+        memcpy(&info.projection[0][0], projection, sizeof(info.projection));
+
+        void** tail = &info.pNext;
+        remixapi_CameraInfoParameterizedEXT params = {};
+        if (hasParams && paramValues && paramLen == 16 * sizeof(float)) {
+          params.sType = REMIXAPI_STRUCT_TYPE_CAMERA_INFO_PARAMETERIZED_EXT;
+          remixapi_Float3D* const vecs[4] = { &params.position, &params.forward, &params.up, &params.right };
+          for (int i = 0; i < 4; ++i) {
+            *vecs[i] = remixapi_Float3D { paramValues[i * 3 + 0], paramValues[i * 3 + 1], paramValues[i * 3 + 2] };
+          }
+          params.fovYInDegrees = paramValues[12];
+          params.aspect = paramValues[13];
+          params.nearPlane = paramValues[14];
+          params.farPlane = paramValues[15];
+          *tail = &params;
+          tail = &params.pNext;
+        }
+        remixapi_CameraInfoFrameEventsEXT events = {};
+        if (hasEvents && originShift && originShiftLen == 3 * sizeof(float)) {
+          events.sType = REMIXAPI_STRUCT_TYPE_CAMERA_INFO_FRAME_EVENTS_EXT;
+          events.flags = eventFlags;
+          events.originShift = remixapi_Float3D { originShift[0], originShift[1], originShift[2] };
+          *tail = &events;
+          tail = &events.pNext;
+        }
+
+        if (!remixapi::g_remix.SetupCamera) {
+          static bool s_warned = false;
+          if (!s_warned) {
+            s_warned = true;
+            Logger::err("[RemixApi_SetupCamera] SetupCamera function pointer is null in g_remix; calls dropped.");
+          }
+          break;
+        }
+        const remixapi_ErrorCode result = remixapi::g_remix.SetupCamera(&info);
+        if (result != REMIXAPI_ERROR_CODE_SUCCESS) {
+          static uint32_t s_failures = 0;
+          if (s_failures++ < 8) {
+            Logger::err(format_string("[RemixApi_SetupCamera] Remix API call failed (error %d)!", static_cast<int>(result)));
+          }
+        }
+        break;
+      }
+
+      case RemixApi_SetCameraMediumMaterial:
+      {
+        const uint32_t uid = DeviceBridge::get_data();
+        remixapi_CameraMediumInfo info = {};
+        info.sType = REMIXAPI_STRUCT_TYPE_CAMERA_MEDIUM_INFO;
+        if (uid != 0) {
+          // An unknown handle (its CreateMaterial failed, or it was destroyed) is dropped
+          // rather than sent as null, which would clear the medium.
+          const auto it = MaterialHandle::s_handleMap.find(uid);
+          if (it == MaterialHandle::s_handleMap.cend()) {
+            Logger::err("[RemixApi_SetCameraMediumMaterial] Invalid material handle!");
+            break;
+          }
+          info.medium = it->second;
+        }
+        if (!remixapi::g_remix.SetCameraMediumMaterial) {
+          static bool s_warned = false;
+          if (!s_warned) {
+            s_warned = true;
+            Logger::err("[RemixApi_SetCameraMediumMaterial] SetCameraMediumMaterial function pointer is null in g_remix; calls dropped.");
+          }
+          break;
+        }
+        const remixapi_ErrorCode result = remixapi::g_remix.SetCameraMediumMaterial(&info);
+        if (result != REMIXAPI_ERROR_CODE_SUCCESS) {
+          static uint32_t s_failures = 0;
+          if (s_failures++ < 8) {
+            Logger::err(format_string("[RemixApi_SetCameraMediumMaterial] Remix API call failed (error %d)!", static_cast<int>(result)));
+          }
         }
         break;
       }

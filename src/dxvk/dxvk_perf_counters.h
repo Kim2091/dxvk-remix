@@ -163,6 +163,23 @@ namespace dxvk::perf {
     TexListCacheHits,     // texture category cache (D3D9Rtx::getTextureListInfo)
     TexListCacheMisses,
     TexListCacheResets,
+    Commits,              // CS: RtxContext::commitGeometryToRT
+    Preserved,            // CS: submitDrawState took the preserve path
+    Dynamic,              // CS: submitDrawState took the dynamic path
+    // CS: first reason the preserve path was not taken (in the order usePreservePath tests them)
+    RejectPreserveOff,
+    RejectNoPrims,
+    RejectDirtyFlags,
+    RejectTranslationInvalid,
+    RejectSecondSubmission,
+    RejectParticleEmitter,
+    RejectConvertToLight,
+    RejectBlasTouched,
+    RejectOverrideParticles,
+    RejectReplacementsChanged,
+    RejectMaterialIdentity,
+    RejectTerrainCascades,
+    RejectTextureCache,
     // CS: DrawCallTracker::findOrCreateReplacementInstance outcome
     TrackerExact,         // L1 identity hash
     TrackerTransform,     // L2 exact transform + vertex position hash
@@ -180,6 +197,10 @@ namespace dxvk::perf {
     "memoHit", "memoMiss", "memoIneligible", "memoSelfCheck", "memoSelfCheckMismatch",
     "queueFullSpins", "captureBufCreated",
     "texListHit", "texListMiss", "texListReset",
+    "commits", "preserved", "dynamic",
+    "rej.preserveOff", "rej.noPrims", "rej.dirtyFlags", "rej.translationInvalid", "rej.secondSubmission",
+    "rej.particleEmitter", "rej.convertToLight", "rej.blasTouched", "rej.overrideParticles",
+    "rej.replacementsChanged", "rej.materialIdentity", "rej.terrainCascades", "rej.textureCache",
     "tracker.exact", "tracker.transform", "tracker.spatial", "tracker.new", "tracker.portal",
     "hashUsageSkipped", "preKeyHits", "preKeyMisses"
   };

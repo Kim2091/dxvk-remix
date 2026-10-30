@@ -687,19 +687,10 @@ namespace dxvk {
             VkImageLayout             NewLayout);
 
     // NV-DXVK start: Native Remix API submission uses the immediate stream
-    // Emits a command whose type the caller does not know. push moves it into the chunk and returns false when the
-    // chunk is full.
-    template<typename Push>
-    void EmitRemixCsWith(Push&& push) {
+    template<typename Cmd>
+    void EmitRemixCs(Cmd&& command) {
       auto lock = LockContext();
-      m_cmdData = nullptr;
-
-      if (unlikely(!push(m_csChunk))) {
-        EmitCsChunk(std::move(m_csChunk));
-
-        m_csChunk = AllocCsChunk();
-        push(m_csChunk);
-      }
+      EmitCs(std::forward<Cmd>(command));
     }
 
     void EnableRemixHost() { m_multithread.SetMultithreadProtected(TRUE); }

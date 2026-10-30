@@ -21,20 +21,16 @@
 */
 #pragma once
 
-// How long an object the game stopped drawing stays alive. Shared by the draw-call tracker (replacement instances),
-// the scene's transient lane (DrawInstance), the game lights and the frontends (src/frontends/translator/lifetime.h),
-// so all of them age objects out the same way.
+// Translator toolkit: how long an object a frontend stopped drawing stays alive. Shared by the draw-call
+// tracker (replacement instances) and the scene's transient lane (DrawInstance), so both age objects out the same way.
 
+#include "../rtx_camera.h"
+#include "../rtx_intersection_test.h"
 #include "../rtx_options.h"
-#include "../rtx_scene_types.h"
+#include "../rtx_types.h"
 
 namespace dxvk {
-  class RtCamera;
-
   namespace translator {
-
-    // Frustum check for an AABB in the space defined by objectToWorld.
-    bool aabbIntersectsFrustum(RtCamera& camera, const AxisAlignedBoundingBox& aabb, const Matrix4& objectToWorld);
 
     // What the policy needs to know about an object that was not drawn this frame.
     struct UnseenObject {
@@ -50,15 +46,13 @@ namespace dxvk {
 
     // Per-collection inputs, read once.
     struct LifetimeFrame {
-      // Tests an object-space box against the camera frustum. frustumSource is passed as its first argument.
-      using FrustumTest = bool (*)(void* frustumSource, const AxisAlignedBoundingBox& bounds, const Matrix4& objectToWorld);
-      FrustumTest intersectsFrustum = nullptr;
-      void* frustumSource = nullptr;
+      RtCamera* camera = nullptr;
       uint32_t currentFrame = 0;
       uint32_t framesToKeepObjects = 0;
       uint32_t framesToKeepLights = 0;
       bool objectAntiCulling = false;
       bool lightAntiCulling = false;
+      bool cameraCut = false;
       bool forceCollect = false;        // too many objects kept: anti-culling off for this collection
       bool antiCullingSupported = false;
       // The last camera cut that kept the scene (SceneManager::m_lastKeptCutFrame; ~0u = none). Set by the caller.
@@ -70,27 +64,33 @@ namespace dxvk {
         return keptCutFrame != ~0u && frameLastSeen < keptCutFrame;
       }
 
-      bool inFrustum(const AxisAlignedBoundingBox& bounds, const Matrix4& objectToWorld) const {
-        return intersectsFrustum(frustumSource, bounds, objectToWorld);
-      }
-
-      // The backend's form, with its camera.
-      static LifetimeFrame read(RtCamera& camera, bool antiCullingSupported, bool forceCollect);
-
-      // The option-driven inputs. The caller sets the frustum test, the camera state and the frame.
-      static LifetimeFrame fromOptions(bool forceCollect) {
+      static LifetimeFrame read(RtCamera& camera, bool antiCullingSupported, bool forceCollect) {
         LifetimeFrame frame;
+        frame.camera = &camera;
         frame.framesToKeepObjects = RtxOptions::numFramesToKeepInstances();
         frame.framesToKeepLights = RtxOptions::AntiCulling::Light::numFramesToExtendLightLifetime();
         frame.objectAntiCulling = RtxOptions::AntiCulling::isObjectAntiCullingEnabled();
         frame.lightAntiCulling = RtxOptions::AntiCulling::isLightAntiCullingEnabled();
+        frame.cameraCut = camera.isCameraCut();
         frame.forceCollect = forceCollect;
+        frame.antiCullingSupported = antiCullingSupported;
         return frame;
       }
     };
 
     class LifetimePolicy {
     public:
+      // Frustum check for an AABB in the space defined by objectToWorld.
+      static bool aabbIntersectsFrustum(RtCamera& camera, const AxisAlignedBoundingBox& aabb, const Matrix4& objectToWorld) {
+        const Matrix4 objectToView = camera.getWorldToView(false) * objectToWorld;
+        if (RtxOptions::AntiCulling::Object::enableHighPrecisionAntiCulling()) {
+          return boundingBoxIntersectsFrustumSAT(
+            camera, aabb.minPos, aabb.maxPos, objectToView,
+            RtxOptions::AntiCulling::Object::enableInfinityFarFrustum());
+        }
+        return boundingBoxIntersectsFrustum(camera.getFrustum(), aabb.minPos, aabb.maxPos, objectToView);
+      }
+
       static bool isStale(const UnseenObject& object, const LifetimeFrame& frame) {
         return object.frameLastSeen + frame.framesToKeepObjects <= frame.currentFrame;
       }
@@ -102,7 +102,7 @@ namespace dxvk {
 
         // Only anti-cull objects that have been matched at least once after creation.
         const bool isStable = object.frameLastSeen > object.frameCreated;
-        if (!isStable || frame.seenBeforeKeptCut(object.frameLastSeen)) {
+        if (frame.cameraCut || !isStable || frame.seenBeforeKeptCut(object.frameLastSeen)) {
           return false;
         }
 
@@ -121,14 +121,14 @@ namespace dxvk {
         // Object anti-culling: keep objects outside the camera frustum (the game's own culling may differ from ours);
         // an object clearly in view that the game stopped drawing had a reason (destruction, LOD swap).
         if (frame.objectAntiCulling && hasMeshes &&
-            !frame.inFrustum(*object.geometryBounds, *object.objectToWorld)) {
+            !aabbIntersectsFrustum(*frame.camera, *object.geometryBounds, *object.objectToWorld)) {
           return true;
         }
 
         // Light anti-culling for mesh replacement lights: outside the frustum, within the extended lifetime.
         if (frame.lightAntiCulling && hasLights &&
             object.frameLastSeen + frame.framesToKeepLights > frame.currentFrame) {
-          return !frame.inFrustum(*object.lightBounds, *object.objectToWorld);
+          return !aabbIntersectsFrustum(*frame.camera, *object.lightBounds, *object.objectToWorld);
         }
         return false;
       }

@@ -135,7 +135,7 @@ namespace dxvk {
                  "holding 95% of the mesh's texel area, and at least 3. Each level less needs a quarter of the memory\n"
                  "and bake work, so many more meshes fit the Opacity Micromap budget. Rays still alpha-test every\n"
                  "micro-triangle the bake marks unknown, so the image does not change.");
-      // Set to 0 as higher values cause bullet decals on glass panels to miss parts
+      // Set to 0 as higher values cause bullet decals on a glass panels to miss parts in Portal RTX
       RTX_OPTION("rtx.opacityMicromap.building", float, decalsMinResolveTransparencyThreshold, 0.f, "Min resolve transparency threshold for decals.");
 
       // Parameterized to <1% FPS overhead on 4090
@@ -327,7 +327,7 @@ namespace dxvk {
     // Set when a BLAS first binds this micromap ([D3d9Alpha] builtNeverBound).
     bool everBound = false;
 
-    // Opacity micromap compaction. Written by the compact pass when baking
+    // rtx.alphaBake.compactMicromaps. Written by the compact pass when baking
     // finished; the build waits for the mixed-triangle count (compactCounter, host visible).
     Rc<DxvkBuffer> compactIndexBuffer;    // uint32 per triangle: special or compact index
     Rc<DxvkBuffer> compactTriangleArray;  // VkMicromapTriangleEXT per mixed triangle (upper bound: numTriangles)
@@ -424,10 +424,6 @@ namespace dxvk {
     bool isOmmBuildRequested(uint32_t currentGeneration) const {
       return ommBuildRequested && ommRegistrationGeneration == currentGeneration;
     }
-    // Whether the instance is linked to a micromap request, in any generation.
-    bool isOmmBuildRequestedAnyGeneration() const { return ommBuildRequested; }
-    // Whether the request waits for the texel footprints, which only an instance-update event computes.
-    bool waitsForTexelFootprints() const { return needsToCalculateNumTexelsPerMicroTriangle; }
     void resetCopiedRequestState() {
       ommRegistrationGeneration = 0;
       ommRetryAfterFrame = 0;
@@ -624,13 +620,6 @@ namespace dxvk {
     size_t getUnprocessedCount() const { return m_unprocessedList.size(); }
     // 0 = the instance has no cached OMM source, 1 = its OMM is pending (queued, baking, baked), 2 = built/ready.
     int getOmmReadiness(const RtInstance& instance) const;
-    // Whether the instance is still a micromap candidate that may ask for a micromap: it is not opaque, and either its
-    // eligibility is not evaluated yet or it is an eligible user whose request is not registered.
-    // An ineligible, blacklisted or registered instance is no longer one.
-    bool waitsForOmmRequest(const RtInstance& instance) const;
-    bool isOmmCandidate(const RtInstance& instance) const {
-      return m_ommCandidates.find(const_cast<RtInstance*>(&instance)) != m_ommCandidates.end();
-    }
 
     // rtx.opacityMicromap.cache.keepMergedBlasMicromapsInUse: marks the micromap held by a BLAS
     // under this hash as used this frame, if it is still the cache's live one.
@@ -728,7 +717,7 @@ namespace dxvk {
     // Called whenever a new instance has been added to the database
     void onInstanceAdded(const RtInstance& instance);
     // Called whenever instance metadata is updated
-    void onInstanceUpdated(const RtInstance& instance, const SceneDraw& drawCall, const MaterialData* material, const bool hasTransformChanged, const bool hasVerticesChanged, const bool isFirstUpdateThisFrame);
+    void onInstanceUpdated(const RtInstance& instance, const DrawCallState& drawCall, const MaterialData* material, const bool hasTransformChanged, const bool hasVerticesChanged, const bool isFirstUpdateThisFrame);
     // Called whenever an instance has been removed from the database
     void onInstanceDestroyed(const RtInstance& instance);
 
@@ -925,7 +914,7 @@ namespace dxvk {
                         uint32_t bytesPerTriangle);
     void censusFrameStart(uint32_t currentFrameIndex);
 
-    // Opacity micromap compaction.
+    // rtx.alphaBake.compactMicromaps.
     struct CompactStats {
       uint64_t micromaps = 0;
       uint64_t triangles = 0;

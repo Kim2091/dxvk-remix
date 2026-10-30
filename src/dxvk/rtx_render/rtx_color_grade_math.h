@@ -1,8 +1,8 @@
 #pragma once
 
-// The color grade's parameters, the built-in grades, blending and the constants the tone map shaders read.
+// The colour grade's parameters, the built-in grades, blending and the constants the tone map shaders read.
 // It has no runtime dependencies, so the unit test (tests/rtx/unit/test_color_grade.cpp) includes it as is.
-// docs/RemixApi.md, "Color grading", describes the fields for API users.
+// docs/RemixApi.md, "Colour grading", describes the fields for API users.
 
 #include <algorithm>
 #include <array>
@@ -15,7 +15,7 @@ namespace color_grade {
   using Mat3 = std::array<std::array<float, 3>, 3>;
   using Vec3 = std::array<float, 3>;
 
-  // The grade runs on linear scene color before the tone curve, in this order:
+  // The grade runs on linear scene colour before the tone curve, in this order:
   //   color = matrix * color
   //   color = balance * color (per channel)
   //   color = lerp(luminance(color), color, saturation)
@@ -213,7 +213,7 @@ namespace color_grade {
     return g;
   }
 
-  // Applies the grade to one color as the shader does (tonemap_operator.slangh, applyGrade).
+  // Applies the grade to one colour as the shader does (tonemap_operator.slangh, applyGrade).
   inline Vec3 apply(const Gpu& g, const Vec3& c) {
     Vec3 r {};
     for (int i = 0; i < 3; ++i) {

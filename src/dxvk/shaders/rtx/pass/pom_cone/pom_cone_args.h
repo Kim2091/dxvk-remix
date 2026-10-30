@@ -32,6 +32,8 @@
 // Texture2D: generated cones (R), read by POM_CONE_COPY_HEIGHT_CONE, coarse cones per cell, read by
 // POM_CONE_COPY_HEIGHT_COARSE, or the cells of pom_cone_coarse (POM_CONE_COARSE_CONES).
 #define POM_CONE_BINDING_CONE 2
+// Texture2D: the map's level (POM_CONE_LEVEL), R = the top of the height field, read by the copy modes when level is 1.
+#define POM_CONE_BINDING_LEVEL 3
 
 // pom_cone_copy modes.
 // output = (source.r at sourceMip, 0)
@@ -42,6 +44,10 @@
 #define POM_CONE_REDUCE_MAX 2
 // output = (source.r at sourceMip, cone.r of the cell holding the texel, cells of 2^coarseShift texels)
 #define POM_CONE_COPY_HEIGHT_COARSE 3
+// output (1x1) = (the top of source's height field, 0): the brightest texel of its first mip of at most
+// POM_CONE_LEVEL_GRID x POM_CONE_LEVEL_GRID texels, or of a grid of cell means of its last mip if it has none. One group.
+#define POM_CONE_LEVEL 4
+#define POM_CONE_LEVEL_GRID 16
 
 struct PomConeCopyArgs {
   // The whole level written. The dispatch covers the texels from origin on, and a merge of single tiles writes only those.
@@ -51,7 +57,9 @@ struct PomConeCopyArgs {
   uint mode;
   uvec2 origin;
   uint coarseShift;
-  uint pad0;
+  // 1: the copy modes write height + 1 - top (at most 1), with top from POM_CONE_BINDING_LEVEL, so the top of the field
+  // is the surface. 0: the height as it is.
+  uint level;
 };
 
 // pom_cone_generate: the cone ratios of one tile of mip 0.

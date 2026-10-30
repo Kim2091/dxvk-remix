@@ -3,10 +3,9 @@
 // and a distant light under an orbiting camera, for a fixed number of frames.
 //
 //   remix_testhost --runtime <dir> [--frames N] [--d3d11] [--show] [--origin-shift [--camera-events] [--instanced]]
-//                  [--skinned N [--reorder] [--skinned-dense]] [--particles] [--usd-mod [--mod-edit-frame F]] [--light-updates N]
-//                  [--asset-key] [--clusters N [--stream K [--create-first]]] [--bad-values [--clean]] [--lifecycle] [--event-frame F]
-//                  [--caller-threads T] [--light-resend] [--light-recreate K] [--vram-budget M]
-//   remix_testhost --runtime <dir> --d3d9 <scenario> [--frames N] [--event-frame F] [--hidden-frames N] [--overlay] [--overlay-first] [--precombined]
+//                  [--skinned N [--reorder]] [--particles] [--usd-mod [--mod-edit-frame F]] [--light-updates N]
+//                  [--asset-key] [--clusters N [--stream K]]
+//   remix_testhost --runtime <dir> --d3d9 <scenario> [--frames N] [--event-frame F] [--hidden-frames N] [--overlay] [--overlay-first]
 //   remix_testhost --d3d9-hashes
 //
 // --d3d9 <scenario>: instead of the Remix API, a D3D9 device made by the runtime's d3d9.dll draws one of the D3D9 v2
@@ -15,34 +14,20 @@
 // --clusters N: instead of the default scene, N small cubes with N distinct meshes (so every one is a merged-BLAS
 // candidate) as retained instances on a grid (1.5 units apart, centred on the origin) under a fixed camera. With
 // --stream K, K of them (round robin) are destroyed and created again every frame from frame 40 until 60 frames
-// before the end, like cell streaming. With --create-first each one's new mesh and instance are created before the
-// old ones are destroyed, as a host that rebuilds a mesh in place does; every cube must stay visible throughout.
-// Prints the host's per-frame CPU time (steady / streaming / after); pair with
+// before the end, like cell streaming. Prints the host's per-frame CPU time (steady / streaming / after); pair with
 // rtx.mergedBucketCellSize and rtx.accelMemoryLogIntervalFrames to see bucket counts and rebuilt primitives.
 // With --movers M, M of them (evenly spread) move in bursts like doors or pushed props: each moves for 3 frames every
-// --mover-period P frames (default 150, staggered), in the same window as --stream (mover back-off).
+// --mover-period P frames (default 150, staggered), in the same window as --stream (rtx.accel.moverBackoff).
 // With --alpha-cutout the cubes are alpha-tested (greater than 127) with a cutout texture laid out so every cube has
 // 6 opaque, 4 transparent and 2 mixed triangles (rtx.alphaBake.census should report 50 / 33 / 17 %).
 //
 // --asset-key: one more cube mesh (hash 0x8000000000000010) with remixapi_AssetKeyEXT {key 0x0A55E70000000001,
-// alias 0x8000000000000002} and a retained instance of it; with --usd-mod the mod (authored
+// alias 0x8000000000000002} and a retained instance of it; with --usd-mod and rtx.scene.assetKeys the mod (authored
 // for 0x8000000000000002) reaches it through the alias. --mod-edit-frame F rewrites the mod at frame F (brighter
 // light, taller pyramid) for a hot reload.
 //
 // --light-updates N: 1000 small sphere lights in a grid above the ground (created once, persistent), and N of them
-// (round robin) moved slightly with UpdateLightDefinition every frame; the rest never change. With --light-resend the
-// host also sends every other grid light again each frame with an unchanged definition, as hosts that rebuild their
-// light list every frame do. With --light-recreate K, K grid lights (round robin) are destroyed and created again each
-// frame, as a host does for lights it creates from scratch every frame. Pair with rtx.profile.detailedLogging: the
-// [PerfCpu] lines' lightSlotsUploadedPerFrame counts the light slots written to the GPU.
-//
-// --vram-budget M: a mid-range card's memory budget of M MiB (rtx.vramBudget.budgetOverrideMB) with slack inside the
-// allocator's chunks. The host creates 4 MiB textures until the runtime's demand (remixapi_GetMemoryPressure usageBytes,
-// driver usage minus the free space inside chunks) reaches 93% of M, then destroys three of every four. The chunks they
-// shared stay allocated, so driver usage stays near the budget while demand falls, and the pressure level must fall to 0.
-// Then it creates textures again until demand reaches 96% of M, and the level must rise. Each check reads the level from
-// remixapi_GetMemoryPressure and from the runtime log's last [VramBudget] line. Prints PASS or FAIL per check and exits
-// with 1 on a failure.
+// (round robin) moved slightly with UpdateLightDefinition every frame; the rest never change.
 //
 // --usd-mod: writes <runtime>/rtx-remix/mods/testhost_usd/mod.usda before startup, replacing the cube mesh (hash
 // 0x8000000000000002) with a pyramid plus a sphere light prim, and removes it at exit. Retained cube 0 moves every
@@ -53,13 +38,10 @@
 //
 // --skinned N: the default scene plus N skinned cubes drawn with DrawInstance every frame (two bones, the top bending
 // over time; a ring around the scene). --reorder rotates their draw order every frame, so frame-to-frame matching
-// cannot rely on the order. --skinned-dense subdivides each face of the skinned cube into 16 x 16 quads (1734 vertices,
-// 3072 triangles), so each one gets a BLAS of its own (rtx.minPrimsInDynamicBLAS) and is skinned on the GPU, as game
-// characters are. With rtx.scene.selfCheckFrames set, the runtime checks every frame that each skinned BLAS holds the
-// pose of its last draw ([SceneCheck] lines).
+// cannot rely on the order.
 //
 // --origin-shift: instead of the default scene, a 40x40 grid of static retained cubes near x = 3 * 16384
-// and a camera flying along +x. The scene origin follows the camera on a 16384-unit grid
+// (FO4's origin grid) and a camera flying along +x. The scene origin follows the camera on a 16384-unit grid
 // (DrawRetainedInstances(origin), camera in render space), so it moves once, at the frame printed as
 // "origin shift". Prints the host's per-frame CPU time around that frame. With --camera-events the shift frame's
 // SetupCamera also carries remixapi_CameraInfoFrameEventsEXT (ORIGIN_SHIFT), so the camera history moves with it.
@@ -67,17 +49,7 @@
 // With --distinct-meshes every cube of the field has its own mesh, so the field goes into merged BLASes (a shared
 // mesh gets one BLAS of its own); the runtime log's [AccelMem] lines then show what the shift rebuilds.
 //
-// --bad-values: the default scene, plus broken values through the Remix API at --event-frame F (default 400) and the
-// nine frames after it, from the bad-values case of docs/frontend-conformance.md. --clean sends the same calls with
-// valid values, so the two runs' good objects can be compared. --lifecycle: the default scene, plus the lifecycle case's
-// calls in unexpected orders (destroy unknown, destroy twice, update after destroy, a mesh hash reused). Both print
-// "<case>: N calls, M unexpected results" with the return codes that differed from the case's table.
-//
-// --caller-threads T: the default scene, plus 32 small cubes drawn with DrawInstance every frame and two meshes made
-// at --event-frame (one with CreateMeshBatched, one with CreateMesh) and drawn from then on, the calls split over T
-// threads (the caller-threads case). T = 1 is the reference run.
-//
-// --d3d11 registers a D3D11 device made by the runtime's d3d11.dll (as a D3D11 host
+// --d3d11 registers a D3D11 device made by the runtime's d3d11.dll (as the Fallout 4
 // plugin does), imports the cube texture with Prepare/ImportD3D11TextureEx and
 // presents through RenderD3D11 + the DXGI swapchain. Without it, the host uses
 // Startup/Present and CreateTexture.
@@ -96,7 +68,6 @@
 #include <cstdio>
 #include <filesystem>
 #include <string>
-#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -111,34 +82,6 @@ namespace {
     out.texcoord[0] = u; out.texcoord[1] = v;
     out.color = 0xFFFFFFFF;
     return out;
-  }
-
-  // A unit cube centred on the origin with each face split into n x n quads.
-  void denseCube(std::vector<remixapi_HardcodedVertex>& v, std::vector<uint32_t>& idx, int n) {
-    const float normals[6][3] = { {1,0,0}, {-1,0,0}, {0,1,0}, {0,-1,0}, {0,0,1}, {0,0,-1} };
-    for (int f = 0; f < 6; ++f) {
-      const float* N = normals[f];
-      const float a[3] = { N[1], N[2], N[0] };
-      const float b[3] = { N[1] * a[2] - N[2] * a[1], N[2] * a[0] - N[0] * a[2], N[0] * a[1] - N[1] * a[0] };
-      const uint32_t base = uint32_t(v.size());
-      for (int j = 0; j <= n; ++j) {
-        for (int i = 0; i <= n; ++i) {
-          const float s = 2.f * float(i) / float(n) - 1.f;
-          const float t = 2.f * float(j) / float(n) - 1.f;
-          v.push_back(vertex(0.5f * (N[0] + s * a[0] + t * b[0]), 0.5f * (N[1] + s * a[1] + t * b[1]),
-                             0.5f * (N[2] + s * a[2] + t * b[2]), N[0], N[1], N[2], (s + 1) * 0.5f, (t + 1) * 0.5f));
-        }
-      }
-      for (int j = 0; j < n; ++j) {
-        for (int i = 0; i < n; ++i) {
-          const uint32_t c = base + uint32_t(j * (n + 1) + i);
-          const uint32_t q[6] = { c, c + 1, c + uint32_t(n) + 2, c, c + uint32_t(n) + 2, c + uint32_t(n) + 1 };
-          for (uint32_t k : q) {
-            idx.push_back(k);
-          }
-        }
-      }
-    }
   }
 
   void cube(std::vector<remixapi_HardcodedVertex>& v, std::vector<uint32_t>& idx) {
@@ -256,24 +199,6 @@ namespace {
     }
   }
 
-  // The calls of a conformance case whose return codes are part of the case.
-  struct CaseCalls {
-    const char* name;
-    int calls = 0;
-    int unexpected = 0;
-
-    void expect(remixapi_ErrorCode r, remixapi_ErrorCode expected, const char* what) {
-      ++calls;
-      if (r != expected) {
-        ++unexpected;
-        std::printf("%s: %s returned %d, expected %d\n", name, what, int(r), int(expected));
-      }
-    }
-  };
-
-  constexpr remixapi_ErrorCode kOk = REMIXAPI_ERROR_CODE_SUCCESS;
-  constexpr remixapi_ErrorCode kInvalid = REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
-
   LRESULT CALLBACK windowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     return DefWindowProcW(hwnd, msg, wParam, lParam);
   }
@@ -289,27 +214,17 @@ int wmain(int argc, wchar_t** argv) {
   bool instanced = false;
   int skinnedCount = 0;
   bool reorder = false;
-  bool skinnedDense = false;
   bool particles = false;
   bool usdMod = false;
   int lightUpdates = -1;
-  bool lightResend = false;
-  int lightRecreate = 0;
-  int vramBudgetMB = 0;
   bool assetKey = false;
   int modEditFrame = -1;
   int clustersCount = 0;
   bool distinctMeshes = false;
   int streamPerFrame = 0;
-  bool createFirst = false;
   int moversCount = 0;
   int moverPeriod = 150;
   bool alphaCutout = false;
-  bool badValues = false;
-  bool clean = false;
-  bool lifecycle = false;
-  int caseFrame = 400;
-  int callerThreads = 0;
   std::wstring d3d9Scenario;
   D3D9ScenarioArgs d3d9Args;
   bool framesGiven = false;
@@ -334,20 +249,12 @@ int wmain(int argc, wchar_t** argv) {
       skinnedCount = _wtoi(argv[++i]);
     } else if (a == L"--reorder") {
       reorder = true;
-    } else if (a == L"--skinned-dense") {
-      skinnedDense = true;
     } else if (a == L"--particles") {
       particles = true;
     } else if (a == L"--usd-mod") {
       usdMod = true;
     } else if (a == L"--light-updates" && i + 1 < argc) {
       lightUpdates = _wtoi(argv[++i]);
-    } else if (a == L"--light-resend") {
-      lightResend = true;
-    } else if (a == L"--light-recreate" && i + 1 < argc) {
-      lightRecreate = std::max(_wtoi(argv[++i]), 0);
-    } else if (a == L"--vram-budget" && i + 1 < argc) {
-      vramBudgetMB = std::max(_wtoi(argv[++i]), 0);
     } else if (a == L"--asset-key") {
       assetKey = true;
     } else if (a == L"--mod-edit-frame" && i + 1 < argc) {
@@ -358,8 +265,6 @@ int wmain(int argc, wchar_t** argv) {
       clustersCount = _wtoi(argv[++i]);
     } else if (a == L"--stream" && i + 1 < argc) {
       streamPerFrame = _wtoi(argv[++i]);
-    } else if (a == L"--create-first") {
-      createFirst = true;
     } else if (a == L"--alpha-cutout") {
       alphaCutout = true;
     } else if (a == L"--movers" && i + 1 < argc) {
@@ -371,22 +276,10 @@ int wmain(int argc, wchar_t** argv) {
     } else if (a == L"--d3d9-hashes") {
       printD3D9Hashes();
       return 0;
-    } else if (a == L"--bad-values") {
-      badValues = true;
-    } else if (a == L"--clean") {
-      clean = true;
-      d3d9Args.clean = true;
-    } else if (a == L"--lifecycle") {
-      lifecycle = true;
-    } else if (a == L"--caller-threads" && i + 1 < argc) {
-      callerThreads = std::max(_wtoi(argv[++i]), 1);
     } else if (a == L"--event-frame" && i + 1 < argc) {
       d3d9Args.eventFrame = _wtoi(argv[++i]);
-      caseFrame = d3d9Args.eventFrame;
     } else if (a == L"--hidden-frames" && i + 1 < argc) {
       d3d9Args.hiddenFrames = std::max(_wtoi(argv[++i]), 1);
-    } else if (a == L"--precombined") {
-      d3d9Args.precombined = true;
     } else if (a == L"--overlay") {
       d3d9Args.overlay = true;
     } else if (a == L"--overlay-first") {
@@ -498,7 +391,6 @@ int wmain(int argc, wchar_t** argv) {
 
   auto proc = [&](const char* name) { return GetProcAddress(dll, name); };
   auto createRetained = reinterpret_cast<PFN_remixapi_CreateRetainedInstance>(proc("remixapi_CreateRetainedInstance"));
-  auto updateRetained = reinterpret_cast<PFN_remixapi_UpdateRetainedInstance>(proc("remixapi_UpdateRetainedInstance"));
   auto updateRetainedMany = reinterpret_cast<PFN_remixapi_UpdateRetainedInstances>(proc("remixapi_UpdateRetainedInstances"));
   auto destroyRetained = reinterpret_cast<PFN_remixapi_DestroyRetainedInstances>(proc("remixapi_DestroyRetainedInstances"));
   auto drawRetained = reinterpret_cast<PFN_remixapi_DrawRetainedInstances>(proc("remixapi_DrawRetainedInstances"));
@@ -507,7 +399,7 @@ int wmain(int argc, wchar_t** argv) {
   auto prepareEx = reinterpret_cast<PFN_remixapi_PrepareD3D11TextureEx>(proc("remixapi_PrepareD3D11TextureEx"));
   auto importEx = reinterpret_cast<PFN_remixapi_ImportD3D11TextureEx>(proc("remixapi_ImportD3D11TextureEx"));
   auto release = reinterpret_cast<PFN_remixapi_ReleaseD3D11Texture>(proc("remixapi_ReleaseD3D11Texture"));
-  if (!createRetained || !updateRetained || !updateRetainedMany || !destroyRetained || !drawRetained) {
+  if (!createRetained || !updateRetainedMany || !destroyRetained || !drawRetained) {
     std::printf("FAILED: retained-instance exports missing\n");
     return 1;
   }
@@ -522,49 +414,6 @@ int wmain(int argc, wchar_t** argv) {
   }
   g_remix.SetConfigVariable("rtx.fallbackLightMode", "0");
   g_remix.SetConfigVariable("rtx.hostImport.enableInPlaceTextureReplace", "True");
-
-  // --vram-budget: the budget, a short relax time so the case does not wait 600 frames per level, and a log line
-  // every 60 frames.
-  auto getPressure = reinterpret_cast<PFN_remixapi_GetMemoryPressure>(proc("remixapi_GetMemoryPressure"));
-  struct VramCase {
-    int phase = 0;
-    int phaseStart = 0;
-    uint64_t budget = 0;
-    uint64_t nextHash = 0x7000000000000000ull;
-    std::vector<remixapi_TextureHandle> textures;
-    std::vector<uint8_t> pixels;
-    uint32_t maxLevel = 0;
-    bool failed = false;
-    bool done = false;
-  } vram;
-  // The runtime's own pressure level, from the last [VramBudget] line of its log, or -1 without one.
-  const auto loggedVramLevel = [&]() {
-    FILE* f = _wfopen((runtime / "rtx-remix" / "logs" / "remix-dxvk.log").wstring().c_str(), L"rb");
-    if (!f) {
-      return -1;
-    }
-    std::string text;
-    char buf[65536];
-    size_t n;
-    while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) {
-      text.append(buf, n);
-    }
-    std::fclose(f);
-    const size_t line = text.rfind("[VramBudget] frame ");
-    const size_t level = line == std::string::npos ? line : text.find(" level ", line);
-    return level == std::string::npos ? -1 : std::atoi(text.c_str() + level + 7);
-  };
-  if (vramBudgetMB > 0) {
-    if (!getPressure) {
-      std::printf("FAILED: no remixapi_GetMemoryPressure export\n");
-      return 1;
-    }
-    g_remix.SetConfigVariable("rtx.vramBudget.budgetOverrideMB", std::to_string(vramBudgetMB).c_str());
-    g_remix.SetConfigVariable("rtx.vramBudget.relaxFrames", "60");
-    g_remix.SetConfigVariable("rtx.vramBudget.logIntervalFrames", "60");
-    vram.budget = uint64_t(vramBudgetMB) << 20;
-    vram.pixels.assign(size_t(1024) * 1024 * 4, 0x80);
-  }
 
   // D3D11 import of one 2D texture with a full mip chain (data: mips sequential, tightly packed).
   auto importD3D11 = [&](DXGI_FORMAT format, uint32_t size, uint32_t blockBytes, const std::vector<uint8_t>& data, D3D11_USAGE usage,
@@ -775,20 +624,11 @@ int wmain(int argc, wchar_t** argv) {
     check(g_remix.CreateMesh(&mi, &cubeMesh), "CreateMesh cube");
 
     if (skinnedCount > 0) {
-      std::vector<remixapi_HardcodedVertex> sv = cv;
-      std::vector<uint32_t> si = ci;
-      if (skinnedDense) {
-        sv.clear();
-        si.clear();
-        denseCube(sv, si, 16);
-      }
-      s.vertices_values = sv.data(); s.vertices_count = sv.size();
-      s.indices_values = si.data(); s.indices_count = si.size();
       // Bone 0 holds the bottom half, bone 1 the top half.
-      std::vector<float> weights(sv.size(), 1.f);
-      std::vector<uint32_t> bones(sv.size());
-      for (size_t v = 0; v < sv.size(); ++v) {
-        bones[v] = sv[v].position[1] > 0.f ? 1u : 0u;
+      std::vector<float> weights(cv.size(), 1.f);
+      std::vector<uint32_t> bones(cv.size());
+      for (size_t v = 0; v < cv.size(); ++v) {
+        bones[v] = cv[v].position[1] > 0.f ? 1u : 0u;
       }
       s.skinning_hasvalue = 1;
       s.skinning_value.bonesPerVertex = 1;
@@ -953,16 +793,6 @@ int wmain(int argc, wchar_t** argv) {
         for (int k = 0; k < streamPerFrame; ++k) {
           const int i = next;
           next = (next + 1) % n;
-          if (createFirst) {
-            const remixapi_MeshHandle oldMesh = meshes[i];
-            uint64_t oldInstance = field[i];
-            ++generation[i];
-            createMesh(i);
-            createOne(i);
-            destroyRetained(&oldInstance, 1);
-            g_remix.DestroyMesh(oldMesh);
-            continue;
-          }
           destroyRetained(&field[i], 1);
           g_remix.DestroyMesh(meshes[i]);
           ++generation[i];
@@ -1295,284 +1125,6 @@ int wmain(int argc, wchar_t** argv) {
     check(createRetained(&pi, &serviced[2]), "CreateRetainedInstance view model");
   }
 
-  // --bad-values and --lifecycle (docs/frontend-conformance.md).
-  const float kNaN = std::nanf("");
-  const float kInf = HUGE_VALF;
-  CaseCalls bad { "bad-values" };
-  CaseCalls life { "lifecycle" };
-  std::vector<remixapi_HardcodedVertex> caseCube;
-  std::vector<uint32_t> caseCubeIdx;
-  cube(caseCube, caseCubeIdx);
-  // A mesh of one cube surface, with optional skinning: bone 0 holds the bottom half, bone 1 the top half.
-  const auto caseMesh = [&](uint64_t hash, const std::vector<remixapi_HardcodedVertex>& v, const std::vector<uint32_t>& idx,
-                            const std::vector<uint32_t>* blendIndices, remixapi_MeshHandle* out, bool batched = false) {
-    std::vector<float> weights(v.size(), 1.f);
-    remixapi_MeshInfoSurfaceTriangles s {};
-    s.vertices_values = v.data(); s.vertices_count = v.size();
-    s.indices_values = idx.data(); s.indices_count = idx.size();
-    s.material = cubeMat;
-    if (blendIndices != nullptr) {
-      s.skinning_hasvalue = 1;
-      s.skinning_value.bonesPerVertex = 1;
-      s.skinning_value.blendWeights_values = weights.data();
-      s.skinning_value.blendWeights_count = uint32_t(weights.size());
-      s.skinning_value.blendIndices_values = blendIndices->data();
-      s.skinning_value.blendIndices_count = uint32_t(blendIndices->size());
-    }
-    remixapi_MeshInfo mi {};
-    mi.sType = REMIXAPI_STRUCT_TYPE_MESH_INFO;
-    mi.hash = hash;
-    mi.surfaces_values = &s;
-    mi.surfaces_count = 1;
-    return batched ? g_remix.CreateMeshBatched(&mi, out) : g_remix.CreateMesh(&mi, out);
-  };
-  std::vector<uint32_t> twoBones(caseCube.size());
-  for (size_t v = 0; v < caseCube.size(); ++v) {
-    twoBones[v] = caseCube[v].position[1] > 0.f ? 1u : 0u;
-  }
-  // A cube twice as tall, for the meshes whose hash is reused for other geometry.
-  std::vector<remixapi_HardcodedVertex> tallCube = caseCube;
-  for (remixapi_HardcodedVertex& v : tallCube) {
-    v.position[1] *= 2.f;
-  }
-  remixapi_MeshHandle caseSkinned = nullptr, caseNaN = nullptr, caseIndex = nullptr, caseEmpty = nullptr,
-                      caseBoneIndex = nullptr, reusedMesh = nullptr;
-  uint64_t reusedInstance = 0;
-  if (badValues) {
-    check(caseMesh(0x8000000000000020ull, caseCube, caseCubeIdx, &twoBones, &caseSkinned), "CreateMesh case skinned");
-  }
-  if (lifecycle) {
-    check(caseMesh(0x8000000000000031ull, caseCube, caseCubeIdx, nullptr, &reusedMesh), "CreateMesh reused");
-    remixapi_InstanceInfo ri {};
-    ri.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
-    ri.mesh = reusedMesh;
-    ri.transform = translate(-4.f, 0.5f, -3.f, 0.6f);
-    check(createRetained(&ri, &reusedInstance), "CreateRetainedInstance reused");
-  }
-  // A skinned case cube drawn with the given bones.
-  const auto drawSkinned = [&](remixapi_MeshHandle mesh, const remixapi_Transform* bones, uint32_t count, float x) {
-    remixapi_InstanceInfoBoneTransformsEXT bonesExt {};
-    bonesExt.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BONE_TRANSFORMS_EXT;
-    bonesExt.boneTransforms_values = bones;
-    bonesExt.boneTransforms_count = count;
-    remixapi_InstanceInfo si {};
-    si.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
-    si.pNext = &bonesExt;
-    si.mesh = mesh;
-    si.transform = translate(x, 0.5f, -4.f, 0.6f);
-    return g_remix.DrawInstance(&si);
-  };
-  const auto drawCase = [&](remixapi_MeshHandle mesh, float x) {
-    remixapi_InstanceInfo ci {};
-    ci.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
-    ci.mesh = mesh;
-    ci.transform = translate(x, 0.5f, -4.f, 0.6f);
-    check(g_remix.DrawInstance(&ci), "DrawInstance case mesh");
-  };
-  // The broken values of one frame. The clean run sends the same calls with valid values.
-  const auto badValuesFrame = [&](int frame, const remixapi_CameraInfo& goodCamera) {
-    const int k = frame - caseFrame;
-    if (k < 0) {
-      return;
-    }
-    const float x = clean ? 1.f : kNaN;
-    const remixapi_ErrorCode rejected = clean ? kOk : kInvalid;
-    if (k == 0) {
-      remixapi_InstanceInfo ii {};
-      ii.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
-      ii.mesh = cubeMesh;
-      ii.transform = translate(0.f, 3.f, 0.f, 0.3f);
-      ii.transform.matrix[0][3] = clean ? 0.f : kNaN;
-      bad.expect(g_remix.DrawInstance(&ii), rejected, "DrawInstance NaN transform");
-      ii.transform.matrix[1][1] = clean ? 0.3f : kInf;
-      ii.transform.matrix[0][3] = 0.f;
-      bad.expect(g_remix.DrawInstance(&ii), rejected, "DrawInstance infinite transform");
-      ii.transform = translate(0.f, 3.f, 1.f, 0.3f);
-      ii.transform.matrix[2][3] = clean ? 1.f : kNaN;
-      uint64_t created = 0;
-      bad.expect(createRetained(&ii, &created), rejected, "CreateRetainedInstance NaN transform");
-      if (created != 0) {
-        destroyRetained(&created, 1);
-      }
-      remixapi_RetainedInstanceUpdate up {};
-      up.handle = retained[1];
-      up.flags = REMIXAPI_RETAINED_UPDATE_TRANSFORM;
-      up.transform = translate(2.5f, 0.75f, 1.5f, 1.5f);
-      up.transform.matrix[1][3] = clean ? 0.75f : kNaN;
-      bad.expect(updateRetainedMany(&up, 1), kOk, "UpdateRetainedInstances NaN transform");
-      remixapi_Transform copies[2] = { translate(0.f, 0.f, 0.f), translate(1.f, 0.f, 0.f) };
-      copies[1].matrix[0][0] = clean ? 1.f : kNaN;
-      remixapi_InstanceInfoGpuInstancingEXT gi {};
-      gi.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_GPU_INSTANCING_EXT;
-      gi.instanceTransforms_values = copies;
-      gi.instanceTransforms_count = 2;
-      ii.pNext = &gi;
-      ii.transform = translate(0.f, 3.f, 2.f, 0.3f);
-      bad.expect(g_remix.DrawInstance(&ii), rejected, "DrawInstance NaN GPU-instance transform");
-      ii.pNext = nullptr;
-      // A second camera after the good one, which is rejected without touching the good one.
-      remixapi_CameraInfoParameterizedEXT cam = *static_cast<const remixapi_CameraInfoParameterizedEXT*>(goodCamera.pNext);
-      cam.position.y = clean ? cam.position.y : kNaN;
-      remixapi_CameraInfo ci = goodCamera;
-      ci.pNext = &cam;
-      bad.expect(g_remix.SetupCamera(&ci), kOk, "SetupCamera NaN position");
-
-      std::vector<remixapi_HardcodedVertex> nanCube = caseCube;
-      if (!clean) {
-        nanCube[3].position[0] = kNaN;
-        nanCube[17].position[2] = -kInf;
-      }
-      bad.expect(caseMesh(0x8000000000000021ull, nanCube, caseCubeIdx, nullptr, &caseNaN), kOk, "CreateMesh NaN positions");
-      std::vector<uint32_t> farIndex = caseCubeIdx;
-      if (!clean) {
-        farIndex[7] = 1000;
-      }
-      bad.expect(caseMesh(0x8000000000000022ull, caseCube, farIndex, nullptr, &caseIndex), kOk, "CreateMesh index past the vertex count");
-      {
-        remixapi_MeshInfoSurfaceTriangles s[2] = {};
-        s[0].vertices_values = caseCube.data(); s[0].vertices_count = clean ? caseCube.size() : 0;
-        s[0].indices_values = caseCubeIdx.data(); s[0].indices_count = clean ? caseCubeIdx.size() : 0;
-        s[0].material = cubeMat;
-        s[1] = s[0];
-        s[1].vertices_count = caseCube.size();
-        s[1].indices_count = caseCubeIdx.size();
-        remixapi_MeshInfo mi {};
-        mi.sType = REMIXAPI_STRUCT_TYPE_MESH_INFO;
-        mi.hash = 0x8000000000000023ull;
-        mi.surfaces_values = clean ? &s[1] : s;
-        mi.surfaces_count = clean ? 1 : 2;
-        bad.expect(g_remix.CreateMesh(&mi, &caseEmpty), kOk, "CreateMesh with an empty surface");
-        remixapi_MeshHandle none = nullptr;
-        mi.hash = 0x8000000000000024ull;
-        mi.surfaces_values = &s[1];
-        mi.surfaces_count = clean ? 1 : 0;
-        bad.expect(g_remix.CreateMesh(&mi, &none), rejected, "CreateMesh without surfaces");
-        if (clean && none != nullptr) {
-          g_remix.DestroyMesh(none);
-        }
-      }
-      {
-        std::vector<uint32_t> shortIndices = twoBones;
-        if (!clean) {
-          shortIndices.resize(shortIndices.size() / 2);
-        }
-        remixapi_MeshHandle none = nullptr;
-        bad.expect(caseMesh(0x8000000000000025ull, caseCube, caseCubeIdx, &shortIndices, &none), rejected,
-                   "CreateMesh with too few blend indices");
-        if (clean && none != nullptr) {
-          g_remix.DestroyMesh(none);
-        }
-      }
-      std::vector<uint32_t> wideIndex = twoBones;
-      if (!clean) {
-        wideIndex[0] = 300;
-      }
-      bad.expect(caseMesh(0x8000000000000026ull, caseCube, caseCubeIdx, &wideIndex, &caseBoneIndex), kOk, "CreateMesh blend index 300");
-
-      remixapi_Transform bones[2] = { translate(0, 0, 0), translate(0, 0, 0) };
-      bones[1].matrix[1][1] = clean ? 1.f : kNaN;
-      bad.expect(drawSkinned(caseSkinned, bones, 2, -1.f), kOk, "DrawInstance NaN bone");
-      std::vector<remixapi_Transform> many(clean ? 2 : 300, translate(0, 0, 0));
-      bad.expect(drawSkinned(caseSkinned, many.data(), uint32_t(many.size()), 0.f), kOk, "DrawInstance 300 bones");
-      bad.expect(drawSkinned(caseSkinned, clean ? bones : nullptr, 2, 1.f), rejected, "DrawInstance null bones");
-    }
-    if (k < 10) {
-      const remixapi_Transform bones[2] = { translate(0, 0, 0), translate(0.2f, 0, 0) };
-      bad.expect(drawSkinned(caseSkinned, bones, clean ? 2 : 1, 2.f), kOk, "DrawInstance missing bone");
-    }
-    drawCase(caseNaN, -3.f);
-    drawCase(caseIndex, -2.f);
-    drawCase(caseEmpty, 3.f);
-    const remixapi_Transform bones[2] = { translate(0, 0, 0), translate(0.2f, 0, 0) };
-    check(drawSkinned(caseBoneIndex, bones, 2, 4.f), "DrawInstance blend index 300");
-  };
-  // --caller-threads: the cubes and meshes of thread t are those whose index modulo the thread count is t.
-  constexpr int kThreadCubes = 32;
-  constexpr int kThreadMeshes = 2;
-  remixapi_MeshHandle threadMeshes[kThreadMeshes] = {};
-  const auto callerThreadsFrame = [&](int frame) {
-    const auto work = [&](int t) {
-      for (int m = t; m < kThreadMeshes; m += callerThreads) {
-        if (frame == caseFrame) {
-          check(caseMesh(0x8000000000000040ull + uint64_t(m), m == 0 ? caseCube : tallCube, caseCubeIdx, nullptr,
-                         &threadMeshes[m], m == 0), m == 0 ? "CreateMeshBatched thread" : "CreateMesh thread");
-        }
-        if (frame >= caseFrame) {
-          remixapi_InstanceInfo mi {};
-          mi.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
-          mi.mesh = threadMeshes[m];
-          mi.transform = translate(-1.f + 2.f * float(m), 1.5f, 4.f, 0.5f);
-          check(g_remix.DrawInstance(&mi), "DrawInstance thread mesh");
-        }
-      }
-      for (int c = t; c < kThreadCubes; c += callerThreads) {
-        remixapi_InstanceInfo ci {};
-        ci.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
-        ci.mesh = cubeMesh;
-        ci.transform = translate(-6.f + 0.4f * float(c), 0.2f, -6.f, 0.3f);
-        check(g_remix.DrawInstance(&ci), "DrawInstance thread cube");
-      }
-    };
-    std::vector<std::thread> threads;
-    for (int t = 1; t < callerThreads; ++t) {
-      threads.emplace_back(work, t);
-    }
-    work(0);
-    for (std::thread& thread : threads) {
-      thread.join();
-    }
-  };
-  // The calls in unexpected orders of one frame.
-  const auto lifecycleFrame = [&](int frame) {
-    if (frame == caseFrame) {
-      const uint64_t unknown = 0xDEAD000000000001ull;
-      life.expect(destroyRetained(&unknown, 1), kOk, "DestroyRetainedInstances unknown");
-      remixapi_InstanceInfo ii {};
-      ii.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
-      ii.mesh = cubeMesh;
-      ii.transform = translate(4.f, 0.5f, -3.f, 0.5f);
-      uint64_t a = 0;
-      check(createRetained(&ii, &a), "CreateRetainedInstance lifecycle");
-      life.expect(destroyRetained(&a, 1), kOk, "DestroyRetainedInstances");
-      life.expect(destroyRetained(&a, 1), kOk, "DestroyRetainedInstances twice");
-      remixapi_RetainedInstanceUpdate up {};
-      up.handle = a;
-      up.flags = REMIXAPI_RETAINED_UPDATE_TRANSFORM;
-      up.transform = translate(4.f, 1.f, -3.f, 0.5f);
-      life.expect(updateRetainedMany(&up, 1), kOk, "UpdateRetainedInstances after destroy");
-      life.expect(updateRetained(a, &ii), kOk, "UpdateRetainedInstance after destroy");
-
-      life.expect(g_remix.DestroyMesh(reinterpret_cast<remixapi_MeshHandle>(0x80000000DEAD0001ull)), kOk, "DestroyMesh unknown");
-      remixapi_MeshHandle once = nullptr;
-      check(caseMesh(0x8000000000000030ull, caseCube, caseCubeIdx, nullptr, &once), "CreateMesh lifecycle");
-      life.expect(g_remix.DestroyMesh(once), kOk, "DestroyMesh");
-      life.expect(g_remix.DestroyMesh(once), kOk, "DestroyMesh twice");
-
-      // A live hash created again with other geometry is dropped: the instance keeps the first geometry.
-      remixapi_MeshHandle again = nullptr;
-      life.expect(caseMesh(0x8000000000000031ull, tallCube, caseCubeIdx, nullptr, &again), kOk, "CreateMesh live hash");
-
-      // A batched create and a destroy of the same hash before the next draw, then the hash with other geometry.
-      remixapi_MeshHandle batched = nullptr;
-      life.expect(caseMesh(0x8000000000000032ull, caseCube, caseCubeIdx, nullptr, &batched, true), kOk, "CreateMeshBatched");
-      life.expect(g_remix.DestroyMesh(batched), kOk, "DestroyMesh of a pending batched create");
-      life.expect(caseMesh(0x8000000000000032ull, tallCube, caseCubeIdx, nullptr, &batched, true), kOk, "CreateMeshBatched again");
-      ii.mesh = batched;
-      ii.transform = translate(5.f, 1.f, -3.f, 0.5f);
-      uint64_t b = 0;
-      check(createRetained(&ii, &b), "CreateRetainedInstance batched");
-    } else if (frame == caseFrame + 10) {
-      // The reused hash destroyed and created with other geometry, and its instance described again.
-      life.expect(g_remix.DestroyMesh(reusedMesh), kOk, "DestroyMesh reused");
-      life.expect(caseMesh(0x8000000000000031ull, tallCube, caseCubeIdx, nullptr, &reusedMesh), kOk, "CreateMesh reused again");
-      remixapi_InstanceInfo ri {};
-      ri.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
-      ri.mesh = reusedMesh;
-      ri.transform = translate(-4.f, 0.5f, -3.f, 0.6f);
-      life.expect(updateRetained(reusedInstance, &ri), kOk, "UpdateRetainedInstance reused");
-    }
-  };
-
   for (int frame = 0; frame < frames; ++frame) {
     MSG msg;
     while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
@@ -1603,15 +1155,6 @@ int wmain(int argc, wchar_t** argv) {
     ci.pNext = &cam;
     ci.type = REMIXAPI_CAMERA_TYPE_WORLD;
     check(g_remix.SetupCamera(&ci), "SetupCamera");
-    if (badValues) {
-      badValuesFrame(frame, ci);
-    }
-    if (lifecycle) {
-      lifecycleFrame(frame);
-    }
-    if (callerThreads > 0) {
-      callerThreadsFrame(frame);
-    }
 
     remixapi_InstanceInfo ii {};
     ii.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
@@ -1670,124 +1213,6 @@ int wmain(int argc, wchar_t** argv) {
       gridLightInfo(k, 0.05f * std::sin(0.1f * float(t) + float(k)), sphere, li);
       check(g_remix.UpdateLightDefinition(gridLights[k], &li), "UpdateLightDefinition grid");
     }
-    if (lightResend && !gridLights.empty()) {
-      const int movedStart = (frame * std::max(1, lightUpdates)) % kGridLights;
-      for (int k = 0; k < kGridLights; ++k) {
-        if ((k - movedStart + kGridLights) % kGridLights < std::max(lightUpdates, 0)) {
-          continue;
-        }
-        remixapi_LightInfoSphereEXT sphere;
-        remixapi_LightInfo li;
-        gridLightInfo(k, 0.f, sphere, li);
-        check(g_remix.UpdateLightDefinition(gridLights[k], &li), "UpdateLightDefinition grid resend");
-      }
-    }
-    for (int r = 0; r < lightRecreate && !gridLights.empty(); ++r) {
-      const int k = (frame * lightRecreate + r) % kGridLights;
-      remixapi_LightInfoSphereEXT sphere;
-      remixapi_LightInfo li;
-      gridLightInfo(k, 0.f, sphere, li);
-      check(g_remix.DestroyLight(gridLights[k]), "DestroyLight grid");
-      check(g_remix.CreateLight(&li, &gridLights[k]), "CreateLight grid again");
-    }
-
-    // --vram-budget: fill, free three of four, check the level falls, fill again, check it rises.
-    if (vramBudgetMB > 0 && !vram.done) {
-      remixapi_MemoryPressureInfo p {};
-      p.structSize = sizeof(p);
-      check(getPressure(&p), "GetMemoryPressure");
-      const double demand = double(p.usageBytes) / double(vram.budget);
-      const int inPhase = frame - vram.phaseStart;
-      const auto next = [&](const char* what) {
-        std::printf("vram-budget frame %d: %s (demand %.1f%% of %d MiB, level %u, %zu textures)\n", frame, what,
-                    100.0 * demand, vramBudgetMB, p.level, vram.textures.size());
-        ++vram.phase;
-        vram.phaseStart = frame;
-      };
-      const auto fill = [&](double target) {
-        if (demand >= target) {
-          return true;
-        }
-        for (int n = 0; n < 16; ++n) {
-          remixapi_TextureInfo ti {};
-          ti.sType = REMIXAPI_STRUCT_TYPE_TEXTURE_INFO;
-          ti.hash = vram.nextHash++;
-          ti.width = 1024; ti.height = 1024; ti.depth = 1; ti.mipLevels = 1;
-          ti.format = REMIXAPI_FORMAT_R8G8B8A8_UNORM;
-          ti.data = vram.pixels.data();
-          ti.dataSize = vram.pixels.size();
-          remixapi_TextureHandle h = nullptr;
-          check(g_remix.CreateTexture(&ti, &h), "CreateTexture vram-budget");
-          vram.textures.push_back(h);
-        }
-        return false;
-      };
-      // Textures created in one frame wait a few frames for the budget's next sample, so filling stops at the target.
-      const uint64_t maxTextures = (vram.budget >> 22) * 2;
-      switch (vram.phase) {
-      case 0:
-        if (inPhase >= 60) {
-          next("warm-up done, filling");
-        }
-        break;
-      case 1:
-      case 4:
-        if (vram.textures.size() >= maxTextures) {
-          std::printf("FAIL vram-budget: demand stayed at %.1f%% after %zu textures\n", 100.0 * demand, vram.textures.size());
-          vram.failed = true;
-          vram.done = true;
-        } else if (inPhase % 4 == 0 && fill(vram.phase == 1 ? 0.93 : 0.96)) {
-          next(vram.phase == 1 ? "filled, destroying three of every four textures" : "filled again, waiting for the level");
-        }
-        break;
-      case 2: {
-        std::vector<remixapi_TextureHandle> kept;
-        for (size_t i = 0; i < vram.textures.size(); ++i) {
-          if (i % 4 == 0) {
-            kept.push_back(vram.textures[i]);
-          } else {
-            check(g_remix.DestroyTexture(vram.textures[i]), "DestroyTexture vram-budget");
-          }
-        }
-        vram.textures.swap(kept);
-        next("destroyed, waiting for the level to relax");
-        break;
-      }
-      case 3:
-        // Up to three levels relax one per 60 frames, after the slack figure's 15-frame refresh.
-        if (inPhase >= 300) {
-          const int logged = loggedVramLevel();
-          if (p.level == 0 && logged == 0) {
-            std::printf("PASS vram-budget: level 0 at %.1f%% demand with the freed space still inside chunks\n", 100.0 * demand);
-          } else {
-            std::printf("FAIL vram-budget: level %u (runtime log: %d) at %.1f%% demand; slack inside chunks keeps the level up\n",
-                        p.level, logged, 100.0 * demand);
-            vram.failed = true;
-          }
-          next("refilling");
-        }
-        break;
-      case 5:
-        vram.maxLevel = std::max(vram.maxLevel, p.level);
-        if (inPhase >= 120) {
-          const int logged = loggedVramLevel();
-          if (vram.maxLevel >= 1 && logged >= 1) {
-            std::printf("PASS vram-budget: level %u (runtime log: %d) at %.1f%% demand\n", vram.maxLevel, logged, 100.0 * demand);
-          } else {
-            std::printf("FAIL vram-budget: level %u (runtime log: %d) at %.1f%% demand\n", vram.maxLevel, logged, 100.0 * demand);
-            vram.failed = true;
-          }
-          for (remixapi_TextureHandle h : vram.textures) {
-            check(g_remix.DestroyTexture(h), "DestroyTexture vram-budget");
-          }
-          vram.textures.clear();
-          vram.done = true;
-        }
-        break;
-      default:
-        break;
-      }
-    }
 
     // A streamed mip upgrade: the cube texture's image is replaced in place with a green checker.
     if (d3d11 && frame == 10) {
@@ -1808,22 +1233,8 @@ int wmain(int argc, wchar_t** argv) {
       pi.sType = REMIXAPI_STRUCT_TYPE_PRESENT_INFO;
       check(g_remix.Present(&pi), "Present");
     }
-    if (vramBudgetMB > 0 && vram.done) {
-      break;
-    }
-  }
-  if (vramBudgetMB > 0 && !vram.done) {
-    std::printf("FAIL vram-budget: not finished in %d frames (phase %d)\n", frames, vram.phase);
-    vram.failed = true;
   }
 
-  if (badValues) {
-    std::printf("%s: %d calls, %d unexpected results\n", bad.name, bad.calls, bad.unexpected);
-  }
-  if (lifecycle) {
-    std::printf("%s: %d calls, %d unexpected results\n", life.name, life.calls, life.unexpected);
-    destroyRetained(&reusedInstance, 1);
-  }
   destroyRetained(retained, 2);
   if (keyedInstance != 0) {
     destroyRetained(&keyedInstance, 1);
@@ -1846,5 +1257,5 @@ int wmain(int argc, wchar_t** argv) {
     device->Release();
   }
   std::printf("testhost: %d frames done (%s)\n", frames, d3d11 ? "d3d11" : "d3d9");
-  return vram.failed ? 1 : 0;
+  return 0;
 }

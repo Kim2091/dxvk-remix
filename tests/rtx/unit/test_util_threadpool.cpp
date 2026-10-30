@@ -23,12 +23,9 @@
 #include <random>
 #include <chrono>
 #include <iostream>
-#include <memory>
-#include <thread>
 
 #include "../../test_utils.h"
 #include "../../../src/util/util_threadpool.h"
-#include "../../../src/util/util_atomic_queue.h"
 #include "../../../src/util/util_timer.h"
 #include "../../../src/tracy/Tracy.hpp"
 
@@ -49,71 +46,18 @@ inline uint64_t hwCounter() {
 #endif
 }
 
-namespace {
-  void check(bool condition, const char* what) {
-    if (!condition) {
-      throw DxvkError(str::format("Check failed: ", what));
-    }
-  }
-
-  void waitFor(const std::atomic<uint32_t>& counter, uint32_t value) {
-    while (counter.load() < value) {
-      std::this_thread::yield();
-    }
-  }
-
-  // A result large enough to show which task wrote it, like the D3D9 geometry results.
-  struct TaggedResult {
-    uint32_t tag = 0;
-    uint32_t payload[15] = {};
-  };
-
-  TaggedResult makeResult(uint32_t tag) {
-    TaggedResult result;
-    result.tag = tag;
-    for (uint32_t i = 0; i < 15; i++) {
-      result.payload[i] = tag * 31 + i;
-    }
-    return result;
-  }
-
-  bool matches(const TaggedResult& result, uint32_t tag) {
-    if (result.tag != tag) {
-      return false;
-    }
-    for (uint32_t i = 0; i < 15; i++) {
-      if (result.payload[i] != tag * 31 + i) {
-        return false;
-      }
-    }
-    return true;
-  }
-}
-
 class ThreadPoolTestApp {
 public:
-  static void run() {
+  static void run() { 
     cout << "Begin smoke test" << endl;
     test_smoke<0>();
     cout << "Begin task cancellation test" << endl;
     test_smoke<4>();
     cout << "Begin misc tests" << endl;
     test_misc();
-    cout << "Begin held future slot test" << endl;
-    test_heldFutureKeepsSlot();
-    cout << "Begin dropped future test" << endl;
-    test_droppedFuturesFreeSlots();
-    cout << "Begin result lifetime test" << endl;
-    test_resultLifetime();
-    cout << "Begin move test" << endl;
-    test_move();
-    cout << "Begin lagging consumer test" << endl;
-    test_laggingConsumer();
-    cout << "Begin stress slot reuse test" << endl;
-    test_stressSlotReuse();
     cout << "WorkerThreadPool successfully smoke tested" << endl;
   }
-
+  
 private:
   template<uint32_t cancelPeriod>
   static void test_smoke() {
@@ -148,7 +92,7 @@ private:
         // Spawn N tasks that sleep a bit, and return a 1
         auto future = threadPool.Schedule([a = a[i], b = b[i], c = c[i], d = d[i]]()->uint32_t {
           ZoneScoped;
-          // Create some varying workloads
+          // Create some varying workloads 
           double sleepFor = (double) (a + b + c + d) / 4;
           auto start = high_resolution_clock::now();
           while (duration_cast<milliseconds>(high_resolution_clock::now() - start).count() < sleepFor);
@@ -160,11 +104,11 @@ private:
           throw DxvkError("Failed to schedule task");
         }
 
+        results[i] = future;
+
         if (cancelPeriod > 0 && (i % cancelPeriod) == 0) {
           future.cancel();
         }
-
-        results[i] = std::move(future);
       }
 
       const uint64_t e = hwCounter();
@@ -244,239 +188,11 @@ private:
 
     // The lambda destructor is executed _after_ the future result is set.
     // We need to either wait for the result to update, or finalize the thread pool.
-    // A Future must not outlive its pool, so it is released first.
-    future.reset();
     delete threadPool;
 
     if (result != 2) {
       throw DxvkError("Result didnt match");
     }
-  }
-
-  // A slot whose Future is still held is not reused, even after its task ran.
-  static void test_heldFutureKeepsSlot() {
-    // One thread and four tasks per thread give a ring of four task slots.
-    WorkerThreadPool<4> threadPool(1);
-    std::atomic<uint32_t> executed = 0;
-
-    std::vector<Future<TaggedResult>> held;
-    for (uint32_t i = 0; i < 4; i++) {
-      held.push_back(threadPool.Schedule([i, &executed]() {
-        executed++;
-        return makeResult(i);
-      }));
-      check(held.back().valid(), "a task is scheduled while slots are free");
-      waitFor(executed, i + 1);
-    }
-
-    // Every task has run, so the worker queue is empty, but every slot is still owned by a Future.
-    Future<TaggedResult> rejected = threadPool.Schedule([&executed]() {
-      executed++;
-      return makeResult(100);
-    });
-    check(!rejected.valid(), "Schedule rejects a task while the next slot's Future is held");
-
-    Future<TaggedResult> inlined = threadPool.ScheduleOrRun([]() {
-      return makeResult(101);
-    });
-    check(inlined.valid(), "ScheduleOrRun always returns a valid Future");
-    check(threadPool.tasksRunByCaller() == 1, "ScheduleOrRun runs the task on the caller when no slot is free");
-    check(matches(inlined.get(), 101), "a task run by the caller returns its own result");
-
-    for (uint32_t i = 0; i < 4; i++) {
-      check(matches(held[i].get(), i), "a held Future returns its own task's result");
-    }
-
-    // The slots are free again once their Futures were read.
-    Future<TaggedResult> next = threadPool.Schedule([]() {
-      return makeResult(102);
-    });
-    check(next.valid(), "a slot is reused after its Future was read");
-    check(matches(next.get(), 102), "a reused slot returns the new task's result");
-  }
-
-  // A Future dropped without get() frees its slot once the task ran, and the task still runs.
-  static void test_droppedFuturesFreeSlots() {
-    WorkerThreadPool<4> threadPool(1);
-    std::atomic<uint32_t> executed = 0;
-    const uint32_t numTasks = 10000;
-
-    for (uint32_t i = 0; i < numTasks; i++) {
-      Future<TaggedResult> dropped = threadPool.ScheduleOrRun([i, &executed]() {
-        executed++;
-        return makeResult(i);
-      });
-      check(dropped.valid(), "ScheduleOrRun always returns a valid Future");
-    }
-    waitFor(executed, numTasks);
-    check(executed.load() == numTasks, "every dropped task ran exactly once");
-
-    // No slot leaked: three tasks fit in the worker queue and in the ring again. A worker frees a slot just after its
-    // lambda returns, so each slot gets a second to become free.
-    std::vector<Future<TaggedResult>> held;
-    for (uint32_t i = 0; i < 3; i++) {
-      const auto start = steady_clock::now();
-      Future<TaggedResult> future;
-      while (!future.valid() && steady_clock::now() - start < seconds(1)) {
-        future = threadPool.Schedule([i]() { return makeResult(i); });
-      }
-      check(future.valid(), "dropped Futures leave no slot in use");
-      held.push_back(std::move(future));
-    }
-    for (uint32_t i = 0; i < 3; i++) {
-      check(matches(held[i].get(), i), "a slot freed by a dropped Future returns the new task's result");
-    }
-  }
-
-  // A result nobody reads is destroyed, whichever of the worker and the Future finishes last.
-  static void test_resultLifetime() {
-    auto token = std::make_shared<uint32_t>(7);
-    {
-      WorkerThreadPool<64> threadPool(2);
-      std::atomic<uint32_t> executed = 0;
-      std::atomic<bool> go = false;
-
-      // Dropped before the task runs: the worker destroys the result.
-      for (uint32_t i = 0; i < 8; i++) {
-        Future<std::shared_ptr<uint32_t>> dropped = threadPool.Schedule([token, &executed, &go]() {
-          while (!go.load()) {
-            std::this_thread::yield();
-          }
-          executed++;
-          return token;
-        });
-        check(dropped.valid(), "a task is scheduled");
-      }
-      go = true;
-      waitFor(executed, 8);
-
-      // Dropped after the task ran: the Future destroys the result.
-      std::vector<Future<std::shared_ptr<uint32_t>>> late;
-      for (uint32_t i = 0; i < 8; i++) {
-        late.push_back(threadPool.Schedule([token, &executed]() {
-          executed++;
-          return token;
-        }));
-      }
-      waitFor(executed, 16);
-      late.clear();
-
-      // Read: the caller owns the result.
-      Future<std::shared_ptr<uint32_t>> read = threadPool.Schedule([token]() { return token; });
-      check(*read.get() == 7, "a read result is the task's result");
-
-      // Destroying the pool joins the workers, so every lambda and result is destroyed after this scope.
-    }
-    check(token.use_count() == 1, "every unread result and every lambda was destroyed");
-  }
-
-  // A moved-from Future is invalid, so a result is read only once.
-  static void test_move() {
-    WorkerThreadPool<16> threadPool(1);
-    Future<TaggedResult> first = threadPool.Schedule([]() { return makeResult(5); });
-    Future<TaggedResult> second = std::move(first);
-    check(!first.valid(), "a moved-from Future is invalid");
-    check(second.valid(), "a moved-to Future is valid");
-
-    Future<TaggedResult> third;
-    third = std::move(second);
-    check(!second.valid(), "a move-assigned-from Future is invalid");
-    check(matches(third.get(), 5), "a moved Future returns its task's result");
-    check(!third.valid(), "a read Future is invalid");
-
-    Future<TaggedResult> ready = Future<TaggedResult>::ready(makeResult(6));
-    Future<TaggedResult> movedReady = std::move(ready);
-    check(!ready.valid(), "a moved-from ready Future is invalid");
-    check(matches(movedReady.get(), 6), "a ready Future returns its value");
-    check(!movedReady.valid(), "a read ready Future is invalid");
-
-    // Assigning over a Future that owns a slot releases that slot.
-    Future<TaggedResult> overwritten = threadPool.Schedule([]() { return makeResult(7); });
-    overwritten = threadPool.Schedule([]() { return makeResult(8); });
-    check(matches(overwritten.get(), 8), "an assigned Future returns the new task's result");
-  }
-
-  // The D3D9 pattern: a producer schedules three tasks per draw and queues the Futures for a consumer thread, which
-  // falls behind by more draws than the pool has task slots. Every Future must return its own draw's result.
-  static void test_laggingConsumer() {
-    uint64_t runByCaller = 0;
-    const uint32_t mismatches = laggingConsumer(20000, runByCaller);
-    cout << "Lagging consumer: " << runByCaller << " of " << 20000 * 3 << " tasks ran on the producer" << endl;
-    check(mismatches == 0, "every Future returned its own draw's result");
-    check(runByCaller > 0, "the consumer fell behind by more draws than the pool has slots");
-  }
-
-  // The same pattern under stress mode: one slot per worker and random delays before each task.
-  static void test_stressSlotReuse() {
-    stress::Config config;
-    config.delayUs = 200;
-    config.delayChance = 0.5f;
-    config.forceSlotReuse = true;
-    config.seed = 7;
-    stress::configure(config);
-    uint64_t runByCaller = 0;
-    const uint32_t mismatches = laggingConsumer(3000, runByCaller);
-    const uint64_t delays = stress::delaysInjected();
-    stress::configure(stress::Config());
-    cout << "Stress: " << runByCaller << " of " << 3000 * 3 << " tasks ran on the producer, " << delays << " delays" << endl;
-    check(mismatches == 0, "under stress, every Future returned its own draw's result");
-    check(delays > 0, "stress mode delayed some tasks");
-    check(runByCaller > 0, "stress mode left the pool fewer slots than draws in flight");
-    check(!stress::active(), "a default configuration turns stress mode off");
-  }
-
-  // Returns the number of draws whose Futures returned another draw's results.
-  static uint32_t laggingConsumer(const uint32_t numDraws, uint64_t& runByCaller) {
-    struct Draw {
-      uint32_t id = 0;
-      Future<TaggedResult> hashes;
-      Future<TaggedResult> bounds;
-      Future<TaggedResult> skinning;
-    };
-
-    // Two threads and 64 tasks per thread give 128 task slots, and the queue holds up to 255 draws (765 Futures).
-    WorkerThreadPool<64> threadPool(2);
-    AtomicQueue<Draw, 256> draws;
-    std::atomic<uint32_t> mismatches = 0;
-
-    std::thread consumer([&]() {
-      uint32_t expected = 0;
-      Draw draw;
-      while (expected < numDraws) {
-        if (!draws.pop(draw)) {
-          std::this_thread::yield();
-          continue;
-        }
-        // The consumer stalls now and then, as a CS thread does when the GPU is shared or the game is in the background.
-        if ((expected % 1000) == 0) {
-          std::this_thread::sleep_for(milliseconds(5));
-        }
-        const uint32_t base = draw.id * 3;
-        if (draw.id != expected ||
-            !matches(draw.hashes.get(), base) ||
-            !matches(draw.bounds.get(), base + 1) ||
-            !matches(draw.skinning.get(), base + 2)) {
-          mismatches++;
-        }
-        expected++;
-      }
-    });
-
-    for (uint32_t i = 0; i < numDraws; i++) {
-      const uint32_t base = i * 3;
-      Draw draw;
-      draw.id = i;
-      draw.hashes = threadPool.ScheduleOrRun([base]() { return makeResult(base); });
-      draw.bounds = threadPool.ScheduleOrRun([base]() { return makeResult(base + 1); });
-      draw.skinning = threadPool.ScheduleOrRun([base]() { return makeResult(base + 2); });
-      while (!draws.push(std::move(draw))) {
-        std::this_thread::yield();
-      }
-    }
-    consumer.join();
-
-    runByCaller = threadPool.tasksRunByCaller();
-    return mismatches.load();
   }
 };
 
@@ -491,3 +207,4 @@ int main() {
 
   return 0;
 }
+

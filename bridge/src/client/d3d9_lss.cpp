@@ -24,6 +24,7 @@
 #include "version.h"
 
 #include "d3d9_lss.h"
+#include "client_memory_stats.h"
 #include "d3d9_surface.h"
 #include "d3d9_texture.h"
 #include "d3d9_cubetexture.h"
@@ -442,14 +443,28 @@ extern "C" {
     return 0;
   }
 
-  // A proxy d3d9.dll that wraps a device of this client registers its own device and IDirect3D9 here, so that
-  // GetDevice on every object of that device and IDirect3DDevice9::GetDirect3D return the proxy's objects.
-  // The client keeps no references to them, so the proxy clears the registration (null pointers) before its
-  // final release. pOuterDirect3D may be null on its own.
-  // Returns E_INVALIDARG when pInner is not a live device of this client.
-  DLLEXPORT HRESULT __stdcall BridgeClient_SetOuterDevice(IDirect3DDevice9* pInner, IDirect3DDevice9* pOuterDevice,
-                                                          IDirect3D9* pOuterDirect3D) {
-    return BaseDirect3DDevice9Ex_LSS::setOuterObjects(pInner, pOuterDevice, pOuterDirect3D) ? S_OK : E_INVALIDARG;
+  // The layout BridgeClient_GetMemoryStats fills. The caller sets `size` to the size of the struct it knows,
+  // so fields appended later are left alone for an older caller.
+  struct BridgeClientMemoryStats {
+    uint32_t size;
+    uint32_t reserved;
+    uint64_t surfaceShadowBytes;
+    uint64_t surfaceShadows;
+    uint64_t bufferShadowBytes;
+    uint64_t bufferShadows;
+  };
+
+  // Reports the client's CPU copies of surface and buffer contents, for a host that watches the game's address space.
+  // Exported by name only (d3d9_lss.def). Allocates nothing, so a crash handler may call it.
+  DLLEXPORT BOOL __stdcall BridgeClient_GetMemoryStats(BridgeClientMemoryStats* pStats) {
+    if (pStats == nullptr || pStats->size < sizeof(BridgeClientMemoryStats)) {
+      return FALSE;
+    }
+    pStats->surfaceShadowBytes = ClientMemoryStats::surfaceShadowBytes.load(std::memory_order_relaxed);
+    pStats->surfaceShadows = ClientMemoryStats::surfaceShadows.load(std::memory_order_relaxed);
+    pStats->bufferShadowBytes = ClientMemoryStats::bufferShadowBytes.load(std::memory_order_relaxed);
+    pStats->bufferShadows = ClientMemoryStats::bufferShadows.load(std::memory_order_relaxed);
+    return TRUE;
   }
 }
 

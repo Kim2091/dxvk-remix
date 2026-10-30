@@ -21,9 +21,31 @@ EXPORTS
   remixapi_InitializeLibrary @ 39
   remixapi_RegisterCallbacks @ 40
 
-  remixapi_SetColorGradePreset @ 41
-  remixapi_SetColorGrade @ 42
-  remixapi_MixColorGradePresets @ 43
-  remixapi_GetColorGrade @ 44
-  remixapi_SaveColorGradePreset @ 45
-  BridgeClient_SetOuterDevice @ 46
+  ; Retained instances, resolved by name like the runtime exports.
+  remixapi_CreateRetainedInstance @ 41
+  remixapi_CreateRetainedInstances @ 42
+  remixapi_UpdateRetainedInstance @ 43
+  remixapi_UpdateRetainedInstances @ 44
+  remixapi_DestroyRetainedInstances @ 45
+  remixapi_DrawRetainedInstances @ 46
+
+  ; D3D9 texture import (resolve by name).
+  remixapi_ImportD3D9Texture @ 47
+
+  ; Host settings (resolve by name); PollHostSettings is bridge-only.
+  remixapi_RegisterHostSetting @ 48
+  remixapi_GetHostSettingsGeneration @ 49
+  remixapi_GetHostSettingValue @ 50
+  remixapi_SetHostSettingValue @ 51
+  remixapi_ClearHostSettings @ 52
+  remixapi_PollHostSettings @ 53
+
+  ; The client's CPU copies of surfaces and buffers (resolve by name).
+  BridgeClient_GetMemoryStats @ 54
+
+  ; Colour grading (resolve by name).
+  remixapi_SetColorGradePreset @ 55
+  remixapi_SetColorGrade @ 56
+  remixapi_MixColorGradePresets @ 57
+  remixapi_GetColorGrade @ 58
+  remixapi_SaveColorGradePreset @ 59

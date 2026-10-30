@@ -35,8 +35,6 @@
 
 #include <cstdint>
 #include <memory>
-#include <string>
-#include <vector>
 #include "../util/rc/util_rc_ptr.h"
 #include "rtx_semaphore.h"
 
@@ -122,10 +120,6 @@ namespace dxvk {
     const std::string& getDLFGNotSupportedReason() {
       return m_dlfgNotSupportedReason;
     }
-
-    // Returns the directories NGX searches for feature DLLs, in search order, joined for display.
-    // Returns an empty string before NGX has been initialized.
-    std::string getFeatureSearchPathText() const;
     
     std::unique_ptr<NGXDLSSContext> createDLSSContext();
     std::unique_ptr<NGXRayReconstructionContext> createRayReconstructionContext();
@@ -147,13 +141,9 @@ namespace dxvk {
 
     bool checkDLSSSupport(NVSDK_NGX_Parameter* params);
     bool checkDlssNeuralRenderingSupport(NVSDK_NGX_Parameter* params);
-    void logDlssNeuralRenderingLibrary() const;
     void checkDLFGSupport(NVSDK_NGX_Parameter* params);
 
     std::string m_dlfgNotSupportedReason;
-
-    // Set up by initialize() and passed to NGX as NVSDK_NGX_FeatureCommonInfo::PathListInfo.
-    std::vector<std::wstring> m_featureSearchPaths;
   };
 
   class NGXFeatureContext {
@@ -410,14 +400,12 @@ namespace dxvk {
       float structuralStrength;
       uint32_t model;
       bool useAutoMask;
-      // An NVSDK_NGX_DLSSNR_Mask_Blend_Mode value.
-      uint32_t maskBlendMode;
       float skinStructureStrength;
     };
 
     // preset is an NVSDK_NGX_DLSSNR_Hint_Render_Preset value, taken as uint32_t so this
     // declaration does not need the DLSS-NR SDK header (which has no arm64 package).
-    void initialize(Rc<DxvkContext> renderContext, const uint32_t displaySize[2], uint32_t preset);
+    void initialize(Rc<DxvkContext> renderContext, const uint32_t displaySize[2], uint32_t preset, bool queryVramAllocation);
 
     bool evaluateNeuralRendering(Rc<DxvkContext> renderContext, const NGXNeuralRenderingBuffers& buffers, const NGXNeuralRenderingSettings& settings) const;
 
@@ -425,6 +413,14 @@ namespace dxvk {
 
     bool isNeuralRenderingInitialized() const {
       return m_initialized && m_neuralRenderingFeature != nullptr;
+    }
+
+    bool hasVramAllocation() const {
+      return m_hasVramAllocation;
+    }
+
+    uint64_t getVramAllocationBytes() const {
+      return m_vramAllocationBytes;
     }
 
   public:
@@ -439,6 +435,8 @@ namespace dxvk {
 
   private:
     bool m_initialized = false;
+    bool m_hasVramAllocation = false;
+    uint64_t m_vramAllocationBytes = 0;
     NVSDK_NGX_Handle* m_neuralRenderingFeature = nullptr;
   };
 #endif // NVSDK_NGX_DEFS_H

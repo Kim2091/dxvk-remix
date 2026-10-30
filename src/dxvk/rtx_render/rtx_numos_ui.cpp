@@ -378,9 +378,9 @@ namespace dxvk {
         const uint32_t stride = g_numosOutputs ? g_numosOutputs->cloudMarchStride : 0u;
         ImGui::TextDisabled("In use: %s", stride >= 4u ? "Sixteenth (4x4)" : stride == 2u ? "Quarter (2x2)"
                                           : stride == 1u ? "Full" : "-");
-        RemixGui::SetTooltipToLastWidgetOnHover("Auto marches sparsely only where it cannot show: native or DLSS Quality-like "
-                                                "upscaling with at least 720 render lines get the quarter march, coarser "
-                                                "upscaling the full rate (submodules/numos/docs/cloud-temporal-filter.md).");
+        RemixGui::SetTooltipToLastWidgetOnHover("Auto marches sparsely only where it cannot show: native resolution and mild "
+                                                "upscaling with at least 720 render lines use the quarter rate, stronger "
+                                                "upscaling the full rate.");
       }
       setting("cloudTemporalHistoryWeight", "Temporal History", 0.005f, 0.0f, 0.98f, "%.3f");
       setting("cloudTemporalStillSamples", "Still History (samples)", 0.5f, 1.0f, 1024.0f);
@@ -586,6 +586,16 @@ namespace dxvk {
         setting("aerialPerspectiveFroxelDepthSlices", "Depth Slices", 1.0f, 16.0f, 256.0f);
         setting("aerialPerspectiveHistoryFrames", "History Frames", 1.0f, 1.0f, 255.0f);
         setting("aerialPerspectiveMieAnisotropyMax", "Forward Scatter Cap", 0.01f, -1.0f, 1.0f, "%.2f");
+        ImGui::TreePop();
+      }
+
+      if (ImGui::TreeNode("Debug")) {
+        static const int values[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+        static const char* names[] = {
+          "Off", "Sun Visibility", "Sky Visibility", "Haze Brightness", "No Sun or Sky Light", "Haze Transmittance",
+          "Sun Visibility (2 m)", "Sky Visibility (2 m)", "Haze Brightness, No Sun or Sky", "Surface Clamp", "Surface Guard"
+        };
+        choice("aerialPerspectiveDebugView", "Debug View", values, names, 11);
         ImGui::TreePop();
       }
     }
@@ -868,7 +878,7 @@ namespace dxvk {
                 "the land were closer, and higher values thicken it, as if the land were farther away.",
                 0.005f, 0.01f, 10.0f, "%.3f");
     userSetting("fogVisibilityMeters", "Ground Fog Visibility",
-                "How far you can see through low-lying fog, in meters. Lower values give thicker fog: 50 is thick fog, "
+                "How far you can see through low-lying fog, in metres. Lower values give thicker fog: 50 is thick fog, "
                 "1000 mist and 10000 light haze. 0 turns the ground fog off.",
                 10.0f, 0.0f, 100000.0f, "%.0f m");
     userSetting("aerialPerspectiveSceneShadow", "Sun Shafts",
@@ -920,7 +930,7 @@ namespace dxvk {
       static const int values[] = { 0, 1, 2, 3 };
       static const char* names[] = { "Auto", "Full", "Quarter", "Sixteenth" };
       userChoice("cloudMarchRate", "Cloud Resolution",
-                 "How many cloud pixels are traced each frame. The rest are rebuilt from their neighbors and earlier "
+                 "How many cloud pixels are traced each frame. The rest are rebuilt from their neighbours and earlier "
                  "frames. Auto chooses from your resolution and upscaling. Full traces every pixel and costs the most. "
                  "Quarter costs about a quarter and looks the same when the view is still. Sixteenth is the cheapest, "
                  "but noisy and soft in motion.",

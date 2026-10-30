@@ -1111,10 +1111,6 @@ namespace dxvk {
             VkPipelineBindPoint pipeline,
             uint32_t            index,
             uint32_t            value);
-
-    // A bind point's specialization constants as a whole, so a caller can restore them after overriding some.
-    const DxvkScInfo& getSpecConstantsInfo(VkPipelineBindPoint pipeline) const;
-    void setSpecConstantsInfo(VkPipelineBindPoint pipeline, const DxvkScInfo& newSpecConstantInfo);
     
     /**
      * \brief Sets barrier control flags

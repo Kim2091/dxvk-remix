@@ -60,7 +60,8 @@ void Direct3DVertexDeclaration9_LSS::onDestroy() {
 
 HRESULT Direct3DVertexDeclaration9_LSS::GetDevice(IDirect3DDevice9** ppDevice) {
   LogFunctionCall();
-  m_pDevice->reportDevice(ppDevice);
+  m_pDevice->AddRef();
+  (*ppDevice) = m_pDevice;
   return S_OK;
 }
 

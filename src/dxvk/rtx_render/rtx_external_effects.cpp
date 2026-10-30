@@ -24,6 +24,11 @@
 #include "../../util/util_env.h"
 #include "../../util/util_global_time.h"
 
+// ScopedGpuProfileZone needs a string literal once Tracy is enabled; effect and pass names are built at
+// runtime. This records a fixed-name CPU zone carrying the name as text, a transient GPU zone and the
+// debug annotation.
+#define ScopedGpuProfileZoneRuntimeName(ctx, name)         ZoneScopedN("External effect");         ZoneText((name), std::strlen(name));         TracyVkZoneTransient((ctx)->getDevice()->queues().graphics.tracyCtx, __tracyGpuZoneRuntimeName, (ctx)->getCmdBuffer(DxvkCmdBuffer::ExecBuffer), (name), true);         __ScopedAnnotation __scopedAnnotation(ctx, name)
+
 namespace dxvk {
 
   namespace {
@@ -2094,7 +2099,7 @@ namespace dxvk {
       return;
     }
 
-    ScopedGpuProfileZone(ctx, effect->manifest.name.c_str());
+    ScopedGpuProfileZoneRuntimeName(ctx, effect->manifest.name.c_str());
     ctx->setFramePassStage(RtxFramePassStage::PostFX);
     ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
 
@@ -2256,7 +2261,7 @@ namespace dxvk {
     for (size_t passIndex = 0; passIndex < effect->passes.size(); passIndex++) {
       const RtxExternalEffectPass& pass = effect->manifest.passes[passIndex];
       const CompiledPass& compiled = effect->passes[passIndex];
-      ScopedGpuProfileZone(ctx, pass.id.c_str());
+      ScopedGpuProfileZoneRuntimeName(ctx, pass.id.c_str());
 
       // Binding 0 is the colour this pass reads, which is the scene input
       // unless the pass asked for what the effect has written so far. Both are

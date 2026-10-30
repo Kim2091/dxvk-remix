@@ -42,7 +42,6 @@
 #include "rtx/pass/opacity_micromap/omm_class_census_args.h"
 #include "rtx/pass/opacity_micromap/omm_micro_census_args.h"
 #include "rtx/pass/opacity_micromap/software_omm_shared.h"
-#include "rtx_fork_d3d9_alpha.h"
 #include "rtx_fork_light_bvh_pass.h" // The software micromap counters live in the LightSamplingStats buffer.
 
 // #define VALIDATION_MODE
@@ -702,11 +701,6 @@ namespace dxvk {
 
       // Note: 2 is minimum to ensure # micro triangle size is a multiple of 1 byte to ensure cross triangle alignment requirement
       RemixGui::DragInt("Subdivision Level", &OpacityMicromapOptions::Building::subdivisionLevelObject(), 1.f, 2, 11, "%d", sliderFlags);
-      RemixGui::Checkbox("Subdivision Level from Texel Density", &OpacityMicromapOptions::Building::adaptiveSubdivisionObject());
-      RemixGui::SetTooltipToLastWidgetOnHover(
-        "rtx.opacityMicromap.building.adaptiveSubdivision. Each mesh gets the lowest level at which micro-triangles are at most\n"
-        "one texel across, capped by the Subdivision Level option. Coarse meshes then need a fraction of the memory, so more\n"
-        "of them fit the budget. Switching it rebuilds every micromap.");
       ADVANCED(RemixGui::Checkbox("Vertex, Texture Ops & Emissive Blending", &OpacityMicromapOptions::Building::enableVertexAndTextureOperationsObject()));
       ADVANCED(RemixGui::Checkbox("Allow 2 State Opacity Micromaps", &OpacityMicromapOptions::Building::allow2StateOpacityMicromapsObject()));
       ADVANCED(RemixGui::Checkbox("Force 2 State Opacity Micromaps", &OpacityMicromapOptions::Building::force2StateOpacityMicromapsObject()));
@@ -767,7 +761,7 @@ namespace dxvk {
   InstanceEventHandler OpacityMicromapManager::getInstanceEventHandler() {
     InstanceEventHandler instanceEvents(this);
     instanceEvents.onInstanceAddedCallback = [this](const RtInstance& instance) { onInstanceAdded(instance); };
-    instanceEvents.onInstanceUpdatedCallback = [this](const RtInstance& instance, const SceneDraw& drawCall, const MaterialData* material, bool hasTransformChanged, bool hasVerticesChanged, bool isFirstUpdateThisFrame) { onInstanceUpdated(instance, drawCall, material, hasTransformChanged, hasVerticesChanged, isFirstUpdateThisFrame); };
+    instanceEvents.onInstanceUpdatedCallback = [this](const RtInstance& instance, const DrawCallState& drawCall, const MaterialData* material, bool hasTransformChanged, bool hasVerticesChanged, bool isFirstUpdateThisFrame) { onInstanceUpdated(instance, drawCall, material, hasTransformChanged, hasVerticesChanged, isFirstUpdateThisFrame); };
     instanceEvents.onInstanceDestroyedCallback = [this](const RtInstance& instance) { onInstanceDestroyed(instance); };
     return instanceEvents;
   }
@@ -825,22 +819,6 @@ namespace dxvk {
       useStagingNumTexelsPerMicroTriangleObject(instance);
   }
 
-  bool OpacityMicromapManager::waitsForOmmRequest(const RtInstance& instance) const {
-    // The same opacity test calculateInstanceUsesOpacityMicromap starts with.
-    const RtSurface::AlphaState& alphaState = instance.surface.alphaState;
-    if (alphaState.isFullyOpaque && !alphaState.emissiveBlend && instance.getMaterialType() != MaterialDataType::RayPortal) {
-      return false;
-    }
-    const OpacityMicromapInstanceData& data = instance.getOpacityMicromapInstanceData();
-    if (data.isOmmBuildRequested(m_ommGeneration)) {
-      return false;
-    }
-    if (data.ommEligibilityGeneration != m_ommGeneration) {
-      return true;
-    }
-    return data.usesOMM && isOmmCandidate(instance);
-  }
-
   int OpacityMicromapManager::getOmmReadiness(const RtInstance& instance) const {
     const XXH64_hash_t hash = getOpacityMicromapHash(instance);
     if (hash == kEmptyHash) {
@@ -872,7 +850,7 @@ namespace dxvk {
   }
 
   void OpacityMicromapManager::onInstanceUpdated(const RtInstance& instance,
-                                                 const SceneDraw& /*drawCall*/,
+                                                 const DrawCallState& /*drawCall*/,
                                                  const MaterialData* /*material*/,
                                                  const bool hasTransformChanged,
                                                  const bool hasVerticesChanged,
@@ -1641,12 +1619,6 @@ namespace dxvk {
         m_ommCandidates.insert(inst);
       }
     };
-    const bool gateStats = D3d9Alpha::statsActive();
-    const auto noteGate = [gateStats](const RtInstance* inst, D3d9Alpha::OmmGate gate) {
-      if (gateStats) {
-        D3d9Alpha::noteOmmCandidateGate(*inst, gate);
-      }
-    };
 
     // Walk the instance table instead of the unordered retry set so OMM request
     // registration is deterministic. Stale generation data catches new instances
@@ -1733,7 +1705,6 @@ namespace dxvk {
       // assigns geometry.  The instance will be processed on a subsequent frame
       // once its BLAS is set.
       if (!inst->getBlas()) {
-        noteGate(inst, D3d9Alpha::OmmGate::NoBlas);
         keepCandidateForRetry(inst);
         continue;
       }
@@ -1744,7 +1715,6 @@ namespace dxvk {
       // yet on the instance's first frame.  Deferring to the next frame
       // ensures the OMM is built against fully initialised geometry.
       if (inst->getFrameAge() == 0) {
-        noteGate(inst, D3d9Alpha::OmmGate::NewInstance);
         keepCandidateForRetry(inst);
         continue;
       }
@@ -1761,7 +1731,6 @@ namespace dxvk {
 
       // Deferred — skip until retry frame is reached.
       if (currentFrameIndex < ommInstanceData.ommRetryAfterFrame) {
-        noteGate(inst, D3d9Alpha::OmmGate::RetryWait);
         keepCandidateForRetry(inst);
         continue;
       }
@@ -1771,7 +1740,6 @@ namespace dxvk {
         // Spread excess candidates across the next 32 frames to avoid future spikes.
         ommInstanceData.ommRetryAfterFrame = currentFrameIndex + 1 + (numThrottled % 32);
         ++numThrottled;
-        noteGate(inst, D3d9Alpha::OmmGate::Throttled);
         keepCandidateForRetry(inst);
         continue;
       }
@@ -1779,7 +1747,6 @@ namespace dxvk {
 
       // No budget — keep candidate for retry when budget becomes available.
       if (!hasBudget) {
-        noteGate(inst, D3d9Alpha::OmmGate::NoBudget);
         keepCandidateForRetry(inst);
         continue;
       }
@@ -1796,7 +1763,6 @@ namespace dxvk {
           ommInstanceData.usesOMM = false;
         }
         if (!ommInstanceData.usesOMM || inst->isViewModelNonReference()) {
-          noteGate(inst, D3d9Alpha::OmmGate::NotUser);
           m_ommCandidates.erase(inst);
           continue;
         }
@@ -1811,7 +1777,6 @@ namespace dxvk {
 
       // Textures not resident yet — defer.
       if (!areInstanceTexturesResident(*inst, textures)) {
-        noteGate(inst, D3d9Alpha::OmmGate::TexturesNotResident);
         keepCandidateForRetry(inst);
         continue;
       }
@@ -1827,7 +1792,6 @@ namespace dxvk {
         }
         // Blacklisted — permanently remove.
         else if (m_blackListedList.find(cachedHash) != m_blackListedList.end()) {
-          noteGate(inst, D3d9Alpha::OmmGate::Blacklisted);
           m_ommCandidates.erase(inst);
           continue;
         }
@@ -1842,7 +1806,6 @@ namespace dxvk {
               m_ommBuildRequestStatistics.find(cachedHash) == m_ommBuildRequestStatistics.end()) {
             ommInstanceData.ommRetryAfterFrame = currentFrameIndex + 1 + (numRegisterFailed % 32);
             ++numRegisterFailed;
-            noteGate(inst, D3d9Alpha::OmmGate::StatsFull);
             keepCandidateForRetry(inst);
             continue;
           }
@@ -1861,7 +1824,6 @@ namespace dxvk {
               stats.numTimesRequested < minNumRequests ||
               stats.numFramesRequested < minNumFramesRequested) {
             ++numRegisterFailed;
-            noteGate(inst, D3d9Alpha::OmmGate::BelowFilter);
             keepCandidateForRetry(inst);
             continue;
           }
@@ -1886,7 +1848,6 @@ namespace dxvk {
         m_instanceOmmRequests.erase(instanceOmmRequestsIter);
       }
 
-      noteGate(inst, allRegistersSucceeded ? D3d9Alpha::OmmGate::Registered : D3d9Alpha::OmmGate::RegisterFailed);
       if (allRegistersSucceeded) {
         ommInstanceData.ommBuildRequested = true;
         ommInstanceData.ommRegistrationGeneration = m_ommGeneration;
@@ -2609,7 +2570,7 @@ namespace dxvk {
     if (!forceBuild && numMicroTriangles > maxMicroTrianglesToBuild)
       return OmmResult::OutOfBudget;
 
-    // The compact pass ran when baking finished; wait for its
+    // rtx.alphaBake.compactMicromaps: the compact pass ran when baking finished; wait for its
     // mixed-triangle count, then build a micromap of the mixed triangles only (uniform ones use
     // special indices).
     const bool compact = ommCacheItem.compactCounter != nullptr;
@@ -2758,7 +2719,7 @@ namespace dxvk {
       ommBlasDesc.baseTriangle = 0;
     }
 
-    // The budget was reserved for a micromap of every triangle;
+    // rtx.alphaBake.compactMicromaps: the budget was reserved for a micromap of every triangle;
     // give back what the compact one does not use.
     if (compact) {
       VkDeviceSize unusedArray, compactBlasSize;
@@ -2860,8 +2821,10 @@ namespace dxvk {
         // Use >= as the number of baked micro triangles is aligned up
         if (ommCacheItem.bakingState.numMicroTrianglesBaked >= ommCacheItem.bakingState.numMicroTrianglesToBake) {
 
-          // Classify the finished array's triangles now. The build and the software store wait for the result.
-          {
+          // rtx.alphaBake.compactMicromaps: classify the finished array's triangles now; the build
+          // waits for the result.
+          // rtx.alphaBake.softwareOmm: the software store is built from the compaction result, so it always runs.
+          if (RtxOptions::compactMicromaps() || m_software) {
             const uint32_t bitsPerMicroTriangle = ommCacheItem.ommFormat == VK_OPACITY_MICROMAP_FORMAT_2_STATE_EXT ? 1 : 2;
             const uint32_t bytesPerTriangle = dxvk::util::ceilDivide(calculateNumMicroTriangles(ommCacheItem.subdivisionLevel) * bitsPerMicroTriangle, 8);
             dispatchCompact(ctx, ommCacheItem, sourceData.numTriangles, bytesPerTriangle);
@@ -3002,7 +2965,7 @@ namespace dxvk {
         ommSrcHashIter++;
         ONCE(Logger::warn("[RTX Opacity Micromap] Building Opacity Micromap Array failed as it ran out of memory."));
       } else if (result == OmmResult::DependenciesUnavailable) {
-        // The compact pass result is not back yet
+        // rtx.alphaBake.compactMicromaps: the compact pass result is not back yet
         ommSrcHashIter++;
       } else {
         omm_validation_assert(0 && "Should not be hit");
@@ -3052,7 +3015,7 @@ namespace dxvk {
     if (m_censusOpen.counters != nullptr || !m_censusClosed.empty()) {
       censusFrameStart(currentFrameIndex); // rtx.alphaBake.census
     }
-    // Compaction: cumulative totals every 300 frames.
+    // rtx.alphaBake.compactMicromaps: cumulative totals every 300 frames.
     if (m_compactStats.micromaps != 0 && (currentFrameIndex < m_compactLogFrame || currentFrameIndex - m_compactLogFrame >= 300)) {
       m_compactLogFrame = currentFrameIndex;
       const CompactStats& c = m_compactStats;
@@ -3320,17 +3283,14 @@ namespace dxvk {
       }
 
       // Purge instances queued for deletion
-      const bool d3d9AlphaStats = D3d9Alpha::statsActive();
       for (const RtInstance* instance : m_instancesToDestroy) {
-        if (d3d9AlphaStats) {
-          D3d9Alpha::noteOmmUnlinkedIdle(*instance);
-        }
         destroyInstance(*instance);
       }
       m_instancesToDestroy.clear();
     }
   }
 
+  // rtx.alphaBake.compactMicromaps.
   bool OpacityMicromapManager::dispatchCompact(Rc<DxvkContext> ctx, OpacityMicromapCacheItem& ommCacheItem, uint32_t numTriangles,
                                                uint32_t bytesPerTriangle) {
     if (ommCacheItem.ommArrayBuffer == nullptr || numTriangles == 0 || bytesPerTriangle == 0 || (bytesPerTriangle % 4) != 0) {

@@ -201,6 +201,7 @@ namespace dxvk {
                                uint32_t(1000.0 / std::max(avgMs, 0.001) * 10.0) / 10.0, " fps, frame ms avg ",
                                uint32_t(avgMs * 10.0) / 10.0, " worst ", uint32_t(s.frameMsWorst * 10.0) / 10.0,
                                " | VRAM ", mib(vram.usageBytes), " / ", mib(vram.budgetBytes), " MiB (pressure level ", vram.level, ")",
+                               " | vsync ", RtxOptions::enableVsyncState == EnableVsync::On ? "on" : "off",
                                " | instances ", scene.getInstanceManager().getActiveCount(),
                                ", lights ", scene.getLightManager().getActiveCount(),
                                " | since the last status: warnings +", warnings - s.warnings, ", errors +", errors - s.errors,

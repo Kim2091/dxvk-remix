@@ -95,7 +95,7 @@ namespace dxvk {
       // Ranges are the addon's own slider ranges (addon.cpp).
       RemixGui::DragFloat("Exposure Target",  &targetObject(),       0.001f, 0.02f,  0.6f, "%.3f",    ImGuiSliderFlags_AlwaysClamp);
       RemixGui::DragFloat("Adaptation Speed", &speedObject(),        0.01f,  0.1f,  16.0f, "%.2f",    ImGuiSliderFlags_AlwaysClamp);
-      RemixGui::DragFloat("Center Weighting", &centreWeightObject(), 0.01f,  0.0f,   1.0f, "%.2f",    ImGuiSliderFlags_AlwaysClamp);
+      RemixGui::DragFloat("Centre Weighting", &centreWeightObject(), 0.01f,  0.0f,   1.0f, "%.2f",    ImGuiSliderFlags_AlwaysClamp);
       RemixGui::DragFloat("Exposure Floor",   &minEvObject(),        0.1f, -24.0f,   0.0f, "%.1f EV", ImGuiSliderFlags_AlwaysClamp);
       RemixGui::DragFloat("Exposure Ceiling", &maxEvObject(),        0.1f,   0.0f,  24.0f, "%.1f EV", ImGuiSliderFlags_AlwaysClamp);
       RemixGui::Checkbox("Meter Lighting (divide albedo out)", &demodulateAlbedoObject());
@@ -110,7 +110,7 @@ namespace dxvk {
       ImGui::EndDisabled();
       RemixGui::DragFloat("Night Compensation",   &compensationNightStopsObject(), 0.05f, -8.0f, 8.0f, "%.2f stops", ImGuiSliderFlags_AlwaysClamp);
       RemixGui::SetTooltipToLastWidgetOnHover("Exposure compensation curve: bias at night (scene EV100 at or below Night EV), "
-                                              "fading to 0 at Day EV. About -2 to -4 keeps a night darker than mid gray.");
+                                              "fading to 0 at Day EV. About -2 to -4 keeps a night darker than mid grey.");
       RemixGui::DragFloat("Night EV",             &compensationNightEvObject(),    0.1f, -12.0f, 16.0f, "%.1f", ImGuiSliderFlags_AlwaysClamp);
       RemixGui::DragFloat("Day EV",               &compensationDayEvObject(),      0.1f, -12.0f, 20.0f, "%.1f", ImGuiSliderFlags_AlwaysClamp);
       ImGui::TextDisabled("Global Exposure (tonemapper) stays an EV offset on top of the meter.");

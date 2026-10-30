@@ -1,5 +1,6 @@
 """Compile one dxvk-remix slang shader variant exactly like compile_shaders.py and print the driver's register statistics.
 
+In-repo copy of the regprobe probe (Phase 5 F2); the compile flags are unchanged.
 Usage: python probe.py [--tree <repo>] <shader.slang relative to src/dxvk/shaders/rtx> <tag> [DEFINE ...]
        (--tree defaults to this repository). Needs regprobe.exe (build.bat) and an NVIDIA GPU.
 """

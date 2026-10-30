@@ -50,7 +50,6 @@ namespace dxvk {
   class ImGuiCapture;
   class DxvkDevice;
   class DxvkContext;
-  class DxvkObjects;
   class RtxGraphGUI;
 
   /**
@@ -71,8 +70,7 @@ namespace dxvk {
     enum class Theme {
       Toolkit,
       Legacy,
-      Nvidia,
-      RemixPlus
+      Nvidia
     };
 
     ImGUI(DxvkDevice* device);
@@ -240,9 +238,6 @@ namespace dxvk {
     void setPrewarmScreenActive(bool active);
 
     void showRenderingSettings(const Rc<DxvkContext>& ctx);
-    // The SCCR block of the Displacement settings, shown in SCCR mode.
-    void showSccrSettings(DxvkObjects* common);
-    void showDeveloperSection(const Rc<DxvkContext>& ctx);
 
     void showDLFGOptions(const Rc<DxvkContext>& ctx);
     void showReflexOptions(const Rc<DxvkContext>& ctx, bool displayStatsWindowToggle);
@@ -271,7 +266,6 @@ namespace dxvk {
     void setToolkitStyle(ImGuiStyle* dst);
     // Sets Nvidia inspired UI theme
     void setNvidiaStyle(ImGuiStyle* dst);
-    void setRemixPlusStyle(ImGuiStyle* dst);
     // Custom style
     void setupStyle(ImGuiStyle* dst = NULL);
 
@@ -287,7 +281,7 @@ namespace dxvk {
     };
     VideoMemoryUsage getVideoMemoryUsage() const;
     void showMemoryStats() const;
-    // Draws the video memory use as one labeled bar that starts controlOffsetX from the start of the line.
+    // Draws the video memory use as one labelled bar that starts controlOffsetX from the start of the line.
     void showCompactMemoryStats(float controlOffsetX) const;
     bool showRayReconstructionEnable(bool supportsRR);
 
@@ -300,17 +294,17 @@ namespace dxvk {
                     args.minValue = 0.0f);
     RTX_OPTION("rtx.gui", bool, enableExternalPresenter, false, "Enables GUI rendering for external presenters.");
     RTX_OPTION("rtx.gui", Vector4, subRect, Vector4(0.f, 0.f, 0.f, 0.f), "Used for toolkit.");
+    RTX_OPTION("rtx.gui", std::string, productName, std::string("Remix Plus"),
+               "The product name the menus show to the player: in the startup message, the welcome window, the developer menu title and the About tab.\n"
+               "A game's rtx.conf can set it to the name of its RTX release.");
+    RTX_OPTION("rtx.gui", std::string, donateUrl, std::string(""),
+               "A link the welcome window, the About tab and the top of the user graphics menu show as a Donate button. Empty hides the button. Only https links are opened.");
     RTX_OPTION("rtx.gui", std::string, logHelpText, std::string(""),
                "The instructions the log section of the menus shows above the log folder, such as which file to send with a bug report and where to send it.\n"
                "Empty shows a short generic instruction.");
     RTX_OPTION_FLAG("rtx.gui", std::string, reportFile, std::string(""), RtxOptionFlags::NoSave,
                     "Set by the game integration (remix API SetConfigVariable): the full path of the newest report file, such as a zip of a session's logs. "
                     "When set, the log section of the menus names the file and gets buttons that show it in Explorer and copy its path.");
-    RTX_OPTION("rtx.gui", std::string, productName, std::string("Remix Plus"),
-               "The product name the menus show to the player: in the startup message, the welcome window, the developer menu title and the About tab.\n"
-               "A game's rtx.conf can set it to the name of its RTX release. The license text keeps the name RTX Remix.");
-    RTX_OPTION("rtx.gui", std::string, donateUrl, std::string(""),
-               "A link the welcome window, the About tab and the top of the user graphics menu show as a Donate button. Empty hides the button. Only https links are opened.");
 
     // The release version: the last word of the build ID when it starts with a digit ("1.0.4" from
     // "Game Release 1.0.4"), else empty.
@@ -321,7 +315,7 @@ namespace dxvk {
     // Returns true when rtx.gui.donateUrl holds an https link.
     public: static bool hasDonateLink();
     // Draws the Donate line: the text and a small button on one line by default.
-    // With a buttonSize width above 0, the text is centered above a button of that size.
+    // With a buttonSize width above 0, the text is centred above a button of that size.
     public: static void showDonateButton(const ImVec2& buttonSize = ImVec2(0.0f, 0.0f));
     
     public: static void onThemeChange(DxvkDevice* device);
@@ -330,7 +324,7 @@ namespace dxvk {
                     args.onChangeCallback = &onThemeChange, args.flags = RtxOptionFlags::UserSetting);
     RTX_OPTION_ARGS("rtx.gui", float, backgroundAlpha, 1.f, "A value controlling the alpha of the GUI background.",
                     args.onChangeCallback = &onBackgroundAlphaChange, args.minValue = 0.0f, args.maxValue = 1.0f, args.flags = RtxOptionFlags::UserSetting);
-    RTX_OPTION_ARGS("rtx.gui", Theme, themeGui, Theme::RemixPlus, "A setting controlling the active GUI theme.",
+    RTX_OPTION_ARGS("rtx.gui", Theme, themeGui, Theme::Toolkit, "A setting controlling the active GUI theme.",
                     args.onChangeCallback = &onThemeChange, args.flags = RtxOptionFlags::UserSetting);
     RTX_OPTION_ARGS("rtx.gui", bool, largeUiMode, false, "Toggles between Large and Regular GUI Scale Modes.",
                     args.onChangeCallback = &onThemeChange, args.flags = RtxOptionFlags::UserSetting);

@@ -64,10 +64,13 @@ class AccelManager : public CommonDeviceObject {
     // refit this frame). Such an instance dirties its bucket every frame, so it is kept apart from
     // static geometry. This covers hosts that do not use the preserve path (API hosts by default).
     bool isVolatile = false;
-    // Instance created within rtx.accel.clusterYoungFrames (outside a
+    // Whether the instance uses opacity micromaps (see rtx.limitOmmRebindToOmmBuckets).
+    bool usesOmm = false;
+    // rtx.accel.staticClusters: instance created within rtx.accel.clusterYoungFrames (outside a
     // full rebuild). Young instances get their own buckets and fold into their cluster later.
     bool young = false;
-    uint8_t pad[2] = {};
+    // Explicit padding, because hashStructByMemory needs no implicit padding. Always 0.
+    uint8_t pad0 = 0;
     // rtx.mergedBucketCellSize: hash of the world grid cell holding the instance's origin, so a
     // merged BLAS only holds geometry from one cell (0 when the option is off).
     uint32_t spatialCell = 0;
@@ -81,6 +84,7 @@ class AccelManager : public CommonDeviceObject {
              isSubsurface == other.isSubsurface &&
              isPreservePath == other.isPreservePath &&
              isVolatile == other.isVolatile &&
+             usesOmm == other.usesOmm &&
              young == other.young &&
              spatialCell == other.spatialCell;
     }
@@ -97,8 +101,9 @@ class AccelManager : public CommonDeviceObject {
           &BlasBucketKey::isSubsurface,
           &BlasBucketKey::isPreservePath,
           &BlasBucketKey::isVolatile,
+          &BlasBucketKey::usesOmm,
           &BlasBucketKey::young,
-          &BlasBucketKey::pad,
+          &BlasBucketKey::pad0,
           &BlasBucketKey::spatialCell>(k));
     }
   };
@@ -124,8 +129,9 @@ class AccelManager : public CommonDeviceObject {
     // (rtx.preferFastTraceForStaticMergedBlas).
     bool isStaticGeometry = false;
     uint64_t totalPrimitives = 0;   // for rtx.maxPrimsPerMergedBucket
-    // The cluster key every member shares, and the youngest member's creation frame.
+    // rtx.accel.staticClusters: the key every member shares, and the youngest member's creation frame.
     BlasBucketKey clusterKey {};
+    bool hasClusterKey = false;
     uint32_t youngestCreatedFrame = 0;
     // A member would be keyed volatile again after a fold (skinned), so folding would only rebuild the bucket as it is.
     bool clusterNoFold = false;
@@ -293,8 +299,8 @@ public:
     uint32_t bucketsBuildSkipped = 0;   // content hash unchanged
     uint64_t bucketPrimsBuilt = 0;      // primitives in built or refit buckets
     uint32_t bucketsSplitByCap = 0;     // extra buckets opened by rtx.maxPrimsPerMergedBucket
-    uint32_t clusterPulls = 0;          // clean buckets pulled into a rebuild of their key
-    uint32_t clusterFolds = 0;          // aged young buckets folded into their cluster
+    uint32_t clusterPulls = 0;          // rtx.accel.staticClusters: clean buckets pulled into a rebuild of their key
+    uint32_t clusterFolds = 0;          // rtx.accel.staticClusters: aged young buckets folded into their cluster
     // Per-geometry (dynamic / shared) BLAS work
     uint32_t dynamicBuilt = 0;
     uint32_t dynamicRefit = 0;
@@ -319,7 +325,7 @@ public:
     // TLAS instance records written this frame
     uint64_t instanceBytesUploaded = 0;
     uint64_t instanceBytesTotal = 0;
-    // Own-BLAS windows widened because geometry moved again after rejoining
+    // rtx.accel.moverBackoff: own-BLAS windows widened because geometry moved again after rejoining
     uint32_t moverBackoffs = 0;
   };
   BuildStats takeBuildStats() {
@@ -378,7 +384,9 @@ private:
   };
   std::unordered_map<uint64_t, DirtyAttribution> m_dirtyAttribution;
   float m_lastMergedBucketCellSize = 0.f;
-  // The first frame at which a cached young / volatile bucket can fold (UINT32_MAX = none).
+  bool m_lastStaticClusters = false;
+  bool m_lastClusterMergeOmm = false;
+  // rtx.accel.staticClusters: first frame at which a cached young / volatile bucket can fold (UINT32_MAX = none).
   uint32_t m_nextClusterFoldFrame = UINT32_MAX;
   // rtx.accel.originTranslation: sum of origin-shift deltas so far (render = absolute + shift).
   double m_originShift[3] = { 0.0, 0.0, 0.0 };
@@ -505,9 +513,10 @@ private:
     // RtInstance::getAccelBucketUid(); m_cachedBuckets stays sorted by it (clean buckets keep
     // their relative order, new buckets are appended with fresh ids).
     uint64_t uid = 0;
-    // The bucket's cluster key, its primitive count and
+    // rtx.accel.staticClusters: the bucket's key (valid when hasKey), its primitive count and
     // the creation frame of its youngest member (young buckets fold into their cluster later).
     BlasBucketKey key {};
+    bool hasKey = false;
     uint64_t totalPrimitives = 0;
     uint32_t youngestCreatedFrame = 0;
     uint32_t builtFrame = 0;
@@ -515,12 +524,12 @@ private:
     // rtx.accel.originTranslation: m_originShift when the bucket was built; the TLAS instance is translated by the
     // shift since then.
     double bakeShift[3] = { 0.0, 0.0, 0.0 };
-    // Every member is owned by the scene, so an origin shift moved them all by the shift (others are placed by the
-    // host in render space and must not be translated: their bucket is rebuilt after a shift instead).
+    // Every member follows the scene origin, so an origin shift moved them all by the shift. Other instances are placed
+    // in render space by the host or a frontend and must not be translated, so their bucket is rebuilt after a shift.
     bool allSceneOwned = true;
   };
   std::vector<CachedBucketState> m_cachedBuckets;
-  // Merged-branch instances collected during routing, filled into
+  // rtx.accel.staticClusters: merged-branch instances collected during routing, filled into
   // buckets after the loop in (key, instance id) order.
   struct PendingClusterMerge {
     BlasBucketKey key;
@@ -577,29 +586,6 @@ private:
     DxvkResource* buffers; // micromap bound this frame (alive in the OMM cache for the frame)
   };
   uint32_t m_ommBindingCheckMismatches = 0;
-  // rtx.scene.selfCheckFrames skinning check, every frame while it is on: each BLAS of the frame that holds skinned
-  // geometry holds the pose of that geometry's last draw, and skinned geometry posed again keeps its vertex history
-  // (noteSkinned*, logSkinCheck).
-  struct SkinCheck {
-    bool active = false;
-    uint32_t frame = 0;
-    uint64_t pendingBatch = 0;      // the skinning batch not submitted yet when the builds were recorded
-    uint32_t checked = 0;           // skinned geometries in this frame's BLASes
-    uint32_t verticesBehind = 0;    // vertices not skinned with the bones of the geometry's last draw
-    uint32_t blasBehind = 0;        // BLAS not built or refit from the skinned vertices
-    uint32_t unsubmitted = 0;       // BLAS built or refit from skinning submitted after the build
-    uint32_t recreated = 0;         // geometry created this frame for an instance that existed before
-    uint32_t noHistory = 0;         // geometry updated this frame without previous-frame positions
-  };
-  SkinCheck m_skinCheck;
-  // Frames on which the skinning check found a skinned BLAS behind its pose.
-  uint32_t m_skinCheckMismatches = 0;
-  // The pose of the skinned geometries of a merged bucket (0 when it has none).
-  static XXH64_hash_t bucketSkinnedPose(const std::vector<RtInstance*>& members);
-  void noteSkinnedGeometry(const BlasEntry& entry, const PooledBlas& blas, bool written, const std::vector<RtInstance*>& instances);
-  void noteSkinnedHistory(const BlasEntry& entry, const RtInstance& instance);
-  void noteSkinnedBucket(const std::vector<RtInstance*>& members, const PooledBlas& blas, bool written);
-  void logSkinCheck(uint32_t currentFrame);
   // Merged BLASes built with OMMs and refit without them this frame (rtx.mergedBlasNoRefitOfOmmBlas off).
   uint32_t m_ommBlasRefitHazards = 0;
   // [PointInstancerCheck] (rtx.accelIncrementalSelfCheckFrames).
@@ -682,7 +668,7 @@ private:
   std::vector<VkAccelerationStructureInstanceKHR> m_lastTlasTail[Tlas::Count];
   uint32_t m_lastTlasCount[Tlas::Count] = {};
   uint32_t m_tlasIdenticalBuilds[Tlas::Count] = {};
-  VkBuildAccelerationStructureFlagsKHR m_lastTlasFlags[Tlas::Count] = {}; // TLAS build flags as last built
+  VkBuildAccelerationStructureFlagsKHR m_lastTlasFlags[Tlas::Count] = {}; // rtx.accel.tlasFastTrace toggles
   // Set when any BLAS was built or refit this frame (TLAS bounds would be stale).
   bool m_blasBuiltThisFrame = false;
   // See isSssTlasActive().

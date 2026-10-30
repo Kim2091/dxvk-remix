@@ -27,8 +27,7 @@
 // N frames. Only the device bridge is counted; the module bridge (IDirect3D9 calls) is start-up traffic.
 //
 // Cost: two QueryPerformanceCounter calls and a few relaxed atomic adds per command, one atomic add per state record,
-// and a copy of the counters (about 28 KB) and one QueryThreadCycleTime call per line. The server, which counts on its
-// device thread only, uses plain relaxed loads and stores for its per-command counters instead of locked adds.
+// and a copy of the counters (about 20 KB) and one GetThreadTimes call per line.
 
 #include <atomic>
 #include <cstdint>
@@ -67,7 +66,7 @@ namespace bridge_util {
     // Client: a setter not sent because the server already has its value (A3a, client.dropRedundantState).
     void noteDropped(uint16_t command);
 
-    // A setter carried as a record inside a Bridge_StatePacket: counted by type with the commands, but not in
+    // A setter carried as a record inside a Bridge_StatePacket (A3b): counted by type with the commands, but not in
     // cmdsPerFrame (the packet is the command).
     void noteRecord(uint16_t command);
 

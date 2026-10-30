@@ -49,7 +49,6 @@ class Direct3DSurface9_LSS: public Direct3DResource9_LSS<IDirect3DSurface9> {
   std::queue<LockInfo> m_lockInfoQueue;
 
   std::unique_ptr<uint8_t[]> m_shadow;
-  inline static size_t g_totalSurfaceShadow = 0;
 
 public:
   Direct3DSurface9_LSS(BaseDirect3DDevice9Ex_LSS* const pDevice,

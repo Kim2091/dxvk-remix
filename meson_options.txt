@@ -23,11 +23,11 @@
 option('enable_tests', type : 'boolean', value : false)
 option('enable_dxgi',  type : 'boolean', value : false, description: 'Build DXGI')
 option('enable_d3d9',  type : 'boolean', value : true, description: 'Build D3D9')
-option('enable_d3d9_frontend', type : 'boolean', value : true, description : 'Convert D3D9 draws for ray tracing (the D3D9 frontend). False builds the API-only module: D3D9 draws are only rasterized and the Remix API is the only way in')
 option('enable_d3d10', type : 'boolean', value : false, description: 'Build D3D10')
 option('enable_d3d11', type : 'boolean', value : false, description: 'Build D3D11')
+option('frontend_d3d9_v2', type : 'boolean', value : true, description: 'Build the D3D9 v2 frontend and the translator toolkit (docs/frontends-plan.md); off: the D3D9 frontend only routes to the old path')
 option('build_id',     type : 'boolean', value : false)
-option('build_tag', type : 'string', value : 'dev', description : 'Build ID printed once in the log at startup as "Build: <id>", e.g. "Release 1.0.0". Empty: no line')
+option('build_tag', type : 'string', value : 'dev', description : 'Build ID printed once in the log at startup as "Build: <id>", e.g. "FNV Release 1.0.0". Empty: no line')
 option('release_build', type : 'boolean', value : true, description : 'No local paths in the binary, no PDB, EXP or LIB installed, and an extra SPIR-V optimisation pass. Set false for a development build')
 
 option('enable_tracy',  type : 'boolean', value : false, description: 'Enable Tracy profiler support')

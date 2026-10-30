@@ -45,12 +45,26 @@ namespace dxvk {
       Full = 0, // diffusion-profile SSS compiled in (255 regs on Blackwell)
       NoSss,    // INTEGRATE_DIRECT_SSS_PROFILE=0: no diffusion-profile SSS instance in this frame's TLAS (163 regs)
       Lean,     // + INTEGRATE_DIRECT_LEAN_VISIBILITY=1: no translucent / thin-opaque shadow-ray hits possible
-      // Lean with the NEE cutout candidates read from the core material
+      // rtx.integrateDirect.coreMaterial. Lean with the NEE cutout candidates read from the core material
       // record (VISIBILITY_CORE_MATERIAL): LeanCore applies only the TextureOps part of the legacy record (no surface with
       // other legacy state this frame), LeanLegacy the whole LegacySurface record.
       LeanCore,
       LeanLegacy,
     };
+
+    RTX_OPTION("rtx.integrateDirect", bool, slimVariants, true,
+               "Uses reduced direct lighting shaders (ray query mode) that leave out features the current frame cannot "
+               "use: diffusion-profile subsurface scattering when no such instance is in the scene, and translucent and "
+               "thin-opaque shadow handling when rtx.enableDirectTranslucentShadows is off and nothing needs it. They "
+               "need fewer registers, which saves GPU time.\n"
+               "The slimmest levels split direct lighting into a shading pass and a tracing pass, with a 48-byte record "
+               "per pixel (about 83 MiB at 1707x1067) while they are in use. The record stores light radiance at half "
+               "precision, so the image is nearly the same.");
+    RTX_OPTION("rtx.integrateDirect", bool, coreMaterial, true,
+               "With the leanest direct lighting shader (rtx.integrateDirect.slimVariants), cutout tests on shadow rays "
+               "read the compact material records (rtx.coreMaterial.build and rtx.coreMaterial.legacyRecord, both "
+               "needed) instead of the full material records. Not used on frames with displacement, eyes, ray portal "
+               "materials, ray traced render targets or debug views. The image is the same.");
 
     explicit DxvkPathtracerIntegrateDirect(DxvkDevice* device);
     ~DxvkPathtracerIntegrateDirect() = default;
@@ -69,12 +83,13 @@ namespace dxvk {
     Rc<DxvkShader> getComputeShader(const bool deferredNrcTrainingSetup, const SlimLevel slimLevel) const;
     static SlimLevel selectSlimLevel(const RtFrameFeatures& features);
     static const char* slimLevelToString(SlimLevel level);
-    // Lean -> LeanCore / LeanLegacy when the core forms apply this frame
+    // Lean -> LeanCore / LeanLegacy when rtx.integrateDirect.coreMaterial applies this frame
     // (coreTableValid / legacyTableValid: RaytraceArgs::coreMaterialTable / legacySurfaceTable are set).
     static SlimLevel selectCoreMaterialLevel(const RtFrameFeatures& features, const SlimLevel level, const bool coreTableValid,
                                              const bool legacyTableValid);
+    static bool coreMaterialOptionActive();
 
-    // Picks the level from the variant table (checked against selectSlimLevel),
+    // rtx.shader.variantTables. Picks the level from the table (checked against selectSlimLevel),
     // applies the compile fallback and writes the [IntegrateDirect] slim level line.
     SlimLevel selectVariantTableLevel(RtxContext* ctx, const bool deferredNrcTrainingSetup, const SlimLevel legacyLevel,
                                       const bool coreTableValid, const bool legacyTableValid);

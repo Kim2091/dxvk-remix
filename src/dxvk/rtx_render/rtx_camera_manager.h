@@ -54,10 +54,16 @@ namespace dxvk {
 
     void onFrameEnd();
 
-    // A camera a frontend found in its draws (SceneInterface::applyDrawCamera): updates the camera of this type (the
-    // first call per camera and frame wins, as RtCamera::update does), with camera-sequence playback / browse / record,
-    // the Main camera's cut registration and the last-set camera type.
+    // Calculates a camera type for the specified draw call, and updates that camera (applyFrameCamera).
+    CameraType::Enum processCameraData(const DrawCallState& input);
+    // The camera update half of processCameraData: updates the camera of this type (the first call per camera and
+    // frame wins, as RtCamera::update does), with camera-sequence playback / browse / record, the Main camera's cut
+    // registration and the last-set camera type.
     void applyFrameCamera(CameraType::Enum cameraType, const Matrix4& worldToView, const Matrix4& viewToProjection);
+    // A draw's camera that a frontend classified (rtx.d3d9v2.explicitCamera: the D3D9 frontend, once per camera type
+    // and frame), applied as processCameraData applies it: a Main or view-model camera first applies the host's held
+    // fallback camera when that rule applies (applyHeldFallbackCamera), then applyFrameCamera.
+    void applyDrawCamera(CameraType::Enum cameraType, const Matrix4& worldToView, const Matrix4& viewToProjection);
     void processExternalCamera(CameraType::Enum type, const Matrix4& worldToView, const Matrix4& viewToProjection);
     // rtx.worldOrigin.enable: worldOrigin is the host's render origin for this camera (render units,
     // render position + origin = world position), or null. When it moved since this camera's last update, the
@@ -69,6 +75,15 @@ namespace dxvk {
     // The Main camera's current host world origin (zero when none has been published).
     const Vector3& getWorldOrigin() const { return m_externalCameraOrigins[CameraType::Main]; }
     bool hasWorldOrigin() const { return m_externalCameraOriginValid[CameraType::Main]; }
+    // rtx.worldOrigin.enable: the history half of processExternalCamera's origin handling, for a camera
+    // that does not come through SetupCamera (the D3D9 camera, SceneManager::applyPendingHostWorldOrigin).
+    // Returns false, doing nothing, when the camera was already updated this frame -- the shift must precede
+    // the update that turns the current camera into the previous one.
+    bool applyHostWorldOrigin(CameraType::Enum type, const Vector3& worldOrigin);
+    // True once a Main-camera SetupCamera call has carried an origin: the host drives the origin through the API
+    // camera, so the D3D9 camera path leaves it alone. An origin on another camera (e.g. the view model) does not
+    // count, since the Main camera may still come from the D3D9 path.
+    bool apiWorldOriginSeen() const { return m_apiWorldOriginSeen; }
 
     uint32_t getLastCameraCutFrameId() const { return m_lastCameraCutFrameId; }
     bool isCameraCutThisFrame() const;
@@ -79,6 +94,13 @@ namespace dxvk {
     // ...ORIGIN_SHIFT: re-expresses the camera's history after the host moved its render origin by offset (new
     // render position = old + offset). Before the camera's update this frame; a second call in a frame is ignored.
     void shiftCameraHistory(CameraType::Enum type, const Vector3& offset);
+
+    // REMIXAPI_CAMERA_FRAME_EVENT_FALLBACK: the host's Main camera for a frame whose draws set none. Held
+    // here (the latest one wins); SceneManager::applyFallbackMainCamera applies it at the frame's ray tracing.
+    void holdFallbackCamera(const Matrix4& worldToView, const Matrix4& viewToProjection);
+    // Takes the held camera (it is cleared either way). False when none is held, or it was held before the
+    // previous frame (a host that stopped sending it).
+    bool takeFallbackCamera(Matrix4& worldToView, Matrix4& viewToProjection);
 
   private:
     template<
@@ -105,6 +127,20 @@ namespace dxvk {
     fast_unordered_cache<DecomposeProjectionParams> m_decompositionCache;
     std::array<Vector3, CameraType::Count> m_externalCameraOrigins {};
     std::array<bool, CameraType::Count> m_externalCameraOriginValid {};
+    bool m_apiWorldOriginSeen = false;
+    // holdFallbackCamera: the held camera and the frame it was held in.
+    bool m_fallbackCameraHeld = false;
+    uint32_t m_fallbackCameraFrameId = 0;
+    Matrix4 m_fallbackWorldToView {};
+    Matrix4 m_fallbackViewToProjection {};
+    float m_fallbackFov = 0.f;
+
+    // REMIXAPI_CAMERA_FRAME_EVENT_FALLBACK: for a draw with this field of view that is about to set a camera, makes
+    // the host's camera of this frame the Main camera first when no draw set Main yet and the fields of view differ (a
+    // first-person draw on a frame whose world camera the host stated). Returns true when it did.
+    // source names the caller in the log.
+    bool applyHeldFallbackCamera(float drawFov, const char* source);
+    uint32_t m_fallbackAheadLogs = 0;
 
     DecomposeProjectionParams getOrDecomposeProjection(const Matrix4& viewToProjection);
     void updateExternalCamera(CameraType::Enum type, const Matrix4& worldToView, const Matrix4& viewToProjection,

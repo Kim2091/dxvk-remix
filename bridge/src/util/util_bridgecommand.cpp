@@ -606,7 +606,7 @@ DECL_COMMAND_FUNC(,Command,const Commands::D3D9Command command,
 
 #ifdef REMIX_BRIDGE_CLIENT
   s_pWriterChannel->m_mutex.lock();
-  // Every state setter recorded so far reaches the server before this command
+  // A3b: every state setter recorded so far reaches the server before this command
   closeStatePacketLocked();
 #endif
 

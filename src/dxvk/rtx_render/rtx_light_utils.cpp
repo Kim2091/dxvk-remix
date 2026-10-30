@@ -20,11 +20,11 @@
 * DEALINGS IN THE SOFTWARE.
 */
 
-#include "rtx_frontend_interface.h"
 #include "rtx_lights.h"
 #include "rtx_options.h"
 #include "rtx_light_manager.h"
 #include "rtx_light_utils.h"
+#include "rtx_scene_interface.h"
 
 namespace dxvk {
 
@@ -120,22 +120,22 @@ float solveQuadraticEndDistance(float originalBrightness, float attenuation2, fl
   return endDistance;
 }
 
-float LightUtils::calculateIntensity(const frontend::FixedFunctionLight& light, const float radius) {
+float LightUtils::calculateIntensity(const D3DLIGHT9& light, const float radius) {
   constexpr float kEpsilon = 0.000001f;
 
   // Calculate max distance based on attenuation.  We're looking to find when the light's attenuation is kLegacyLightEndValue.
-  // Attenuation in D3D9 for lights is calculated as 1/(light.attenuation2*d*d + light.attenuation1*d + light.attenuation0).
+  // Attenuation in D3D9 for lights is calculated as 1/(light.Attenuation2*d*d + light.Attenuation1*d + light.Attenuation).
   // This is calculated with respect to the max component of the light's 3 color components, and then is translated to RGB with the normalized color later.
   // Note that the calculated max distance may be greater than the Light's original "Range" value. This is because often times in older games the
   // Range was merely used in conjunction with a custom large color value and attenuation curve as an optimization to keep very bright lights from extending
   // across the entire level when only needed in a small area, but physical lights must reflect the "intended" full max distance as calculated by the attenuation.
-  const float a = light.attenuation2;
-  const float b = light.attenuation1;
-  const float c = light.attenuation0;
+  const float a = light.Attenuation2;
+  const float b = light.Attenuation1;
+  const float c = light.Attenuation0;
 
-  const float originalBrightness = std::max(light.diffuse.x, std::max(light.diffuse.y, light.diffuse.z));
+  const float originalBrightness = std::max(light.Diffuse.r, std::max(light.Diffuse.g, light.Diffuse.b));
 
-  float endDistance = light.range;
+  float endDistance = light.Range;
 
   if (c > 0 && originalBrightness / c < kLegacyLightEndValue) {
     // Light constant is already lower than our minimum right next to the light, so just set the radiance to 0.
@@ -145,20 +145,20 @@ float LightUtils::calculateIntensity(const frontend::FixedFunctionLight& light, 
     if (b > kEpsilon) {
       // linear falloff
       if (LightManager::calculateLightIntensityUsingLeastSquares()) {
-        endDistance = intensityToEndDistance(leastSquareIntensity(originalBrightness, light.attenuation2, light.attenuation1, light.attenuation0, light.range));
+        endDistance = intensityToEndDistance(leastSquareIntensity(originalBrightness, light.Attenuation2, light.Attenuation1, light.Attenuation0, light.Range));
       } else {
         // 1/(b*d + c) = kLegacyLightEndValue
         endDistance = ((originalBrightness / kLegacyLightEndValue) - c) / b;
       }
     } else {
       // No falloff - the light is at full power * c until the range runs out
-      // TODO may want to do something different here - the light is still fully bright at light.range...
+      // TODO may want to do something different here - the light is still fully bright at light.Range...
     }
   } else {
     if (LightManager::calculateLightIntensityUsingLeastSquares()) {
-      endDistance = intensityToEndDistance(leastSquareIntensity(originalBrightness, light.attenuation2, light.attenuation1, light.attenuation0, light.range));
+      endDistance = intensityToEndDistance(leastSquareIntensity(originalBrightness, light.Attenuation2, light.Attenuation1, light.Attenuation0, light.Range));
     } else {
-      endDistance = solveQuadraticEndDistance(originalBrightness, light.attenuation2, light.attenuation1, light.attenuation0, light.range);
+      endDistance = solveQuadraticEndDistance(originalBrightness, light.Attenuation2, light.Attenuation1, light.Attenuation0, light.Range);
     }
   }
 
@@ -183,9 +183,9 @@ float LightUtils::calculateIntensity(const frontend::FixedFunctionLight& light, 
 }
 
 
-Vector3 LightUtils::calculateRadiance(const frontend::FixedFunctionLight& light, const float radius) {
+Vector3 LightUtils::calculateRadiance(const D3DLIGHT9& light, const float radius) {
   const float intensity = calculateIntensity(light, radius);
-  const float originalBrightness = std::max(light.diffuse.x, std::max(light.diffuse.y, light.diffuse.z));
+  const float originalBrightness = std::max(light.Diffuse.r, std::max(light.Diffuse.g, light.Diffuse.b));
 
   // Convert the max component radiance to RGB using the normalized color of the light.
   // Note: Many old games did their lighting entierly in gamma space (when sRGB textures and framebuffers were absent),
@@ -193,30 +193,67 @@ Vector3 LightUtils::calculateRadiance(const frontend::FixedFunctionLight& light,
   // physically correct, this changes the look of lighting too much (which makes artists unhappy), so it is left unchanged.
   // In the future a conversion may be needed if gamma corrected framebuffers were used in the original game, but for now this is fine.
   Vector3 result;
-  result[0] = light.diffuse.x / originalBrightness * intensity;
-  result[1] = light.diffuse.y / originalBrightness * intensity;
-  result[2] = light.diffuse.z / originalBrightness * intensity;
+  result[0] = light.Diffuse.r / originalBrightness * intensity;
+  result[1] = light.Diffuse.g / originalBrightness * intensity;
+  result[2] = light.Diffuse.b / originalBrightness * intensity;
 
   return result;
 }
 
 
-Matrix4 LightUtils::getLightTransform(const frontend::FixedFunctionLight& light) {
+uint32_t LightUtils::legacyIdentity(const D3DLIGHT9& light) {
+  if (light.Type != D3DLIGHT_POINT) {
+    return 0;
+  }
+  const float lo = light.Theta;
+  const float hi = light.Phi;
+  if (!(lo >= 0.0f && lo <= 65535.0f && hi >= 0.0f && hi <= 65535.0f)) {
+    return 0;
+  }
+  if (lo != std::floor(lo) || hi != std::floor(hi)) {
+    return 0;
+  }
+  return (static_cast<uint32_t>(hi) << 16) | static_cast<uint32_t>(lo);
+}
+
+XXH64_hash_t LightUtils::legacyAssetKey(const D3DLIGHT9& light) {
+  // Falloff, which a point light does not use, marks the key. Direction holds it as three exact integers:
+  // x = bits 0-21, y = bits 22-42, z = bits 43-63.
+  constexpr float kAssetKeyMarker = 4932953.0f;
+  constexpr int kBits[3] = { 22, 21, 21 };
+  if (light.Type != D3DLIGHT_POINT || light.Falloff != kAssetKeyMarker || !scene::Options::assetKeys()) {
+    return kEmptyHash;
+  }
+  const float parts[3] = { light.Direction.x, light.Direction.y, light.Direction.z };
+  uint64_t key = 0;
+  int shift = 0;
+  for (int i = 0; i < 3; ++i) {
+    const float limit = static_cast<float>(1u << kBits[i]);
+    if (!(parts[i] >= 0.0f && parts[i] < limit) || parts[i] != std::floor(parts[i])) {
+      return kEmptyHash;
+    }
+    key |= static_cast<uint64_t>(parts[i]) << shift;
+    shift += kBits[i];
+  }
+  return key;
+}
+
+Matrix4 LightUtils::getLightTransform(const D3DLIGHT9& light) {
 
   // Determine the optimal light transform from light
-  switch (light.type) {
-  case frontend::FixedFunctionLight::Type::Spot:
+  switch (light.Type) {
+  case D3DLIGHT_SPOT:
   {
-    const Vector3 zAxis = safeNormalize(light.direction, Vector3(0.0f, 0.0f, 1.0f));
-    return Matrix4(getOrientation(Vector3(0.f, 0.f, -1.f), zAxis), light.position);
+    const Vector3 zAxis = safeNormalize(Vector3{ light.Direction.x, light.Direction.y, light.Direction.z }, Vector3(0.0f, 0.0f, 1.0f));
+    return Matrix4(getOrientation(Vector3(0.f, 0.f, -1.f), zAxis), Vector3{ light.Position.x, light.Position.y, light.Position.z });
   }
-  case frontend::FixedFunctionLight::Type::Point:
+  case D3DLIGHT_POINT:
   {
-    return Matrix4(light.position);
+    return Matrix4(Vector3(light.Position.x, light.Position.y, light.Position.z));
   }
-  case frontend::FixedFunctionLight::Type::Directional:
+  case D3DLIGHT_DIRECTIONAL:
   {
-    const Vector3 zAxis = safeNormalize(light.direction, Vector3(0.0f, 0.0f, 1.0f));
+    const Vector3 zAxis = safeNormalize(Vector3{ light.Direction.x, light.Direction.y, light.Direction.z }, Vector3(0.0f, 0.0f, 1.0f));
     return Matrix4(getOrientation(Vector3(0.f, 0.f, -1.f), zAxis), Vector3{ 0.0f });
   }
   default:

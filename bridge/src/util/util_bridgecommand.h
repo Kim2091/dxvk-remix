@@ -239,7 +239,7 @@ public:
     return result;
   }
   
-  // Writes a command's arguments into the data ring. Shared by Command and StateMessage.
+  // Writes a command's arguments into the data ring. Shared by Command and StateMessage (A3b).
   class DataWriter {
   public:
     inline void send_data(const DataT obj) {
@@ -424,7 +424,7 @@ public:
     const Commands::D3D9Command m_command;
   };
 
-  // Called once by the client device with client.batchState (and not sendAllServerResponses).
+  // A3b: called once by the client device with client.batchState (and not sendAllServerResponses).
   static void setStateBatching(bool enabled) {
     s_stateBatching = enabled;
   }
@@ -434,7 +434,7 @@ private:
   Bridge(const Bridge&) = delete;
   Bridge(const Bridge&&) = delete;
 
-  // Open state packet. Called with the writer channel's mutex held.
+  // A3b: open state packet. Called with the writer channel's mutex held.
   static void openStatePacketLocked(uint32_t handle);
   static void closeStatePacketLocked();
   // Pushes a command header, retrying like ~Command; turns the bridge off when it cannot. Mutex held.
@@ -530,7 +530,7 @@ private:
   static inline size_t         s_cmdCounter = 0;
   // UIDs are assigned to commands to tag the responses from server to allow misorder responses to be handled correctly
   static inline UID s_cmdUID = 0;
-  // The state packet (client, device bridge)
+  // A3b state packet (client, device bridge)
   static inline bool     s_stateBatching = false;
   static inline bool     s_packetOpen = false;
   static inline uint32_t s_packetHandle = 0;

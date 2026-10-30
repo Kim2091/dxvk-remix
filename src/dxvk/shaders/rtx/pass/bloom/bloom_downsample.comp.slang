@@ -20,8 +20,9 @@
 * DEALINGS IN THE SOFTWARE.
 */
 #include "rtx/pass/bloom/bloom.h"
-#include "rtx/utility/color.slangh"
 
+// Sampled with clamp-to-border (black outside the image): a bright area leaving the screen fades out of the bloom
+// instead of acting as an infinite light at the edge.
 layout(binding = BLOOM_DOWNSAMPLE_INPUT)
 Sampler2D<float4> InColorBuffer;
 
@@ -36,39 +37,30 @@ float2 calcUV(const int2 downsampledPix)
   return (float2(downsampledPix) + float2(0.5)) * cb.downsampledOutputSizeInverse;
 }
 
+// Froyok's downsample: the 13-tap pattern of Call of Duty: Advanced Warfare (SIGGRAPH 2014, "Next Generation Post
+// Processing in Call of Duty: Advanced Warfare"), weighted as half the inner 4 taps and half the outer 3x3 grid.
 float3 downsample13tap(const int2 downsampledPix)
 {
   const float2 centerUv = calcUV(downsampledPix);
 
-  // For reference, see SIGGRAPH 2014 https://advances.realtimerendering.com/s2014/index.html
-  // 'Next Generation Post Processing in Call of Duty: Advanced Warfare' - Bloom - Downsampling
-  // Weighted average of 5 overplapped blocks of 4-texel regions
+  // Inner 4 taps at +-1 texel: (1 / 4) * 0.5 each.
+  float3 inner = InColorBuffer.SampleLevel(centerUv + float2(-1, 1) * cb.inputSizeInverse, 0).rgb
+               + InColorBuffer.SampleLevel(centerUv + float2( 1, 1) * cb.inputSizeInverse, 0).rgb
+               + InColorBuffer.SampleLevel(centerUv + float2(-1,-1) * cb.inputSizeInverse, 0).rgb
+               + InColorBuffer.SampleLevel(centerUv + float2( 1,-1) * cb.inputSizeInverse, 0).rgb;
 
-  float3 taps_0  = InColorBuffer.SampleLevel(centerUv + float2(-2,-2) * cb.inputSizeInverse, 0).rgb;
-  float3 taps_1  = InColorBuffer.SampleLevel(centerUv + float2( 0,-2) * cb.inputSizeInverse, 0).rgb;
-  float3 taps_2  = InColorBuffer.SampleLevel(centerUv + float2( 2,-2) * cb.inputSizeInverse, 0).rgb;
-  float3 taps_3  = InColorBuffer.SampleLevel(centerUv + float2(-1,-1) * cb.inputSizeInverse, 0).rgb;
-  float3 taps_4  = InColorBuffer.SampleLevel(centerUv + float2( 1,-1) * cb.inputSizeInverse, 0).rgb;
-  float3 taps_5  = InColorBuffer.SampleLevel(centerUv + float2(-2, 0) * cb.inputSizeInverse, 0).rgb;
-  float3 taps_6  = InColorBuffer.SampleLevel(centerUv + float2( 0, 0) * cb.inputSizeInverse, 0).rgb;
-  float3 taps_7  = InColorBuffer.SampleLevel(centerUv + float2( 2, 0) * cb.inputSizeInverse, 0).rgb;
-  float3 taps_8  = InColorBuffer.SampleLevel(centerUv + float2(-1, 1) * cb.inputSizeInverse, 0).rgb;
-  float3 taps_9  = InColorBuffer.SampleLevel(centerUv + float2( 1, 1) * cb.inputSizeInverse, 0).rgb;
-  float3 taps_10 = InColorBuffer.SampleLevel(centerUv + float2(-2, 2) * cb.inputSizeInverse, 0).rgb;
-  float3 taps_11 = InColorBuffer.SampleLevel(centerUv + float2( 0, 2) * cb.inputSizeInverse, 0).rgb;
-  float3 taps_12 = InColorBuffer.SampleLevel(centerUv + float2( 2, 2) * cb.inputSizeInverse, 0).rgb;
+  // Outer 3x3 grid at 0 / +-2 texels: (1 / 9) * 0.5 each.
+  float3 outer = InColorBuffer.SampleLevel(centerUv + float2(-2, 2) * cb.inputSizeInverse, 0).rgb
+               + InColorBuffer.SampleLevel(centerUv + float2( 0, 2) * cb.inputSizeInverse, 0).rgb
+               + InColorBuffer.SampleLevel(centerUv + float2( 2, 2) * cb.inputSizeInverse, 0).rgb
+               + InColorBuffer.SampleLevel(centerUv + float2(-2, 0) * cb.inputSizeInverse, 0).rgb
+               + InColorBuffer.SampleLevel(centerUv + float2( 0, 0) * cb.inputSizeInverse, 0).rgb
+               + InColorBuffer.SampleLevel(centerUv + float2( 2, 0) * cb.inputSizeInverse, 0).rgb
+               + InColorBuffer.SampleLevel(centerUv + float2(-2,-2) * cb.inputSizeInverse, 0).rgb
+               + InColorBuffer.SampleLevel(centerUv + float2( 0,-2) * cb.inputSizeInverse, 0).rgb
+               + InColorBuffer.SampleLevel(centerUv + float2( 2,-2) * cb.inputSizeInverse, 0).rgb;
 
-  float3 a = 0.25 * (taps_3 + taps_4 + taps_8  + taps_9);
-  float3 b = 0.25 * (taps_0 + taps_1 + taps_5  + taps_6);
-  float3 c = 0.25 * (taps_1 + taps_2 + taps_6  + taps_7);
-  float3 d = 0.25 * (taps_5 + taps_6 + taps_10 + taps_11);
-  float3 e = 0.25 * (taps_6 + taps_7 + taps_11 + taps_12);
-
-  return 0.5   * a +
-         0.125 * b +
-         0.125 * c +
-         0.125 * d +
-         0.125 * e;
+  return inner * 0.125f + outer * (0.5f / 9.0f);
 }
 
 [shader("compute")]
@@ -82,10 +74,10 @@ void main(uint2 ipos : SV_DispatchThreadID)
 
   float3 result = downsample13tap(int2(ipos));
 
-  if (cb.threshold > 0)
+  // A NaN or Inf in the scene would spread over the whole bloom chain.
+  if (any(isnan(result)) || any(isinf(result)))
   {
-    // smoothly suppress values under threshold
-    result *= smoothstep(0.0, cb.threshold, calcBt709Luminance(result));
+    result = float3(0.0f);
   }
 
   OutColorBuffer[ipos] = float4(result, 0);

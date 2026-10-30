@@ -2,6 +2,7 @@
 // runtime build, with no game. Standalone 64-bit console exe; build.bat builds it.
 //
 //   remix_replay <recording-dir> --runtime <dir> [options]
+//   remix_replay --identity-trace <file.d9it> --runtime <dir> [--set key=value ...]
 //   remix_replay --compare <a.dds> <b.dds>
 //
 // The runtime directory is the one holding d3d9.dll (a copy of _Comp64Release\src\d3d9
@@ -13,6 +14,7 @@
 
 #include <remix/remix_c.h>
 #include "../../src/dxvk/rtx_render/rtx_fork_api_record_format.h"
+#include "../../src/dxvk/rtx_render/rtx_fork_d3d9_identity_trace_format.h"
 
 #include <algorithm>
 #include <chrono>
@@ -678,12 +680,16 @@ namespace {
     bool verbose = false;
     uint32_t marker = 0;
     bool listMarkers = false;
+    fs::path identityTrace;  // --identity-trace: D3D9 identity trace dry run instead of a recording
   };
 
   void usage() {
     std::printf(
       "usage: remix_replay <recording-dir> --runtime <dir> [options]\n"
       "       remix_replay <recording-dir> --list-markers\n"
+      "       remix_replay --identity-trace <file.d9it> --runtime <dir> [--set key=value ...]\n"
+      "                        replay a D3D9 identity trace (rtx.d3d9Identity.traceFrames) through the draw-call\n"
+      "                        tracker with the runtime's options; nothing is rendered\n"
       "       remix_replay --compare <a.dds> <b.dds>\n"
       "options:\n"
       "  --marker N            replay everything before scene marker N for state, then measure from marker N to\n"
@@ -786,12 +792,17 @@ namespace {
         o.listMarkers = true;
       } else if (a == L"--verbose") {
         o.verbose = true;
+      } else if (a == L"--identity-trace") {
+        o.identityTrace = next();
       } else if (a.rfind(L"--", 0) == 0) {
         std::printf("unknown option %s\n", narrow(a).c_str());
         return false;
       } else {
         o.recording = a;
       }
+    }
+    if (!o.identityTrace.empty()) {
+      return !o.runtime.empty();
     }
     return !o.recording.empty() && (!o.runtime.empty() || o.listMarkers);
   }
@@ -1296,6 +1307,76 @@ namespace {
     }
   }
 
+  // --identity-trace: start the runtime (it needs a device for its options), present nothing, and let the runtime's export
+  // replay the trace on this thread.
+  int runIdentityTrace(const Options& o) {
+    const fs::path trace = fs::absolute(o.identityTrace);
+    const fs::path runtime = fs::absolute(o.runtime);
+    SetEnvironmentVariableW(L"RTX_API_RECORD", L"0");
+    SetCurrentDirectoryW((o.cwd.empty() ? runtime : fs::absolute(o.cwd)).wstring().c_str());
+    SetDllDirectoryW(runtime.wstring().c_str());
+    const fs::path dllPath = runtime / "d3d9.dll";
+    HMODULE dll = LoadLibraryExW(dllPath.wstring().c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    if (!dll) {
+      std::printf("error: cannot load %s (error %lu)\n", dllPath.string().c_str(), GetLastError());
+      return 1;
+    }
+    auto initialize = reinterpret_cast<PFN_remixapi_InitializeLibrary>(GetProcAddress(dll, "remixapi_InitializeLibrary"));
+    auto replayTrace = reinterpret_cast<PFN_remixapi_fork_ReplayIdentityTrace>(GetProcAddress(dll, "remixapi_fork_ReplayIdentityTrace"));
+    if (!initialize || !replayTrace) {
+      std::printf("error: %s has no %s\n", dllPath.string().c_str(),
+                  !initialize ? "remixapi_InitializeLibrary" : "remixapi_fork_ReplayIdentityTrace (older build)");
+      return 1;
+    }
+    remixapi_InitializeLibraryInfo initInfo {};
+    initInfo.sType = REMIXAPI_STRUCT_TYPE_INITIALIZE_LIBRARY_INFO;
+    initInfo.version = REMIXAPI_VERSION_MAKE(REMIXAPI_VERSION_MAJOR, REMIXAPI_VERSION_MINOR, REMIXAPI_VERSION_PATCH);
+    remixapi_Interface remix {};
+    remixapi_ErrorCode status = initialize(&initInfo, &remix);
+    if (status != REMIXAPI_ERROR_CODE_SUCCESS) {
+      std::printf("error: InitializeLibrary failed (%d)\n", int(status));
+      return 1;
+    }
+    WNDCLASSEXW wc {};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = windowProc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = L"RemixReplayIdentity";
+    RegisterClassExW(&wc);
+    HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"Remix Identity Replay", WS_POPUP, 0, 0, 64, 64,
+                                nullptr, nullptr, wc.hInstance, nullptr);
+    remixapi_StartupInfo startup {};
+    startup.sType = REMIXAPI_STRUCT_TYPE_STARTUP_INFO;
+    startup.hwnd = hwnd;
+    status = remix.Startup(&startup);
+    if (status != REMIXAPI_ERROR_CODE_SUCCESS) {
+      std::printf("error: Startup failed (%d)\n", int(status));
+      return 1;
+    }
+    remix.SetConfigVariable("rtx.d3d9Identity.log", "True");
+    for (const auto& [k, v] : o.sets) {
+      remix.SetConfigVariable(k.c_str(), v.c_str());
+    }
+    std::printf("identity trace: %s\n", trace.string().c_str());
+    remixapi_fork_IdentityReplayResult result {};
+    const auto start = std::chrono::steady_clock::now();
+    status = replayTrace(trace.wstring().c_str(), &result);
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    std::printf("%s\n", result.message);
+    if (status == REMIXAPI_ERROR_CODE_SUCCESS) {
+      std::printf("frames=%llu draws=%llu exact=%llu matched=%llu created=%llu destroyed=%llu clears=%llu cutsKept=%llu "
+                  "peakInstances=%llu endInstances=%llu (%.1f s)\n",
+                  (unsigned long long) result.frames, (unsigned long long) result.draws, (unsigned long long) result.exact,
+                  (unsigned long long) result.matched, (unsigned long long) result.created, (unsigned long long) result.destroyed,
+                  (unsigned long long) result.clears, (unsigned long long) result.cutsKept,
+                  (unsigned long long) result.peakInstances, (unsigned long long) result.endInstances, seconds);
+      std::printf("per-interval counters: [D3d9Identity] lines in %s\n", (runtime / "rtx-remix" / "logs").string().c_str());
+    }
+    std::fflush(stdout);
+    remix.Shutdown();
+    return status == REMIXAPI_ERROR_CODE_SUCCESS ? 0 : 1;
+  }
+
   double percentile(std::vector<double> v, double p) {
     if (v.empty()) {
       return 0;
@@ -1314,6 +1395,9 @@ int wmain(int argc, wchar_t** argv) {
   if (!parseArgs(argc, argv, o)) {
     usage();
     return 2;
+  }
+  if (!o.identityTrace.empty()) {
+    return runIdentityTrace(o);
   }
   o.recording = fs::absolute(o.recording);
   if (!o.runtime.empty()) {
@@ -1473,9 +1557,8 @@ int wmain(int argc, wchar_t** argv) {
   }
   remixapi_InitializeLibraryInfo initInfo {};
   initInfo.sType = REMIXAPI_STRUCT_TYPE_INITIALIZE_LIBRARY_INFO;
-  // The payloads are decoded by the recorded version into this header's structs, with defaults for the fields an
-  // older host did not send, so the runtime is initialized with this header's version.
-  initInfo.version = REMIXAPI_VERSION_MAKE(REMIXAPI_VERSION_MAJOR, REMIXAPI_VERSION_MINOR, REMIXAPI_VERSION_PATCH);
+  // Report the recorded version so version-gated struct fields mean the same thing.
+  initInfo.version = apiVersion ? apiVersion : REMIXAPI_VERSION_MAKE(REMIXAPI_VERSION_MAJOR, REMIXAPI_VERSION_MINOR, REMIXAPI_VERSION_PATCH);
   remixapi_Interface remix {};
   remixapi_ErrorCode status = initialize(&initInfo, &remix);
   if (status != REMIXAPI_ERROR_CODE_SUCCESS) {

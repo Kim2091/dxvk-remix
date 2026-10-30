@@ -70,6 +70,32 @@ static const uint8_t surfaceMaterialTypeMask = uint8_t(0x3u);
 // material's specularMetalParams/specularMetalTint. Last free flag bit.
 #define OPAQUE_SURFACE_MATERIAL_FLAG_METALLIC_FROM_SPECULAR (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(13))
 // NV-DXVK end
+// The FO4 host-encoding flags above use the last free flag bits and data[27] / data[30-31], so FNV materials
+// share those words with them. Host-encoded materials never carry FNV features, and the host-encoding path
+// never writes SMOOTHNESS_IN_GREEN without ROUGHNESS_FROM_SMOOTHNESS; that combination marks the "FNV layout":
+//   data[27]    (roughnessFloor)                          = FNV flags word, bits below
+//   data[30-31] (specularMetalParams | specularMetalTint<<16) = terrain-layers extension index (SURFACE_INDEX_INVALID = none)
+// Every FO4 test (NORMAL_TANGENT_XY, ROUGHNESS_FROM_SMOOTHNESS, METALLIC_FROM_SPECULAR) is false on an FNV-layout
+// material, so the FO4 decode paths are untouched. Use opaqueSurfaceMaterialFnvFlags() /
+// opaqueSurfaceMaterialTerrainLayersIndex() (opaque_surface_material.slangh) to read them.
+#define OPAQUE_SURFACE_MATERIAL_FLAG_FNV_LAYOUT_MASK (OPAQUE_SURFACE_MATERIAL_FLAG_SMOOTHNESS_IN_GREEN | OPAQUE_SURFACE_MATERIAL_FLAG_ROUGHNESS_FROM_SMOOTHNESS)
+#define OPAQUE_SURFACE_MATERIAL_FLAG_FNV_LAYOUT OPAQUE_SURFACE_MATERIAL_FLAG_SMOOTHNESS_IN_GREEN
+// Bits of the FNV flags word (NOT of OpaqueSurfaceMaterial::flags).
+// The normal texture is an RGB (0.5-biased, DirectX-convention) tangent-space map: n = normalize(2 * rgb - 1).
+#define OPAQUE_SURFACE_MATERIAL_FLAG_NORMAL_RGB_TANGENT_SPACE (1 << 0)
+// The normal texture alpha is a per-texel specular mask: roughness = lerp(1, roughness, normal.a).
+#define OPAQUE_SURFACE_MATERIAL_FLAG_ROUGHNESS_FROM_NORMAL_ALPHA (1 << 1)
+// The emissive texture sample is multiplied by emissiveColorConstant (instead of replacing it).
+#define OPAQUE_SURFACE_MATERIAL_FLAG_EMISSIVE_TEXTURE_TINTED (1 << 2)
+// With ROUGHNESS_FROM_NORMAL_ALPHA: the alpha is gloss (inverted roughness, NVR convention) instead of a specular mask:
+// roughness = lerp(fnvGlossRoughnessMin, fnvGlossRoughnessMax, 1 - normal.a).
+#define OPAQUE_SURFACE_MATERIAL_FLAG_NORMAL_ALPHA_IS_GLOSS (1 << 3)
+
+// Flags word of the terrain-layers surface-material extension entry (TerrainLayersMaterial).
+#define TERRAIN_LAYERS_MATERIAL_FLAG_NORMALS_RGB_TANGENT_SPACE (1 << 0)
+// Bits 1-8: layer i's normal alpha is gloss (roughness = lerp(min, max, 1 - a)); clear = the material roughness constant.
+#define TERRAIN_LAYERS_MATERIAL_FLAG_LAYER_GLOSS_SHIFT 1
+#define TERRAIN_LAYERS_MATERIAL_MAX_LAYERS 8
 
 
 #define OPAQUE_SURFACE_MATERIAL_INTERACTION_FLAG_HAS_HEIGHT_TEXTURE (1 << 0)

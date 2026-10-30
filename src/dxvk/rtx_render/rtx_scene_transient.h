@@ -59,6 +59,10 @@ namespace dxvk {
     TransientLane(SceneManager& scene, RetainedScene& retained);
     ~TransientLane();
 
+    // rtx.scene.directTransient as last applied (read once per frame, at the end of injectRTX).
+    bool enabled() const { return m_enabled; }
+    void applyOption(bool enabled);
+
     // False: not taken; the caller uses submitExternalDraw. state is left as it was in that case.
     bool draw(const Rc<DxvkContext>& ctx, ExternalDrawState& state);
 
@@ -98,6 +102,7 @@ namespace dxvk {
 
     SceneManager& m_scene;
     RetainedScene& m_retained;
+    bool m_enabled = false;
     uint64_t m_nextId = 1;
     uint64_t m_assetGlobalEpoch = ~0ull;
     std::unordered_map<uint64_t, Entry> m_entries;

@@ -6,7 +6,7 @@ SCCR (Silhouette Curvature-Corrected Cone Relief) is a parallax displacement mod
 | Layer | What it does |
 |---|---|
 | 1. Cone relief | Texture-space POM with relaxed cone stepping and a curvature correction. Every displaced surface in SCCR mode. |
-| 2. Shell tracing | An object-space march through prisms between the mesh and an inner offset copy of it, across triangles. It stops the relief from sliding. Primary and PSR G-buffer rays only. On by default (`rtx.displacement.shell.enable`). |
+| 2. Shell tracing | An object-space march through prisms between the mesh and an inner offset copy of it, across triangles. It stops the relief from sliding. Primary and PSR G-buffer rays only. Off by default (`rtx.displacement.shell.enable`). |
 
 Outlines are not carved: a silhouette keeps the mesh's own outline.
 

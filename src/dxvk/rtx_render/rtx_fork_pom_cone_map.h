@@ -38,8 +38,8 @@ namespace dxvk {
   class RtxContext;
 
   // Derived height+cone textures for the height maps of displaced materials (rtx.displacement.mode =
-  // SCCR, pom_sccr.slangh). R is a copy of the height, every mip; G is the square root of the relaxed cone ratio
-  // (GPU Gems 3 ch. 18) at mip 0, in UV per unit of depth. A material points at the derived texture from its
+  // SCCR, pom_sccr.slangh). R is a copy of the height, every mip; G is the square root of the cone ratio (relaxed or
+  // conservative, see ConeVariant) at mip 0, in UV per unit of depth. A material points at the derived texture from its
   // creation on, so the texture index never changes (preserved instances keep the index they were built with); until its cones are ready G is 0, which
   // the march reads as "take a linear step". Generation (pom_cone_generate.comp.slang) walks candidate rays only in a
   // small near field and finds every other texel's bound with a hierarchical search of a max-height pyramid. Square
@@ -51,6 +51,16 @@ namespace dxvk {
     explicit PomConeMapManager(DxvkDevice* device);
     ~PomConeMapManager();
 
+    // Which cones a derived texture holds. Relaxed (GPU Gems 3 ch. 18): a cone may contain the field once, past the
+    // first surface the ray meets; the widest cones, for a single height map. Conservative: a cone contains no point of
+    // the field at all (the generator without its ray walk), so cones of several maps blended with fixed weights still
+    // bound the blend (terrain layers). Each variant gets its own derived texture and its own cache files, so a height
+    // map used both ways is generated once per variant and the two never share a texture.
+    enum class ConeVariant : uint32_t {
+      Relaxed,
+      Conservative
+    };
+
     // What G of the derived textures holds (rtx.displacement.coneMap.quality). Full: generated cones, coarse ones until
     // a map's tiles are done. CoarseOnly: coarse cones in every map that allows them (square power-of-two maps of more
     // than one tile; the others keep G = 0, a linear march, as before generation), for comparing the two; generation,
@@ -61,7 +71,8 @@ namespace dxvk {
     };
 
     // The texture a material displaced with `height` should use; coneAvailable says whether it is a derived one.
-    TextureRef resolveHeight(const TextureRef& height, bool displaced, bool& coneAvailable);
+    TextureRef resolveHeight(const TextureRef& height, bool displaced, bool& coneAvailable,
+                             ConeVariant variant = ConeVariant::Relaxed);
 
     // Records the pending cone map work. Once per frame, after the frame's materials are created, before ray tracing.
     void update(RtxContext& ctx);
@@ -92,7 +103,7 @@ namespace dxvk {
     }
 
     // Every cone in G of every derived texture is conservative: coarse cones, or cones generated without a ray walk
-    // (rayStepsPerCandidate = 0), or none. A march that leaves the field (shell-traced
+    // (rayStepsPerCandidate = 0, or the conservative variant), or none. A march that leaves the field (shell-traced
     // self-shadows, SCCR_SHELL_MARCH_FLAG_CONSERVATIVE_CONES) may then take cone steps. As of the last update; after a
     // switch to CoarseOnly it turns true once the coarse pass has overwritten every map's generated cones.
     bool conesConservative() const {
@@ -108,6 +119,13 @@ namespace dxvk {
                "generation pauses. Maps that cannot have coarse cones (not square powers of two, or a single 64x64 "
                "tile) march linearly. Coarse cones are never written to the disk cache. Switching back to Full restores "
                "the generated cones from the disk cache, or resumes generation. Uses no extra memory.");
+    RTX_OPTION("rtx.displacement", bool, levelHeightMaps, true,
+               "SCCR: raises each height map so the top of its field is the surface: every height gets 1 - top added "
+               "and is clamped to 1, where top is the brightest texel of the map's 16x16 mip (the broad top, not a few "
+               "bright texels). Height maps made for a mid-grey surface otherwise sit entirely below the surface, look "
+               "sunken and swim. The depth range is unchanged. Applies to height maps loaded after the change; already "
+               "loaded maps keep their copy until the game loads them again. Only in SCCR mode (rtx.displacement.mode "
+               "= 3) with cone maps on.");
     RTX_OPTION("rtx.displacement.coneMap", uint32_t, maxResolution, 4096,
                "SCCR: height maps larger than this on either side get no cone map and are marched linearly.");
     RTX_OPTION("rtx.displacement.coneMap", uint32_t, generateTexelsPerFrame, 16384,
@@ -152,6 +170,8 @@ namespace dxvk {
 
     bool createImage(Entry& entry) const;
     bool beginGeneration(Entry& entry) const;
+    void recordLevel(RtxContext& ctx, Entry& entry) const;
+    static bool levelApplies(const Entry& entry, const Rc<DxvkImageView>& height);
     static bool hasHeight(const Entry& entry);
     static Rc<DxvkImageView> heightSource(const Entry& entry);
     Rc<DxvkImageView> mergeHeight(RtxContext& ctx, const Entry& entry) const;

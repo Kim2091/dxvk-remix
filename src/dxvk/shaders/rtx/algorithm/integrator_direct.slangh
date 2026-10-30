@@ -199,7 +199,7 @@ void evalNEEPrimary(
       minimalRayInteraction.coneRadius, viewRay.spreadAngle, 1.0, geometryFlags.isViewModel, false,
       sharedSurfaceIndex, SharedTextureCoord[pixelCoordinate],
       isThinOpaqueSubsurface,
-      opaqueSurfaceMaterialInteraction.shadingNormal) :
+      opaqueSurfaceMaterialInteraction.shadingNormal, true) :
     occludedVisibility;
 
 #if !INTEGRATE_DIRECT_SSS_PROFILE
@@ -349,7 +349,7 @@ void evalDedicatedSunPrimary(
       minimalRayInteraction.coneRadius, viewRay.spreadAngle, 1.0, geometryFlags.isViewModel, false,
       sharedSurfaceIndex, SharedTextureCoord[pixelCoordinate],
       isThinOpaqueSubsurface,
-      opaqueSurfaceMaterialInteraction.shadingNormal);
+      opaqueSurfaceMaterialInteraction.shadingNormal, true);
 
   hitDistance = visibility.hitDistance;
   contributionLuminance = 0.0f;

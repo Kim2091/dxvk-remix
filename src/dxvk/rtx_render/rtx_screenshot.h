@@ -57,8 +57,22 @@ namespace dxvk {
                     args.flags = RtxOptionFlags::UserSetting);
     RTX_OPTION_ARGS("rtx.screenshot", std::string, folder, std::string(""),
                     "The folder screenshots are saved to. A relative path is relative to the game's executable. "
-                    "Empty = a Screenshots folder next to the game's executable.",
+                    "Empty = Pictures\\RTX Remix\\<the executable's name>, outside the game folder, so a mod "
+                    "manager's virtual or root file handling does not move or hide them (a Screenshots folder next "
+                    "to the game's executable when the Pictures folder cannot be found).",
                     args.flags = RtxOptionFlags::UserSetting);
+
+    RTX_OPTION_FLAG("rtx.screenshot", std::string, thumbnailRequest, std::string(""), RtxOptionFlags::NoSave,
+                    "Set by the game integration (remix API SetConfigVariable): each new value asks for a thumbnail of "
+                    "the latest ray traced frame, taken where the frame is written to the game's render target, so it has "
+                    "none of the game's interface. While frames are not ray traced (a game menu over a frozen "
+                    "background), that is the last one that was. The value is answered at the next present. "
+                    "The thumbnail is written to rtx-remix\\thumbnail.rgb: the bytes "
+                    "'RTHB', then the width, the height and the length of the value as 32-bit little-endian numbers, "
+                    "the value, then 8-bit RGB rows from the top, SDR (an HDR frame is converted as the SDR file of an "
+                    "HDR screenshot is).");
+    RTX_OPTION("rtx.screenshot", uint32_t, thumbnailWidth, 512, "The width of the thumbnail rtx.screenshot.thumbnailRequest "
+               "asks for. The height follows the frame's aspect ratio.");
 
     explicit RtxScreenshot(DxvkDevice* device);
     ~RtxScreenshot();
@@ -67,9 +81,14 @@ namespace dxvk {
     void request();
 
     // Records the copy of the back buffer when a screenshot is asked for, and queues the files to be written.
+    // Also answers a new rtx.screenshot.thumbnailRequest from the latest ray traced frame.
     // Call it at present, after the frame's own rendering and before the Remix menu or the DXVK HUD is drawn
     // into the back buffer. hdrOutput tells whether the back buffer holds HDR10 output (rtx_tone_mapping.h).
     void capture(DxvkContext* ctx, const Rc<DxvkImage>& backBuffer, bool hdrOutput);
+
+    // Keeps a downscaled copy of the ray traced frame for rtx.screenshot.thumbnailRequest. Call it right after the
+    // frame is written to the game's render target, before the game draws its interface into it.
+    void captureThumbnail(DxvkContext* ctx, const Rc<DxvkImage>& image);
 
     // Returns the message the HUD shows while a screenshot is saved and shortly after.
     // Returns false when there is none.
@@ -81,11 +100,18 @@ namespace dxvk {
   private:
     struct Job;
 
+    void serviceThumbnail(DxvkContext* ctx);
     void runWorker();
     void write(Job& job);
     void setHudMessage(std::string text, std::string subText, double seconds);
 
     std::atomic<bool> m_requested { false };
+    // Render thread only.
+    std::string m_handledThumbnailRequest;
+    // The latest ray traced frame, downscaled, and how to convert it (null until a frame was ray traced).
+    Rc<DxvkImage> m_thumbnailImage;
+    std::unique_ptr<Job> m_thumbnailFrame;
+    bool m_thumbnailWarned = false;
     std::atomic<bool> m_stopping { false };
 
     // The worker thread starts with the first screenshot and writes the jobs in order.

@@ -25,6 +25,7 @@ namespace dxvk {
     RTX_OPTION("rtx.worldOrigin", bool, enable, false,
                "For hosts that submit the scene relative to a moving render origin and publish that origin, in render "
                "units, in the game values __mcrtx.world_origin.x/y/z (remixapi_SetGameValue) before each SetupCamera. "
+               "For a camera that arrives as D3D9 transforms, the host publishes them before the frame's first draw. "
                "When the origin moves, the previous camera and every instance's previous transform are moved with it, "
                "so motion vectors, camera-cut detection and temporal history see no jump, and NUMOS clouds stay "
                "anchored to the world. When off, those game values are ignored.");

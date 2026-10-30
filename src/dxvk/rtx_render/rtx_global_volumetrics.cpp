@@ -190,7 +190,7 @@ namespace dxvk {
     int2(3,  48)
   };
   // Note: Higher end options brought down when Portals are in use due to the the current volumetric solution for Portals requiring 3x more video memory
-  // and cost. Additionally, these settings are tuned somewhat specifically for one portal-heavy game to further adjust performance to a desired level, in the future
+  // and cost. Additionally, these settings are tuned somewhat specifically for Portal RTX to further adjust performance to a desired level, in the future
   // a more generalized system is needed so this sort of performance/quality tradeoff may be made on a per-game basis.
   // Note: 32, 16, 12, 8, 4 is probably a more reasonable set of resolution scales, but set mostly to 16 for performance reasons for now.
   // See REMIX-3834 for more information.
@@ -490,7 +490,7 @@ namespace dxvk {
   // A typical use for this function is checking if the player is in the water, which has high density and we want to use fix function fog.
   // Note: Fogs in Portal uses linear fix fog function, so the density can only be approximated
   bool shouldConvertToPhysicalFog(const FogState& fogState, const float fogDensityThrehold) {
-    if (fogState.mode == frontend::FogMode::None || (fogState.mode == frontend::FogMode::Linear && fogState.end < 1e-7f)) {
+    if (fogState.mode == D3DFOG_NONE || (fogState.mode == D3DFOG_LINEAR && fogState.end < 1e-7f)) {
       return true;
     }
 
@@ -524,13 +524,13 @@ namespace dxvk {
     Vector3 multiScatteringEstimate = Vector3();
 
     // Check if fog density is below the configurable threshold to determine if physical volumetrics should be used.
-    // This threshold is tuned for a game whose fixed function fog is used for underwater.
+    // This threshold was created specifically for Portal RTX's underwater fixed function fog.
     const bool canUsePhysicalFog = shouldConvertToPhysicalFog(fogState, waterFogDensityThreshold());
 
     if (
       enableFogRemap() &&
       // Note: Only consider remapping fog if any fixed function fog is actually enabled (not the "none" mode).
-      fogState.mode != frontend::FogMode::None &&
+      fogState.mode != D3DFOG_NONE &&
       canUsePhysicalFog
     ) {
       // Handle Fog Color remapping
@@ -549,7 +549,7 @@ namespace dxvk {
       if (enableFogMaxDistanceRemap()) {
         // Switch transmittance measurement distance derivation from D3D9 fog based on which fog mode is in use
 
-        if (fogState.mode == frontend::FogMode::Linear) {
+        if (fogState.mode == D3DFOG_LINEAR) {
           float fogRemapMaxDistanceMin { fogRemapMaxDistanceMinMeters() * RtxOptions::getMeterToWorldUnitScale() };
           float fogRemapMaxDistanceMax { fogRemapMaxDistanceMaxMeters() * RtxOptions::getMeterToWorldUnitScale() };
           float fogRemapTransmittanceMeasurementDistanceMin { fogRemapTransmittanceMeasurementDistanceMinMeters() * RtxOptions::getMeterToWorldUnitScale() };
@@ -576,7 +576,7 @@ namespace dxvk {
           }
 
           transmittanceMeasurementDistance = normalizedRange * transmittanceMeasurementDistanceRange + fogRemapTransmittanceMeasurementDistanceMin;
-        } else if (fogState.mode == frontend::FogMode::Exp || fogState.mode == frontend::FogMode::Exp2) {
+        } else if (fogState.mode == D3DFOG_EXP || fogState.mode == D3DFOG_EXP2) {
           // Note: Derived using the following, doesn't take fog color into account but that is fine for a rough estimate:
           // density = -ln(color) / measurement_distance (For exp)
           // density^2 = -ln(color) / measurement_distance (For exp2)

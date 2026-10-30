@@ -21,26 +21,21 @@
 */
 #pragma once
 
-#include <algorithm>
-#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <functional>
 #include <mutex>
-#include <new>
-#include <optional>
 #include <thread>
 #include <vector>
 #include <type_traits>
-#include <utility>
+#include <future>
 #include <assert.h>
 #include "util_atomic_queue.h"
 #include "util_env.h"
 #include "util_math.h"
 #include "util_fastops.h"
 #include "util_bit.h"
-#include "util_stress.h"
 #include "sync/sync_spinlock.h"
 
 namespace dxvk {
@@ -48,267 +43,221 @@ namespace dxvk {
   // Note: use up to 64 bytes for state
   const size_t kResultStorageCapacity = 256 - 64;
 
-  using TaskId = uint32_t;
+  template<size_t Capacity = kResultStorageCapacity, bool UseWait = false>
+  struct Result {
+    struct Nop { };
+    using OnSetCondition = std::conditional_t<UseWait, dxvk::condition_variable, Nop>;
+    using ResultMutex = std::conditional_t<UseWait, dxvk::mutex, Nop>;
 
-  // One slot of a WorkerThreadPool: a scheduled lambda and its result.
-  // The worker that runs the lambda and the Future that owns the result each release the slot once. The slot is
-  // free again only after both have released it, so a Future still held never reads a later task's result.
-  struct Task {
-    Task() = default;
-    Task(const Task&) = delete;
-    Task& operator=(const Task&) = delete;
+    template<typename T>
+    void set(T&& t) {
+      static_assert(sizeof(T) <= Capacity,
+          "Result object storage space overrun!");
 
-    // Stores the lambda. The slot must be free.
-    template<typename LambdaType, typename ResultType>
-    void capture(LambdaType&& lambda) {
-      using Lambda = std::decay_t<LambdaType>;
-      static_assert(sizeof(Lambda) <= kLambdaStorageCapacity, "Task object storage space overrun!");
-      static_assert(alignof(Lambda) <= 64, "Task lambda alignment is too large!");
-      if constexpr (!std::is_void_v<ResultType>) {
-        static_assert(sizeof(ResultType) <= kResultStorageCapacity, "Result object storage space overrun!");
-        static_assert(alignof(ResultType) <= 64, "Task result alignment is too large!");
-      }
-      assert(free());
+      new(storage.data()) T(std::forward<T>(t));
 
-      new (m_lambdaStorage.data()) Lambda(std::forward<LambdaType>(lambda));
-      m_run = &run<Lambda, ResultType>;
-      m_destroyResult = nullptr;
-      m_cancelled.store(false, std::memory_order_relaxed);
-      m_state.store(0, std::memory_order_relaxed);
+      set();
     }
 
-    // Runs the lambda on a worker, unless the task was cancelled, and releases the worker's side of the slot.
-    void operator() () {
-#ifdef _DEBUG
-      if (!m_run) {
-        throw DxvkError("Task thunk was not initialized!");
-      }
-#endif
-      stress::delay(stress::Site::PoolTask);
-      m_run(*this);
-      m_run = nullptr;
-      finish(kExecuted);
-    }
-
-    bool free() const {
-      return m_state.load(std::memory_order_acquire) == kFree;
-    }
-
-    // Skips the lambda if it has not started yet.
-    void cancel() {
-      m_cancelled.store(true, std::memory_order_release);
-    }
-
-    // Waits for the lambda, then moves its result out and releases the owner's side of the slot.
-    template<typename ResultType>
-    ResultType take() {
-      wait();
-      if constexpr (std::is_void_v<ResultType>) {
-        finish(kReleased);
+    void set() {
+      if constexpr (UseWait) {
+        std::unique_lock<dxvk::mutex> lock(mtx);
+        hasResult = true;
+        cond.notify_one();
       } else {
-        assert(m_destroyResult != nullptr && "The task was cancelled and has no result.");
-        ResultType result = std::move(*std::launder(reinterpret_cast<ResultType*>(m_resultStorage.data())));
-        finish(kReleased);
-        return result;
+        hasResult = true;
       }
-    }
-
-    // Releases the owner's side of the slot without reading the result. The lambda still runs unless it was cancelled.
-    void release() {
-      finish(kReleased);
-    }
-
-  private:
-    // m_state holds kExecuted and kReleased while the task is in use, and only kFree once both sides released it.
-    static constexpr uint32_t kExecuted = 1;
-    static constexpr uint32_t kReleased = 2;
-    static constexpr uint32_t kFree = 4;
-
-    template<typename Lambda, typename ResultType>
-    static void run(Task& task) {
-      Lambda& lambda = *std::launder(reinterpret_cast<Lambda*>(task.m_lambdaStorage.data()));
-      if (!task.m_cancelled.load(std::memory_order_acquire)) {
-        if constexpr (std::is_void_v<ResultType>) {
-          lambda();
-        } else {
-          new (task.m_resultStorage.data()) ResultType(lambda());
-          task.m_destroyResult = &destroy<ResultType>;
-        }
-      }
-      lambda.~Lambda();
-    }
-
-    template<typename ResultType>
-    static void destroy(void* pResult) {
-      std::launder(reinterpret_cast<ResultType*>(pResult))->~ResultType();
-    }
-
-    void wait() const {
-      while ((m_state.load(std::memory_order_acquire) & kExecuted) == 0) {
-        std::this_thread::yield();
-      }
-    }
-
-    // The second side to release destroys a result nobody took and frees the slot.
-    void finish(uint32_t side) {
-      const uint32_t previous = m_state.fetch_or(side, std::memory_order_acq_rel);
-      assert((previous & (side | kFree)) == 0 && "A task slot was released twice.");
-      if ((previous | side) == (kExecuted | kReleased)) {
-        if (m_destroyResult != nullptr) {
-          m_destroyResult(m_resultStorage.data());
-          m_destroyResult = nullptr;
-        }
-        m_state.store(kFree, std::memory_order_release);
-      }
-    }
-
-    alignas(64) std::array<uint8_t, kLambdaStorageCapacity> m_lambdaStorage;
-    alignas(64) std::array<uint8_t, kResultStorageCapacity> m_resultStorage;
-    void (*m_run)(Task&) = nullptr;
-    void (*m_destroyResult)(void*) = nullptr;
-    std::atomic<uint32_t> m_state = kFree;
-    std::atomic<bool> m_cancelled = false;
-  };
-
-  // The result of a scheduled task, or a value computed without a task. A Future owns its task slot until it is read,
-  // reset or destroyed, so it is move-only.
-  template<typename ResultType>
-  class Future {
-  public:
-    Future() = default;
-
-    explicit Future(Task& task)
-    : m_pTask { &task } { }
-
-    Future(Future&& other) noexcept
-    : m_pTask { std::exchange(other.m_pTask, nullptr) }
-    , m_value { std::move(other.m_value) } {
-      other.m_value.reset();
-    }
-
-    Future& operator=(Future&& other) noexcept {
-      if (this != &other) {
-        reset();
-        m_pTask = std::exchange(other.m_pTask, nullptr);
-        m_value = std::move(other.m_value);
-        other.m_value.reset();
-      }
-      return *this;
-    }
-
-    Future(const Future&) = delete;
-    Future& operator=(const Future&) = delete;
-
-    ~Future() {
-      reset();
-    }
-
-    static Future ready(ResultType&& value) {
-      Future future;
-      future.m_value.emplace(std::move(value));
-      return future;
-    }
-
-    // Waits for the result and moves it out. The Future is invalid afterwards.
-    ResultType get() {
-      assert(valid());
-      if (m_value.has_value()) {
-        ResultType value = std::move(*m_value);
-        m_value.reset();
-        return value;
-      }
-      return std::exchange(m_pTask, nullptr)->template take<ResultType>();
-    }
-
-    bool valid() const {
-      return m_pTask != nullptr || m_value.has_value();
-    }
-
-    // Skips the task if it has not started, and drops the result.
-    void cancel() {
-      if (m_pTask != nullptr) {
-        m_pTask->cancel();
-      }
-      reset();
-    }
-
-    // Drops the result. A scheduled task still runs, and its slot is reused after it has.
-    void reset() {
-      if (Task* pTask = std::exchange(m_pTask, nullptr)) {
-        pTask->release();
-      }
-      m_value.reset();
-    }
-
-  private:
-    Task* m_pTask = nullptr;
-    std::optional<ResultType> m_value;
-  };
-
-  template<>
-  class Future<void> {
-  public:
-    Future() = default;
-
-    explicit Future(Task& task)
-    : m_pTask { &task } { }
-
-    Future(Future&& other) noexcept
-    : m_pTask { std::exchange(other.m_pTask, nullptr) }
-    , m_ready { std::exchange(other.m_ready, false) } { }
-
-    Future& operator=(Future&& other) noexcept {
-      if (this != &other) {
-        reset();
-        m_pTask = std::exchange(other.m_pTask, nullptr);
-        m_ready = std::exchange(other.m_ready, false);
-      }
-      return *this;
-    }
-
-    Future(const Future&) = delete;
-    Future& operator=(const Future&) = delete;
-
-    ~Future() {
-      reset();
-    }
-
-    static Future ready() {
-      Future future;
-      future.m_ready = true;
-      return future;
     }
 
     void get() {
-      assert(valid());
-      if (m_ready) {
-        m_ready = false;
-        return;
+#ifdef _DEBUG
+      if (isDisposed) {
+        throw DxvkError("Refusing to get a disposed result!");
       }
-      std::exchange(m_pTask, nullptr)->take<void>();
+#endif
+
+      if constexpr (UseWait) {
+        if (!hasResult) {
+          std::unique_lock<dxvk::mutex> lock(mtx);
+          cond.wait(lock, [this] {
+            return hasResult;
+          });
+        }
+      } else {
+        while (!hasResult) {
+          std::this_thread::yield();
+        }
+      }
+
+      hasResult = false;
+      isDisposed = true;
     }
 
-    bool valid() const {
-      return m_pTask != nullptr || m_ready;
-    }
-
-    void cancel() {
-      if (m_pTask != nullptr) {
-        m_pTask->cancel();
-      }
-      reset();
+    template<typename T>
+    T get() {
+      get();
+      return std::move(*reinterpret_cast<T*>(storage.data()));
     }
 
     void reset() {
-      if (Task* pTask = std::exchange(m_pTask, nullptr)) {
-        pTask->release();
-      }
-      m_ready = false;
+      hasResult = false;
+      isDisposed = false;
+    }
+
+    void cancel() {
+      hasResult = false;
+      isDisposed = true;
+    }
+
+    bool disposed() const {
+      return isDisposed;
     }
 
   private:
-    Task* m_pTask = nullptr;
-    bool m_ready = false;
+    std::array<uint8_t, Capacity> storage;
+    std::atomic_bool hasResult = false;
+    std::atomic_bool isDisposed = false;
+
+    OnSetCondition cond;
+    mutable ResultMutex mtx;
+  };
+
+  using TaskId = uint32_t;
+  template<typename ResultType> struct Future;
+
+  struct Task {
+    using LambdaStorage = std::array<uint8_t, kLambdaStorageCapacity>;
+    using ThunkType = void(void*);
+    using ThunkStorage = std::array<uint8_t, sizeof(uintptr_t)>;
+
+    template<typename LambdaType, typename ResultType>
+    Future<ResultType> capture(LambdaType&& lambda) {
+      if constexpr (sizeof(LambdaType) > sizeof(lambdaStorage)) {
+        char(*__type_size)[sizeof(LambdaType)] = 1;
+        static_assert(false, "Task object storage space overrun!");
+      }
+
+      // Create lambda in-place
+      new (lambdaStorage.data()) LambdaType(std::forward<LambdaType>(lambda));
+
+      // We need to use a thunk to capture the actual lambda type
+      captureThunk([this]() {
+        auto& lambda = *reinterpret_cast<LambdaType*>(lambdaStorage.data());
+
+        if (!result.disposed()) {
+          if constexpr (!std::is_void_v<ResultType>) {
+            result.set(lambda());
+          } else {
+            lambda();
+            result.set();
+          }
+        }
+
+        lambda.~LambdaType();
+      });
+
+      result.reset();
+
+      return Future<ResultType>(*this);
+    }
+
+    void operator() () {
+      dispatchThunk();
+    }
+
+    template<typename ResultType>
+    ResultType getResult() {
+      return result.get<ResultType>();
+    }
+
+    void getResult() {
+      result.get();
+    }
+
+    void cancel() {
+      result.cancel();
+    }
+
+    bool valid() const {
+      return !result.disposed();
+    }
+
+  private:
+    template<typename InvocableType>
+    static inline void Thunk(void* thunkLambda) {
+      (*static_cast<InvocableType*>(thunkLambda))();
+    }
+
+    template<typename TunkLambdaType>
+    void captureThunk(TunkLambdaType&& thunkLambda) {
+      new (thunkStorage.data()) TunkLambdaType(std::forward<TunkLambdaType>(thunkLambda));
+      thunk = &Thunk<typename std::decay_t<TunkLambdaType>>;
+    }
+
+    void dispatchThunk() {
+#ifdef _DEBUG
+      if (!thunk) {
+        throw DxvkError("Task thunk was not initialized!");
+      }
+#endif
+      thunk(thunkStorage.data());
+      thunk = nullptr;
+    }
+
+    alignas(64) LambdaStorage lambdaStorage;
+    alignas(64) Result<kResultStorageCapacity> result;
+    alignas(64) ThunkStorage thunkStorage;
+    ThunkType* thunk = nullptr;
+  };
+
+  template<typename ResultType>
+  struct Future {
+    Future() = default;
+    explicit Future(Task& task)
+    : task { &task }
+    { }
+
+    ResultType get() const {
+      ResultType r = task->getResult<ResultType>();
+      task = nullptr;
+      return r;
+    }
+
+    bool valid() const {
+      return task != nullptr && task->valid();
+    }
+
+    void cancel() const {
+      task->cancel();
+      task = nullptr;
+    }
+
+  private:
+    mutable Task* task = nullptr;
+  };
+
+  template<>
+  struct Future<void> {
+    Future() = default;
+    explicit Future(Task& task)
+    : task { &task } { }
+
+    void get() const {
+      task->getResult();
+      task = nullptr;
+    }
+
+    bool valid() const {
+      return task != nullptr && task->valid();
+    }
+
+    void cancel() const {
+      task->cancel();
+      task = nullptr;
+    }
+
+  private:
+    mutable Task* task = nullptr;
   };
 
   /**
@@ -322,14 +271,12 @@ namespace dxvk {
     *  LowLatency: Enables the low-latency mode where workers will spin instead of
     *              waiting for tasks on a conditional variable
     *  (ctor)workerName: Name given to threads with the pattern: workerName(N)
-    *
+    * 
     *  Example usage:
     *   // Creates 1 thread, and uses it to return PI via a future
     *   WorkerThreadPool threadPool(1, "thread-pool-name");
     *   Future<float> result = threadPool.Schedule([]{ return 3.14159265359f; });
     *   float pi = result.get();
-    *
-    *  Every Future must be destroyed before the pool.
     */
   template<size_t NumTasksPerThread, bool WorkStealing = true, bool LowLatency = true>
   class WorkerThreadPool {
@@ -341,11 +288,10 @@ namespace dxvk {
     using TaskMutex = std::conditional_t<LowLatency, Nop, dxvk::mutex>;
 
   public:
-    WorkerThreadPool(uint8_t numThreads, const char* workerName = "Nameless Worker Thread")
+    WorkerThreadPool(uint8_t numThreads, const char* workerName = "Nameless Worker Thread") 
     : m_numThread(std::clamp(numThreads, (uint8_t)1u, (uint8_t)dxvk::thread::hardware_concurrency())) {
       // Note: round up to a closest power-of-two so we can use mask as modulo
       m_taskCount = 1 << (32 - bit::lzcnt(static_cast<uint32_t>(NumTasksPerThread * m_numThread) - 1));
-      m_minTaskCount = std::min(m_taskCount, static_cast<uint32_t>(1u << (32 - bit::lzcnt(static_cast<uint32_t>(m_numThread) - 1))));
       m_tasks.reset(new Task[m_taskCount]);
       m_workerTasks.resize(m_numThread);
       m_workerThreads.resize(m_numThread);
@@ -394,103 +340,48 @@ namespace dxvk {
       assert(m_numTasks == 0 && "Tasks left in thread pool queue after destruction!");
     }
 
-    // Schedules a task to be executed by the thread pool.
-    // Returns an invalid Future when the worker's queue is full, or when the next task slot is still owned by a Future
-    // or still running.
+    // Schedule a task to be executed by the thread pool
     template <uint8_t Affinity = 0xFF, typename F, typename R = std::invoke_result_t<std::decay_t<F>>>
     Future<R> Schedule(F&& f) {
-      uint32_t thread;
-      TaskId taskId;
-      Task* pTask = reserve<Affinity>(thread, taskId);
-      if (pTask == nullptr) {
-        return Future<R>();
-      }
-      return submit<F, R>(*pTask, taskId, thread, std::forward<F>(f));
-    }
-
-    // Schedule, except that a task the pool cannot take runs on the calling thread, so it always returns a valid
-    // Future. The caller does the work itself when the consumers of earlier results fall behind.
-    template <uint8_t Affinity = 0xFF, typename F, typename R = std::invoke_result_t<std::decay_t<F>>>
-    Future<R> ScheduleOrRun(F&& f) {
-      uint32_t thread;
-      TaskId taskId;
-      Task* pTask = reserve<Affinity>(thread, taskId);
-      if (pTask != nullptr) {
-        return submit<F, R>(*pTask, taskId, thread, std::forward<F>(f));
-      }
-      ++m_tasksRunByCaller;
-      if constexpr (std::is_void_v<R>) {
-        f();
-        return Future<R>::ready();
-      } else {
-        return Future<R>::ready(f());
-      }
-    }
-
-    // The number of tasks ScheduleOrRun ran on the calling thread.
-    uint64_t tasksRunByCaller() const {
-      return m_tasksRunByCaller;
-    }
-
-  private:
-    // Picks the worker and returns the next task slot, or nullptr when either is not available.
-    template <uint8_t Affinity>
-    Task* reserve(uint32_t& thread, TaskId& taskId) {
       // Is the affinity mask valid?
       const uint8_t affinityMask = std::min(popcnt_uint8(Affinity), m_numThread);
 
       // Schedule work on the appropriate thread
-      thread = fast::findNthBit(Affinity, (uint8_t) (m_schedulerIndex++ % affinityMask));
+      const uint32_t thread = fast::findNthBit(Affinity, (uint8_t) (m_schedulerIndex++ % affinityMask));
       assert(thread < m_numThread);
 
-      // A slot is reused only after its last Future released it and its worker finished with it. Slots are taken in
-      // ring order, so a slot still in use blocks scheduling until it is free.
-      taskId = m_taskId & slotMask();
-      Task& task = m_tasks[taskId];
-      if (m_workerTasks[thread]->isFull() || !task.free()) {
-        return nullptr;
-      }
-      return &task;
-    }
-
-    template <typename F, typename R>
-    Future<R> submit(Task& task, TaskId taskId, uint32_t thread, F&& f) {
       // Atomic queue is SPSC, so we don't need to take a lock here
       // since we know this will always be called from a single thread.
-      ++m_taskId;
-      assert(&m_tasks[taskId] == &task);
 
-      // Capture task lambda
-      task.capture<F, R>(std::forward<F>(f));
+      Future<R> future;
+      if (!m_workerTasks[thread]->isFull()) {
+        // Get next task id
+        TaskId taskId = m_taskId++ & (m_taskCount - 1);
 
-      // Place task into queue
-      m_workerTasks[thread]->push(std::move(taskId));
+        // Capture task lambda
+        future = m_tasks[taskId].capture<F, R>(std::forward<F>(f));
 
-      if constexpr (!LowLatency) {
-        std::unique_lock<TaskMutex> lock(m_taskMutex);
-        if constexpr (WorkStealing) {
-          // Notify only one worker when workers can steal from the others
-          m_condOnAdd.notify_one();
-        } else {
-          // Notify all workers when they cannot steal
-          m_condOnAdd.notify_all();
+        // Place task into queue
+        m_workerTasks[thread]->push(std::move(taskId));
+
+        if constexpr (!LowLatency) {
+          std::unique_lock<TaskMutex> lock(m_taskMutex);
+          if constexpr (WorkStealing) {
+            // Notify only one worker when workers can steal from the others
+            m_condOnAdd.notify_one();
+          } else {
+            // Notify all workers when they cannot steal
+            m_condOnAdd.notify_all();
+          }
         }
+
+        ++m_numTasks;
       }
 
-      ++m_numTasks;
-
-      return Future<R>(task);
+      return future;
     }
 
-    // The ring of slots in use: all of them, or under stress (rtx.debug.stress.forceSlotReuse) one per worker, so
-    // a slot is reused as early as possible.
-    uint32_t slotMask() const {
-      if (stress::active() && stress::forceSlotReuse()) {
-        return m_minTaskCount - 1;
-      }
-      return m_taskCount - 1;
-    }
-
+  private:
     void processWork(const uint32_t workerId) {
       while (true) {
         // Using a conditional wait in high-latency mode
@@ -555,15 +446,12 @@ namespace dxvk {
     std::unique_ptr<Task[]> m_tasks;
     std::atomic<TaskId> m_taskId = 0;
     uint32_t m_taskCount;
-    uint32_t m_minTaskCount;
 
     // Add the task to the queue and notify a worker thread
     //  just distribute evenly to all threads for some mask denoted by Affinity.
     size_t m_schedulerIndex = 0;
 
     uint8_t m_numThread;
-
-    uint64_t m_tasksRunByCaller = 0;
 
     std::atomic<bool> m_stopWork = false;
 

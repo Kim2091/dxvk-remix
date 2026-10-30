@@ -102,7 +102,7 @@ struct BlasEntry;
 class RtInstance;
 struct RaytraceGeometry;
 struct MaterialData;
-struct SceneDraw;
+struct DrawCallState;
 struct LegacyMaterialData;
 
 // Declared here so GameCapturer can befriend the hook, which uses m_exporter and m_pCap.
@@ -235,7 +235,7 @@ private:
   void captureFrame(const Rc<DxvkContext> ctx);
   void captureCamera();
   void captureLights();
-  void captureSphereLight(const dxvk::RtSphereLight& rtLight);
+  void captureSphereLight(const dxvk::RtSphereLight& rtLight, XXH64_hash_t hash);
   void captureDistantLight(const RtDistantLight& rtLight);
   void captureInstances(const Rc<DxvkContext> ctx);
   void newInstance(const Rc<DxvkContext> ctx, const RtInstance& rtInstance);

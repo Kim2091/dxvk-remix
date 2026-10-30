@@ -87,7 +87,8 @@ void Direct3DQuery9_LSS::onDestroy() {
 
 HRESULT Direct3DQuery9_LSS::GetDevice(IDirect3DDevice9** ppDevice) {
   LogFunctionCall();
-  m_pDevice->reportDevice(ppDevice);
+  m_pDevice->AddRef();
+  (*ppDevice) = m_pDevice;
   return S_OK;
 }
 

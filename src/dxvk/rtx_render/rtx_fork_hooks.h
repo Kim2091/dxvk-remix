@@ -3,7 +3,7 @@
 // Declares the fork_hooks functions that upstream files call.
 // Each hook is implemented in the rtx_fork_*.cpp file its comment names.
 
-// Provides AssetReplacer, MaterialData, SceneDraw and XXH64_hash_t.
+// Provides AssetReplacer, MaterialData, DrawCallState and XXH64_hash_t.
 #include "rtx_asset_replacer.h"
 
 // Provides Rc<T> for the hook signatures.
@@ -32,7 +32,8 @@ namespace lss {
 using remixapi_LightHandle = struct remixapi_LightHandle_T*;
 #endif
 
-namespace dxvk { class RemixApiDevice; }
+// Forward-declared so this header does not pull in d3d9_device.h.
+namespace dxvk { class D3D9DeviceEx; class RemixApiDevice; }
 
 // Provides Resources::RaytracingOutput for the render-pass hooks.
 #include "rtx_resources.h"
@@ -72,14 +73,26 @@ namespace dxvk {
     void showPostProcessingStackSettings(const Rc<DxvkContext>& ctx);
 
     // Looks up a USD mesh or light replacement for an API mesh handle hash.
-    // A registered host key and its aliases are looked up instead when the mesh has one.
+    // With rtx.scene.assetKeys, a registered host key and its aliases are looked up instead.
     // Returns the replacement bucket.
     // Returns null when the mesh has no replacement.
     // Implementation in rtx_fork_submit.cpp.
     std::shared_ptr<const ReplacementBucket> externalDrawMeshReplacement(
       AssetReplacer& replacer, XXH64_hash_t meshHash);
 
+    // Returns the D3D9 image hash of an API material's albedo imported from the game's D3D9 device
+    // (remixapi_ImportD3D9Texture). A D3D9 draw of the same texture uses this hash as its material hash,
+    // so USD material replacements and texture lists name the texture by it.
+    // Returns kEmptyHash when the albedo is not an imported game texture.
+    // Implementation in rtx_fork_submit.cpp.
+    XXH64_hash_t externalDrawGameTextureHash(const MaterialData& material);
+
+    // externalDrawGameTextureHash for an albedo texture reference.
+    // Implementation in rtx_fork_submit.cpp.
+    XXH64_hash_t gameTextureHash(const TextureRef& albedo);
+
     // Looks up a USD material replacement and points `material` at it.
+    // The material's own hash (or its host asset key) is looked up first, then externalDrawGameTextureHash.
     // Returns the replacement's owning shared_ptr, or null when there is none.
     // The caller must keep it alive for as long as it dereferences `material`.
     // Implementation in rtx_fork_submit.cpp.
@@ -88,21 +101,12 @@ namespace dxvk {
 
     // Resolves the albedo texture hash of an API material into textureHash,
     // then applies every texture-based instance category whose set contains it.
+    // For an imported texture, textureHash is the game's D3D9 image hash, which the texture lists and object picking use.
     // Implementation in rtx_fork_submit.cpp.
     void externalDrawTextureCategories(
       const MaterialData* material,
-      SceneDraw& drawCall,
+      DrawCallState& drawCall,
       XXH64_hash_t& textureHash);
-
-    // Stores the draw's texture hash in SceneManager::m_drawCallMeta while object picking is active,
-    // as the D3D9 draw path does.
-    // Requires friend access to SceneManager (see rtx_scene_manager.h).
-    // Implementation in rtx_fork_submit.cpp.
-    void externalDrawObjectPicking(
-      DxvkDevice& device,
-      SceneDraw& drawCall,
-      XXH64_hash_t textureHash,
-      SceneManager& scene);
 
     // Forwards keyboard (WM_KEY*, WM_CHAR, WM_SYSCHAR) and mouse (WM_MOUSEMOVE, WM_*BUTTON*,
     // WM_MOUSEWHEEL, WM_MOUSEHWHEEL) messages from the game window to ImGui_ImplWin32_WndProcHandler.
@@ -246,6 +250,21 @@ namespace dxvk {
     // Implementation in rtx_fork_api_entry.cpp.
     remixapi_ErrorCode setUiState(RemixApiDevice* remixDevice, remixapi_UIState state);
 
+    // Stub, because the D3D11 shared-texture backbuffer export is not implemented.
+    // Validates the arguments, then returns GENERAL_FAILURE so callers fall back.
+    // Implementation in rtx_fork_api_entry.cpp.
+    remixapi_ErrorCode getSharedD3D11TextureHandle(
+      RemixApiDevice* remixDevice,
+      void**       out_sharedHandle,
+      uint32_t*    out_width,
+      uint32_t*    out_height);
+
+    // Writes the hash of the D3D9 texture's DxvkImage to out_hash.
+    // Implementation in rtx_fork_api_entry.cpp.
+    remixapi_ErrorCode dxvkGetTextureHash(
+      IDirect3DTexture9* texture,
+      uint64_t*          out_hash);
+
     // Creates an image and stages the pixel data on the calling thread.
     // The command stream then uploads every mip and registers the texture with the texture manager
     // and the ImGui texture catalog under info->hash.
@@ -261,6 +280,11 @@ namespace dxvk {
     remixapi_ErrorCode destroyTexture(
       RemixApiDevice*     remixDevice,
       remixapi_TextureHandle handle);
+
+    // CS thread. Records ref in the hash -> texture map createTexture fills, so a "0x<hash>" material path finds an
+    // imported texture (remixapi_ImportD3D9Texture) after RtxTextureManager::clear() the same way it finds an uploaded
+    // one. destroyTexture removes it. Implementation in rtx_fork_api_entry.cpp.
+    void registerApiTexture(uint64_t hash, const TextureRef& ref);
 
     // Fires the beginScene callback once per frame, on the first API submission of the frame.
     // Called from the instance, light and retained draw entry points before they take s_mutex.

@@ -189,6 +189,12 @@ public:
     return get().perfLogIntervalFrames;
   }
 
+  // [TexDiag]: log a data fingerprint of every surface upload at least this many pixels wide on both sides; 0 = off
+  // (util_texdiag.h).
+  static uint32_t getTextureUploadDiagnostics() {
+    return get().textureUploadDiagnostics;
+  }
+
   // How long a command-ring wait spins before it blocks on its wake event (util_atomiccircularqueue.h).
   static uint32_t getIpcSpinMicroseconds() {
     return get().ipcSpinMicroseconds;
@@ -412,6 +418,9 @@ private:
     // [PerfBridge] counters: log every N frames on both sides, 0 = off.
     perfLogIntervalFrames = bridge_util::Config::getOption<uint32_t>("perfLogIntervalFrames", 0);
 
+    // [TexDiag]: fingerprint surface uploads at least this many pixels wide on client and server, 0 = off.
+    textureUploadDiagnostics = bridge_util::Config::getOption<uint32_t>("textureUploadDiagnostics", 0);
+
     // A command-ring wait spins this long before it blocks on its wake event. Short gaps between commands stay
     // in the spin (lowest latency); longer idle periods cost no CPU. 0 blocks at once.
     ipcSpinMicroseconds = bridge_util::Config::getOption<uint32_t>("ipcSpinMicroseconds", 100);
@@ -492,6 +501,7 @@ private:
   uint8_t presentSemaphoreMaxFrames;
   bool presentSemaphoreEnabled;
   uint32_t perfLogIntervalFrames;
+  uint32_t textureUploadDiagnostics;
   uint32_t ipcSpinMicroseconds;
   bool disableTimeoutsWhenDebugging;
   bool disableTimeouts;

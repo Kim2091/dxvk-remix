@@ -3,6 +3,8 @@
 #include "rtx_perf_log.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cfloat>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -12,6 +14,7 @@
 #include "rtx_accel_manager.h"
 #include "rtx_opacity_micromap_manager.h"
 #include "rtx_fork_d3d9_alpha.h"
+#include "rtx_fork_sccr_shell.h"
 #include "rtx_light_manager.h"
 #include "rtx_rtxdi_rayquery.h"
 #include "rtx_options.h"
@@ -281,7 +284,11 @@ namespace dxvk {
     w.retainedSkipped += cpu.retainedSkipped;
     w.retainedSteady += cpu.retainedSteady;
     w.retainedPinned += cpu.retainedPinned;
+    w.retainedV2Replays += cpu.retainedV2Replays;
     w.retainedMoved += cpu.retainedMoved;
+    w.retainedAwake += cpu.retainedAwake;
+    w.retainedReleased += cpu.retainedReleased;
+    w.retainedV3Replays += cpu.retainedV3Replays;
     w.sceneDirect += cpu.sceneDirect;
     w.sceneLegacy += cpu.sceneLegacy;
     w.sceneCreated += cpu.sceneCreated;
@@ -301,6 +308,15 @@ namespace dxvk {
     w.transientBuiltBlocked += cpu.transientBuiltBlocked;
     w.sceneServiced += cpu.sceneServiced;
     w.lightSlotsUploaded += cpu.lightSlotsUploaded;
+    w.d3d9CommitMs.push_back(float(cpu.d3d9CommitMs));
+    w.d3d9FutureWaitMs.push_back(float(cpu.d3d9FutureWaitMs));
+    w.d3d9SkyTerrainMs.push_back(float(cpu.d3d9SkyTerrainMs));
+    w.d3d9SubmitMs.push_back(float(cpu.d3d9SubmitMs));
+    w.d3d9PreserveMs.push_back(float(cpu.d3d9PreserveMs));
+    w.d3d9DynamicMs.push_back(float(cpu.d3d9DynamicMs));
+    w.d3d9GeometryMs.push_back(float(cpu.d3d9GeometryMs));
+    w.d3d9InstanceMs.push_back(float(cpu.d3d9InstanceMs));
+    w.d3d9Commits += cpu.d3d9Commits;
     for (uint32_t i = 0; i < cpu.prepPhases && i < kMaxPrepPhases; ++i) {
       w.prepMs[i].push_back(float(cpu.prepMs[i]));
     }
@@ -317,6 +333,27 @@ namespace dxvk {
     w.changes.surfaceBytes += c.surfaceBytes;
     w.changes.ommBakedKTris += c.ommBakedKTris;
     w.changes.ommBuiltKTris += c.ommBuiltKTris;
+
+    // An interval whose displacement settings changed part way mixes two configs (and its GPU samples,
+    // read back 8+ frames late, lag the change): logInterval marks it so the A/B ladder drops it.
+    {
+      DispConfig d;
+      d.mode = uint32_t(RtxOptions::Displacement::mode());
+      d.shell = SccrShellManager::enable();
+      d.shellMaxDistance = SccrShellManager::maxDistance();
+      d.maxSteps = SccrShellManager::maxSteps();
+      d.maxPrisms = SccrShellManager::maxPrisms();
+      d.shellShadows = SccrShellManager::shadows();
+      d.maxShadowPrisms = SccrShellManager::maxShadowPrisms();
+      d.liveWeights = RtxOptions::Displacement::terrainLiveWeights();
+      if (!w.dispSet) {
+        w.disp = d;
+        w.dispSet = true;
+      } else if (!(d == w.disp)) {
+        w.disp = d;
+        w.dispChanged = true;
+      }
+    }
 
     // Spike detection (the first frames of a window have a thin median; need 15 frames of history).
     const float threshold = std::max(spikeThresholdMs(), spikeMedianMultiplier() > 0.f ? spikeMedianMultiplier() * r.medianMs : 0.f);
@@ -340,10 +377,346 @@ namespace dxvk {
       }
     }
 
-    if (w.frames >= std::max(1u, detailedLogIntervalFrames())) {
-      logInterval(ctx);
+    switch (costTestFrame()) {
+    case CostTestAction::NotRunning:
+      if (w.frames >= std::max(1u, detailedLogIntervalFrames())) {
+        logInterval(ctx);
+        startWindow();
+      }
+      break;
+    case CostTestAction::Running:
+      break;
+    case CostTestAction::RestartWindow:
       startWindow();
+      break;
+    case CostTestAction::LogAndRestart:
+      logInterval(ctx);
+      if (m_ctSummaryPending) {
+        m_ctSummaryPending = false;
+        costTestLogSummary();
+      }
+      startWindow();
+      break;
     }
+  }
+
+  // rtx.profile.sccrCostTest. Each step: apply its settings (deferred: they resolve at the end of this
+  // frame), drop sccrCostTestSettleFrames frames (shell data rebuilds, GPU samples of the old settings read
+  // back late), then measure sccrCostTestStepFrames frames as one log interval, labelled by a [SccrCostTest] line.
+  namespace {
+    constexpr const char* kCostTestStepNames[] = {
+      "everything on", "shell self-shadows off", "shell tracing off" };
+    // The A/B test's step names, written while it is not running (g_costTestProgress 0), read by the dev menu.
+    char g_abStepNames[RtxPerfLog::kTestMaxSteps][96] = {};
+    // 0: not running; else 1 + cycle * steps + step. g_costTestShape: steps in the low 8 bits, cycles above, and bit 31
+    // for the A/B test.
+    std::atomic<uint32_t> g_costTestProgress { 0 };
+    std::atomic<uint32_t> g_costTestShape { 0 };
+    constexpr uint32_t kShapeAb = 1u << 31;
+
+    std::string trimmed(const std::string& s) {
+      const size_t b = s.find_first_not_of(" \t");
+      const size_t e = s.find_last_not_of(" \t");
+      return b == std::string::npos ? std::string() : s.substr(b, e - b + 1);
+    }
+
+    void setOptionValue(RtxOptionImpl* option, const std::string& name, const std::string& value) {
+      Config config;
+      config.setOptionMove(std::string(name), std::string(value));
+      std::lock_guard lock { RtxOptionImpl::getUpdateMutex() };
+      option->readOption(config, RtxOptionLayer::getUserLayer());
+    }
+
+    float medianOf(std::vector<float> v) {
+      if (v.empty()) {
+        return 0.f;
+      }
+      std::sort(v.begin(), v.end());
+      const size_t n = v.size();
+      return n % 2 ? v[n / 2] : 0.5f * (v[n / 2 - 1] + v[n / 2]);
+    }
+  }
+
+  bool RtxPerfLog::sccrCostTestProgress(uint32_t& cycle, uint32_t& cycles, uint32_t& step, uint32_t& steps,
+                                        const char*& stepName) {
+    const uint32_t p = g_costTestProgress.load(std::memory_order_relaxed);
+    const uint32_t shape = g_costTestShape.load(std::memory_order_relaxed);
+    steps = shape & 0xFFu;
+    if (p == 0 || steps == 0) {
+      return false;
+    }
+    cycles = (shape & ~kShapeAb) >> 8;
+    cycle = (p - 1) / steps;
+    step = (p - 1) % steps;
+    stepName = (shape & kShapeAb) != 0 ? g_abStepNames[std::min(step, kTestMaxSteps - 1)] : kCostTestStepNames[step % kCostTestSteps];
+    return true;
+  }
+
+  // sccrAbTestOption: "name" (a bool, False/True) or "name=A/B", separated by commas. False (logged) when an option is
+  // unknown, a bare name is not a bool, or there are none or too many.
+  bool RtxPerfLog::abParse(const std::string& list) {
+    m_ctAbOptions.clear();
+    size_t start = 0;
+    while (start <= list.size()) {
+      const size_t comma = std::min(list.find(',', start), list.size());
+      const std::string item = trimmed(list.substr(start, comma - start));
+      start = comma + 1;
+      if (item.empty()) {
+        continue;
+      }
+      AbOption o;
+      const size_t eq = item.find('=');
+      o.name = trimmed(item.substr(0, eq));
+      RtxOptionImpl* option = RtxOptionImpl::getOptionByFullName(o.name);
+      if (option == nullptr) {
+        Logger::info(str::format("[SccrCostTest] not started: no option '", o.name, "'"));
+        return false;
+      }
+      if (eq == std::string::npos) {
+        if (option->getType() != OptionType::Bool) {
+          Logger::info(str::format("[SccrCostTest] not started: '", o.name, "' is not a bool option (give name=A/B)"));
+          return false;
+        }
+        o.a = "False";
+        o.b = "True";
+      } else {
+        const std::string values = item.substr(eq + 1);
+        const size_t slash = values.find('/');
+        if (slash == std::string::npos) {
+          Logger::info(str::format("[SccrCostTest] not started: '", item, "' needs name=A/B"));
+          return false;
+        }
+        o.a = trimmed(values.substr(0, slash));
+        o.b = trimmed(values.substr(slash + 1));
+      }
+      o.saved = option->getResolvedValueAsString();
+      m_ctAbOptions.push_back(std::move(o));
+    }
+    if (m_ctAbOptions.empty() || m_ctAbOptions.size() > kAbTestMaxOptions) {
+      Logger::info(str::format("[SccrCostTest] not started: sccrAbTestOption names ", m_ctAbOptions.size(), " options (1 to ",
+                               kAbTestMaxOptions, ")"));
+      return false;
+    }
+    const size_t n = m_ctAbOptions.size();
+    for (uint32_t s = 0; s < steps(); ++s) {
+      std::string name = n == 1 ? (s == 0 ? "A: " + m_ctAbOptions[0].a : "B: " + m_ctAbOptions[0].b)
+                       : s == 0 ? std::string("A: every option at A")
+                       : s == n + 1 ? std::string("all options at B")
+                       : str::format("B: ", m_ctAbOptions[s - 1].name, " = ", m_ctAbOptions[s - 1].b);
+      snprintf(g_abStepNames[s], sizeof(g_abStepNames[s]), "%s", name.c_str());
+    }
+    return true;
+  }
+
+  std::string RtxPerfLog::abSummary() const {
+    std::string s;
+    for (const AbOption& o : m_ctAbOptions) {
+      s += str::format(s.empty() ? "" : ", ", o.name, " ", o.a, "/", o.b, " (was ", o.saved, ")");
+    }
+    return s;
+  }
+
+  uint32_t RtxPerfLog::cycles() const {
+    return std::max(1u, m_ctAb ? sccrAbTestCycles() : sccrCostTestCycles());
+  }
+
+  void RtxPerfLog::costTestApplyStep(uint32_t step) {
+    if (m_ctAb) {
+      // The A/B runs on full shell tracing (the cost test's first step), whatever the menu had.
+      SccrShellManager::enableObject().setDeferred(true);
+      const uint32_t n = uint32_t(m_ctAbOptions.size());
+      for (uint32_t i = 0; i < n; ++i) {
+        const bool b = n == 1 ? step == 1 : (step == n + 1 || step == i + 1);
+        if (RtxOptionImpl* option = RtxOptionImpl::getOptionByFullName(m_ctAbOptions[i].name)) {
+          setOptionValue(option, m_ctAbOptions[i].name, b ? m_ctAbOptions[i].b : m_ctAbOptions[i].a);
+        }
+      }
+    } else {
+      SccrShellManager::enableObject().setDeferred(step < 2);
+      SccrShellManager::shadowsObject().setDeferred(step < 1);
+    }
+    g_costTestShape.store(steps() | (cycles() << 8) | (m_ctAb ? kShapeAb : 0u), std::memory_order_relaxed);
+    g_costTestProgress.store(1 + m_ctCycle * steps() + step, std::memory_order_relaxed);
+  }
+
+  void RtxPerfLog::costTestFinish(const char* why) {
+    if (m_ctAb) {
+      for (const AbOption& o : m_ctAbOptions) {
+        if (RtxOptionImpl* option = RtxOptionImpl::getOptionByFullName(o.name)) {
+          setOptionValue(option, o.name, o.saved);
+        }
+      }
+    }
+    SccrShellManager::enableObject().setDeferred(m_ctSavedShell);
+    SccrShellManager::shadowsObject().setDeferred(m_ctSavedShadows);
+    if (sccrCostTest()) {
+      sccrCostTestObject().setDeferred(false);
+    }
+    if (sccrAbTest()) {
+      sccrAbTestObject().setDeferred(false);
+    }
+    m_ctState = CostTestState::Idle;
+    g_costTestProgress.store(0, std::memory_order_relaxed);
+    if (why != nullptr) {
+      Logger::info(str::format("[SccrCostTest] stopped (", why, ") in cycle ", m_ctCycle + 1, " step ", m_ctStep + 1,
+                               "; shell settings restored", m_ctAb ? ", and the options' values" : ""));
+    }
+  }
+
+  RtxPerfLog::CostTestAction RtxPerfLog::costTestFrame() {
+    const bool wanted = m_ctState == CostTestState::Idle ? (sccrCostTest() || sccrAbTest())
+                                                         : (m_ctAb ? sccrAbTest() : sccrCostTest());
+    const bool sccr = RtxOptions::Displacement::mode() == DisplacementMode::SCCR;
+    if (m_ctState == CostTestState::Idle) {
+      if (!wanted) {
+        return CostTestAction::NotRunning;
+      }
+      m_ctAb = !sccrCostTest();
+      if (!sccr) {
+        Logger::info("[SccrCostTest] not started: the displacement mode is not SCCR");
+        sccrCostTestObject().setDeferred(false);
+        sccrAbTestObject().setDeferred(false);
+        return CostTestAction::NotRunning;
+      }
+      if (m_ctAb && !abParse(sccrAbTestOption())) {
+        sccrAbTestObject().setDeferred(false);
+        return CostTestAction::NotRunning;
+      }
+      m_ctSavedShell = SccrShellManager::enable();
+      m_ctSavedShadows = SccrShellManager::shadows();
+      for (uint32_t s = 0; s < kTestMaxSteps; ++s) {
+        m_ctTotalP50[s].clear();
+        m_ctStageP50[s].clear();
+      }
+      m_ctCycle = 0;
+      m_ctStep = 0;
+      m_ctFrames = 0;
+      m_ctSummaryPending = false;
+      m_ctState = CostTestState::Settle;
+      costTestApplyStep(0);
+      Logger::info(str::format("[SccrCostTest] start",
+                               m_ctAb ? str::format(" A/B of ", abSummary()) : std::string(),
+                               ": ", cycles(), " cycles x ", steps(), " steps, ", std::max(1u, sccrCostTestStepFrames()),
+                               " measured frames each after ", sccrCostTestSettleFrames(), " settle frames"));
+      return CostTestAction::Running;
+    }
+    if (!wanted || !sccr) {
+      costTestFinish(!wanted ? "turned off" : "displacement mode left SCCR");
+      return CostTestAction::RestartWindow;
+    }
+    ++m_ctFrames;
+    if (m_ctState == CostTestState::Settle) {
+      if (m_ctFrames < sccrCostTestSettleFrames()) {
+        return CostTestAction::Running;
+      }
+      m_ctState = CostTestState::Measure;
+      m_ctFrames = 0;
+      return CostTestAction::RestartWindow;
+    }
+    if (m_ctFrames < std::max(1u, sccrCostTestStepFrames())) {
+      return CostTestAction::Running;
+    }
+
+    // The step is measured: keep its p50s for the summary, label the interval logInterval writes next.
+    const Window& w = m_w;
+    m_ctTotalP50[m_ctStep].push_back(percentiles(w.gpuMeasuredMs).p50);
+    std::vector<float> stages(w.gpuStageMs.size(), 0.f);
+    for (size_t i = 0; i < w.gpuStageMs.size(); ++i) {
+      stages[i] = percentiles(w.gpuStageMs[i]).p50;
+    }
+    m_ctStageP50[m_ctStep].push_back(std::move(stages));
+    Logger::info(str::format("[SccrCostTest] cycle ", m_ctCycle + 1, "/", cycles(), " step ", m_ctStep + 1, "/", steps(),
+                             " '", m_ctAb ? g_abStepNames[m_ctStep] : kCostTestStepNames[m_ctStep], "': ", w.frames,
+                             " frames, ", w.gpuSamples, " GPU samples, Remix GPU p50 ", f2(m_ctTotalP50[m_ctStep].back()),
+                             " ms (block below)"));
+    if (++m_ctStep == steps()) {
+      m_ctStep = 0;
+      ++m_ctCycle;
+    }
+    if (m_ctCycle >= cycles()) {
+      m_ctSummaryPending = true;
+      costTestFinish(nullptr);
+    } else {
+      m_ctState = CostTestState::Settle;
+      m_ctFrames = 0;
+      costTestApplyStep(m_ctStep);
+    }
+    return CostTestAction::LogAndRestart;
+  }
+
+  void RtxPerfLog::costTestLogSummary() {
+    const size_t cycles = m_ctTotalP50[0].size();
+    // What each feature costs, per cycle (neighbouring steps of one cycle, so slow drift cancels), then the median and
+    // the range over the cycles.
+    const auto costOf = [&](uint32_t on, uint32_t off) {
+      std::vector<float> d;
+      for (size_t c = 0; c < cycles && c < m_ctTotalP50[off].size(); ++c) {
+        d.push_back(m_ctTotalP50[on][c] - m_ctTotalP50[off][c]);
+      }
+      std::string s = f2(medianOf(d));
+      if (!d.empty()) {
+        s += str::format(" (", f2(*std::min_element(d.begin(), d.end())), " to ", f2(*std::max_element(d.begin(), d.end())), ")");
+      }
+      return s;
+    };
+    if (m_ctAb && m_ctAbOptions.size() <= 1) {
+      Logger::info(str::format("[SccrCostTest] A/B done, ", cycles, " cycles of ", abSummary(),
+        ": Remix GPU p50 (median over cycles) A ", f2(medianOf(m_ctTotalP50[0])), ", B ", f2(medianOf(m_ctTotalP50[1])),
+        " ms; B - A per cycle, median (min to max): ", costOf(1, 0), " ms (negative: B is faster)"));
+    } else if (m_ctAb) {
+      const uint32_t n = uint32_t(m_ctAbOptions.size());
+      Logger::info(str::format("[SccrCostTest] A/B done, ", cycles, " cycles of ", n, " options; Remix GPU p50 with every "
+        "option at A (median over cycles): ", f2(medianOf(m_ctTotalP50[0])), " ms. Each at B minus every one at A, per "
+        "cycle, median (min to max), negative: B is faster:"));
+      for (uint32_t i = 0; i < n; ++i) {
+        Logger::info(str::format("[SccrCostTest]   ", m_ctAbOptions[i].name, " ", m_ctAbOptions[i].a, " -> ",
+                                 m_ctAbOptions[i].b, ": ", costOf(i + 1, 0), " ms"));
+      }
+      Logger::info(str::format("[SccrCostTest]   all options at B: ", costOf(n + 1, 0), " ms"));
+    } else {
+    Logger::info(str::format("[SccrCostTest] done, ", cycles, " cycles. Remix GPU p50 per step (median over cycles): ",
+      "1 everything on ", f2(medianOf(m_ctTotalP50[0])), ", 2 shell self-shadows off ", f2(medianOf(m_ctTotalP50[1])),
+      ", 3 shell off ", f2(medianOf(m_ctTotalP50[2])), " ms"));
+    Logger::info(str::format("[SccrCostTest] cost in ms, median (min to max) over cycles: shell self-shadows ", costOf(0, 1),
+      ", shell march ", costOf(1, 2), ", whole shell ", costOf(0, 2)));
+    }
+
+    // Per stage: the median p50 of each step, for stages whose steps differ by 0.05 ms or more, largest change first.
+    size_t labels = 0;
+    const uint32_t stepCount = steps();
+    for (uint32_t s = 0; s < stepCount; ++s) {
+      for (const auto& v : m_ctStageP50[s]) {
+        labels = std::max(labels, v.size());
+      }
+    }
+    struct Row { size_t idx; float step[kTestMaxSteps]; float spread; };
+    std::vector<Row> rows;
+    for (size_t i = 0; i < labels && i < m_labels.size(); ++i) {
+      Row row { i, {}, 0.f };
+      float lo = FLT_MAX, hi = -FLT_MAX;
+      for (uint32_t s = 0; s < stepCount; ++s) {
+        std::vector<float> v;
+        for (const auto& cycle : m_ctStageP50[s]) {
+          v.push_back(i < cycle.size() ? cycle[i] : 0.f);
+        }
+        row.step[s] = medianOf(v);
+        lo = std::min(lo, row.step[s]);
+        hi = std::max(hi, row.step[s]);
+      }
+      row.spread = hi - lo;
+      if (row.spread >= 0.05f) {
+        rows.push_back(row);
+      }
+    }
+    std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.spread > b.spread; });
+    std::string line = m_ctAb ? "[SccrCostTest] stages, ms per step (in step order):" : "[SccrCostTest] stages, steps 1/2/3/4/5 ms:";
+    for (const Row& row : rows) {
+      line += str::format(" ", m_labels[row.idx], "=", f2(row.step[0]));
+      for (uint32_t s = 1; s < stepCount; ++s) {
+        line += str::format("/", f2(row.step[s]));
+      }
+    }
+    Logger::info(line);
   }
 
   void RtxPerfLog::emitSpike(const FrameRec& r, const std::vector<const char*>& labels) {
@@ -352,6 +725,10 @@ namespace dxvk {
       if (r.cpu.prepMs[i] >= 0.5) {
         cpu += str::format(" prep.", SceneManager::kPrepPhaseNames[i], "=", f2(r.cpu.prepMs[i]));
       }
+    }
+    if (r.cpu.d3d9Commits != 0) {
+      cpu += str::format(" d3d9Commit=", f2(r.cpu.d3d9CommitMs), "(", r.cpu.d3d9Commits, ") d3d9.futureWait=", f2(r.cpu.d3d9FutureWaitMs),
+                         " d3d9.preserve=", f2(r.cpu.d3d9PreserveMs), " d3d9.dynamic=", f2(r.cpu.d3d9DynamicMs));
     }
     cpu += str::format(" retained=", f2(r.cpu.retainedMs), " apiDraws=", f2(r.cpu.apiDrawMs), "(", r.cpu.apiDraws, ")",
                        " texUpload=", f2(r.cpu.texUploadMs), " flush=", f2(r.cpu.flushMs), "(", r.cpu.flushes, ")",
@@ -417,6 +794,13 @@ namespace dxvk {
       " | spikes=", w.spikes, " logged=", w.spikesLogged,
       " | gpuStalls=", stalls, " longestFenceWaitMs=", perf::g_gpuStallMaxWaitMs.load(std::memory_order_relaxed)));
 
+    // The settings at the end of the interval; mixed=1 when they changed during it.
+    const DispConfig& d = w.disp;
+    Logger::info(str::format("[PerfDisp] mixed=", w.dispChanged ? 1 : 0, " mode=", d.mode, " (2 Quadtree, 3 SCCR)",
+      " shell=", d.shell ? 1 : 0, " shellShadows=", d.shellShadows ? 1 : 0, " liveWeights=", d.liveWeights ? 1 : 0,
+      " maxDistance=", f2(d.shellMaxDistance), " maxSteps=", d.maxSteps, " maxPrisms=", d.maxPrisms,
+      " maxShadowPrisms=", d.maxShadowPrisms));
+
     // GPU stages sorted by p50, all stages with p95 >= 0.05 ms.
     if (w.gpuSamples > 0) {
       struct Row { size_t idx; Pct p; };
@@ -453,10 +837,21 @@ namespace dxvk {
            str::format(" flushesPerFrame=", f2(double(w.flushes) / n)) +
            triple("flush.end", w.flushEndMs) + triple("flush.submitWait", w.flushSubmitMs) + triple("flush.begin", w.flushBeginMs) +
            triple("retained.full", w.retainedFullMs) +
+           triple("d3d9Commit", w.d3d9CommitMs) + str::format(" d3d9CommitsPerFrame=", f2(double(w.d3d9Commits) / n)) +
+           triple("d3d9.futureWait", w.d3d9FutureWaitMs) + triple("d3d9.skyTerrain", w.d3d9SkyTerrainMs) +
+           triple("d3d9.submit", w.d3d9SubmitMs) + triple("d3d9.preserve", w.d3d9PreserveMs) +
+           triple("d3d9.dynamic", w.d3d9DynamicMs) + triple("d3d9.dynamic.geometry", w.d3d9GeometryMs) +
+           triple("d3d9.dynamic.instance", w.d3d9InstanceMs) +
            str::format(" retainedPerFrame=full:", f2(double(w.retainedFull) / n), ",preserved:", f2(double(w.retainedPreserved) / n),
                        ",skipped:", f2(double(w.retainedSkipped) / n), ",steady:", f2(double(w.retainedSteady) / n),
                        ",pinned:", f2(double(w.retainedPinned) / n),
-                       ",moved:", f2(double(w.retainedMoved) / n),
+                       // rtx.retained.useV2: which implementation ran the window's replays, and its own counts.
+                       // rtx.scene.directRetained (v3): the scene's direct lane with the first implementation as legacy.
+                       ",impl:", w.retainedV3Replays * 2 >= w.frames && w.retainedV3Replays != 0 ? "v3"
+                         : (w.retainedV2Replays == 0 && w.retainedV3Replays == 0 ? "v1"
+                         : (w.retainedV2Replays * 2 >= w.frames ? "v2" : "mixed")),
+                       ",moved:", f2(double(w.retainedMoved) / n), ",awake:", f2(double(w.retainedAwake) / n),
+                       ",released:", f2(double(w.retainedReleased) / n),
                        ",direct:", f2(double(w.sceneDirect) / n), ",legacy:", f2(double(w.sceneLegacy) / n),
                        ",created:", f2(double(w.sceneCreated) / n), ",settled:", f2(double(w.sceneSettled) / n),
                        ",ommPending:", f2(double(w.sceneOmmPending) / n), ",serviced:", f2(double(w.sceneServiced) / n)) +

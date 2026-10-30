@@ -414,6 +414,8 @@ namespace dxvk {
     }
     if (m_rayReconstructionContext) {
       const auto optimalSettings = m_rayReconstructionContext->queryOptimalSettings(displaySize, perfQuality);
+      logRenderSize("DLSS-RR", mActualProfile, displaySize, optimalSettings.optimalRenderSize,
+                    optimalSettings.minRenderSize, optimalSettings.maxRenderSize);
 
       mInputSize[0] = outRenderSize[0] = optimalSettings.optimalRenderSize[0];
       mInputSize[1] = outRenderSize[1] = optimalSettings.optimalRenderSize[1];

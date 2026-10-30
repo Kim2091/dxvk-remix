@@ -9,6 +9,8 @@
 #include "../dxvk_image.h"
 #include "../dxvk_objects.h"
 #include "../imgui/imgui.h"
+#include "../../d3d11/d3d11_include.h"
+#include "../../d3d9/d3d9_include.h"
 
 #include "../../util/log/log.h"
 #include "../../util/util_filesys.h"
@@ -639,9 +641,25 @@ namespace dxvk {
     g_apiVersion = apiVersion;
   }
 
-  void ApiRecorder::onDeviceRegistered(bool d3d11, uint32_t width, uint32_t height) {
+  void ApiRecorder::onDeviceRegistered(bool d3d11, IDirect3DDevice9Ex* d3d9Device) {
     if (!enable()) {
       return;
+    }
+    uint32_t width = 0, height = 0;
+    IDirect3DSwapChain9* swapchain = nullptr;
+    if (d3d9Device && SUCCEEDED(d3d9Device->GetSwapChain(0, &swapchain)) && swapchain) {
+      D3DPRESENT_PARAMETERS params {};
+      if (SUCCEEDED(swapchain->GetPresentParameters(&params))) {
+        width = params.BackBufferWidth;
+        height = params.BackBufferHeight;
+        // The presented size follows the window's client area, which the OS may have clamped.
+        RECT client {};
+        if (params.hDeviceWindow && GetClientRect(params.hDeviceWindow, &client) && client.right > client.left && client.bottom > client.top) {
+          width = uint32_t(client.right - client.left);
+          height = uint32_t(client.bottom - client.top);
+        }
+      }
+      swapchain->Release();
     }
     std::lock_guard lock { g_mutex };
     if (g_session) {
@@ -1073,18 +1091,23 @@ namespace dxvk {
     return result;
   }
 
-  remixapi_ErrorCode ApiRecorder::RenderD3D11(PFN_remixapi_RenderD3D11 fn, void* destination, remixapi_Bool render,
-                                             const TargetDesc& target) {
+  remixapi_ErrorCode ApiRecorder::RenderD3D11(PFN_remixapi_RenderD3D11 fn, void* destination, remixapi_Bool render) {
     pollMarkerHotkey();
     const auto result = REC_CALL(destination, render);
     if (result != REMIXAPI_ERROR_CODE_SUCCESS) {
       return result;
     }
+    D3D11_TEXTURE2D_DESC desc {};
+    ID3D11Texture2D* texture = nullptr;
+    if (destination && SUCCEEDED(static_cast<IUnknown*>(destination)->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&texture)))) {
+      texture->GetDesc(&desc);
+      texture->Release();
+    }
     if (Rec rec { Op::RenderD3D11, result, kFlagFrameEnd }) {
       rec.w().pod(uint32_t(render));
-      rec.w().pod(target.width);
-      rec.w().pod(target.height);
-      rec.w().pod(target.format);
+      rec.w().pod(uint32_t(desc.Width));
+      rec.w().pod(uint32_t(desc.Height));
+      rec.w().pod(uint32_t(desc.Format));
     }
     return result;
   }
@@ -1364,10 +1387,54 @@ namespace dxvk {
     return result;
   }
 
-  void ApiRecorder::recordDxvkInterop(DxvkCall which, remixapi_ErrorCode result) {
-    if (Rec rec { Op::DxvkInterop, result, kFlagMarker }) {
-      rec.w().pod(uint32_t(which));
+  namespace {
+    void dxvkMarker(DxvkCall which, remixapi_ErrorCode result) {
+      if (Rec rec { Op::DxvkInterop, result, kFlagMarker }) {
+        rec.w().pod(uint32_t(which));
+      }
     }
+  }
+
+  remixapi_ErrorCode ApiRecorder::dxvk_CreateD3D9(PFN_remixapi_dxvk_CreateD3D9 fn, remixapi_Bool editorModeEnabled, IDirect3D9Ex** out) {
+    const auto result = REC_CALL(editorModeEnabled, out);
+    dxvkMarker(DxvkCall::CreateD3D9, result);
+    return result;
+  }
+
+  remixapi_ErrorCode ApiRecorder::dxvk_GetExternalSwapchain(PFN_remixapi_dxvk_GetExternalSwapchain fn, uint64_t* image, uint64_t* renderingDone, uint64_t* resume) {
+    const auto result = REC_CALL(image, renderingDone, resume);
+    dxvkMarker(DxvkCall::GetExternalSwapchain, result);
+    return result;
+  }
+
+  remixapi_ErrorCode ApiRecorder::dxvk_GetVkImage(PFN_remixapi_dxvk_GetVkImage fn, IDirect3DSurface9* source, uint64_t* out) {
+    const auto result = REC_CALL(source, out);
+    dxvkMarker(DxvkCall::GetVkImage, result);
+    return result;
+  }
+
+  remixapi_ErrorCode ApiRecorder::dxvk_CopyRenderingOutput(PFN_remixapi_dxvk_CopyRenderingOutput fn, IDirect3DSurface9* destination, remixapi_dxvk_CopyRenderingOutputType type) {
+    const auto result = REC_CALL(destination, type);
+    dxvkMarker(DxvkCall::CopyRenderingOutput, result);
+    return result;
+  }
+
+  remixapi_ErrorCode ApiRecorder::dxvk_SetDefaultOutput(PFN_remixapi_dxvk_SetDefaultOutput fn, remixapi_dxvk_CopyRenderingOutputType type, const remixapi_Float4D* color) {
+    const auto result = REC_CALL(type, color);
+    dxvkMarker(DxvkCall::SetDefaultOutput, result);
+    return result;
+  }
+
+  remixapi_ErrorCode ApiRecorder::dxvk_GetTextureHash(PFN_remixapi_dxvk_GetTextureHash fn, IDirect3DTexture9* texture, uint64_t* out) {
+    const auto result = REC_CALL(texture, out);
+    dxvkMarker(DxvkCall::GetTextureHash, result);
+    return result;
+  }
+
+  remixapi_ErrorCode ApiRecorder::dxvk_GetSharedD3D11TextureHandle(PFN_remixapi_dxvk_GetSharedD3D11TextureHandle fn, void** handle, uint32_t* width, uint32_t* height) {
+    const auto result = REC_CALL(handle, width, height);
+    dxvkMarker(DxvkCall::GetSharedD3D11TextureHandle, result);
+    return result;
   }
 
 #undef REC_CALL

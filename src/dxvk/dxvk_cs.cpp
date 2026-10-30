@@ -6,7 +6,6 @@
 // NV-DXVK end
 
 #include "../tracy/TracyC.h"
-#include "../util/util_stress.h"
 
 namespace dxvk {
   
@@ -201,7 +200,6 @@ namespace dxvk {
         
         if (chunk) {
           m_context->addStatCtr(DxvkStatCounter::CsChunkCount, 1);
-          stress::delay(stress::Site::CsChunk);
           const auto t0 = dxvk::high_resolution_clock::now();
           chunk->executeAll(m_context.ptr());
           const auto t1 = dxvk::high_resolution_clock::now();

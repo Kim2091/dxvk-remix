@@ -133,6 +133,10 @@ struct ShadowTerminatorArgs
 
 #define OBJECT_PICKING_INVALID (cb.clearColorPicking)
 
+// RaytraceArgs::pomSccrTerrainArgs.
+#define POM_SCCR_TERRAIN_MAX_LAYERS_MASK 0xFFu
+#define POM_SCCR_TERRAIN_FLAG_LIVE_WEIGHTS 0x100u
+
 // Constant buffer
 struct RaytraceArgs {
   // NOTE: this class should be kept as all structs, then all non-structs.  This is because the padding rules are different between C++ and shaders.
@@ -420,13 +424,17 @@ struct RaytraceArgs {
   float pomSccrIndirectShadowFootprintScale;
   // rtx.displacement.enableDepthOffset: depth and motion at the relief point.
   uint pomSccrDepthOffset;
-  // The SCCR shell march (rtx.displacement.shell.*, SccrShellManager): the hand-off distance in world units (0 turns
-  // the march off), the most prisms crossed and steps taken per march, and its switches (SCCR_SHELL_MARCH_FLAG_*,
-  // sccr_shell_args.h, with the shadow march's prism budget in bits 8-15).
+  // The prism march (rtx.displacement.shell.*, SccrShellManager): the hand-off distance in
+  // world units (0: shell tracing off, not SCCR, or no reference density), the most prisms crossed and steps taken per
+  // march, and its switches (SCCR_SHELL_MARCH_FLAG_*, sccr_shell_args.h; bits 8-15 the shadow march's prism budget).
+  // Four dwords, so every field after them keeps its offset modulo 16.
   float pomSccrShellMaxDistance;
   uint pomSccrShellMaxPrisms;
   uint pomSccrShellMaxSteps;
   uint pomSccrShellFlags;
+  // Bits 0-7 rtx.displacement.terrainMaxLayers (0 = every layer), bit 8
+  // rtx.displacement.terrainLiveWeights (POM_SCCR_TERRAIN_*, pom_sccr_terrain.slangh).
+  uint pomSccrTerrainArgs;
   uint enableSssTransmission;
   uint enableSssTransmissionSingleScattering;
   uint sssTransmissionBsdfSampleCount;
@@ -558,6 +566,10 @@ struct RaytraceArgs {
   // softOmmFlags: SOFT_OMM_FLAG_* (software_omm_shared.h).
   uint surfaceSoftOmmTable;
   uint softOmmFlags;
+
+  // rtx.resolveKeepsCoplanarSurfaces. 1 = a ray query resolve iteration after a cut-out texel skips only the
+  // triangle passed instead of starting behind its plane (resolve_expanded.slangh).
+  uint resolveKeepsCoplanarSurfaces;
 
   // NOTE: Add structs to the top section of RaytraceArgs, not the bottom.
   // NOTE: bool does not work in debug builds, use uint instead.

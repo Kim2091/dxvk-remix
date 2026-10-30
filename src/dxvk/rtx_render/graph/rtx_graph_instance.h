@@ -36,7 +36,7 @@ struct ScenePrimOwner {
   struct Slot {
     PrimInstance::Type type = PrimInstance::Type::None;
     uint32_t submesh = 0;       // Instance: the entry's submesh
-    RtLight* light = nullptr;   // Light: the entry's light, owned by the entry
+    RtLight* light = nullptr;   // Light: the object's light, owned by the frontend
   };
   const RetainedScene* scene = nullptr;
   uint64_t handle = 0;          // 0 = the graph instance has no scene owner

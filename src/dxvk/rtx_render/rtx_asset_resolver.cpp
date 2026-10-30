@@ -32,8 +32,11 @@ namespace dxvk {
   template<size_t Size, size_t Expected> struct CheckMaterialKeyFields {
     static_assert(Size == Expected, "a material struct changed: check whether its hashed fields (material keys) changed");
   };
-  [[maybe_unused]] CheckMaterialKeyFields<sizeof(OpaqueMaterialData), 704> kOpaqueKeyFields;
-  [[maybe_unused]] CheckMaterialKeyFields<sizeof(TranslucentMaterialData), 208> kTranslucentKeyFields;
-  [[maybe_unused]] CheckMaterialKeyFields<sizeof(RayPortalMaterialData), 136> kPortalKeyFields;
+  // 16 bytes more than upstream (704 / 208 / 136) in every material struct, because the shared material
+  // macro adds m_forkFnvFlags and m_terrainLayers (rtx_material_data.h). Both are folded into the hash only when set,
+  // so materials without them keep their upstream keys.
+  [[maybe_unused]] CheckMaterialKeyFields<sizeof(OpaqueMaterialData), 720> kOpaqueKeyFields;
+  [[maybe_unused]] CheckMaterialKeyFields<sizeof(TranslucentMaterialData), 224> kTranslucentKeyFields;
+  [[maybe_unused]] CheckMaterialKeyFields<sizeof(RayPortalMaterialData), 152> kPortalKeyFields;
 
 } // namespace dxvk

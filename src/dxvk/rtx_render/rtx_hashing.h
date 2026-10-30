@@ -97,6 +97,10 @@ namespace dxvk {
       }
     }
 
+    // The VS bytecode hash of vertex-captured draws, for the identity classifier (rtx_fork_d3d9_identity.h).
+    // It is a side field, never a HashComponent.
+    XXH64_hash_t vertexShaderBytecode = kEmptyHash;
+
     template<uint32_t rule>
     XXH64_hash_t getHashForRule() const {
       switch (rule) {

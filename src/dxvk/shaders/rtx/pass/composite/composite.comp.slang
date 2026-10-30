@@ -936,8 +936,22 @@ vec4 compositeResult(
     const float foregroundDistance = numosKmToWorld(foreground.w, skyArgs);
     const vec3 foregroundVolumeAttenuation = calcVolumetricAttenuation(cb.volumeArgs, none, false,
       foregroundDistance, cameraGetWorldPosition(cb.camera), primaryRayDirections.worldDirection);
-    applyAerialPerspective(pixelCoordinate, false, foregroundDistance, foregroundVolumeAttenuation,
-      saturate(vec3(1.0f) - primaryAttenuation), vec4(0.0f), foregroundRadiance);
+    // The foreground's emission fades by the air up to its own mean depth, and the in-scatter in front of
+    // the foreground's opacity ends at the nearest contributor (foreground.w). One call covers both
+    // when the emission lies at the nearest contributor.
+    // The emission depth is valid only where the foreground holds emission (gbuffer_bindings.slangh).
+    const float emissionDepthKm = any(foregroundRadiance > 0.0f) ? AtmosphereForegroundEmissionDepth[pixelCoordinate] : 0.0f;
+    if (emissionDepthKm > foreground.w * 1.01f) {
+      applyAerialPerspective(pixelCoordinate, false, numosKmToWorld(emissionDepthKm, skyArgs), vec3(1.0f),
+        vec3(0.0f), vec4(0.0f), foregroundRadiance);
+      vec3 foregroundInScatter = vec3(0.0f);
+      applyAerialPerspective(pixelCoordinate, false, foregroundDistance, foregroundVolumeAttenuation,
+        saturate(vec3(1.0f) - primaryAttenuation), vec4(0.0f), foregroundInScatter);
+      foregroundRadiance += foregroundInScatter;
+    } else {
+      applyAerialPerspective(pixelCoordinate, false, foregroundDistance, foregroundVolumeAttenuation,
+        saturate(vec3(1.0f) - primaryAttenuation), vec4(0.0f), foregroundRadiance);
+    }
   }
   vec3 foregroundLayer = vec3(0.0f);
   if (trackSkyLayer && separateForeground) {

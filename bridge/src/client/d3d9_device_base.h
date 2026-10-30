@@ -32,7 +32,6 @@
 #include "shadow_map.h"
 
 #include <array>
-#include <atomic>
 
 class Direct3D9Ex_LSS;
 class Direct3DSwapChain9_LSS;
@@ -196,16 +195,6 @@ protected:
   INT m_gpuThreadPriority;
   UINT m_maxFrameLatency;
 
-  // The device cursor's visibility, which ShowCursor returns and replaces. The runtime starts with FALSE too.
-  BOOL m_cursorVisible = FALSE;
-
-  // The last GetAvailableTextureMem answer from the server, returned until it is kTextureMemRefreshMs old or a Reset
-  // or EvictManagedResources forgets it.
-  static constexpr ULONGLONG kTextureMemRefreshMs = 1000;
-  bool m_textureMemValid = false;
-  UINT m_textureMem = 0;
-  ULONGLONG m_textureMemTick = 0;
-
   struct StateCaptureDirtyFlags {
     // Vertex Decl
     bool vertexDecl;
@@ -328,32 +317,9 @@ protected:
     return false;
   }
 
-  // The outer proxy objects that the app holds in place of this device and its IDirect3D9 (setOuterObjects).
-  // They are not referenced: the proxy clears them before its final release.
-  std::atomic<IDirect3DDevice9*> m_pOuterDevice { nullptr };
-  std::atomic<IDirect3D9*> m_pOuterDirect3D { nullptr };
-
 public:
-  ~BaseDirect3DDevice9Ex_LSS() override;
-
   // The server's device state changed in a way this client cannot follow (StateBlock Apply, Reset).
   void invalidateSentState() {
     m_sentState.invalidateAll();
   }
-
-  // Writes the device that the app sees, with a reference added, for the GetDevice methods of this device's objects.
-  // That is the registered outer device, or this device when none is registered.
-  void reportDevice(IDirect3DDevice9** ppDevice);
-
-  // Writes the registered outer IDirect3D9 with a reference added, for GetDirect3D.
-  // Returns false and writes nothing when none is registered.
-  bool reportOuterDirect3D(IDirect3D9** ppDirect3D);
-
-  // Registers the outer proxy objects that wrap the live client device pInner. Null pointers clear a registration.
-  // Returns false when pInner is not a live device of this client.
-  static bool setOuterObjects(IDirect3DDevice9* pInner, IDirect3DDevice9* pOuterDevice, IDirect3D9* pOuterDirect3D);
-
-protected:
-  // Removes this device from the live devices that setOuterObjects accepts, and clears its outer objects.
-  void unregisterLiveDevice();
 };

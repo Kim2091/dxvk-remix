@@ -46,9 +46,18 @@ namespace dxvk {
       uint64_t s = 0;
       uint32_t bit = 0;
       auto add = [&](const bool v) { s |= (v ? 1ull : 0ull) << bit; bit++; };
+      add(DxvkPathtracerGbuffer::slimVariants());
+      add(DxvkPathtracerIntegrateDirect::slimVariants());
+      add(DxvkPathtracerIntegrateIndirect::slimVariants());
+      add(DxvkPathtracerIntegrateIndirect::slimAssembly());
+      add(DxvkPathtracerIntegrateIndirect::slimNonSharc());
       add(DxvkPathtracerIntegrateIndirect::slimKeepPom());
       add(RtxOptions::FrameFeatures::validate());
       add(RtxOptions::foliageRaysOmm2StateActive());
+      // The direct core forms.
+      add(DxvkPathtracerIntegrateDirect::coreMaterial());
+      add(RtxOptions::CoreMaterial::build());
+      add(RtxOptions::CoreMaterial::legacyRecord());
       return s;
     }
 
@@ -238,7 +247,8 @@ namespace dxvk {
 
   bool variantFallbackActive(RtxContext& ctx) {
     // Without the state cache nothing compiles in the background, so a cold entry would never become ready.
-    return RtxOptions::Shader::slimFallbackWhileCompiling() && ctx.getCommonObjects()->pipelineManager().hasStateCache();
+    return RtxOptions::Shader::slimFallbackWhileCompiling() && RtxOptions::Shader::variantTables() &&
+           ctx.getCommonObjects()->pipelineManager().hasStateCache();
   }
 
   bool RtxContext::isComputeShaderPipelineReady(const Rc<DxvkShader>& shader) {
@@ -296,11 +306,13 @@ namespace dxvk {
   }
 
   void showVariantTablesImguiSettings() {
+    ImGui::BeginDisabled(!RtxOptions::Shader::variantTables());
     RemixGui::Checkbox("Shader Variants: Fall Back While Compiling", &RtxOptions::Shader::slimFallbackWhileCompilingObject());
     RemixGui::SetTooltipToLastWidgetOnHover(
-      "rtx.shader.slimFallbackWhileCompiling. A compute pass binds the chosen variant only once its\n"
+      "rtx.shader.slimFallbackWhileCompiling (needs Variant Tables). A compute pass binds the chosen variant only once its\n"
       "pipeline is compiled; until then it binds the next matching (larger) table entry, so a cold variant does not stall the\n"
       "frame. Same image. [VariantTable] fallback in the log names the entries.");
+    ImGui::EndDisabled();
   }
 
 } // namespace dxvk

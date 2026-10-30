@@ -259,6 +259,7 @@ namespace dxvk
       Resource m_sharedRadianceRG;
       Resource m_sharedRadianceB;
       Resource m_atmosphereForeground;
+      Resource m_atmosphereForegroundEmissionDepth;
       AliasedResource m_sharedIntegrationSurfacePdf;
       Resource m_sharedMaterialData0;
       Resource m_sharedMaterialData1;

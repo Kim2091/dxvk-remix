@@ -7,7 +7,6 @@
 
 #include <remix/remix_c.h>
 
-#include "rtx_fork_api_record_format.h"
 #include "rtx_option.h"
 #include "../../util/rc/util_rc_ptr.h"
 
@@ -61,8 +60,8 @@ namespace dxvk {
     }
 
     static void onInitializeLibrary(uint64_t apiVersion);
-    // width and height are the D3D9 device's output size. D3D11 hosts pass 0 and record it per RenderD3D11.
-    static void onDeviceRegistered(bool d3d11, uint32_t width, uint32_t height);
+    // d3d9Device (D3D9 hosts) gives the recorded output size; D3D11 hosts record it per RenderD3D11.
+    static void onDeviceRegistered(bool d3d11, IDirect3DDevice9Ex* d3d9Device = nullptr);
     // Top of remixapi_Shutdown: ends the recording. End of remixapi_Shutdown: waits (bounded) for its texture files.
     static void onShutdown();
     static void onShutdownDone();
@@ -101,14 +100,7 @@ namespace dxvk {
     static remixapi_ErrorCode CreateTexture(PFN_remixapi_CreateTexture fn, const remixapi_TextureInfo* info, remixapi_TextureHandle* out);
     static remixapi_ErrorCode DestroyTexture(PFN_remixapi_DestroyTexture fn, remixapi_TextureHandle handle);
     static remixapi_ErrorCode Present(PFN_remixapi_Present fn, const remixapi_PresentInfo* info);
-    // The size and DXGI format of a RenderD3D11 destination, which the D3D11 host measures.
-    struct TargetDesc {
-      uint32_t width = 0;
-      uint32_t height = 0;
-      uint32_t format = 0;
-    };
-    static remixapi_ErrorCode RenderD3D11(PFN_remixapi_RenderD3D11 fn, void* destination, remixapi_Bool render,
-                                          const TargetDesc& target);
+    static remixapi_ErrorCode RenderD3D11(PFN_remixapi_RenderD3D11 fn, void* destination, remixapi_Bool render);
     static remixapi_ErrorCode CreateRetainedInstance(PFN_remixapi_CreateRetainedInstance fn, const remixapi_InstanceInfo* info, uint64_t* out);
     static remixapi_ErrorCode CreateRetainedInstances(PFN_remixapi_CreateRetainedInstances fn, const remixapi_InstanceInfo* infos, uint32_t count, uint64_t* out);
     static remixapi_ErrorCode UpdateRetainedInstance(PFN_remixapi_UpdateRetainedInstance fn, uint64_t handle, const remixapi_InstanceInfo* info);
@@ -134,19 +126,15 @@ namespace dxvk {
     static void ClearHostSettings(PFN_remixapi_ClearHostSettings fn);
     static remixapi_ErrorCode RegisterCallbacks(PFN_remixapi_RegisterCallbacks fn, PFN_remixapi_BridgeCallback beginScene, PFN_remixapi_BridgeCallback endScene, PFN_remixapi_BridgeCallback present);
     static remixapi_ErrorCode SetUIState(remixapi_ErrorCode (REMIXAPI_PTR* fn)(remixapi_UIState), remixapi_UIState state);
-
-    // A dxvk_ interop call records a marker with the call and its result, not its arguments.
-    template<typename Fn, typename... Args>
-    static remixapi_ErrorCode dxvkInterop(remix_record::DxvkCall which, Fn fn, Args... args) {
-      t_inCall = true;
-      const remixapi_ErrorCode result = fn(args...);
-      t_inCall = false;
-      recordDxvkInterop(which, result);
-      return result;
-    }
+    static remixapi_ErrorCode dxvk_CreateD3D9(PFN_remixapi_dxvk_CreateD3D9 fn, remixapi_Bool editorModeEnabled, IDirect3D9Ex** out);
+    static remixapi_ErrorCode dxvk_GetExternalSwapchain(PFN_remixapi_dxvk_GetExternalSwapchain fn, uint64_t* image, uint64_t* renderingDone, uint64_t* resume);
+    static remixapi_ErrorCode dxvk_GetVkImage(PFN_remixapi_dxvk_GetVkImage fn, IDirect3DSurface9* source, uint64_t* out);
+    static remixapi_ErrorCode dxvk_CopyRenderingOutput(PFN_remixapi_dxvk_CopyRenderingOutput fn, IDirect3DSurface9* destination, remixapi_dxvk_CopyRenderingOutputType type);
+    static remixapi_ErrorCode dxvk_SetDefaultOutput(PFN_remixapi_dxvk_SetDefaultOutput fn, remixapi_dxvk_CopyRenderingOutputType type, const remixapi_Float4D* color);
+    static remixapi_ErrorCode dxvk_GetTextureHash(PFN_remixapi_dxvk_GetTextureHash fn, IDirect3DTexture9* texture, uint64_t* out);
+    static remixapi_ErrorCode dxvk_GetSharedD3D11TextureHandle(PFN_remixapi_dxvk_GetSharedD3D11TextureHandle fn, void** handle, uint32_t* width, uint32_t* height);
 
   private:
-    static void recordDxvkInterop(remix_record::DxvkCall which, remixapi_ErrorCode result);
     static void stopSession(uint32_t patienceSeconds);
 
     inline static std::atomic<bool> s_active { false };
@@ -160,6 +148,3 @@ namespace dxvk {
   if (dxvk::ApiRecorder::shouldRecord()) { return dxvk::ApiRecorder::name(&remixapi_##name, __VA_ARGS__); }
 #define REMIX_FORK_RECORD0(name) \
   if (dxvk::ApiRecorder::shouldRecord()) { return dxvk::ApiRecorder::name(&remixapi_##name); }
-// The same for the dxvk_ interop entry point remixapi_<name>, recorded as DxvkCall::call.
-#define REMIX_FORK_RECORD_DXVK(call, name, ...) \
-  if (dxvk::ApiRecorder::shouldRecord()) { return dxvk::ApiRecorder::dxvkInterop(remix_record::DxvkCall::call, &remixapi_##name, __VA_ARGS__); }

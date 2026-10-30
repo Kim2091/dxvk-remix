@@ -460,7 +460,7 @@ namespace dxvk {
     return desc;
   }
 
-  bool RtxParticleSystemManager::fetchParticleSystem(DxvkContext* ctx, const SceneDraw& drawCallState, RtxParticleSystemDesc desc, const MaterialData& renderMaterialData, ParticleSystem** materialSystem) {
+  bool RtxParticleSystemManager::fetchParticleSystem(DxvkContext* ctx, const DrawCallState& drawCallState, RtxParticleSystemDesc desc, const MaterialData& renderMaterialData, ParticleSystem** materialSystem) {
     ScopedCpuProfileZone();
     if (desc.maxNumParticles == 0) {
       return false;
@@ -499,7 +499,7 @@ namespace dxvk {
     return true;
   }
 
-  uint32_t RtxParticleSystemManager::getNumberOfParticlesToSpawn(ParticleSystem* particleSystem, const SceneDraw& drawCallState) {
+  uint32_t RtxParticleSystemManager::getNumberOfParticlesToSpawn(ParticleSystem* particleSystem, const DrawCallState& drawCallState) {
     ScopedCpuProfileZone();
 
     const auto& desc = particleSystem->context.desc;
@@ -562,7 +562,7 @@ namespace dxvk {
     return numParticles;
   }
 
-  void RtxParticleSystemManager::spawnParticles(DxvkContext* ctx, const RtxParticleSystemDesc& desc, const uint32_t instanceId, const uint64_t instanceUid, const SceneDraw& drawCallState, const MaterialData& renderMaterialData) {
+  void RtxParticleSystemManager::spawnParticles(DxvkContext* ctx, const RtxParticleSystemDesc& desc, const uint32_t instanceId, const uint64_t instanceUid, const DrawCallState& drawCallState, const MaterialData& renderMaterialData) {
     ScopedCpuProfileZone();
     if (!enable() || !enableSpawning()) {
       return;
@@ -972,13 +972,12 @@ namespace dxvk {
 
       const RtCamera& camera = ctx->getSceneManager().getCamera();
 
-      SceneDraw newDrawCallState;
+      DrawCallState newDrawCallState;
       newDrawCallState.modifyGeometryData() = particleGeometry; // Note: Geometry Data replaced
       newDrawCallState.modifyCategoryFlags() = particleSystem.categories;
       newDrawCallState.modifyCategoryFlags().set(InstanceCategories::Particle); // ?
       newDrawCallState.modifyCategoryFlags().clr(InstanceCategories::ParticleEmitter);
       newDrawCallState.modifyCategoryFlags().clr(InstanceCategories::Hidden);
-      newDrawCallState.newGeometryEveryFrame = true;
       newDrawCallState.modifyTransformData().viewToProjection = camera.getViewToProjection();
       newDrawCallState.modifyTransformData().worldToView = camera.getWorldToView();
       newDrawCallState.modifyMaterialData() = particleSystem.legacyMaterialData;

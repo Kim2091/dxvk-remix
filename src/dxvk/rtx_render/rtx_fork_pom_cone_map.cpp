@@ -63,6 +63,7 @@ namespace dxvk {
         TEXTURE2D(POM_CONE_BINDING_SOURCE)
         TEXTURE2D(POM_CONE_BINDING_CONE)
         RW_TEXTURE2D(POM_CONE_BINDING_OUTPUT)
+        TEXTURE2D(POM_CONE_BINDING_LEVEL)
       END_PARAMETER()
     };
     PREWARM_SHADER_PIPELINE(PomConeCopyShader);
@@ -94,6 +95,11 @@ namespace dxvk {
 
     // Derived keys live in the texture manager's key space next to the hashes of every other texture.
     constexpr XXH64_hash_t kDerivedKeySeed = 0x53434352434f4e45ull; // "SCCRCONE"
+    // Conservative cones (terrain layers) have keys of their own, for the texture table and the disk cache alike.
+    // A source used both as a single height map and as a terrain layer gets two derived textures that never collide.
+    // Relaxed keys keep the seeds above, and 0 for the cache.
+    constexpr XXH64_hash_t kConservativeDerivedKeySeed = 0x53434352434f4e43ull; // "SCCRCONC"
+    constexpr XXH64_hash_t kConservativeCacheKeySeed = 0x434f4e5345525600ull;   // "CONSERV"
     // Bump when pom_cone_generate.comp.slang changes what it computes, since the disk cache is keyed on it.
     constexpr uint32_t kConeCacheVersion = 2;
     constexpr uint32_t kMaxCacheLoadsInFlight = 4;
@@ -111,7 +117,7 @@ namespace dxvk {
     }
 
     std::string coneCacheFile(XXH64_hash_t sourceHash, const VkExtent3D& extent, VkFormat format, uint32_t nearRadius,
-                              uint32_t raySteps) {
+                              uint32_t raySteps, bool conservative) {
       struct Key {
         uint64_t sourceHash;
         uint32_t width;
@@ -123,7 +129,7 @@ namespace dxvk {
       };
       static_assert(sizeof(Key) == 32, "Key must have no padding: it is hashed by memory.");
       const Key key { sourceHash, extent.width, extent.height, uint32_t(format), kConeCacheVersion, nearRadius, raySteps };
-      return str::format(std::hex, XXH64(&key, sizeof(key), 0), ".dds");
+      return str::format(std::hex, XXH64(&key, sizeof(key), conservative ? kConservativeCacheKeySeed : 0), ".dds");
     }
 
     VkFormat derivedFormat(VkFormat sourceFormat) {
@@ -225,9 +231,10 @@ namespace dxvk {
       uint32_t farLevels = 0;
     };
 
-    GenerationParams generationParams(const VkExtent3D& extent, uint32_t nearRadiusOption, uint32_t rayStepsOption) {
+    GenerationParams generationParams(const VkExtent3D& extent, bool conservative, uint32_t nearRadiusOption,
+                                      uint32_t rayStepsOption) {
       GenerationParams params;
-      params.raySteps = clampedRaySteps(rayStepsOption);
+      params.raySteps = conservative ? 0u : clampedRaySteps(rayStepsOption);
       const uint32_t width = extent.width;
       if (width == extent.height && width > 1 && (width & (width - 1)) == 0) {
         params.farLevels = log2Floor(width);
@@ -263,6 +270,7 @@ namespace dxvk {
         ctx.pushConstants(0, sizeof(args), &args);
         ctx.bindResourceView(POM_CONE_BINDING_SOURCE, source, nullptr);
         ctx.bindResourceView(POM_CONE_BINDING_CONE, source, nullptr);
+        ctx.bindResourceView(POM_CONE_BINDING_LEVEL, source, nullptr);
         ctx.bindResourceView(POM_CONE_BINDING_OUTPUT, storageViews[level], nullptr);
         const VkExtent3D workgroups = util::computeBlockCount(levelExtent, VkExtent3D { 16, 16, 1 });
         ctx.dispatch(workgroups.width, workgroups.height, workgroups.depth);
@@ -297,6 +305,8 @@ namespace dxvk {
     std::vector<Rc<DxvkImageView>> mipViews; // storage, one per mip
     size_t bytes = 0;
     bool pending = false;
+    // ConeVariant::Conservative: generated without the ray walk. Fixed by the derived key.
+    bool conservative = false;
     State state = State::Copy;
     // G holds finished cones (generated, read from the cache or copied from a twin), not zeros or a partial result.
     bool hasCones = false;
@@ -314,6 +324,14 @@ namespace dxvk {
     // Back in the queue after it was done (coarse-only quality), without its source: the height comes from the derived
     // texture's own R, which holds the source height in the precision every pass works in (heightSource).
     bool heightFromDerived = false;
+    // R is levelled (levelHeightMaps): level holds the top of the source's field, and every R written from the source
+    // is raised by 1 - top. R itself, and anything made from it, is already levelled.
+    bool levelled = false;
+    Rc<DxvkImage> level;
+    Rc<DxvkImageView> levelSampledView;
+    Rc<DxvkImageView> levelStorageView;
+    // The generation pyramid was made from the source, not from the levelled R.
+    bool pyramidRaw = false;
 
     // Cone generation scratch, alive from beginGeneration to finish. pyramid: max heights, mip 0 = the height map in
     // the derived R precision; cone: the generated G.
@@ -337,7 +355,8 @@ namespace dxvk {
 
   PomConeMapManager::~PomConeMapManager() = default;
 
-  TextureRef PomConeMapManager::resolveHeight(const TextureRef& height, bool displaced, bool& coneAvailable) {
+  TextureRef PomConeMapManager::resolveHeight(const TextureRef& height, bool displaced, bool& coneAvailable,
+                                              ConeVariant variant) {
     coneAvailable = false;
     // Only SCCR reads the cones. A material created in another mode keeps its source height texture, which SCCR
     // marches linearly if the mode changes while the material lives on (preserved instances).
@@ -363,8 +382,10 @@ namespace dxvk {
 
     std::lock_guard<dxvk::mutex> lock(m_mutex);
 
+    const bool conservative = variant == ConeVariant::Conservative;
     const size_t sourceKey = height.getUniqueKey();
-    const size_t derivedKey = XXH64(&sourceKey, sizeof(sourceKey), kDerivedKeySeed);
+    const size_t derivedKey = XXH64(&sourceKey, sizeof(sourceKey),
+                                    conservative ? kConservativeDerivedKeySeed : kDerivedKeySeed);
     std::unique_ptr<Entry>& entry = m_entries[derivedKey];
     if (entry == nullptr || entry->sourceImage != sourceView->image().ptr()) {
       const XXH64_hash_t sourceHash = height.getImageHash();
@@ -386,6 +407,7 @@ namespace dxvk {
         fresh->extent = extent;
         fresh->format = format;
         fresh->mipLevels = viewInfo.numLevels;
+        fresh->conservative = conservative;
         if (!createImage(*fresh)) {
           if (entry == nullptr) {
             m_entries.erase(derivedKey);
@@ -413,6 +435,7 @@ namespace dxvk {
       // The copy this frame's update records clears G before any ray tracing.
       entry->relaxedInG = false;
       entry->heightFromDerived = false;
+      entry->levelled = false;
       if (!entry->pending) {
         entry->pending = true;
         m_pending.push_back(derivedKey);
@@ -471,12 +494,46 @@ namespace dxvk {
       const VkExtent3D mipExtent = entry.image->mipLevelExtent(mip);
       entry.bytes += size_t(mipExtent.width) * mipExtent.height * texelBytes;
     }
+
+    entry.level = createScratchImage(m_device, VK_FORMAT_R32G32_SFLOAT, VkExtent3D { 1, 1, 1 }, 1, "SCCR height level");
+    if (entry.level == nullptr) {
+      Logger::err("[SCCR] Failed to create a height level image.");
+      return false;
+    }
+    entry.levelSampledView = createView(m_device, entry.level, VK_IMAGE_USAGE_SAMPLED_BIT, 0, 1);
+    entry.levelStorageView = createView(m_device, entry.level, VK_IMAGE_USAGE_STORAGE_BIT, 0, 1);
     return entry.view != nullptr;
+  }
+
+  void PomConeMapManager::recordLevel(RtxContext& ctx, Entry& entry) const {
+    ctx.changeImageLayout(entry.level, VK_IMAGE_LAYOUT_GENERAL);
+    ctx.setPushConstantBank(DxvkPushConstantBank::RTX);
+    ctx.bindShader(VK_SHADER_STAGE_COMPUTE_BIT, PomConeCopyShader::getShader());
+    ctx.bindResourceView(POM_CONE_BINDING_SOURCE, entry.sourceView, nullptr);
+    ctx.bindResourceView(POM_CONE_BINDING_CONE, entry.sourceView, nullptr);
+    ctx.bindResourceView(POM_CONE_BINDING_LEVEL, entry.sourceView, nullptr);
+    ctx.bindResourceView(POM_CONE_BINDING_OUTPUT, entry.levelStorageView, nullptr);
+    PomConeCopyArgs args = {};
+    args.extent = { POM_CONE_LEVEL_GRID, POM_CONE_LEVEL_GRID };
+    args.sourceExtent = args.extent;
+    args.mode = POM_CONE_LEVEL;
+    ctx.pushConstants(0, sizeof(args), &args);
+    ctx.dispatch(1, 1, 1);
+    ctx.changeImageLayout(entry.level, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+  }
+
+  bool PomConeMapManager::levelApplies(const Entry& entry, const Rc<DxvkImageView>& height) {
+    // Only a height read from the source is raised: one read from R, or from a pyramid made from R, is levelled already.
+    if (!entry.levelled || height == nullptr) {
+      return false;
+    }
+    return height == entry.sourceView ||
+           (entry.pyramidRaw && !entry.pyramidSampledViews.empty() && height == entry.pyramidSampledViews[0]);
   }
 
   bool PomConeMapManager::beginGeneration(Entry& entry) const {
     // Square power-of-two maps: the pyramid reaches 1x1 for the hierarchical search (farLevels = log2(width)).
-    const GenerationParams params = generationParams(entry.extent, nearRadius(), rayStepsPerCandidate());
+    const GenerationParams params = generationParams(entry.extent, entry.conservative, nearRadius(), rayStepsPerCandidate());
     entry.nearRadius = params.nearRadius;
     entry.rayStepsPerCandidate = params.raySteps;
     entry.farLevels = params.farLevels;
@@ -546,8 +603,10 @@ namespace dxvk {
     ctx.changeImageLayout(entry.image, VK_IMAGE_LAYOUT_GENERAL);
     ctx.setPushConstantBank(DxvkPushConstantBank::RTX);
     ctx.bindShader(VK_SHADER_STAGE_COMPUTE_BIT, PomConeCopyShader::getShader());
+    const bool level = levelApplies(entry, height);
     ctx.bindResourceView(POM_CONE_BINDING_SOURCE, height, nullptr);
     ctx.bindResourceView(POM_CONE_BINDING_CONE, withCones ? entry.coneSampledView : height, nullptr);
+    ctx.bindResourceView(POM_CONE_BINDING_LEVEL, level ? entry.levelSampledView : height, nullptr);
     for (uint32_t mip = 0; mip < mipCount; ++mip) {
       const VkExtent3D mipExtent = entry.image->mipLevelExtent(mip);
       PomConeCopyArgs args = {};
@@ -555,6 +614,7 @@ namespace dxvk {
       args.sourceExtent = args.extent;
       args.sourceMip = mip;
       args.mode = mode;
+      args.level = level ? 1u : 0u;
       ctx.pushConstants(0, sizeof(args), &args);
       ctx.bindResourceView(POM_CONE_BINDING_OUTPUT, entry.mipViews[mip], nullptr);
       const VkExtent3D workgroups = util::computeBlockCount(mipExtent, VkExtent3D { 16, 16, 1 });
@@ -564,6 +624,7 @@ namespace dxvk {
   }
 
   void PomConeMapManager::recordPyramid(RtxContext& ctx, Entry& entry) const {
+    entry.pyramidRaw = entry.sourceView != nullptr;
     recordMaxPyramid(ctx, heightSource(entry), entry.pyramid, entry.pyramidSampledViews, entry.pyramidStorageViews);
   }
 
@@ -576,14 +637,17 @@ namespace dxvk {
     ctx.changeImageLayout(entry.image, VK_IMAGE_LAYOUT_GENERAL);
     ctx.setPushConstantBank(DxvkPushConstantBank::RTX);
     ctx.bindShader(VK_SHADER_STAGE_COMPUTE_BIT, PomConeCopyShader::getShader());
+    const bool level = levelApplies(entry, height);
     ctx.bindResourceView(POM_CONE_BINDING_SOURCE, height, nullptr);
     ctx.bindResourceView(POM_CONE_BINDING_CONE, cones, nullptr);
+    ctx.bindResourceView(POM_CONE_BINDING_LEVEL, level ? entry.levelSampledView : height, nullptr);
     ctx.bindResourceView(POM_CONE_BINDING_OUTPUT, entry.mipViews[0], nullptr);
     PomConeCopyArgs args = {};
     args.extent = { entry.extent.width, entry.extent.height };
     args.sourceExtent = args.extent;
     args.sourceMip = 0;
     args.mode = mode;
+    args.level = level ? 1u : 0u;
     args.origin = { uint32_t(region.offset.x), uint32_t(region.offset.y) };
     args.coarseShift = coarseShift;
     ctx.pushConstants(0, sizeof(args), &args);
@@ -738,7 +802,8 @@ namespace dxvk {
     for (const auto& item : m_entries) {
       const Entry* other = item.second.get();
       if (other == nullptr || other == &entry || other->sourceHash != entry.sourceHash ||
-          other->sourceFormat != entry.sourceFormat ||
+          other->sourceFormat != entry.sourceFormat || other->conservative != entry.conservative ||
+          other->levelled != entry.levelled ||
           other->format != entry.format || other->mipLevels != entry.mipLevels ||
           other->extent.width != entry.extent.width || other->extent.height != entry.extent.height) {
         continue;
@@ -814,10 +879,11 @@ namespace dxvk {
   }
 
   void PomConeMapManager::startCacheLoad(Entry& entry) const {
-    const GenerationParams params = generationParams(entry.extent, nearRadius(), rayStepsPerCandidate());
+    const GenerationParams params = generationParams(entry.extent, entry.conservative, nearRadius(), rayStepsPerCandidate());
     entry.cacheRaySteps = params.raySteps;
     const std::filesystem::path file = std::filesystem::path(cacheDirectory()) /
-      coneCacheFile(entry.sourceHash, entry.extent, scratchFormat(entry.format), params.nearRadius, params.raySteps);
+      coneCacheFile(entry.sourceHash, entry.extent, scratchFormat(entry.format), params.nearRadius, params.raySteps,
+                    entry.conservative);
     entry.cacheLoad = std::async(std::launch::async, [file]() {
       std::error_code error;
       if (!std::filesystem::exists(file, error)) {
@@ -870,12 +936,16 @@ namespace dxvk {
   }
 
   void PomConeMapManager::storeInCache(RtxContext& ctx, const Entry& entry) const {
+    // The cache is keyed by the source: cones generated from the levelled R bound the levelled field only.
+    if (entry.levelled && !entry.pyramidRaw) {
+      return;
+    }
     const std::string directory = cacheDirectory();
     if (!util::createDirectories(directory)) {
       return;
     }
     const std::string file = coneCacheFile(entry.sourceHash, entry.extent, scratchFormat(entry.format),
-                                           entry.nearRadius, entry.rayStepsPerCandidate);
+                                           entry.nearRadius, entry.rayStepsPerCandidate, entry.conservative);
     m_device->getCommon()->metaExporter().dumpImageToFile(&ctx, str::format(directory, "/"), file, entry.cone);
   }
 
@@ -962,6 +1032,10 @@ namespace dxvk {
       }
       Entry& entry = *it->second;
       if (entry.state == Entry::State::Copy) {
+        entry.levelled = levelHeightMaps();
+        if (entry.levelled) {
+          recordLevel(ctx, entry);
+        }
         recordCopy(ctx, entry, POM_CONE_COPY_HEIGHT);
         entry.state = useCache ? Entry::State::CacheLookup : Entry::State::Pyramid;
       } else if (entry.state == Entry::State::CacheLoad) {

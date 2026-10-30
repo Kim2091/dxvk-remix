@@ -78,7 +78,7 @@ void ReadBoneTransform::updateRange(const Rc<DxvkContext>& context, const size_t
         // Access skinning data from the drawCall via the BLAS input
         BlasEntry* blasEntry = rtInstance->getBlas();
         if (blasEntry != nullptr) {
-          const SceneDraw& drawCall = blasEntry->input;
+          const DrawCallState& drawCall = blasEntry->input;
           const SkinningData& skinningData = drawCall.getSkinningState();
           
           // Check if this drawCall has skinning data and the bone index is valid

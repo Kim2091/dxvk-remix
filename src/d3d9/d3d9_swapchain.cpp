@@ -54,7 +54,7 @@ namespace dxvk {
   // HDR10 output (rtx.tonemap.hdrEnabled): whether Windows has HDR turned on for the display showing `window`.
   // Some drivers accept an ST.2084 swap chain even with HDR off (Windows then converts it back to SDR), so
   // the swap chain format alone cannot tell. Asked through the display configuration API rather than DXGI,
-  // because this module hosts DXVK's own DXGI. Advanced color with "wide color enforced" is SDR auto color
+  // because this module hosts DXVK's own DXGI. Advanced colour with "wide colour enforced" is SDR auto colour
   // management, not HDR.
   static bool IsWindowsHdrEnabled(HWND window) {
     if (window == nullptr)
@@ -405,6 +405,9 @@ namespace dxvk {
     if (RtxOptions::enableVsync() == EnableVsync::WaitingForImplicitSwapchain) {
       // save the vsync state when the first swapchain is created, to act as the default
       RtxOptions::enableVsyncState = m_presentParams.PresentationInterval ? EnableVsync::On : EnableVsync::Off;
+    } else {
+      // A saved choice wins over the game's setting.
+      RtxOptions::enableVsyncState = RtxOptions::enableVsync();
     }
     // NV-DXVK end
 
@@ -451,8 +454,6 @@ namespace dxvk {
       m_inputPingThread.join();
     }
     // NV-DXVK end
-
-    m_parent->ForgetSceneOutput(this);
 
     DestroyBackBuffers();
 
@@ -553,15 +554,7 @@ namespace dxvk {
     ScopedCpuProfileZone();
 
     // NV-DXVK start: Restart RTX capture on the new frame
-    {
-      // The frame's commands go into the chunk under the device lock, which is released again before the Remix API
-      // flush below.
-      D3D9DeviceLock endFrameLock = m_parent->LockDevice();
-      m_presentsScene = m_parent->IsSceneOutput(this);
-      if (m_presentsScene) {
-        m_parent->m_rtx.EndFrame(m_backBuffers[0]->GetCommonTexture()->GetImage());
-      }
-    }
+    m_parent->m_rtx.EndFrame(m_backBuffers[0]->GetCommonTexture()->GetImage());
     // NV-DXVK end
 
     // NV-DXVK start: Remix API. Flush pending C-API light/mesh work once per frame.
@@ -572,9 +565,7 @@ namespace dxvk {
     // Must run before LockDevice(). It takes the remix API's s_mutex and then the device lock,
     // the process-wide order, so calling it with the device lock held would deadlock against any
     // concurrent remixapi_* call (a hard hang: RecursiveSpinlock never sleeps).
-    if (m_presentsScene) {
-      (void)remixapi_AutoInstancePersistentLights();
-    }
+    (void)remixapi_AutoInstancePersistentLights();
     // NV-DXVK end
 
     D3D9DeviceLock lock = m_parent->LockDevice();
@@ -1275,19 +1266,15 @@ namespace dxvk {
     // Note: Set the latency ping thread to this thread. This is not a great place to do this as this will be called every present, but this operation
     // should be fairly cheap. Additionally this thread can be changed dynamically without issue so not setting it further in advance on the thread
     // this function is called on is fine too.
-    if (m_presentsScene) {
-      reflex.setLatencyPingThread();
-    }
+    reflex.setLatencyPingThread();
 
     // Note: Simulation ended on the same thread it started on (the main thread). This is put here specifically as when the application
     // calls into DXVK's Present this typically means it is done all its work for the frame. The application's own rendering calls are counted
     // as simulation here not rendering as they are really just mapped into Remix's geometry and other processing rather than rendering directly,
     // instead the actual rendering happens on the DXVK side once the CS thread kicks off Vulkan work. The Reflex markers for rendering
     // are tracked on that thread in parallel which may mean some overlap with the simulation region occurs, but this is allowed in Reflex (same
-    // goes for the present markers). Only the scene output's Present ends a Reflex frame.
-    if (m_presentsScene) {
-      reflex.endSimulation(d3d9Rtx.GetReflexFrameId());
-    }
+    // goes for the present markers).
+    reflex.endSimulation(d3d9Rtx.GetReflexFrameId());
 
     // NV-DXVK end
 
@@ -1298,20 +1285,6 @@ namespace dxvk {
     // Bump our frame id.
     ++m_frameId;
     SyncFrameLatency();
-
-    // The external frame is the back buffer, so it holds the rendered frames without generated frames or the
-    // developer menu, which are drawn into the presenter's image below.
-    if (m_presentsScene) {
-      RtxFrameExport& frameExport = m_device->getCommon()->metaFrameExport();
-      if (frameExport.isActive()) {
-        Rc<DxvkCommandList> exportCopy = frameExport.recordCopy(swapImage);
-        if (exportCopy != nullptr) {
-          m_parent->EmitCs([this, cCommandList = std::move(exportCopy), cStatus = frameExport.submitStatus()] (DxvkContext* ctx) {
-            m_device->submitCommandListWithStatus(cCommandList, cStatus);
-          });
-        }
-      }
-    }
 
     for (uint32_t i = 0; i < SyncInterval || i < 1; i++) {
       SynchronizePresent();
@@ -1358,15 +1331,13 @@ namespace dxvk {
 
       // HDR10 output is active while the back buffer is float and the swap chain really is ST.2084.
       const bool hdr10 = m_hdrBackBuffer && info.format.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT;
-      if (m_presentsScene) {
-        DxvkToneMapping::setHdrOutputActive(hdr10);
-      }
+      DxvkToneMapping::setHdrOutputActive(hdr10);
       m_blitter->setHdr10Output(hdr10, DxvkToneMapping::hdrUiNitsClamped());
 
       auto& gui = m_device->getCommon()->getImgui();
 
       // Screenshots copy the back buffer before the HUD and the Remix menu are drawn into it.
-      if (i == 0 && m_presentsScene) {
+      if (i == 0) {
         m_device->getCommon()->metaScreenshot().capture(m_context.ptr(), swapImage, hdr10);
       }
 
@@ -1385,27 +1356,22 @@ namespace dxvk {
         if (m_hud != nullptr)
           m_hud->render(m_context, { swapImage->info().format, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR }, backBufferExtent);
 
-        if (m_presentsScene) {
-          gui.render(m_context, backBufferExtent);
-        }
+        gui.render(m_context, backBufferExtent);
       }
 
       m_blitter->presentImage(m_context.ptr(),
         m_imageViews.at(imageIndex), dstRect,
         swapImageView, srcRect);
 
-      if (!hdr10 && m_hud != nullptr) {
-        m_hud->render(m_context, info.format, info.imageExtent);
+      if (!hdr10) {
+        if (m_hud != nullptr)
+          m_hud->render(m_context, info.format, info.imageExtent);
+
+        gui.render(m_context, info.imageExtent);
       }
 
-      // NV-DXVK start: The Remix GUI and the ray traced image go to the scene output only.
-      if (m_presentsScene) {
-        if (!hdr10) {
-          gui.render(m_context, info.imageExtent);
-        }
-
-        m_parent->m_rtx.OnPresent(m_imageViews.at(imageIndex)->image());
-      }
+      // NV-DXVK start
+      m_parent->m_rtx.OnPresent(m_imageViews.at(imageIndex)->image());
       // NV-DXVK end
 
       if (i + 1 >= SyncInterval)
@@ -1421,18 +1387,7 @@ namespace dxvk {
 
     m_parent->m_flags.set(D3D9DeviceFlag::DirtyFramebuffer);
 
-    // The consumer of the external frame waits on its ready semaphore as soon as Present returns, so the copy that
-    // signals it must already be submitted to the Vulkan queue. SubmitPresent has flushed the CS chunk that queues it.
-    if (m_presentsScene) {
-      m_device->getCommon()->metaFrameExport().waitForSubmission();
-    }
-
     // NV-DXVK start: Reflex integration
-    // Only the scene output's Present ends a Reflex frame.
-    if (!m_presentsScene) {
-      return;
-    }
-
     // Note: Sleeping here in the present function essentially makes it so when the application calls into a D3D Present function it will block for the desired amount of time Reflex indicates.
     // This helps accomplish what Reflex desires by delaying the point at which the application does input sampling likely near the start of its simulation on the next frame, thus reducing latency.
     reflex.sleep();
@@ -1468,11 +1423,9 @@ namespace dxvk {
     m_presentStatus.result = VK_NOT_READY;
 
     // The frame rate limit spaces the presents where the CS thread queues them, after the frame's rendering is submitted.
-    // Another output's present neither waits for the limit nor advances the Remix frame.
-    const uint32_t presentFrameRateLimit = FrameId == 0 && m_presentsScene ? m_device->getCommon()->metaReflex().presentFrameRateLimit() : 0u;
+    const uint32_t presentFrameRateLimit = FrameId == 0 ? m_device->getCommon()->metaReflex().presentFrameRateLimit() : 0u;
 
     m_parent->EmitCs([this,
-      cPresentsScene = m_presentsScene,
       cPresentFrameRateLimit = presentFrameRateLimit,
       cReflexFrameId = currentReflexFrameId,
       cAcquiredImageIndex = imageIndex,
@@ -1503,10 +1456,9 @@ namespace dxvk {
       // NV-DXVK start: DLFG integration
       // Note: Do not insert Reflex present markers when DLFG is enabled, the DLFG Presenter will insert its own Reflex markers
       // (unless the workaround is enabled as this requires that the Present markers stay where they usually are).
-      const bool insertReflexPresentMarkers = cPresentsScene && (!m_context->isDLFGEnabled() || (__DLFG_REFLEX_WORKAROUND != 0));
+      const bool insertReflexPresentMarkers = !m_context->isDLFGEnabled() || (__DLFG_REFLEX_WORKAROUND != 0);
 
-      m_device->presentImage(cReflexFrameId, insertReflexPresentMarkers, cAcquiredImageIndex, GetPresenter(), &m_presentStatus,
-                             cPresentsScene);
+      m_device->presentImage(cReflexFrameId, insertReflexPresentMarkers, cAcquiredImageIndex, GetPresenter(), &m_presentStatus);
       // NV-DXVK end
     });
 

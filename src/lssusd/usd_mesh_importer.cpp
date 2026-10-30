@@ -47,19 +47,12 @@
 #include <pxr/usd/usdSkel/bindingAPI.h>
 #include "usd_include_end.h"
 #include <vector>
+#include <d3d9types.h>
 
 using namespace pxr;
 using namespace dxvk;
 
 namespace lss {
-  namespace {
-    // Packs four 8-bit channels into a vertex colour with alpha in the top byte and blue in the bottom byte.
-    // Each channel keeps only its low 8 bits.
-    uint32_t packArgb(uint32_t a, uint32_t r, uint32_t g, uint32_t b) {
-      return ((a & 0xff) << 24) | ((r & 0xff) << 16) | ((g & 0xff) << 8) | (b & 0xff);
-    }
-  }
-
   inline static const TfToken kFaceVertexCounts("faceVertexCounts");
   inline static const TfToken kFaceVertexIndices("faceVertexIndices");
   inline static const TfToken kHoleIndices("holeIndices");
@@ -509,7 +502,7 @@ namespace lss {
             if (ppMeshSamplers[Attributes::Colors]) {
               ppMeshSamplers[Attributes::Colors]->SampleBuffer(idx, &color);
             }
-            vertexColor = packArgb((uint32_t) (opacity * 255.f), (uint32_t) (color[0] * 255.f), (uint32_t) (color[1] * 255.f), (uint32_t) (color[2] * 255.f));
+            vertexColor = D3DCOLOR_ARGB(((DWORD) (opacity * 255.f)), (DWORD) ((color[0]) * 255.f), (DWORD) ((color[1]) * 255.f), (DWORD) ((color[2]) * 255.f));
             break;
           }
           case Attributes::Opacity:

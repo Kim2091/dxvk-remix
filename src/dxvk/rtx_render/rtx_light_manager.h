@@ -22,6 +22,8 @@
 #pragma once
 
 #include <array>
+#include <atomic>
+#include <mutex>
 #include <vector>
 #include <unordered_map>
 #include "../util/rc/util_rc_ptr.h"
@@ -34,7 +36,6 @@
 #include "rtx/pass/common_binding_indices.h"
 #include "rtx/pass/raytrace_args.h"
 #include "rtx_fork_light_bvh.h"
-#include "rtx_frontend_interface.h"
 
 #ifndef REMIXAPI_LIGHTHANDLE_DEFINED
 #define REMIXAPI_LIGHTHANDLE_DEFINED
@@ -134,17 +135,19 @@ public:
   void clearFromUIThread();
 
   void garbageCollection(RtCamera& camera);
-  // A camera cut kept the scene. Sleeping static lights last touched
-  // before it are collected like awake ones, as a clear would have removed them.
-  void setKeptCutFrame(uint32_t frame) { m_keptCutFrame = frame; }
 
   void dynamicLightMatching();
 
   void prepareSceneData(Rc<DxvkContext> ctx, CameraManager const& cameraManager);
 
-  void addGameLight(frontend::FixedFunctionLight::Type type, const RtLight& light);
-  RtLight* addLight(const RtLight& light, const RtLightAntiCullingType antiCullingType);
-  RtLight* addLight(const RtLight& light, const SceneDraw& drawCallState, const RtLightAntiCullingType antiCullingType);
+  // legacyIdentity: the host's identity of the light (LightUtils::legacyIdentity), 0 = none. A light whose
+  // hash (its position) is not in the table is first matched to last frame's light of the same identity.
+  void addGameLight(D3DLIGHTTYPE type, const RtLight& light, uint32_t legacyIdentity = 0);
+  // Records that the game set its light list this frame, before its lights are added. An empty list counts.
+  // In such a frame, garbageCollection removes every light with a host identity that the list did not contain.
+  void beginGameLightList();
+  RtLight* addLight(const RtLight& light, const RtLightAntiCullingType antiCullingType, uint32_t legacyIdentity = 0);
+  RtLight* addLight(const RtLight& light, const DrawCallState& drawCallState, const RtLightAntiCullingType antiCullingType);
 
   // Externally tracked lights are lights whose lifecycle (creation, update, removal) is managed externally, rather than the
   // existing frame-to-frame tracking and anti-culling systems. These are kept separte to avoid any interference from anti culling
@@ -204,7 +207,7 @@ private:
   // memory usage, but these buffers are fairly small at only 4 MiB or so max with 2^16 lights present).
   std::vector<RtLight*> m_linearizedLights{};
   std::vector<unsigned char> m_lightsGPUData{};
-  // These track the incremental light upload.
+  // These track the incremental upload used with rtx.scene.explicitLights.
   // They hold the light buffer layout (linearized order, types, active flags), how many uploads it has been unchanged,
   // the upload count, and the upload in which each slot's GPU data last changed.
   uint64_t m_lightLayoutHash = 0;
@@ -212,8 +215,31 @@ private:
   uint32_t m_lightLayoutStableFrames = 0;
   uint32_t m_lightPrepSerial = 0;
   std::vector<uint32_t> m_lightSlotChangedSerial;
-  uint32_t m_keptCutFrame = ~0u;  // setKeptCutFrame
   uint32_t m_lightSlotsUploaded = 0;  // [PerfCpu]-style counter: slots written last frame (incremental or full)
+  // The host's identity of each legacy light (addLight's legacyIdentity), by the m_lights key, and the
+  // reverse map. Kept outside RtLight (its size is asserted). An entry is dropped with its light.
+  std::unordered_map<XXH64_hash_t, uint32_t> m_legacyIdentityByHash;
+  std::unordered_map<uint32_t, XXH64_hash_t> m_legacyHashByIdentity;
+  void rememberLegacyIdentity(XXH64_hash_t hash, uint32_t identity);
+  void forgetLegacyIdentity(XXH64_hash_t hash);
+  void logLegacyLightsNearCamera(const RtCamera& camera, bool cameraCut);
+  uint32_t m_nearLightLogFrame = 0;  // [LegacyLights] log rate limit (garbageCollection)
+  uint32_t m_gameLightListFrame = ~0u;  // The last frame in which the game set its light list (beginGameLightList).
+  uint32_t m_identityLightsDropped = 0;  // Identity lights removed because the game's list no longer held them, since the last [LegacyLights] line.
+  // Where a legacy light comes from, for the [LegacyLights] line.
+  enum class LightKind : uint32_t { Named, Game, Effect, Other, Count };
+  LightKind lightKind(XXH64_hash_t hash, const RtLight& light) const;
+  // Lights that garbageCollection kept although they were not sent this frame, in light-frames by kind, since the last [LegacyLights] line.
+  std::array<uint32_t, static_cast<uint32_t>(LightKind::Count)> m_keptUnsent {};
+  // The first frame of each effect light's unbroken run at its place (within addLight's 2 cm match), by the m_lights key.
+  std::unordered_map<XXH64_hash_t, uint32_t> m_effectInPlaceSince;
+  // What garbageCollection does with an effect light the game did not draw this frame: keep it, or remove it and why.
+  enum class EffectVerdict : uint32_t { Keep, Brief, InView, Cut, Count };
+  EffectVerdict judgeEffectLight(XXH64_hash_t hash, const RtLight& light, bool cameraCut) const;
+  // Returns true for an effect light drawn at its place for at least getNumFramesToPutLightsToSleep frames.
+  bool isEffectLightInPlace(XXH64_hash_t hash, const RtLight& light) const;
+  // Effect lights removed since the last [LegacyLights] line, by EffectVerdict.
+  std::array<uint32_t, static_cast<uint32_t>(EffectVerdict::Count)> m_effectLightsDropped {};
 public:
   uint32_t getLightSlotsUploaded() const { return m_lightSlotsUploaded; }
 private:
@@ -223,10 +249,16 @@ private:
   // Mutex to prevent the debugging UI from accessing the light data after it's been deleted.
   mutable std::mutex m_lightUIMutex;
   std::unique_lock<std::mutex> m_lightDebugUILock = std::unique_lock<std::mutex>(m_lightUIMutex, std::defer_lock);
+  // The light debug view draws a copy taken at the light GC, never the live table: a light submitted
+  // after the GC keeps m_lightUIMutex held across Present, so locking (or try-locking) it from the overlay hung or
+  // flickered the view.
+  mutable std::mutex m_debugSnapshotMutex;
+  std::vector<RtLight> m_debugSnapshot;
+  mutable std::atomic<bool> m_debugSnapshotWanted { false };
 
   bool getActiveDomeLight(DomeLight& lightOut);
 
-  void garbageCollectionInternal();
+  void garbageCollectionInternal(bool cameraCut);
 
   // Similarity check.
   //  Returns -1 if not similar

@@ -54,10 +54,28 @@ namespace dxvk {
     static bool slimLevelIsLean(SlimLevel level) { return level == SlimLevel::Lean || level == SlimLevel::LeanPom; }
     static bool slimLevelKeepsPom(SlimLevel level) { return level == SlimLevel::Full || level == SlimLevel::SlimPom || level == SlimLevel::LeanPom; }
 
+    RTX_OPTION("rtx.integrateIndirect", bool, slimVariants, true,
+               "Uses reduced SHARC update and query shaders that leave out features the current frame cannot use: "
+               "displacement, the RIS and light BVH fallback of secondary NEE (when the NEE cache handles analytic "
+               "lights), and translucent and thin-opaque handling of secondary shadow rays (when "
+               "rtx.enableIndirectTranslucentShadows is off and nothing needs it). Saves GPU time. The image is the "
+               "same. Only with WBOIT, no portals and the 2-state micromap mode off. Other configurations use the full "
+               "shaders.");
+    RTX_OPTION("rtx.integrateIndirect", bool, slimAssembly, true,
+               "Uses reduced indirect assembly (NEE) shaders that leave out displacement in the NEE cache shadow ray "
+               "(when displacement or rtx.displacement.enableNEECache is off) and translucent and thin-opaque handling "
+               "of that ray (under the same conditions as rtx.integrateIndirect.slimVariants). Works in every indirect "
+               "mode. Saves GPU time. The image is the same.");
+    RTX_OPTION("rtx.integrateIndirect", bool, slimNonSharc, true,
+               "Applies the reduced shaders of rtx.integrateIndirect.slimVariants to the TraceRay indirect pass without "
+               "SHARC (Importance Sampled, NRC and ReSTIR GI): no displacement while it is off, no RIS or light BVH "
+               "fallback when the NEE cache takes every sample, and, at the leanest level, no translucent or "
+               "thin-opaque handling on secondary shadow rays. Only with the NEE cache, WBOIT, no portals, the 2-state "
+               "micromap mode off and TraceRay mode. The image is the same.");
     RTX_OPTION("rtx.integrateIndirect", bool, slimKeepPom, false,
-               "Lets the reduced indirect shaders (SHARC update and query, the TraceRay pass without SHARC and the "
-               "assembly) keep displacement compiled in while the frame uses displacement. Otherwise displacement "
-               "forces the full shaders. The image is the same.");
+               "Lets rtx.integrateIndirect.slimVariants, slimNonSharc and slimAssembly use reduced shaders with "
+               "displacement compiled in while the frame uses displacement. Otherwise displacement forces the full "
+               "shaders. The image is the same.");
 
     explicit DxvkPathtracerIntegrateIndirect(DxvkDevice* device);
     ~DxvkPathtracerIntegrateIndirect() = default;
@@ -81,7 +99,7 @@ namespace dxvk {
     void dispatchNEE(RtxContext* ctx, const AssemblyResources& resources, const SlimLevel slimLevel);
 
     static DxvkRaytracingPipelineShaders getPipelineShaders(const bool useRayQuery, const bool serEnabled, const bool ommEnabled, const bool useNeeCache, const bool includePortals, const bool pomEnabled, const bool nrcEnabled, const bool wboitEnbaled, const SlimLevel slimLevel = SlimLevel::Full);
-    // Full unless the TraceRay slim variants exist for this
+    // rtx.integrateIndirect.slimNonSharc. Full unless the TraceRay slim variants exist for this
     // configuration and the frame cannot use what they compile out.
     static SlimLevel selectNonSharcSlimLevel(RtxContext* ctx, const RaytraceArgs& args, const bool useRayQuery, const bool ommEnabled,
                                              const bool useNeeCache, const bool includePortals, const bool wboitEnabled);
@@ -120,7 +138,7 @@ namespace dxvk {
     std::array<int32_t, (uint32_t) SlimPass::Count> m_frameSlimLevels = { -1, -1, -1 };
     std::array<int32_t, (uint32_t) SlimPass::Count> m_loggedSlimLevels = { -1, -1, -1 };
     uint32_t m_lastSlimLogFrame = UINT32_MAX;
-    // Variant table entry text per pass (empty where no table picks the level), on the [IntegrateIndirect] line.
+    // rtx.shader.variantTables entry text per pass (empty while off), on the [IntegrateIndirect] line.
     std::array<std::string, (uint32_t) SlimPass::Count> m_frameVariantInfo;
     std::array<std::string, (uint32_t) SlimPass::Count> m_loggedVariantInfo;
     // The SHARC / non-SHARC / assembly selection through the tables (checked against `legacyLevel`).

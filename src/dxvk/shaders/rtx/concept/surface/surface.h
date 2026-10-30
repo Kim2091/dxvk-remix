@@ -541,22 +541,21 @@ struct SurfaceInteraction : MinimalSurfaceInteraction
   vec3 rawBitangent = 0.f;
   vec4 vertexColor = 0.0f;
   float triangleArea = 0.f;
-  // SCCR displacement fields (surface_interaction_sccr.slangh). surfaceInteractionCreate fills them in SCCR mode only.
-  // World units per UV unit along the triangle's larger UV axis. 0 means unknown.
-  float pomUvToWorld = 0.f;
-  // The smooth base surface at the hit, over the triangle: height, d/du, d/dv (world units) and its bound.
-  vec4 pomBaseLinear = 0.f;
-  // The base surface's second derivatives over UV (uu, uv, vv).
-  vec3 pomBaseQuadric = 0.f;
-  // The along-ray world distance from the mesh point to the relief point the primary march found, negative where the
-  // relief stands above the mesh. Set in G-buffer passes with rtx.displacement.enableDepthOffset and read only for the
-  // depth and motion outputs (geometry_resolver.slangh).
+  // Filled by surfaceInteractionCreate in SCCR displacement mode only, 0 otherwise
+  // (surface_interaction_sccr.slangh).
+  float pomUvToWorld = 0.f;   // world units per UV unit along the triangle's larger UV axis; 0: unknown
+  vec4 pomBaseLinear = 0.f;   // smooth base surface at the hit, over the triangle: height, d/du, d/dv (world units), bound
+  vec3 pomBaseQuadric = 0.f;  // its second derivatives over UV (uu, uv, vv)
+  // Along-ray world distance from the mesh point to the relief point the primary march found
+  // (negative where the relief stands above the mesh). Set by opaqueSurfaceMaterialInteractionCreate in G-buffer passes
+  // with rtx.displacement.enableDepthOffset; read only for the depth / motion outputs (geometry_resolver.slangh).
   float pomDepthOffset = 0.f;
   // The shell march (sccrShellResolve) already placed the texture coordinates and re-framed this interaction, so
   // opaqueSurfaceMaterialInteractionCreate skips its own POM march.
   bool pomShellDone = false;
-  // With pomShellDone, the shell marker the G-buffer stores in SharedTextureCoord.w (sccrShellMarkerEncode), so the
-  // self-shadows find the relief point's prism again.
+  // With pomShellDone, the shell marker the G-buffer stores in SharedTextureCoord.w
+  // (sccrShellMarkerEncode: the result triangle and the march's orientation; 0 when the triangle does not fit), so the
+  // self-shadows find the carved point's prism again.
   float pomShellMarker = 0.f;
 };
 

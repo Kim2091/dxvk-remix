@@ -32,7 +32,7 @@
 *
 * The meter takes the channel average rather than luminance, so a scene lit by one hue meters
 * like a neutral one. It takes the geometric mean, so a small bright object moves exposure only
-* a little. It is center weighted with a circular falloff in units of half the frame height,
+* a little. It is centre weighted with a circular falloff in units of half the frame height,
 * around a point 10% of the frame height below the middle, so the sky at the top of the frame
 * counts less.
 * It meters lighting like an incident meter: each pixel is divided by its albedo and multiplied
@@ -85,7 +85,7 @@ groupshared float g_meterCentreSum[kMeterThreads];
 float meterWeight(uint2 pixel, uint2 size)
 {
   const float2 uv = (float2(pixel) + 0.5f) / float2(size);
-  // The weighting center sits 10% of the frame height below the middle, so the sky that fills
+  // The weighting centre sits 10% of the frame height below the middle, so the sky that fills
   // the top of the frame does not dominate the meter.
   float2 offset = (uv - float2(0.5f, 0.6f)) * 2.0f;
   // Units of half the frame height: a circle on screen, not an ellipse.

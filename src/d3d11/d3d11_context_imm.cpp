@@ -50,10 +50,9 @@ namespace dxvk {
     m_remixTarget = image;
     EndReflexSimulation();
     if (render) {
-      EmitCs([image, frameId = m_remixFrameId, bound = sceneCommandsIssued(*m_device)](DxvkContext* ctx) {
+      EmitCs([image, frameId = m_remixFrameId](DxvkContext* ctx) {
         auto* rtx = static_cast<RtxContext*>(ctx);
         rtx->flushCommandList();
-        rtx->setInjectionSceneCommandBound(bound);
         rtx->injectRTX(frameId, image);
       });
       RestoreState();

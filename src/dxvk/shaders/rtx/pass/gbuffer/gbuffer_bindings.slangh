@@ -64,6 +64,11 @@ RWTexture2D<float> SharedRadianceB;
 layout(rgba16f, binding = GBUFFER_BINDING_ATMOSPHERE_FOREGROUND_OUTPUT)
 RWTexture2D<float4> AtmosphereForeground;
 
+// The luminance-weighted mean depth in kilometres of the emission in AtmosphereForeground.rgb.
+// It is written only while that emission is non-zero, so it is valid only where the emission is.
+layout(r16f, binding = GBUFFER_BINDING_ATMOSPHERE_FOREGROUND_EMISSION_DEPTH_OUTPUT)
+RWTexture2D<float> AtmosphereForegroundEmissionDepth;
+
 layout(r16f, binding = GBUFFER_BINDING_SHARED_INTEGRATION_SURFACE_PDF_OUTPUT)
 RWTexture2D<float> SharedIntegrationSurfacePdf;
 

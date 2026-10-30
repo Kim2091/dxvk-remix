@@ -89,7 +89,7 @@ namespace dxvk {
       s_problems.push_back({ std::move(id), std::move(text) });
     }
 
-    // Runs once: the crash checks of the previous session, and the folders the notice names.
+    // Runs once to check for crashes in the previous session and to find the folders the notice names.
     void start() {
       s_started = true;
 
@@ -120,7 +120,7 @@ namespace dxvk {
       s_runtimeCount = s_problems.size();
     }
 
-    // Takes the game integration's report again when it changed.
+    // Rebuilds the problem list when the game integration's report changes.
     void update() {
       if (!s_started) {
         start();
@@ -199,16 +199,25 @@ namespace dxvk {
                                         ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoSavedSettings;
     if (ImGui::Begin("##faultNotice", nullptr, kFlags)) {
       showProblemList(false);
-      ImGui::TextWrapped("Logs: %s", s_logFolder.c_str());
-      ImGui::TextWrapped("Crash dumps: %s", s_dumpFolder.c_str());
+      const std::string& upload = uploadFile();
+      if (upload.empty()) {
+        ImGui::TextWrapped("Logs: %s", s_logFolder.c_str());
+        ImGui::TextWrapped("Crash dumps: %s", s_dumpFolder.c_str());
+      } else {
+        ImGui::TextWrapped("Upload this file: %s", upload.c_str());
+      }
       if (!supportText().empty()) {
         ImGui::TextWrapped("%s", supportText().c_str());
       }
       if (!supportUrl().empty()) {
         ImGui::TextColored(kLinkColor, "%s", supportUrl().c_str());
       }
-      ImGui::TextWrapped("Press %s for buttons that open these folders and the link, and to hide this notice.",
-                         buildKeyBindDescriptorStringForDisplay(RtxOptions::remixMenuKeyBinds()).c_str());
+      const std::string menuKeys = buildKeyBindDescriptorStringForDisplay(RtxOptions::remixMenuKeyBinds());
+      if (upload.empty()) {
+        ImGui::TextWrapped("Press %s for buttons that open these folders and the link, and to hide this notice.", menuKeys.c_str());
+      } else {
+        ImGui::TextWrapped("Press %s for buttons that show this file and open the link, and to hide this notice.", menuKeys.c_str());
+      }
     }
     ImGui::End();
     if (font != nullptr) {
@@ -226,7 +235,21 @@ namespace dxvk {
 
     ImGui::PushID("faultNotice");
     showProblemList(true);
-    ImGUI::showLogFolder();
+
+    const std::string& upload = uploadFile();
+    if (!upload.empty()) {
+      if (ImGui::Button("Show File to Upload")) {
+        runExplorer(L"/select,\"" + str::tows(upload.c_str()) + L"\"");
+      }
+      RemixGui::SetTooltipToLastWidgetOnHover("Opens the folder of the file to attach to a bug report, with the file selected.");
+      ImGui::SameLine();
+      if (ImGui::SmallButton("Copy Path##upload")) {
+        ImGui::SetClipboardText(upload.c_str());
+      }
+      ImGui::TextWrapped("File to upload: %s", upload.c_str());
+    }
+
+    ImGUI::showLogFolder(false);
 
     if (ImGui::Button("Open Crash Dump Folder")) {
       runExplorer(s_newestDump.empty() ? L"\"" + str::tows(s_dumpFolder.c_str()) + L"\"" : L"/select,\"" + s_newestDump.wstring() + L"\"");

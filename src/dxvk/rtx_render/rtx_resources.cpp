@@ -524,7 +524,7 @@ namespace dxvk {
 
   void Resources::updateDlssNeuralRenderingResources(Rc<DxvkContext>& ctx) {
     const bool resourcesAreNeeded =
-      device()->getCommon()->metaNeuralUplift().useNeuralUplift();
+      device()->getCommon()->metaDlssNeuralRendering().useDlssNeuralRendering();
 
     if (resourcesAreNeeded == m_dlssNeuralRenderingResourcesAllocated) {
       return;
@@ -1195,6 +1195,7 @@ namespace dxvk {
     m_raytracingOutput.m_sharedRadianceRG = createImageResource(ctx, "shared radiance RG", m_downscaledExtent, VK_FORMAT_R16G16_SFLOAT);
     m_raytracingOutput.m_sharedRadianceB = createImageResource(ctx, "shared radiance B", m_downscaledExtent, VK_FORMAT_R16_SFLOAT);
     m_raytracingOutput.m_atmosphereForeground = createImageResource(ctx, "atmosphere foreground", m_downscaledExtent, VK_FORMAT_R16G16B16A16_SFLOAT);
+    m_raytracingOutput.m_atmosphereForegroundEmissionDepth = createImageResource(ctx, "atmosphere foreground emission depth", m_downscaledExtent, VK_FORMAT_R16_SFLOAT);
     m_raytracingOutput.m_sharedMaterialData0 = createImageResource(ctx, "shared material data 0", m_downscaledExtent, VK_FORMAT_R32_UINT);
     m_raytracingOutput.m_sharedMaterialData1 = createImageResource(ctx, "shared material data 1", m_downscaledExtent, VK_FORMAT_R32_UINT);
     // Note: This value is isolated rather than being packed with other data (such as the alpha channel combined with the Shared Radiance RGB) so that

@@ -265,11 +265,20 @@ namespace dxvk {
   void RtxOptionManager::logEffectiveValues() {
     Logger::info("Effective RtxOption values (after all config layers and migrations):");
     
+    // Long values (texture hash lists) are cut to their start and their entry count; rtx.conf has them in full.
+    constexpr size_t kMaxValueChars = 160;
     auto& globalRtxOptions = RtxOptionImpl::getGlobalOptionMap();
     for (const auto& [hash, optionPtr] : globalRtxOptions) {
       const RtxOptionImpl& rtxOption = *optionPtr;
       if (!rtxOption.isDefault()) {
-        Logger::info(str::format("  ", rtxOption.getFullName(), " = ", rtxOption.getResolvedValueAsString()));
+        const std::string value = rtxOption.getResolvedValueAsString();
+        if (value.size() <= kMaxValueChars) {
+          Logger::info(str::format("  ", rtxOption.getFullName(), " = ", value));
+        } else {
+          const size_t entries = size_t(std::count(value.begin(), value.end(), ',')) + 1;
+          Logger::info(str::format("  ", rtxOption.getFullName(), " = ", value.substr(0, kMaxValueChars), "... (",
+                                   entries, " entries, ", value.size(), " characters)"));
+        }
       }
     }
   }

@@ -166,8 +166,7 @@ public:
   }
 
   bool transform(uint32_t state, const D3DMATRIX& matrix) {
-    // World matrices 250 to 255 are an in-band data channel, where a repeated value is a new message: always send.
-    if (state >= kTransforms || state >= D3DTS_WORLDMATRIX(250)) {
+    if (state >= kTransforms) {
       return true;
     }
     return update(m_transforms[state], matrix);

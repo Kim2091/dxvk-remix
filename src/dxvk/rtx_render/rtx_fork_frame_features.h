@@ -23,47 +23,47 @@ namespace dxvk {
   struct RtFrameFeatures {
     // Scene content of this frame.
     enum SceneBit : uint32_t {
-      kSceneThinFilm             = 1u << 0,  // an opaque material with the thin-film layer (sticky or live)
-      kScenePortalsActive        = 1u << 1,  // portal textures configured or portals active (args)
-      kScenePortalMaterial       = 1u << 2,  // a ray portal material (sticky or live)
-      kSceneBillboardDynamic     = 1u << 3,  // orientation-corrected billboard with a dynamic mask bit
-      kSceneThinOpaque           = 1u << 4,  // a thin-opaque subsurface material (sticky or live)
-      kSceneSssTlas              = 1u << 5,  // the SSS TLAS was built this frame
-      kScenePom                  = 1u << 6,  // cb.pomMode != Off
-      kSceneTranslucentDynamic   = 1u << 7,  // a translucent view-model / player-model instance
-      kSceneUnorderedEmpty       = 1u << 8,  // the unordered TLAS is empty
+      kSceneThinFilm             = 1u << 0,  // row 5: an opaque material with the thin-film layer (sticky or live)
+      kScenePortalsActive        = 1u << 1,  // row 6: portal textures configured or portals active (args)
+      kScenePortalMaterial       = 1u << 2,  // row 7: a ray portal material (sticky or live)
+      kSceneBillboardDynamic     = 1u << 3,  // row 9: orientation-corrected billboard with a dynamic mask bit
+      kSceneThinOpaque           = 1u << 4,  // row 11: a thin-opaque subsurface material (sticky or live)
+      kSceneSssTlas              = 1u << 5,  // row 12: the SSS TLAS was built this frame
+      kScenePom                  = 1u << 6,  // row 13: cb.pomMode != Off
+      kSceneTranslucentDynamic   = 1u << 7,  // row 15: a translucent view-model / player-model instance
+      kSceneUnorderedEmpty       = 1u << 8,  // row 19: the unordered TLAS is empty
       // Material bits. The direct integrator's variant table reads the render-target,
       // legacy, eye and texture-ops bits.
       kSceneTranslucentInstance  = 1u << 16, // live count of instances bound to a translucent material
       kSceneRaytracedRenderTarget = 1u << 17, // live count of instances bound to a raytraced-render-target material
-      kSceneLegacySurface        = 1u << 18, // a surface with non-identity legacy state other than texture ops (exact while the legacy records are current, else always set)
+      kSceneLegacySurface        = 1u << 18, // a surface with non-identity legacy state other than texture ops (exact with rtx.coreMaterial.legacyRecord, else always set)
       kSceneEye                  = 1u << 19, // a surface with the eye bit (same)
-      kSceneClassTranslucent     = 1u << 20, // a core class 1 surface
-      kSceneClassSss             = 1u << 21, // a core class 2 surface
-      kSceneClassFallback        = 1u << 22, // a core class 3 surface
-      kSceneTextureOps           = 1u << 23, // a surface with non-default texture ops (exact while the legacy records are current, else always set)
+      kSceneClassTranslucent     = 1u << 20, // a core class 1 surface (rtx.coreMaterial.build)
+      kSceneClassSss             = 1u << 21, // a core class 2 surface (rtx.coreMaterial.build)
+      kSceneClassFallback        = 1u << 22, // a core class 3 surface (rtx.coreMaterial.build)
+      kSceneTextureOps           = 1u << 23, // a surface with non-default texture ops (exact with rtx.coreMaterial.legacyRecord, else always set)
     };
 
-    // Options and modes that select kernels.
+    // Options and modes that select kernels. Row numbers as above.
     enum ModeBit : uint32_t {
-      kModeWboit                      = 1u << 0,
-      kModeNrc                        = 1u << 1,
-      kModeNrcDeferred                = 1u << 2,
-      kModeThinFilmOverride           = 1u << 3,
-      kModeBillboardsPrimary          = 1u << 4,
-      kModeSssThinOpaqueOpt           = 1u << 5,
-      kModeSssProfileOpt              = 1u << 6,
-      kModePomNeeCache                = 1u << 7,
-      kModeDirectTranslucentShadows   = 1u << 8,
-      kModeIndirectTranslucentShadows = 1u << 9,
-      kModeNeeCacheOnly               = 1u << 10,
-      kModeOmm2State                  = 1u << 11,
-      kModeDedicatedSun               = 1u << 12,
-      kModeSamplerBvh                 = 1u << 13,
-      kModeBvhSelectPass              = 1u << 14,
-      kModeAtmosphereNee              = 1u << 15,
+      kModeWboit                      = 1u << 0,  // row 1
+      kModeNrc                        = 1u << 1,  // row 2
+      kModeNrcDeferred                = 1u << 2,  // row 3
+      kModeThinFilmOverride           = 1u << 3,  // row 4
+      kModeBillboardsPrimary          = 1u << 4,  // row 8
+      kModeSssThinOpaqueOpt           = 1u << 5,  // row 10
+      kModeSssProfileOpt              = 1u << 6,  // row 10
+      kModePomNeeCache                = 1u << 7,  // row 13
+      kModeDirectTranslucentShadows   = 1u << 8,  // row 14
+      kModeIndirectTranslucentShadows = 1u << 9,  // row 14
+      kModeNeeCacheOnly               = 1u << 10, // row 16
+      kModeOmm2State                  = 1u << 11, // row 17
+      kModeDedicatedSun               = 1u << 12, // row 18
+      kModeSamplerBvh                 = 1u << 13, // row 20
+      kModeBvhSelectPass              = 1u << 14, // row 20
+      kModeAtmosphereNee              = 1u << 15, // row 21
       // 1u << 16 is unused.
-      kModeDebugView                  = 1u << 17,
+      kModeDebugView                  = 1u << 17, // row 23
       // 1u << 18 and 1u << 19 are unused.
     };
 
@@ -72,9 +72,9 @@ namespace dxvk {
     uint32_t frameId = UINT32_MAX;
     uint32_t scene = 0;
     uint32_t mode = 0;
-    uint32_t lightTypes = 0;            // bit t set when cb.lightRanges[t].count > 0
+    uint32_t lightTypes = 0;            // row 25: bit t set when cb.lightRanges[t].count > 0
     uint32_t gbufferFeatureVariant = 0; // gbuffer_rayquery features axis index this frame's G-buffer binds
-    bool liveMaterialCounts = false;    // the thin-film, portal-material and thin-opaque bits came from live counts (rtx.frameFeatures.liveMaterialCounts)
+    bool liveMaterialCounts = false;    // scene bits 5, 7, 11 came from live counts (rtx.frameFeatures.liveMaterialCounts)
 
     // For the log only; not part of the change test.
     struct Counts {

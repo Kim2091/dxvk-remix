@@ -24,7 +24,7 @@
 //
 // The game drives it through options it sets with the remix API's SetConfigVariable, all NoSave:
 //   rtx.weather.gameWeather          the current game weather: one id, or several separated by commas,
-//                                    most specific first (e.g. "0002B52A, ClearDay, pleasant"):
+//                                    most specific first (e.g. "0002B52A, CommonwealthClear, pleasant"):
 //                                    the first id a preset is bound to wins, so a preset bound to a broad
 //                                    class covers every weather no other preset names
 //   rtx.weather.gameWeatherOutgoing  the weather it is leaving, when the game blends weathers itself

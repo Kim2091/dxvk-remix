@@ -28,6 +28,36 @@ Entry format:
 - Docs: [RemixApi.md](RemixApi.md)   (only if a public doc covers it)
 ```
 
+## New Vegas RTX
+
+The New Vegas RTX runtime is Remix Plus with the additions below, which the Fallout: New Vegas integration uses. The dated entries after this section are the Remix Plus trunk's, and this runtime shares only part of that history. It does not have the trunk's frontend interface rework (interface steps I1 to I6f), the input checks at the scene interface, game lights, external frame export, neural uplift or the stress mode.
+
+### Legacy material protocol for D3D9 hosts
+A host can describe each D3D9 draw's material through render states 42, 149, 169 and 177: instance categories, the diffuse, normal, glow and height texture slots, gloss in the normal map's alpha, RGB tangent-space normal maps and a glow tint. A host can also keep a draw on the per-draw path (bit 31 of render state 42). Materials without these states keep their usual hash and decode.
+- Options: added `rtx.fnvProtocol.enable`, `normalAlphaMode`, `glossRoughnessMin`, `glossRoughnessMax`, `glowEmissiveIntensity`, `heightDisplaceIn`, `apiGlowTint`, and the `[MaterialDump]` diagnostics `logMaterials` and `logMaterialTextures`.
+
+### Terrain-layers materials
+`remixapi_MaterialInfoTerrainLayersEXT` blends up to eight albedo and normal layers per hit in the opaque material by weight maps, with an optional tint and per-layer gloss from the normal map's alpha. Per-layer height maps give the blend parallax occlusion, and SCCR marches the blended height field. The bridge forwards the extension.
+- Options: added `rtx.displacement.terrainMaxLayers` and `rtx.displacement.terrainLiveWeights`.
+- Docs: [RemixApi.md](RemixApi.md)
+
+### SCCR height-map levelling and real geometry
+Height maps are raised so the top of their field is the surface, which keeps the relief from sliding at grazing angles. SCCR real geometry tessellates smooth displaced meshes once, so shadows, bounce light and reflections see the relief.
+- Options: added `rtx.displacement.levelHeightMaps` (default on) and `rtx.displacement.realGeometry.*` (`enable` default off).
+
+### Thumbnails of the ray traced frame
+A host can ask for a small SDR copy of the latest ray traced frame, taken where the frame is written to the game's render target, so it has none of the game's interface. A request made while the game shows a frozen menu background is answered from the last ray traced frame.
+- Options: added `rtx.screenshot.thumbnailRequest` (set by the game integration) and `rtx.screenshot.thumbnailWidth`.
+
+### D3D9 lights keep their identity, and finer hit barycentrics
+D3D9 point lights can carry the host's own identity in their unused spot fields, so a light that moves is matched to its previous frame's copy. Hit barycentrics are refined to full precision, which removes banded, stretched textures on large, densely tiled triangles. The `[D3d9Identity]` log and identity trace explain why D3D9 draws get new replacement instances.
+- Options: added `rtx.d3d9Identity.log`, `logTopN` and `traceFrames`.
+
+### Other additions
+- `rtx.resolveKeepsCoplanarSurfaces` (default off) keeps a surface that lies in the plane of a cut-out texel visible.
+- `rtx.retained.useV2` (default off) is a second implementation of Remix API retained instances whose per-frame cost follows what changed.
+- Every graphics preset keeps `rtx.enableStochasticAlphaBlend` on, so hair and other blended surfaces keep soft edges on the Medium and Low presets.
+
 ## 2026-10-28
 
 ### Developer menu: settings search

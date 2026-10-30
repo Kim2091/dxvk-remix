@@ -425,8 +425,8 @@ namespace dxvk {
     }
 
     VkPipeline pipeline = VK_NULL_HANDLE;
-    const auto cacheLock = m_pipeMgr->m_cache->lockForCreate();
     const auto createStart = std::chrono::steady_clock::now();
+    const auto cacheLock = m_pipeMgr->m_cache->lockForCreate();
     if (m_vkd->vkCreateGraphicsPipelines(m_vkd->device(),
           m_pipeMgr->m_cache->handle(), 1, &info, nullptr, &pipeline) != VK_SUCCESS) {
       Logger::err("DxvkGraphicsPipeline: Failed to compile pipeline");

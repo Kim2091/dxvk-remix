@@ -1,8 +1,6 @@
 #pragma once
 
-#include <cstdint>
-
-#include <windows.h>
+#include <d3d9.h>
 
 namespace dxvk {
   using NTSTATUS = LONG;
@@ -10,7 +8,7 @@ namespace dxvk {
   // Slightly modified definitions...
   struct D3DKMT_CREATEDCFROMMEMORY {
     void*         pMemory;
-    uint32_t      Format;  // A D3DDDIFORMAT value.
+    D3DFORMAT     Format;
     UINT          Width;
     UINT          Height;
     UINT          Pitch;

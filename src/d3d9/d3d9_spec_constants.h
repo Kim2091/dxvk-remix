@@ -2,8 +2,6 @@
 
 #include <cstdint>
 
-#include "../dxvk/dxvk_limits.h"
-
 namespace dxvk {
 
   enum D3D9SpecConstantId : uint32_t {
@@ -30,7 +28,5 @@ namespace dxvk {
 
     Count
   };
-
-  static_assert(D3D9SpecConstantId::Count <= DxvkLimits::MaxNumSpecConstants);
 
 }

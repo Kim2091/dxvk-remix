@@ -23,7 +23,6 @@
 
 // The prism march of a displaced primary hit (G-buffer and PSR G-buffer passes), the hook that applies its result
 // (sccrShellResolve), and the self-shadows of the pixels it marched. Outlines are not carved.
-
 // Included at the end of pom_sccr.slangh, whose field, footprint and visibility helpers it uses.
 //
 // The volume. The game mesh is the outer shell. Each vertex i has a shell vector s_i, its welded direction

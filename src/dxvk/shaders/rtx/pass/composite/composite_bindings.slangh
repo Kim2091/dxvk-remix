@@ -42,6 +42,8 @@ layout(binding = COMPOSITE_SHARED_RADIANCE_B_INPUT)
 Texture2D<float> SharedRadianceB;
 layout(binding = COMPOSITE_ATMOSPHERE_FOREGROUND_INPUT)
 Texture2D<float4> AtmosphereForeground;
+layout(binding = COMPOSITE_ATMOSPHERE_FOREGROUND_EMISSION_DEPTH_INPUT)
+Texture2D<float> AtmosphereForegroundEmissionDepth;
 
 // Sky provider (NUMOS) outputs, see composite_binding_indices.h. The Atmosphere* names are
 // numos_host.slangh's binding contract (ATMOSPHERE_AVAILABLE): the far fog's lighting reads them.

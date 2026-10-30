@@ -1,6 +1,4 @@
 /*
-* The tone curve and the color grade.
-*
 * MIT License
 *
 * Copyright (c) 2026 TheGreatHmmmmm
@@ -22,12 +20,16 @@
 * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 * SOFTWARE.
+*/
+/*
+* Inspired by Prism by Jon (OopyDoopy / KickFister / Jon).
 *
-* Inspired by Prism by Jon (OopyDoopy / KickFister / Jon)
-*
-* Like Prism, the curve runs per channel in a desaturated working basis, so bright saturated colors roll off
-* without skewing hue. Prism is by Jon for RenoDX, and its shoulder curve is by Musa Haji. This code is close
-* to Prism's, so Prism's MIT notice applies to it too:
+* The tone curve and its working primaries (Custom Primaries 1 and 2 below) are TheGreatHmmmmm's.
+* Like Prism, it runs a per-channel curve in a desaturated working basis, so bright saturated
+* colours roll off without skewing hue. Prism was created by Jon for RenoDX, with a shoulder curve
+* by Musa Haji, and came to this runtime through the "halocedlaart" Halo CE (MCC) path-tracer
+* ReShade addon's prism.hlsli, used with the addon author's permission.
+* Prism's MIT notice, from that file:
 *
 *   MIT License
 *

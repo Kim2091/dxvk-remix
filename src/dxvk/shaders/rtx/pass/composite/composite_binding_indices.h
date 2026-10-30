@@ -63,8 +63,9 @@
 #define COMPOSITE_ACTIVE_PIXEL_MASK_INPUT                           27
 #define COMPOSITE_ACTIVE_LOCAL_PIXEL_COORDS_INPUT                   28
 #define COMPOSITE_PIXEL_SAMPLING_RATE_INPUT                         58
-// 64-69: free (59 is COMPOSITE_DLSS_NR_CONTROL_MASK_OUTPUT and 60-63 are the cloud motion vector
+// 65-69: free (59 is COMPOSITE_DLSS_NR_CONTROL_MASK_OUTPUT and 61-64 are the cloud motion vector
 // targets below). The sky provider's (NUMOS) composite inputs are at 72-89.
+#define COMPOSITE_ATMOSPHERE_FOREGROUND_EMISSION_DEPTH_INPUT       60
 #define COMPOSITE_ATMOSPHERE_FOREGROUND_INPUT                      70
 // Virtual hit distance of the secondary (PSR) surface, -1 on a miss. Aerial perspective on PSR pixels.
 #define COMPOSITE_SECONDARY_HIT_DISTANCE_INPUT                     71
@@ -106,10 +107,10 @@
 // The primary depth and screen-space motion vectors the upscalers and frame generation read. Where the
 // sky provider's clouds hide a pixel's surface, the composite replaces them with the cloud's
 // (CompositeArgs::cloudMotionVectors). The ray reconstruction copies are bound only while it runs.
-#define COMPOSITE_PRIMARY_DEPTH_INPUT_OUTPUT                        60
-#define COMPOSITE_PRIMARY_SCREEN_SPACE_MOTION_VECTOR_INPUT_OUTPUT   61
-#define COMPOSITE_PRIMARY_DEPTH_DLSSRR_INPUT_OUTPUT                 62
-#define COMPOSITE_PRIMARY_SCREEN_SPACE_MOTION_VECTOR_DLSSRR_INPUT_OUTPUT 63
+#define COMPOSITE_PRIMARY_DEPTH_INPUT_OUTPUT                        61
+#define COMPOSITE_PRIMARY_SCREEN_SPACE_MOTION_VECTOR_INPUT_OUTPUT   62
+#define COMPOSITE_PRIMARY_DEPTH_DLSSRR_INPUT_OUTPUT                 63
+#define COMPOSITE_PRIMARY_SCREEN_SPACE_MOTION_VECTOR_DLSSRR_INPUT_OUTPUT 64
 
 // Outputs
 

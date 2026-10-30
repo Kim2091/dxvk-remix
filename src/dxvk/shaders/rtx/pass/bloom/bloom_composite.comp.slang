@@ -22,7 +22,7 @@
 #include "rtx/pass/bloom/bloom.h"
 
 layout(binding = BLOOM_COMPOSITE_COLOR_INPUT_OUTPUT)
-RWTexture2D<float4> InOutColorBuffer; 
+RWTexture2D<float4> InOutColorBuffer;
 
 layout(binding = BLOOM_COMPOSITE_BLOOM)
 Sampler2D InBloomBuffer;
@@ -49,5 +49,7 @@ void main(uint2 ipos : SV_DispatchThreadID)
     return;
   }
 
-  InOutColorBuffer[ipos] = dst + src * cb.intensity;
+  // Froyok: lerp the scene towards the bloom instead of adding it, so bloom spreads light without adding energy:
+  // bright pixels bleed into their surroundings and lose what they give away.
+  InOutColorBuffer[ipos] = float4(lerp(dst.rgb, src.rgb, cb.intensity), dst.a);
 }

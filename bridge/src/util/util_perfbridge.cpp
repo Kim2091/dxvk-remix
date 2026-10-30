@@ -34,7 +34,6 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <intrin.h>
 
 namespace bridge_util {
   namespace perf {
@@ -59,7 +58,6 @@ namespace bridge_util {
 
       // Static storage: zero-initialised before any constructor runs.
       std::atomic<uint32_t> s_cmdCount[kMaxCommands];
-      std::atomic<uint64_t> s_cmdTicksByType[kMaxCommands];
       std::atomic<uint32_t> s_respWaitCount[kMaxCommands];
       std::atomic<uint64_t> s_respWaitTicks[kMaxCommands];
       std::atomic<uint32_t> s_droppedCount[kMaxCommands];
@@ -103,7 +101,6 @@ namespace bridge_util {
       // The unsigned differences stay right across a wrap of a 32-bit counter.
       struct Totals {
         uint32_t cmdCount[kMaxCommands];
-        uint64_t cmdTicksByType[kMaxCommands];
         uint32_t respWaitCount[kMaxCommands];
         uint64_t respWaitTicks[kMaxCommands];
         uint32_t droppedCount[kMaxCommands];
@@ -115,7 +112,6 @@ namespace bridge_util {
         void take(const QueueWaitStats& writer, const QueueWaitStats& reader) {
           for (uint32_t i = 0; i < kMaxCommands; ++i) {
             cmdCount[i] = s_cmdCount[i].load(std::memory_order_relaxed);
-            cmdTicksByType[i] = s_cmdTicksByType[i].load(std::memory_order_relaxed);
             respWaitCount[i] = s_respWaitCount[i].load(std::memory_order_relaxed);
             respWaitTicks[i] = s_respWaitTicks[i].load(std::memory_order_relaxed);
             droppedCount[i] = s_droppedCount[i].load(std::memory_order_relaxed);
@@ -139,7 +135,6 @@ namespace bridge_util {
         void diff(const Totals& now, const Totals& base) {
           for (uint32_t i = 0; i < kMaxCommands; ++i) {
             cmdCount[i] = now.cmdCount[i] - base.cmdCount[i];
-            cmdTicksByType[i] = now.cmdTicksByType[i] - base.cmdTicksByType[i];
             respWaitCount[i] = now.respWaitCount[i] - base.respWaitCount[i];
             respWaitTicks[i] = now.respWaitTicks[i] - base.respWaitTicks[i];
             droppedCount[i] = now.droppedCount[i] - base.droppedCount[i];
@@ -168,8 +163,7 @@ namespace bridge_util {
         Totals base;
         bool cpuValid = false;
         DWORD cpuThreadId = 0;
-        uint64_t cpuCycles = 0;
-        uint64_t tscStart = 0;
+        uint64_t cpu100ns = 0;
       };
 
       // Presenting thread only. Static: the totals are too big for the game thread's stack.
@@ -193,23 +187,14 @@ namespace bridge_util {
         return double(ticks) / ticksPerUs();
       }
 
-      // The calling thread's CPU cycles. GetThreadTimes is sampled at the scheduler tick and misses short bursts, so
-      // the cycle counter is used instead. Windows reports thread cycles in time stamp counter units.
-      bool threadCycles(uint64_t& out) {
-        ULONG64 cycles = 0;
-        if (!QueryThreadCycleTime(GetCurrentThread(), &cycles)) {
+      bool threadCpu100ns(uint64_t& out) {
+        FILETIME creationTime, exitTime, kernelTime, userTime;
+        if (!GetThreadTimes(GetCurrentThread(), &creationTime, &exitTime, &kernelTime, &userTime)) {
           return false;
         }
-        out = cycles;
+        const auto toU64 = [](const FILETIME& t) { return (uint64_t(t.dwHighDateTime) << 32) | uint64_t(t.dwLowDateTime); };
+        out = toU64(kernelTime) + toU64(userTime);
         return true;
-      }
-
-      uint64_t tsc() {
-#if defined(_M_IX86) || defined(_M_X64)
-        return __rdtsc();
-#else
-        return 0;
-#endif
       }
 
       // "IDirect3DDevice9Ex_SetRenderState" -> "Device9Ex_SetRenderState".
@@ -220,22 +205,6 @@ namespace bridge_util {
           name = name.substr(sizeof(kPrefix) - 1);
         }
         return name;
-      }
-
-      // Adds to a counter. The server counts on its device thread only, so a relaxed load and store replace the
-      // locked add there. The client counts on every thread that calls into the device.
-      template<typename T, typename V>
-      void bump(std::atomic<T>& counter, V value) {
-#if defined(REMIX_BRIDGE_CLIENT)
-        counter.fetch_add(T(value), std::memory_order_relaxed);
-#else
-        counter.store(counter.load(std::memory_order_relaxed) + T(value), std::memory_order_relaxed);
-#endif
-      }
-
-      bool isPresent(uint32_t command) {
-        return command == Commands::IDirect3DDevice9Ex_Present || command == Commands::IDirect3DDevice9Ex_PresentEx ||
-               command == Commands::IDirect3DSwapChain9_Present;
       }
 
       enum Class { kSetters, kDraws, kUploads, kLocks, kCreates, kDestroys, kGets, kOther, kClassCount };
@@ -263,23 +232,18 @@ namespace bridge_util {
         iv.start = t;
         iv.base = s_now;
         uint64_t cpu = 0;
-        iv.cpuValid = threadCycles(cpu);
-        iv.cpuCycles = cpu;
-        iv.tscStart = tsc();
+        iv.cpuValid = threadCpu100ns(cpu);
+        iv.cpu100ns = cpu;
         iv.cpuThreadId = GetCurrentThreadId();
       }
 
-      // The presenting thread's CPU time since the interval began, in milliseconds. The cycles are converted with the
-      // time stamp counter rate measured against QPC over the same interval. False when there is no time stamp counter.
-      bool cpuMsSince(const Interval& iv, int64_t t, double& out) {
+      // The presenting thread's CPU time since the interval began, in 100 ns units.
+      bool cpuSince(const Interval& iv, uint64_t& out) {
         uint64_t cpu = 0;
-        const uint64_t tscEnd = tsc();
-        if (!iv.cpuValid || !threadCycles(cpu) || GetCurrentThreadId() != iv.cpuThreadId || cpu < iv.cpuCycles ||
-            tscEnd <= iv.tscStart || t <= iv.start) {
+        if (!iv.cpuValid || !threadCpu100ns(cpu) || GetCurrentThreadId() != iv.cpuThreadId || cpu < iv.cpu100ns) {
           return false;
         }
-        const double tscPerUs = double(tscEnd - iv.tscStart) / toUs(uint64_t(t - iv.start));
-        out = double(cpu - iv.cpuCycles) / tscPerUs / 1e3;
+        out = cpu - iv.cpu100ns;
         return true;
       }
 
@@ -306,8 +270,8 @@ namespace bridge_util {
         const double perFrame = 1.0 / double(std::max(1u, iv.frames));
         const double seconds = toUs(uint64_t(t - iv.start)) / 1e6;
         const QueueSnapshot& full = d.writerFull;
-        double cpuMs = 0.0;
-        const bool cpuValid = cpuMsSince(iv, t, cpuMs);
+        uint64_t cpu = 0;
+        const bool cpuValid = cpuSince(iv, cpu);
 
         uint64_t blockingCount = 0, blockingTicks = 0, topTicks = 0;
         uint32_t topCommand = kMaxCommands;
@@ -331,7 +295,7 @@ namespace bridge_util {
 #if defined(REMIX_BRIDGE_CLIENT)
         ss << " | game thread per frame: CPU ";
         if (cpuValid) {
-          ss << cpuMs * perFrame << " ms";
+          ss << double(cpu) / 1e4 * perFrame << " ms";
         } else {
           ss << "?";
         }
@@ -349,7 +313,7 @@ namespace bridge_util {
         ss << " | server thread per frame: processing commands " << toUs(d.cmdTicks) / 1e3 * perFrame
            << " ms (" << double(d.commands) * perFrame << " commands), CPU ";
         if (cpuValid) {
-          ss << cpuMs * perFrame << " ms";
+          ss << double(cpu) / 1e4 * perFrame << " ms";
         } else {
           ss << "?";
         }
@@ -366,16 +330,14 @@ namespace bridge_util {
         const QueueSnapshot& full = d.writerFull;
         const QueueSnapshot& empty = d.readerEmpty;
 
-        double cpuMs = 0.0;
-        const bool cpuValid = cpuMsSince(iv, t, cpuMs);
-        const double cpuMsPerFrame = cpuValid ? cpuMs * perFrame : -1.0;
+        uint64_t cpu = 0;
+        const bool cpuValid = cpuSince(iv, cpu);
+        const double cpuMsPerFrame = cpuValid ? double(cpu) / 1e4 * perFrame : -1.0;
         // Spinning in either wait is CPU time the thread counter includes but no work.
         const double spinMsPerFrame = toUs(full.spinTicks + empty.spinTicks) / 1e3 * perFrame;
 
         uint64_t classCount[kClassCount] = {};
         std::vector<std::pair<uint32_t, uint32_t>> commands;  // count, command
-        std::vector<std::pair<uint64_t, uint32_t>> timed;     // ticks, command
-        uint64_t presentTicks = 0;
         std::vector<std::pair<uint64_t, uint32_t>> blocking;  // ticks, command
         std::vector<std::pair<uint32_t, uint32_t>> dropped;   // count, command
         uint64_t blockingCount = 0, blockingTicks = 0, droppedCount = 0;
@@ -390,13 +352,6 @@ namespace bridge_util {
             classCount[classify(i)] += n;
             commands.emplace_back(n, i);
           }
-          const uint64_t ct = d.cmdTicksByType[i];
-          if (ct != 0) {
-            timed.emplace_back(ct, i);
-            if (isPresent(i)) {
-              presentTicks += ct;
-            }
-          }
           const uint32_t w = d.respWaitCount[i];
           if (w != 0) {
             const uint64_t wt = d.respWaitTicks[i];
@@ -406,7 +361,6 @@ namespace bridge_util {
           }
         }
         std::sort(commands.begin(), commands.end(), std::greater<>());
-        std::sort(timed.begin(), timed.end(), std::greater<>());
         std::sort(blocking.begin(), blocking.end(), std::greater<>());
         std::sort(dropped.begin(), dropped.end(), std::greater<>());
 
@@ -469,19 +423,6 @@ namespace bridge_util {
         }
         Logger::info(top.str());
 
-        // Time per command type, as a share of all command time. Records of a state packet count in the packet.
-        if (d.cmdTicks != 0) {
-          const auto share = [&d](uint64_t ticks) { return 100.0 * double(ticks) / double(d.cmdTicks); };
-          std::ostringstream byTime;
-          byTime << std::fixed << std::setprecision(1) << "[PerfBridge] " << kSide << " top commands by time per frame: present="
-                 << toUs(presentTicks) * perFrame << "us (" << share(presentTicks) << "%) |";
-          for (size_t i = 0; i < timed.size() && i < kTopCommands; ++i) {
-            byTime << " " << shortName(timed[i].second) << "=" << toUs(timed[i].first) * perFrame << "us ("
-                   << share(timed[i].first) << "%)";
-          }
-          Logger::info(byTime.str());
-        }
-
         if (!dropped.empty()) {
           // Setters sent appear in "top commands"; these are the ones not sent (already on the server).
           std::ostringstream drp;
@@ -520,21 +461,19 @@ namespace bridge_util {
     }
 
     void noteCommand(uint16_t command, uint32_t dataWords, int64_t ticks) {
-      const uint64_t positiveTicks = uint64_t(std::max<int64_t>(ticks, 0));
       if (command < kMaxCommands) {
-        bump(s_cmdCount[command], 1);
-        bump(s_cmdTicksByType[command], positiveTicks);
+        s_cmdCount[command].fetch_add(1, std::memory_order_relaxed);
       }
-      bump(s_commands, 1);
-      bump(s_dataWords, dataWords);
-      bump(s_cmdTicks, positiveTicks);
+      s_commands.fetch_add(1, std::memory_order_relaxed);
+      s_dataWords.fetch_add(dataWords, std::memory_order_relaxed);
+      s_cmdTicks.fetch_add(uint64_t(std::max<int64_t>(ticks, 0)), std::memory_order_relaxed);
     }
 
     void noteRecord(uint16_t command) {
       if (command < kMaxCommands) {
-        bump(s_cmdCount[command], 1);
+        s_cmdCount[command].fetch_add(1, std::memory_order_relaxed);
       }
-      bump(s_records, 1);
+      s_records.fetch_add(1, std::memory_order_relaxed);
     }
 
     void noteDropped(uint16_t command) {
@@ -571,7 +510,7 @@ namespace bridge_util {
     }
 
     void noteUpload(uint64_t bytes) {
-      bump(s_uploadBytes, bytes);
+      s_uploadBytes.fetch_add(bytes, std::memory_order_relaxed);
     }
 
     void noteAsyncCreateFailure(uint16_t command, long hresult) {

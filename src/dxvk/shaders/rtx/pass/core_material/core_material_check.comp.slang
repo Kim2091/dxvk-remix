@@ -144,16 +144,20 @@ void main(uint3 threadId : SV_DispatchThreadID)
       any(core.emissiveColorConstant != vec3(o.emissiveColorConstant)) ||
       core.emissiveIntensity != float(o.emissiveIntensity),
       CORE_MATERIAL_CHECK_FIELD_EMISSIVE);
+    // The old record's data[27] holds the FNV flags word and
+    // data[30-31] the terrain-layers index, so roughnessFloor and specularMetal are only comparable on other materials.
+    const bool fnvLayout =
+      (uint(o.flags) & OPAQUE_SURFACE_MATERIAL_FLAG_FNV_LAYOUT_MASK) == OPAQUE_SURFACE_MATERIAL_FLAG_FNV_LAYOUT;
     fields |= mismatchIf(
       core.roughnessConstant != float(o.roughnessConstant) ||
       core.metallicConstant != float(o.metallicConstant) ||
       core.anisotropy != float(o.anisotropy) ||
-      core.roughnessFloor != float(o.roughnessFloor),
+      (!fnvLayout && core.roughnessFloor != f16tof32(uint(o.roughnessFloorBits))),
       CORE_MATERIAL_CHECK_FIELD_ROUGH_METAL);
     fields |= mismatchIf(core.dlssControlMask != o.dlssControlMask, CORE_MATERIAL_CHECK_FIELD_DLSS_MASK);
     fields |= mismatchIf(
-      core.specularMetalParams != uint(o.specularMetalParams) ||
-      core.specularMetalTint != uint(o.specularMetalTint),
+      !fnvLayout && (core.specularMetalParams != uint(o.specularMetalParams) ||
+                     core.specularMetalTint != uint(o.specularMetalTint)),
       CORE_MATERIAL_CHECK_FIELD_SPECULAR_METAL);
     fields |= mismatchIf(core.decalSortOrder != uint(surface.decalSortOrder), CORE_MATERIAL_CHECK_FIELD_DECAL_SORT_ORDER);
 

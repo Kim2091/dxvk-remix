@@ -14,6 +14,8 @@ util_src = files([
 
   'thread.cpp',
   
+  'util_shared_res.cpp',
+  
   'com/com_guid.cpp',
   'com/com_private_data.cpp',
 
@@ -57,8 +59,6 @@ util_src = files([
   'util_frame_pacer.h',
 
   'util_threadpool.h',
-  'util_stress.cpp',
-  'util_stress.h',
   'util_atomic_queue.h',
 
   'util_renderprocessor.h',

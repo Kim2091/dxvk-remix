@@ -466,7 +466,7 @@ namespace dxvk {
       }
       ImGui::EndCombo();
     }
-    RemixGui::SetTooltipToLastWidgetOnHover("The color grade preset (rtx.tonemap.gradePreset). The sliders below edit it, "
+    RemixGui::SetTooltipToLastWidgetOnHover("The colour grade preset (rtx.tonemap.gradePreset). The sliders below edit it, "
                                             "and the image shows the edits at once. A * marks unsaved edits.");
 
     RemixGui::DragFloat("Grade Blend Time", &gradeBlendSecondsObject(), 0.05f, 0.0f, 60.0f, "%.2f s", ImGuiSliderFlags_AlwaysClamp);
@@ -489,12 +489,12 @@ namespace dxvk {
       changed |= ImGui::DragFloat3("Matrix Row 1", p.matrix[0].data(), 0.002f, color_grade::kMatrixMin, color_grade::kMatrixMax, "%.4f");
       changed |= ImGui::DragFloat3("Matrix Row 2", p.matrix[1].data(), 0.002f, color_grade::kMatrixMin, color_grade::kMatrixMax, "%.4f");
       changed |= ImGui::DragFloat3("Matrix Row 3", p.matrix[2].data(), 0.002f, color_grade::kMatrixMin, color_grade::kMatrixMax, "%.4f");
-      RemixGui::SetTooltipToLastWidgetOnHover("The color matrix: each output channel is its row times the input red, green and "
-                                              "blue. The identity (1 0 0 / 0 1 0 / 0 0 1) leaves the color unchanged.");
-      changed |= ImGui::DragFloat3("Color Balance", p.balance.data(), 0.002f, 0.0f, color_grade::kBalanceMax, "%.3f");
+      RemixGui::SetTooltipToLastWidgetOnHover("The colour matrix: each output channel is its row times the input red, green and "
+                                              "blue. The identity (1 0 0 / 0 1 0 / 0 0 1) leaves the colour unchanged.");
+      changed |= ImGui::DragFloat3("Colour Balance", p.balance.data(), 0.002f, 0.0f, color_grade::kBalanceMax, "%.3f");
       RemixGui::SetTooltipToLastWidgetOnHover("A gain on red, green and blue after the matrix. 1, 1, 1 is neutral.");
       changed |= ImGui::DragFloat("Saturation", &p.saturation, 0.005f, 0.0f, color_grade::kSaturationMax, "%.3f");
-      RemixGui::SetTooltipToLastWidgetOnHover("1 is unchanged, 0 is gray, above 1 more saturated.");
+      RemixGui::SetTooltipToLastWidgetOnHover("1 is unchanged, 0 is grey, above 1 more saturated.");
       changed |= ImGui::DragFloat("Contrast", &p.contrast, 0.005f, color_grade::kContrastMin, color_grade::kContrastMax, "%.3f");
       RemixGui::SetTooltipToLastWidgetOnHover("A power around mid gray (0.18), before the tone curve. 1 is unchanged.");
       changed |= ImGui::DragFloat("Curve Anchor", &p.anchor, 0.001f, color_grade::kAnchorMin, color_grade::kAnchorMax, "%.3f");
@@ -594,7 +594,7 @@ namespace dxvk {
     std::lock_guard<std::mutex> lock(s.mutex);
     ensureLoadedLocked(s);
     const std::string selected = gradePreset();
-    if (ImGui::BeginCombo("Color Grade", selected.c_str())) {
+    if (ImGui::BeginCombo("Colour Grade", selected.c_str())) {
       for (const Preset& p : s.presets) {
         if (ImGui::Selectable(p.name.c_str(), p.name == selected)) {
           gradePresetObject().setDeferred(p.name);

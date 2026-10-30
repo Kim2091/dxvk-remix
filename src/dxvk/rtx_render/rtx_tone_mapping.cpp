@@ -21,7 +21,7 @@
 */
 #include "rtx_pre_exposure.h"
 #include "rtx_tone_mapping.h"
-#include "rtx_neural_uplift.h"
+#include "rtx_dlss_neural_rendering.h"
 #include "dxvk_device.h"
 #include "dxvk_scoped_annotation.h"
 #include "rtx_render/rtx_shader_manager.h"
@@ -665,20 +665,16 @@ namespace dxvk {
 
   void DxvkToneMapping::showEffectSettings() {
     RemixGui::DragFloat("Global Exposure", &exposureBiasObject(), 0.01f, -4.f, 4.f);
-    // tonemap_operator.slangh credits the tone curve's authors.
-    RemixGui::Combo("Tone Curve Primaries", &primariesObject(), "Primaries 1\0Primaries 2\0BT.709\0");
+    RemixGui::Combo("Primaries", &primariesObject(), "Custom Primaries 1\0Custom Primaries 2\0BT.709\0");
 
-    if (RemixGui::CollapsingHeader("Color Grade", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (RemixGui::CollapsingHeader("Colour Grade", ImGuiTreeNodeFlags_DefaultOpen)) {
       ImGui::Indent();
       ColorGrade::showImguiSettings();
       ImGui::Unindent();
     }
 
-    // HDR output follows Windows on its own, and rtx.tonemap.hdrEnabled only allows it. The swap chain is made
-    // when the game starts, so a change applies after a restart.
-    RemixGui::Checkbox("Allow HDR Output (after restart)", &hdrEnabledObject());
-
-    // The HDR controls exist only while HDR output is running: in SDR the curve peaks at 1 and none apply.
+    // HDR output follows Windows on its own; rtx.tonemap.hdrEnabled only allows it, from the user menu's Other
+    // Settings. The HDR controls exist only while HDR output is running: in SDR the curve peaks at 1 and none apply.
     if (hdrOutputActive()) {
       RemixGui::DragFloat("Peak Brightness", &hdrPeakNitsObject(), 1.0f, 80.0f, 10000.0f, "%.0f nits", ImGuiSliderFlags_AlwaysClamp);
       RemixGui::DragFloat("Paper White", &hdrPaperWhiteNitsObject(), 1.0f, 80.0f, 1000.0f, "%.0f nits", ImGuiSliderFlags_AlwaysClamp);
@@ -686,7 +682,7 @@ namespace dxvk {
     }
     showToneCurve();
 
-    // Gray the dependent controls rather than removing them: the enable toggle
+    // Grey the dependent controls rather than removing them: the enable toggle
     // sits on the stack row header, so hiding the body made an expanded but
     // disabled section collapse to an empty indent.
     ImGui::Indent();
@@ -757,8 +753,8 @@ namespace dxvk {
   }
 
   void DxvkToneMapping::prewarmShaders(DxvkPipelineManager& pipelineManager) const {
-    const auto& neuralUplift = m_device->getCommon()->metaNeuralUplift();
-    if (DxvkNeuralUplift::enable() && neuralUplift.isSupported()) {
+    const auto& dlssNeuralRendering = m_device->getCommon()->metaDlssNeuralRendering();
+    if (DlssNeuralRendering::enable() && dlssNeuralRendering.supportsDlssNeuralRendering()) {
       FastTonemappingShader::getShader();
       InverseTonemappingShader::getShader();
     }
@@ -808,9 +804,9 @@ namespace dxvk {
     pushArgs.tonemapPrimaries = static_cast<uint32_t>(primaries());
     pushArgs.grade = gradeArgs(ctx);
     // Highlight recovery (inverse-tonemap only path)
-    pushArgs.enableHighlightRecovery = DxvkNeuralUplift::enableHighlightRecovery() ? 1u : 0u;
+    pushArgs.enableHighlightRecovery = DlssNeuralRendering::enableHighlightRecovery();
     {
-      const Vector4& t = DxvkNeuralUplift::highlightRecoveryThresholds();
+      const Vector4& t = DlssNeuralRendering::highlightRecoveryThresholds();
       pushArgs.highlightRecoveryThresholds = vec4(t.x, t.y, t.z, t.w);
     }
 

@@ -1,6 +1,6 @@
 #pragma once
 
-// Fork: the NUMOS sky provider (submodules/numos) in Remix, while rtx.skyMode is Numos.
+// The NUMOS sky provider (submodules/numos) in Remix, while rtx.skyMode is Numos.
 //
 // Frame flow (rtx_context.cpp):
 //   updateRaytraceArgsConstantBuffer  -> beginFrame: settings, camera and scene inputs, NUMOS's

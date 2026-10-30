@@ -372,6 +372,7 @@ VisibilityResult traceVisibilityRay<let VisibilityMode : uint>(
       : RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
   }
 
+
   while (true)
   {
     RayQuery<0> rayQuery = RayQuery<0>();
@@ -507,6 +508,7 @@ VisibilityResult traceVisibilityRay<let VisibilityMode : uint>(
   return result;
 }
 
+
 VisibilityResult traceVisibilityRay<let VisibilityMode : uint>(
   MinimalSurfaceInteraction minimalSurfaceInteraction, float3 targetPosition,
   uint8_t rayMask, uint8_t expectedRayPortalIndex, PortalSpace2BitsType rayOriginPortalSpace, bool pomOpaqueSurfaceEncountered,
@@ -578,7 +580,9 @@ VisibilityResult traceVisibilityRay<let VisibilityMode : uint>(
       const MemoryPolymorphicSurfaceMaterial memoryPolymorphicSurfaceMaterial = surfaceMaterials[primarySurfaceIndex];
       if (memoryPolymorphicSurfaceMaterial.hasValidDisplacement())
       {
-        OpaqueSurfaceMaterial opaqueSurfaceMaterial = opaqueSurfaceMaterialCreate(memoryPolymorphicSurfaceMaterial, true);
+        // The full material (not the visibility-only one, which drops the FNV layout and with it
+        // the terrain-layers index) so a terrain material's blended layer heights self-shadow as they displace.
+        OpaqueSurfaceMaterial opaqueSurfaceMaterial = opaqueSurfaceMaterialCreate(memoryPolymorphicSurfaceMaterial);
         
         // Indirect-light queries take coarse SCCR self-shadows.
         const float pomShadowFootprint = (VisibilityMode & visibilityModePomIndirect) != 0 ?

@@ -503,10 +503,8 @@ namespace dxvk {
     // Recreate swap chain if the previous present call failed
     VkResult status = m_device->waitForSubmission(&m_presentStatus);
     
-    if (status != VK_SUCCESS) {
-      Logger::info(str::format("D3D11SwapChain: Present returned ", status, ", recreating the swap chain"));
+    if (status != VK_SUCCESS)
       RecreateSwapChain(m_vsync);
-    }
   }
 
 
@@ -524,21 +522,8 @@ namespace dxvk {
     presenterDesc.numPresentModes = PickPresentModes(Vsync, presenterDesc.presentModes);
     presenterDesc.fullScreenExclusive = PickFullscreenMode();
 
-    VkResult vr = m_presenter->recreateSwapChain(presenterDesc);
-
-    // Swap chain images come from the same heap as Remix's allocator chunks. Empty
-    // chunks are returned to the driver before one more attempt.
-    if (vr != VK_SUCCESS) {
-      Logger::err(str::format("D3D11SwapChain: Recreating the swap chain failed with ", vr,
-                              ", retrying after releasing empty memory chunks"));
-      m_device->getCommon()->memoryManager().freeUnusedChunks();
-      vr = m_presenter->recreateSwapChain(presenterDesc);
-    }
-
-    if (vr != VK_SUCCESS) {
-      Logger::err(str::format("D3D11SwapChain: Failed to recreate swap chain: ", vr));
+    if (m_presenter->recreateSwapChain(presenterDesc) != VK_SUCCESS)
       throw DxvkError("D3D11SwapChain: Failed to recreate swap chain");
-    }
     
     CreateRenderTargetViews();
   }

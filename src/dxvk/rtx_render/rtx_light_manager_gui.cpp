@@ -28,6 +28,7 @@
 #include "rtx_options.h"
 #include "rtx_utils.h"
 
+#include "../d3d9/d3d9_state.h"
 #include "rtx/pass/common_binding_indices.h"
 #include "rtx/pass/raytrace_args.h"
 #include "math.h"
@@ -434,16 +435,20 @@ namespace dxvk {
   }
 
   void LightManager::showImguiDebugVisualization() const {
+    m_debugSnapshotWanted.store(LightManagerGuiSettings::enableDebugMode(), std::memory_order_relaxed);
     if (!LightManagerGuiSettings::enableDebugMode()) {
       return;
     }
+
+    // Draw the copy the light GC took (m_debugSnapshot), never the live table under m_lightUIMutex;
+    // see rtx_light_manager.h. The GC holds the snapshot mutex only while copying.
+    std::lock_guard<std::mutex> lock(m_debugSnapshotMutex);
 
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(viewport->Pos);
     ImGui::SetNextWindowSize(viewport->Size);
     ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.f, 0.f, 0.f, 0.0f));
     if (ImGui::Begin("Light Debug View", nullptr, ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoSavedSettings)) {
-      std::lock_guard<std::mutex> lock(m_lightUIMutex);
       ImDrawList* drawList = ImGui::GetWindowDrawList();
       drawList->PushClipRectFullScreen();
       const RtCamera& camera = device()->getCommon()->getSceneManager().getCamera();
@@ -452,16 +457,9 @@ namespace dxvk {
       cFrustum frustum;
       frustum.Setup(NDC_D3D, *reinterpret_cast<const float4x4*>(&worldToProj));
 
-      for (auto&& linearizedLight : m_linearizedLights) {
-        const RtLight* light = linearizedLight;
-        if (light->getType() == RtLightType::Distant) {
-          continue;
-        }
-
-        if (light->getType() > RtLightType::Distant) {
-          // This happens because the linearizedLights stored pointers to the actual lights.
-          // the actual lights can be garbage collected after linearizedLights is made, but before this function runs.
-          Logger::err("tried to use a deleted light in showImguiDebugVisualization.");
+      for (const RtLight& snapshotLight : m_debugSnapshot) {
+        const RtLight* light = &snapshotLight;
+        if (light->getType() >= RtLightType::Distant) {
           continue;
         }
 

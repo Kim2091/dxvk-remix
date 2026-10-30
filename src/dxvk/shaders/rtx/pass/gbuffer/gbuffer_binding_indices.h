@@ -114,6 +114,7 @@
 
 #define GBUFFER_BINDING_PRIMARY_OBJECT_PICKING_OUTPUT                           150
 #define GBUFFER_BINDING_ATMOSPHERE_FOREGROUND_OUTPUT                            151
+#define GBUFFER_BINDING_ATMOSPHERE_FOREGROUND_EMISSION_DEPTH_OUTPUT             154
 
 // rtx.gbuffer.compactPsr. PSR Prepare appends the pixels that run Reflection and Transmission PSR to two lists,
 // and the PSR passes dispatch indirectly over them (gbuffer_rayquery_compact.comp.slang).

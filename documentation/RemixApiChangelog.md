@@ -5,50 +5,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Removed
-- 2026-10-21: the named export `remixapi_fork_ReplayIdentityTrace` and its
-  result struct `remixapi_fork_IdentityReplayResult`, with the D3D9 identity
-  trace it replayed (`rtx.d3d9Identity.traceFrames`). It was a diagnostics
-  entry point for `remix_replay --identity-trace`, not part of the plugin
-  contract; `remix_c.h` and `remixapi_Interface` are unchanged.
-
 ### Changed
-- 2026-10-27: `REMIXAPI_VERSION` is `1.0.0` (was `0.1000.1`), for the release
-  after `public-rpv2-rc1`. Major 1 marks the Remix Plus line as distinct from
-  NVIDIA dxvk-remix (0.x) and other forks. Under the version check, the runtime
-  and the bridge client accept 1.x callers whose minor is at most theirs, and
-  also 0.1000.x callers (the header of `rebased-9-19` and rc1), because the
-  interface table and all structs are unchanged. Every other 0.x caller, such as
-  NVIDIA's 0.6.x or another fork's 0.1003.x, is rejected. Existing 0.1000.x
-  binaries keep working unrebuilt, and the version-gated struct reads still
-  apply to them. Rebuild against this header to use the new exports. See
-  `docs/RemixApi-Migration.md`.
-- 2026-10-25: `remixapi_GetMemoryPressure` reports the runtime's own pressure
+- 2026-10-28: `remixapi_GetMemoryPressure` reports the runtime's own pressure
   level, which now follows `usageBytes` (driver usage minus the free space inside
   the runtime's memory chunks) instead of the driver's usage. The struct is
   unchanged.
-- 2026-10-25: the entry points check their input (docs/frontend-conformance.md)
-  and count what they reject or fix in the runtime log's `[SceneInput]` line.
-  `DrawInstance`, `CreateRetainedInstance(s)` and `UpdateRetainedInstance`
-  return `REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS` for a non-finite transform or
-  GPU-instance transform, or a bone or instance-transform array of null with a
-  count. `CreateMesh` and `CreateMeshBatched` drop a surface without vertices
-  or with too few blend indices or weights, and return
-  `REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS` when no surface is left; non-finite
-  positions become 0 with their triangles collapsed, a triangle with an index
-  past `vertices_count` collapses, and a blend index of 256 or more becomes 0.
-  An instance with fewer bones than its mesh's blend indices name gets identity
-  for the rest, and bones past 256 are dropped. `UpdateRetainedInstance` of a
-  destroyed handle no longer creates it again, and `DestroyMesh` drops a
-  pending `CreateMeshBatched` of the same hash. The surface is unchanged.
-- 2026-10-25: `remixapi_StartupInfo::combineGuiInFinalColor` takes effect. With
-  `rtx.gui.enableExternalPresenter` set, false keeps the Remix GUI out of the
-  final color, so the host composites it from `dxvk_CopyRenderingOutput`'s GUI
-  output. It had no effect before, and the GUI was always in the final color.
-- 2026-10-21: `remixapi_AssetKeyEXT` is always honored. The runtime option
-  `rtx.scene.assetKeys` that gated it is removed, and so are the scene
-  options that made retained instances use the scene's lanes and lock-free
-  command queue: those paths are now always on. The API surface is unchanged.
 - 2026-10-20: `remixapi_GetMemoryPressure` reports a `level` that never exceeds
   the runtime's own pressure level, which now follows the driver's usage. The
   reported `level`, `usageBytes`, `bytesToRelease` and `requestHostRelease` follow
@@ -56,29 +17,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `requestHostRelease` is set from level 2 (High) by default.
 
 ### Added
-- 2026-10-27: color grading, as named exports: `remixapi_SetColorGradePreset`,
+- 2026-10-27: the bridge forwards `remixapi_InstanceInfoGpuInstancingEXT` on
+  `DrawInstance` and the retained-instance calls (the client logs "Forwarding
+  InstanceInfoGpuInstancingEXT"), so 32-bit hosts can GPU-instance a mesh.
+- 2026-10-27: colour grading, as named exports: `remixapi_SetColorGradePreset`,
   `remixapi_SetColorGrade`, `remixapi_MixColorGradePresets`, `remixapi_GetColorGrade` and
   `remixapi_SaveColorGradePreset`, with `remixapi_ColorGradeEXT`
   (`REMIXAPI_STRUCT_TYPE_COLOR_GRADE_EXT` = 0x4E560004, `REMIXAPI_COLOR_GRADE_VERSION` 1).
   Besides the grade (matrix, balance, saturation, contrast), the struct carries the tone curve's
   `anchor` (default 0.18) and `shoulder` (default 0.01). A 0 in either takes the default.
   The bridge exports and forwards them. `remixapi_Interface` is unchanged. docs/RemixApi.md,
-  "Color grading".
-- 2026-10-27: `REMIXAPI_HOST_SETTING_FLAG_USER_MENU` (0x4) in `remix_c.h`. A host
-  setting with this flag also appears in the user menu (Alt+X) under Game Settings,
-  with the same control as in the developer menu's Host Settings tab. The struct
-  and the other flag values are unchanged.
-
-- 2026-10-26: `remixapi_ConfigureExternalFrame` / `PFN_remixapi_ConfigureExternalFrame`
-  and `remixapi_ExternalFrameEXT` (`REMIXAPI_STRUCT_TYPE_EXTERNAL_FRAME_EXT` =
-  `0x4E560003`, `REMIXAPI_EXTERNAL_FRAME_VERSION` = 1): the presented frame is
-  copied every `Present` into an exported R8G8B8A8_UNORM image with a ready and
-  a released binary semaphore, all as OPAQUE_WIN32 NT handles, so another Vulkan
-  device or process shows it without a CPU readback (docs/RemixApi.md,
-  "External frame"). A named export, so `remixapi_Interface` and
-  `REMIXAPI_VERSION` are unchanged.
-- 2026-10-26: `REMIXAPI_ERROR_CODE_FEATURE_UNAVAILABLE` (`0x4E560001`), the first
-  fork error code, in the fork range that the fork struct types use.
+  "Colour grading".
+- 2026-10-19: the bridge forwards `remixapi_TextureInfoHostImportEXT` on
+  `CreateTexture` (the client logs "Forwarding
+  remixapi_TextureInfoHostImportEXT"), so 32-bit hosts can upload textures in
+  any `vkFormat`, such as R16G16B16A16_SFLOAT. The terrain-layers blend
+  (`remixapi_MaterialInfoTerrainLayersEXT`) clamps the blended albedo at 0, so
+  layers and tint may be signed float textures.
 - `remixapi_DrawScreenOverlayD3D11` / `PFN_remixapi_DrawScreenOverlayD3D11`
   and `remixapi_ScreenOverlayLayerD3D11`: a native D3D11 host passes its UI
   render targets (up to 8 layers, with a premultiplied-alpha flag and a
@@ -112,7 +67,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that mods, captures and caches use instead of the mesh hash or material
   content hash, plus aliases (keys older host versions produced) and an
   optional name. Replacements are looked up by key, then by each alias in
-  order. It is honored while `rtx.scene.assetKeys` is on (default off).
+  order. It is honoured while `rtx.scene.assetKeys` is on (default off).
   Commit `0b31bedd5`.
 - 2026-10-06: named export `remixapi_fork_ReplayIdentityTrace(const wchar_t*
   path, remixapi_fork_IdentityReplayResult* result)`, a diagnostics entry
@@ -122,6 +77,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `src/dxvk/rtx_render/rtx_fork_d3d9_identity_trace_format.h`, not in
   `remix_c.h`, so `remixapi_Interface` and `REMIXAPI_VERSION` are unchanged.
   Commit `4408886d5`.
+- 2026-10-20: a D3D9 point light can carry an asset key: `Falloff` =
+  4932953.0 marks it, `Direction.x/y/z` hold bits 0-21, 22-42 and 43-63 as
+  exact integers. With `rtx.scene.assetKeys`, replacements, the light picker
+  and captures use the key instead of the position hash
+  ([RemixApi.md](../docs/RemixApi.md#asset-keys-remixapi_assetkeyext)).
+
+### Changed
+- 2026-10-20: the bridge forwards `remixapi_AssetKeyEXT` on
+  `remixapi_MeshInfo` (key and aliases). The bridge client and server must
+  come from the same build.
+- 2026-10-20: captures write an API material whose albedo was imported from
+  the D3D9 device as `mat_<D3D9 image hash>` unless it has an asset key.
 
 ## [0.1000.1]
 

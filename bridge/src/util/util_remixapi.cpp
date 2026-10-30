@@ -411,6 +411,60 @@ void MaterialInfoPortal::_deserialize(void*& pDeserialize) {
 void MaterialInfoPortal::_dtor() {
 }
 
+
+// remixapi_MaterialInfoOpaqueAlbedoTintEXT (a gamma-space RGB multiplier on the albedo texture).
+#define MaterialInfoOpaqueAlbedoTintVars sType, \
+                                         albedoTint
+uint32_t MaterialInfoOpaqueAlbedoTint::_calcSize() const {
+  return fold_helper::calcSize(MaterialInfoOpaqueAlbedoTintVars);
+}
+void MaterialInfoOpaqueAlbedoTint::_serialize(void*& pSerialize) const {
+  fold_helper::serialize(pSerialize, MaterialInfoOpaqueAlbedoTintVars);
+}
+void MaterialInfoOpaqueAlbedoTint::_deserialize(void*& pDeserialize) {
+  pNext = nullptr;
+  fold_helper::deserialize(pDeserialize, MaterialInfoOpaqueAlbedoTintVars);
+}
+void MaterialInfoOpaqueAlbedoTint::_dtor() {
+}
+
+
+// remixapi_MaterialInfoTerrainLayersEXT. Every path slot is sent (NULL-aware), independent of layerCount.
+#define MaterialInfoTerrainLayersVars sType, \
+                                      layerCount, \
+                                      albedoTextures[0], albedoTextures[1], albedoTextures[2], albedoTextures[3], \
+                                      albedoTextures[4], albedoTextures[5], albedoTextures[6], albedoTextures[7], \
+                                      normalTextures[0], normalTextures[1], normalTextures[2], normalTextures[3], \
+                                      normalTextures[4], normalTextures[5], normalTextures[6], normalTextures[7], \
+                                      weightTextures[0], weightTextures[1], \
+                                      tintTexture, \
+                                      weightUvScale, \
+                                      weightUvOffset, \
+                                      normalsRgbTangentSpace, \
+                                      heightTextures[0], heightTextures[1], heightTextures[2], heightTextures[3], \
+                                      heightTextures[4], heightTextures[5], heightTextures[6], heightTextures[7]
+static_assert(REMIXAPI_TERRAIN_MAX_LAYERS == 8, "MaterialInfoTerrainLayersVars lists 8 layers");
+uint32_t MaterialInfoTerrainLayers::_calcSize() const {
+  return fold_helper::calcSize(MaterialInfoTerrainLayersVars);
+}
+void MaterialInfoTerrainLayers::_serialize(void*& pSerialize) const {
+  fold_helper::serialize(pSerialize, MaterialInfoTerrainLayersVars);
+}
+void MaterialInfoTerrainLayers::_deserialize(void*& pDeserialize) {
+  pNext = nullptr;
+  fold_helper::deserialize(pDeserialize, MaterialInfoTerrainLayersVars);
+}
+void MaterialInfoTerrainLayers::_dtor() {
+  for (uint32_t i = 0; i < REMIXAPI_TERRAIN_MAX_LAYERS; ++i) {
+    delete albedoTextures[i];
+    delete normalTextures[i];
+    delete heightTextures[i];
+  }
+  delete weightTextures[0];
+  delete weightTextures[1];
+  delete tintTexture;
+}
+
 //////////////
 // MeshInfo //
 //////////////
@@ -439,11 +493,16 @@ uint32_t MeshInfo::_calcSize() const {
   return size;
 }
 
-static inline uint32_t blendWeightSizePerVtx(const remixapi_MeshInfoSkinning& skinning) {
-  return skinning.blendWeights_count * skinning.bonesPerVertex * sizeof(float);
+// remix_c.h: blendWeights_count / blendIndices_count are the TOTAL element
+// counts of their arrays (bonesPerVertex * vertexCount), and the runtime sizes
+// its copies from them (rtx_remix_api.cpp CreateMesh). They are not per-vertex
+// or per-bone counts: multiplying by vertices_count and bonesPerVertex again
+// sized a 3000-vertex body at ~576 MB and read far past the caller's buffer.
+static inline uint32_t blendWeightsSize(const remixapi_MeshInfoSkinning& skinning) {
+  return skinning.blendWeights_count * uint32_t(sizeof(float));
 }
-static inline uint32_t blendIndicesSizePerVtx(const remixapi_MeshInfoSkinning& skinning) {
-  return skinning.blendIndices_count * skinning.bonesPerVertex * sizeof(uint32_t);
+static inline uint32_t blendIndicesSize(const remixapi_MeshInfoSkinning& skinning) {
+  return skinning.blendIndices_count * uint32_t(sizeof(uint32_t));
 }
 template<>
 static inline uint32_t sizeOf(const remixapi_MeshInfoSurfaceTriangles& surface) {
@@ -456,9 +515,9 @@ static inline uint32_t sizeOf(const remixapi_MeshInfoSurfaceTriangles& surface) 
   if(surface.skinning_hasvalue) {
     size += sizeOf(surface.skinning_value.bonesPerVertex);
     size += sizeOf(surface.skinning_value.blendWeights_count);
-    size += surface.vertices_count * blendWeightSizePerVtx(surface.skinning_value);
+    size += blendWeightsSize(surface.skinning_value);
     size += sizeOf(surface.skinning_value.blendIndices_count);
-    size += surface.vertices_count * blendIndicesSizePerVtx(surface.skinning_value);
+    size += blendIndicesSize(surface.skinning_value);
   }
   size += sizeof(uint32_t);
   return size;
@@ -491,12 +550,10 @@ void serialize(const remixapi_MeshInfoSurfaceTriangles& surface, void*& pSeriali
     bridge_util::serialize(skinning.bonesPerVertex, pSerialize);
     // Blend Weights
     bridge_util::serialize(skinning.blendWeights_count, pSerialize);
-    const size_t blendWeightsSize = surface.vertices_count * blendWeightSizePerVtx(skinning);
-    bridge_util::serialize(skinning.blendWeights_values, pSerialize, blendWeightsSize);
+    bridge_util::serialize(skinning.blendWeights_values, pSerialize, blendWeightsSize(skinning));
     // Blend Indices
     bridge_util::serialize(skinning.blendIndices_count, pSerialize);
-    const size_t blendIndicesSize = surface.vertices_count * blendIndicesSizePerVtx(skinning);
-    bridge_util::serialize(skinning.blendIndices_values, pSerialize, blendIndicesSize);
+    bridge_util::serialize(skinning.blendIndices_values, pSerialize, blendIndicesSize(skinning));
   }
   bridge_util::serialize(surface.material, pSerialize);
 }
@@ -524,12 +581,10 @@ void deserialize(void*& pDeserialize, remixapi_MeshInfoSurfaceTriangles& surface
     bridge_util::deserialize(pDeserialize, skinning.bonesPerVertex);
     // Blend Weights
     bridge_util::deserialize(pDeserialize, skinning.blendWeights_count);
-    const size_t blendWeightsSize = surface.vertices_count * blendWeightSizePerVtx(skinning);
-    deserialize_const_p(pDeserialize, skinning.blendWeights_values, blendWeightsSize);
+    deserialize_const_p(pDeserialize, skinning.blendWeights_values, blendWeightsSize(skinning));
     // Blend Indices
     bridge_util::deserialize(pDeserialize, skinning.blendIndices_count);
-    const size_t blendIndicesSize = surface.vertices_count * blendIndicesSizePerVtx(skinning);
-    deserialize_const_p(pDeserialize, skinning.blendIndices_values, blendIndicesSize);
+    deserialize_const_p(pDeserialize, skinning.blendIndices_values, blendIndicesSize(skinning));
   }
   bridge_util::deserialize(pDeserialize, surface.material);
 }
@@ -730,6 +785,24 @@ void InstanceInfoGpuInstancing::_deserialize(void*& pDeserialize) {
 }
 void InstanceInfoGpuInstancing::_dtor() {
   delete[] instanceTransforms_values;
+}
+
+
+// The material travels as its bridge handle (a uint32 uid); the server
+// maps it to the runtime's handle after deserializing.
+#define InstanceInfoMaterialOverrideVars sType, \
+                                         material
+uint32_t InstanceInfoMaterialOverride::_calcSize() const {
+  return fold_helper::calcSize(InstanceInfoMaterialOverrideVars);
+}
+void InstanceInfoMaterialOverride::_serialize(void*& pSerialize) const {
+  fold_helper::serialize(pSerialize, InstanceInfoMaterialOverrideVars);
+}
+void InstanceInfoMaterialOverride::_deserialize(void*& pDeserialize) {
+  pNext = nullptr;
+  fold_helper::deserialize(pDeserialize, InstanceInfoMaterialOverrideVars);
+}
+void InstanceInfoMaterialOverride::_dtor() {
 }
 
 

@@ -36,8 +36,8 @@
 #include "rtx_scene_manager.h"
 #include "rtx_accel_manager.h"
 #include "rtx_point_instancer_system.h"
-#include "rtx_scene_interface.h"
 
+#include "../d3d9/d3d9_state.h"
 #include "rtx_matrix_helpers.h"
 
 #include "dxvk_scoped_annotation.h"
@@ -45,6 +45,7 @@
 #include "rtx_vram_budget.h"
 #include "rtx_fork_d3d9_alpha.h"
 #include "rtx_fork_sccr_shell.h"
+#include "rtx_fork_sccr_tess.h"
 
 #include "rtx/pass/instance_definitions.h"
 #include "rtx/concept/billboard.h"
@@ -332,10 +333,24 @@ namespace dxvk {
 
     const size_t firstGeometry = geometries.size();
     geometries.insert(geometries.end(), blasEntry->buildGeometries.begin(), blasEntry->buildGeometries.end());
-    // Patch the copies, not the shared entry. Cluster routing adds instances after the
+    // Patch the copies, not the shared entry. rtx.accel.staticClusters adds instances after the
     // whole routing loop, when the entry holds the address of its last-routed instance.
+    // The copies also take this instance's own geometry flags. The entry's buildGeometries are refilled only when its
+    // geometry changes, from whichever instance of a shared mesh got there first, so they can hold another instance's
+    // opaque flag. An alpha-tested member built opaque never runs its any-hit alpha test and loses its cutout.
+    const VkGeometryFlagsKHR instanceGeometryFlags = instance->getGeometryFlags();
     for (size_t g = firstGeometry; g < geometries.size(); ++g) {
       geometries[g].geometry.triangles.transformData.deviceAddress = transformAddress;
+      if (geometries[g].flags != instanceGeometryFlags) {
+        static uint32_t s_flagPatchLogs = 0;
+        if (s_flagPatchLogs < 64) {
+          ++s_flagPatchLogs;
+          Logger::info(str::format("[BlasFlags] merged copy of instance ", instance->getId(), ": the shared entry carried geometry flags 0x",
+                                   std::hex, geometries[g].flags, ", the instance needs 0x", instanceGeometryFlags, std::dec,
+                                   " (", blasEntry->getLinkedInstances().size(), " linked instances)"));
+        }
+        geometries[g].flags = instanceGeometryFlags;
+      }
     }
     ranges.insert(ranges.end(), blasEntry->buildRanges.begin(), blasEntry->buildRanges.end());
 
@@ -890,12 +905,16 @@ namespace dxvk {
     const bool optForceMergeAllMeshes = RtxOptions::forceMergeAllMeshes();
     const uint32_t optOwnBlasMovedFrames = RtxOptions::ownBlasForMovedInstancesFrames();
     const uint32_t optOwnBlasToggledFrames = RtxOptions::ownBlasForToggledInstancesFrames();
+    const bool optMoverBackoff = RtxOptions::moverBackoff();
     const bool optSplitByPreserveState = RtxOptions::splitBlasBucketsByPreserveState();
     const bool optSplitByVolatility = RtxOptions::splitBlasBucketsByVolatility();
+    const bool optLimitOmmRebindToOmmBuckets = RtxOptions::limitOmmRebindToOmmBuckets();
     const uint32_t optMaxPrimsPerMergedBucket = RtxOptions::maxPrimsPerMergedBucket();
     const float optMergedBucketCellSize = RtxOptions::effectiveMergedBucketCellSize();
+    const bool optStaticClusters = RtxOptions::staticClusters();
     const uint32_t optClusterYoungFrames = RtxOptions::clusterYoungFrames();
     const uint32_t optClusterFoldsPerFrame = std::max(RtxOptions::clusterFoldsPerFrame(), 1u);
+    const bool optClusterMergeOmm = optStaticClusters && RtxOptions::clusterMergeOmm();
     const bool optPreferFastTraceForStaticBlas = RtxOptions::preferFastTraceForStaticBlas();
     const uint32_t optMaxBlasRefitsBeforeRebuild = RtxOptions::maxBlasRefitsBeforeRebuild();
     const bool optSeparateUnordered = RtxOptions::enableSeparateUnorderedApproximations();
@@ -921,9 +940,12 @@ namespace dxvk {
     const VkBuildAccelerationStructureFlagsKHR optExtraBlasFlags = additionalAccelerationStructureFlags() | compactionBuildFlag();
 
     // Clean cached buckets keep their membership until something dirties them, so a change of
-    // rtx.mergedBucketCellSize re-buckets everything once.
-    if (optMergedBucketCellSize != m_lastMergedBucketCellSize) {
+    // rtx.mergedBucketCellSize, rtx.accel.staticClusters or rtx.accel.clusterMergeOmm re-buckets everything once.
+    if (optMergedBucketCellSize != m_lastMergedBucketCellSize || optStaticClusters != m_lastStaticClusters ||
+        optClusterMergeOmm != m_lastClusterMergeOmm) {
       m_lastMergedBucketCellSize = optMergedBucketCellSize;
+      m_lastStaticClusters = optStaticClusters;
+      m_lastClusterMergeOmm = optClusterMergeOmm;
       m_cachedBuckets.clear();
       syncCachedBucketUids();
       m_instanceBucketIndex.clear();
@@ -956,8 +978,8 @@ namespace dxvk {
       const uint64_t currentGeneration = instanceManager.getSceneGeneration();
       const bool sceneUnchanged = (currentGeneration == m_lastProcessedGeneration);
 
-      // An aged young / volatile bucket folds into its cluster even when nothing else changed.
-      const bool clusterFoldDue = optClusterYoungFrames != 0 && m_nextClusterFoldFrame <= currentFrame;
+      // rtx.accel.staticClusters: an aged young / volatile bucket folds into its cluster even when nothing else changed.
+      const bool clusterFoldDue = optStaticClusters && optClusterYoungFrames != 0 && m_nextClusterFoldFrame <= currentFrame;
       if (sceneUnchanged && !m_ommBindPending && !m_reorderedSurfaces.empty() && !clusterFoldDue) {
         m_sceneUnchangedThisFrame = true;
         m_buildStats.unchangedFrames++;
@@ -1261,8 +1283,8 @@ namespace dxvk {
     m_ommRebindHashes.clear();
     m_ommRebindPrecise = false;
 
-    // rtx.accel.originTranslation: a clean bucket holding an instance the scene does not own was not moved by the
-    // shift (the host places it in render space), so it cannot be translated; rebuild it.
+    // rtx.accel.originTranslation: a clean bucket holding an instance the origin shift did not move (one the host or a
+    // frontend places in render space) cannot be translated, so it is rebuilt.
     if (hasValidBucketCache && !fullBucketRebuild) {
       for (uint32_t bi = 0; bi < m_cachedBuckets.size() && bi < bucketDirty.size(); ++bi) {
         const CachedBucketState& cached = m_cachedBuckets[bi];
@@ -1276,15 +1298,15 @@ namespace dxvk {
       }
     }
 
-    // Young buckets (members created recently) and volatile buckets
+    // rtx.accel.staticClusters: young buckets (members created recently) and volatile buckets
     // (geometry that changed when they were built) stay out of their cluster. Once a clean one is
     // old enough its members are re-routed, take their static key and pull the cluster in (below).
     // At most rtx.accel.clusterFoldsPerFrame keys a frame; every aged bucket of a chosen key folds.
-    if (hasValidBucketCache && !fullBucketRebuild && optClusterYoungFrames != 0) {
+    if (optStaticClusters && hasValidBucketCache && !fullBucketRebuild && optClusterYoungFrames != 0) {
       std::vector<BlasBucketKey> foldKeys;
       for (uint32_t bi = 0; bi < m_cachedBuckets.size(); ++bi) {
         const CachedBucketState& cached = m_cachedBuckets[bi];
-        if (bucketDirty[bi] || !(cached.key.young || cached.key.isVolatile) ||
+        if (bucketDirty[bi] || !cached.hasKey || !(cached.key.young || cached.key.isVolatile) ||
             (cached.key.isVolatile && cached.noFold)) {
           continue;
         }
@@ -1516,21 +1538,21 @@ namespace dxvk {
     }
     subPhase(9);
 
-    // Clean cached buckets by key. A merged instance routed this frame
+    // rtx.accel.staticClusters: clean cached buckets by key. A merged instance routed this frame
     // pulls every clean bucket of its (static) key into the rebuild, so a key's buckets are always
     // rebuilt together and their membership does not depend on which of them was dirty.
     std::unordered_multimap<BlasBucketKey, uint32_t, BlasBucketKeyHash> clusterIndex;
-    if (hasValidBucketCache && !fullBucketRebuild) {
+    if (optStaticClusters && hasValidBucketCache && !fullBucketRebuild) {
       for (uint32_t bi = 0; bi < m_cachedBuckets.size(); ++bi) {
         const CachedBucketState& cached = m_cachedBuckets[bi];
-        if (!bucketDirty[bi] && !cached.key.young && !cached.key.isVolatile) {
+        if (!bucketDirty[bi] && cached.hasKey && !cached.key.young && !cached.key.isVolatile) {
           clusterIndex.emplace(cached.key, bi);
         }
       }
     }
     m_pendingClusterMerges.clear();
 
-    // Index loop: cluster routing appends pulled-in members.
+    // Index loop: rtx.accel.staticClusters appends pulled-in members while routing.
     for (size_t routeIndex = 0; routeIndex < routeItems.size(); ++routeIndex) {
       RtInstance* instance = routeItems[routeIndex].instance;
       const bool wasInCachedBucket = routeItems[routeIndex].wasInCachedBucket;
@@ -1588,12 +1610,12 @@ namespace dxvk {
         return frames != 0 && stamp != kInvalidFrameIndex && stamp <= currentFrame && currentFrame - stamp < frames;
       };
       const bool promotableGeometry = blasEntry->buildGeometries.size() == 1 && !optForceMergeAllMeshes;
-      // A move that starts after the geometry rejoined its merged bucket
+      // rtx.accel.moverBackoff: a move that starts after the geometry rejoined its merged bucket
       // (gap since the previous move >= the window) doubles the window, up to 8x; a gap of 8
       // windows resets it. Updated once per new move stamp, so every instance routed this frame
       // sees the same window.
       uint32_t ownBlasMovedFrames = optOwnBlasMovedFrames;
-      if (optOwnBlasMovedFrames != 0) {
+      if (optMoverBackoff && optOwnBlasMovedFrames != 0) {
         const uint32_t moved = blasEntry->frameLastInstanceMoved;
         if (moved != kInvalidFrameIndex && moved <= currentFrame && moved != blasEntry->accelMoveSeenFrame) {
           const uint32_t prev = blasEntry->accelMoveSeenFrame;
@@ -1647,7 +1669,11 @@ namespace dxvk {
       // A deforming entry is rebuilt or refit in place every frame, so it gets its own BLAS at once
       // instead of after the chronic-dirty streak, and never dirties a merged bucket.
       const bool promoteDeforming = promotableGeometry && blasEntry->deforming;
-      const bool promoteToOwnBlas = promoteMoved || promoteToggled || promoteChronic || promoteDeforming;
+      // A candidate always has its own TLAS entry, so its BLAS
+      // reference can become its tessellated mesh's once built (SccrTessManager::blasReference). Decided by draw state
+      // and material only, so the arrival of a built mesh never moves it.
+      const bool promoteRealGeometry = promotableGeometry && instance->isRealGeometry;
+      const bool promoteToOwnBlas = promoteMoved || promoteToggled || promoteChronic || promoteDeforming || promoteRealGeometry;
 
       const bool forceMergedBlas = !promoteToOwnBlas &&
                                    (blasEntry->buildGeometries.size() > 1 ||                                       // Currently we use multiple build geometries for particle billboards, which we prefer to merge into large BLAS
@@ -1663,6 +1689,8 @@ namespace dxvk {
             m_buildStats.promotedToggled++;
           } else if (promoteChronic) {
             m_buildStats.promotedChronic++;
+          } else if (promoteRealGeometry) {
+            // Not counted (the SCCR real-geometry log reports its candidates).
           }
         }
         // The merged-bucket cache never looks at a per-geometry-BLAS instance's dirty flag; clear it
@@ -1734,6 +1762,11 @@ namespace dxvk {
         // a merged BLAS full of static clutter every frame.
         bucketKey.isVolatile = optSplitByVolatility
           && (blasEntry->input.getSkinningState().numBones != 0 || blasGeometryChanged);
+        // Keep OMM users (alpha-tested geometry) apart too: their buckets are rebuilt
+        // whenever new OMMs finish baking, and that should not drag static opaque
+        // geometry along.
+        bucketKey.usesOmm = optLimitOmmRebindToOmmBuckets && !optClusterMergeOmm
+          && OpacityMicromapManager::usesOpacityMicromap(*instance);
         // rtx.mergedBucketCellSize: without it, buckets take instances in table order from the whole
         // world, so the merged BLASes overlap and the TLAS cannot cull them.
         bucketKey.spatialCell = mergedBucketCellOf(*instance, optMergedBucketCellSize, m_originShift);
@@ -1742,34 +1775,69 @@ namespace dxvk {
           m_buildStats.addedInstances++;
         }
 
-        bucketKey.young = optClusterYoungFrames != 0 && !fullBucketRebuild &&
-          instance->isCreatedWithinFrames(currentFrame, optClusterYoungFrames);
-        if (!bucketKey.young && !bucketKey.isVolatile && !clusterIndex.empty()) {
-          const auto range = clusterIndex.equal_range(bucketKey);
-          for (auto it = range.first; it != range.second; ++it) {
-            const uint32_t bi = it->second;
-            if (bucketDirty[bi]) {
-              continue;
-            }
-            bucketDirty[bi] = true;
-            anyBucketDirty = true;
-            m_buildStats.clusterPulls++;
-            for (RtInstance* member : m_cachedBuckets[bi].instances) {
-              if (member->isHidden() || member->isMarkedForGC() || member->getVkInstance().mask == 0) {
+        if (optStaticClusters) {
+          bucketKey.young = optClusterYoungFrames != 0 && !fullBucketRebuild &&
+            instance->isCreatedWithinFrames(currentFrame, optClusterYoungFrames);
+          if (!bucketKey.young && !bucketKey.isVolatile && !clusterIndex.empty()) {
+            const auto range = clusterIndex.equal_range(bucketKey);
+            for (auto it = range.first; it != range.second; ++it) {
+              const uint32_t bi = it->second;
+              if (bucketDirty[bi]) {
                 continue;
               }
-              routeItems.push_back(RouteItem { member, true });
+              bucketDirty[bi] = true;
+              anyBucketDirty = true;
+              m_buildStats.clusterPulls++;
+              for (RtInstance* member : m_cachedBuckets[bi].instances) {
+                if (member->isHidden() || member->isMarkedForGC() || member->getVkInstance().mask == 0) {
+                  continue;
+                }
+                routeItems.push_back(RouteItem { member, true });
+              }
             }
+            clusterIndex.erase(bucketKey);
           }
-          clusterIndex.erase(bucketKey);
+          // Filled into buckets after the loop, in (key, instance id) order.
+          m_pendingClusterMerges.push_back(PendingClusterMerge { bucketKey, instance, blasPrims, transformDeviceAddress });
+          trackBlasBuildResources(ctx, execBarriers, blasEntry, true, !batchBarriers);
+          continue;
         }
-        // Filled into buckets after the loop, in (key, instance id) order.
-        m_pendingClusterMerges.push_back(PendingClusterMerge { bucketKey, instance, blasPrims, transformDeviceAddress });
+
+        bool merged = false;
+        auto bucketIt = bucketMap.find(bucketKey);
+        if (bucketIt != bucketMap.end()) {
+          // Cap the bucket (rtx.maxPrimsPerMergedBucket) so that one change rebuilds a bounded
+          // amount of geometry: once full, the key's next instances open a new bucket, which
+          // then becomes the key's bucket for later instances.
+          const uint32_t maxBucketPrims = optMaxPrimsPerMergedBucket;
+          BlasBucket* existingBucket = bucketIt->second;
+          const bool bucketFull = maxBucketPrims != 0 && !existingBucket->geometries.empty() &&
+            existingBucket->totalPrimitives + blasPrims > maxBucketPrims;
+          if (bucketFull) {
+            m_buildStats.bucketsSplitByCap++;
+          } else {
+            merged = existingBucket->tryAddInstance(instance, transformDeviceAddress);
+          }
+        }
+
+        // The instance couldn't be merged into any bucket - make a new one
+        if (!merged) {
+          auto newBucket = std::make_unique<BlasBucket>();
+          merged = newBucket->tryAddInstance(instance, transformDeviceAddress);
+          assert(merged);
+          // Every instance of a bucket shares its key, so this holds for all of them.
+          newBucket->isStaticGeometry = optSplitByVolatility && !bucketKey.isVolatile;
+
+          bucketMap[bucketKey] = newBucket.get();
+          blasBuckets.push_back(std::move(newBucket));
+        }
+
+        // Track the lifetime and states of the source geometry buffers
         trackBlasBuildResources(ctx, execBarriers, blasEntry, true, !batchBarriers);
       }
     }
 
-    // Fill the buckets of every key routed this frame in (key, instance
+    // rtx.accel.staticClusters: fill the buckets of every key routed this frame in (key, instance
     // id) order, so the result is a function of the key's members only (same cap split as above).
     if (!m_pendingClusterMerges.empty()) {
       std::sort(m_pendingClusterMerges.begin(), m_pendingClusterMerges.end(),
@@ -1800,6 +1868,7 @@ namespace dxvk {
           assert(merged);
           newBucket->isStaticGeometry = optSplitByVolatility && !pending.key.isVolatile && !pending.key.young;
           newBucket->clusterKey = pending.key;
+          newBucket->hasClusterKey = true;
           bucket = newBucket.get();
           bucketMap[pending.key] = newBucket.get();
           blasBuckets.push_back(std::move(newBucket));
@@ -1880,7 +1949,6 @@ namespace dxvk {
       assert(blasEntry->buildRanges.size() == 1); // dynamic BLAS should always have this
 
       bool forceRebuild = false;
-      bool ommBindTried = false;
       XXH64_hash_t boundOpacityMicromapHash = kEmptyHash;
       DxvkResource* boundOmmBuffers = nullptr;
       if (opacityMicromapManager) {
@@ -1914,7 +1982,6 @@ namespace dxvk {
         }
 
         if (ommsCompatible) {
-          ommBindTried = true;
           RtInstance* exemplarInstance = uniqueBlasEntry.instances[0];
 
           // Bind opacity micromap
@@ -1962,9 +2029,36 @@ namespace dxvk {
         // No OMM manager — clear any stale OMM binding from cached geometry data
         blasEntry->buildGeometries[0].geometry.triangles.pNext = nullptr;
       }
-      if (d3d9AlphaStats && opacityMicromapManager) {
-        D3d9Alpha::notePointInstancerGroup(uniqueBlasEntry.instances, *opacityMicromapManager, ommBindTried,
-                                           boundOpacityMicromapHash != kEmptyHash);
+
+      // The geometry flags a per-geometry BLAS is built with follow the instances that use it this
+      // frame (see BlasBucket::tryAddInstance for why the entry's cached flags can be another instance's). Opaque only
+      // when every instance is opaque; otherwise the opaque bit is dropped so an alpha-tested or blended instance keeps
+      // its any-hit (an opaque instance of the same mesh then just runs an any-hit that accepts). A BLAS built with
+      // other flags is rebuilt: a refit cannot change them.
+      {
+        VkGeometryFlagsKHR anyFlags = 0;
+        bool allOpaque = true;
+        for (const RtInstance* inst : uniqueBlasEntry.instances) {
+          const VkGeometryFlagsKHR f = inst->getGeometryFlags();
+          anyFlags |= f;
+          allOpaque = allOpaque && (f & VK_GEOMETRY_OPAQUE_BIT_KHR) != 0;
+        }
+        const VkGeometryFlagsKHR wantedFlags = allOpaque ? anyFlags
+          : (anyFlags & ~static_cast<VkGeometryFlagsKHR>(VK_GEOMETRY_OPAQUE_BIT_KHR));
+        blasEntry->buildGeometries[0].flags = wantedFlags;
+        const PooledBlas* builtBlas = blasEntry->dynamicBlas.ptr();
+        if (builtBlas != nullptr && builtBlas->buildInfo.pGeometries != nullptr && builtBlas->buildInfo.geometryCount == 1 &&
+            builtBlas->buildInfo.pGeometries[0].flags != wantedFlags) {
+          static uint32_t s_flagRebuildLogs = 0;
+          if (s_flagRebuildLogs < 64) {
+            ++s_flagRebuildLogs;
+            Logger::info(str::format("[BlasFlags] per-geometry BLAS rebuilt: built with geometry flags 0x", std::hex,
+                                     builtBlas->buildInfo.pGeometries[0].flags, ", its instances need 0x", wantedFlags, std::dec,
+                                     " (", uniqueBlasEntry.instances.size(), " instances this frame, first ",
+                                     uniqueBlasEntry.instances[0]->getId(), ")"));
+          }
+          forceRebuild = true;
+        }
       }
       m_dynamicOmmScratch[uniqueBlasIdx] = { boundOpacityMicromapHash, forceRebuild, boundOmmBuffers };
     }
@@ -2043,11 +2137,6 @@ namespace dxvk {
       });
     }
 
-    m_skinCheck = SkinCheck {};
-    m_skinCheck.active = scene::Options::selfCheckFrames() != 0;
-    m_skinCheck.frame = currentFrame;
-    m_skinCheck.pendingBatch = m_device->getCommon()->metaGeometryUtils().pendingSkinningBatch();
-
     for (uint32_t uniqueBlasIdx = 0; uniqueBlasIdx < m_uniqueDynamicBlasCount; ++uniqueBlasIdx) {
       if (parallelDynamicPass && m_dynamicPassScratch[uniqueBlasIdx].state != DynamicPassResult::kWork) {
         if (m_dynamicPassScratch[uniqueBlasIdx].state == DynamicPassResult::kEmpty) {
@@ -2056,9 +2145,6 @@ namespace dxvk {
         // Idle: stamps done; keep it in the active list, and track it as the serial path would.
         // (Only the scratch array is read here, not the BlasEntry.)
         PooledBlas* idleBlas = m_dynamicPassScratch[uniqueBlasIdx].blas;
-        if (m_skinCheck.active) {
-          noteSkinnedGeometry(*m_uniqueDynamicBlas[uniqueBlasIdx].blasEntry, *idleBlas, false, m_uniqueDynamicBlas[uniqueBlasIdx].instances);
-        }
         if (!optTrackDynamicBlasOnChange) {
           ctx->getCommandList()->trackResource<DxvkAccess::Read>(idleBlas->accelStructure);
         }
@@ -2178,7 +2264,6 @@ namespace dxvk {
           m_buildStats.dynamicBuilt++;
         }
         selectedBlas->noteBuilt(currentFrame);
-        selectedBlas->builtPose = blasEntry->skinnedPose;
         selectedBlas->uncompactedSize = 0; // never compacted here: compacted ones are replaced above
         selectedBlas->hasOmm = boundOpacityMicromapHash != kEmptyHash;
         selectedBlas->boundOmms.clear();
@@ -2239,9 +2324,6 @@ namespace dxvk {
       if (!(optSkipIdleInputTracking && !update && !build)) {
         trackBlasBuildResources(ctx, execBarriers, blasEntry, !batchBarriers || update || build, !batchBarriers);
       }
-      if (m_skinCheck.active) {
-        noteSkinnedGeometry(*blasEntry, *blasEntry->dynamicBlas, update || build, uniqueBlasEntry.instances);
-      }
     }
     for (size_t i = activeDynamicCount; i < m_activeDynamicBlases.size(); ++i) {
       retireActiveDynamicBlas(ctx, m_activeDynamicBlases[i]);
@@ -2291,9 +2373,6 @@ namespace dxvk {
 
         // Touch the BLAS so GC doesn't collect it
         cached.assignedBlas->frameLastTouched = currentFrame;
-        if (m_skinCheck.active) {
-          noteSkinnedBucket(cached.instances, *cached.assignedBlas, false);
-        }
 
         // Emit TLAS instance with updated surface offset
         auto tlasInst = cached.tlasInstance;
@@ -2352,7 +2431,6 @@ namespace dxvk {
                 textures, instances, blasBuckets, blasToBuild, blasRangesToBuild,
                 instanceTransforms, totalScratchMemory);
     m_blasBuiltThisFrame = m_blasBuiltThisFrame || !blasToBuild.empty();
-    logSkinCheck(currentFrame);
     subPhase(5);
     // uploadSurfaceData (inside buildBlases) timed itself into sub-phase 4.
     m_mergeSubMs[5] = std::max(0.0, m_mergeSubMs[5] - m_mergeSubMs[4]);
@@ -2405,7 +2483,7 @@ namespace dxvk {
           if (cached.instances.empty() || cached.instances.back() != inst) {
             cached.instances.push_back(inst);
             cached.instanceCacheIdentities.push_back(inst->getCacheIdentity());
-            cached.allSceneOwned = cached.allSceneOwned && inst->getSceneOwnedHandle() != 0;
+            cached.allSceneOwned = cached.allSceneOwned && inst->getSceneOwnedHandle() != 0 && inst->followsSceneOrigin();
           }
         }
         cached.surfaces = bucket->originalInstances;
@@ -2413,6 +2491,7 @@ namespace dxvk {
         cached.isUnordered = bucket->usesUnorderedApproximations;
         cached.hasSssInstances = bucket->hasSssInstances;
         cached.key = bucket->clusterKey;
+        cached.hasKey = bucket->hasClusterKey;
         cached.totalPrimitives = bucket->totalPrimitives;
         cached.youngestCreatedFrame = bucket->youngestCreatedFrame;
         cached.noFold = bucket->clusterNoFold;
@@ -2460,9 +2539,9 @@ namespace dxvk {
       m_cachedBuckets = std::move(newCachedBuckets);
       syncCachedBucketUids();
       m_nextClusterFoldFrame = UINT32_MAX;
-      if (optClusterYoungFrames != 0) {
+      if (optStaticClusters && optClusterYoungFrames != 0) {
         for (const CachedBucketState& cached : m_cachedBuckets) {
-          if (cached.key.young || (cached.key.isVolatile && !cached.noFold)) {
+          if (cached.hasKey && (cached.key.young || (cached.key.isVolatile && !cached.noFold))) {
             const uint32_t since = cached.key.young ? cached.youngestCreatedFrame : cached.builtFrame;
             m_nextClusterFoldFrame = std::min(m_nextClusterFoldFrame, since + optClusterYoungFrames);
           }
@@ -2547,101 +2626,6 @@ namespace dxvk {
     if (mergedEvicted != 0) {
       Logger::info(str::format("[OmmBindingCheck] frame ", m_device->getCurrentFrameId(), ": merged BLASes hold ", mergedEvicted,
         " evicted micromaps (of ", mergedHeld, ") until their buckets are rebuilt."));
-    }
-  }
-
-  namespace {
-    bool isSkinnedGeometry(const BlasEntry& entry) {
-      return entry.input.getSkinningState().numBones != 0 && entry.input.getGeometryData().numBonesPerVertex != 0;
-    }
-  }
-
-  XXH64_hash_t AccelManager::bucketSkinnedPose(const std::vector<RtInstance*>& members) {
-    XXH64_hash_t pose = 0;
-    for (const RtInstance* member : members) {
-      const BlasEntry* entry = member->getBlas();
-      if (entry != nullptr && isSkinnedGeometry(*entry)) {
-        pose = XXH3_64bits_withSeed(&entry->skinnedPose, sizeof(entry->skinnedPose), pose);
-      }
-    }
-    return pose;
-  }
-
-  void AccelManager::noteSkinnedHistory(const BlasEntry& entry, const RtInstance& instance) {
-    // An instance that existed before this frame keeps its geometry entry, so a pose change refits the BLAS and the
-    // previous positions (motion vectors) come from the last pose.
-    const uint32_t frame = m_skinCheck.frame;
-    if (entry.frameCreated == frame && !instance.isCreatedThisFrame(frame)) {
-      ++m_skinCheck.recreated;
-    } else if (entry.frameLastUpdated == frame && entry.frameCreated != frame &&
-               !entry.modifiedGeometryData.previousPositionBuffer.defined()) {
-      ++m_skinCheck.noHistory;
-    }
-  }
-
-  void AccelManager::noteSkinnedGeometry(const BlasEntry& entry, const PooledBlas& blas, bool written,
-                                         const std::vector<RtInstance*>& instances) {
-    if (!isSkinnedGeometry(entry)) {
-      return;
-    }
-    ++m_skinCheck.checked;
-    if (!instances.empty()) {
-      noteSkinnedHistory(entry, *instances[0]);
-    }
-    if (entry.skinnedPose != entry.input.getSkinningState().boneHash) {
-      ++m_skinCheck.verticesBehind;
-    } else if (blas.builtPose != entry.skinnedPose) {
-      ++m_skinCheck.blasBehind;
-    }
-    if (written && entry.skinnedBatch != 0 && entry.skinnedBatch == m_skinCheck.pendingBatch) {
-      ++m_skinCheck.unsubmitted;
-    }
-  }
-
-  void AccelManager::noteSkinnedBucket(const std::vector<RtInstance*>& members, const PooledBlas& blas, bool written) {
-    bool any = false;
-    bool verticesBehind = false;
-    bool unsubmitted = false;
-    for (const RtInstance* member : members) {
-      const BlasEntry* entry = member->getBlas();
-      if (entry == nullptr || !isSkinnedGeometry(*entry)) {
-        continue;
-      }
-      any = true;
-      ++m_skinCheck.checked;
-      noteSkinnedHistory(*entry, *member);
-      if (entry->skinnedPose != entry->input.getSkinningState().boneHash) {
-        ++m_skinCheck.verticesBehind;
-        verticesBehind = true;
-      }
-      if (written && entry->skinnedBatch != 0 && entry->skinnedBatch == m_skinCheck.pendingBatch) {
-        unsubmitted = true;
-      }
-    }
-    if (!any) {
-      return;
-    }
-    if (!verticesBehind && blas.builtPose != bucketSkinnedPose(members)) {
-      ++m_skinCheck.blasBehind;
-    }
-    if (unsubmitted) {
-      ++m_skinCheck.unsubmitted;
-    }
-  }
-
-  void AccelManager::logSkinCheck(uint32_t currentFrame) {
-    const SkinCheck& c = m_skinCheck;
-    if (!c.active || (c.verticesBehind | c.blasBehind | c.unsubmitted | c.recreated | c.noHistory) == 0) {
-      return;
-    }
-    ++m_skinCheckMismatches;
-    if (m_skinCheckMismatches <= 30) {
-      Logger::warn(str::format("[SceneCheck] frame ", currentFrame, ": skinned geometry behind its pose (", c.checked,
-        " checked): vertices not skinned with the drawn bones ", c.verticesBehind,
-        ", BLAS not built or refit from the skinned vertices ", c.blasBehind,
-        ", BLAS built from skinning submitted after the build ", c.unsubmitted,
-        ", geometry recreated for an existing instance ", c.recreated, ", updated without previous positions ", c.noHistory,
-        ". Frames with mismatches so far: ", m_skinCheckMismatches));
     }
   }
 
@@ -2747,6 +2731,8 @@ namespace dxvk {
     }
     m_pointInstancerBatches.resize(running.batches);
 
+    // Read-only lookups, safe on the workers.
+    const SccrTessManager& sccrTess = m_device->getCommon()->metaSccrTess();
     // Fill pass: each group writes its own ranges, exactly as addBlas / addPointInstancerBlas would.
     concurrency::parallel_for<uint32_t>(0, chunkCount, [&](uint32_t chunk) {
       const uint32_t end = std::min(groupCount, (chunk + 1) * kChunk);
@@ -2758,7 +2744,9 @@ namespace dxvk {
           if (inst->surface.instancesToObject == nullptr) {
             // addBlas
             VkAccelerationStructureInstanceKHR blasInstance = inst->getVkInstance();
-            blasInstance.accelerationStructureReference = blasEntry->dynamicBlas->accelerationStructureReference;
+            // A bound instance references its tessellated mesh.
+            blasInstance.accelerationStructureReference =
+              sccrTess.blasReference(*inst, blasEntry->dynamicBlas->accelerationStructureReference);
             blasInstance.instanceCustomIndex =
               (blasInstance.instanceCustomIndex & ~uint32_t(CUSTOM_INDEX_SURFACE_MASK)) |
               uint32_t(cursor.surfaces) & uint32_t(CUSTOM_INDEX_SURFACE_MASK);
@@ -2883,7 +2871,10 @@ namespace dxvk {
                              bool separateUnordered) {
     // Create an instance for this BLAS
     VkAccelerationStructureInstanceKHR blasInstance = instance->getVkInstance();
-    blasInstance.accelerationStructureReference = blasEntry->dynamicBlas->accelerationStructureReference;
+    // A bound instance references its tessellated mesh (the point-instancer path is never
+    // bound: SccrShellManager::isRealGeometryCandidate).
+    blasInstance.accelerationStructureReference = m_device->getCommon()->metaSccrTess().blasReference(
+      *instance, blasEntry->dynamicBlas->accelerationStructureReference);
     blasInstance.instanceCustomIndex =
       (blasInstance.instanceCustomIndex & ~uint32_t(CUSTOM_INDEX_SURFACE_MASK)) |
       uint32_t(m_reorderedSurfaces.size()) & uint32_t(CUSTOM_INDEX_SURFACE_MASK);
@@ -2940,6 +2931,7 @@ namespace dxvk {
     const bool separateUnordered = RtxOptions::enableSeparateUnorderedApproximations();
     const bool optNoRefitOfOmmBlas = RtxOptions::mergedBlasNoRefitOfOmmBlas();
     const bool optFastTraceStaticMerged = RtxOptions::preferFastTraceForStaticMergedBlas();
+    const bool optClusterQuality = RtxOptions::staticClusters() && RtxOptions::staticClusterQuality();
 
     // Create or find a matching BLAS for each bucket, then build it
     for (const auto& bucket : blasBuckets) {
@@ -2949,9 +2941,10 @@ namespace dxvk {
       buildInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
       // rtx.preferFastTraceForStaticMergedBlas: static buckets are built once and traced every frame. ALLOW_UPDATE is
       // kept so the refit / skip-unchanged logic below works unchanged (validateUpdateMode matches the flags exactly).
-      // A settled cluster bucket (not young, not volatile) is rebuilt only when its
+      // rtx.accel.staticClusterQuality: a settled cluster bucket (not young, not volatile) is rebuilt only when its
       // membership changes, never refit, so it is built for trace speed and without ALLOW_UPDATE.
-      const bool clusterQuality = !bucket->clusterKey.young && !bucket->clusterKey.isVolatile;
+      const bool clusterQuality = optClusterQuality && bucket->hasClusterKey &&
+        !bucket->clusterKey.young && !bucket->clusterKey.isVolatile;
       const VkBuildAccelerationStructureFlagsKHR qualityFlag = ((optFastTraceStaticMerged && bucket->isStaticGeometry) || clusterQuality)
         ? VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR
         : VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR;
@@ -3106,12 +3099,6 @@ namespace dxvk {
         m_buildStats.bucketPrimsBuilt += bucket->totalPrimitives;
       }
 
-      if (!canSkipBuild) {
-        selectedBlas->builtPose = bucketSkinnedPose(bucket->originalInstances);
-      }
-      if (m_skinCheck.active) {
-        noteSkinnedBucket(bucket->originalInstances, *selectedBlas, !canSkipBuild);
-      }
       if (!canSkipBuild) {
         selectedBlas->noteBuilt(currentFrame);
         selectedBlas->uncompactedSize = 0; // fresh content, full layout
@@ -3580,13 +3567,15 @@ namespace dxvk {
 
   // Primitive-ID prefix sum: element i + 1 holds surface i's primitive count until finishPrimitiveIdPrefixSum.
   void AccelManager::fillPrimitiveCountsSerial() {
+    // A surface bound to a tessellated mesh counts its triangles.
+    const SccrTessManager& sccrTess = m_device->getCommon()->metaSccrTess();
     for (uint32_t i = 0; i < m_reorderedSurfaces.size(); i++) {
       auto surface = m_reorderedSurfaces[i];
       int primitiveCount = 0;
       for (const auto& buildRange: surface->getBlas()->buildRanges) {
         primitiveCount += buildRange.primitiveCount;
       }
-      m_reorderedSurfacesPrimitiveIDPrefixSum[i + 1] = primitiveCount;
+      m_reorderedSurfacesPrimitiveIDPrefixSum[i + 1] = sccrTess.primitiveCount(*surface, uint32_t(primitiveCount));
     }
   }
 
@@ -3640,6 +3629,7 @@ namespace dxvk {
     const uint32_t* firstIndexOffsets = m_reorderedSurfacesFirstIndexOffset.data();
     // Writes each record's SCCR shell slot. SceneManager::prepareSceneData already ran the shell manager's frame.
     const SccrShellManager& sccrShell = m_device->getCommon()->metaSccrShell();
+    const SccrTessManager& sccrTess = m_device->getCommon()->metaSccrTess();
     unsigned char* gpuData = surfacesGPUData.data();
     const unsigned char* uploadedData = m_uploadedSurfaceData.data();
 
@@ -3689,7 +3679,7 @@ namespace dxvk {
           for (const auto& buildRange : instance.getBlas()->buildRanges) {
             primitiveCount += buildRange.primitiveCount;
           }
-          primitiveCounts[i] = primitiveCount;
+          primitiveCounts[i] = sccrTess.primitiveCount(instance, uint32_t(primitiveCount));
         }
         if (particleInfos != nullptr) {
           // What buildParticleSurfaceMapping's first loop records for this slot.
@@ -3779,7 +3769,7 @@ namespace dxvk {
         surface.firstIndex += firstIndexOffsets[i];
         surface.writeGPUData(record.data(), offset, i);
         surface.firstIndex -= firstIndexOffsets[i];
-        sccrShell.patchSurfaceRecord(record.data(), *surfaces[i]);
+        sccrShell.patchSurfaceRecord(record.data(), *surfaces[i]); // As the pass above
         if (std::memcmp(record.data(), gpuData + size_t(i) * kSurfaceGPUSize, kSurfaceGPUSize) != 0) {
           ++recordMismatches;
         }
@@ -3796,7 +3786,7 @@ namespace dxvk {
           for (const auto& buildRange : surfaces[i]->getBlas()->buildRanges) {
             primitiveCount += buildRange.primitiveCount;
           }
-          running += uint32_t(primitiveCount);
+          running += sccrTess.primitiveCount(*surfaces[i], uint32_t(primitiveCount));
         }
       }
       if (recordMismatches + splitInstances != 0) {
@@ -4338,11 +4328,14 @@ namespace dxvk {
   template<Tlas::Type type>
   void AccelManager::internalBuildTlas(Rc<DxvkContext> ctx, size_t& totalScratchSize) {
     static constexpr const char* names[] = { "TLAS_Opaque", "TLAS_NonOpaque", "TLAS_SSS" };
+    static_assert(sizeof(names) / sizeof(names[0]) == Tlas::Count, "a name per TLAS type");
     ScopedGpuProfileZone(ctx, names[type]);
     // TLAS always uses BUILD mode, so it does not need the extra storage for updates.
-    // Fast-trace TLAS (the size cache keys on the flags).
+    // rtx.accel.tlasFastTrace: fast-trace TLAS (the size cache keys on the flags).
     const VkBuildAccelerationStructureFlagsKHR flags =
-      VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR | additionalAccelerationStructureFlags();
+      (RtxOptions::tlasFastTrace() ? VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR
+                                   : VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR) |
+      additionalAccelerationStructureFlags();
 
     const auto& vkd = m_device->vkd();
 

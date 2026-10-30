@@ -34,7 +34,7 @@ Keys an integration typically pushes:
 |---|---|
 | `rtx.skyMode` | `1` = NUMOS sky (`0` = the game's skybox) |
 | `rtx.atmosphere.sunElevation`, `sunRotation` | the sun from the game clock, degrees (or `timeCycleEnable` + `timeOfDayHours` to let NUMOS run the clock) |
-| `rtx.atmosphere.unitsPerMeter` | game units per real meter: a measurement of the game (Gamebryo engines about 70, centimeter engines 100) |
+| `rtx.atmosphere.unitsPerMeter` | game units per real metre: a measurement of the game (FO4 about 70, Gamebryo 70.4, centimetre engines 100) |
 | `rtx.atmosphere.worldScale` | the sky's size relative to the game's world (default 1). NUMOS renders everything at full scale in its own metres; one NUMOS metre is `unitsPerMeter x worldScale` game units. Below 1 shrinks the whole sky (clouds, haze, fog, lamp glow, lightning) together; settings in metres/km are NUMOS metres and shrink with it, settings in world units do not |
 | `rtx.atmosphere.groundLevelAuto` | default on: altitude zero (cloud bases, height fog, sky) is the measured ground under the player, from rays against the scene's TLAS, low-passed over `groundSmoothingMeters` (NUMOS metres, default 4000). Off: `groundLevelWorldUnits` |
 | `rtx.atmosphere.groundLevelWorldUnits` | manual ground level (engine units along the up axis); the fallback while Auto has measured nothing |

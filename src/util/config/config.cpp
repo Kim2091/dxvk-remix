@@ -27,7 +27,6 @@
 #include <utility>
 #include <filesystem>
 #include <algorithm>
-#include <limits>
 
 #include "config.h"
 
@@ -1185,22 +1184,6 @@ namespace dxvk {
       ? iter->second : std::string();
   }
 
-  // NV-DXVK start: 0x hex integers in config files
-  // Reads "0x..." (after leading spaces) as a 32-bit pattern. Returns false for anything else; throws on a malformed or
-  // out-of-range hex number.
-  static bool parseHex32(const std::string& value, uint32_t& result) {
-    const size_t start = value.find_first_not_of(" \t");
-    if (start == std::string::npos || value.size() <= start + 2 || value[start] != '0' ||
-        (value[start + 1] != 'x' && value[start + 1] != 'X'))
-      return false;
-    const unsigned long long parsed = std::stoull(value, nullptr, 16);
-    if (parsed > std::numeric_limits<uint32_t>::max())
-      throw std::out_of_range("hex value exceeds 32 bits");
-    result = uint32_t(parsed);
-    return true;
-  }
-  // NV-DXVK end
-
   bool Config::parseOptionValue(
     const std::string&  value,
           std::string&  result) {
@@ -1243,14 +1226,8 @@ namespace dxvk {
     if (value.size() == 0)
       return false;
 
-    // NV-DXVK start: skip whitespaces at start of number strings; 0x hex is a 32-bit pattern (unsigned options
-    // are stored as int)
+    // NV-DXVK start: skip whitespaces at start of number strings
     try {
-      uint32_t bits = 0;
-      if (parseHex32(value, bits)) {
-        result = int32_t(bits);
-        return true;
-      }
       result = std::stoi(value);
       return true;
     }
@@ -1266,15 +1243,9 @@ namespace dxvk {
     if (value.size() == 0)
       return false;
 
-    // NV-DXVK start: skip whitespaces at start of number strings; the full unsigned range, decimal or 0x hex
+    // NV-DXVK start: skip whitespaces at start of number strings
     try {
-      if (parseHex32(value, result))
-        return true;
-      // Decimal is read signed, so a negative value wraps.
-      const long long parsed = std::stoll(value);
-      if (parsed < std::numeric_limits<int32_t>::min() || parsed > (long long) std::numeric_limits<uint32_t>::max())
-        return false;
-      result = uint32_t(parsed);
+      result = std::stol(value);
       return true;
     }
     catch (...) {

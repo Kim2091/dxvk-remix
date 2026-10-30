@@ -63,11 +63,15 @@
 #include "rtx_render/rtx_particle_system.h"
 #include "rtx_render/rtx_point_instancer_system.h"
 #include "rtx_render/rtx_settings_sweep.h"
-#include "rtx_render/rtx_frame_export.h"
+// NV-DXVK start: SCCR cone maps
 #include "rtx_render/rtx_fork_pom_cone_map.h"
+// NV-DXVK end
+// NV-DXVK start: SCCR shell tracing
 #include "rtx_render/rtx_fork_sccr_shell.h"
+#include "rtx_render/rtx_fork_sccr_tess.h"
+// NV-DXVK end
 #include "rtx_render/rtx_gpu_crash.h"
-#include "rtx_render/rtx_neural_uplift.h"
+#include "rtx_render/rtx_dlss_neural_rendering.h"
 
 #include "rtx_render/rtx_denoise_type.h"
 #include "../util/util_lazy.h"
@@ -248,8 +252,8 @@ namespace dxvk {
       return m_dlfg.get();
     }
 
-    DxvkNeuralUplift& metaNeuralUplift() {
-      return m_neuralUplift.get();
+    DlssNeuralRendering& metaDlssNeuralRendering() {
+      return m_dlssNeuralRendering.get();
     }
 
     DxvkNIS& metaNIS() {
@@ -328,10 +332,6 @@ namespace dxvk {
       return m_screenshot.get(m_device);
     }
 
-    RtxFrameExport& metaFrameExport() {
-      return m_frameExport.get(m_device);
-    }
-
     SceneManager& getSceneManager() {
       return m_sceneManager;
     }
@@ -378,13 +378,21 @@ namespace dxvk {
       return m_pointInstancerSystem.get(m_device);
     }
 
+    // NV-DXVK start: SCCR cone maps
     PomConeMapManager& metaPomConeMaps() {
       return m_pomConeMaps.get(m_device);
     }
+    // NV-DXVK end
 
+    // NV-DXVK start: SCCR shell tracing
     SccrShellManager& metaSccrShell() {
       return m_sccrShell.get(m_device);
     }
+    // SCCR real geometry
+    SccrTessManager& metaSccrTess() {
+      return m_sccrTess.get(m_device);
+    }
+    // NV-DXVK end
 
     void onDestroy();
 
@@ -452,7 +460,7 @@ namespace dxvk {
     Active<DxvkDenoise>                     m_referenceDenoiserSecondLobe2;
     Active<DxvkDLSS>                        m_dlss;
     Active<DxvkRayReconstruction>           m_rayReconstruction;
-    Active<DxvkNeuralUplift>                m_neuralUplift;
+    Active<DlssNeuralRendering>             m_dlssNeuralRendering;
     Active<DxvkNIS>                         m_nis;
     Active<DxvkTemporalAA>                  m_taa;
     Active<DxvkXeSS>                        m_xess;
@@ -472,12 +480,16 @@ namespace dxvk {
     Lazy<RtxReflex>                         m_reflex;
     Lazy<RtxSettingsSweep>                  m_settingsSweep;
     Lazy<RtxScreenshot>                     m_screenshot;
-    Lazy<RtxFrameExport>                    m_frameExport;
     Lazy<RtxDustParticles>                  m_dustParticles;
     Lazy<RtxParticleSystemManager>          m_particleSystem;
     Lazy<RtxPointInstancerSystem>            m_pointInstancerSystem;
+    // NV-DXVK start: SCCR cone maps
     Lazy<PomConeMapManager>                  m_pomConeMaps;
+    // NV-DXVK end
+    // NV-DXVK start: SCCR shell tracing
     Lazy<SccrShellManager>                   m_sccrShell;
+    Lazy<SccrTessManager>                    m_sccrTess;
+    // NV-DXVK end
 
     std::atomic<HWND>                       m_lastKnownWindowHandle;
   };

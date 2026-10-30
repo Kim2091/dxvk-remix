@@ -5,7 +5,7 @@
 #include "d3d9_texture.h"
 #include <d3d9types.h>
 
-#include "d3d9_shared_res.h"
+#include "../util/util_shared_res.h"
 
 #include <algorithm>
 #include <iostream>

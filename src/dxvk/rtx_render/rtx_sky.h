@@ -92,6 +92,54 @@ namespace dxvk {
     };
   }
 
+  static bool isSkyboxQuad(const DrawCallState& state) {
+    if (state.getMaterialData().blendMode.enableBlending) {
+      return false;
+    }
+    if (state.getGeometryData().indexCount == 0) {
+      return state.getGeometryData().vertexCount <= 6;
+    }
+    return state.getGeometryData().indexCount <= 6;
+  }
+
+} // namespace dxvk
+
+#include "MathLib/MathLib_f.h"
+
+namespace dxvk {
+  static Matrix4d overrideNearFarPlanes(const Matrix4d& modifiedViewToProj, float nearPlane, float farPlane) {
+    // Note: Converted to floats to interface with MathLib. Ideally this should be a double still.
+    Matrix4 floatModifiedViewToProj{ modifiedViewToProj };
+
+    // Check size since struct padding can impact this memcpy
+    static_assert(sizeof(float4x4) == sizeof(floatModifiedViewToProj));
+
+    uint32_t flags;
+    float    cameraParams[PROJ_NUM];
+    DecomposeProjection(
+      NDC_D3D,
+      NDC_D3D,
+      *reinterpret_cast<float4x4*>(&floatModifiedViewToProj),
+      &flags,
+      cameraParams,
+      nullptr,
+      nullptr,
+      nullptr,
+      nullptr);
+
+    float4x4 newProjection;
+    newProjection.SetupByAngles(
+      cameraParams[PROJ_ANGLEMINX],
+      cameraParams[PROJ_ANGLEMAXX],
+      cameraParams[PROJ_ANGLEMINY],
+      cameraParams[PROJ_ANGLEMAXY],
+      nearPlane,
+      farPlane,
+      flags);
+    memcpy(&floatModifiedViewToProj, &newProjection, sizeof(float4x4));
+
+    return Matrix4d{ floatModifiedViewToProj };
+  }
 } // namespace dxvk
 
 void dxvk::RtxContext::initSkyTargets() {
@@ -107,4 +155,153 @@ void dxvk::RtxContext::initSkyTargets() {
     getResourceManager().getSkyMatte(this, m_skyColorFormat).view,
     m_skyRtColorFormat);
   initSkyProbe();
+}
+
+bool dxvk::RtxContext::skyDrawRasterizes(const DrawCallState& drawCallState) {
+  if (!RtxOptions::skyReprojectToMainCameraSpace()) {
+    return true;
+  }
+  // When skyForceAutoDetectedToReproject is enabled, draw calls classified as sky by
+  // autoDetect are always reprojected instead of rasterized to the cubemap. This fixes
+  // a class of bugs where autoDetect misclassifies world geometry as sky (due to shared
+  // camera positions), causing that geometry to become invisible.
+  if (RtxOptions::skyForceAutoDetectedToReproject() && drawCallState.skyAutoDetected) {
+    return false;
+  }
+  // Always rasterize sky planes
+  if (isSkyboxQuad(drawCallState)) {
+    return true;
+  }
+  return false;
+}
+
+bool dxvk::RtxContext::rasterizeSkyDraw(const DrawParameters& params, const DrawCallState& drawCallState) {
+  if (RtxOptions::skyMode() == SkyMode::Numos) {
+    return true;  // NUMOS draws no game sky; tryHandleSky skips these draws too
+  }
+  if (!skyDrawRasterizes(drawCallState)) {
+    return false;
+  }
+  initSkyTargets();
+  rasterizeSky(params, drawCallState);
+  return true;
+}
+
+bool dxvk::RtxContext::reprojectSkyToMain(DrawCallTransforms& skyTransform, bool allowStaleMainCamera) {
+  // The same reprojection as tryHandleSky's delayed submit below.
+  const RtCamera& mainCam = getSceneManager().getCameraManager().getCamera(CameraType::Main);
+  const uint32_t frame = m_device->getCurrentFrameId();
+  const uint32_t lastUpdate = mainCam.getLastUpdateFrame();
+  if (lastUpdate != frame && !(allowStaleMainCamera && lastUpdate + 1 == frame)) {
+    return false;
+  }
+
+  const auto [mainCamNearPlane, mainCamFarPlane] = mainCam.calculateNearFarPlanes();
+  const float scale = RtxOptions::skyReprojectScale();
+  const Matrix4d scaleMatrix{
+    scale, 0,     0,     0,
+    0,     scale, 0,     0,
+    0,     0,     scale, 0,
+    0,     0,     0,     1,
+  };
+  const Matrix4d skyViewToProjection = overrideNearFarPlanes(
+    skyTransform.viewToProjection,
+    mainCamNearPlane,
+    mainCamFarPlane);
+  const Matrix4d skyViewToMainWorld =
+    mainCam.getViewToWorld(false) *
+    (mainCam.getProjectionToView() * skyViewToProjection) *
+    scaleMatrix;
+
+  skyTransform.objectToWorld    = skyViewToMainWorld * skyTransform.worldToView * skyTransform.objectToWorld;
+  skyTransform.worldToView      = mainCam.getWorldToView();
+  skyTransform.viewToProjection = mainCam.getViewToProjection();
+  skyTransform.sanitize();
+  return true;
+}
+
+dxvk::RtxContext::TryHandleSkyResult dxvk::RtxContext::tryHandleSky(const DrawParameters* originalParams,
+                                                                    DrawCallState* originalDrawCallState) {
+
+  // Skip all sky geometry when using Numos mode
+  if (originalParams && originalDrawCallState && originalDrawCallState->cameraType == CameraType::Sky &&
+      RtxOptions::skyMode() == SkyMode::Numos) {
+    return TryHandleSkyResult::SkipSubmit;
+  }
+
+  if (originalParams && originalDrawCallState && originalDrawCallState->cameraType == CameraType::Sky) {
+
+    // Initialize the sky render targets
+    initSkyTargets();
+
+    if (skyDrawRasterizes(*originalDrawCallState)) {
+      rasterizeSky(*originalParams, *originalDrawCallState);
+      return TryHandleSkyResult::Default;
+    }
+
+    // But for 3D skybox (i.e. the objects that are rendered in sky camera space),
+    // we would need to know the main camera to be able to reproject from sky to main camera space,
+    // so delay ray traced logic until then
+    m_delayedRayTracedSky.push_back(std::move(*originalDrawCallState));
+    return TryHandleSkyResult::SkipSubmit;
+  }
+
+  // Received a non-sky 'originalDrawCallState'
+  assert(!originalDrawCallState || originalDrawCallState->cameraType != CameraType::Sky);
+
+  if (m_delayedRayTracedSky.empty()) {
+    return TryHandleSkyResult::Default;
+  }
+
+  // 2. Submit ray traced sky geometry as a part of the main scene by reprojecting its transform
+  const RtCamera& mainCam = getSceneManager().getCameraManager().getCamera(CameraType::Main);
+
+  if (mainCam.getLastUpdateFrame() != m_device->getCurrentFrameId()) {
+    // Skip, if the main camera hasn't been updated yet
+    return TryHandleSkyResult::Default;
+  }
+
+  // Note: getNearPlane() / getFarPlane() do not return actual values in case if overrideNearPlane is enabled
+  const auto [mainCamNearPlane, mainCamFarPlane] = mainCam.calculateNearFarPlanes();
+
+  const float scale = RtxOptions::skyReprojectScale();
+  const Matrix4d scaleMatrix{
+    scale, 0,     0,     0,
+    0,     scale, 0,     0,
+    0,     0,     scale, 0,
+    0,     0,     0,     1,
+  };
+
+  for (DrawCallState& skyGeometry : m_delayedRayTracedSky) {
+    // Swap camera
+    skyGeometry.cameraType = CameraType::Main;
+    skyGeometry.modifyCategoryFlags().clr(InstanceCategories::Sky);
+
+    // And reproject
+    DrawCallTransforms& skyTransform = skyGeometry.modifyTransformData();
+
+    // Near / far planes must match to prevent problems related to the mismatching Z-space
+    const Matrix4d skyViewToProjection = overrideNearFarPlanes(
+      skyTransform.viewToProjection,
+      mainCamNearPlane,
+      mainCamFarPlane);
+
+    const Matrix4d skyViewToMainWorld =
+      mainCam.getViewToWorld(false) *
+      (mainCam.getProjectionToView() * skyViewToProjection) *
+      scaleMatrix;
+
+    skyTransform.objectToWorld    = skyViewToMainWorld * skyTransform.worldToView * skyTransform.objectToWorld;
+    skyTransform.worldToView      = mainCam.getWorldToView();
+    skyTransform.viewToProjection = mainCam.getViewToProjection();
+    skyTransform.sanitize();
+
+    getSceneManager().submitDrawState(this, skyGeometry, nullptr);
+  }
+  m_delayedRayTracedSky.clear();
+
+  // since 'originalDrawCallState' is not a sky (it just triggers delayed sky submit),
+  // proceed with the default path
+  assert(!originalDrawCallState || originalDrawCallState->cameraType != CameraType::Sky);
+  return TryHandleSkyResult::Default;
 }

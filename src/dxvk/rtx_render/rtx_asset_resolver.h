@@ -29,7 +29,7 @@
 
 namespace dxvk {
 
-  // Asset keys of API assets (scene interface spec section 2.1; remixapi_AssetKeyEXT).
+  // Asset keys of API assets (scene interface spec section 2.1; remixapi_AssetKeyEXT, rtx.scene.assetKeys).
   //
   // A host may give a mesh or material a key that mods, captures and caches use instead of the default (the mesh
   // handle; the material's runtime content hash), plus aliases: the keys an older host or plugin version produced,

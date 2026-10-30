@@ -220,7 +220,7 @@ vec3 evalOpaqueSchlickFresnel(vec3 baseReflectivity,
   // This however despite being fairly commonly seen in BRDF implementations is fairly dubious as realistically only pure metals will
   // have this control (dielectrics will pull it back to the standard dielectric base reflectivity used in the material model), and artists
   // need to actually be aware of this to actually utilize it (which is not often the case unless specifically called out).
-  // As such, the standard Schlick Fresnel is implemented here as no Remix content in practice explicitly utilizes this
+  // As such, the standard Schlick Fresnel is implemented here as nothing in Remix (well Portal RTX at least) actually explicitly utilizes this
   // non-physically based shadowing feature art wise.
 
   return baseReflectivity + (vec3(1.0f) - baseReflectivity) * invClampPow5(outputDirectionDotMicrofacetNormal);

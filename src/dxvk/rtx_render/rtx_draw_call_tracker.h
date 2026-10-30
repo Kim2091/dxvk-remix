@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "rtx_types.h"
+#include "rtx_fork_d3d9_identity.h"
 #include "../util/util_spatial_map.h"
 
 namespace dxvk {
@@ -53,25 +54,38 @@ public:
   // m_assetSpatialMaps). Used when a draw source tied to that bucket is invalidated.
   void removeReplacementInstancesWithSpatialMapHash(XXH64_hash_t spatialMapHash);
 
-  // Find or create a ReplacementInstance from a SceneDraw.
-  // L1 identity includes legacy material hash from SceneDraw plus the hash of
+  // Find or create a ReplacementInstance from a DrawCallState.
+  // L1 identity includes legacy material hash from DrawCallState plus the hash of
   // overrideMaterialData when non-null (terrain bake, particles, etc.); full merged
   // render MaterialData is not required for tracking.
   // Portal-aware matching for ViewModel draw calls is performed using the RayPortalManager.
   ReplacementInstance* findOrCreateReplacementInstance(
     const ReplacementInstance::LookupKey& key);
 
-  // Wrapper for the above function that constructs the LookupKey from the SceneDraw.
+  // Wrapper for the above function that constructs the LookupKey from the DrawCallState.
+  // hasReplacements: the draw has USD mesh replacements (rtx.d3d9Identity.traceFrames records it).
   ReplacementInstance* findOrCreateReplacementInstance(
-      const SceneDraw& drawCallState,
+      const DrawCallState& drawCallState,
       const RayPortalManager& rayPortalManager,
-      const MaterialData* overrideMaterialData);
+      const MaterialData* overrideMaterialData,
+      bool hasReplacements = false);
+
+  // The lookup once its key is formed: L1 / L2 / L3. Shared by the draw path above and the identity-trace replay
+  // (rtx_fork_d3d9_identity_trace.h). identityLookup: the classifier inputs ([D3d9Identity]), or nullptr.
+  ReplacementInstance* findOrCreateKeyed(
+      const ReplacementInstance::LookupKey& key,
+      const D3d9Identity::Lookup* identityLookup);
+
+  // Identity-trace replay: frame ids come from *frame instead of the device (nullptr = the device's).
+  void setFrameOverride(const uint32_t* frame) { m_frameOverride = frame; }
 
   // Look up an existing ReplacementInstance by L1 identity hash only. Returns
   // nullptr if no RI exists for this key. Unlike findOrCreateReplacementInstance,
   // this never allocates and never runs the L2 spatial search -- intended
   // for "is there stale state to clean up?" probes that must not pollute the
-  // tracker with empty RIs.
+  // tracker with empty RIs (e.g. game lights when their replacement was just
+  // toggled off).
+  // outMatchKind is always set to how the instance was resolved.
   ReplacementInstance* findReplacementInstanceByIdentity(XXH64_hash_t identityHash);
 
   // Garbage collect expired ReplacementInstances. Object anti-culling keeps mesh RIs alive
@@ -81,8 +95,9 @@ public:
       RtCamera& camera,
       bool isAntiCullingSupported,
       bool parallelScan = false,   // rtx.parallelScenePrepScans
-      uint32_t keptCutFrame = ~0u); // SceneManager::m_lastKeptCutFrame
-  // The same once its inputs are read (lifetime.currentFrame and forceCollect are filled in here).
+      uint32_t keptCutFrame = ~0u); // SceneManager::m_lastKeptCutFrame (rtx.scene.d3d9CutAsEvent / noImplicitClears)
+  // The same once its inputs are read (lifetime.currentFrame and forceCollect are filled in here); the identity-trace
+  // replay calls it with a LifetimeFrame from the trace.
   void collectReplacementInstances(const translator::LifetimeFrame& lifetimeIn, bool parallelScan = false);
 
   size_t getReplacementInstanceCount() const { return m_replacementInstances.size(); }
@@ -100,7 +115,7 @@ public:
   // Compute a hash that uniquely identifies a draw call for L1 matching.
   // When overrideMaterialData is non-null, its hash is mixed in (e.g. terrain bake, particle material).
   static XXH64_hash_t computeIdentityHash(
-      const SceneDraw& drawCallState,
+      const DrawCallState& drawCallState,
       const MaterialData* overrideMaterialData = nullptr);
 
   // rtx.retainedSteadyFastPath: changes whenever a ReplacementInstance cached by a retained
@@ -114,7 +129,31 @@ public:
   const std::vector<const ReplacementInstance*>& getRetainedSteadyInvalidations() const { return m_retainedSteadyInvalidations; }
   void clearRetainedSteadyInvalidations() { m_retainedSteadyInvalidations.clear(); }
 
+  // rtx.retained.useV2: RetainedInstanceStore is told synchronously, while the replacement instance
+  // is still alive, when one carrying a nonzero retainedV2Ticket is destroyed or re-keyed (the
+  // ticket is cleared first). clear() destroys every replacement instance without telling anyone;
+  // it bumps getClearGeneration() instead.
+  using RetainedV2Listener = void (*)(void* owner, uint64_t ticket);
+  void setRetainedV2Listener(RetainedV2Listener listener, void* owner) {
+    m_retainedV2Listener = listener;
+    m_retainedV2ListenerOwner = owner;
+  }
+  uint64_t getClearGeneration() const { return m_clearGeneration; }
+
 private:
+  RetainedV2Listener m_retainedV2Listener = nullptr;
+  void* m_retainedV2ListenerOwner = nullptr;
+  uint64_t m_clearGeneration = 0;
+  void reportToRetainedV2(ReplacementInstance* ri) {
+    if (ri != nullptr && ri->retainedV2Ticket != 0) {
+      const uint64_t ticket = ri->retainedV2Ticket;
+      ri->retainedV2Ticket = 0;
+      if (m_retainedV2Listener != nullptr) {
+        m_retainedV2Listener(m_retainedV2ListenerOwner, ticket);
+      }
+    }
+  }
+
   uint64_t m_retainedSteadyEpoch = 0;
   uint64_t m_retainedSteadyClearEpoch = 0;
   std::vector<const ReplacementInstance*> m_retainedSteadyInvalidations;
@@ -133,9 +172,12 @@ private:
   }
   // Cleans up a ReplacementInstance's map/index entries and prims. Does NOT remove
   // the entry from m_replacementInstances -- callers must handle that separately.
-  void destroyReplacementInstance(ReplacementInstance* replacementInstance);
+  // reason: rtx.d3d9Identity.log only.
+  void destroyReplacementInstance(ReplacementInstance* replacementInstance,
+                                  D3d9Identity::DestroyReason reason = D3d9Identity::DestroyReason::Gc);
 
   DxvkDevice* m_device;
+  const uint32_t* m_frameOverride = nullptr;  // setFrameOverride
   uint32_t frameId() const;
 
   std::unordered_map<XXH64_hash_t, ReplacementInstance*> m_identityHashMap;
@@ -168,6 +210,11 @@ private:
 
   std::vector<std::unique_ptr<ReplacementInstance>> m_replacementInstances;
   uint32_t m_nextReplacementInstanceId = 0;
+
+  // rtx.d3d9Identity.log: the classifier inputs of the D3D9 draw being looked up (nullptr while the log is
+  // off and for lookups without a DrawCallState).
+  const D3d9Identity::Lookup* m_identityLookup = nullptr;
+
 };
 
 }  // namespace dxvk

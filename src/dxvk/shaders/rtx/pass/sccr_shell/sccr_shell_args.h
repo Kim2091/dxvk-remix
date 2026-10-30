@@ -41,7 +41,8 @@
 //                         for a shell against the direction in bits 0-15, a shortened one for a shell along it in bits
 //                         20-31) and SCCR_SHELL_VERTEX_FLAG_* (bits 16-19)
 //   [4 + 3T + 2V, 4 + 3T + 3V) per vertex: its welded id, the smallest vertex index at its position (the vertex's own
-//                         index when it did not weld). The march does not read it.
+//                         index when it did not weld). Read by the real-geometry tessellator (sccr_tess.comp.slang), so
+//                         every copy of a welded corner takes its position and height from one vertex.
 // Triangle t is the t-th triangle of the geometry's whole index buffer (or of its vertices when it has none): for a hit
 // it is primitiveIndex + surface.firstIndex / 3.
 // ---------------------------------------------------------------------------------------------------------------------

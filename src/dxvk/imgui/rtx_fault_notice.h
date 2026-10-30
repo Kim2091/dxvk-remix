@@ -37,14 +37,18 @@ namespace dxvk {
     RTX_OPTION("rtx.faultNotice", bool, enable, false,
       "Shows a notice on top of the game when a problem is detected: a likely conflict with another mod, a broken "
       "install, or a crash in the previous session. The notice names the log and crash dump folders and where to "
-      "get help, and stays until the user menu is opened.");
+      "get help, and stays until any Remix menu is opened.");
     RTX_OPTION("rtx.faultNotice", std::string, supportUrl, std::string(""),
       "The https link the problem notice offers for getting help, such as a support forum or chat invite.");
     RTX_OPTION("rtx.faultNotice", std::string, supportText, std::string(""),
       "The instructions the problem notice shows above rtx.faultNotice.supportUrl, such as where to upload the logs.");
     RTX_OPTION_FLAG("rtx.faultNotice", std::string, hostReport, std::string(""), RtxOptionFlags::NoSave,
-      "Set by the game integration (remix API SetConfigVariable): the problems it detected, one per line, each "
-      "written as id|text. The id names the problem for \"Don't Show Again\".");
+      "The problems the game integration detected, set through the Remix API's SetConfigVariable. Each line holds "
+      "one problem written as id|text. The id identifies the problem for \"Don't Show Again\".");
+    RTX_OPTION_FLAG("rtx.faultNotice", std::string, uploadFile, std::string(""), RtxOptionFlags::NoSave,
+      "The full path of the one file to attach to a bug report, such as a zip of the previous session's logs. The game "
+      "integration sets it through the Remix API's SetConfigVariable. When set, the problem notice names this file in place of "
+      "the log and crash dump folders, and the problem section of the user menu gets a button that shows it in Explorer.");
 
     // Draws the notice on top of the game.
     // Opening a menu marks the problems shown so far as seen, which hides the notice until a new one arrives.

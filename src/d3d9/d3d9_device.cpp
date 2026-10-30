@@ -1455,13 +1455,11 @@ namespace dxvk {
 
     if (unlikely(!isImplicitSwapchain)) {
       // Check if RT is a surface of an additional swapchain
-      // Only a swapchain that is or can become the scene output sets the scene's present parameters.
       IDirect3DSwapChain9* swapchain = nullptr;
       if (D3D_OK == rt->GetContainer(__uuidof(IDirect3DSwapChain9),
                                      reinterpret_cast<void**>(&swapchain))) {
         D3DPRESENT_PARAMETERS pp;
-        if (CanBeSceneOutput(static_cast<D3D9SwapChainEx*>(swapchain)) &&
-            D3D_OK == swapchain->GetPresentParameters(&pp)) {
+        if (D3D_OK == swapchain->GetPresentParameters(&pp)) {
           m_rtx.ResetSwapChain(pp);
         }
 
@@ -3761,25 +3759,6 @@ namespace dxvk {
 
   HRESULT STDMETHODCALLTYPE D3D9DeviceEx::CheckDeviceState(HWND hDestinationWindow) {
     return D3D_OK;
-  }
-
-
-  bool D3D9DeviceEx::IsSceneOutput(const D3D9SwapChainEx* swapchain) {
-    if (swapchain == m_implicitSwapchain.ptr()) {
-      if (!m_implicitSwapchainPresented) {
-        // Another swapchain may have set the scene's present parameters before the implicit one first presented.
-        m_rtx.ResetSwapChain(*m_implicitSwapchain->GetPresentParams());
-        m_implicitSwapchainPresented = true;
-      }
-      return true;
-    }
-    if (m_implicitSwapchainPresented) {
-      return false;
-    }
-    if (m_fallbackSceneOutput == nullptr) {
-      m_fallbackSceneOutput = swapchain;
-    }
-    return swapchain == m_fallbackSceneOutput;
   }
 
 

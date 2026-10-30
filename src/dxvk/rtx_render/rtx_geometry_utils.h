@@ -63,8 +63,6 @@ namespace dxvk {
     Rc<DxvkContext> m_skinningContext;
     // Commands recorded into the skinning context since its last flush.
     uint32_t m_skinningCommands = 0;
-    // The skinning context's current batch: what it records until its next flush submits it.
-    uint64_t m_skinningBatch = 1;
     // The skinning constants of the last dispatch. Only the bones it used are current.
     std::unique_ptr<SkinningArgs> m_skinningArgs;
 
@@ -87,12 +85,7 @@ namespace dxvk {
     /**
      * \brief Execute a compute shader to perform skinning
      */
-    void dispatchSkinning(const SceneDraw& drawCallState, const RaytraceGeometry& geo);
-
-    /**
-     * \brief The skinning batch recorded but not submitted yet, or 0 when none is pending.
-     */
-    uint64_t pendingSkinningBatch() const { return m_skinningCommands > 0 ? m_skinningBatch : 0; }
+    void dispatchSkinning(const DrawCallState& drawCallState, const RaytraceGeometry& geo);
 
     /**
      * \brief Execute a compute shader to perform view model perspective correction
@@ -192,6 +185,12 @@ namespace dxvk {
     // Calculate the maximum UV tile size (i.e. minimum UV density) of a draw call.
     static float computeMaxUVTileSize(const RasterGeometry& input, const Matrix4& objectToWorld);
 
+    // [UvPrecision] One info line per new mesh (once per texcoord+index hash) whose texture coordinates are large
+    // (max |uv| > 16) or whose triangles span enough texture tiles for the ray hit's 16-bit barycentrics to step
+    // the interpolated coordinate by >= 1/8 texel of a 2048 texture. Reads CPU-visible vertex data only (half2
+    // decoded); a GPU-only buffer is skipped silently.
+    static void logTexcoordPrecision(const RasterGeometry& input, XXH64_hash_t albedoHash, const Vector3& worldPosition);
+
     /**
      * \brief Execute a compute shader to generate a triangle list from arbitrary topologies
      */
@@ -227,7 +226,7 @@ namespace dxvk {
     void dispatchSoftOmmSelfTest(const Rc<DxvkContext>& ctx, const Rc<DxvkBuffer>& results) const;
 
     /**
-     * \brief Opacity micromap compaction: writes the special / compact OMM index of
+     * \brief rtx.alphaBake.compactMicromaps: writes the special / compact OMM index of
      * every triangle of a baked array, the compact triangle records of its mixed triangles and their count.
      */
     void dispatchOmmCompact(const Rc<DxvkContext>& ctx, const Rc<DxvkBuffer>& ommArray, const Rc<DxvkBuffer>& indexOut,
@@ -262,7 +261,6 @@ namespace dxvk {
       if (m_skinningContext->getCommandList() != nullptr && m_skinningCommands > 0) {
         m_skinningContext->flushCommandList();
         m_skinningCommands = 0;
-        ++m_skinningBatch;
       }
     }
 

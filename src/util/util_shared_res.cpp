@@ -1,4 +1,4 @@
-#include "d3d9_shared_res.h"
+#include "util_shared_res.h"
 
 #include "winioctl.h"
 

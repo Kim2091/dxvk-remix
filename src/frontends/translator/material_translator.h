@@ -24,10 +24,10 @@
 // MaterialTranslator (translator toolkit).
 //
 // Fixed-function state in, scene-interface material descriptions out:
-// - MaterialData: the render material the frontend had the backend resolve for the draw, passed through unchanged, so
-//   material hashes and mod keys stay the backend's;
+// - MaterialData: unchanged, still through SceneManager::resolveDrawMaterial, so material hashes and mod keys stay
+//   exactly today's;
 // - AlphaStateDesc and LegacySurfaceDesc: the scene-interface derivations of rtx_fork_material_derivation.h, the same
-//   functions the backend calls for draws without descriptions, from the plain record below.
+//   functions the old backend path calls (decision D5 (a)), from the plain record below.
 // A frontend fills the record from its own state (D3D9 texture stages and render state today; glTexEnv / glAlphaFunc /
 // glBlendFunc for the fixed-function OpenGL frontend later) and hands the descriptions over with its
 // ExternalDrawState (alphaState / legacySurface), so the backend packs the GPU records from them.
@@ -35,11 +35,14 @@
 #include "../../dxvk/rtx_render/rtx_fork_material_derivation.h"
 
 namespace dxvk {
+  class SceneManager;
+  struct DrawCallState;
+
   namespace translator {
 
     // Plain fixed-function state of one draw. No API types beyond the backend's own enums.
     struct FixedFunctionState {
-      // Texture stage 0 (color and alpha) and the texture factor.
+      // Texture stage 0 (colour and alpha) and the texture factor.
       RtTextureArgSource textureColorArg1Source = RtTextureArgSource::Texture;
       RtTextureArgSource textureColorArg2Source = RtTextureArgSource::None;
       DxvkRtTextureOperation textureColorOperation = DxvkRtTextureOperation::Modulate;
@@ -70,9 +73,9 @@ namespace dxvk {
 
     class MaterialTranslator {
     public:
-      // material is the draw's resolved render material, which the translation keeps. The alpha / legacy descriptions
-      // come from state and that material.
-      static MaterialTranslation translate(MaterialData&& material, const FixedFunctionState& state);
+      // `draw` is the draw as the frontend prepared it for the scene (material data, categories); its material goes
+      // through resolveDrawMaterial unchanged. The alpha / legacy descriptions come from `state` alone.
+      static MaterialTranslation translate(SceneManager& scene, const DrawCallState& draw, const FixedFunctionState& state);
 
       // The descriptions alone (no material resolve), from a given render material.
       static AlphaStateDesc translateAlphaState(const FixedFunctionState& state, const MaterialData& material);

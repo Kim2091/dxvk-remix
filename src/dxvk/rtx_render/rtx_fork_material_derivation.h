@@ -13,7 +13,7 @@
 #include <cstdint>
 
 #include "rtx_materials.h"
-#include "rtx_scene_types.h"
+#include "rtx_types.h"
 
 namespace dxvk {
 
@@ -65,12 +65,6 @@ namespace dxvk {
     Matrix4 textureTransform = Matrix4();
     bool enableClipPlane = false;
     Vector4 clipPlane { 0.f };
-  };
-
-  // A frontend's descriptions of one surface (frontend::SceneInstanceDesc::surface).
-  struct SurfaceDescs {
-    AlphaStateDesc alphaState;
-    LegacySurfaceDesc legacySurface;
   };
 
   // The legacy surface state of a draw (the fields updateInstance reads from the legacy material and transform data).

@@ -58,7 +58,12 @@
 #include "rtx/pass/interleave_geometry.h"
 
 #include <algorithm>
+#include <cfloat>
+#include <cmath>
 #include <cstddef>
+#include <cstring>
+#include <mutex>
+#include <unordered_set>
 
 namespace dxvk {
   static constexpr uint32_t kMaxInterleavedComponents = 3 + 3 + 2 + 1;
@@ -218,7 +223,7 @@ namespace dxvk {
       END_PARAMETER()
     };
 
-    // Opacity micromap compaction.
+    // rtx.alphaBake.compactMicromaps.
     class OmmCompactShader : public ManagedShader {
       SHADER_SOURCE(OmmCompactShader, VK_SHADER_STAGE_COMPUTE_BIT, omm_compact)
 
@@ -343,7 +348,7 @@ namespace dxvk {
     m_skinningContext = nullptr;
   }
 
-  void RtxGeometryUtils::dispatchSkinning(const SceneDraw& drawCallState,
+  void RtxGeometryUtils::dispatchSkinning(const DrawCallState& drawCallState,
                                           const RaytraceGeometry& geo) {
     const Rc<DxvkContext>& ctx = m_skinningContext;
     // Create command list for the initial skinning dispatch (e.g. The first frame we get skinning mesh draw calls)
@@ -1236,6 +1241,11 @@ namespace dxvk {
     args.hasTexcoord = input.texcoordBuffer.defined();
     if (args.hasTexcoord) {
       mustUseGPU |= input.texcoordBuffer.isPendingGpuWrite() || input.texcoordBuffer.mapPtr() == nullptr;
+      // GeometryBufferData hands the CPU path float32 texcoords only (null for half2), so a half2 stream of
+      // <= 1024 vertices must convert on the GPU too; the CPU interleaver would read through that null pointer.
+      const VkFormat texcoordFormat = input.texcoordBuffer.vertexFormat();
+      mustUseGPU |= texcoordFormat != VK_FORMAT_R32G32_SFLOAT && texcoordFormat != VK_FORMAT_R32G32B32_SFLOAT &&
+                    texcoordFormat != VK_FORMAT_R32G32B32A32_SFLOAT;
       assert(input.texcoordBuffer.offsetFromSlice() % 4 == 0);
       args.texcoordOffset = input.texcoordBuffer.offsetFromSlice() / 4;
       args.texcoordStride = input.texcoordBuffer.stride() / 4;
@@ -1375,6 +1385,141 @@ namespace dxvk {
     }
 
     return std::sqrtf(maxUvTileSizeSqr);
+  }
+
+  void RtxGeometryUtils::logTexcoordPrecision(const RasterGeometry& input, XXH64_hash_t albedoHash, const Vector3& worldPosition) {
+    constexpr float kTexels = 2048.f;              // the striped FNV albedos are 2048^2
+    constexpr float kLogMaxAbsUv = 16.f;
+    constexpr float kLogBarycentricStepTexels = 0.125f;
+    constexpr float kUnorm16Step = 1.f / 65535.f;  // barycentricsToUint (packing.slangh)
+    constexpr size_t kMaxTrackedMeshes = size_t(1) << 20;
+    constexpr uint32_t kMaxLines = 512;
+
+    if (!input.texcoordBuffer.defined() || input.vertexCount == 0) {
+      return;
+    }
+    const VkFormat format = input.texcoordBuffer.vertexFormat();
+    const bool isHalf2 = format == VK_FORMAT_R16G16_SFLOAT;
+    if (!isHalf2 && format != VK_FORMAT_R32G32_SFLOAT && format != VK_FORMAT_R32G32B32_SFLOAT && format != VK_FORMAT_R32G32B32A32_SFLOAT) {
+      return;
+    }
+
+    static std::mutex s_mutex;
+    static std::unordered_set<XXH64_hash_t> s_seen;
+    static uint32_t s_lines = 0;
+    const XXH64_hash_t key = XXH64(&input.hashes[HashComponents::Indices], sizeof(XXH64_hash_t), input.hashes[HashComponents::VertexTexcoord]);
+    {
+      std::lock_guard<std::mutex> lock(s_mutex);
+      if (s_lines >= kMaxLines || s_seen.size() >= kMaxTrackedMeshes || !s_seen.insert(key).second) {
+        return;
+      }
+    }
+
+    if (input.texcoordBuffer.isPendingGpuWrite()) {
+      return;
+    }
+    const uint8_t* texcoordData = static_cast<const uint8_t*>(input.texcoordBuffer.mapPtr((size_t) input.texcoordBuffer.offsetFromSlice()));
+    if (texcoordData == nullptr) {
+      return;
+    }
+    const size_t texcoordStride = input.texcoordBuffer.stride();
+    const auto readTexcoord = [&](uint32_t vertex, float& u, float& v) {
+      const uint8_t* p = texcoordData + size_t(vertex) * texcoordStride;
+      if (isHalf2) {
+        uint16_t h[2];
+        std::memcpy(h, p, sizeof(h));
+        u = ::f16tof32(uint32_t(h[0]));
+        v = ::f16tof32(uint32_t(h[1]));
+      } else {
+        float f[2];
+        std::memcpy(f, p, sizeof(f));
+        u = f[0];
+        v = f[1];
+      }
+    };
+
+    float minU = FLT_MAX, minV = FLT_MAX, maxU = -FLT_MAX, maxV = -FLT_MAX, maxAbs = 0.f;
+    uint32_t nonFinite = 0;
+    for (uint32_t vertex = 0; vertex < input.vertexCount; ++vertex) {
+      float u, v;
+      readTexcoord(vertex, u, v);
+      if (!std::isfinite(u) || !std::isfinite(v)) {
+        ++nonFinite;
+        continue;
+      }
+      minU = std::min(minU, u);
+      minV = std::min(minV, v);
+      maxU = std::max(maxU, u);
+      maxV = std::max(maxV, v);
+      maxAbs = std::max(maxAbs, std::max(std::abs(u), std::abs(v)));
+    }
+
+    // Triangles: the per-axis |t1 - t0| + |t2 - t0| bounds how far one 16-bit step of each packed barycentric moves
+    // the interpolated coordinate.
+    const void* indexData = input.indexBuffer.defined() && input.indexCount > 0 ?
+      input.indexBuffer.mapPtr((size_t) input.indexBuffer.offsetFromSlice()) : nullptr;
+    const size_t indexStride = indexData != nullptr ? input.indexBuffer.stride() : 0;
+    const bool indexed = indexData != nullptr && (indexStride == 2 || indexStride == 4);
+    const uint32_t elementCount = indexed ? input.indexCount : input.vertexCount;
+    const auto element = [&](uint32_t i) -> uint32_t {
+      if (!indexed) {
+        return i;
+      }
+      return indexStride == 2 ? uint32_t(static_cast<const uint16_t*>(indexData)[i]) : static_cast<const uint32_t*>(indexData)[i];
+    };
+    uint32_t triangleCount = 0;
+    bool strip = false;
+    if (input.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST) {
+      triangleCount = elementCount / 3;
+    } else if (input.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP) {
+      triangleCount = elementCount >= 3 ? elementCount - 2 : 0;
+      strip = true;
+    }
+    float maxSpan = 0.f;
+    for (uint32_t triangle = 0; triangle < triangleCount; ++triangle) {
+      const uint32_t first = strip ? triangle : triangle * 3;
+      const uint32_t i0 = element(first), i1 = element(first + 1), i2 = element(first + 2);
+      if (i0 >= input.vertexCount || i1 >= input.vertexCount || i2 >= input.vertexCount) {
+        continue;
+      }
+      float u0, v0, u1, v1, u2, v2;
+      readTexcoord(i0, u0, v0);
+      readTexcoord(i1, u1, v1);
+      readTexcoord(i2, u2, v2);
+      const float span = std::max(std::abs(u1 - u0) + std::abs(u2 - u0), std::abs(v1 - v0) + std::abs(v2 - v0));
+      if (std::isfinite(span)) {
+        maxSpan = std::max(maxSpan, span);
+      }
+    }
+
+    // Round-to-nearest packing: half a step per barycentric.
+    const float barycentricStepTexels = 0.5f * kUnorm16Step * maxSpan * kTexels;
+    if (maxAbs <= kLogMaxAbsUv && barycentricStepTexels < kLogBarycentricStepTexels) {
+      return;
+    }
+
+    // maxAbs in [2^(e-1), 2^e): one float32 ulp there is 2^(e-24), one half step 2^(e-11).
+    int exponent = 0;
+    std::frexp(maxAbs, &exponent);
+    const float floatUlpTexels = maxAbs > 0.f ? std::ldexp(1.f, exponent - 24) * kTexels : 0.f;
+    const float halfStepTexels = maxAbs > 0.f ? std::ldexp(1.f, exponent - 11) * kTexels : 0.f;
+
+    {
+      std::lock_guard<std::mutex> lock(s_mutex);
+      if (s_lines >= kMaxLines) {
+        return;
+      }
+      ++s_lines;
+    }
+    Logger::info(str::format("[UvPrecision] mesh=0x", std::hex, key, " albedo=0x", albedoHash, std::dec,
+                             " pos=(", worldPosition.x, ", ", worldPosition.y, ", ", worldPosition.z, ")",
+                             " fmt=", isHalf2 ? "half2" : "float2", " verts=", input.vertexCount, " tris=", triangleCount,
+                             " uv=(", minU, ", ", minV, ")..(", maxU, ", ", maxV, ") max|uv|=", maxAbs,
+                             " nonFinite=", nonFinite, " maxTriUvSpan=", maxSpan,
+                             " | texel steps on 2048: source vertex step=", isHalf2 ? halfStepTexels : floatUlpTexels,
+                             " (the game's raster has it too), float32 interpolation ulp=", floatUlpTexels,
+                             ", 16-bit hit barycentric step=", barycentricStepTexels,
+                             " (removed by the shader's refined barycentrics)"));
   }
 
   void RtxGeometryUtils::dispatchSmoothNormals(const Rc<DxvkContext>& ctx, const RasterGeometry& input, RaytraceGeometry& geo) {

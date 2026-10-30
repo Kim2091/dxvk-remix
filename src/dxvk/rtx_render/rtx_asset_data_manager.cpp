@@ -146,7 +146,7 @@ namespace dxvk {
       std::fread(&header, sizeof(header), 1, m_file);
 
       if ((header.Format.flags & gli::dx::DDPF_FOURCC) &&
-          (static_cast<uint32_t>(header.Format.fourCC) == GLI_MAKEFOURCC('D', 'X', '1', '0') || static_cast<uint32_t>(header.Format.fourCC) == GLI_MAKEFOURCC('G', 'L', 'I', '1'))) {
+          (header.Format.fourCC == gli::dx::D3DFMT_DX10 || header.Format.fourCC == gli::dx::D3DFMT_GLI1)) {
         if (m_fileSize < sizeof(FOURCC_DDS) + sizeof(header) + sizeof(header10))
           return false;
 

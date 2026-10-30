@@ -91,6 +91,37 @@ void computeAnisotropicEllipseAxes(
   texGradientY = (1.0 - u2 - v2) * txcoords[0] + u2 * txcoords[1] + v2 * txcoords[2] - interpolatedTexCoordsAtIntersection;
 }
 
+// A ray hit carries its barycentrics as two UNORM16 values (barycentricsToUint), so
+// every attribute interpolated from them moves in steps of 1/65535 of the triangle's extent. Texture coordinates
+// that span S tiles across a triangle step by S/65535 of a tile, S/32 texels of a 2048 texture: a big, densely
+// tiled triangle (cliff faces, walls) shows the texture in bands along the step axis. Re-intersect the ray's line
+// with the (world space) triangle in float32 and use that result when it lies inside the packed value's rounding
+// cell, with slack for float error. A ray that is not the traced one (a synthetic NEE-cache ray) or a degenerate
+// triangle (NaN/Inf) falls outside the cell and keeps the packed barycentrics, so the result is never further from
+// the hit than the packed one's own rounding.
+vec3 refineHitBarycentrics(vec3 packedBary, vec3 worldPositions[3], Ray ray)
+{
+  const vec3 direction = vec3(ray.direction);
+  const vec3 edge01 = worldPositions[1] - worldPositions[0];
+  const vec3 edge02 = worldPositions[2] - worldPositions[0];
+  const vec3 originOffset = ray.origin - worldPositions[0];
+  const vec3 pVec = cross(direction, edge02);
+  const vec3 qVec = cross(originOffset, edge01);
+  const float rcpDeterminant = 1.0f / dot(edge01, pVec);
+  const vec2 refined = vec2(dot(originOffset, pVec), dot(direction, qVec)) * rcpDeterminant;
+
+  // Round-to-nearest packing leaves the true value within half a step; 1.5 steps covers the float error too.
+  const float tolerance = 1.5f / 65535.0f;
+  const vec2 deviation = abs(refined - packedBary.yz);
+
+  if (deviation.x <= tolerance && deviation.y <= tolerance)
+  {
+    return vec3(1.0f - refined.x - refined.y, refined.x, refined.y);
+  }
+
+  return packedBary;
+}
+
 // Surface Interaction Functions
 
 bool isSurfaceClipped(Surface surface, MinimalSurfaceInteraction surfaceInteraction)
@@ -294,7 +325,7 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
     }
   }
 
-  const vec3 bary = uintToBarycentrics(rayInteraction.barycentricCoordinates);
+  const vec3 packedBary = uintToBarycentrics(rayInteraction.barycentricCoordinates);
 
   SurfaceInteraction surfaceInteraction;
   sccrSurfaceInteractionClear(surfaceInteraction);
@@ -321,6 +352,9 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
     worldPositions[1] = mul(surface.objectToWorld, vec4(positions[1], 1.0f));
     worldPositions[2] = mul(surface.objectToWorld, vec4(positions[2], 1.0f));
   }
+
+  // Full-precision barycentrics in place of the hit's 16-bit ones (refineHitBarycentrics).
+  const vec3 bary = refineHitBarycentrics(packedBary, worldPositions, ray);
 
   // Calculate the approximate position error in object space
   surfaceInteraction.positionError = max(

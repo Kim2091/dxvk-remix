@@ -24,18 +24,20 @@ the API, see [`docs/RemixApi.md`](docs/RemixApi.md).
 | `REMIXAPI_VERSION_GET_MAJOR(version)` | `(((uint64_t)(version) >> 48) & (uint64_t)0xFFFF)` |
 | `REMIXAPI_VERSION_GET_MINOR(version)` | `(((uint64_t)(version) >> 16) & (uint64_t)0xFFFFFFFF)` |
 | `REMIXAPI_VERSION_GET_PATCH(version)` | `(((uint64_t)(version)      ) & (uint64_t)0xFFFF)` |
-| `REMIXAPI_VERSION_MAJOR` | `1` |
-| `REMIXAPI_VERSION_MINOR` | `0` |
-| `REMIXAPI_VERSION_PATCH` | `0` |
+| `REMIXAPI_VERSION_MAJOR` | `0` |
+| `REMIXAPI_VERSION_MINOR` | `1000` |
+| `REMIXAPI_VERSION_PATCH` | `1` |
 | `REMIX_WINAPI_LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR` | `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR` |
 | `REMIX_WINAPI_LOAD_LIBRARY_SEARCH_DEFAULT_DIRS` | `LOAD_LIBRARY_SEARCH_DEFAULT_DIRS` |
 | `REMIX_WINAPI_MAX_PATH` | `MAX_PATH` |
 | `REMIX_WINAPI_LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR` | `0x00000100` |
 | `REMIX_WINAPI_LOAD_LIBRARY_SEARCH_DEFAULT_DIRS` | `0x00001000` |
 | `REMIX_WINAPI_MAX_PATH` | `260` |
+| `REMIXAPI_TERRAIN_MAX_LAYERS` | `8` |
 | `REMIXAPI_CAMERA_FRAME_EVENT_CAMERA_CUT` | `0x1u` |
 | `REMIXAPI_CAMERA_FRAME_EVENT_HISTORY_INVALID` | `0x2u` |
 | `REMIXAPI_CAMERA_FRAME_EVENT_ORIGIN_SHIFT` | `0x8u` |
+| `REMIXAPI_CAMERA_FRAME_EVENT_FALLBACK` | `0x10u` |
 | `REMIXAPI_INSTANCE_INFO_MAX_BONES_COUNT` | `256` |
 | `REMIXAPI_TEXTURE_HOST_IMPORT_FLAG_REPLACE` | `0x1u` |
 | `REMIXAPI_TEXTURE_ENCODING_NONE` | `0u` |
@@ -46,11 +48,12 @@ the API, see [`docs/RemixApi.md`](docs/RemixApi.md).
 | `REMIXAPI_HOST_SETTING_FLAG_READ_ONLY` | `0x2u` |
 | `REMIXAPI_HOST_SETTING_FLAG_USER_MENU` | `0x4u` |
 | `REMIXAPI_COLOR_GRADE_VERSION` | `1u` |
-| `REMIXAPI_EXTERNAL_FRAME_VERSION` | `1u` |
 | `REMIXAPI_RETAINED_UPDATE_TRANSFORM` | `0x1u` |
 | `REMIXAPI_RETAINED_UPDATE_VISIBILITY` | `0x2u` |
 | `REMIXAPI_SCREEN_OVERLAY_LAYER_PREMULTIPLIED` | `0x1u  // RGB already multiplied by alpha` |
 | `REMIXAPI_SCREEN_OVERLAY_MAX_LAYERS` | `8u` |
+| `REMIXAPI_D3D9_TEXTURE_IMPORT_SRGB` | `0x1u  // sample through the texture's sRGB view` |
+| `REMIXAPI_D3D9_TEXTURE_IMPORT_OPAQUE_ALPHA` | `0x2u  // alpha reads as 1 (e.g. DXT1 as an opaque BC1)` |
 | `REMIXAPI_MEMORY_PRESSURE_NONE` | `0u` |
 | `REMIXAPI_MEMORY_PRESSURE_ELEVATED` | `1u` |
 | `REMIXAPI_MEMORY_PRESSURE_HIGH` | `2u` |
@@ -66,6 +69,7 @@ the API, see [`docs/RemixApi.md`](docs/RemixApi.md).
 | `IDirect3DDevice9Ex` | `struct IDirect3DDevice9Ex` |
 | `IDirect3DSurface9` | `struct IDirect3DSurface9` |
 | `IDirect3DTexture9` | `struct IDirect3DTexture9` |
+| `IDirect3DBaseTexture9` | `struct IDirect3DBaseTexture9` |
 | `remixapi_HWND` | `HWND` |
 | `remixapi_HMODULE` | `HMODULE` |
 | `remixapi_loader_PROC` | `FARPROC` |
@@ -124,8 +128,8 @@ the API, see [`docs/RemixApi.md`](docs/RemixApi.md).
 | `REMIXAPI_STRUCT_TYPE_TEXTURE_INFO_HOST_IMPORT_EXT` | `33` |  |
 | `REMIXAPI_STRUCT_TYPE_CAMERA_INFO_FRAME_EVENTS_EXT` | `0x4E560001` | Remix Plus struct types live from 0x4E560000 on, a range upstream never uses, so a new upstream sType cannot collide with them. |
 | `REMIXAPI_STRUCT_TYPE_ASSET_KEY_EXT` | `0x4E560002` |  |
-| `REMIXAPI_STRUCT_TYPE_EXTERNAL_FRAME_EXT` | `0x4E560003` |  |
-| `REMIXAPI_STRUCT_TYPE_COLOR_GRADE_EXT` | `0x4E560004` |  |
+| `REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_TERRAIN_LAYERS_EXT` | `0x7F000001` | The terrain-layers struct type lives in a separate range, so upstream additions can never collide with it. |
+| `REMIXAPI_STRUCT_TYPE_COLOR_GRADE_EXT` | `0x4E560004` | 0x4E560003 is reserved for REMIXAPI_STRUCT_TYPE_EXTERNAL_FRAME_EXT. |
 
 ### `remixapi_ErrorCode`
 
@@ -149,7 +153,6 @@ the API, see [`docs/RemixApi.md`](docs/RemixApi.md).
 | `REMIXAPI_ERROR_CODE_HRESULT_VK_CREATE_INSTANCE_FAIL` | `0x88960004` |  |
 | `REMIXAPI_ERROR_CODE_HRESULT_VK_CREATE_DEVICE_FAIL` | `0x88960005` |  |
 | `REMIXAPI_ERROR_CODE_HRESULT_GRAPHICS_QUEUE_FAMILY_MISSING` | `0x88960006` |  |
-| `REMIXAPI_ERROR_CODE_FEATURE_UNAVAILABLE` | `0x4E560001` | Remix Plus error codes live from 0x4E560000 on, like the Remix Plus struct types. The device or the current output does not support the requested feature. |
 
 ### `remixapi_CameraType`
 
@@ -414,6 +417,37 @@ untinted.
 | `float` | `thinWallThickness_value` |  |
 | `remixapi_Bool` | `useDiffuseLayer` |  |
 
+### `remixapi_MaterialInfoTerrainLayersEXT`
+
+Multi-layer terrain blended per hit in the opaque material shader. Valid only if remixapi_MaterialInfo
+contains remixapi_MaterialInfoOpaqueEXT in its pNext chain (MaterialInfo -> OpaqueEXT -> TerrainLayersEXT).
+Per hit, with uv = the mesh texcoord and weightUV = uv * weightUvScale + weightUvOffset:
+w0123 = weightTextures[0](weightUV), w4567 = weightTextures[1](weightUV)   (bilinear, clamp to edge)
+albedo = sum_i w_i * albedoTextures[i](uv)                                (not renormalised)
+albedo *= tintTexture(weightUV).rgb                                        (if present)
+albedo = max(albedo, 0)            (layers and tint may be float textures, see TextureInfoHostImportEXT.vkFormat)
+normal = normalize(sum_i w_i * decode(normalTextures[i](uv)))             (missing normal layer = (0,0,1))
+Roughness/metallic come from the OpaqueEXT constants. Set MaterialInfo.albedoTexture to layer 0 as a fallback.
+Parallax (POM), when any heightTextures[i] is set and OpaqueEXT.displaceIn/displaceOut > 0: the march runs on the
+blended height field depth(uv) = sum_i w_i * (1 - heightTextures[i](uv).r) / sum_i w_i, with the weights read once
+at the undisplaced weightUV (a layer without a height map counts as flat, i.e. white = the surface itself).
+Depth comes from OpaqueEXT.displaceIn/displaceOut; always the raymarch POM (QuadtreePOM needs one texture).
+Textures: "0x%016llX" of a remixapi_TextureInfo.hash passed to CreateTexture, or file paths; NULL/"" = none.
+
+| Type | Field | Notes |
+| :-- | :-- | :-- |
+| `remixapi_StructType` | `sType` |  |
+| `void*` | `pNext` |  |
+| `uint32_t` | `layerCount` | 1..REMIXAPI_TERRAIN_MAX_LAYERS |
+| `remixapi_Path` | `albedoTextures[REMIXAPI_TERRAIN_MAX_LAYERS]` |  |
+| `remixapi_Path` | `normalTextures[REMIXAPI_TERRAIN_MAX_LAYERS]` |  |
+| `remixapi_Path` | `weightTextures[2]` | RGBA UNORM: [0] = layers 0-3, [1] = layers 4-7 |
+| `remixapi_Path` | `tintTexture` | optional RGB multiplier (UNORM) |
+| `remixapi_Float2D` | `weightUvScale` |  |
+| `remixapi_Float2D` | `weightUvOffset` |  |
+| `remixapi_Bool` | `normalsRgbTangentSpace` | 1: RGB 0.5-biased DirectX tangent space, 0: octahedral |
+| `remixapi_Path` | `heightTextures[REMIXAPI_TERRAIN_MAX_LAYERS]` | Optional per-layer height maps (terrain POM), R channel, white = top. NULL/"" = flat layer. Client, bridge and runtime must be built from the same header (the bridge serialises every field). |
+
 ### `remixapi_MaterialInfoPortalEXT`
 
 | Type | Field | Notes |
@@ -498,8 +532,8 @@ is already registered under the same hash, instead of the default behavior
 of ignoring the repeated registration.
 
 Intended for CPU-deformed geometry whose topology is fixed but whose vertex
-positions are rewritten by the host every few frames (e.g. facial morphs
-for lip sync, blinks, and expressions). Re-using the hash is what
+positions are rewritten by the host every few frames (e.g. Fallout 4 FaceGen
+morphs for lip sync, blinks, and expressions). Re-using the hash is what
 makes this work: the mesh handle IS the hash, and the handle feeds both
 ExternalDrawState::computeExternalDrawIdentityHash and the spatial-map hash,
 so minting a fresh hash per update would hand the scene manager a brand-new
@@ -552,7 +586,8 @@ Remix Plus scene interface. Chain on remixapi_MeshInfo or remixapi_MaterialInfo:
 key mods, captures and caches use for this asset instead of the default (the mesh hash / the material's runtime
 content hash), and aliases, the keys older host versions produced, so mods made against them keep matching.
 Replacements are looked up by key, then by each alias in order. 0 is never a key. assetName is optional (logs,
-captures). A runtime that predates the struct ignores it.
+captures). Honoured while the runtime option rtx.scene.assetKeys is on; a runtime that predates the struct
+ignores it.
 
 | Type | Field | Notes |
 | :-- | :-- | :-- |
@@ -898,9 +933,9 @@ Most fields correspond to a usd token. Set to null, if no value.
 
 ### `remixapi_ColorGradeEXT`
 
-Color grading: the grade the tone mapper applies to the linear scene color before the tone curve.
+Colour grading: the grade the tone mapper applies to the linear scene colour before the tone curve.
 Optional named exports; the versioned Interface table is unchanged. Probe with
-GetProcAddress(dll, "remixapi_SetColorGradePreset") and so on. See docs/RemixApi.md, "Color grading".
+GetProcAddress(dll, "remixapi_SetColorGradePreset") and so on. See docs/RemixApi.md, "Colour grading".
 
 The grade runs in this order, and the default values below are the neutral grade, which changes nothing:
 color = matrix * color                                      matrix: row-major 3x3, identity
@@ -935,42 +970,6 @@ picks another preset (rtx.tonemap.gradePreset). Any thread may call these; they 
 | `float` | `contrast` |  |
 | `float` | `anchor` | where the tone curve's shoulder starts |
 | `float` | `shoulder` | how late and hard the shoulder bends |
-
-### `remixapi_ExternalFrameEXT`
-
-External frame: the presented image, shared with another Vulkan device or process without a CPU readback.
-An optional named export; the versioned Interface table is unchanged. Probe with
-GetProcAddress(dll, "remixapi_ConfigureExternalFrame"). See docs/RemixApi.md, "External frame".
-
-Call it after Startup, on the thread that calls Present. On success, every Present copies the frame (after
-tone mapping and upscaling, without the developer menu) into the shared image, releases the image to
-VK_QUEUE_FAMILY_EXTERNAL in VK_IMAGE_LAYOUT_GENERAL and signals readySemaphore. The copy after the first one waits
-on releasedSemaphore on the GPU, so the consumer must answer every ready with a released. When Present returns,
-the submission that signals readySemaphore is in the Vulkan queue, so the consumer can wait on it at once.
-
-The image is 2D, R8G8B8A8_UNORM, one mip and one layer, optimal tiling, exclusive sharing, no create flags, usage
-TRANSFER_SRC | TRANSFER_DST | SAMPLED, in a dedicated allocation. Its values are the presented, display-encoded
-values. The three handles are new NT handles (OPAQUE_WIN32) owned by the caller. The semaphores are binary.
-
-frame == NULL stops the export. Calling it again replaces the image and the semaphores, for example after the
-window was resized. The consumer keeps whatever it imported from the old set.
-Returns REMIXAPI_ERROR_CODE_FEATURE_UNAVAILABLE when the device cannot export memory or semaphores, or when the
-output cannot be expressed as R8G8B8A8_UNORM.
-
-| Type | Field | Notes |
-| :-- | :-- | :-- |
-| `remixapi_StructType` | `sType` | REMIXAPI_STRUCT_TYPE_EXTERNAL_FRAME_EXT |
-| `void*` | `pNext` |  |
-| `uint32_t` | `version` | in: 1 |
-| `uint32_t` | `width` | out: the back buffer width |
-| `uint32_t` | `height` | out: the back buffer height |
-| `uint32_t` | `format` | out: VkFormat, VK_FORMAT_R8G8B8A8_UNORM |
-| `uint32_t` | `memoryTypeIndex` | out |
-| `uint64_t` | `allocationSize` | out |
-| `uint8_t` | `deviceUUID[16]` | out: VkPhysicalDeviceIDProperties::deviceUUID |
-| `void*` | `memoryHandle` | out: NT handle, VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT |
-| `void*` | `readySemaphore` | out: NT handle, VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT |
-| `void*` | `releasedSemaphore` | out: NT handle, VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT |
 
 ### `remixapi_InitializeLibraryInfo`
 
@@ -1501,6 +1500,18 @@ Parameters:
 
 - *(none)*
 
+### `PFN_remixapi_PollHostSettings`
+
+Returns: `remixapi_ErrorCode`
+
+Parameters:
+
+- `uint64_t last_generation`
+- `uint64_t* out_generation`
+- `double* out_values`
+- `const remixapi_HostSettingHandle* handles`
+- `uint32_t count`
+
 ### `PFN_remixapi_SetColorGradePreset`
 
 Returns: `remixapi_ErrorCode`
@@ -1545,14 +1556,6 @@ Parameters:
 
 - `const char* name`
 - `const remixapi_ColorGradeEXT* grade`
-
-### `PFN_remixapi_ConfigureExternalFrame`
-
-Returns: `remixapi_ErrorCode`
-
-Parameters:
-
-- `remixapi_ExternalFrameEXT* frame`
 
 ### `PFN_remixapi_DrawScreenOverlay`
 

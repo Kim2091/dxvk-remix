@@ -99,8 +99,9 @@ struct OpaqueSurfaceMaterial
   // 26
   uint16_t samplerFeedbackStamp;
   // Lower bound for roughness decoded from a smoothness map
-  // (OPAQUE_SURFACE_MATERIAL_FLAG_ROUGHNESS_FROM_SMOOTHNESS).
-  float16_t roughnessFloor;
+  // (OPAQUE_SURFACE_MATERIAL_FLAG_ROUGHNESS_FROM_SMOOTHNESS), as half-float bits: read it with
+  // f16tof32(). The FNV flags word on an FNV-layout material (opaqueSurfaceMaterialFnvFlags()).
+  uint16_t roughnessFloorBits;
 
   // 28-29
   uint dlssControlMask;
@@ -108,6 +109,8 @@ struct OpaqueSurfaceMaterial
   // Todo: Fixed function blend state info here in the future (Actually this should go on a Legacy Material, or some sort of non-PBR Legacy Surface)
 
   // 30-31
+  // On an FNV-layout material (see OPAQUE_SURFACE_MATERIAL_FLAG_FNV_LAYOUT) these two words are the
+  // terrain-layers extension index instead; read it with opaqueSurfaceMaterialTerrainLayersIndex().
   // OPAQUE_SURFACE_MATERIAL_FLAG_METALLIC_FROM_SPECULAR parameters, 4 bits each
   // (value / 15): [0:3] spec low, [4:7] spec high, [8:11] albedo luminance max
   // (gamma; 15 = no albedo gate), [12:15] metal strength.
@@ -190,6 +193,45 @@ struct SubsurfaceMaterial
 
   // padding (to keep size matching with MemoryPolymorphicSurfaceMaterial)
   uint16_t data[16];
+};
+
+// Terrain-layers extension (remixapi_MaterialInfoTerrainLayersEXT). Mirrors RtTerrainLayersMaterial::writeGPUData
+// in rtx_materials.h; lives in surfaceMaterialExtensions and is referenced by OpaqueSurfaceMaterial::terrainLayersMaterialIndex.
+// Only 16-bit and 32-bit scalars so the reinterpret<> from the 64-byte MemoryPolymorphicSurfaceMaterial has no padding.
+struct TerrainLayersMaterial
+{
+  // 0-1
+  uint16_t flags; // TERRAIN_LAYERS_MATERIAL_FLAG_*
+  uint16_t layerCount;
+  // 2-9, 10-17
+  uint16_t albedoTextureIndices[TERRAIN_LAYERS_MATERIAL_MAX_LAYERS];
+  uint16_t normalTextureIndices[TERRAIN_LAYERS_MATERIAL_MAX_LAYERS];
+  // 18-21
+  uint16_t weightTextureIndex0;
+  uint16_t weightTextureIndex1;
+  uint16_t tintTextureIndex;
+  uint16_t weightSamplerIndex;
+  // 22-29
+  float weightUvScaleX;
+  float weightUvScaleY;
+  float weightUvOffsetX;
+  float weightUvOffsetY;
+  // 30-31: terrain POM, surfaceMaterialExtensions index of the TerrainLayersHeightMaterial entry
+  // (SURFACE_INDEX_INVALID = no layer has a height map)
+  uint32_t heightMaterialIndex;
+};
+
+// Per-layer height maps of a terrain-layers entry. Mirrors RtTerrainLayersHeightMaterial::writeGPUData
+// in rtx_materials.h; referenced by TerrainLayersMaterial::heightMaterialIndex.
+struct TerrainLayersHeightMaterial
+{
+  // 0-1
+  uint16_t layerMask; // bit i: heightTextureIndices[i] is valid
+  uint16_t coneMask;  // SCCR terrain: bit i: heightTextureIndices[i] is a conservative height+cone texture
+  // 2-9
+  uint16_t heightTextureIndices[TERRAIN_LAYERS_MATERIAL_MAX_LAYERS];
+  // 10-31: padding (to keep size matching with MemoryPolymorphicSurfaceMaterial)
+  uint16_t data[22];
 };
 
 struct SubsurfaceMaterialInteraction

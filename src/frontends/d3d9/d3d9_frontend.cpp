@@ -21,8 +21,10 @@
 */
 #include "d3d9_frontend.h"
 
+#include "../../dxvk/rtx_render/rtx_context.h"
+
+#ifdef REMIX_FRONTEND_D3D9_V2
 #include <algorithm>
-#include <cassert>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -33,154 +35,378 @@
 #include <unordered_set>
 #include <vector>
 
-#include "../../d3d9/d3d9_rtx.h"
-#include "../../dxvk/rtx_render/rtx_frontend_interface.h"
+#include "../../dxvk/dxvk_device.h"
+#include "../../dxvk/rtx_render/rtx_asset_replacer.h"
 #include "../../dxvk/rtx_render/rtx_frontend_ui.h"
 #include "../../dxvk/rtx_render/rtx_imgui.h"
+#include "../../dxvk/rtx_render/rtx_instance_manager.h"
+#include "../../dxvk/rtx_render/rtx_light_utils.h"
+#include "../../dxvk/rtx_render/rtx_lights_data.h"
 #include "../../dxvk/rtx_render/rtx_matrix_helpers.h"
 #include "../../dxvk/rtx_render/rtx_option.h"
+#include "../../dxvk/rtx_render/rtx_option_manager.h"
 #include "../../dxvk/rtx_render/rtx_options.h"
-#include "../translator/change_test.h"
-#include "../translator/decal_rank.h"
-#include "../translator/frame_batch.h"
-#include "../translator/instance_matcher.h"
-#include "../translator/lifetime.h"
+#include "../../dxvk/rtx_render/rtx_retained_scene.h"
+#include "../../dxvk/rtx_render/rtx_scene_interface.h"
+#include "../../dxvk/rtx_render/rtx_scene_manager.h"
+#include "../../dxvk/rtx_render/rtx_terrain_baker.h"
+#include "../../dxvk/rtx_render/translator/rtx_translator_lifetime.h"
 #include "../translator/material_translator.h"
-#include "../translator/sky_rules.h"
-#include "d3d9_camera.h"
-#include "d3d9_draw_call.h"
-#include "d3d9_raster_replay.h"
 #include "../../util/log/log.h"
 #include "../../util/util_string.h"
+#endif
 
 namespace dxvk {
   namespace frontends {
     namespace d3d9 {
 
-      namespace {
-        // A 32-bit unsigned option edited as eight hex digits, for bit patterns outside int's range.
-        bool inputHex32(const char* label, RtxOption<uint32_t>* rtxOption) {
-          RemixGui::RtxOptionUxWrapper wrapper(rtxOption);
-          uint32_t value = rtxOption->get();
-          const bool changed = ImGui::InputScalar(label, ImGuiDataType_U32, &value, nullptr, nullptr, "%08X",
-                                                  ImGuiInputTextFlags_CharsHexadecimal);
-          if (changed) {
-            RemixGui::CheckRtxOptionPopups(rtxOption);
-            rtxOption->setDeferred(value);
-          }
-          return changed;
-        }
+#ifdef REMIX_FRONTEND_D3D9_V2
 
+      namespace {
         class D3D9V2Options {
         public:
           RTX_OPTION("rtx.d3d9v2", bool, log, false,
                      "D3D9 frontend diagnostic: describes every D3D9 draw sent to ray tracing by its resources and "
-                     "their versions, and every 300 frames logs how many draws repeat last frame's exactly and what the "
-                     "scene did with them. Counters only.");
+                     "their versions, and every 300 frames logs how many draws repeat last frame's exactly and what "
+                     "rtx.d3d9v2.direct did. Counters only.");
+          RTX_OPTION("rtx.d3d9v2", bool, direct, true,
+                     "Hands objects the game draws unchanged for rtx.d3d9v2.handoverFrames frames to the scene, which "
+                     "keeps them. Their later draws skip the render thread's per-draw work (hashing, tracking and the "
+                     "preserve path), which saves CPU time. A moved object is moved in place, and any other change "
+                     "hands it back to the standard path.\n"
+                     "Not handed over by this option alone: vertex-captured, skinned, blended, user-pointer, particle, "
+                     "sky, terrain, decal and other special draws, and draws with USD mesh replacements. The other "
+                     "rtx.d3d9v2 options extend it to those. Needs rtx.scene.directRetained.");
+          RTX_OPTION("rtx.d3d9v2", uint32_t, handoverFrames, 8,
+                     "With rtx.d3d9v2.direct: how many frames an object must be drawn unchanged before it is handed to "
+                     "the scene.");
+          RTX_OPTION("rtx.d3d9v2", bool, materialTranslator, true,
+                     "With rtx.d3d9v2.direct: objects handed to the scene carry their alpha state and fixed-function "
+                     "surface state from the frontend, instead of the backend deriving them from the draw. Material "
+                     "hashes, mod keys and the image are unchanged. With rtx.coreMaterial.selfCheck, "
+                     "[MaterialTranslator] parity lines compare the two for every handover.");
+          RTX_OPTION("rtx.d3d9v2", bool, directReplacements, true,
+                     "With rtx.d3d9v2.direct: objects with a USD mesh replacement are handed to the scene too. The "
+                     "replacement's meshes become the object's parts, each with its own transform and material, and its "
+                     "lights and graphs are created, moved and removed with the object. A mod change hands every object "
+                     "back.\n"
+                     "Not handed over: replacements with point instancers, replacements with particle systems unless "
+                     "rtx.d3d9v2.specialCategories is on, and everything rtx.d3d9v2.direct leaves out.");
+          RTX_OPTION("rtx.d3d9v2", bool, explicitCamera, true,
+                     "With rtx.d3d9v2.direct: the frontend classifies each draw's camera (main, view model, sky or "
+                     "render-to-texture, with the same rules as the render thread) and sends each camera once per "
+                     "frame, instead of sending a camera-only draw whenever a skipped draw's camera differs. With "
+                     "rtx.fusedWorldViewMode it sends the corrected camera.");
+          RTX_OPTION("rtx.d3d9v2", bool, earlyChangeTest, true,
+                     "With rtx.d3d9v2.direct and rtx.d3d9v2.explicitCamera: recognises draws of objects the scene owns "
+                     "from their raw D3D9 state (buffers, render, stage and sampler states, textures, material, "
+                     "transforms, viewport and clip planes) before any preparation. Unchanged or only moved draws then "
+                     "skip the vertex and index copies, texture processing and hashing on the game thread, which saves "
+                     "CPU time. Other draws are prepared as usual. See rtx.d3d9v2.earlyChangeTestSelfCheckFrames to "
+                     "verify it.");
+          RTX_OPTION("rtx.d3d9v2", bool, firstDrawHandover, true,
+                     "With rtx.d3d9v2.direct and rtx.d3d9v2.explicitCamera: hands an eligible object to the scene at "
+                     "its first draw instead of after rtx.d3d9v2.handoverFrames repeats. A draw the scene does not "
+                     "accept is drawn by the standard path. Objects that change within 8 frames of their handover wait "
+                     "longer before the next attempt.");
+          RTX_OPTION("rtx.d3d9v2", bool, dynamicGeometry, true,
+                     "With rtx.d3d9v2.firstDrawHandover: objects the scene owns are updated in place when their draw "
+                     "changes (rewritten or dynamic buffers, fixed-function skinning, user-pointer draws), instead of "
+                     "being handed back to the standard path, and such draws are handed over too. Vertex-captured draws "
+                     "also need rtx.d3d9v2.capturedGeometry, and blended, decal and particle draws "
+                     "rtx.d3d9v2.unordered.");
+          RTX_OPTION("rtx.d3d9v2", bool, capturedGeometry, true,
+                     "With rtx.d3d9v2.dynamicGeometry: vertex-captured draws (vertex shader draws and GPU skinning) are "
+                     "handed to the scene too, and updated in place from their capture when they change. With "
+                     "rtx.d3d9v2.earlyChangeTest, a captured draw whose shader constants, camera and inputs did not "
+                     "change skips its preparation and its capture. The geometry is still refit on frames where it "
+                     "changes.");
+          RTX_OPTION("rtx.d3d9v2", bool, unordered, true,
+                     "With rtx.d3d9v2.dynamicGeometry and rtx.scene.directUnordered: blended draws, decals, particles "
+                     "and beams are handed to the scene too, which refreshes their billboards. Decals keep the game's "
+                     "draw order. Particle emitters (particle systems) stay on the standard path.");
+          RTX_OPTION("rtx.d3d9v2", bool, frameEvents, true,
+                     "With rtx.d3d9v2.direct: finds the frame's fog from the frontend's draw order, including skipped "
+                     "draws, at the end of the frame instead of per submitted draw, so the first unreplaced fog of the "
+                     "frame is used whichever path drew it. Takes effect from the next frame.");
+          RTX_OPTION("rtx.d3d9v2", bool, lights, true,
+                     "With rtx.d3d9v2.direct: the frontend translates the game's fixed-function lights (SetLight and "
+                     "LightEnable). Lights with a USD light replacement become lights the frontend owns, created, "
+                     "updated and aged out like replacement instances, anti-culling included. Other lights go to the "
+                     "usual game-light handling.");
+          RTX_OPTION("rtx.d3d9v2", bool, skyService, true,
+                     "With rtx.d3d9v2.specialCategories: sky-camera draws are owned by the scene, and their "
+                     "rasterization into the sky matte and probe runs every frame without the standard path. 3D-skybox "
+                     "draws reprojected into the main camera (rtx.skyReprojectToMainCameraSpace) need "
+                     "rtx.d3d9v2.skybox3d.");
+          RTX_OPTION("rtx.d3d9v2", bool, terrain, true,
+                     "With rtx.d3d9v2.specialCategories: terrain draws (the Terrain category, with terrain baking on) "
+                     "are owned by the scene with the baked terrain material. The bake into the terrain cascades still "
+                     "runs every frame, and a cascade change updates the material.");
+          RTX_OPTION("rtx.d3d9v2", bool, skybox3d, true,
+                     "With rtx.d3d9v2.skyService: 3D-skybox draws (sky-camera draws reprojected into the main camera, "
+                     "rtx.skyReprojectToMainCameraSpace) are owned by the scene too, and the frontend reprojects them "
+                     "every frame from the sky camera's transforms.");
+          RTX_OPTION("rtx.d3d9v2", bool, renderTargets, true,
+                     "With rtx.d3d9v2.specialCategories: draws to or sampling a ray traced render target "
+                     "(rtx.raytracedRenderTargetTextures) are handed to the scene too, with the render-to-texture "
+                     "camera updated every frame.");
+          RTX_OPTION("rtx.d3d9v2", bool, unknownCamera, true,
+                     "With rtx.d3d9v2.firstDrawHandover: draws whose camera could not be classified are handed over as "
+                     "main-camera draws, as the standard path treats them, unless rtx.skipObjectsWithUnknownCamera is "
+                     "on.");
+          RTX_OPTION("rtx.d3d9v2", bool, specialCategories, true,
+                     "With rtx.d3d9v2.dynamicGeometry and rtx.scene.directServices: special draws are handed to the "
+                     "scene too, which does their per-frame work itself: view-model and portal cameras, the player "
+                     "model and body, ray portals, light-converted materials, particle emitters, animated water, hair "
+                     "cards, world UI and world matte.\n"
+                     "Sky, the 3D skybox, terrain, ray traced render targets and draws with an unknown camera have "
+                     "their own options (rtx.d3d9v2.skyService, skybox3d, terrain, renderTargets and unknownCamera).");
           RTX_OPTION("rtx.d3d9v2", uint32_t, earlyChangeTestSelfCheckFrames, 0,
-                     "Diagnostic for the D3D9 frontend's early change test, which skips the preparation of unchanged "
-                     "draws: every this many frames, the draws it would skip are prepared in full and compared with what "
-                     "was stored. Differences are logged as [D3D9v2] preKeyMismatch. 0 = off.");
-          RTX_OPTION("rtx.d3d9v2", uint32_t, perDrawRenderState, 0,
-                     "Compatibility hook for hosts that keep some draws out of the D3D9 frontend's scene: the D3D9 "
-                     "render state (1-255) whose bit rtx.d3d9v2.perDrawRenderStateBit marks a draw as per-draw. A "
-                     "marked draw is ray traced only in the frames it is drawn in, with its own fog and its own "
-                     "projection. With rtx.viewModel.enable, a field of view that differs from the main camera's makes "
-                     "it a view-model draw. It does not replace a camera that earlier draws of the frame set up, and it "
-                     "never makes the scene rebuild other objects. Unmarked draws are unaffected. 0 = off.");
-          RTX_OPTION("rtx.d3d9v2", uint32_t, perDrawRenderStateBit, 0,
-                     "The bit (0-31) of rtx.d3d9v2.perDrawRenderState that marks a per-draw draw.");
-          RTX_OPTION("rtx.d3d9v2", uint32_t, perDrawRenderStateUnmarkedValue, 0,
-                     "A value of rtx.d3d9v2.perDrawRenderState that never marks a draw, even when the marker bit is set "
-                     "in it: the value a host writes when it clears that render state (for example "
-                     "0xFEFEFEFE). 0 = none.");
+                     "Diagnostic for rtx.d3d9v2.earlyChangeTest: every this many frames, the draws it would skip are "
+                     "prepared in full and compared with what was stored. Differences are logged as [D3D9v2] "
+                     "preKeyMismatch. 0 = off.");
         };
 
-        // The camera types a handover accepts: every classified type, and Unknown (drawn as Main) unless
-        // rtx.skipObjectsWithUnknownCamera is on.
+        // rtx.d3d9v2.explicitCamera in effect (needs rtx.d3d9v2.direct).
+        bool explicitCameraActive() {
+          return D3D9V2Options::direct() && D3D9V2Options::explicitCamera();
+        }
+
+        // rtx.d3d9v2.firstDrawHandover in effect (R4 decides eligibility from R2's camera type, so it needs R2).
+        bool firstDrawHandoverActive() {
+          return explicitCameraActive() && D3D9V2Options::firstDrawHandover();
+        }
+
+        // rtx.d3d9v2.dynamicGeometry in effect (R5 builds on R4's synchronous handover).
+        bool dynamicGeometryActive() {
+          return firstDrawHandoverActive() && D3D9V2Options::dynamicGeometry();
+        }
+
+        // rtx.d3d9v2.capturedGeometry in effect (R6 updates captured objects the R5 way).
+        bool capturedGeometryActive() {
+          return dynamicGeometryActive() && D3D9V2Options::capturedGeometry();
+        }
+
+        // rtx.d3d9v2.unordered in effect (R7: blended / decal / particle draws, updated in place the R5 way; the scene's
+        // unordered handling is rtx.scene.directUnordered).
+        bool unorderedActive() {
+          return dynamicGeometryActive() && D3D9V2Options::unordered() && scene::Options::directUnordered();
+        }
+
+        // rtx.d3d9v2.specialCategories in effect (R8: the scene's per-frame services, rtx.scene.directServices, replace the
+        // old path's per-draw work).
+        bool specialCategoriesActive() {
+          return dynamicGeometryActive() && D3D9V2Options::specialCategories() && scene::Options::directServices();
+        }
+
+        // R8: camera types the scene takes with rtx.d3d9v2.specialCategories (stamped per frame, kServiceStamp). Sky,
+        // RenderToTexture and Unknown need their R8b options.
+        bool serviceCamera(uint32_t cameraType) {
+          return cameraType == CameraType::ViewModel || cameraType == CameraType::Portal0 || cameraType == CameraType::Portal1;
+        }
+
+        // R8b options in effect.
+        bool skyServiceActive() {
+          return specialCategoriesActive() && D3D9V2Options::skyService();
+        }
+        bool renderTargetsActive() {
+          return specialCategoriesActive() && D3D9V2Options::renderTargets();
+        }
+        bool skybox3dActive() {
+          return skyServiceActive() && D3D9V2Options::skybox3d();
+        }
+        bool terrainActive() {
+          return specialCategoriesActive() && D3D9V2Options::terrain();
+        }
+        bool unknownCameraActive() {
+          return firstDrawHandoverActive() && D3D9V2Options::unknownCamera() && !RtxOptions::skipObjectsWithUnknownCamera();
+        }
+
+        // R8 / R8b: the camera types a handover accepts.
         bool acceptedCamera(uint32_t cameraType) {
-          if (cameraType == uint32_t(translator::CameraClass::Unknown)) {
-            return !RtxOptions::skipObjectsWithUnknownCamera();
+          if (cameraType == CameraType::Main) {
+            return true;
           }
-          return cameraType < uint32_t(translator::CameraClass::Unknown);
+          if (serviceCamera(cameraType)) {
+            return specialCategoriesActive();
+          }
+          if (cameraType == CameraType::Sky) {
+            return skyServiceActive();
+          }
+          if (cameraType == CameraType::RenderToTexture) {
+            return renderTargetsActive();
+          }
+          if (cameraType == CameraType::Unknown) {
+            return unknownCameraActive();
+          }
+          return false;
         }
 
-        // A terrain draw the terrain bake service takes while baking is on: replayed every frame (RasterOnly).
+        // A terrain draw the terrain bake service takes (rtx.d3d9v2.terrain with baking on): replayed every frame
+        // (RasterOnly).
         bool bakedTerrainCategory(uint32_t categories) {
-          return frontend::terrainBakeActive() && CategoryFlags(categories).test(InstanceCategories::Terrain);
+          return terrainActive() && TerrainBaker::needsTerrainBaking() && CategoryFlags(categories).test(InstanceCategories::Terrain);
         }
 
-        // True when a sky-camera draw is rasterized into the sky matte and probe (translator::skyDrawRasterizes).
-        // False for a 3D-skybox draw.
-        bool skyDrawRasterizes(const DrawCallState& state) {
-          translator::SkyDraw draw;
-          draw.blending = state.getMaterialData().blendMode.enableBlending;
-          draw.vertexCount = state.getGeometryData().vertexCount;
-          draw.indexCount = state.getGeometryData().indexCount;
-          draw.autoDetected = state.skyAutoDetected;
-          return translator::skyDrawRasterizes(draw);
+        // rtx.d3d9v2.frameEvents in effect (R10).
+        bool frameEventsActive() {
+          return D3D9V2Options::direct() && D3D9V2Options::frameEvents();
         }
 
-        // Moves a 3D-skybox draw's sky-camera transforms into the main camera's world (translator::reprojectSkyToMain).
-        // Returns false, with the transforms unchanged, when there is no main camera to move them into.
-        bool reprojectSky(const frontend::CameraQuery& main, uint32_t frame, DrawCallTransforms& transforms,
-                          bool allowStaleMainCamera) {
-          translator::SkyTransforms sky { transforms.objectToWorld, transforms.worldToView, transforms.viewToProjection };
-          if (!translator::reprojectSkyToMain(sky, main, frame, allowStaleMainCamera)) {
-            return false;
+        FogState toFogState(const FogInputs& in) {
+          FogState fog;
+          fog.mode = in.mode;
+          fog.color = Vector3(in.color[0], in.color[1], in.color[2]);
+          fog.scale = in.scale;
+          fog.end = in.end;
+          fog.density = in.density;
+          return fog;
+        }
+
+        // rtx.d3d9v2.lights in effect (R9).
+        bool lightsActive() {
+          return D3D9V2Options::direct() && D3D9V2Options::lights();
+        }
+
+        // rtx.d3d9v2.earlyChangeTest in effect (R1 sends cameras the R2 way, so it needs R2).
+        bool earlyChangeTestActive() {
+          return explicitCameraActive() && D3D9V2Options::earlyChangeTest();
+        }
+
+        // CameraManager::processCameraData's classification (rtx_camera_manager.cpp), on the app thread. "The Main camera
+        // was updated this frame" is the first Main classification of this D3D9 frame; draw order is the same on both
+        // threads, so the result is the same.
+        class CameraClassifier {
+        public:
+          // updatesCamera: false where processCameraData returns before updating a camera (rejected matrices: the type is
+          // then Unknown, or Sky for Sky-category draws, and no camera may be sent).
+          CameraType::Enum classify(const CameraInputs& c, bool& updatesCamera) {
+            updatesCamera = false;
+            const CameraType::Enum rejected = c.sky ? CameraType::Sky : CameraType::Unknown;
+            if (isIdentityExact(c.viewToProjection)) {
+              return rejected;
+            }
+            if (RtxOptions::fusedWorldViewMode() == FusedWorldViewMode::None &&
+                c.objectToView == c.objectToWorld && !isIdentityExact(c.objectToView)) {
+              return rejected;
+            }
+            if (!m_hasLast || std::memcmp(&m_lastProjection, &c.viewToProjection, sizeof(Matrix4)) != 0) {
+              decomposeProjection(c.viewToProjection, m_lastParams);
+              m_lastProjection = c.viewToProjection;
+              m_hasLast = true;
+            }
+            if (std::abs(m_lastParams.shearX) > 0.01f || !(m_lastParams.fov >= kFovToleranceRadians)) {
+              return rejected;
+            }
+            updatesCamera = true;
+            const CameraType::Enum type = classifyValid(c);
+            m_views[type] = c.worldToView;
+            m_viewFrames[type] = m_frame + 1;
+            return type;
           }
-          transforms.objectToWorld = sky.objectToWorld;
-          transforms.worldToView = sky.worldToView;
-          transforms.viewToProjection = sky.viewToProjection;
-          transforms.sanitize();
-          return true;
-        }
+
+          // The camera RtxContext::prepareGeometryForRTImpl rebuilds a pre-combined draw's world matrix from: the camera
+          // of the draw's type when it was set this frame or the last, otherwise Main.
+          // Returns null when neither was ever set.
+          const Matrix4* referenceView(CameraType::Enum type) const {
+            // m_viewFrames holds the frame plus one, so the camera was set this frame or the last when it is at least
+            // m_frame.
+            if (type >= CameraType::Unknown || m_viewFrames[type] == 0 || m_viewFrames[type] < m_frame) {
+              type = CameraType::Main;
+            }
+            return m_viewFrames[type] != 0 ? &m_views[type] : nullptr;
+          }
+
+          // True the first time a camera type is seen this frame.
+          bool firstOfFrame(CameraType::Enum type) {
+            const uint32_t bit = 1u << uint32_t(type);
+            const bool first = (m_fed & bit) == 0;
+            m_fed |= bit;
+            return first;
+          }
+
+          void endFrame() {
+            m_mainSet = false;
+            m_fed = 0;
+            ++m_frame;
+          }
+
+        private:
+          CameraType::Enum classifyValid(const CameraInputs& c) {
+            if (c.drawingToRaytracedRenderTarget) {
+              return CameraType::RenderToTexture;
+            }
+            if (c.sky) {
+              return CameraType::Sky;
+            }
+            if (RtxOptions::ViewModel::enable()) {
+              if (c.maxZ <= RtxOptions::ViewModel::maxZThreshold()) {
+                return CameraType::ViewModel;
+              }
+              if (m_mainSet && !(std::abs(m_lastParams.fov - m_mainFov) < kFovToleranceRadians)) {
+                return CameraType::ViewModel;
+              }
+            }
+            if (!m_mainSet) {
+              m_mainSet = true;
+              m_mainFov = m_lastParams.fov;
+            }
+            return CameraType::Main;
+          }
+
+          static constexpr float kFovToleranceRadians = 0.001f;  // rtx_camera_manager.cpp
+          Matrix4 m_lastProjection;
+          DecomposeProjectionParams m_lastParams;
+          bool m_hasLast = false;
+          bool m_mainSet = false;
+          float m_mainFov = 0.f;
+          uint32_t m_fed = 0;
+          // The last camera set per type and the frame plus one it was set in (0 = never), for referenceView.
+          Matrix4 m_views[CameraType::Count];
+          uint32_t m_viewFrames[CameraType::Count] = {};
+          uint32_t m_frame = 0;
+        };
 
         constexpr uint32_t kLogIntervalFrames = 300;
+        // R4: an object handed back as changed within this many frames of its first-draw handover backs off.
+        constexpr uint32_t kChurnFrames = 8;
 
         // Scene handles of D3D9 objects (bit 62 is the transient lane's, rtx_scene_transient.h).
         constexpr uint64_t kHandleNamespace = uint64_t(1) << 61;
-        // Geometry-sharing keys (SceneInstanceDesc::mesh) of D3D9 objects: identical geometry shares one BLAS entry.
+        // Geometry-sharing keys (ExternalDrawState::mesh) of D3D9 objects: identical geometry shares one BLAS entry.
         constexpr uint64_t kMeshNamespace = uint64_t(1) << 60;
-        // The geometry-sharing keys of per-draw draws, below kMeshNamespace.
-        constexpr uint64_t kPerDrawMeshNamespace = uint64_t(1) << 59;
 
         // A scene-owned object's object-picking value, unique per handle. Old-path draws use their draw-call ID, which
         // counts from 0 each frame, so the top bit keeps the two apart.
-        uint32_t pickingValue(uint64_t handle) {
-          return 0x80000000u | (uint32_t(handle) & 0x7FFFFFFFu);
+        ObjectPickingValue pickingValue(uint64_t handle) {
+          return ObjectPickingValue(0x80000000u | (uint32_t(handle) & 0x7FFFFFFFu));
         }
 
         void drawPanel() {
-          RemixGui::Checkbox("D3D9: Input Log", &D3D9V2Options::logObject());
-          RemixGui::DragInt("D3D9: Early Change Test Self-Check Every N Frames (0 = off)",
-                            &D3D9V2Options::earlyChangeTestSelfCheckFramesObject(), 1.f, 0, 100000);
-          RemixGui::DragInt("D3D9: Per-Draw Marker Render State (0 = off)", &D3D9V2Options::perDrawRenderStateObject(), 1.f, 0, 255);
-          RemixGui::DragInt("D3D9: Per-Draw Marker Bit", &D3D9V2Options::perDrawRenderStateBitObject(), 1.f, 0, 31);
-          inputHex32("D3D9: Per-Draw Unmarked Value (hex, 0 = none)", &D3D9V2Options::perDrawRenderStateUnmarkedValueObject());
-        }
-
-        void drawHeuristicsPanel() {
-          RemixGui::Checkbox("Orthographic Is UI", &D3D9Rtx::orthographicIsUIObject());
-          RemixGui::Checkbox("Pre-Transformed Vertices Is UI", &D3D9Rtx::preTransformedVerticesIsUIObject());
-          RemixGui::Checkbox("Allow Cubemaps", &D3D9Rtx::allowCubemapsObject());
-        }
-
-        void drawShaderSupportPanel() {
-          if (RemixGui::CollapsingHeader("Shader Support (Experimental)", ImGuiTreeNodeFlags_CollapsingHeader)) {
-            ImGui::Indent();
-            RemixGui::Checkbox("Capture Vertices from Shader", &D3D9Rtx::useVertexCaptureObject());
-            RemixGui::Checkbox("Capture Normals from Shader", &D3D9Rtx::useVertexCapturedNormalsObject());
-            RemixGui::Checkbox("Capture Texcoords from Shader", &D3D9Rtx::useVertexCapturedTexcoordsObject());
-            RemixGui::Separator();
-            RemixGui::Checkbox("Use World Transforms", &D3D9Rtx::useWorldMatricesForShadersObject());
-            ImGui::Unindent();
+          RemixGui::Checkbox("D3D9 v2: Stable Objects Owned by the Scene", &D3D9V2Options::directObject());
+          if (D3D9V2Options::direct() && !scene::Options::directRetained()) {
+            ImGui::TextUnformatted("  (needs \"Scene: Direct Retained Instances\")");
           }
         }
 
-        void drawSelfChecksPanel() {
-          RemixGui::Separator();
-          RemixGui::DragInt("D3D9: Self-Check Memoized Hashes Every N Frames (0 = off)", &D3D9Rtx::geometryHashMemoSelfCheckFramesObject(), 1.f, 0, 100000);
+        // The categories rtx.d3d9v2.direct never hands over (the old preserve-path exclusions plus the direct lane's own).
+        // unordered (R7, rtx.d3d9v2.unordered): decals, particles and beams are the scene's unordered instances, not special.
+        // services (R8, rtx.d3d9v2.specialCategories): emitters, player model, world UI / matte, water and hair are the
+        // scene's services. Sky and terrain stay special (old path) in v1.
+        // Terrain is special only while terrain baking is on: otherwise the old path draws it as a plain draw.
+        bool specialCategory(const CategoryFlags& categories, bool unordered, bool services) {
+          if ((categories.test(InstanceCategories::Terrain) && TerrainBaker::needsTerrainBaking() && !terrainActive()) ||  // R8b
+              (categories.test(InstanceCategories::Sky) && !skyServiceActive())) {  // R8b
+            return true;
+          }
+          if (!services && categories.any(InstanceCategories::ParticleEmitter,
+                                          InstanceCategories::ThirdPersonPlayerModel, InstanceCategories::ThirdPersonPlayerBody,
+                                          InstanceCategories::WorldUI, InstanceCategories::WorldMatte,
+                                          InstanceCategories::AnimatedWater, InstanceCategories::HairCards)) {
+            return true;
+          }
+          return !unordered && categories.any(InstanceCategories::Particle, InstanceCategories::Beam, DECAL_CATEGORY_FLAGS);
         }
 
         // The D3D9 draw's fixed-function state as the MaterialTranslator's plain record.
@@ -208,104 +434,84 @@ namespace dxvk {
           return ff;
         }
 
-        // The description of a prepared draw: its transforms, camera, categories, legacy material, skinning and raster
-        // flags. Its object-picking value is the draw's own ID.
-        frontend::SceneInstanceDesc describe(const DrawCallState& state) {
-          const DrawCallTransforms& transforms = state.getTransformData();
-          frontend::SceneInstanceDesc desc;
-          desc.objectToWorld = transforms.objectToWorld;
-          desc.textureTransform = transforms.textureTransform;
-          desc.texGen = frontend::TexGen(transforms.texgenMode);
-          if (transforms.enableClipPlane) {
-            desc.clipPlane = transforms.clipPlane;
-          }
-          desc.cameraView = translator::toView(state.cameraType);
-          desc.categories = state.getCategoryFlags().raw();
-          desc.vertexShader = state.usesVertexShader;
-          desc.raytracedRenderTarget = state.isUsingRaytracedRenderTarget;
-          desc.objectPickingValue = state.drawCallID;
-          desc.legacyMaterial = std::make_shared<const LegacyMaterialData>(state.getMaterialData());
-          // A draw whose vertices use one bone has it in its transforms and no bones left.
-          const SkinningData& skinning = state.getSkinningState();
-          if (skinning.numBones > 0) {
-            frontend::SkinningDesc& bones = desc.skinning.emplace();
-            bones.bones = skinning.pBoneMatrices;
-            bones.firstBone = skinning.minBoneIndex;
-            bones.bonesPerVertex = skinning.numBonesPerVertex;
-          }
-          return desc;
-        }
-
-        // Resolves the draw's geometry hashes, bounds and skinning. Fixed-function skinning decomposes the bone matrices
-        // with the view the app thread attached (DrawCallState::skinningWorldToView). Without one, it uses the camera of
-        // skinningCamera, or the last camera set up when it is CameraClass::Count.
-        // Returns false when the geometry hashes failed.
-        bool finalizeDraw(RtxContext& ctx, DrawCallState& state, translator::CameraClass skinningCamera = translator::CameraClass::Count) {
-          std::optional<frontend::CameraQuery> camera;
-          if (state.skinningPending() && state.hasSkinningView) {
-            frontend::CameraQuery attached;
-            attached.valid = true;
-            attached.preciseWorldToView = Matrix4d { state.skinningWorldToView };
-            attached.preciseViewToWorld = inverseAffine(attached.preciseWorldToView);
-            camera = attached;
-          } else if (state.skinningPending()) {
-            const frontend::SceneInterface scene { ctx };
-            camera = scene.camera(skinningCamera < translator::CameraClass::Count ? translator::toView(skinningCamera) : scene.lastSetupCamera());
-          }
-          return state.finalizePendingFutures(camera.has_value() && camera->valid ? &*camera : nullptr);
-        }
-
-        std::shared_ptr<const SurfaceDescs> surfaceDescs(const translator::MaterialTranslation& translation) {
-          return std::make_shared<const SurfaceDescs>(SurfaceDescs { translation.alphaState, translation.legacySurface });
-        }
-
         bool sameMatrix(const Matrix4& a, const Matrix4& b) {
           return std::memcmp(&a, &b, sizeof(Matrix4)) == 0;
         }
-
-        // The vertex layout of a geometry, which stays the same while its vertex data changes.
-        XXH64_hash_t layoutKey(const RasterGeometry& geometry) {
-          const uint32_t layout[4] = { uint32_t(geometry.topology), uint32_t(geometry.indexBuffer.indexType()),
-                                       uint32_t(geometry.positionBuffer.stride()), uint32_t(geometry.positionBuffer.vertexFormat()) };
-          return XXH3_64bits_withSeed(layout, sizeof(layout), geometry.hashes[HashComponents::VertexLayout]);
-        }
-
-        // The vertical field of view of a projection, in degrees.
-        float verticalFovDegrees(const Matrix4& viewToProjection) {
-          const float scale = std::abs(viewToProjection[1][1]);
-          return scale > 0.f ? 2.f * std::atan(1.f / scale) * 180.f / 3.14159265f : 0.f;
-        }
-
-        // What the backend's fog replacement material takes from a draw with that fog.
-        frontend::DrawMaterialSource materialSource(const DrawCallState& state) {
-          frontend::DrawMaterialSource source;
-          source.sampler = state.getMaterialData().getSampler();
-          source.texcoords = state.hasTextureCoordinates();
-          source.viewPositionTexgen = state.getTransformData().texgenMode == TexGenMode::ViewPositions;
-          source.raytracedRenderTarget = state.isUsingRaytracedRenderTarget;
-          source.hairCards = state.testCategoryFlags(InstanceCategories::HairCards);
-          return source;
-        }
-
-        // The backend's FogState hashes like the toolkit's record, which keys the fog draws.
-        static_assert(sizeof(translator::FogRecord) == sizeof(FogState));
-
-        frontend::FogDesc fogDesc(const translator::FogRecord& fog) {
-          frontend::FogDesc desc;
-          desc.mode = frontend::FogMode(fog.mode);
-          desc.color = fog.color;
-          desc.scale = fog.scale;
-          desc.end = fog.end;
-          desc.density = fog.density;
-          return desc;
-        }
       }
+
+      // ---- shared between the two halves -------------------------------------------------------------------------
+
+      // CS -> app: what became of a handed-over object.
+      struct Channel {
+        enum class Kind : uint8_t {
+          Accepted,  // the scene owns it (Pending -> Direct)
+          Rejected,  // it cannot be direct; back to the old path (with a back-off)
+          Released,  // the CS thread wants it back (aged out, a reset, rebuilt and rejected): the app thread sends a
+                     // destroy and routes the draw to the old path. The scene keeps the entry until that destroy, so
+                     // nothing disappears while the app thread still skips the draw.
+          Retry,     // it cannot be built yet (a 3D-skybox draw before the first main camera): handed back without a
+                     // back-off, so the next draw is handed over again.
+        };
+        struct Result {
+          uint64_t handle;
+          Kind kind;
+        };
+        std::mutex mutex;
+        std::vector<Result> results;
+        // An option that invalidates draw-call translation changed: every Direct object is prepared and described again
+        // at its next draw.
+        bool reprepare = false;
+
+        void push(uint64_t handle, Kind kind) {
+          std::lock_guard<std::mutex> lock(mutex);
+          results.push_back({ handle, kind });
+        }
+
+        void requestReprepare() {
+          std::lock_guard<std::mutex> lock(mutex);
+          reprepare = true;
+        }
+      };
+
+      struct FrameBatch {
+        struct Move {
+          uint64_t handle;
+          Matrix4 objectToWorld;
+        };
+        std::vector<uint64_t> seen;        // direct objects drawn this frame (unchanged or moved): not on the old path
+        std::vector<uint64_t> pendingSeen; // pending objects drawn unchanged this frame (still on the old path)
+        std::vector<Move> moves;
+        std::vector<uint64_t> destroys;    // direct or pending objects whose draw changed
+        // R7: direct decals whose rank in this frame's draw order changed, or that were (re)built (RetainedScene::setSortOrder).
+        struct SortOrder {
+          uint64_t handle;
+          uint8_t order;
+        };
+        std::vector<SortOrder> sortOrders;
+        // R10 (rtx.d3d9v2.frameEvents): the frame's fog states in draw order (each once, D3DFOG_NONE left out).
+        std::vector<FogState> fogOrder;
+        bool frameEvents = false;
+        bool releaseAll = false;           // rtx.d3d9v2.direct switched off
+
+        bool empty() const {
+          return seen.empty() && pendingSeen.empty() && moves.empty() && destroys.empty() && sortOrders.empty() &&
+                 fogOrder.empty() && !releaseAll;
+        }
+      };
 
       // ---- CS thread -------------------------------------------------------------------------------------------
 
       struct D3D9Frontend::Impl {
+        // V4: what one prim index of a mesh replacement is in the scene's copy: a submesh, one of the object's lights
+        // (index into Object::lights), a graph, or nothing.
+        struct PrimSlot {
+          PrimInstance::Type type = PrimInstance::Type::None;
+          uint32_t index = 0;
+          bool operator==(const PrimSlot& o) const { return type == o.type && index == o.index; }
+        };
+
         struct Object {
-          XXH64_hash_t assetHash = 0;   // mesh hash for the hash checker / hash dumps (reportAssetUse)
+          XXH64_hash_t assetHash = 0;   // mesh hash for the hash checker / hash dumps (trackMeshHash)
           XXH64_hash_t legacyHash0 = 0; // the legacy asset hashes submitDrawState also tracks (0 = rule off)
           XXH64_hash_t legacyHash1 = 0;
           XXH64_hash_t fogHash = 0;     // 0 = no fog
@@ -316,39 +522,43 @@ namespace dxvk {
           uint32_t frameCreated = 0;
           uint32_t frameLastSeen = 0;
           uint32_t frameMoved = ~0u;
-          uint32_t frameMergedPass = 0; // The last frame mergePass ran for the object
+          uint32_t frameMergedPass = 0; // A4: the last frame mergePass ran for the object
+          bool pending = true;          // described, not yet built
           bool releasing = false;       // Released sent, waiting for the app thread's destroy
-          // The scene expanded a USD mesh replacement for it (InstanceFeedback::replaced). The scene's copy owns the
-          // replacement's lights and graphs.
+          // V4 (rtx.d3d9v2.directReplacements): an expanded USD mesh replacement and its lights. The lights are the
+          // scene's from the first frame the app thread skips the draw (the old path's replacement instance, which had
+          // them until then, is collected in that frame: ReplacementInstance::handedToScene).
           bool replaced = false;
-          AxisAlignedBoundingBox lightBounds;   // object space, the replacement's lights
-          uint32_t lights = 0;
-          bool skinned = false;         // Never kept unseen (LifetimePolicy), as the tracker does for skinned instances
-          bool nonMainCamera = false;   // Never kept unseen either (the anti-culling frustum is the main camera's)
-          // A 3D-skybox object, described as a Main-camera entry. skyTransforms are its latest sky-camera transforms,
-          // reprojected at every flush.
+          AxisAlignedBoundingBox lightBounds;   // object space, as ReplacementInstance::lightBoundingBox
+          std::vector<RtLight> lightTemplates;  // the replacement's lights in object space
+          std::vector<RtLight*> lights;         // externally tracked lights, one per template once created
+          bool lightsCreated = false;
+          // V4: the replacement's prims (what each prim index is in the entry) and its graphs. Each graph instance
+          // (GraphManager id, 0 = none) is made with the lights, at the slot of its template.
+          std::vector<PrimSlot> primSlots;
+          std::vector<std::shared_ptr<const RtGraphState>> graphTemplates;
+          std::vector<uint64_t> graphs;
+          bool skinned = false;         // R5: never kept unseen (LifetimePolicy), as the tracker does for skinned instances
+          bool nonMainCamera = false;   // R8: never kept unseen either (the anti-culling frustum is the main camera's)
+          bool captured = false;        // R6: its geometry is a vertex capture (rtx.d3d9v2.log lines)
+          // R8b (rtx.d3d9v2.skybox3d): a 3D-skybox object, described as a Main-camera entry; skyTransforms are its latest
+          // sky-camera transforms, reprojected at every flush.
           bool skybox3d = false;
-          bool terrain = false;         // baked every frame by RasterOnly, material from the baker
+          bool terrain = false;         // R8b (rtx.d3d9v2.terrain): baked every frame by RasterOnly, material from the baker
           DrawCallTransforms skyTransforms;
           uint32_t reprepareEpoch = 0;  // the epoch of its description: an older one is described again even if unchanged
-          // What a new object must share with an object the game stopped drawing in the same frame to take over its
-          // motion history: the vertex layout, the counts and the colour texture.
-          XXH64_hash_t pairKey = 0;
-          bool agedOut = false;         // released because the game stopped drawing it
-          bool hiddenUnseen = false;    // hidden in the frames it is not drawn, until the app thread's destroy arrives
         };
         std::unordered_map<uint64_t, Object> objects;
-        // The objects the scene accepted this frame, for the pairing with the objects that went stale (endFrame).
-        std::vector<uint64_t> createdThisFrame;
-        // Objects whose scene entry has a merged pass (SceneInterface::setMergedPass).
+        // A4: objects whose scene entry has a merged pass (RetainedScene::setMergedPass).
         std::unordered_set<uint64_t> mergedPasses;
-        // A draw of each fog state, which the backend makes a fog replacement material from (FrameInfo::fog).
-        std::unordered_map<XXH64_hash_t, frontend::DrawMaterialSource> fogDraws;
+        // One draw state per fog state of a direct object: fog discovery (SceneManager::discoverFogState) needs one.
+        // R10: also of old-path draws (keepFogDraw); a fog replacement material is created from it.
+        std::unordered_map<XXH64_hash_t, DrawCallState> fogDraws;
 
-        // A draw of each fog state, for the fog replacement material at the flush. Bounded: a game whose fog changes
+        // R10: a draw of each fog state, for the fog replacement material at the flush. Bounded: a game whose fog changes
         // every frame refills it from the frame's draws.
         void keepFogDraw(const DrawCallState& state) {
-          if (state.getFogState().mode == frontend::FogMode::None) {
+          if (state.getFogState().mode == D3DFOG_NONE) {
             return;
           }
           const XXH64_hash_t fogHash = state.getFogState().getHash();
@@ -356,7 +566,7 @@ namespace dxvk {
             return;
           }
           if (makeRoomForFogDraw()) {
-            fogDraws.emplace(fogHash, materialSource(state));
+            fogDraws.emplace(fogHash, state);
           }
         }
 
@@ -379,80 +589,298 @@ namespace dxvk {
           }
           return fogDraws.size() < kMaxFogDraws;
         }
-        std::shared_ptr<translator::Channel> channel = std::make_shared<translator::Channel>();
-        // The D3D9 lights of the last emission, converted for addGameLights.
-        std::vector<frontend::FixedFunctionLight> lightScratch;
-        // Counts the re-preparations requested from the app thread (translator::Channel::reprepare).
+        std::shared_ptr<Channel> channel = std::make_shared<Channel>();
+        // Counts the re-preparations requested from the app thread (Channel::reprepare).
         uint32_t reprepareEpoch = 0;
-        // Feedback taken from the scene and not applied yet: Released results wait for the flush, which hands those
-        // objects back.
-        std::vector<frontend::InstanceFeedback> feedback;
-        std::vector<frontend::InstanceFeedback> feedbackScratch;
-        // The fog states of the last frame's FrameInfo ([D3D9v2] direct fogStates=).
-        uint32_t fogStates = 0;
+        uint64_t clearEpoch = ~0ull;
+        uint64_t assetEpoch = ~0ull;
+        bool v4WasOn = false;  // rtx.d3d9v2.directReplacements at the last flush
 
-        // The result of the buildInstance just made for handle.
-        frontend::InstanceFeedback buildResult(frontend::SceneInterface& scene, uint64_t handle) {
-          scene.takeFeedback(feedbackScratch);
-          frontend::InstanceFeedback result;
-          result.handle = handle;
-          result.kind = frontend::InstanceFeedback::Kind::Rejected;
-          for (const frontend::InstanceFeedback& item : feedbackScratch) {
-            if (item.handle == handle && item.kind != frontend::InstanceFeedback::Kind::Released) {
-              result = item;
-            } else {
-              feedback.push_back(item);
+        // R9 (rtx.d3d9v2.lights): D3D9 lights with a USD light replacement, keyed as SceneManager::addLight keyed their
+        // replacement instance (the light's hash and position). The entry owns the replacement's lights.
+        struct LightEntry {
+          std::shared_ptr<const ReplacementBucket> bucket;
+          std::vector<RtLight*> lights;     // one per light replacement, in bucket order (null = not created)
+          Matrix4 transform;                // LightUtils::getLightTransform of the D3D9 light
+          AxisAlignedBoundingBox lightBounds;
+          uint32_t frameCreated = 0;
+          uint32_t frameLastSeen = 0;
+        };
+        std::unordered_map<XXH64_hash_t, LightEntry> lightTable;
+        uint32_t lightCollectFrame = ~0u;
+        uint64_t lightClearEpoch = ~0ull;
+        struct LightTotals {
+          uint64_t game = 0;       // emitted lights handed to LightManager::addGameLight
+          uint64_t replaced = 0;   // emitted lights with a replacement (entry updated)
+          uint64_t created = 0;    // entries created
+          uint64_t collected = 0;  // entries aged out
+        } lightTotals;
+
+        static void destroyLightEntry(LightEntry& entry) {
+          for (RtLight* light : entry.lights) {
+            if (light != nullptr) {
+              light->markForGarbageCollection();
             }
           }
-          return result;
+          entry.lights.clear();
+        }
+
+        // R9: SceneManager::addLight's work for one emission of the enabled lights, with the replacement lights owned by
+        // lightTable instead of tracker replacement instances.
+        void translateLights(RtxContext* ctx, const D3DLIGHT9* lights, uint32_t count) {
+          SceneManager& sm = ctx->getSceneManager();
+          LightManager& lightManager = sm.getLightManager();
+          const uint32_t frame = sm.device()->getCurrentFrameId();
+          lightManager.beginGameLightList();
+          for (uint32_t l = 0; l < count; ++l) {
+            const D3DLIGHT9& light = lights[l];
+            const std::optional<LightData> lightData = LightData::tryCreate(light);
+            if (!lightData.has_value()) {
+              continue;  // malformed, as the old path skips it
+            }
+            RtLight rtLight = lightData->toRtLight();
+            const XXH64_hash_t assetKey = LightUtils::legacyAssetKey(light);
+            if (assetKey != kEmptyHash) {
+              rtLight.setAssetKey(assetKey);
+            }
+            const XXH64_hash_t assetHash = rtLight.getInitialHash();
+            const Vector3 position = rtLight.getPosition();
+            // A light with an asset key keeps its entry while it moves.
+            const XXH64_hash_t key = assetKey != kEmptyHash ? assetKey : XXH64(&position, sizeof(Vector3), assetHash);
+            const std::shared_ptr<const ReplacementBucket> bucket = sm.getAssetReplacer()->getReplacementsForLight(assetHash);
+            if (bucket == nullptr) {
+              // A light that had a replacement (replacement lights toggled off): its replacement lights go first.
+              const auto stale = lightTable.find(key);
+              if (stale != lightTable.end()) {
+                destroyLightEntry(stale->second);
+                lightTable.erase(stale);
+              }
+              lightManager.addGameLight(light.Type, rtLight, LightUtils::legacyIdentity(light));
+              lightTotals.game++;
+              continue;
+            }
+
+            const Matrix4 transform = LightUtils::getLightTransform(light);
+            auto [found, inserted] = lightTable.try_emplace(key);
+            LightEntry& entry = found->second;
+            if (inserted) {
+              entry.frameCreated = frame;
+              lightTotals.created++;
+            }
+            if (entry.bucket != bucket) {
+              // New or changed bucket (unchanged buckets keep their address): its lights are created again.
+              destroyLightEntry(entry);
+              entry.bucket = bucket;
+              entry.lightBounds = AxisAlignedBoundingBox();
+            }
+            const bool boundsNeeded = !entry.lightBounds.isValid();
+            AxisAlignedBoundingBox litBounds;
+            size_t slot = 0;
+            for (const AssetReplacement& replacement : bucket->replacements) {
+              if (replacement.type != AssetReplacement::eLight || !replacement.lightData.has_value()) {
+                continue;  // meshes under lights are not supported (the old path asserts)
+              }
+              LightData replacementLight = replacement.lightData.value();
+              // Merged before the bounds: some entries take type, position and radius from the D3D9 light.
+              replacementLight.merge(light);
+              RtLight rtReplacement = replacementLight.toRtLight();
+              if (boundsNeeded) {
+                const Vector3 p = rtReplacement.getPosition();
+                const float radius = rtReplacement.getType() == RtLightType::Sphere ? rtReplacement.getSphereLight().getRadius() : 0.f;
+                for (uint32_t j = 0; j < 3; ++j) {
+                  litBounds.minPos[j] = std::min(litBounds.minPos[j], p[j] - radius);
+                  litBounds.maxPos[j] = std::max(litBounds.maxPos[j], p[j] + radius);
+                }
+              }
+              if (replacementLight.relativeTransform()) {
+                rtReplacement.applyTransform(transform);
+              }
+              if (slot < entry.lights.size() && entry.lights[slot] != nullptr) {
+                lightManager.updateExternallyTrackedLight(entry.lights[slot], rtReplacement);
+              } else {
+                RtLight* created = lightManager.createExternallyTrackedLight(rtReplacement);
+                if (slot < entry.lights.size()) {
+                  entry.lights[slot] = created;
+                } else {
+                  entry.lights.push_back(created);
+                }
+              }
+              ++slot;
+            }
+            if (boundsNeeded && litBounds.isValid()) {
+              entry.lightBounds = litBounds;
+            }
+            entry.transform = transform;
+            entry.frameLastSeen = frame;
+            lightTotals.replaced++;
+          }
+        }
+
+        // R9: once per frame, the light entries age out as the tracker's light replacement instances did (LifetimePolicy
+        // with the lights' bounds, anti-culling included); all of them go on a scene clear or when the option is off.
+        void collectLights(RtxContext* ctx) {
+          SceneManager& sm = ctx->getSceneManager();
+          const uint32_t frame = sm.device()->getCurrentFrameId();
+          if (lightCollectFrame == frame) {
+            return;
+          }
+          lightCollectFrame = frame;
+          const uint64_t clears = sm.clearEpoch();
+          const bool cleared = lightClearEpoch != ~0ull && clears != lightClearEpoch;
+          lightClearEpoch = clears;
+          if (lightTable.empty()) {
+            return;
+          }
+          if (cleared || !lightsActive()) {
+            for (auto& [key, entry] : lightTable) {
+              destroyLightEntry(entry);
+            }
+            lightTotals.collected += lightTable.size();
+            lightTable.clear();
+            return;
+          }
+          // As the old path: anti-culling only when the game sets a view matrix (SceneManager::prepareSceneData).
+          translator::LifetimeFrame lifetime = translator::LifetimeFrame::read(
+            sm.getCamera(), sm.isAntiCullingSupported(),
+            objects.size() + lightTable.size() >= RtxOptions::AntiCulling::Object::numObjectsToKeep());
+          lifetime.currentFrame = frame;
+          lifetime.keptCutFrame = sm.m_lastKeptCutFrame;
+          for (auto it = lightTable.begin(); it != lightTable.end();) {
+            LightEntry& entry = it->second;
+            if (entry.frameLastSeen == frame) {
+              ++it;
+              continue;
+            }
+            translator::UnseenObject unseen;
+            unseen.frameLastSeen = entry.frameLastSeen;
+            unseen.frameCreated = entry.frameCreated;
+            unseen.categories = 0;
+            unseen.wasMovingWhenLastSeen = false;
+            unseen.skinned = false;
+            unseen.geometryBounds = nullptr;
+            unseen.lightBounds = &entry.lightBounds;
+            unseen.objectToWorld = &entry.transform;
+            if (!translator::LifetimePolicy::isStale(unseen, lifetime) || translator::LifetimePolicy::keepUnseen(unseen, lifetime)) {
+              ++it;
+              continue;
+            }
+            destroyLightEntry(entry);
+            lightTotals.collected++;
+            it = lightTable.erase(it);
+          }
         }
 
         // Why the CS thread asked for an object back ([D3D9v2] direct "released (...)").
         enum class ReleaseReason : uint8_t { Aged, Rebuilt, Reset };
         // Which event handed everything back ([D3D9v2] direct "resets (...)").
-        enum class ResetReason : uint8_t { Clear, Mods };
+        enum class ResetReason : uint8_t { Clear, Mods, Off };
 
         struct Totals {
           uint64_t accepted = 0;
           uint64_t rejected = 0;
           uint64_t released = 0;
           uint64_t resets = 0;
+          uint64_t cameraOnly = 0;
           uint64_t handovers = 0;
           uint64_t releasedBy[3] = {};   // ReleaseReason
-          uint64_t resetsBy[2] = {};     // ResetReason
+          uint64_t resetsBy[3] = {};     // ResetReason
           uint64_t reprepares = 0;       // re-preparations of every Direct object after a translation-invalidating option
-          uint64_t replacedAccepted = 0;
-          uint64_t lightsCreated = 0;
-          uint64_t updated = 0;          // Objects described and built again in place
-          uint64_t unchangedUpdates = 0; // Updates whose description matched the scene's, kept as they were
-          uint64_t recreations = 0;      // new objects that took over the motion history of a stale object
-          uint64_t hiddenUnseen = 0;     // stale objects hidden in the frame the game stopped drawing them
-          uint64_t historyResets = 0;    // rebuilds of deforming geometry that lost its previous positions
-          uint64_t historyJumps = 0;     // the resets for a draw that did not continue its geometry's last draw
-          float refitMotionMax = 0.f;    // the largest move between two draws of deforming geometry that continue it
-          uint64_t mergedPasses = 0;     // Merged passes described to the scene
-          uint64_t rasterMisses = 0;     // RasterOnly draws that were not rasterized sky draws (expected 0)
-          uint64_t skyboxMoves = 0;      // 3D-skybox reprojections applied
+          uint64_t replacedAccepted = 0; // V4
+          uint64_t lightsCreated = 0;    // V4
+          uint64_t updated = 0;          // R5: objects described and built again in place
+          uint64_t unchangedUpdates = 0; // R5: updates whose description matched the scene's, kept as they were
+          uint64_t mergedPasses = 0;     // A4: merged passes described to the scene
+          uint64_t cameraChecks = 0;     // R2: old-path draws whose camera type was compared
+          uint64_t cameraMismatches = 0;
+          uint64_t fallbackDraws = 0;    // R4: rejected first-draw handovers replayed through the old path
+          uint64_t rasterMisses = 0;     // R8b: RasterOnly draws that were not rasterized sky draws (expected 0)
+          uint64_t skyboxMoves = 0;      // R8b: 3D-skybox reprojections applied (rtx.d3d9v2.skybox3d)
           uint64_t skyboxRetries = 0;    // 3D-skybox handovers tried again because no main camera was known yet
-          uint64_t terrainBakes = 0;     // Terrain bakes of scene-owned objects
+          uint64_t terrainBakes = 0;     // R8b: terrain bakes of scene-owned objects (rtx.d3d9v2.terrain)
           uint64_t terrainMisses = 0;    // ... that baked nothing
-          uint64_t rejectedBakes = 0;    // bakes of rejected terrain objects' draws (rejectedTerrainDraw)
+          uint64_t terrainFallbacks = 0; // R8b: draws of rejected terrain objects drawn by the old path (rejectedTerrainDraw)
           uint64_t terrainRematerials = 0;  // ... that re-described the material after a cascade change
-          uint64_t terrainChannelPasses = 0;  // bake passes of a material channel other than albedo
-          uint64_t perDraws = 0;         // per-draw draws described on the transient lane
-          uint64_t perDrawDrops = 0;     // per-draw draws with nothing to describe (no geometry, failed futures or copy)
-          uint64_t perDrawViewModel = 0; // ... with the view-model camera
-          uint64_t perDrawFrames = 0;    // flushes after per-draw draws
-          // The vertical FOV in degrees of the Main camera at the last flush with and without per-draw draws, and of the
-          // view-model camera at the last flush with per-draw draws that set it up (-1 = none).
-          float fovMainWith = -1.f;
-          float fovMainWithout = -1.f;
-          float fovViewModelWith = -1.f;
-          uint64_t skinDeferred = 0;     // skinned draws held until this frame's camera was set up
-          uint64_t skinDeferredLate = 0; // ... decomposed with the last frame's camera, as none was set up this frame
         } totals;
+        std::string firstCameraMismatch = "none";
 
-        // The capture buffer of a vertex-captured draw (its positions), or null.
+        // rtx.d3d9v2.log: per-frame lines of the objects built and aged out in a frame (at most kFrameLogLines of each per
+        // log interval), and of World UI objects (in-world screens).
+        static constexpr uint32_t kFrameLogLines = 24;
+        std::vector<uint64_t> frameBuilt;  // first-draw handovers built this frame
+        uint32_t builtLogLines = 0;
+        uint32_t agedLogLines = 0;
+        uint32_t worldUILogLines = 0;
+
+        static std::string describeObject(uint64_t handle, const Object& object, uint32_t frame) {
+          const Vector3 p = object.objectToWorld[3].xyz();
+          return str::format(" 0x", std::hex, handle, " cat=0x", object.categories, " asset=0x", object.assetHash, std::dec,
+                             " pos=(", p.x, ", ", p.y, ", ", p.z, ") age=", frame - object.frameCreated,
+                             object.captured ? " captured" : "", object.skinned ? " skinned" : "",
+                             object.nonMainCamera ? " nonMain" : "");
+        }
+
+        // One line for a frame that built or aged out objects: how many, how many were World UI or vertex-captured, and
+        // up to four of them.
+        void logFrameObjects(const char* what, const std::vector<uint64_t>& handles, uint32_t frame, uint32_t& lines) {
+          if (handles.empty() || lines >= kFrameLogLines) {
+            return;
+          }
+          ++lines;
+          uint32_t worldUI = 0, captured = 0;
+          std::string samples;
+          for (size_t i = 0; i < handles.size(); ++i) {
+            const auto found = objects.find(handles[i]);
+            if (found == objects.end()) {
+              continue;
+            }
+            worldUI += CategoryFlags(found->second.categories).test(InstanceCategories::WorldUI) ? 1 : 0;
+            captured += found->second.captured ? 1 : 0;
+            if (i < 4) {
+              samples += describeObject(handles[i], found->second, frame);
+            }
+          }
+          Logger::info(str::format("[D3D9v2] ", what, " frame=", frame, " count=", handles.size(), " worldUI=", worldUI,
+                                   " captured=", captured, " |", samples));
+        }
+
+        // Every fourth frame, every World UI object after the frame's moves: where the frontend placed it and where its
+        // instance is. At most kWorldUILogLines per log interval.
+        static constexpr uint32_t kWorldUILogLines = 64;
+        void logWorldUIObjects(RetainedScene& scene, uint32_t frame) {
+          if ((frame & 3) != 0) {
+            return;
+          }
+          for (const auto& [handle, object] : objects) {
+            if (!CategoryFlags(object.categories).test(InstanceCategories::WorldUI) || worldUILogLines >= kWorldUILogLines) {
+              continue;
+            }
+            ++worldUILogLines;
+            const RtInstance* instance = scene.submeshInstance(handle, 0);
+            const RetainedScene::EntryState state = scene.entryState(handle);
+            const char* stateName = state == RetainedScene::EntryState::Direct ? "direct"
+                                  : state == RetainedScene::EntryState::Pending ? "pending"
+                                  : state == RetainedScene::EntryState::Legacy ? "legacy"
+                                  : state == RetainedScene::EntryState::Rejected ? "rejected" : "none";
+            std::string placed = " instance=none";
+            if (instance != nullptr) {
+              const Vector3 q = instance->surface.objectToWorld[3].xyz();
+              placed = str::format(" instance=(", q.x, ", ", q.y, ", ", q.z, ")");
+            }
+            Logger::info(str::format("[D3D9v2] worldUI object frame=", frame, describeObject(handle, object, frame),
+                                     " lastSeen=", object.frameLastSeen, " moved=", object.frameMoved == ~0u ? -1 : int64_t(object.frameMoved),
+                                     " entry=", stateName, placed, object.releasing ? " releasing" : ""));
+          }
+        }
+
+        // R4: a first-draw handover the scene rejected. The app thread keeps skipping the draw until it hears of the
+        // rejection (1-2 frames), so the CS thread replays the kept draw through the old path meanwhile.
+        struct Fallback {
+          DrawCallState state;     // the processed draw, its geometry snapshotted
+          uint32_t lastFrame = 0;
+        };
+        std::unordered_map<uint64_t, Fallback> fallbacks;
+
+        // R6: the capture buffer of a vertex-captured draw (its positions), or null.
         static const DxvkBuffer* captureBufferOf(const DrawCallState& state) {
           return state.vertexCaptured && state.getGeometryData().positionBuffer.defined()
             ? state.getGeometryData().positionBuffer.buffer().ptr() : nullptr;
@@ -460,19 +888,20 @@ namespace dxvk {
 
         // What a description of a processed draw depends on besides the world matrix: the geometry (FullGeometryHash, the
         // hash acquireGeometry reuses geometry by), the bones, both materials, the texture transform, the categories, the
-        // camera, the fog and the resolver's replacement (ReplacementQuery::version). The world matrix is compared with
-        // Object::objectToWorld, which follows the moves applied since the description.
-        static XXH64_hash_t descriptionKey(const DrawCallState& state, const MaterialData& material, uint64_t replacement) {
+        // camera, the fog and the replacement bucket. The world matrix is compared with Object::objectToWorld, which
+        // follows the moves applied since the description.
+        static XXH64_hash_t descriptionKey(const DrawCallState& state, const MaterialData& material,
+                                           const ReplacementBucket* bucket) {
           const DrawCallTransforms& transforms = state.getTransformData();
           const struct {
             XXH64_hash_t geometry, bones, material, legacyMaterial, fog;
-            uint64_t replacementVersion;
+            uint64_t bucket;
             uint32_t categories, cameraType, texgenMode, pad;
           } k = {
             state.getGeometryData().getHashForRule<rules::FullGeometryHash>(), state.getSkinningState().boneHash,
             material.getHash(), state.getMaterialData().computeIdentityHash(),
-            state.getFogState().mode != frontend::FogMode::None ? state.getFogState().getHash() : 0,
-            replacement, state.getCategoryFlags().raw(), uint32_t(state.cameraType),
+            state.getFogState().mode != D3DFOG_NONE ? state.getFogState().getHash() : 0,
+            uint64_t(reinterpret_cast<uintptr_t>(bucket)), state.getCategoryFlags().raw(), uint32_t(state.cameraType),
             uint32_t(transforms.texgenMode), 0u
           };
           static_assert(sizeof(k) == 64, "no implicit padding");
@@ -480,44 +909,86 @@ namespace dxvk {
           return XXH3_64bits_withSeed(&transforms.textureTransform, sizeof(transforms.textureTransform), h);
         }
 
-        // An opaque draw of a scene-owned object after a non-opaque draw of it in the same frame. The per-draw path merges
+        // A4: an opaque draw of a scene-owned object after a non-opaque draw of it in the same frame. The old path merges
         // it into the first draw's instance, so its prepared state becomes the scene entry's merged pass.
         void mergePass(RtxContext* ctx, const DrawParameters& params, DrawCallState& state, uint64_t handle) {
           const auto found = objects.find(handle);
-          if (found == objects.end() || found->second.releasing) {
+          if (found == objects.end() || found->second.pending || found->second.releasing) {
             return;
           }
+          SceneManager& sm = ctx->getSceneManager();
           const MaterialData* overrideMaterial = nullptr;
-          if (!prepareDraw(ctx, params, state, overrideMaterial, skinningCamera(state))) {
+          if (!ctx->prepareGeometryForRT(params, state, overrideMaterial, skinningCamera(state))) {
             return;
           }
           RTX_OPTION_INVALIDATION_SCOPE(RtxOptionFlags::InvalidatesDrawcallTranslation);
-          frontend::SceneInterface scene { *ctx };
-          translator::MaterialTranslation translation =
-            translator::MaterialTranslator::translate(scene.resolveMaterial(state.getMaterialData()), fixedFunctionState(state));
-          frontend::SceneInstanceDesc desc = describe(state);
-          desc.surface = surfaceDescs(translation);
-          desc.resolvedMaterial = std::make_shared<const MaterialData>(std::move(translation.material));
-          const XXH64_hash_t key = descriptionKey(state, *desc.resolvedMaterial, 0);
-          found->second.frameMergedPass = scene.frameIndex();
+          auto pass = std::make_shared<RetainedScene::MergedPass>();
+          if (D3D9V2Options::materialTranslator()) {
+            translator::MaterialTranslation translation =
+              translator::MaterialTranslator::translate(sm, state, fixedFunctionState(state));
+            pass->material = std::make_shared<const MaterialData>(std::move(translation.material));
+            pass->alphaState = translation.alphaState;
+            pass->legacySurface = translation.legacySurface;
+          } else {
+            pass->material = std::make_shared<const MaterialData>(sm.resolveDrawMaterial(state));
+          }
+          pass->key = descriptionKey(state, *pass->material, nullptr);
+          pass->drawCall = std::move(state);
+          // The build draws the pass with the entry's geometry, so the pass keeps no reference to this frame's buffers.
+          pass->drawCall.overrideGeometryData(std::make_shared<const RasterGeometry>());
+          found->second.frameMergedPass = sm.device()->getCurrentFrameId();
           if (mergedPasses.insert(handle).second) {
             totals.mergedPasses++;
           }
-          frontend::PreparedInstance pass = frontend::prepareInstance(std::move(desc));
-          scene.setMergedPass(handle, std::move(pass), key);
+          sm.retainedScene().setMergedPass(handle, std::move(pass));
         }
 
-        // A handover or update the scene cannot take: the draw is dropped and counted under its reason, and the app
-        // thread backs off before it hands the object over again. An object being updated loses its scene copy (and
-        // lights) first.
-        void rejectHandover(frontend::SceneInterface& scene, uint64_t handle, const char* reason) {
-          eraseObject(scene, handle);
+        void rejectFirstDraw(RtxContext* ctx, DrawCallState& state, const MaterialData* overrideMaterial, uint64_t handle,
+                             const char* reason) {
+          SceneManager& sm = ctx->getSceneManager();
+          // R5: an object being updated loses its scene copy (and lights) first; a no-op for a first-draw handover.
+          eraseObject(sm, handle);
+          // The processed state, copied before the submit (which may move it); its geometry still points at this
+          // frame's staging data, so the snapshot is taken now.
+          Fallback fallback;
+          bool keep = overrideMaterial == nullptr;  // per-frame override materials (terrain bake) are not replayed
+          if (keep) {
+            fallback.state = state;
+            RasterGeometry geometry = fallback.state.getGeometryData();
+            keep = snapshotGeometry(ctx, sm.device(), geometry, captureBufferOf(fallback.state));
+            if (keep) {
+              geometry.futureGeometryHashes = Future<GeometryHashes>();
+              geometry.futureBoundingBox = Future<AxisAlignedBoundingBox>();
+              geometry.hashesPrecomputed = true;
+              fallback.state.overrideGeometryData(std::make_shared<const RasterGeometry>(std::move(geometry)));
+            }
+          }
+          ctx->submitPreparedGeometry(state, overrideMaterial);
+          if (keep) {
+            fallback.lastFrame = sm.device()->getCurrentFrameId();
+            fallbacks[handle] = std::move(fallback);
+          }
           reject(handle, reason);
+        }
+
+        // R2 parity: the frontend's camera type (written into the queued state) against processCameraData's (written by
+        // prepareGeometryForRTImpl, Unknown mapped to Main unless rtx.skipObjectsWithUnknownCamera).
+        void checkCamera(CameraType::Enum expected, const DrawCallState& state) {
+          if (expected == CameraType::Unknown && !RtxOptions::skipObjectsWithUnknownCamera()) {
+            expected = CameraType::Main;
+          }
+          totals.cameraChecks++;
+          if (state.cameraType != expected) {
+            if (totals.cameraMismatches == 0) {
+              firstCameraMismatch = str::format("frontend ", uint32_t(expected), " render thread ", uint32_t(state.cameraType));
+            }
+            totals.cameraMismatches++;
+          }
         }
         std::unordered_map<std::string, uint64_t> rejectReasons;
         uint32_t logFrames = 0;
 
-        // [MaterialTranslator] parity (rtx.coreMaterial.selfCheck).
+        // [MaterialTranslator] parity (rtx.d3d9v2.materialTranslator with rtx.coreMaterial.selfCheck).
         struct Parity {
           uint64_t draws = 0;
           uint64_t mismatches = 0;
@@ -526,10 +997,9 @@ namespace dxvk {
         } parity;
 
         void checkParity(const translator::MaterialTranslation& translation, const DrawCallState& state) {
-          // The backend's derivation for the same draw and render material, from the draw's own legacy material
-          // (InstanceManager::calculateAlphaState and the legacy fields updateInstance reads).
-          const AlphaStateDesc backendAlpha = deriveAlphaState(FixedFunctionAlphaInput::fromLegacyMaterial(state.getMaterialData()),
-                                                               translation.material, state.getCategoryFlags());
+          // The backend's derivation for the same draw and render material (InstanceManager::calculateAlphaState and the
+          // legacy fields updateInstance reads).
+          const AlphaStateDesc backendAlpha = InstanceManager::predictAlphaState(state, translation.material);
           const LegacySurfaceDesc backendLegacy = deriveLegacySurface(state.getMaterialData(), state.getTransformData());
           const char* alphaField = firstAlphaStateDifference(translation.alphaState, backendAlpha);
           const char* legacyField = firstLegacySurfaceDifference(translation.legacySurface, backendLegacy);
@@ -563,72 +1033,7 @@ namespace dxvk {
         void reject(uint64_t handle, const char* reason) {
           totals.rejected++;
           rejectReasons[reason]++;
-          channel->push(handle, translator::Channel::Kind::Rejected);
-        }
-
-        // Fixed-function skinned draws whose app-thread camera was the last frame's, held until this frame's camera of
-        // their class is set up (or the frame ends), so their skinning is decomposed with it.
-        struct PendingSkinned {
-          DrawParameters params;
-          DrawCallState state;
-          bool update = false;
-          uint64_t handle = 0;
-        };
-        std::vector<PendingSkinned> pendingSkinned;
-
-        static frontend::CameraView skinningView(const DrawCallState& state) {
-          const translator::CameraClass camera = skinningCamera(state);
-          return camera < translator::CameraClass::Count ? translator::toView(camera) : frontend::CameraView::Main;
-        }
-
-        // Returns true when the draw was held. A draw whose camera is set up already takes it at once.
-        bool holdSkinned(RtxContext* ctx, const DrawParameters& params, DrawCallState& state, CommitMode mode, uint64_t handle) {
-          if ((mode != CommitMode::HandoverFirstDraw && mode != CommitMode::Update) || !state.vertexBlend ||
-              !state.hasSkinningView || state.skinningViewThisFrame || !state.skinningPending()) {
-            return false;
-          }
-          const frontend::SceneInterface scene { *ctx };
-          const frontend::CameraQuery current = scene.camera(skinningView(state));
-          if (current.lastSetupFrame == kInvalidFrameIndex) {
-            return false;
-          }
-          if (current.lastSetupFrame == scene.frameIndex()) {
-            state.skinningWorldToView = current.worldToView;
-            state.skinningViewThisFrame = true;
-            return false;
-          }
-          pendingSkinned.push_back(PendingSkinned { params, std::move(state), mode == CommitMode::Update, handle });
-          totals.skinDeferred++;
-          return true;
-        }
-
-        // Builds the held draws once this frame's camera is set up, or at once when frameEnd is set (or handle is held).
-        void drainSkinned(RtxContext* ctx, bool frameEnd, uint64_t handle = 0) {
-          if (pendingSkinned.empty()) {
-            return;
-          }
-          const frontend::SceneInterface scene { *ctx };
-          const bool held = handle != 0 && std::any_of(pendingSkinned.begin(), pendingSkinned.end(),
-                                                       [&](const PendingSkinned& p) { return p.handle == handle; });
-          if (!frameEnd && !held && scene.cameraFov(frontend::CameraView::Main).lastSetupFrame != scene.frameIndex()) {
-            return;
-          }
-          std::vector<PendingSkinned> pending;
-          pending.swap(pendingSkinned);
-          for (PendingSkinned& p : pending) {
-            const frontend::CameraQuery current = scene.camera(skinningView(p.state));
-            if (current.lastSetupFrame == scene.frameIndex()) {
-              p.state.skinningWorldToView = current.worldToView;
-            } else {
-              totals.skinDeferredLate++;
-            }
-            handover(ctx, p.params, p.state, p.handle, p.update);
-          }
-          // The skinning of these draws is submitted with the next command list, so at the frame's end that list is
-          // submitted now, before the scene builds the BLASes from it.
-          if (frameEnd) {
-            ctx->flushCommandList();
-          }
+          channel->push(handle, Channel::Kind::Rejected);
         }
 
         void requestRelease(uint64_t handle, Object& object, ReleaseReason reason) {
@@ -636,70 +1041,137 @@ namespace dxvk {
             object.releasing = true;
             totals.released++;
             totals.releasedBy[uint32_t(reason)]++;
-            channel->push(handle, translator::Channel::Kind::Released);
+            channel->push(handle, Channel::Kind::Released);
           }
         }
 
-        // Hides the object until it is drawn again.
-        void hideUnseen(frontend::SceneInterface& scene, uint64_t handle, Object& object) {
-          if (!object.hiddenUnseen) {
-            scene.setVisible(handle, false);
-            object.hiddenUnseen = true;
-            totals.hiddenUnseen++;
+        // V4: the replacement's lights at the object's transform, as SceneManager::processReplacementLights places them.
+        static void createLights(LightManager& lightManager, Object& object) {
+          for (const RtLight& objectSpace : object.lightTemplates) {
+            RtLight light = objectSpace;
+            light.applyTransform(object.objectToWorld);
+            object.lights.push_back(lightManager.createExternallyTrackedLight(light));
+          }
+          object.lightsCreated = true;
+        }
+
+        static void moveLights(LightManager& lightManager, Object& object) {
+          for (size_t i = 0; i < object.lights.size() && i < object.lightTemplates.size(); ++i) {
+            RtLight light = object.lightTemplates[i];
+            light.applyTransform(object.objectToWorld);
+            lightManager.updateExternallyTrackedLight(object.lights[i], light);
           }
         }
 
-        // A stale object leaves the frame's scene at once, as the game does not draw it in this frame. The app thread's
-        // destroy follows a frame or two later. A new object of this frame that draws the same mesh next to it is taken
-        // to be the same object under a new key, so it takes over the stale object's motion history.
-        void retireStale(frontend::SceneInterface& scene, uint64_t handle, Object& object, uint32_t frame) {
-          object.agedOut = true;
-          hideUnseen(scene, handle, object);
-          if (object.frameLastSeen + 1 != frame) {
-            return;  // Not drawn in the last frame, so no draw of this frame continues it.
+        // Externally tracked lights live until marked; the light manager drops them at its next collection.
+        static void destroyLights(Object& object) {
+          for (RtLight* light : object.lights) {
+            light->markForGarbageCollection();
           }
-          const Vector3 centre = (object.objectToWorld * Vector4(object.bounds.getCentroid(), 1.f)).xyz();
-          const float maxDistanceSqr = RtxOptions::getUniqueObjectDistanceSqr();
-          uint64_t best = 0;
-          float bestDistanceSqr = std::numeric_limits<float>::infinity();
-          for (const uint64_t created : createdThisFrame) {
-            const auto found = objects.find(created);
-            if (found == objects.end() || found->second.pairKey != object.pairKey || found->second.releasing) {
+          object.lights.clear();
+        }
+
+        // V4: the replacement's graph instances, owned by the object (ScenePrimOwner resolves their targets through the
+        // scene by handle and submesh). Made once the object's lights exist, and again for any the graph manager dropped
+        // since (a graph reset, rtx.graph.enable switched off and on), as drawReplacements makes them again.
+        static void ensureGraphs(SceneManager& sm, RtxContext* ctx, uint64_t handle, Object& object) {
+          if (object.graphTemplates.empty() || !object.lightsCreated) {
+            return;
+          }
+          GraphManager& graphManager = sm.getGraphManager();
+          object.graphs.resize(object.graphTemplates.size(), 0);
+          ScenePrimOwner owner;
+          bool ownerReady = false;
+          for (size_t i = 0; i < object.graphTemplates.size(); ++i) {
+            if (object.graphs[i] != 0 && graphManager.getGraphInstances().count(object.graphs[i]) != 0) {
               continue;
             }
-            const Object& candidate = found->second;
-            const Vector3 other = (candidate.objectToWorld * Vector4(candidate.bounds.getCentroid(), 1.f)).xyz();
-            const float distanceSqr = lengthSqr(other - centre);
-            if (distanceSqr <= maxDistanceSqr && distanceSqr < bestDistanceSqr) {
-              best = created;
-              bestDistanceSqr = distanceSqr;
+            if (!ownerReady) {
+              owner.scene = &sm.retainedScene();
+              owner.handle = handle;
+              owner.slots.resize(object.primSlots.size());
+              for (size_t k = 0; k < object.primSlots.size(); ++k) {
+                const PrimSlot& slot = object.primSlots[k];
+                owner.slots[k].type = slot.type;
+                if (slot.type == PrimInstance::Type::Instance) {
+                  owner.slots[k].submesh = slot.index;
+                } else if (slot.type == PrimInstance::Type::Light) {
+                  owner.slots[k].light = slot.index < object.lights.size() ? object.lights[slot.index] : nullptr;
+                }
+              }
+              ownerReady = true;
             }
-          }
-          if (best != 0 && scene.inheritHistory(best, handle)) {
-            totals.recreations++;
-            createdThisFrame.erase(std::find(createdThisFrame.begin(), createdThisFrame.end(), best));
+            const GraphInstance* graph = graphManager.addInstance(Rc<DxvkContext>(ctx), object.graphTemplates[i], &owner);
+            object.graphs[i] = graph != nullptr ? graph->getId() : 0;
           }
         }
 
-        // The scene's copy of the object goes, with the lights and graphs of its mesh replacement.
-        void eraseObject(frontend::SceneInterface& scene, uint64_t handle) {
+        static void destroyGraphs(SceneManager& sm, Object& object) {
+          GraphManager& graphManager = sm.getGraphManager();
+          for (const uint64_t id : object.graphs) {
+            if (id != 0 && graphManager.getGraphInstances().count(id) != 0) {
+              graphManager.removeInstance(id);
+            }
+          }
+          object.graphs.clear();
+        }
+
+        // The scene's copy of the object goes (its entry and, V4, its lights and graphs).
+        void eraseObject(SceneManager& sm, uint64_t handle) {
           const auto found = objects.find(handle);
           if (found == objects.end()) {
             return;
           }
+          destroyGraphs(sm, found->second);
+          destroyLights(found->second);
           objects.erase(found);
-          scene.destroyInstance(handle);
+          sm.retainedScene().destroy(handle);
         }
 
-        // Why the scene cannot take a prepared draw, or null. The scene checks the mesh replacement the asset resolver
-        // has for the draw. An ignored material is accepted: the scene builds no instance for it.
-        static const char* eligibility(const DrawCallState& state, const MaterialData* overrideMaterial) {
-          if (!acceptedCamera(uint32_t(state.cameraType))) {
+        // replacementsAllowed (rtx.d3d9v2.directReplacements): draws with USD mesh replacements pass here and are checked
+        // by expandReplacement; otherwise they are rejected here.
+        static const char* eligibility(SceneManager& sm, const DrawCallState& state, const MaterialData* overrideMaterial,
+                                       const MaterialData& material, bool replacementsAllowed, bool skinnedAllowed) {
+          const bool unordered = unorderedActive();  // R7
+          const bool services = specialCategoriesActive();  // R8
+          if (!sm.retainedScene().active()) {
+            return "rtx.scene.directRetained off";
+          }
+          if (!acceptedCamera(state.cameraType)) {  // R8 / R8b
             return "camera";
           }
-          // The terrain baker's material is a baked terrain object's material.
-          if (overrideMaterial != nullptr && !state.getCategoryFlags().test(InstanceCategories::Terrain)) {
+          // R8b (rtx.d3d9v2.terrain): the terrain baker's material is the object's material.
+          if (overrideMaterial != nullptr && !(terrainActive() && state.getCategoryFlags().test(InstanceCategories::Terrain))) {
             return "override material";
+          }
+          if (state.getSkinningState().numBones > 0 && !skinnedAllowed) {
+            return "skinned";
+          }
+          if (specialCategory(state.getCategoryFlags(), unordered, services)) {
+            return "category";
+          }
+          if ((state.isDrawingToRaytracedRenderTarget || state.isUsingRaytracedRenderTarget) && !renderTargetsActive()) {
+            return "render target";
+          }
+          if (!services && RtxOptions::shouldConvertToLight(state.getMaterialData().getHash())) {
+            return "light conversion";
+          }
+          if (state.getMaterialData().blendMode.enableBlending && !unordered) {
+            return "blended";
+          }
+          if (!replacementsAllowed && sm.hasMeshReplacements(state)) {
+            return "mesh replacement";
+          }
+          // An ignored material is accepted: the scene builds no instance for it, as processDrawCallState draws nothing.
+          if (!services && material.getType() == MaterialDataType::RayPortal) {
+            return "portal";
+          }
+          if (!services && material.getParticleSystemDesc() != nullptr) {
+            return "particle material";
+          }
+          const RtSurface::AlphaState alpha = InstanceManager::predictAlphaState(state, material);
+          if ((alpha.isDecal || alpha.emissiveBlend) && !unordered) {
+            return "unordered";
           }
           if (!state.getGeometryData().positionBuffer.defined()) {
             return "geometry";
@@ -707,213 +1179,278 @@ namespace dxvk {
           return nullptr;
         }
 
-        // The terrain bake of a Terrain-category draw. overrideMaterial is the baked material, or null.
-        static void bakeTerrain(RtxContext* ctx, const DrawParameters& params, DrawCallState& state, const MaterialData*& overrideMaterial) {
-          overrideMaterial = replayTerrain(*ctx, params, state).material;
-        }
+        // The draw's buffers are D3D9-owned or staging memory that is reused after the frame: copy every referenced
+        // range into buffers the snapshot owns (once per distinct source range) and point the slices at them.
+        // keep (R6): a buffer referenced as it is instead of copied: a vertex-capture buffer (positions and any captured
+        // normals / texcoords). It is a new buffer per draw (D3D9Rtx::allocVertexCaptureBuffer), written once by the
+        // raster draw recorded before this commit, so holding the reference keeps the data and saves the GPU copy.
+        static bool snapshotGeometry(RtxContext* ctx, DxvkDevice* device, RasterGeometry& geometry, const DxvkBuffer* keep = nullptr) {
+          struct Copied {
+            const DxvkBuffer* source;
+            VkDeviceSize offset;
+            VkDeviceSize length;
+            DxvkBufferSlice copy;
+          };
+          std::vector<Copied> copies;
+          bool ok = true;
 
-        // A per-frame draw's futures before a raster replay, which reads the geometry's bounds. Fixed-function skinning
-        // decomposes with the last camera set.
-        // Returns false when the futures failed.
-        static bool finalizeForReplay(RtxContext* ctx, DrawCallState& state) {
-          return finalizeDraw(*ctx, state);
-        }
-
-        // rtx.fusedWorldViewMode View: the draw's world-view matrix is its world matrix, and its view is identity.
-        static void applyFusedWorldView(DrawCallState& state) {
-          if (RtxOptions::fusedWorldViewMode() == FusedWorldViewMode::View) {
-            DrawCallTransforms& transforms = state.modifyTransformData();
-            transforms.objectToWorld = transforms.objectToView;
-            transforms.worldToView = Matrix4();
-          }
-        }
-
-        // The CS thread's preparation of a draw for the scene: the world-view fix-up, the geometry futures, the camera
-        // type, the sky and terrain raster replays, and the pre-combined matrix and free-camera fix-ups.
-        // skinningCamera: the camera whose view decomposes fixed-function skinned matrices. CameraClass::Count takes the
-        // last camera set.
-        // Returns false when there is nothing to describe: the futures failed, the camera is unknown and such draws are
-        // skipped, or the draw is a sky draw that is not ray traced.
-        bool prepareDraw(RtxContext* ctx, const DrawParameters& params, DrawCallState& state, const MaterialData*& overrideMaterial,
-                         translator::CameraClass skinningCamera) {
-          overrideMaterial = nullptr;
-          assert(state.geometryHashesPending());
-          assert(state.getGeometryData().positionBuffer.defined());
-          applyFusedWorldView(state);
-          DrawCallTransforms& transformData = state.modifyTransformData();
-
-          // The futures are final before the camera type is derived, since sky detection reads the geometry hash.
-          if (!finalizeDraw(*ctx, state, skinningCamera)) {
-            return false;
-          }
-          state.cameraType = classifyDrawCamera(*ctx, state);
-          if (state.cameraType == translator::CameraClass::Unknown) {
-            if (RtxOptions::skipObjectsWithUnknownCamera()) {
-              return false;
+          const auto copyRange = [&](const RasterBuffer& from) -> DxvkBufferSlice {
+            if (keep != nullptr && from.buffer().ptr() == keep) {
+              return DxvkBufferSlice(from.buffer(), from.offset(), from.length());
             }
-            state.cameraType = translator::CameraClass::Main;
-          }
-
-          // A sky-camera draw is rasterized into the sky matte and probe, and then described like any other draw. A
-          // 3D-skybox draw is prepared by prepareSkyboxDraw instead, so one that only the CS thread classifies as sky is
-          // not described.
-          if (state.cameraType == translator::CameraClass::Sky) {
-            if (!frontend::RasterService { *ctx }.rendersGameSky() || !skyDrawRasterizes(state)) {
-              return false;
+            for (const Copied& c : copies) {
+              if (c.source == from.buffer().ptr() && c.offset == from.offset() && c.length == from.length()) {
+                return c.copy;
+              }
             }
-            replaySky(*ctx, params, state);
-          }
-
-          bakeTerrain(ctx, params, state, overrideMaterial);
-
-          // A game that pre-combines its view and world matrices draws with an identity view. The world matrix is
-          // rebuilt from the camera of the draw's type, from this frame or the last, else from the main camera. A
-          // camera from the last frame lags the object by a frame.
-          const frontend::SceneInterface scene { *ctx };
-          if (RtxOptions::resolvePreCombinedMatrices() && isIdentityExact(state.getTransformData().worldToView)) {
-            frontend::CameraQuery referenceCamera = scene.camera(translator::toView(state.cameraType));
-            const uint32_t frame = scene.frameIndex();
-            if (referenceCamera.lastSetupFrame != frame && referenceCamera.lastSetupFrame != frame - 1) {
-              referenceCamera = scene.camera(frontend::CameraView::Main);
+            DxvkBufferCreateInfo info {};
+            info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                         VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+            info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
+            info.access = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+            info.size = align(from.length(), CACHE_LINE_SIZE);
+            Rc<DxvkBuffer> buffer = device->createBuffer(info, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+                                                         DxvkMemoryStats::Category::RTXBuffer, "D3D9 v2 geometry snapshot");
+            if (buffer == nullptr) {
+              ok = false;
+              return DxvkBufferSlice();
             }
-            transformData.objectToWorld = referenceCamera.preciseViewToWorld * state.getTransformData().objectToView;
-            transformData.worldToView = referenceCamera.preciseWorldToView;
-          }
-
-          // View-space texture coordinate generation follows the free camera. The terrain bake's cascade texgen
-          // applies it itself.
-          if ((transformData.texgenMode == TexGenMode::ViewPositions || transformData.texgenMode == TexGenMode::ViewNormals) &&
-              frontend::freeCameraEnabled()) {
-            const frontend::CameraQuery mainCamera = scene.camera(frontend::CameraView::Main);
-            if (mainCamera.valid) {
-              transformData.textureTransform *= mainCamera.freeCameraViewTransform;
+            const void* src = from.mapPtr(0);
+            void* dst = buffer->mapPtr(0);
+            if (src != nullptr && dst != nullptr && !from.isPendingGpuWrite()) {
+              std::memcpy(dst, src, from.length());
             } else {
-              ONCE(Logger::warn(str::format("[RTX] Tried to update surface transform with Free Camera's transform "
-                                            "but main camera has not been processed this frame yet. Skipping the transform update")));
+              ctx->copyBuffer(buffer, 0, from.buffer(), from.offset(), from.length());
             }
+            DxvkBufferSlice slice(buffer, 0, from.length());
+            copies.push_back({ from.buffer().ptr(), from.offset(), from.length(), slice });
+            return slice;
+          };
+          const auto vertex = [&](RasterBuffer& b) {
+            if (b.defined()) {
+              b = RasterBuffer(copyRange(b), b.offsetFromSlice(), b.stride(), b.vertexFormat());
+            }
+          };
+          vertex(geometry.positionBuffer);
+          vertex(geometry.normalBuffer);
+          vertex(geometry.texcoordBuffer);
+          vertex(geometry.color0Buffer);
+          vertex(geometry.blendWeightBuffer);
+          vertex(geometry.blendIndicesBuffer);
+          if (geometry.indexBuffer.defined()) {
+            geometry.indexBuffer = RasterBuffer(copyRange(geometry.indexBuffer), geometry.indexBuffer.offsetFromSlice(),
+                                                geometry.indexBuffer.stride(), geometry.indexBuffer.indexType());
           }
-          return true;
+          return ok;
         }
 
-        // prepareDraw for a 3D-skybox draw: the world-view fix-up, the futures and the camera type only.
-        // Returns false when there is nothing to describe: the futures failed, or the draw is not a sky-camera draw.
-        static bool prepareSkyboxDraw(RtxContext* ctx, DrawCallState& state) {
-          applyFusedWorldView(state);
-          if (!finalizeDraw(*ctx, state)) {
-            return false;
+        // V4: a USD mesh replacement expanded the way SceneManager::drawReplacements draws it.
+        struct Expansion {
+          std::vector<RasterGeometry> submeshes;            // one per mesh prim
+          std::vector<ExternalDrawState::SubmeshPart> parts; // same order
+          std::vector<size_t> originalSlots;                // submeshes that are the draw's own geometry (includeOriginal)
+          std::vector<RtLight> lights;                      // light prims, object space
+          std::vector<PrimSlot> primSlots;                  // one per prim of the bucket
+          std::vector<std::shared_ptr<const RtGraphState>> graphs;  // graph prims, in prim order
+        };
+
+        // Fills `out` from the bucket, or says why the object stays on the old path. Same prims, order, transforms,
+        // categories and materials as drawReplacements / buildReplacementMeshDrawCallState, including its running
+        // material: a mesh prim with its own material sets it for the prims after it that have none.
+        // A replacement of a vertex-captured draw is placed at the draw's transform as on the old path, and its original
+        // (includeOriginal) is the captured geometry. With rtx.d3d9v2.specialCategories, replacement prims with particle
+        // systems, particle materials or portal materials are allowed, as they are for plain draws: the scene's services
+        // spawn the particles and stamp the portals.
+        static const char* expandReplacement(const DrawCallState& state, const ReplacementBucket& bucket,
+                                             const MaterialData& drawMaterial, Expansion& out) {
+          const bool services = specialCategoriesActive();
+          std::shared_ptr<const MaterialData> running = std::make_shared<const MaterialData>(drawMaterial);
+          uint32_t drawnParts = 0;
+          out.primSlots.resize(bucket.replacements.size());
+          for (size_t prim = 0; prim < bucket.replacements.size(); ++prim) {
+            const AssetReplacement& replacement = bucket.replacements[prim];
+            if (replacement.type == AssetReplacement::eGraph) {
+              // As processReplacementGraphs: a graph prim without a graph state is an authoring error.
+              if (!replacement.graphState) {
+                return "replacement: graph state";
+              }
+              out.primSlots[prim].type = PrimInstance::Type::Graph;
+              out.graphs.push_back(replacement.graphState);
+              continue;
+            }
+            if (replacement.particleSystem.has_value() && !services) {
+              return "replacement: particle system";
+            }
+            ExternalDrawState::SubmeshPart part;
+            part.particleSystem = replacement.particleSystem;
+            if (replacement.includeOriginal) {
+              part.submeshToObject = Matrix4();
+              part.meshReplacement = false;
+              out.primSlots[prim] = { PrimInstance::Type::Instance, uint32_t(out.submeshes.size()) };
+              out.originalSlots.push_back(out.submeshes.size());
+              out.submeshes.push_back(RasterGeometry());  // the snapshot of the draw's geometry, filled by handover
+            } else if (replacement.type == AssetReplacement::eMesh) {
+              if (replacement.instancesToObject != nullptr && !replacement.instancesToObject->empty()) {
+                return "replacement: point instancer";
+              }
+              if (replacement.geometry == nullptr || !replacement.geometry->data.positionBuffer.defined()) {
+                return "replacement: geometry";
+              }
+              if (replacement.materialData != nullptr) {
+                running = std::make_shared<const MaterialData>(*replacement.materialData);
+              }
+              part.submeshToObject = replacement.replacementToObject;
+              part.meshReplacement = true;
+              out.primSlots[prim] = { PrimInstance::Type::Instance, uint32_t(out.submeshes.size()) };
+              RasterGeometry geometry = replacement.geometry->data;
+              geometry.externalMaterial = nullptr;
+              geometry.externalMesh = nullptr;
+              out.submeshes.push_back(std::move(geometry));
+            } else {
+              if (replacement.type == AssetReplacement::eLight && replacement.lightData.has_value()) {
+                out.primSlots[prim] = { PrimInstance::Type::Light, uint32_t(out.lights.size()) };
+                out.lights.push_back(replacement.lightData->toRtLight());
+              }
+              continue;
+            }
+            part.material = running;
+            part.categories = replacement.categories.applyCategoryFlags(state.getCategoryFlags());
+            // What eligibility checks on the draw, for the prim as drawn.
+            if (specialCategory(part.categories, unorderedActive(), specialCategoriesActive())) {
+              return "replacement: category";
+            }
+            if (running->getType() == MaterialDataType::RayPortal && !services) {
+              return "replacement: portal";
+            }
+            if (running->getParticleSystemDesc() != nullptr && !services) {
+              return "replacement: particle material";
+            }
+            DrawCallState probe = state;
+            probe.modifyCategoryFlags() = part.categories;
+            const RtSurface::AlphaState alpha = InstanceManager::predictAlphaState(probe, *running);
+            if (alpha.isDecal || alpha.emissiveBlend) {
+              return "replacement: unordered";
+            }
+            drawnParts += running->getIgnored() ? 0 : 1;
+            out.parts.push_back(std::move(part));
           }
-          state.cameraType = classifyDrawCamera(*ctx, state);
-          return state.cameraType == translator::CameraClass::Sky;
+          // drawReplacements places lights only on a replacement that drew a mesh.
+          if (drawnParts == 0) {
+            return "replacement: no meshes";
+          }
+          return nullptr;
         }
 
-        // A sky-camera draw of a scene-owned object (RasterOnly).
-        // Returns true when the draw was handled as a sky draw: replayed into the sky matte and probe, or dropped
-        // while the backend renders its own sky.
-        // Returns false for a 3D-skybox draw.
-        bool skyDraw(RtxContext* ctx, const DrawParameters& params, const DrawCallState& state) {
-          if (!frontend::RasterService { *ctx }.rendersGameSky()) {
-            return true;
+        // With rtx.d3d9v2.explicitCamera the queued state carries the draw's camera type, and its camera decomposes the
+        // draw's fixed-function skinned matrices. A skipped draw sets no camera, so the last camera set may be another
+        // type's. Unknown is mapped to Main, as prepareGeometryForRTImpl maps it.
+        static CameraType::Enum skinningCamera(const DrawCallState& state) {
+          if (!explicitCameraActive() || state.cameraType >= CameraType::Count) {
+            return CameraType::Count;
           }
-          if (!skyDrawRasterizes(state)) {
-            return false;
-          }
-          replaySky(*ctx, params, state);
-          return true;
+          return state.cameraType == CameraType::Unknown ? CameraType::Main : state.cameraType;
         }
 
-        // The queued state carries the draw's camera type, and its camera decomposes the draw's fixed-function skinned
-        // matrices. A skipped draw sets no camera, so the last camera set may be another type's. Unknown is mapped to
-        // Main, as prepareDraw maps it.
-        static translator::CameraClass skinningCamera(const DrawCallState& state) {
-          if (state.cameraType >= translator::CameraClass::Count) {
-            return translator::CameraClass::Count;
-          }
-          return state.cameraType == translator::CameraClass::Unknown ? translator::CameraClass::Main : state.cameraType;
-        }
-
-        // A handover (CommitMode::HandoverFirstDraw): the scene builds the object at once. A rejection drops the draw
-        // (rejectHandover).
-        // update (CommitMode::Update): the same for an object the scene already owns under `handle`. The entry is
-        // described and built again in place (same instances, geometry refit or rebuilt in place).
-        void handover(RtxContext* ctx, const DrawParameters& params, DrawCallState& state, uint64_t handle, bool update) {
+        // firstDraw (R4, CommitMode::HandoverFirstDraw): the old path does not run for this draw; the scene builds the
+        // object at once, and a rejection draws it through the old path and keeps a fallback (rejectFirstDraw).
+        // update (R5, CommitMode::Update): the same as firstDraw for an object the scene already owns under `handle`: the
+        // entry is described and built again in place (same instances; geometry refit or rebuilt in place).
+        void handover(RtxContext* ctx, const DrawParameters& params, DrawCallState& state, uint64_t handle, bool firstDraw,
+                      bool update = false) {
           totals.handovers++;
-          frontend::SceneInterface scene { *ctx };
+          SceneManager& sm = ctx->getSceneManager();
           const MaterialData* overrideMaterial = nullptr;
-          // A 3D-skybox draw is described as a Main-camera object (Sky category cleared, transforms reprojected). Its
-          // sky-space transforms are kept for the per-frame reprojection. While the backend renders its own sky, the
-          // game's sky draws are dropped (prepareDraw).
-          const bool skybox = state.cameraType == translator::CameraClass::Sky && frontend::RasterService { *ctx }.rendersGameSky() &&
-                              !skyDrawRasterizes(state);
+          // R8b (rtx.d3d9v2.skybox3d): a 3D-skybox draw is described as the Main-camera object tryHandleSky would submit
+          // (Sky category cleared, transforms reprojected); its sky-space transforms are kept for the per-frame reprojection.
+          // (NUMOS draws no game sky: tryHandleSky skips these draws, and so does this.)
+          const bool skybox = skybox3dActive() && state.cameraType == CameraType::Sky &&
+                              RtxOptions::skyMode() != SkyMode::Numos && !ctx->skyDrawRasterizes(state);
           DrawCallTransforms skyTransforms;
           if (skybox) {
-            if (!prepareSkyboxDraw(ctx, state)) {
+            if (!ctx->prepareSkyboxGeometry(state)) {
               reject(handle, "not submitted");
               return;
             }
             skyTransforms = state.getTransformData();
-            state.cameraType = translator::CameraClass::Main;
+            state.cameraType = CameraType::Main;
             state.modifyCategoryFlags().clr(InstanceCategories::Sky);
-            if (!reprojectSky(scene.camera(frontend::CameraView::Main), scene.frameIndex(), state.modifyTransformData(), true)) {
+            if (!ctx->reprojectSkyToMain(state.modifyTransformData(), true)) {
               // Nothing is ray traced before the first main camera, so the draw is only tried again.
               totals.skyboxRetries++;
-              channel->push(handle, translator::Channel::Kind::Retry);
+              channel->push(handle, Channel::Kind::Retry);
               return;
             }
-          } else if (!prepareDraw(ctx, params, state, overrideMaterial, skinningCamera(state))) {
+          } else if (!ctx->prepareGeometryForRT(params, state, overrideMaterial, skinningCamera(state))) {
             reject(handle, "not submitted");
             return;
           }
           // As around submitDrawState's dynamic update: every option the translation and the build read is tagged, so
-          // changing it re-prepares the scene's objects (flush, translator::Channel::reprepare).
+          // changing it re-prepares the scene's objects (flush, Channel::reprepare).
           RTX_OPTION_INVALIDATION_SCOPE(RtxOptionFlags::InvalidatesDrawcallTranslation);
-          // The backend resolves the render material (SceneInterface::resolveMaterial), and the translator adds the alpha
-          // and legacy surface descriptions. A baked terrain draw's material is the baker's (overrideMaterial), which the
-          // translator does not describe.
-          const bool bakedTerrain = overrideMaterial != nullptr && state.getCategoryFlags().test(InstanceCategories::Terrain);
+          // Phase 4 M3b: rtx.d3d9v2.materialTranslator. The render material is the same resolveDrawMaterial result
+          // either way; the translator adds the alpha / legacy descriptions.
+          // R8b: a baked terrain draw's material is the baker's (overrideMaterial); the translator does not describe it.
+          const bool bakedTerrain = overrideMaterial != nullptr && terrainActive() &&
+                                    state.getCategoryFlags().test(InstanceCategories::Terrain);
+          const bool useTranslator = D3D9V2Options::materialTranslator() && !bakedTerrain;
           std::optional<translator::MaterialTranslation> translation;
-          if (!bakedTerrain) {
-            translation.emplace(translator::MaterialTranslator::translate(scene.resolveMaterial(state.getMaterialData()),
-                                                                          fixedFunctionState(state)));
+          if (useTranslator) {
+            translation.emplace(translator::MaterialTranslator::translate(sm, state, fixedFunctionState(state)));
             if (RtxOptions::CoreMaterial::selfCheck()) {
               checkParity(*translation, state);
             }
           }
-          MaterialData material = bakedTerrain ? *overrideMaterial : translation->material;
-          // The asset resolver's mesh replacement for the draw. The scene expands it, so the frontend only reads what
-          // it has to send: the original geometry or not, and which keys count as used.
-          frontend::AssetKeys keys;
-          keys.mesh = state.getHash(RtxOptions::geometryAssetHashRule());
-          if ((RtxOptions::geometryHashGenerationRule() & rules::LegacyAssetHash0) == rules::LegacyAssetHash0) {
-            keys.legacyMesh[0] = state.getHashLegacy(rules::LegacyAssetHash0);
+          MaterialData material = bakedTerrain ? *overrideMaterial
+                                : translation.has_value() ? translation->material : sm.resolveDrawMaterial(state);
+          // V4: the replacement submitDrawState draws for this draw (none looked up while the option is off).
+          const bool replacementsAllowed = D3D9V2Options::directReplacements();
+          uint32_t matchedRule = 0;
+          const std::shared_ptr<const ReplacementBucket> bucket =
+            replacementsAllowed ? sm.findMeshReplacements(state, &matchedRule) : nullptr;
+          const char* reason = eligibility(sm, state, overrideMaterial, material, replacementsAllowed, update || dynamicGeometryActive());
+          Expansion expansion;
+          if (reason == nullptr && bucket != nullptr) {
+            reason = expandReplacement(state, *bucket, material, expansion);
           }
-          if ((RtxOptions::geometryHashGenerationRule() & rules::LegacyAssetHash1) == rules::LegacyAssetHash1) {
-            keys.legacyMesh[1] = state.getHashLegacy(rules::LegacyAssetHash1);
+          // The old path runs as for any draw (the object is still on it until the scene has built its copy); the
+          // processed state is kept first, since the submit may move it. A replaced object's replacement instance is
+          // marked handed to the scene (collected once the old path stops drawing it, lights included).
+          DrawCallState kept;
+          if (reason == nullptr) {
+            kept = state;
           }
-          const frontend::ReplacementQuery replacement = scene.findReplacement(keys);
-          const char* reason = eligibility(state, overrideMaterial);
-          if (reason != nullptr) {
-            rejectHandover(scene, handle, reason);
-            return;
+          if (firstDraw) {
+            if (reason != nullptr) {
+              rejectFirstDraw(ctx, state, overrideMaterial, handle, reason);
+              return;
+            }
+          } else {
+            sm.setSubmittingHandedOver(reason == nullptr && bucket != nullptr);
+            ctx->submitPreparedGeometry(state, overrideMaterial);
+            sm.setSubmittingHandedOver(false);
+            if (reason != nullptr) {
+              reject(handle, reason);
+              return;
+            }
           }
-          DrawCallState kept = std::move(state);
 
           // An update that would describe the object as the scene already has it counts as seen, without the snapshot and
           // the rebuild. Captured, 3D-skybox and baked-terrain draws are always described again, since their positions or
           // transforms come from more than the geometry hash and the draw's own transforms show.
-          const XXH64_hash_t described = descriptionKey(kept, material, replacement.version);
+          const XXH64_hash_t described = descriptionKey(kept, material, bucket.get());
           if (update && !kept.vertexCaptured && !skybox && !bakedTerrain) {
             const auto previous = objects.find(handle);
             const Matrix4& objectToWorld = kept.getTransformData().objectToWorld;
-            if (previous != objects.end() && !previous->second.releasing &&
+            if (previous != objects.end() && !previous->second.pending && !previous->second.releasing &&
                 previous->second.described == described && previous->second.reprepareEpoch == reprepareEpoch &&
                 std::memcmp(&previous->second.objectToWorld, &objectToWorld, sizeof(Matrix4)) == 0) {
-              previous->second.frameLastSeen = scene.frameIndex();
+              previous->second.frameLastSeen = sm.device()->getCurrentFrameId();
               totals.unchangedUpdates++;
               return;
             }
           }
 
-          // The draw's own geometry: the whole object, or the original a replacement keeps (includeOriginal).
+          // The draw's own geometry: the whole object (V2), or the original kept by a replacement (V4 includeOriginal).
           RasterGeometry geometry = kept.getGeometryData();
           const AxisAlignedBoundingBox originalBounds = geometry.boundingBox;
           const XXH64_hash_t originalFullHash = geometry.getHashForRule<rules::FullGeometryHash>();
@@ -921,161 +1458,207 @@ namespace dxvk {
           // the same across updates: the scene then refits it with motion history when the indices match and rebuilds it
           // in place when they do not. The vertex layout is part of it, so a layout change builds new geometry.
           const bool deforming = kept.getSkinningState().numBones > 0 || kept.dynamicSource || kept.vertexCaptured || update;
-          const XXH64_hash_t layoutHash = layoutKey(geometry);
-          const bool needOriginal = !replacement.found || replacement.keepsOriginal;
+          XXH64_hash_t layoutHash = geometry.hashes[HashComponents::VertexLayout];
+          const uint32_t layout[4] = { uint32_t(geometry.topology), uint32_t(geometry.indexBuffer.indexType()),
+                                       uint32_t(geometry.positionBuffer.stride()), uint32_t(geometry.positionBuffer.vertexFormat()) };
+          layoutHash = XXH3_64bits_withSeed(layout, sizeof(layout), layoutHash);
+          const bool needOriginal = bucket == nullptr || !expansion.originalSlots.empty();
           if (needOriginal) {
-            // The draw's buffers are D3D9-owned or staging memory that is reused after the frame, so the scene gets
-            // copies. A vertex-capture buffer is adopted instead: it is a new buffer per draw
-            // (D3D9Rtx::allocVertexCaptureBuffer), written once by the raster draw recorded before this commit. The
-            // hashes and bounds were finalized by prepareDraw.
-            if (!scene.createMesh(geometry, captureBufferOf(kept))) {
-              rejectHandover(scene, handle, "snapshot");
+            if (!snapshotGeometry(ctx, sm.device(), geometry, captureBufferOf(kept))) {
+              if (firstDraw) {
+                rejectFirstDraw(ctx, state, overrideMaterial, handle, "snapshot");
+              } else {
+                reject(handle, "snapshot");
+              }
               return;
             }
+            // Hashes and bounds were finalized by prepareGeometryForRT; the snapshot carries them as values.
+            geometry.futureGeometryHashes = Future<GeometryHashes>();
+            geometry.futureBoundingBox = Future<AxisAlignedBoundingBox>();
+            geometry.hashesPrecomputed = true;
+            geometry.externalMaterial = nullptr;
+            geometry.externalMesh = nullptr;
           }
 
-          const uint32_t frame = scene.frameIndex();
+          const uint32_t frame = sm.device()->getCurrentFrameId();
           Object object;
-          object.assetHash = keys.mesh;
-          // The legacy hashes a per-frame draw reports: all with the rule on, but for a replaced draw only those looked
-          // at before the replacement was found.
-          if (keys.legacyMesh[0].has_value() && (!replacement.found || replacement.matchedKey >= 1)) {
-            object.legacyHash0 = *keys.legacyMesh[0];
+          object.assetHash = kept.getHash(RtxOptions::geometryAssetHashRule());
+          // The legacy hashes submitDrawState tracks: all with the rule on, but for a replaced draw only those it
+          // looked at before the replacement was found.
+          if ((RtxOptions::geometryHashGenerationRule() & rules::LegacyAssetHash0) == rules::LegacyAssetHash0 &&
+              (bucket == nullptr || matchedRule >= 1)) {
+            object.legacyHash0 = kept.getHashLegacy(rules::LegacyAssetHash0);
           }
-          if (keys.legacyMesh[1].has_value() && (!replacement.found || replacement.matchedKey >= 2)) {
-            object.legacyHash1 = *keys.legacyMesh[1];
+          if ((RtxOptions::geometryHashGenerationRule() & rules::LegacyAssetHash1) == rules::LegacyAssetHash1 &&
+              (bucket == nullptr || matchedRule >= 2)) {
+            object.legacyHash1 = kept.getHashLegacy(rules::LegacyAssetHash1);
           }
           object.bounds = originalBounds;
           object.objectToWorld = kept.getTransformData().objectToWorld;
-          const uint64_t pairParts[3] = { layoutHash, (uint64_t(geometry.indexCount) << 32) | geometry.vertexCount,
-                                          kept.getMaterialData().getColorTexture().getImageHash() };
-          object.pairKey = XXH3_64bits(pairParts, sizeof(pairParts));
           object.categories = kept.getCategoryFlags().raw();
           object.frameCreated = frame;
           object.frameLastSeen = frame;
           object.described = described;
           object.reprepareEpoch = reprepareEpoch;
-          if (kept.getFogState().mode != frontend::FogMode::None) {
+          if (kept.getFogState().mode != D3DFOG_NONE) {
             object.fogHash = kept.getFogState().getHash();
           }
 
-          frontend::SceneInstanceDesc desc = describe(kept);
-          XXH64_hash_t meshKey;
-          if (!replacement.found) {
-            meshKey = deforming ? layoutHash : originalFullHash;
-          } else {
-            // Objects replaced by the same replacement share the prims' geometry. The key includes the original geometry
-            // when the replacement keeps it.
-            const XXH64_hash_t lookupHash = replacement.matchedKey == 0 ? keys.mesh : *keys.legacyMesh[replacement.matchedKey - 1];
-            constexpr uint64_t kReplacedSeed = 0x56344d6573685265ull;
-            meshKey = XXH3_64bits_withSeed(&lookupHash, sizeof(lookupHash), kReplacedSeed);
-            if (replacement.keepsOriginal) {
-              meshKey = XXH3_64bits_withSeed(&originalFullHash, sizeof(originalFullHash), meshKey);
+          ExternalDrawState desc;
+          if (bucket == nullptr) {
+            const uint64_t meshKey = kMeshNamespace | ((deforming ? layoutHash : originalFullHash) & (kMeshNamespace - 1));
+            desc.mesh = reinterpret_cast<remixapi_MeshHandle>(static_cast<uintptr_t>(meshKey));
+            desc.inlineSubmeshes = std::make_shared<const std::vector<RasterGeometry>>(1, std::move(geometry));
+            if (translation.has_value()) {
+              desc.alphaState = translation->alphaState;
+              desc.legacySurface = translation->legacySurface;
             }
+          } else {
+            // V4: one submesh per replacement mesh prim. Objects replaced by the same bucket share the prims' geometry
+            // (the key includes the original geometry when the replacement keeps it).
+            for (const size_t slot : expansion.originalSlots) {
+              expansion.submeshes[slot] = geometry;
+            }
+            const XXH64_hash_t lookupHash = matchedRule == 0 ? object.assetHash
+                                          : kept.getHashLegacy(matchedRule == 1 ? rules::LegacyAssetHash0 : rules::LegacyAssetHash1);
+            constexpr uint64_t kV4Seed = 0x56344d6573685265ull;  // "V4MeshRe"
+            XXH64_hash_t key = XXH3_64bits_withSeed(&lookupHash, sizeof(lookupHash), kV4Seed);
+            if (!expansion.originalSlots.empty()) {
+              key = XXH3_64bits_withSeed(&originalFullHash, sizeof(originalFullHash), key);
+            }
+            desc.mesh = reinterpret_cast<remixapi_MeshHandle>(static_cast<uintptr_t>(kMeshNamespace | (key & (kMeshNamespace - 1))));
+            desc.inlineSubmeshes = std::make_shared<const std::vector<RasterGeometry>>(std::move(expansion.submeshes));
+            desc.inlineSubmeshParts = std::make_shared<const std::vector<ExternalDrawState::SubmeshPart>>(std::move(expansion.parts));
+
+            // Anti-culling bounds as the replacement instance computes them (meshes and lights, object space).
+            ReplacementInstance::LookupKey scratchKey {};
+            ReplacementInstance scratch(scratchKey, 0, frame);
+            scratch.activeReplacements = bucket;
+            scratch.recalculateBoundingBox(object.objectToWorld, &originalBounds);
+            scratch.activeReplacements.reset();
+            object.bounds = scratch.geometryBoundingBox;
+            object.lightBounds = scratch.lightBoundingBox;
+            object.replaced = true;
+            object.lightTemplates = std::move(expansion.lights);
+            object.primSlots = std::move(expansion.primSlots);
+            object.graphTemplates = std::move(expansion.graphs);
           }
-          desc.mesh = kMeshNamespace | (meshKey & (kMeshNamespace - 1));
-          desc.inlineSubmeshes = std::make_shared<const std::vector<RasterGeometry>>(1, std::move(geometry));
-          if (translation.has_value()) {
-            desc.surface = surfaceDescs(*translation);
-          }
-          // The scene expands the resolver's replacement for these keys into submeshes and parts.
-          desc.assetKeys = keys;
           desc.resolvedMaterial = std::make_shared<const MaterialData>(std::move(material));
-          // Geometry that changes between descriptions (skinned, dynamic / user-pointer data, or an object updated in
+          desc.frontendResolved = true;
+          desc.cameraType = kept.cameraType;
+          desc.categories = kept.getCategoryFlags();
+          // R5: geometry that changes between descriptions (skinned, dynamic / user-pointer data, or an object updated in
           // place) is owned by the entry.
           object.skinned = kept.getSkinningState().numBones > 0;
-          object.nonMainCamera = kept.cameraType != translator::CameraClass::Main;
-          object.skybox3d = skybox;
+          object.nonMainCamera = kept.cameraType != CameraType::Main;  // R8
+          object.captured = kept.vertexCaptured;
+          object.skybox3d = skybox;  // R8b
           object.terrain = bakedTerrain;
           object.skyTransforms = skyTransforms;
           desc.deforming = deforming;
-          // The instance's object-picking value stays the same in every frame, and the scene registers it every frame,
-          // so it is never a stale draw ID.
-          desc.objectPickingValue = pickingValue(handle);
+          desc.drawCall = std::move(kept);
+          // The instance's object-picking value (InstanceManager::updateInstance reads drawCallID) stays the same in every
+          // frame, and RetainedScene::trackPickingMeta registers it every frame, so it is never a stale draw ID.
+          desc.drawCall.drawCallID = pickingValue(handle);
+          // The stored draw state points at owned geometry too (the snapshot, or V4's first submesh), not at the D3D9 /
+          // staging buffers it was made from.
+          desc.drawCall.overrideGeometryData(std::shared_ptr<const RasterGeometry>(desc.inlineSubmeshes, &desc.inlineSubmeshes->front()));
           if (object.fogHash != 0 && fogDraws.find(object.fogHash) == fogDraws.end() && makeRoomForFogDraw()) {
-            fogDraws.emplace(object.fogHash, materialSource(kept));
+            fogDraws.emplace(object.fogHash, desc.drawCall);
           }
-          // Built now: the scene owns the object from this draw on. The scene's record points at the description's
-          // geometry, not at the D3D9 or staging buffers the draw was made from.
-          frontend::PreparedInstance prepared = frontend::prepareInstance(std::move(desc));
-          scene.buildInstance(handle, std::move(prepared));
-          const frontend::InstanceFeedback result = buildResult(scene, handle);
-          if (result.kind == frontend::InstanceFeedback::Kind::Accepted) {
-            if (result.replaced) {
-              // Anti-culling bounds as the replacement instance computes them (meshes and lights, object space).
-              object.replaced = true;
-              object.bounds = result.bounds;
-              object.lightBounds = result.lightBounds;
-              object.lights = result.lights;
-            }
+          if (!firstDraw) {
+            sm.retainedScene().describe(handle, std::move(desc));
+            objects[handle] = std::move(object);
+            return;
+          }
+          // R4: built now; the scene owns the object from this draw on (no Accepted message, no pending state).
+          RetainedScene& scene = sm.retainedScene();
+          if (scene.describeAndBuild(ctx, handle, std::move(desc)) == RetainedScene::EntryState::Direct) {
+            object.pending = false;
             const auto previous = objects.find(handle);
             if (previous != objects.end()) {
-              // An update: same object, and its age carries over. The scene carries the replacement's lights over.
+              // R5 update: same object; its age and (when the light set kept its size) its lights carry over.
               object.frameCreated = previous->second.frameCreated;
               // An update that moves the object counts as a move, so it is not anti-culled mid-motion.
               object.frameMoved = sameMatrix(previous->second.objectToWorld, object.objectToWorld)
                 ? previous->second.frameMoved
                 : frame;
+              if (object.replaced && previous->second.lights.size() == object.lightTemplates.size()) {
+                object.lights = std::move(previous->second.lights);
+                object.lightsCreated = true;
+                moveLights(sm.getLightManager(), object);
+              } else {
+                destroyLights(previous->second);
+              }
+              // The graphs keep their state through an update of the same replacement. Their owners point at the
+              // carried lights and resolve the rebuilt submeshes through the scene.
+              if (object.lightsCreated && previous->second.graphTemplates == object.graphTemplates &&
+                  previous->second.primSlots == object.primSlots) {
+                object.graphs = std::move(previous->second.graphs);
+              } else {
+                destroyGraphs(sm, previous->second);
+              }
               totals.updated++;
             } else {
               totals.accepted++;
               totals.replacedAccepted += object.replaced ? 1 : 0;
-              createdThisFrame.push_back(handle);
+              if (D3D9V2Options::log()) {
+                frameBuilt.push_back(handle);
+              }
             }
-            totals.lightsCreated += result.lightsCreated;
+            if (object.replaced && !object.lightsCreated) {
+              // No old replacement instance exists (the old path never drew it), so the scene's lights start now.
+              createLights(sm.getLightManager(), object);
+              totals.lightsCreated += object.lights.size();
+            }
+            ensureGraphs(sm, ctx, handle, object);
             objects[handle] = std::move(object);
             return;
           }
-          // A description the scene took onto another lane is destroyed here. One it did not describe at all leaves an
-          // existing entry as it was, which rejectHandover erases.
-          const bool tookDescription = !result.resolverRejected && !result.inputRejected;
-          if (tookDescription) {
-            objects.erase(handle);
-            scene.destroyInstance(handle);
-          }
-          rejectHandover(scene, handle, !tookDescription && result.reason != nullptr ? result.reason : "scene");
+          scene.destroy(handle);
+          rejectFirstDraw(ctx, state, overrideMaterial, handle, "scene");
         }
 
-        // A terrain object's per-frame draw (RasterOnly): the bake into the cascades, then the baked texture transform
+        // An old-path draw of a pending object (handle != 0). A replaced object's replacement instance is marked handed
+        // to the scene, so it goes in the first frame the app thread skips the draw.
+        // R8b: a 3D-skybox object's per-frame draw (RasterOnly): its sky-camera transforms for this frame's reprojection.
+        // R8b: a terrain object's per-frame draw (RasterOnly): the bake into the cascades, then the baked texture transform
         // and, after a cascade change, the baker's material for the scene's copy.
         bool terrainDraw(RtxContext* ctx, const DrawParameters& params, DrawCallState& state, uint64_t handle) {
           const auto found = objects.find(handle);
           if (found == objects.end() || !found->second.terrain) {
             return false;
           }
-          const TerrainReplay baked = finalizeForReplay(ctx, state) ? replayTerrain(*ctx, params, state) : TerrainReplay {};
-          totals.terrainChannelPasses += baked.channelPasses;
-          if (baked.material == nullptr) {
+          SceneManager& sm = ctx->getSceneManager();
+          const MaterialData* bakerMaterial = ctx->bakeTerrainDraw(params, state);
+          if (bakerMaterial == nullptr) {
             totals.terrainMisses++;  // baking off or failed this frame: the scene keeps its last texture transform
             return true;
           }
-          frontend::SceneInterface scene { *ctx };
+          RetainedScene& scene = sm.retainedScene();
           const DrawCallTransforms& transforms = state.getTransformData();
-          scene.setTextureTransform(handle, transforms.textureTransform, frontend::TexGen(transforms.texgenMode));
-          if (baked.cascadesChanged) {
-            scene.setResolvedMaterial(handle, *baked.material);
+          scene.setTextureTransform(handle, transforms.textureTransform, transforms.texgenMode);
+          if (sm.getTerrainBaker().cascadeCompositionChangedThisFrame()) {
+            scene.setResolvedMaterial(handle, std::make_shared<const MaterialData>(*bakerMaterial));
             totals.terrainRematerials++;
           }
           totals.terrainBakes++;
           return true;
         }
 
-        // A baked terrain object the scene rejected: the app thread replays its draw as a raster service until it hears
-        // of the rejection (1-2 frames). Its draw is dropped, but it is still baked, so the cascades the other terrain
-        // objects sample stay complete.
+        // R4: a baked terrain object the scene rejected keeps no fallback (its baker material is made per frame), but the
+        // app thread replays its draw as a raster service until it hears of the rejection. The old path draws those
+        // draws, bake included, so the terrain is not missing for a frame or two.
         bool rejectedTerrainDraw(RtxContext* ctx, const DrawParameters& params, DrawCallState& state, uint64_t handle) {
           if (objects.find(handle) != objects.end() || !state.testCategoryFlags(InstanceCategories::Terrain) ||
-              !frontend::terrainBakeActive()) {
+              !TerrainBaker::needsTerrainBaking()) {
             return false;
           }
-          if (finalizeForReplay(ctx, state)) {
-            totals.terrainChannelPasses += replayTerrain(*ctx, params, state).channelPasses;
-          }
-          totals.rejectedBakes++;
+          commitOldPath(ctx, params, state);
+          totals.terrainFallbacks++;
           return true;
         }
 
-        // A 3D-skybox object's per-frame draw (RasterOnly): its sky-camera transforms for this frame's reprojection.
         bool skyboxDraw(uint64_t handle, const DrawCallState& state) {
           const auto found = objects.find(handle);
           if (found == objects.end() || !found->second.skybox3d) {
@@ -1085,163 +1668,155 @@ namespace dxvk {
           return true;
         }
 
-        // Per-draw draws: their geometry copies by content, which keep a draw's geometry the same object from frame to
-        // frame, and whether one was drawn since the last flush.
-        struct PerDrawMesh {
-          std::shared_ptr<const std::vector<RasterGeometry>> submeshes;
-          uint32_t frameLastUsed = 0;
-        };
-        struct PerDraws {
-          std::unordered_map<XXH64_hash_t, PerDrawMesh> meshes;
-          bool drawn = false;
-          bool lastFlush = false;  // the last flush with a frame batch had per-draw draws
-        } perDraws;
-
-        // A host-marked draw (CommitMode::PerDraw), described on the transient lane for this frame only. Its camera type
-        // comes from the translator's camera rules, applied to its own matrices, so a different field of view makes it a
-        // view-model draw. It does not replace a camera that other draws set up earlier in the frame. No scene-owned
-        // object is described, moved or built again for it.
-        void perDraw(RtxContext* ctx, DrawCallState& state) {
-          frontend::SceneInterface scene { *ctx };
-          if (!state.getGeometryData().positionBuffer.defined()) {
-            totals.perDrawDrops++;
-            return;
-          }
-          applyFusedWorldView(state);
-          const Matrix4 worldToView = state.getTransformData().worldToView;
-
-          // Fixed-function skinning decomposes the bone matrices with the last camera set up, whose view can differ from
-          // the draw's own. The world matrix is then moved into the draw's own view.
-          if (!finalizeDraw(*ctx, state)) {
-            totals.perDrawDrops++;
-            return;
-          }
-          DrawCallTransforms& transforms = state.modifyTransformData();
-          if (!sameMatrix(transforms.worldToView, worldToView)) {
-            transforms.objectToWorld = inverseAffine(worldToView) * transforms.worldToView * transforms.objectToWorld;
-            transforms.worldToView = worldToView;
-          }
-          state.cameraType = classifyDrawCamera(*ctx, state);
-          if (state.cameraType == translator::CameraClass::Unknown) {
-            if (RtxOptions::skipObjectsWithUnknownCamera()) {
-              totals.perDrawDrops++;
-              return;
-            }
-            state.cameraType = translator::CameraClass::Main;
-          }
-          totals.perDrawViewModel += state.cameraType == translator::CameraClass::ViewModel ? 1 : 0;
-          scene.reportAssetUse(frontend::AssetUse::Mesh, state.getHash(RtxOptions::geometryAssetHashRule()));
-
-          translator::MaterialTranslation translation =
-            translator::MaterialTranslator::translate(scene.resolveMaterial(state.getMaterialData()), fixedFunctionState(state));
-          if (RtxOptions::CoreMaterial::selfCheck()) {
-            checkParity(translation, state);
-          }
-
-          // Geometry whose data changes from frame to frame is owned by the transient entry and updated in place, so
-          // its key is the vertex layout. Other geometry is copied once per content and shared by its draws.
-          RasterGeometry geometry = state.getGeometryData();
-          const bool deforming = state.getSkinningState().numBones > 0 || state.dynamicSource || state.vertexCaptured;
-          const XXH64_hash_t fullHash = geometry.getHashForRule<rules::FullGeometryHash>();
-          const XXH64_hash_t layoutHash = layoutKey(geometry);
-          const XXH64_hash_t contentKey = XXH3_64bits_withSeed(&fullHash, sizeof(fullHash), layoutHash);
-          const uint32_t frame = scene.frameIndex();
-          std::shared_ptr<const std::vector<RasterGeometry>> submeshes;
-          const auto cached = state.vertexCaptured ? perDraws.meshes.end() : perDraws.meshes.find(contentKey);
-          if (cached != perDraws.meshes.end()) {
-            cached->second.frameLastUsed = frame;
-            submeshes = cached->second.submeshes;
-          } else {
-            // A vertex-captured draw's positions are a new buffer per draw, written once, so it is adopted. Its content
-            // is not in its hash, so it is never shared.
-            if (!scene.createMesh(geometry, captureBufferOf(state))) {
-              totals.perDrawDrops++;
-              return;
-            }
-            submeshes = std::make_shared<const std::vector<RasterGeometry>>(1, std::move(geometry));
-            if (!state.vertexCaptured) {
-              perDraws.meshes[contentKey] = PerDrawMesh { submeshes, frame };
-            }
-          }
-
-          const XXH64_hash_t meshKey = deforming ? layoutHash : fullHash;
-          frontend::SceneInstanceDesc desc = describe(state);
-          desc.mesh = kPerDrawMeshNamespace | (meshKey & (kPerDrawMeshNamespace - 1));
-          desc.inlineSubmeshes = std::move(submeshes);
-          desc.surface = surfaceDescs(translation);
-          desc.resolvedMaterial = std::make_shared<const MaterialData>(std::move(translation.material));
-          desc.deforming = deforming;
-          // The same value every frame, so the transient lane keeps an unchanged draw's instance.
-          desc.objectPickingValue = pickingValue(desc.mesh);
-          frontend::PreparedInstance prepared = frontend::prepareInstance(std::move(desc));
-          scene.drawInstance(std::move(prepared));
-          totals.perDraws++;
-          perDraws.drawn = true;
+        void oldPathDraw(RtxContext* ctx, const DrawParameters& params, DrawCallState& state, uint64_t handle) {
+          const auto found = objects.find(handle);
+          const bool handedOver = found != objects.end() && found->second.replaced && !found->second.releasing;
+          SceneManager& sm = ctx->getSceneManager();
+          sm.setSubmittingHandedOver(handedOver);
+          commitOldPath(ctx, params, state);
+          sm.setSubmittingHandedOver(false);
         }
 
-        void flush(RtxContext* ctx, const translator::FrameBatch& batch) {
-          frontend::SceneInterface sceneInterface { *ctx };
-          const uint32_t frame = sceneInterface.frameIndex();
+        // The old path for one draw; with rtx.d3d9v2.explicitCamera the frontend's camera type is checked against it.
+        void commitOldPath(RtxContext* ctx, const DrawParameters& params, DrawCallState& state) {
+          if (!explicitCameraActive()) {
+            ctx->commitGeometryToRT(params, state);
+            return;
+          }
+          const CameraType::Enum expected = state.cameraType;
+          ctx->commitGeometryToRT(params, state);
+          checkCamera(expected, state);
+        }
 
-          // Per-draw geometry copies no draw used in the last two frames go.
-          for (auto it = perDraws.meshes.begin(); it != perDraws.meshes.end();) {
-            it = it->second.frameLastUsed + 2 < frame ? perDraws.meshes.erase(it) : std::next(it);
+        void releaseEverything(SceneManager& sm) {
+          if (objects.empty()) {
+            return;
           }
-          perDraws.lastFlush = perDraws.drawn;
-          perDraws.drawn = false;
-          if (perDraws.lastFlush) {
-            totals.perDrawFrames++;
+          for (auto& [handle, object] : objects) {
+            destroyGraphs(sm, object);
+            destroyLights(object);
+            sm.retainedScene().destroy(handle);
+            channel->push(handle, Channel::Kind::Released);
+            totals.released++;
+            totals.releasedBy[uint32_t(ReleaseReason::Reset)]++;
           }
-          if (D3D9V2Options::log()) {
-            const float mainFov = verticalFovDegrees(sceneInterface.camera(frontend::CameraView::Main).viewToProjection);
-            (perDraws.lastFlush ? totals.fovMainWith : totals.fovMainWithout) = mainFov;
-            const frontend::CameraQuery viewModel = sceneInterface.camera(frontend::CameraView::ViewModel);
-            if (perDraws.lastFlush && viewModel.valid) {
-              totals.fovViewModelWith = verticalFovDegrees(viewModel.viewToProjection);
-            }
-            logKeptCameraCut(*ctx);
-          }
+          objects.clear();
+          fogDraws.clear();
+          fallbacks.clear();
+          totals.resets++;
+          totals.resetsBy[uint32_t(ResetReason::Off)]++;
+        }
 
-          // Events that end the scene's copies: a scene clear or mods changed.
-          const uint32_t events = sceneInterface.takeSceneEvents();
-          const bool clearChanged = (events & frontend::kSceneEventCleared) != 0;
-          const bool modsChanged = (events & frontend::kSceneEventModsChanged) != 0;
+        void flush(RtxContext* ctx, const FrameBatch& batch) {
+          SceneManager& sm = ctx->getSceneManager();
+          // D3D9-only games have no DrawRetainedInstances to switch the direct lane on (rtx.scene.directRetained).
+          if (!sm.retainedV2Active()) {
+            sm.selectSceneImplementation(scene::Options::directRetained());
+          }
+          RetainedScene& scene = sm.retainedScene();
+          LightManager& lightManager = sm.getLightManager();
+          const uint32_t frame = sm.device()->getCurrentFrameId();
+
+          // Events that end the scene's copies: a scene clear, mods changed, the direct lane or rtx.d3d9v2.direct
+          // switched off.
+          const uint64_t clears = sm.clearEpoch();
+          const uint64_t assets = sm.getAssetReplacer()->getExternalAssetGlobalEpoch();
+          const bool resetNow = batch.releaseAll || !scene.active();
+          const bool clearChanged = clearEpoch != ~0ull && clears != clearEpoch;
+          const bool modsChanged = assetEpoch != ~0ull && assets != assetEpoch;
           const bool resetRequested = clearChanged || modsChanged;
-          if (resetRequested && !objects.empty()) {
-            // Everything is handed over again; the entries stay until the app thread's destroys arrive.
+          clearEpoch = clears;
+          assetEpoch = assets;
+          if (resetNow) {
+            // The app thread dropped its handles already (switched off), or the scene lost its entries.
+            releaseEverything(sm);
+          } else if (resetRequested && !objects.empty()) {
+            // Everything goes back to the old path; the entries stay until the app thread's destroys arrive.
             for (auto& [handle, object] : objects) {
               requestRelease(handle, object, ReleaseReason::Reset);
             }
             totals.resets++;
             // The first event that applies ([D3D9v2] direct "resets (...)", for the churn hunt).
             totals.resetsBy[uint32_t(clearChanged ? ResetReason::Clear : ResetReason::Mods)]++;
-          } else if ((events & frontend::kSceneEventTranslationInvalid) != 0 && !objects.empty()) {
-            // Every draw is translated once more: the scene's objects are prepared and described again in place at their
-            // next draw.
-            ++reprepareEpoch;
-            channel->requestReprepare();
-            totals.reprepares++;
-          }
-
-          for (const uint64_t handle : batch.destroys) {
-            eraseObject(sceneInterface, handle);
-          }
-          for (const translator::FrameBatch::Move& move : batch.moves) {
-            const auto found = objects.find(move.handle);
-            if (found != objects.end() && found->second.skybox3d) {
-              found->second.skyTransforms.objectToWorld = move.objectToWorld;  // Sky space, reprojected below
-              found->second.frameMoved = frame;
-            } else if (found != objects.end()) {
-              // The lights of a mesh replacement follow the object.
-              sceneInterface.setTransform(move.handle, move.objectToWorld);
-              found->second.objectToWorld = move.objectToWorld;
-              found->second.frameMoved = frame;
+          } else {
+            if (RtxOptionManager::isDrawcallTranslationInvalid() && !objects.empty()) {
+              // As the old path translates every draw once more: Direct objects are prepared and described again in
+              // place at their next draw. Pending ones are not built yet, so they go back to the old path.
+              bool anyDirect = false;
+              for (auto& [handle, object] : objects) {
+                if (object.pending) {
+                  requestRelease(handle, object, ReleaseReason::Reset);
+                } else {
+                  anyDirect = true;
+                }
+              }
+              if (anyDirect) {
+                ++reprepareEpoch;
+                channel->requestReprepare();
+                totals.reprepares++;
+              }
+            }
+            if (v4WasOn && !D3D9V2Options::directReplacements()) {
+              // V4 switched off: replaced objects go back to the old path.
+              for (auto& [handle, object] : objects) {
+                if (object.replaced) {
+                  requestRelease(handle, object, ReleaseReason::Reset);
+                }
+              }
             }
           }
-          // Decal order after this frame's builds (a rebuilt entry has taken its creation order meanwhile).
-          for (const translator::FrameBatch::SortOrder& order : batch.sortOrders) {
+          v4WasOn = D3D9V2Options::directReplacements();
+
+          for (const uint64_t handle : batch.destroys) {
+            eraseObject(sm, handle);
+            fallbacks.erase(handle);  // R4: the app thread heard of the rejection
+          }
+          for (const FrameBatch::Move& move : batch.moves) {
+            const auto found = objects.find(move.handle);
+            if (found != objects.end() && found->second.skybox3d) {
+              found->second.skyTransforms.objectToWorld = move.objectToWorld;  // R8b: sky space, reprojected below
+              found->second.frameMoved = frame;
+            } else if (found != objects.end()) {
+              scene.setTransform(move.handle, move.objectToWorld);
+              found->second.objectToWorld = move.objectToWorld;
+              found->second.frameMoved = frame;
+              // V4: the replacement's lights follow the object.
+              if (found->second.lightsCreated) {
+                moveLights(lightManager, found->second);
+              }
+            }
+          }
+          // R7: decal order after this frame's builds (a rebuilt entry has taken its creation order meanwhile).
+          for (const FrameBatch::SortOrder& order : batch.sortOrders) {
             if (objects.find(order.handle) != objects.end()) {
-              sceneInterface.setSortOrder(order.handle, order.order);
+              scene.setSortOrder(order.handle, order.order);
+            }
+          }
+          // Pending objects drawn unchanged (on the old path until the app thread hears they were accepted): kept alive.
+          for (const uint64_t handle : batch.pendingSeen) {
+            const auto found = objects.find(handle);
+            if (found != objects.end()) {
+              found->second.frameLastSeen = frame;
+            }
+          }
+          std::vector<XXH64_hash_t> fogSeen;
+          const auto feedSideEffects = [&](const Object& object) {
+            // What submitDrawState would have done for the draw: mesh-hash tracking and fog discovery.
+            sm.trackMeshHash(object.assetHash);
+            if (object.legacyHash0 != 0) {
+              sm.trackMeshHash(object.legacyHash0);
+            }
+            if (object.legacyHash1 != 0) {
+              sm.trackMeshHash(object.legacyHash1);
+            }
+            if (object.fogHash != 0 && std::find(fogSeen.begin(), fogSeen.end(), object.fogHash) == fogSeen.end()) {
+              fogSeen.push_back(object.fogHash);
+            }
+          };
+          for (const uint64_t handle : batch.pendingSeen) {
+            const auto found = objects.find(handle);
+            if (found != objects.end()) {
+              feedSideEffects(found->second);
             }
           }
           for (const uint64_t handle : batch.seen) {
@@ -1251,90 +1826,115 @@ namespace dxvk {
             }
             Object& object = found->second;
             object.frameLastSeen = frame;
-            if (object.hiddenUnseen) {
-              // Drawn again before the app thread's destroy: shown until then.
-              sceneInterface.setVisible(handle, true);
-              object.hiddenUnseen = false;
+            feedSideEffects(object);
+            // V4: the first frame the old path did not draw the object, its replacement instance is collected
+            // (handedToScene) and the scene's lights take over.
+            if (object.replaced && !object.lightsCreated && !object.pending) {
+              createLights(lightManager, object);
+              totals.lightsCreated += object.lights.size();
             }
-            // The mesh hashes a per-frame draw reports.
-            sceneInterface.reportAssetUse(frontend::AssetUse::Mesh, object.assetHash);
-            if (object.legacyHash0 != 0) {
-              sceneInterface.reportAssetUse(frontend::AssetUse::Mesh, object.legacyHash0);
-            }
-            if (object.legacyHash1 != 0) {
-              sceneInterface.reportAssetUse(frontend::AssetUse::Mesh, object.legacyHash1);
-            }
-            if (object.replaced) {
-              sceneInterface.markDrawn(handle);
-            }
+            ensureGraphs(sm, ctx, handle, object);
           }
-          // An object drawn this frame without its merged pass is the first draw's alone again, as on the per-draw path.
+          // A4: an object drawn this frame without its merged pass is the first draw's alone again, as on the old path.
           for (auto it = mergedPasses.begin(); it != mergedPasses.end();) {
             const auto found = objects.find(*it);
             if (found == objects.end()) {
               it = mergedPasses.erase(it);
             } else if (found->second.frameLastSeen == frame && found->second.frameMergedPass != frame) {
-              sceneInterface.clearMergedPass(*it);
+              scene.setMergedPass(*it, nullptr);
               it = mergedPasses.erase(it);
             } else {
               ++it;
             }
           }
-          // The frame's fog in the app thread's draw order, skipped draws included.
-          frontend::FrameInfo frameInfo;
-          frameInfo.fog.reserve(batch.fogOrder.size());
-          fogStates = uint32_t(batch.fogOrder.size());
-          for (const translator::FogRecord& fog : batch.fogOrder) {
-            frontend::FogDesc& desc = frameInfo.fog.emplace_back(fogDesc(fog));
-            const auto draw = fogDraws.find(fog.hash());
-            if (draw != fogDraws.end()) {
-              desc.draw = draw->second;
+          // R4: rejected first-draw handovers the app thread still skips are drawn by the old path from their kept state;
+          // fallbacks not seen for 2 frames (the app thread draws them itself again) are dropped.
+          if (!fallbacks.empty()) {
+            for (const uint64_t handle : batch.seen) {
+              const auto found = fallbacks.find(handle);
+              if (found == fallbacks.end() || found->second.lastFrame == frame) {
+                continue;
+              }
+              found->second.lastFrame = frame;
+              sm.submitDrawState(Rc<DxvkContext>(ctx), found->second.state, nullptr);
+              totals.fallbackDraws++;
+            }
+            for (auto it = fallbacks.begin(); it != fallbacks.end();) {
+              it = frame - it->second.lastFrame > 2 ? fallbacks.erase(it) : std::next(it);
             }
           }
+          if (batch.frameEvents) {
+            // R10: the frame's fog in the app thread's draw order (old-path and scene-owned draws alike); submitDrawState
+            // no longer discovers it (setFrontendFogDiscovery, from the next frame).
+            for (const FogState& fog : batch.fogOrder) {
+              const auto draw = fogDraws.find(fog.getHash());
+              sm.discoverFog(fog, draw != fogDraws.end() ? &draw->second : nullptr);
+            }
+          } else {
+            for (const XXH64_hash_t fog : fogSeen) {
+              const auto draw = fogDraws.find(fog);
+              if (draw != fogDraws.end()) {
+                sm.discoverFogState(draw->second);
+              }
+            }
+          }
+          sm.setFrontendFogDiscovery(batch.frameEvents);
 
-          // 3D-skybox objects follow the main camera, so they are reprojected every frame.
-          const frontend::CameraQuery mainCamera = sceneInterface.camera(frontend::CameraView::Main);
+          // R8b (rtx.d3d9v2.skybox3d): 3D-skybox objects follow the main camera; reprojected every frame, as tryHandleSky's
+          // delayed submit did.
           for (auto& [handle, object] : objects) {
-            if (!object.skybox3d || object.releasing) {
+            if (!object.skybox3d || object.pending || object.releasing) {
               continue;
             }
             DrawCallTransforms transforms = object.skyTransforms;
-            if (reprojectSky(mainCamera, frame, transforms, false)) {
-              // The lights of a mesh replacement stay where the object was described.
-              sceneInterface.setTransform(handle, transforms.objectToWorld, false);
+            if (ctx->reprojectSkyToMain(transforms, false)) {
+              scene.setTransform(handle, transforms.objectToWorld);
               object.objectToWorld = transforms.objectToWorld;
               totals.skyboxMoves++;
             }
           }
 
           // Builds this frame's descriptions unless a host's DrawRetainedInstances already ran the scene's frame.
-          sceneInterface.endFrame(frameInfo);
+          scene.frontendFrame(ctx);
 
-          // An entry the scene rebuilt later (texture cache, scene clear) and could not take any more is handed back.
-          sceneInterface.takeFeedback(feedbackScratch);
-          feedback.insert(feedback.end(), feedbackScratch.begin(), feedbackScratch.end());
-          for (const frontend::InstanceFeedback& item : feedback) {
-            const auto found = objects.find(item.handle);
-            if (item.kind == frontend::InstanceFeedback::Kind::Released && found != objects.end()) {
-              requestRelease(item.handle, found->second, ReleaseReason::Rebuilt);
+          std::vector<uint64_t> dead;
+          for (auto& [handle, object] : objects) {
+            switch (scene.entryState(handle)) {
+            case RetainedScene::EntryState::Direct:
+              if (object.pending) {
+                object.pending = false;
+                // Aging starts now: the app thread may not have reported this object seen while it was pending.
+                object.frameLastSeen = frame;
+                totals.accepted++;
+                totals.replacedAccepted += object.replaced ? 1 : 0;
+                channel->push(handle, Channel::Kind::Accepted);
+              }
+              break;
+            case RetainedScene::EntryState::Pending:
+              break;
+            default:
+              if (object.pending) {
+                // Never accepted: the app thread still draws it on the old path.
+                dead.push_back(handle);
+                reject(handle, "scene");
+              } else {
+                // Rebuilt later (lane options, texture cache, scene clear) and no longer direct.
+                requestRelease(handle, object, ReleaseReason::Rebuilt);
+              }
+              break;
             }
           }
-          feedback.clear();
 
           // Direct objects the game stopped drawing age out like replacement instances (anti-culling included).
-          translator::LifetimeFrame lifetime = translator::frontendLifetime(
-            sceneInterface.camera(frontend::CameraView::Main), sceneInterface,
-            objects.size() >= RtxOptions::AntiCulling::Object::numObjectsToKeep());
+          // As the old path: anti-culling only when the game sets a view matrix (SceneManager::prepareSceneData).
+          translator::LifetimeFrame lifetime = translator::LifetimeFrame::read(
+            sm.getCamera(), sm.isAntiCullingSupported(), objects.size() >= RtxOptions::AntiCulling::Object::numObjectsToKeep());
           lifetime.currentFrame = frame;
+          lifetime.keptCutFrame = sm.m_lastKeptCutFrame;
+          const bool logObjects = D3D9V2Options::log();
+          std::vector<uint64_t> aged;
           for (auto& [handle, object] : objects) {
-            if (object.frameLastSeen == frame) {
-              continue;
-            }
-            if (object.releasing) {
-              // An aged-out object drawn again while its destroy was on the way is hidden again when it is not drawn.
-              if (object.agedOut) {
-                hideUnseen(sceneInterface, handle, object);
-              }
+            if (object.pending || object.releasing || object.frameLastSeen == frame) {
               continue;
             }
             translator::UnseenObject unseen;
@@ -1342,65 +1942,74 @@ namespace dxvk {
             unseen.frameCreated = object.frameCreated;
             unseen.categories = object.categories;
             unseen.wasMovingWhenLastSeen = object.frameMoved == object.frameLastSeen;
-            unseen.skinned = object.skinned || object.nonMainCamera;  // Both exempt from anti-culling
+            unseen.skinned = object.skinned || object.nonMainCamera;  // R8: both exempt from anti-culling
             unseen.geometryBounds = &object.bounds;
-            // Replacement lights keep the object alive as they keep its replacement instance (light anti-culling).
+            // V4: replacement lights keep the object alive as they keep its replacement instance (light anti-culling).
             unseen.lightBounds = object.replaced ? &object.lightBounds : nullptr;
             unseen.objectToWorld = &object.objectToWorld;
             if (!translator::LifetimePolicy::isStale(unseen, lifetime) || translator::LifetimePolicy::keepUnseen(unseen, lifetime)) {
               continue;
             }
             requestRelease(handle, object, ReleaseReason::Aged);
-            retireStale(sceneInterface, handle, object, frame);
+            if (logObjects) {
+              aged.push_back(handle);
+            }
           }
-          createdThisFrame.clear();
-          const frontend::HistoryStats history = sceneInterface.takeHistoryStats();
-          totals.historyResets += history.resets;
-          totals.historyJumps += history.jumps;
-          totals.refitMotionMax = std::max(totals.refitMotionMax, history.maxMotion);
-          if (RtxOptions::CoreMaterial::selfCheck()) {
+          if (logObjects) {
+            logFrameObjects("built", frameBuilt, frame, builtLogLines);
+            logFrameObjects("aged", aged, frame, agedLogLines);
+            logWorldUIObjects(scene, frame);
+          }
+          frameBuilt.clear();
+          for (const uint64_t handle : dead) {
+            eraseObject(sm, handle);
+          }
+
+          if (D3D9V2Options::materialTranslator() && RtxOptions::CoreMaterial::selfCheck()) {
             logParity(frame);
           }
 
           if (D3D9V2Options::log() && ++logFrames >= kLogIntervalFrames) {
-            uint32_t releasing = 0, replaced = 0, lights = 0;
+            uint32_t pending = 0, releasing = 0, replaced = 0, lights = 0;
             for (const auto& [handle, object] : objects) {
+              pending += object.pending ? 1 : 0;
               releasing += object.releasing ? 1 : 0;
               replaced += object.replaced ? 1 : 0;
-              lights += object.lights;
+              lights += uint32_t(object.lights.size());
             }
-            const frontend::GameLightStats gameLights = sceneInterface.takeGameLightStats();
             std::string reasons;
             for (const auto& [reason, count] : rejectReasons) {
               reasons += str::format(" ", reason, "=", count);
             }
-            // objects / releasing / replaced / lights: now. The rest: totals over the interval. released and resets are
-            // split by cause.
+            // objects / pending / releasing / replaced / lights: now; the rest: totals over the interval. released and
+            // resets are split by cause (the accept / release churn hunt).
             Logger::info(str::format(
-              "[D3D9v2] direct (totals over ", logFrames, " frames) objects=", objects.size(),
+              "[D3D9v2] direct (totals over ", logFrames, " frames) objects=", objects.size(), " pending=", pending,
               " releasing=", releasing, " replaced=", replaced, " lights=", lights,
               " handovers=", totals.handovers, " accepted=", totals.accepted, " (replaced ", totals.replacedAccepted, ")",
               " rejected=", totals.rejected,
-              " skinDeferred=", totals.skinDeferred, " skinDeferredLate=", totals.skinDeferredLate,
               " released=", totals.released, " (aged ", totals.releasedBy[uint32_t(ReleaseReason::Aged)],
               " rebuilt ", totals.releasedBy[uint32_t(ReleaseReason::Rebuilt)],
               " reset ", totals.releasedBy[uint32_t(ReleaseReason::Reset)], ")",
               " resets=", totals.resets, " (clear ", totals.resetsBy[uint32_t(ResetReason::Clear)],
-              " mods ", totals.resetsBy[uint32_t(ResetReason::Mods)], ")", " reprepares=", totals.reprepares,
-              " lightsCreated=", totals.lightsCreated, " updated=", totals.updated,
-              " unchangedUpdates=", totals.unchangedUpdates, " recreations=", totals.recreations,
-              " hiddenUnseen=", totals.hiddenUnseen, " historyResets=", totals.historyResets, " (jumps ", totals.historyJumps, ") refitMotionMax=", totals.refitMotionMax,
-              " mergedPasses=", totals.mergedPasses,
+              " mods ", totals.resetsBy[uint32_t(ResetReason::Mods)],
+              " off ", totals.resetsBy[uint32_t(ResetReason::Off)], ")", " reprepares=", totals.reprepares,
+              " lightsCreated=", totals.lightsCreated, " cameraOnly=", totals.cameraOnly,
+              " fallbackDraws=", totals.fallbackDraws, " (live ", fallbacks.size(), ")", " updated=", totals.updated,
+              " unchangedUpdates=", totals.unchangedUpdates, " mergedPasses=", totals.mergedPasses,
               " rasterMisses=", totals.rasterMisses, " skyboxMoves=", totals.skyboxMoves, " skyboxRetries=", totals.skyboxRetries,
-              " terrain: bakes=", totals.terrainBakes, " misses=", totals.terrainMisses, " rejectedBakes=", totals.rejectedBakes,
-              " rematerials=", totals.terrainRematerials, " channelPasses=", totals.terrainChannelPasses, " fogStates=", fogStates,
-              " | perDraw: draws=", totals.perDraws, " drops=", totals.perDrawDrops, " viewModel=", totals.perDrawViewModel,
-              " frames=", totals.perDrawFrames, " lastFrame=", perDraws.lastFlush ? 1 : 0, " fovMainWith=", totals.fovMainWith,
-              " fovMainWithout=", totals.fovMainWithout, " fovViewModelWith=", totals.fovViewModelWith,
+              " terrain: bakes=", totals.terrainBakes, " misses=", totals.terrainMisses, " fallbacks=", totals.terrainFallbacks,
+              " rematerials=", totals.terrainRematerials,
+              " cameraCheck=", totals.cameraMismatches, "/", totals.cameraChecks, " (first: ", firstCameraMismatch, ")",
               " | rejected:", reasons.empty() ? std::string(" none") : reasons,
-              " | lights: game=", gameLights.game, " replaced=", gameLights.replaced, " entries=", gameLights.entries,
-              " created=", gameLights.created, " collected=", gameLights.collected));
+              " | lights (R9): game=", lightTotals.game, " replaced=", lightTotals.replaced, " entries=", lightTable.size(),
+              " created=", lightTotals.created, " collected=", lightTotals.collected));
             totals = Totals();
+            lightTotals = LightTotals();
+            builtLogLines = 0;
+            agedLogLines = 0;
+            worldUILogLines = 0;
+            firstCameraMismatch = "none";
             rejectReasons.clear();
             logFrames = 0;
           }
@@ -1413,82 +2022,71 @@ namespace dxvk {
 
       void D3D9Frontend::commit(RtxContext* ctx, const DrawParameters& params, DrawCallState& drawCallState,
                                 CommitMode mode, uint64_t handle) {
-        m_impl->keepFogDraw(drawCallState);
-        // Held skinned draws go first once this frame's camera is set up, and a draw of a held object waits for it.
-        m_impl->drainSkinned(ctx, false, handle);
-        if (m_impl->holdSkinned(ctx, params, drawCallState, mode, handle)) {
-          return;
+        if (frameEventsActive()) {
+          m_impl->keepFogDraw(drawCallState);  // R10
         }
         switch (mode) {
-        case CommitMode::HandoverFirstDraw:
+        case CommitMode::Handover:
           m_impl->handover(ctx, params, drawCallState, handle, false);
           return;
-        case CommitMode::Update:
+        case CommitMode::HandoverFirstDraw:
           m_impl->handover(ctx, params, drawCallState, handle, true);
+          return;
+        case CommitMode::Update:
+          m_impl->handover(ctx, params, drawCallState, handle, true, true);
           return;
         case CommitMode::MergePass:
           m_impl->mergePass(ctx, params, drawCallState, handle);
           return;
-        case CommitMode::PerDraw:
-          m_impl->perDraw(ctx, drawCallState);
-          return;
         case CommitMode::RasterOnly:
-          // The scene owns the object, and only its raster services run: a terrain object's bake, else the sky matte
-          // and probe replay, else a 3D-skybox object's transforms.
+          // R8b: the scene owns the object; only the game's raster draw into the sky matte / probe is replayed.
+          // R8b: a terrain object's bake, else the sky matte / probe replay, else a 3D-skybox object's transforms.
           if (!m_impl->terrainDraw(ctx, params, drawCallState, handle) &&
               !m_impl->rejectedTerrainDraw(ctx, params, drawCallState, handle) &&
-              !(drawCallState.cameraType == translator::CameraClass::Sky && m_impl->skyDraw(ctx, params, drawCallState)) &&
+              !(drawCallState.cameraType == CameraType::Sky && ctx->rasterizeSkyDraw(params, drawCallState)) &&
               !m_impl->skyboxDraw(handle, drawCallState)) {
             m_impl->totals.rasterMisses++;
           }
           return;
+        case CommitMode::CameraOnly: {
+          // The scene owns the object; only the camera the old path derives from draws is fed.
+          const MaterialData* overrideMaterial = nullptr;
+          ctx->prepareGeometryForRT(params, drawCallState, overrideMaterial);
+          m_impl->totals.cameraOnly++;
+          return;
+        }
+        default:
+          // The old path (the fallback until D3D9 v2 matches it; deleted in Phase 6). handle: a pending object's draw.
+          if (handle != 0) {
+            m_impl->oldPathDraw(ctx, params, drawCallState, handle);
+            return;
+          }
+          m_impl->commitOldPath(ctx, params, drawCallState);
+          return;
         }
       }
 
-      // The neutral light types take D3DLIGHTTYPE's values, so a D3D9 light type converts unchanged.
-      static_assert(uint32_t(frontend::FixedFunctionLight::Type::Point) == D3DLIGHT_POINT &&
-                    uint32_t(frontend::FixedFunctionLight::Type::Spot) == D3DLIGHT_SPOT &&
-                    uint32_t(frontend::FixedFunctionLight::Type::Directional) == D3DLIGHT_DIRECTIONAL);
-
-      void D3D9Frontend::lights(RtxContext* ctx, const D3DLIGHT9* lights, uint32_t count) {
-        const auto color = [](const D3DCOLORVALUE& c) { return Vector4(c.r, c.g, c.b, c.a); };
-        const auto vector = [](const D3DVECTOR& v) { return Vector3(v.x, v.y, v.z); };
-        std::vector<frontend::FixedFunctionLight>& converted = m_impl->lightScratch;
-        converted.resize(count);
-        for (uint32_t l = 0; l < count; ++l) {
-          const D3DLIGHT9& in = lights[l];
-          frontend::FixedFunctionLight& out = converted[l];
-          out.type = frontend::FixedFunctionLight::Type(in.Type);
-          out.diffuse = color(in.Diffuse);
-          out.specular = color(in.Specular);
-          out.ambient = color(in.Ambient);
-          out.position = vector(in.Position);
-          out.direction = vector(in.Direction);
-          out.range = in.Range;
-          out.falloff = in.Falloff;
-          out.attenuation0 = in.Attenuation0;
-          out.attenuation1 = in.Attenuation1;
-          out.attenuation2 = in.Attenuation2;
-          out.theta = in.Theta;
-          out.phi = in.Phi;
+      void D3D9Frontend::lights(RtxContext* ctx, const D3DLIGHT9* lights, uint32_t count, bool translate) {
+        if (translate) {
+          m_impl->translateLights(ctx, lights, count);
+        } else {
+          ctx->addLights(lights, count);  // the old path
         }
-        frontend::SceneInterface { *ctx }.addGameLights(converted.data(), count);
       }
 
-      void D3D9Frontend::flush(RtxContext* ctx, const std::shared_ptr<translator::FrameBatch>& batch) {
-        m_impl->drainSkinned(ctx, true);
-        frontend::SceneInterface { *ctx }.beginFrame();
+      void D3D9Frontend::flush(RtxContext* ctx, const std::shared_ptr<FrameBatch>& batch) {
+        m_impl->collectLights(ctx);  // R9
         if (batch != nullptr) {
           m_impl->flush(ctx, *batch);
         } else if (!m_impl->objects.empty()) {
-          frontend::SceneInterface { *ctx }.endFrame(frontend::FrameInfo {});
+          ctx->getSceneManager().retainedScene().frontendFrame(ctx);
         }
       }
 
       // ---- app thread ------------------------------------------------------------------------------------------
 
       struct D3D9FrontendApp::Impl {
-        // Statistics (rtx.d3d9v2.log): per object key, the draws of that key in draw order.
+        // V1 statistics (rtx.d3d9v2.log): per object key, the draws of that key in draw order.
         struct Seen {
           XXH64_hash_t inputs = 0;
           XXH64_hash_t inputsNoVsConstants = 0;
@@ -1507,13 +2105,15 @@ namespace dxvk {
           uint64_t repeat = 0;            // same object, same occurrence, same inputs as last frame
           uint64_t repeatNoVsConst = 0;   // the same, ignoring VS constants
           uint64_t newObject = 0;         // no draw of this object key (and occurrence) last frame
-          // The scene's objects
+          // rtx.d3d9v2.direct
           uint64_t skipped = 0;           // direct, unchanged: nothing queued
           uint64_t moved = 0;             // direct, moved: setTransform
           uint64_t changed = 0;           // direct, changed: handed back
           uint64_t handovers = 0;
-          uint64_t cameraFeeds = 0;       // Cameras sent (first draw of a camera type in a frame)
-          // The early change test
+          uint64_t cameraOnly = 0;
+          uint64_t pendingRepeats = 0;    // pending, unchanged: still on the old path
+          uint64_t cameraFeeds = 0;       // R2: cameras sent (first draw of a camera type in a frame)
+          // R1 (rtx.d3d9v2.earlyChangeTest)
           uint64_t preKeyHits = 0;        // skipped before preparation, unchanged
           uint64_t preKeyMoves = 0;       // skipped before preparation, moved
           uint64_t preKeyMisses = 0;      // pre-checked, prepared
@@ -1521,13 +2121,13 @@ namespace dxvk {
           uint64_t preKeyMismatches = 0;  // self-check found a change the pre-key missed
           uint64_t preKeyNs = 0;          // time building pre-keys (D3D9 thread)
           uint64_t preKeyTimed = 0;
-          uint64_t dropped = 0;           // draws not handed over (notEligible) and their repeats in the frame
-          uint64_t updates = 0;           // Changed draws of Direct objects updated in place
-          uint64_t sortOrders = 0;        // Decal orders sent
-          uint64_t rasterOnly = 0;        // Raster-service draws of scene-owned objects (sky)
+          uint64_t churnBackoffs = 0;     // R4: objects handed back as changed within 8 frames of their handover
+          uint64_t updates = 0;           // R5: changed draws of Direct objects updated in place
+          uint64_t sortOrders = 0;        // R7: decal orders sent
+          uint64_t rasterOnly = 0;        // R8b: raster-service draws of scene-owned objects (sky)
           uint64_t derivedChanges = 0;    // draws with unchanged inputs whose categories or camera type changed
           uint64_t reprepared = 0;        // unchanged draws of Direct objects updated after an option change
-          uint64_t duplicates = 0;        // Repeated draws of an object already drawn this frame
+          uint64_t duplicates = 0;        // A4: repeated draws of an object already drawn this frame
           uint64_t skinDeferrals = 0;     // new skinned objects held back a frame to take over an undrawn character
           uint64_t skinPairs = 0;         // ... that took it over
           uint64_t skinCancels = 0;       // ... whose partner was drawn later in the frame (the held-back draw was not drawn)
@@ -1535,26 +2135,48 @@ namespace dxvk {
           uint64_t skinEvents = 0;        // skinned lifecycle events (skinEvent), logged or not
           uint64_t skinSwaps = 0;         // skinned draws that took a slot whose last material or position differs
           uint64_t matchMaterialRejects = 0;  // slot candidates skipped for another material (lookupNearest)
-          uint64_t matchShapeRejects = 0;     // stale slot candidates of coarse-keyed draws skipped for another shape
-          uint64_t matchContentExact = 0;     // coarse-keyed draws matched to a slot of the same bytes at the same position
-          uint64_t matchContentNear = 0;      // ... of the same bytes at the nearest position
           uint64_t resetPairs = 0;        // new objects after a device Reset that took over a scene object of the same draw
         } totals;
-        uint32_t mismatchLogs = 0;        // [D3D9v2] preKeyMismatch lines written (first 20)
+        uint32_t mismatchLogs = 0;        // R1: [D3D9v2] preKeyMismatch lines written (first 20)
         // Skinned lifecycle lines written in this log interval.
         static constexpr uint32_t kSkinEventLinesPerInterval = 40;
         uint32_t skinEventLines = 0;
 
-        // Why draws of objects the scene does not own were not handed over, per class. A draw counts once in every class
-        // it is in (not exclusive). Collected only while rtx.d3d9v2.log is on.
-        // inputs: the draw cannot be handed over (a pre-combined draw before any camera).
-        // backoff: the scene rejected the object, and it waits before the next attempt.
-        // camUnknown: an unknown camera with rtx.skipObjectsWithUnknownCamera on.
-        enum NotEligible : uint32_t { kNeInputs, kNeBackoff, kNeCameraUnknown, kNeCount };
-        static constexpr const char* kNotEligibleNames[kNeCount] = { "inputs", "backoff", "camUnknown" };
+        // rtx.d3d9v2.log: World UI draws (in-world screens), one line per draw with what the frontend did with it, the
+        // object's handle, its world translation and its camera's vertical field of view. At most kWorldUILinesPerInterval
+        // lines per log interval.
+        static constexpr uint32_t kWorldUILinesPerInterval = 96;
+        uint32_t worldUILines = 0;
+        void worldUIEvent(uint32_t categories, const char* event, uint64_t handle, const Matrix4& objectToWorld,
+                          const Matrix4& viewToProjection) {
+          if (!D3D9V2Options::log() || !CategoryFlags(categories).test(InstanceCategories::WorldUI) ||
+              worldUILines >= kWorldUILinesPerInterval) {
+            return;
+          }
+          ++worldUILines;
+          const Vector3 p = objectToWorld[3].xyz();
+          const float scaleY = std::abs(viewToProjection[1][1]);
+          const float fov = scaleY > 0.f ? 2.f * std::atan(1.f / scaleY) : 0.f;
+          Logger::info(str::format("[D3D9v2] worldUI draw frame=", frame, " ", event, " handle=0x", std::hex, handle,
+                                   std::dec, " pos=(", p.x, ", ", p.y, ", ", p.z, ") fov=", fov));
+        }
+
+        // R8 step 0: why draws of objects on the old path were not handed over at their first-draw check, per class. A draw
+        // counts once in every class it is in (not exclusive). Collected only while rtx.d3d9v2.log is on.
+        enum NotEligible : uint32_t {
+          kNeInputs, kNeBackoff, kNeCameraViewModel, kNeCameraPortal, kNeCameraSky, kNeCameraRenderToTexture,
+          kNeCameraUnknown, kNeSky, kNeTerrain, kNeParticle, kNeParticleEmitter, kNeBeam, kNeDecal, kNePlayerModel,
+          kNeWorldUI, kNeWorldMatte, kNeAnimatedWater, kNeHairCards, kNeLightConversion, kNeRenderTarget, kNeCount
+        };
+        static constexpr const char* kNotEligibleNames[kNeCount] = {
+          "inputs", "backoff", "camViewModel", "camPortal", "camSky", "camRenderToTexture",
+          "camUnknown", "sky", "terrain", "particle", "particleEmitter", "beam", "decal", "playerModel",
+          "worldUI", "worldMatte", "animatedWater", "hairCards", "lightConversion", "renderTarget"
+        };
         uint64_t notEligible[kNeCount] = {};
 
-        void countNotEligible(bool eligible, bool backoff, uint32_t cameraType) {
+        void countNotEligible(bool eligible, bool backoff, uint32_t cameraType, const PreparedState& prepared, bool services,
+                              bool unordered) {
           if (!eligible) {
             notEligible[kNeInputs]++;
           }
@@ -1562,58 +2184,100 @@ namespace dxvk {
             notEligible[kNeBackoff]++;
           }
           if (!acceptedCamera(cameraType)) {
-            notEligible[kNeCameraUnknown]++;
+            notEligible[cameraType == CameraType::ViewModel ? kNeCameraViewModel
+                      : cameraType == CameraType::Portal0 || cameraType == CameraType::Portal1 ? kNeCameraPortal
+                      : cameraType == CameraType::Sky ? kNeCameraSky
+                      : cameraType == CameraType::RenderToTexture ? kNeCameraRenderToTexture : kNeCameraUnknown]++;
           }
+          const CategoryFlags c(prepared.categories);
+          const auto note = [&](bool in, NotEligible what) { notEligible[what] += in ? 1 : 0; };
+          note(!skyServiceActive() && c.test(InstanceCategories::Sky), kNeSky);
+          note(!terrainActive() && TerrainBaker::needsTerrainBaking() && c.test(InstanceCategories::Terrain), kNeTerrain);
+          note(!unordered && c.test(InstanceCategories::Particle), kNeParticle);
+          note(!services && c.test(InstanceCategories::ParticleEmitter), kNeParticleEmitter);
+          note(!unordered && c.test(InstanceCategories::Beam), kNeBeam);
+          note(!unordered && c.any(DECAL_CATEGORY_FLAGS), kNeDecal);
+          note(!services && c.any(InstanceCategories::ThirdPersonPlayerModel, InstanceCategories::ThirdPersonPlayerBody), kNePlayerModel);
+          note(!services && c.test(InstanceCategories::WorldUI), kNeWorldUI);
+          note(!services && c.test(InstanceCategories::WorldMatte), kNeWorldMatte);
+          note(!services && c.test(InstanceCategories::AnimatedWater), kNeAnimatedWater);
+          note(!services && c.test(InstanceCategories::HairCards), kNeHairCards);
+          note(!services && prepared.convertsToLight, kNeLightConversion);
+          note(!renderTargetsActive() && prepared.raytracedRenderTarget, kNeRenderTarget);
         }
 
-        // The object an early check looked up, handed to decide when the draw is prepared after all.
+        // R1: the object an early check looked up, handed to decide when the draw is prepared after all.
         struct Pending {
           bool valid = false;
           XXH64_hash_t objectKey = 0;      // the draw it belongs to (a draw the preparation then ignored never calls decide)
           XXH64_hash_t key = 0;
-          translator::EarlyKey early;
+          EarlyKey early;
           bool wouldHit = false;           // self-check: the pre-key matched, the draw is prepared to verify it
         } pending;
-        translator::CameraClassifier cameras;
+        CameraClassifier cameras;         // R2 (rtx.d3d9v2.explicitCamera)
         uint32_t frames = 0;
         bool wasActive = false;
 
-        // The app thread's view of an object: the scene owns it (Direct) or not.
-        enum class State : uint8_t { Legacy, Direct };
+        // rtx.d3d9v2.direct
+        enum class State : uint8_t { Legacy, Pending, Direct };
         struct Object {
-          // The change test's record of the last prepared draw: its keys, derived state, re-preparation epoch and
-          // early keys.
-          translator::ChangeRecord change;
+          XXH64_hash_t inputs = 0;
+          XXH64_hash_t inputsNoWorld = 0;
           uint64_t handle = 0;
+          uint32_t streak = 0;
           uint32_t lastFrame = 0;
           uint32_t backoffUntil = 0;
           uint32_t rejects = 0;
           State state = State::Legacy;
-          int32_t sortOrder = -1;         // The decal order last sent to the scene (-1 = none)
-          bool rasterService = false;     // A sky-camera object: its draw is replayed every frame (RasterOnly)
+          bool hasLast = false;
+          uint32_t handoverFrame = 0;     // R4: frame of the last handover (churn guard)
+          int32_t sortOrder = -1;         // R7: the decal order last sent to the scene (-1 = none)
+          bool rasterService = false;     // R8b: a sky-camera object: its draw is replayed every frame (RasterOnly)
+          // The categories and camera type of the last prepared draw. A draw that differs in either is not a repeat.
+          uint32_t derivedCategories = 0;
+          uint32_t derivedCamera = Decision::kNoCamera;
+          bool derivedTerrainBaking = false;
+          bool derivedFreeCamera = false;  // rtx.camera.enableFreeCamera at the last prepared draw
+          // The re-preparation epoch its scene copy was described in. A Direct object of an older one is updated at its
+          // next draw.
+          uint32_t reprepareEpoch = 0;
           // Fixed-function skinned draws: the class skinnedByClass lists the object under (0 = not listed), and its last
           // draw's bone centroid, drawn counts, bone extent, used bone range, material and object key.
           XXH64_hash_t skinClass = 0;
           Vector3 skinPosition;
-          Vector3 skinVelocity;  // the bone centroid's movement between the object's last two draws
           uint64_t skinCounts = 0;
           float skinRadius = 0.f;
           uint32_t skinFirstBone = 0;
           uint32_t skinBoneCount = 0;
           XXH64_hash_t skinMaterial = 0;
           XXH64_hash_t skinObjectKey = 0;
-          XXH64_hash_t resetSignature = 0;  // translator::DrawInputs::resetSignature of the last draw (0 = coarse-keyed)
-          // The last full preparation's record and derived state.
-          translator::DrawInputs last;
+          XXH64_hash_t resetSignature = 0;  // D3D9DrawInputs::resetSignature of the last draw (0 = coarse-keyed)
+          // R1: the last full preparation's pre-keys, record and derived state.
+          bool hasEarly = false;
+          XXH64_hash_t preKey = 0;
+          XXH64_hash_t preKeyNoWorld = 0;
+          D3D9DrawInputs last;
           PreparedState prepared;
         };
-        std::unordered_map<XXH64_hash_t, Object> objects;       // by object key + slot (InstanceMatcher)
-        std::unordered_map<uint64_t, XXH64_hash_t> byHandle;    // direct objects
-        translator::InstanceMatcher matcher;
-        // This frame's draws (frameDrawKey) to the object of the first one, by inputs and by pre-key.
+        std::unordered_map<XXH64_hash_t, Object> objects;       // by object key + slot (lookupNearest)
+        std::unordered_map<uint64_t, XXH64_hash_t> byHandle;    // pending and direct objects
+        std::unordered_map<XXH64_hash_t, uint32_t> occurrence;  // this frame, per object key
+        // lookupNearest: per key, the last draw of each slot (the index in the object's lookup key). Slots outlive frames
+        // without a draw, so an object that was culled for a while finds its own slot again, and are freed by endFrame
+        // once their object is forgotten.
+        struct PositionSlot {
+          Vector3 position;
+          XXH64_hash_t signature = 0;
+          XXH64_hash_t material = 0;  // the legacy material identity of its last prepared draw (0 = not known)
+          uint32_t lastFrame = 0;  // the slot is taken in this frame when lastFrame equals it
+          bool valid = false;
+        };
+        std::unordered_map<XXH64_hash_t, std::vector<PositionSlot>> slots;
+        std::unordered_map<XXH64_hash_t, uint32_t> slotCursors;  // this frame, per key: no free slot is below it
+        // A4: this frame's draws (frameDrawKey) to the object of the first one, by inputs and by pre-key.
         std::unordered_map<XXH64_hash_t, XXH64_hash_t> frameDraws;
         std::unordered_map<XXH64_hash_t, XXH64_hash_t> framePreKeys;
-        // This frame's draws by pass key (frameDrawKey of passInputsOf) to the object of the first one, and whether a
+        // A4: this frame's draws by pass key (frameDrawKey of passInputsOf) to the object of the first one, and whether a
         // later pass was merged into it.
         struct FramePass {
           XXH64_hash_t object = 0;
@@ -1637,18 +2301,30 @@ namespace dxvk {
         static constexpr uint32_t kResetFrames = 16;
         std::unordered_multimap<XXH64_hash_t, ResetCandidate> resetCandidates;
         uint32_t resetFrame = 0;
-        std::shared_ptr<translator::FrameBatch> batch = std::make_shared<translator::FrameBatch>();
+        std::shared_ptr<FrameBatch> batch = std::make_shared<FrameBatch>();
         bool batchTaken = false;
-        std::shared_ptr<translator::Channel> channel;
-        uint32_t reprepareEpoch = 0;      // translator::Channel::reprepare requests heard so far
+        std::shared_ptr<Channel> channel;
+        uint32_t reprepareEpoch = 0;      // Channel::reprepare requests heard so far
         uint32_t frame = 0;
         uint64_t nextHandle = 1;
-        translator::DecalRank decalRank;  // The ranks of this frame's Direct decals
-        translator::FogOrder fogOrder;
+        Matrix4 queuedView;
+        Matrix4 queuedProjection;
+        bool queuedCameraValid = false;
+        uint32_t decalRank = 0;           // R7: Direct decals drawn so far this frame
+        std::vector<XXH64_hash_t> fogSeenThisFrame;  // R10
 
-        // The draw's fog, once per frame, in draw order.
-        void noteFog(const translator::FogRecord& fog) {
-          fogOrder.note(fog, batch->fogOrder);
+        // R10: the draw's fog, once per frame, in draw order.
+        void noteFog(const FogInputs& in) {
+          if (in.mode == D3DFOG_NONE || !frontends::d3d9::frameEventsActive()) {
+            return;
+          }
+          const FogState fog = toFogState(in);
+          const XXH64_hash_t hash = fog.getHash();
+          if (std::find(fogSeenThisFrame.begin(), fogSeenThisFrame.end(), hash) != fogSeenThisFrame.end()) {
+            return;
+          }
+          fogSeenThisFrame.push_back(hash);
+          batch->fogOrder.push_back(fog);
         }
 
         void resetStats() {
@@ -1656,18 +2332,21 @@ namespace dxvk {
           current.clear();
           totals = Totals();
           skinEventLines = 0;
+          worldUILines = 0;
           frames = 0;
         }
 
-        void observe(const translator::DrawInputs& in) {
-          // A coarse-keyed draw's occurrence among the draws of its key follows the draw order, so a draw whose bytes are
-          // known is compared with the last draw of the same bytes at the same place instead.
-          XXH64_hash_t key = in.identityKey();
-          const XXH64_hash_t content = in.usesCoarseKey() ? in.contentKey() : 0;
-          if (content != 0) {
-            const float place[3] = { in.anchor.x, in.anchor.y, in.anchor.z };
-            key = XXH3_64bits_withSeed(place, sizeof(place), XXH3_64bits_withSeed(&content, sizeof(content), key));
-          }
+        // The key decide identifies the draw's object by.
+        // R5: draws whose data moves or changes size every frame are identified by what they draw (coarse key).
+        static bool usesCoarseKey(const D3D9DrawInputs& in) {
+          return dynamicGeometryActive() && (in.flags & (D3D9DrawInputs::kDynamicSource | D3D9DrawInputs::kUserPointer));
+        }
+        static XXH64_hash_t identityKey(const D3D9DrawInputs& in) {
+          return usesCoarseKey(in) ? in.coarseKey() : in.objectKey();
+        }
+
+        void observe(const D3D9DrawInputs& in) {
+          const XXH64_hash_t key = identityKey(in);
           Seen seen;
           seen.inputs = in.inputsKey(true);
           seen.inputsNoVsConstants = in.inputsKey(false);
@@ -1679,10 +2358,10 @@ namespace dxvk {
 
           totals.draws++;
           totals.versioned += seen.versioned ? 1 : 0;
-          totals.userPointer += (in.flags & translator::DrawInputs::kUserPointer) ? 1 : 0;
-          totals.programmableVS += (in.flags & translator::DrawInputs::kProgrammableVS) ? 1 : 0;
-          totals.capture += (in.flags & translator::DrawInputs::kVertexCapture) ? 1 : 0;
-          totals.skinned += (in.flags & translator::DrawInputs::kSkinned) ? 1 : 0;
+          totals.userPointer += (in.flags & D3D9DrawInputs::kUserPointer) ? 1 : 0;
+          totals.programmableVS += (in.flags & D3D9DrawInputs::kProgrammableVS) ? 1 : 0;
+          totals.capture += (in.flags & D3D9DrawInputs::kVertexCapture) ? 1 : 0;
+          totals.skinned += (in.flags & D3D9DrawInputs::kSkinned) ? 1 : 0;
 
           const auto it = previous.find(key);
           if (it == previous.end() || index >= it->second.size()) {
@@ -1691,7 +2370,7 @@ namespace dxvk {
           }
           // Unversioned inputs compare equal (version 0) whatever their data, and fixed-function bones are not in the
           // record: neither can be a repeat.
-          if (!seen.versioned || (in.flags & translator::DrawInputs::kSkinned)) {
+          if (!seen.versioned || (in.flags & D3D9DrawInputs::kSkinned)) {
             return;
           }
           const Seen& last = it->second[index];
@@ -1719,34 +2398,43 @@ namespace dxvk {
           }
           const double n = double(frames);
           const auto perFrame = [n](uint64_t v) { return uint64_t(double(v) / n + 0.5); };
-          // live: the objects the scene owns at this moment. The per-frame values are rounded averages over the
-          // interval, so the interval totals of skipped and handovers are printed too: a handful of skips rounds to 0.
+          // live / direct / pending: this thread's objects at this moment (direct = drawn by the scene, pending =
+          // handed over, still drawn on the old path). The per-frame values are rounded averages over the interval, so
+          // the interval totals of skipped and handovers are printed too: a handful of skips rounds to 0.
+          uint32_t directNow = 0, pendingNow = 0;
+          for (const auto& [handle, key] : byHandle) {
+            const auto found = objects.find(key);
+            if (found != objects.end()) {
+              directNow += found->second.state == State::Direct ? 1 : 0;
+              pendingNow += found->second.state == State::Pending ? 1 : 0;
+            }
+          }
           Logger::info(str::format(
             "[D3D9v2] inputs frames=", frames, " (per frame) draws=", perFrame(totals.draws),
             " versioned=", perFrame(totals.versioned), " up=", perFrame(totals.userPointer),
             " programmableVS=", perFrame(totals.programmableVS), " capture=", perFrame(totals.capture),
             " skinned=", perFrame(totals.skinned), " newObject=", perFrame(totals.newObject),
             " repeat=", perFrame(totals.repeat), " repeatNoVsConst=", perFrame(totals.repeatNoVsConst),
-            " | direct: live=", byHandle.size(),
+            " | direct: live=", byHandle.size(), " (direct ", directNow, " pending ", pendingNow, ")",
             " skipped=", perFrame(totals.skipped), " moved=", perFrame(totals.moved),
             " changed=", perFrame(totals.changed), " handovers=", perFrame(totals.handovers),
-            " cameraFeeds=", perFrame(totals.cameraFeeds),
+            " cameraOnly=", perFrame(totals.cameraOnly), " cameraFeeds=", perFrame(totals.cameraFeeds),
+            " pendingRepeats=", perFrame(totals.pendingRepeats),
             " | early: hits=", perFrame(totals.preKeyHits), " moves=", perFrame(totals.preKeyMoves),
             " misses=", perFrame(totals.preKeyMisses), " selfChecks=", totals.selfChecks,
             " preKeyMismatch=", totals.preKeyMismatches,
             " preKeyUs/frame=", str::format(double(totals.preKeyNs) / 1000.0 / n),
             " preKeyNs/draw=", totals.preKeyTimed != 0 ? totals.preKeyNs / totals.preKeyTimed : 0,
-            " | dropped=", perFrame(totals.dropped), " updates=", perFrame(totals.updates),
+            " | churnBackoffs=", totals.churnBackoffs, " updates=", perFrame(totals.updates),
             " sortOrders=", perFrame(totals.sortOrders), " rasterOnly=", perFrame(totals.rasterOnly),
             " derivedChanges=", totals.derivedChanges, " reprepared=", totals.reprepared,
             " duplicates=", perFrame(totals.duplicates), " skinPairs=", totals.skinPairs, "/", totals.skinDeferrals,
             " skinCancels=", totals.skinCancels, " skinAmbiguous=", totals.skinAmbiguous, " skinSwaps=", totals.skinSwaps,
-            " matchMaterialRejects=", totals.matchMaterialRejects, " matchShapeRejects=", totals.matchShapeRejects,
-            " matchContentExact=", perFrame(totals.matchContentExact), " matchContentNear=", perFrame(totals.matchContentNear),
+            " matchMaterialRejects=", totals.matchMaterialRejects,
             " skinEvents=", skinEventLines, "/", totals.skinEvents, " (logged/all)",
             " resetPairs=", totals.resetPairs,
             " | interval totals: skipped=", totals.skipped, " handovers=", totals.handovers, " changed=", totals.changed));
-          // Draws per frame not handed over, per class (non-exclusive).
+          // R8 step 0: draws per frame not handed over at their first-draw check, per class (non-exclusive).
           std::string notEligibleLine;
           for (uint32_t i = 0; i < kNeCount; ++i) {
             if (notEligible[i] != 0) {
@@ -1759,65 +2447,171 @@ namespace dxvk {
           }
           totals = Totals();
           skinEventLines = 0;
+          worldUILines = 0;
           frames = 0;
+        }
+
+        // The CS thread derives the camera from queued draws: a skipped draw whose camera differs from the last one
+        // queued this frame is queued for that alone.
+        bool cameraNeedsFeed(const Matrix4& view, const Matrix4& projection) {
+          if (queuedCameraValid && sameMatrix(view, queuedView) && sameMatrix(projection, queuedProjection)) {
+            return false;
+          }
+          noteQueuedCamera(view, projection);
+          return true;
+        }
+
+        void noteQueuedCamera(const Matrix4& view, const Matrix4& projection) {
+          queuedView = view;
+          queuedProjection = projection;
+          queuedCameraValid = true;
         }
 
         void dropHandle(Object& object) {
           byHandle.erase(object.handle);
           object.handle = 0;
           object.state = State::Legacy;
+          object.streak = 0;
           object.sortOrder = -1;
           object.rasterService = false;
         }
 
-        // A Direct decal's rank among this frame's Direct decals, in draw order (8 bits on the GPU, so it wraps, as the
-        // per-draw path's counter does). Sent when it changed, or after a (re)build, which assigns a creation order.
+        // R7: a Direct decal's rank among this frame's Direct decals, in draw order (8 bits on the GPU, so it wraps, as the
+        // old path's counter does). Sent when it changed, or after a (re)build, which assigns a creation order.
         void noteSortOrder(Object& object, uint32_t categories, bool built) {
-          if (!CategoryFlags(categories).any(DECAL_CATEGORY_FLAGS)) {
+          if (!frontends::d3d9::unorderedActive() || !CategoryFlags(categories).any(DECAL_CATEGORY_FLAGS)) {
             return;
           }
-          const uint8_t rank = decalRank.next();
-          if (translator::DecalRank::needsSend(object.sortOrder, rank, built)) {
+          const uint8_t rank = uint8_t(decalRank++ & 0xFFu);
+          if (built || object.sortOrder != int32_t(rank)) {
             batch->sortOrders.push_back({ object.handle, rank });
+            object.sortOrder = rank;
             totals.sortOrders++;
           }
         }
 
-        using SlotQuery = translator::InstanceMatcher::Query;
+        // lookupNearest's limits for one draw, and what the slot it took held before.
+        struct SlotQuery {
+          // LegacyMaterialData::computeIdentityHash of the draw, or 0 when not known (earlyCheck): slots are then
+          // compared by position and signature only.
+          XXH64_hash_t material = 0;
+          // A slot not drawn in the previous frame is taken only this close.
+          float staleDistanceSqr = 0.f;
+          // A slot whose last material differs is taken only when it was drawn in the previous frame and is this close:
+          // the same object, whose material the game changed.
+          float otherMaterialDistanceSqr = 0.f;
+          // Out: whether a known slot was taken, with its last position and material.
+          bool reused = false;
+          Vector3 previousPosition;
+          XXH64_hash_t previousMaterial = 0;
+        };
 
         // The limits for a draw: a fixed-function skinned draw takes a stale slot or one of another material only within
         // its bone extent (skinPairBound), since another character of the same mesh may have left the view nearby. Other
         // draws take a stale slot within rtx.uniqueObjectDistance and one of another material within a twentieth of it.
-        // A coarse-keyed draw takes a slot of its own shape first (InstanceMatcher::Query::shapeFirst).
-        static SlotQuery slotQuery(const translator::DrawInputs& in) {
+        static SlotQuery slotQuery(const D3D9DrawInputs& in) {
           SlotQuery query;
           query.material = in.material;
           const float tight = skinPairBound(in.skinRadius, 0.f);
           query.otherMaterialDistanceSqr = tight * tight;
-          query.staleDistanceSqr = (in.flags & translator::DrawInputs::kSkinned) ? tight * tight : RtxOptions::getUniqueObjectDistanceSqr();
-          query.shapeFirst = in.usesCoarseKey();
-          // The bones of a fixed-function skinned draw are not in its bytes, so look-alike characters have one content.
-          query.content = in.usesCoarseKey() && !(in.flags & translator::DrawInputs::kSkinned) ? in.contentKey() : 0;
+          query.staleDistanceSqr = (in.flags & D3D9DrawInputs::kSkinned) ? tight * tight : RtxOptions::getUniqueObjectDistanceSqr();
           return query;
         }
 
-        // The object of this draw (InstanceMatcher::match). position is the world translation, or the bone centroid for
-        // fixed-function skinned draws.
+        // The object of this draw: a slot of its key, told apart from the other draws of the key by position (the world
+        // translation, or the bone centroid for fixed-function skinned draws). Draws of one key can change order between
+        // frames, so each takes the free slot whose last position is nearest to its own and within rtx.uniqueObjectDistance,
+        // searched within kWindow slots of its occurrence index. A slot of the draw's material ranks above every slot of
+        // another material, and SlotQuery limits stale slots and slots of another material. Equal distances (identity
+        // world matrices among them) prefer the slot with the same content signature, then the occurrence order. A draw
+        // without a candidate takes a slot no known object holds, so it never inherits the history of another object.
         XXH64_hash_t lookupNearest(XXH64_hash_t groupKey, const Vector3& position, XXH64_hash_t signature, SlotQuery& query) {
-          const XXH64_hash_t key = matcher.match(groupKey, position, signature, query, frame);
-          totals.matchMaterialRejects += query.materialRejects;
-          totals.matchShapeRejects += query.shapeRejects;
-          totals.matchContentExact += query.tier == SlotQuery::Tier::ContentExact ? 1 : 0;
-          totals.matchContentNear += query.tier == SlotQuery::Tier::ContentNear ? 1 : 0;
-          return key;
+          constexpr uint32_t kWindow = 32;
+          const uint32_t index = occurrence[groupKey]++;
+          std::vector<PositionSlot>& known = slots[groupKey];
+          const uint32_t count = uint32_t(known.size());
+          const auto claimable = [&](uint32_t slot) { return known[slot].valid && known[slot].lastFrame != frame; };
+          const auto sameMaterialAs = [&](uint32_t slot) {
+            return query.material == 0 || known[slot].material == 0 || known[slot].material == query.material;
+          };
+
+          uint32_t chosen = ~0u;
+          if (index < count && claimable(index) && known[index].position == position && known[index].signature == signature &&
+              sameMaterialAs(index)) {
+            chosen = index;
+          } else if (count != 0) {
+            const float maxDistanceSqr = RtxOptions::getUniqueObjectDistanceSqr();
+            float best = std::numeric_limits<float>::infinity();
+            bool bestSameMaterial = false;
+            bool bestSameSignature = false;
+            uint32_t bestOffset = ~0u;
+            const uint32_t first = index > kWindow ? index - kWindow : 0u;
+            const uint32_t last = std::min(count, index + kWindow + 1);
+            for (uint32_t slot = first; slot < last; ++slot) {
+              if (!claimable(slot)) {
+                continue;
+              }
+              const float distance = lengthSqr(known[slot].position - position);
+              const bool recent = known[slot].lastFrame + 1 == frame;
+              if (distance > maxDistanceSqr || (!recent && distance > query.staleDistanceSqr)) {
+                continue;
+              }
+              const bool sameMaterial = sameMaterialAs(slot);
+              if (!sameMaterial && (!recent || distance > query.otherMaterialDistanceSqr)) {
+                totals.matchMaterialRejects++;
+                continue;
+              }
+              const bool sameSignature = known[slot].signature == signature;
+              const uint32_t offset = slot > index ? slot - index : index - slot;
+              const bool better = chosen == ~0u ||
+                (sameMaterial != bestSameMaterial ? sameMaterial
+                 : distance != best ? distance < best
+                 : sameSignature != bestSameSignature ? sameSignature : offset < bestOffset);
+              if (better) {
+                best = distance;
+                bestSameMaterial = sameMaterial;
+                bestSameSignature = sameSignature;
+                bestOffset = offset;
+                chosen = slot;
+              }
+            }
+          }
+          query.reused = false;
+          if (chosen == ~0u) {
+            uint32_t& cursor = slotCursors[groupKey];
+            while (cursor < count && known[cursor].valid) {
+              ++cursor;
+            }
+            chosen = cursor;
+          } else {
+            query.reused = true;
+            query.previousPosition = known[chosen].position;
+            query.previousMaterial = known[chosen].material;
+          }
+          if (chosen >= known.size()) {
+            known.resize(chosen + 1);
+          }
+          PositionSlot& taken = known[chosen];
+          taken.position = position;
+          taken.signature = signature;
+          if (query.material != 0 || !query.reused) {
+            taken.material = query.material;
+          }
+          taken.lastFrame = frame;
+          taken.valid = true;
+          return slotKey(groupKey, chosen);
+        }
+
+        static XXH64_hash_t slotKey(XXH64_hash_t groupKey, uint32_t slot) {
+          return XXH3_64bits_withSeed(&slot, sizeof(slot), groupKey);
         }
 
         // What stays the same when a character's draw moves to other buffers or another key: its material and topology.
-        static XXH64_hash_t skinClassOf(const translator::DrawInputs& in) {
+        static XXH64_hash_t skinClassOf(const D3D9DrawInputs& in) {
           return XXH3_64bits_withSeed(&in.primitiveType, sizeof(in.primitiveType), in.material) | 1;
         }
 
-        static uint64_t drawnCounts(const translator::DrawInputs& in) {
+        static uint64_t drawnCounts(const D3D9DrawInputs& in) {
           return (uint64_t(in.primitiveCount) << 32) | in.numVertices;
         }
 
@@ -1856,7 +2650,7 @@ namespace dxvk {
           return what.empty() ? std::string("none") : what;
         }
 
-        void noteSkinned(Object& object, XXH64_hash_t key, const translator::DrawInputs& in) {
+        void noteSkinned(Object& object, XXH64_hash_t key, const D3D9DrawInputs& in) {
           const bool known = object.skinClass != 0;
           const bool changed = known &&
             (object.skinMaterial != in.material || object.skinBoneCount != in.skinBoneCount ||
@@ -1867,14 +2661,13 @@ namespace dxvk {
                                "+", object.skinBoneCount, " counts=", uint32_t(object.skinCounts >> 32), "/",
                                uint32_t(object.skinCounts));
           }
-          object.skinVelocity = known ? in.skinPosition - object.skinPosition : Vector3(0.f);
           object.skinPosition = in.skinPosition;
           object.skinCounts = drawnCounts(in);
           object.skinRadius = in.skinRadius;
           object.skinFirstBone = in.skinFirstBone;
           object.skinBoneCount = in.skinBoneCount;
           object.skinMaterial = in.material;
-          object.skinObjectKey = in.identityKey();
+          object.skinObjectKey = identityKey(in);
           const XXH64_hash_t skinClass = skinClassOf(in);
           if (object.skinClass != skinClass) {
             object.skinClass = skinClass;
@@ -1915,7 +2708,7 @@ namespace dxvk {
         // The nearest scene-owned skinned object of the draw's class that was drawn in the previous frame but not yet in
         // this one, is not claimed yet and lies within skinPairBound. Drops list entries whose object is gone or is
         // listed under another class.
-        SkinSearch findSkinnedPartner(const translator::DrawInputs& in, XXH64_hash_t self) {
+        SkinSearch findSkinnedPartner(const D3D9DrawInputs& in, XXH64_hash_t self) {
           SkinSearch search;
           const XXH64_hash_t skinClass = skinClassOf(in);
           const auto list = skinnedByClass.find(skinClass);
@@ -2009,7 +2802,7 @@ namespace dxvk {
           skinPairings.clear();
         }
 
-        // A device Reset makes the game create its default-pool buffers again, so their draws get new object keys.
+        // M1: a device Reset makes the game create its default-pool buffers again, so their draws get new object keys.
         // Each scene-owned object becomes a candidate for a new draw with the same draw apart from its buffers.
         void onDeviceReset() {
           resetCandidates.clear();
@@ -2022,10 +2815,10 @@ namespace dxvk {
           }
         }
 
-        // A new object whose draw matches a candidate that has not been drawn since the Reset takes that object over,
+        // M1: a new object whose draw matches a candidate that has not been drawn since the Reset takes that object over,
         // so the draw is an Update of the same scene object. The CS thread then compares the geometry hash and the world
         // matrix, and keeps the scene's copy as it is when both match (unchangedUpdates).
-        void takeOverAfterReset(Object& object, XXH64_hash_t key, const translator::DrawInputs& in) {
+        void takeOverAfterReset(Object& object, XXH64_hash_t key, const D3D9DrawInputs& in) {
           const auto range = resetCandidates.equal_range(in.resetSignature());
           for (auto it = range.first; it != range.second; ++it) {
             const XXH64_hash_t candidateKey = it->second.key;
@@ -2043,17 +2836,16 @@ namespace dxvk {
           }
         }
 
-        // The frontend's camera for this draw, sent at the first draw of each camera type in the frame.
-        translator::CameraClass classifyCamera(const translator::CameraInputs& camera, Decision& decision) {
+        // R2: the frontend's camera for this draw, sent at the first draw of each camera type in the frame.
+        void classifyCamera(const CameraInputs& camera, Decision& decision) {
           bool updatesCamera = false;
-          const translator::CameraClass type = cameras.classify(camera, updatesCamera);
+          const CameraType::Enum type = cameras.classify(camera, updatesCamera);
           useCamera(type, updatesCamera, decision);
-          return type;
         }
 
         // classify gives the same result when called again for the same draw, so earlyCheck can classify a draw that
         // decide classifies again after a miss. Only this step is once per draw.
-        void useCamera(translator::CameraClass type, bool updatesCamera, Decision& decision) {
+        void useCamera(CameraType::Enum type, bool updatesCamera, Decision& decision) {
           decision.cameraType = uint32_t(type);
           if (updatesCamera && cameras.firstOfFrame(type)) {
             decision.feedCamera = true;
@@ -2063,7 +2855,7 @@ namespace dxvk {
 
         // True when the sky heuristic would now classify the draw differently from its last preparation. Explicit sky
         // rules read only inputs the pre-key holds.
-        static bool skyDetectionChanged(const PreparedState& prepared, const translator::CameraInputs& camera, const SkyDetectInputs& sky) {
+        static bool skyDetectionChanged(const PreparedState& prepared, const CameraInputs& camera, const SkyDetectInputs& sky) {
           const bool explicitSky = CategoryFlags(prepared.categories).test(InstanceCategories::Sky) && !prepared.skyAutoDetected;
           if (explicitSky || sky.seenCameraPositions == nullptr) {
             return false;
@@ -2073,46 +2865,46 @@ namespace dxvk {
                                                      sky.prevFrameSeenCameras, *sky.seenCameraPositions) != prepared.skyAutoDetected;
         }
 
-        // True for view-space texture coordinate generation, whose texture transform D3D9Frontend's prepareDraw
-        // corrects for the free camera.
-        static bool viewSpaceTexgen(uint32_t texgenMode) {
-          return texgenMode == uint32_t(TexGenMode::ViewPositions) || texgenMode == uint32_t(TexGenMode::ViewNormals);
+        // True when the draw's texture transform is corrected for the free camera (RtxContext::prepareGeometryForRTImpl):
+        // view-space texgen while the free camera is on.
+        static bool followsFreeCamera(uint32_t texgenMode, bool freeCamera) {
+          return freeCamera && (texgenMode == uint32_t(TexGenMode::ViewPositions) || texgenMode == uint32_t(TexGenMode::ViewNormals));
         }
 
-        // A draw's inputs with the per-draw path's material identity, the legacy material hash and the categories.
-        static XXH64_hash_t passInputsOf(const translator::DrawInputs& in, const PreparedState& prepared) {
+        // A4: a draw's inputs with the old path's material identity, the legacy material hash and the categories.
+        static XXH64_hash_t passInputsOf(const D3D9DrawInputs& in, const PreparedState& prepared) {
           const uint64_t passMaterial[2] = { prepared.legacyMaterialHash, prepared.categories };
           return in.passKey(XXH3_64bits(passMaterial, sizeof(passMaterial)));
         }
 
-        // The key of one draw in this frame, from its object and inputs (decide) or its pre-key (earlyCheck), and the
+        // A4: the key of one draw in this frame, from its object and inputs (decide) or its pre-key (earlyCheck), and the
         // camera it is drawn with.
-        static XXH64_hash_t frameDrawKey(XXH64_hash_t object, XXH64_hash_t inputs, const translator::CameraInputs& camera) {
+        static XXH64_hash_t frameDrawKey(XXH64_hash_t object, XXH64_hash_t inputs, const CameraInputs& camera) {
           const XXH64_hash_t parts[2] = { object, inputs };
           XXH64_hash_t h = XXH3_64bits(parts, sizeof(parts));
           h = XXH3_64bits_withSeed(&camera.worldToView, sizeof(Matrix4), h);
           return XXH3_64bits_withSeed(&camera.viewToProjection, sizeof(Matrix4), h);
         }
 
-        // A repeated draw of an object already drawn this frame. A scene-owned object is not drawn again (a raster
-        // service still replays the draw), and the per-draw path merges the draw of any other object into its instance.
+        // A4: a repeated draw of an object already drawn this frame. A scene-owned object is not drawn again (a raster
+        // service still replays the draw), and the old path merges the draw of any other object into its instance.
         Decision duplicate(XXH64_hash_t firstKey, Decision decision) {
           totals.duplicates++;
           const auto first = objects.find(firstKey);
           if (first == objects.end() || first->second.state != State::Direct) {
-            totals.dropped++;
             return decision;
           }
           if (first->second.rasterService) {
-            decision.skip = false;
             decision.mode = CommitMode::RasterOnly;
             decision.handle = first->second.handle;
+            return decision;
           }
+          decision.skip = true;
           return decision;
         }
 
-        // A second pass of an object drawn this frame that differs from the first only in its blend or alpha state. The
-        // per-draw path merges it into the first draw's instance with a second update in the frame (its alpha state wins when it
+        // A4: a second pass of an object drawn this frame that differs from the first only in its blend or alpha state. The
+        // old path merges it into the first draw's instance with a second update in the frame (its alpha state wins when it
         // is opaque), so a scene-owned object gets it as its merged pass. One pass is merged per frame, and later ones are
         // skipped.
         Decision mergedPass(FramePass& pass, Decision decision) {
@@ -2122,25 +2914,24 @@ namespace dxvk {
           }
           totals.duplicates++;
           pass.merged = true;
-          decision.skip = false;
           decision.mode = CommitMode::MergePass;
           decision.handle = first->second.handle;
           return decision;
         }
 
-        bool earlyCheck(const translator::DrawInputs& identity, const translator::EarlyKey& key, translator::CameraInputs camera, const SkyDetectInputs& sky,
+        bool earlyCheck(const D3D9DrawInputs& identity, const EarlyKey& key, CameraInputs camera, const SkyDetectInputs& sky,
                         Decision& decision, PreparedState& stored, bool collectStats) {
           pending = Pending();
           if (key.preKeyNs != 0) {
             totals.preKeyNs += key.preKeyNs;
             totals.preKeyTimed++;
           }
-          // A repeated draw is checked against the first draw's object without taking a slot of its own.
+          // A4: a repeated draw is checked against the first draw's object without taking a slot of its own.
           const XXH64_hash_t drawKey = frameDrawKey(key.preKey, 0, camera);
           const auto repeated = framePreKeys.find(drawKey);
           if (repeated != framePreKeys.end()) {
             const auto first = objects.find(repeated->second);
-            if (first == objects.end() || first->second.state != State::Direct || !first->second.change.hasEarly ||
+            if (first == objects.end() || first->second.state != State::Direct || !first->second.hasEarly ||
                 first->second.rasterService) {
               totals.preKeyMisses++;
               return false;  // decide finds the first draw by its inputs
@@ -2151,6 +2942,7 @@ namespace dxvk {
             classifyCamera(camera, decision);
             decision.skip = true;
             stored = first->second.prepared;
+            worldUIEvent(stored.categories, "earlyDuplicate", first->second.handle, key.objectToWorld, camera.viewToProjection);
             return true;
           }
           pending.valid = true;
@@ -2165,8 +2957,9 @@ namespace dxvk {
             return false;
           }
           Object& object = found->second;
-          // Raster-service objects are never skipped (their draw is replayed every frame).
-          if (object.state != State::Direct || object.rasterService || !object.change.earlyMatches(key, reprepareEpoch)) {
+          // R8b: raster-service objects are never skipped (their draw is replayed every frame).
+          if (object.state != State::Direct || !object.hasEarly || object.rasterService ||
+              object.preKeyNoWorld != key.preKeyNoWorld || object.reprepareEpoch != reprepareEpoch) {
             totals.preKeyMisses++;
             return false;
           }
@@ -2174,16 +2967,15 @@ namespace dxvk {
           // change is prepared, so decide sees it. The sky test comes first: classify keeps the frame's first Main FOV, so it must see the draw's real Sky
           // category.
           if (skyDetectionChanged(object.prepared, camera, sky) ||
-              translator::ChangeTest::followsFreeCamera(viewSpaceTexgen(object.last.texgenMode),
-                                                        frontend::freeCameraEnabled() || object.change.derivedFreeCamera)) {
+              followsFreeCamera(object.last.texgenMode, RtCamera::enableFreeCamera() || object.derivedFreeCamera)) {
             totals.derivedChanges++;
             totals.preKeyMisses++;
             return false;
           }
           camera.sky = CategoryFlags(object.prepared.categories).test(InstanceCategories::Sky);
           bool updatesCamera = false;
-          const translator::CameraClass cameraType = cameras.classify(camera, updatesCamera);
-          if (uint32_t(cameraType) != object.change.derivedCamera) {
+          const CameraType::Enum cameraType = cameras.classify(camera, updatesCamera);
+          if (uint32_t(cameraType) != object.derivedCamera) {
             totals.derivedChanges++;
             totals.preKeyMisses++;
             return false;
@@ -2196,12 +2988,12 @@ namespace dxvk {
           }
 
           // As decide's Direct branch for a repeat or a move.
-          const bool moved = object.change.preKey != key.preKey;
+          const bool moved = object.preKey != key.preKey;
           if (moved) {
             batch->moves.push_back({ object.handle, key.objectToWorld });
             object.last.objectToWorld = key.objectToWorld;
-            object.change.preKey = key.preKey;
-            object.change.inputs = object.last.inputsKey(true, true);
+            object.preKey = key.preKey;
+            object.inputs = object.last.inputsKey(true, true);
             totals.moved++;
             totals.preKeyMoves++;
           } else {
@@ -2210,7 +3002,7 @@ namespace dxvk {
           }
           batch->seen.push_back(object.handle);
           noteSortOrder(object, object.prepared.categories, false);
-          noteFog(object.prepared.fog);
+          noteFog(object.prepared.fog);  // R10
           object.lastFrame = frame;
           if (collectStats) {
             wasActive = true;
@@ -2219,6 +3011,8 @@ namespace dxvk {
           useCamera(cameraType, updatesCamera, decision);
           decision.skip = true;
           stored = object.prepared;
+          worldUIEvent(stored.categories, moved ? "earlyMove" : "earlySkip", object.handle, key.objectToWorld,
+                       camera.viewToProjection);
           framePreKeys.emplace(drawKey, pending.key);
           framePasses.emplace(frameDrawKey(object.last.objectKey(), passInputsOf(object.last, object.prepared), camera),
                               FramePass { pending.key });
@@ -2226,7 +3020,7 @@ namespace dxvk {
           return true;
         }
 
-        // The early check's self-check: the pre-key matched (wouldHit) and the draw was prepared in full to verify it.
+        // R1 self-check: the pre-key matched (wouldHit) and the draw was prepared in full to verify it.
         void checkEarly(const Object& object, bool repeat, bool moved, XXH64_hash_t storedPreKey, const PreparedState& prepared) {
           const char* what = nullptr;
           if (storedPreKey == pending.early.preKey ? !repeat : !(repeat || moved)) {
@@ -2249,56 +3043,38 @@ namespace dxvk {
           }
         }
 
-        // The draw with its skin centroid in the world space of the reference camera of its class.
-        // Returns the draw as it is when it is not skinned, its view is that camera's, or no camera was set yet.
-        const translator::DrawInputs& skinInFrameWorld(const translator::DrawInputs& in, const translator::CameraInputs& camera,
-                                                       translator::CameraClass cameraClass, translator::DrawInputs& rebased) const {
-          if (!(in.flags & translator::DrawInputs::kSkinned)) {
-            return in;
-          }
-          const Matrix4* reference = cameras.referenceView(cameraClass);
-          if (reference == nullptr || std::memcmp(reference, &camera.worldToView, sizeof(Matrix4)) == 0) {
-            return in;
-          }
-          rebased = in;
-          const Vector4 inView = camera.worldToView * Vector4(in.skinPosition.x, in.skinPosition.y, in.skinPosition.z, 1.f);
-          rebased.skinPosition = (inverseAffine(*reference) * inView).xyz();
-          return rebased;
-        }
-
-        Decision decide(const translator::DrawInputs& drawn, const translator::CameraInputs& camera, const PreparedState* prepared) {
+        Decision decide(const D3D9DrawInputs& in, const CameraInputs& camera, bool neverHandOver,
+                        const PreparedState* prepared) {
           Decision decision;
-          // The frontend's camera, sent at the first draw of each camera type in the frame.
-          const translator::CameraClass cameraClass = classifyCamera(camera, decision);
-
-          // A skinned draw's view can offset its bones from the frame's world, so it is matched in the camera's world,
-          // and its skinning is decomposed with the same camera. A camera of the last frame is replaced by this frame's
-          // on the CS thread once this frame's is set up (D3D9Frontend::commit).
-          translator::DrawInputs rebased;
-          const translator::DrawInputs& in = skinInFrameWorld(drawn, camera, cameraClass, rebased);
-          if (drawn.flags & translator::DrawInputs::kSkinned) {
-            const Matrix4* reference = cameras.referenceView(cameraClass, &decision.skinningViewThisFrame);
-            decision.hasSkinningView = reference != nullptr;
-            if (reference != nullptr) {
-              decision.skinningWorldToView = *reference;
-            }
+          const bool direct = D3D9V2Options::direct();
+          if (!direct && byHandle.empty()) {
+            pending = Pending();
+            return decision;
+          }
+          const Matrix4& view = camera.worldToView;
+          const Matrix4& projection = camera.viewToProjection;
+          // R2: the frontend's camera, sent at the first draw of each camera type in the frame.
+          const bool explicitCamera = explicitCameraActive();
+          if (explicitCamera) {
+            classifyCamera(camera, decision);
           }
 
-          // An early check looked this draw up already (the occurrence index is counted once).
-          const XXH64_hash_t objectKey = in.identityKey();
+          // R1: an early check looked this draw up already (the occurrence index is counted once).
+          const bool dynamicGeometry = dynamicGeometryActive();
+          const XXH64_hash_t objectKey = identityKey(in);
           XXH64_hash_t inputs = in.inputsKey(true, true);
           XXH64_hash_t inputsNoWorld = in.inputsKey(true, false);
           XXH64_hash_t passInputs = prepared != nullptr ? passInputsOf(in, *prepared) : 0;
-          Vector3 position = in.usesCoarseKey() ? in.anchor : in.objectToWorld[3].xyz();
+          Vector3 position = in.objectToWorld[3].xyz();
           // A pre-combined draw's world matrix holds world-view, which the CS thread turns into a world matrix with the
           // reference camera. A view-locked object keeps its world-view while the camera moves, so the reference camera
-          // is part of its inputs, and its position is looked up in world space. Before any camera there is no
-          // reference, so the draw is not handed over.
-          bool noReference = false;
+          // is part of its inputs, and its position is looked up in world space. Without the frontend's camera there is
+          // no reference, so the draw stays on the old path.
+          bool stayOnOldPath = neverHandOver;
           if (camera.preCombined) {
-            const Matrix4* reference = cameras.referenceView(cameraClass);
+            const Matrix4* reference = explicitCamera ? cameras.referenceView(CameraType::Enum(decision.cameraType)) : nullptr;
             if (reference == nullptr) {
-              noReference = true;
+              stayOnOldPath = true;
             } else {
               inputs = XXH3_64bits_withSeed(reference, sizeof(Matrix4), inputs);
               inputsNoWorld = XXH3_64bits_withSeed(reference, sizeof(Matrix4), inputsNoWorld);
@@ -2306,32 +3082,35 @@ namespace dxvk {
               position = (inverseAffine(*reference) * in.objectToWorld)[3].xyz();
             }
           }
-          // A second draw of the same object with the same inputs, world and camera in this frame is the first
-          // draw's object, as the per-draw path merges it into one instance. Unversioned data may differ, so it is never one.
-          // A coarse-keyed draw is keyed by its range, since two ranges of one dynamic buffer are two objects, or by its
-          // bytes when they are known, so a pass drawn from another buffer or offset is found too.
-          // A draw that differs from the first only in its blend or alpha state is merged too, since the per-draw path's instance
+          // A4: a second draw of the same object with the same inputs, world and camera in this frame is the first
+          // draw's object, as the old path merges it into one instance. Unversioned data may differ, so it is never one.
+          // The draw is keyed by its range even when its object has a coarse key, since two ranges of one dynamic buffer
+          // are two objects.
+          // A draw that differs from the first only in its blend or alpha state is merged too, since the old path's instance
           // identity holds the legacy material hash, not that state (mergedPass).
           XXH64_hash_t drawKey = 0;
           XXH64_hash_t passKey = 0;
           if (in.versioned()) {
-            // The content key holds no material, so a pass with other blend state, which has another coarse key, is found.
-            const XXH64_hash_t content = in.usesCoarseKey() ? in.contentKey() : 0;
-            const XXH64_hash_t rangeKey = !in.usesCoarseKey() ? objectKey
-                                        : content != 0 ? XXH3_64bits_withSeed(&in.vsBytecode, sizeof(in.vsBytecode), content)
-                                        : in.objectKey();
+            const XXH64_hash_t rangeKey = usesCoarseKey(in) ? in.objectKey() : objectKey;
             drawKey = frameDrawKey(rangeKey, inputs, camera);
+            const uint32_t preparedCategories = prepared != nullptr ? prepared->categories : 0;
             const auto first = frameDraws.find(drawKey);
             if (first != frameDraws.end()) {
               pending = Pending();
-              return duplicate(first->second, decision);
+              decision = duplicate(first->second, decision);
+              worldUIEvent(preparedCategories, decision.skip ? "duplicateSkipped" : "duplicate", decision.handle,
+                           in.objectToWorld, projection);
+              return decision;
             }
             if (prepared != nullptr) {
               passKey = frameDrawKey(rangeKey, passInputs, camera);
               const auto firstPass = framePasses.find(passKey);
               if (firstPass != framePasses.end()) {
                 pending = Pending();
-                return mergedPass(firstPass->second, decision);
+                decision = mergedPass(firstPass->second, decision);
+                worldUIEvent(preparedCategories, decision.mode == CommitMode::MergePass ? "mergedPass" : "passDuplicate",
+                             decision.handle, in.objectToWorld, projection);
+                return decision;
               }
             }
           }
@@ -2339,7 +3118,7 @@ namespace dxvk {
           XXH64_hash_t key = pending.key;
           SlotQuery slotMatch = slotQuery(in);
           if (!early) {
-            const bool skinned = (in.flags & translator::DrawInputs::kSkinned) != 0;
+            const bool skinned = (in.flags & D3D9DrawInputs::kSkinned) != 0;
             key = lookupNearest(objectKey, skinned ? in.skinPosition : position, in.contentSignature(), slotMatch);
           }
           if (drawKey != 0) {
@@ -2352,13 +3131,13 @@ namespace dxvk {
             framePreKeys.emplace(frameDrawKey(pending.early.preKey, 0, camera), key);
           }
           Object& object = objects[key];
-          if (!object.change.hasLast && !resetCandidates.empty() && !in.usesCoarseKey()) {
+          if (!object.hasLast && !resetCandidates.empty() && dynamicGeometry && direct && !usesCoarseKey(in)) {
             takeOverAfterReset(object, key, in);
           }
-          if (!in.usesCoarseKey()) {
+          if (!usesCoarseKey(in)) {
             object.resetSignature = in.resetSignature();
           }
-          const bool fresh = !object.change.hasLast;
+          const bool fresh = !object.hasLast;
 
           // Unversioned inputs (user-pointer data, version-0 buffers) compare equal whatever their data: never a repeat.
           // The categories and the camera type also come from sky auto-detection, the draw-call-ID sky rule, texture
@@ -2366,65 +3145,71 @@ namespace dxvk {
           // Terrain baking switched on or off moves terrain between the bake service and plain draws.
           // A view-space texgen draw's texture transform follows the free camera, so it changes every frame the free
           // camera is on, and once more when it is switched off.
-          // A scene copy described before the last translation-invalidating option change is updated once.
-          if (object.state != State::Direct) {
-            object.change.reprepareEpoch = reprepareEpoch;
-          }
-          translator::ChangeInputs change;
-          change.inputs = inputs;
-          change.inputsNoWorld = inputsNoWorld;
-          change.comparable = in.versioned() && !(in.flags & translator::DrawInputs::kVertexTextures);
-          // A move would send a pre-combined draw's world-view to setTransform, so such a change is an Update.
-          change.preCombined = camera.preCombined;
-          change.viewSpaceTexgen = viewSpaceTexgen(in.texgenMode);
-          translator::DerivedState derived;
-          if (prepared != nullptr) {
-            derived.categories = prepared->categories;
-            derived.cameraType = decision.cameraType;
-            derived.terrain = CategoryFlags(prepared->categories).test(InstanceCategories::Terrain);
-            derived.terrainBaking = frontend::terrainBakeActive();
-            derived.freeCamera = frontend::freeCameraEnabled();
-          }
-          const translator::ChangeVerdict verdict =
-            translator::ChangeTest::test(object.change, change, prepared != nullptr ? &derived : nullptr, reprepareEpoch);
-          if (verdict.inputsSame && !verdict.derivedSame) {
+          const bool terrainBaking = TerrainBaker::needsTerrainBaking();
+          const bool freeCamera = RtCamera::enableFreeCamera();
+          const bool derivedSame = prepared == nullptr ||
+            (prepared->categories == object.derivedCategories && decision.cameraType == object.derivedCamera &&
+             (!CategoryFlags(prepared->categories).test(InstanceCategories::Terrain) || terrainBaking == object.derivedTerrainBaking) &&
+             !followsFreeCamera(in.texgenMode, freeCamera || object.derivedFreeCamera));
+          const bool inputsSame = object.hasLast && in.versioned() && !(in.flags & D3D9DrawInputs::kVertexTextures) &&
+                                  inputsNoWorld == object.inputsNoWorld;
+          if (inputsSame && !derivedSame) {
             totals.derivedChanges++;
           }
-          if (verdict.inputsSame && verdict.derivedSame && !verdict.current) {
+          // A scene copy described before the last translation-invalidating option change is updated once.
+          if (object.state != State::Direct) {
+            object.reprepareEpoch = reprepareEpoch;
+          }
+          const bool current = object.reprepareEpoch == reprepareEpoch;
+          if (inputsSame && derivedSame && !current) {
             totals.reprepared++;
           }
-          const bool repeat = verdict.repeat;
-          const bool moved = verdict.moved;
+          const bool repeat = inputsSame && derivedSame && current && inputs == object.inputs;
+          // A move would send a pre-combined draw's world-view to setTransform, so such a change is an Update.
+          const bool moved = inputsSame && derivedSame && current && !repeat && !camera.preCombined;
+          object.inputs = inputs;
+          object.inputsNoWorld = inputsNoWorld;
+          object.hasLast = true;
+          if (prepared != nullptr) {
+            object.derivedCategories = prepared->categories;
+            object.derivedCamera = decision.cameraType;
+            object.derivedTerrainBaking = terrainBaking;
+            object.derivedFreeCamera = freeCamera;
+          }
           object.lastFrame = frame;
           if (early && prepared != nullptr) {
             if (pending.wouldHit) {
-              checkEarly(object, repeat, moved, object.change.preKey, *prepared);
+              checkEarly(object, repeat, moved, object.preKey, *prepared);
             }
-            object.change.hasEarly = true;
-            object.change.preKey = pending.early.preKey;
-            object.change.preKeyNoWorld = pending.early.preKeyNoWorld;
+            object.hasEarly = true;
+            object.preKey = pending.early.preKey;
+            object.preKeyNoWorld = pending.early.preKeyNoWorld;
             object.last = in;
             object.prepared = *prepared;
           } else {
-            object.change.hasEarly = false;
+            object.hasEarly = false;
           }
           pending = Pending();
-          const uint32_t categories = prepared != nullptr ? prepared->categories : object.prepared.categories;
-          noteFog(prepared != nullptr ? prepared->fog : object.prepared.fog);
+          const uint32_t categories = prepared != nullptr ? prepared->categories : object.prepared.categories;  // R7
+          noteFog(prepared != nullptr ? prepared->fog : object.prepared.fog);  // R10
 
-          // Changing draws (rewritten or dynamic buffers, fixed-function skinning, user-pointer data, vertex capture) are
-          // handed over too and updated in place when they change.
-          const bool eligible = (in.versioned() || (in.flags & translator::DrawInputs::kUserPointer)) && !noReference;
+          // Vertex-captured draws are handed over only with rtx.d3d9v2.capturedGeometry (R6): their VS constants change with
+          // the camera, so they are updated in place like R5's dynamic draws.
+          // R5 (rtx.d3d9v2.dynamicGeometry): fixed-function skinned and user-pointer draws too (they are updated in place).
+          const bool eligible = dynamicGeometry
+            ? (in.versioned() || (in.flags & D3D9DrawInputs::kUserPointer)) && !stayOnOldPath &&
+              (!(in.flags & D3D9DrawInputs::kVertexCapture) || frontends::d3d9::capturedGeometryActive())  // R6
+            : in.versioned() && !stayOnOldPath &&
+              !(in.flags & (D3D9DrawInputs::kUserPointer | D3D9DrawInputs::kSkinned | D3D9DrawInputs::kVertexCapture));
+          const bool firstDraw = firstDrawHandoverActive();  // R4
 
-          const bool logSkinned = (in.flags & translator::DrawInputs::kSkinned) && fresh && D3D9V2Options::log();
+          const bool logSkinned = (in.flags & D3D9DrawInputs::kSkinned) && fresh && D3D9V2Options::log();
           std::string skinSearchDetail;
-          if (in.flags & translator::DrawInputs::kSkinned) {
-            // A slot whose last draw had another material, or lay farther than the draw's bone extent from where the
-            // object's last movement would have taken it, held another object or this one changed. Logged before
-            // noteSkinned overwrites the object's last draw.
-            const Vector3 predicted = slotMatch.previousPosition + (object.skinClass != 0 ? object.skinVelocity : Vector3(0.f));
+          if (in.flags & D3D9DrawInputs::kSkinned) {
+            // A slot whose last draw had another material, or lay farther than the draw's bone extent, held another
+            // object or this one changed. Logged before noteSkinned overwrites the object's last draw.
             if (!early && slotMatch.reused && (slotMatch.previousMaterial != in.material ||
-                lengthSqr(predicted - in.skinPosition) > slotMatch.otherMaterialDistanceSqr)) {
+                lengthSqr(slotMatch.previousPosition - in.skinPosition) > slotMatch.otherMaterialDistanceSqr)) {
               totals.skinSwaps++;
               if (D3D9V2Options::log()) {
                 const Vector3& p = slotMatch.previousPosition;
@@ -2440,7 +3225,7 @@ namespace dxvk {
             // a ragdoll) waits one frame, and that character is kept for it. If the character stays undrawn, endFrame
             // moves it to this draw's slot, so the next draw updates it in place with its history instead of building a
             // second copy. A new skinned object without such a character is a new object at once.
-            if (fresh && eligible) {
+            if (fresh && direct && dynamicGeometry && eligible) {
               const SkinSearch search = findSkinnedPartner(in, key);
               if (search.chosen != 0) {
                 const Object& partner = objects.find(search.chosen)->second;
@@ -2463,7 +3248,7 @@ namespace dxvk {
           }
 
           if (object.state == State::Direct) {
-            if (eligible && (repeat || moved)) {
+            if (direct && eligible && (repeat || moved)) {
               if (moved) {
                 batch->moves.push_back({ object.handle, in.objectToWorld });
                 totals.moved++;
@@ -2473,77 +3258,141 @@ namespace dxvk {
               batch->seen.push_back(object.handle);
               noteSortOrder(object, categories, false);
               if (object.rasterService) {
-                // The scene owns the object, and its draw still feeds the raster services.
-                decision.skip = false;
+                // R8b: the scene owns the object; its draw still feeds the sky matte / probe.
                 decision.mode = CommitMode::RasterOnly;
                 decision.handle = object.handle;
                 totals.rasterOnly++;
+              } else if (!explicitCamera && cameraNeedsFeed(view, projection)) {
+                decision.mode = CommitMode::CameraOnly;
+                totals.cameraOnly++;
+              } else {
+                decision.skip = true;
               }
+              worldUIEvent(categories, moved ? "move" : "skip", object.handle, in.objectToWorld, projection);
               return decision;
             }
-            if (eligible) {
-              // Changed but still eligible: described and built again in place under the same handle (the CS thread
+            if (dynamicGeometry && direct && eligible) {
+              // R5: changed but still eligible: described and built again in place under the same handle (the CS thread
               // hands it back itself if the scene no longer takes it).
-              decision.skip = false;
               decision.mode = CommitMode::Update;
               decision.handle = object.handle;
-              object.change.reprepareEpoch = reprepareEpoch;
+              object.reprepareEpoch = reprepareEpoch;
               // A reclassified draw (a world object detected as sky, or the reverse) changes its raster service too.
-              object.rasterService = decision.cameraType == uint32_t(translator::CameraClass::Sky) ||
+              object.rasterService = decision.cameraType == uint32_t(CameraType::Sky) ||
                                      bakedTerrainCategory(categories);
               totals.updates++;
-              batch->seen.push_back(object.handle);  // fed like a skipped draw at the flush (mesh-hash tracking)
+              batch->seen.push_back(object.handle);  // fed like a skipped draw at the flush (mesh-hash tracking, fog)
               noteSortOrder(object, categories, true);
+              noteQueuedCamera(view, projection);
+              worldUIEvent(categories, "update", object.handle, in.objectToWorld, projection);
               return decision;
             }
-            // No longer eligible: the scene's copy goes.
+            worldUIEvent(categories, "handedBack", object.handle, in.objectToWorld, projection);
+            // Changed (or v2 switched off): the scene's copy goes, the old path takes the draw again.
             if (object.skinClass != 0) {
               skinEvent("handedBack", object);
             }
             batch->destroys.push_back(object.handle);
             dropHandle(object);
             totals.changed++;
+            // R4 churn guard: an object that changes soon after its first-draw handover backs off as a rejected one does,
+            // so a draw that changes every frame is not described, built and destroyed every frame.
+            if (firstDraw && frame - object.handoverFrame < kChurnFrames) {
+              object.rejects++;
+              object.backoffUntil = frame + std::min(2048u, 32u << std::min(object.rejects, 6u));
+              totals.churnBackoffs++;
+            }
+          } else if (object.state == State::Pending) {
+            if (repeat) {
+              // Drawn on the old path until accepted; the scene's copy counts as seen too, so it does not age out. The
+              // draw carries the handle so the CS thread knows whose old-path draw it is (V4: handedToScene).
+              batch->pendingSeen.push_back(object.handle);
+              decision.handle = object.handle;
+              totals.pendingRepeats++;
+            } else {
+              // Changed before the scene reported back: its description is stale.
+              batch->destroys.push_back(object.handle);
+              dropHandle(object);
+            }
           }
 
-          if (object.state == State::Legacy) {
-            // Handed over at its first eligible draw: Direct from this draw on (the CS thread builds it at once and
-            // drops the draw if the scene rejects it). The app thread checks the camera, and the CS thread the rest.
-            const bool sceneEligible = eligible && prepared != nullptr && acceptedCamera(decision.cameraType);
+          if (object.state == State::Legacy && direct && firstDraw) {
+            // R4: handed over at its first eligible draw, without an old-path copy: Direct from this draw on (the CS
+            // thread builds it at once and draws it through the old path if the scene rejects it). The app thread checks
+            // what it knows (camera, categories, light conversion, raytraced render targets); the CS thread the rest.
+            const bool services = frontends::d3d9::specialCategoriesActive();  // R8
+            const bool unordered = frontends::d3d9::unorderedActive();         // R7
+            const bool sceneEligible = eligible && prepared != nullptr &&
+              acceptedCamera(decision.cameraType) &&  // R8 / R8b
+              !specialCategory(CategoryFlags(prepared->categories), unordered, services) &&
+              (services || !prepared->convertsToLight) && (renderTargetsActive() || !prepared->raytracedRenderTarget);
             if ((!sceneEligible || frame < object.backoffUntil) && prepared != nullptr && D3D9V2Options::log()) {
-              countNotEligible(eligible, sceneEligible && frame < object.backoffUntil, decision.cameraType);
+              countNotEligible(eligible, sceneEligible && frame < object.backoffUntil, decision.cameraType, *prepared,
+                               services, unordered);
             }
             if (sceneEligible && frame >= object.backoffUntil) {
               object.state = State::Direct;
               object.handle = kHandleNamespace | nextHandle++;
+              object.handoverFrame = frame;
               byHandle[object.handle] = key;
-              decision.skip = false;
               decision.mode = CommitMode::HandoverFirstDraw;
               decision.handle = object.handle;
-              object.rasterService = decision.cameraType == uint32_t(translator::CameraClass::Sky) ||  // sky matte and probe
+              object.rasterService = decision.cameraType == uint32_t(CameraType::Sky) ||  // R8b: sky matte / probe
                                      bakedTerrainCategory(categories);  // bake
               totals.handovers++;
-              // Fed like a skipped draw at the flush (mesh-hash tracking).
+              // Fed like a skipped draw at the flush (mesh-hash tracking, fog).
               batch->seen.push_back(object.handle);
               noteSortOrder(object, categories, true);
             }
-          }
-          if (object.state != State::Direct) {
-            totals.dropped++;
+          } else if (object.state == State::Legacy && direct) {
+            // Probation path.
+            object.streak = (repeat && eligible) ? object.streak + 1 : 0;
+            if (object.streak >= std::max(1u, D3D9V2Options::handoverFrames()) && frame >= object.backoffUntil) {
+              object.state = State::Pending;
+              object.handle = kHandleNamespace | nextHandle++;
+              byHandle[object.handle] = key;
+              decision.mode = CommitMode::Handover;
+              decision.handle = object.handle;
+              totals.handovers++;
+            }
           }
           if (logSkinned) {
-            skinEvent("created", object, str::format(object.state == State::Direct ? "scene-owned" : "not handed over",
+            skinEvent("created", object, str::format(object.state == State::Direct ? "scene-owned" : "old path",
                                                      skinSearchDetail.empty() ? "" : " ", skinSearchDetail));
           }
+          noteQueuedCamera(view, projection);
+          worldUIEvent(categories,
+                       decision.mode == CommitMode::HandoverFirstDraw ? "handover"
+                       : decision.mode == CommitMode::Handover ? "handoverAfterRepeats"
+                       : object.state == State::Pending ? "pendingOldPath" : "oldPath",
+                       decision.handle, in.objectToWorld, projection);
           return decision;
         }
 
-        std::shared_ptr<translator::FrameBatch> takeBatch() {
+        std::shared_ptr<FrameBatch> takeBatch() {
           if (batchTaken) {
             return nullptr;
           }
           batchTaken = true;
-          std::shared_ptr<translator::FrameBatch> taken = std::move(batch);
-          batch = std::make_shared<translator::FrameBatch>();
+          batch->frameEvents = frontends::d3d9::frameEventsActive();  // R10
+          if (!D3D9V2Options::direct() && !byHandle.empty()) {
+            // Switched off: every object goes back to the old path; the CS thread drops the scene's copies.
+            batch->releaseAll = true;
+            for (auto& [handle, key] : byHandle) {
+              const auto found = objects.find(key);
+              if (found != objects.end()) {
+                found->second.handle = 0;
+                found->second.state = State::Legacy;
+                found->second.streak = 0;
+              }
+            }
+            byHandle.clear();
+          }
+          if (batch->empty() && byHandle.empty() && !D3D9V2Options::direct()) {
+            return nullptr;
+          }
+          std::shared_ptr<FrameBatch> taken = std::move(batch);
+          batch = std::make_shared<FrameBatch>();
           return taken;
         }
 
@@ -2551,7 +3400,7 @@ namespace dxvk {
           if (channel == nullptr) {
             return;
           }
-          std::vector<translator::Channel::Result> results;
+          std::vector<Channel::Result> results;
           {
             std::lock_guard<std::mutex> lock(channel->mutex);
             results.swap(channel->results);
@@ -2560,10 +3409,10 @@ namespace dxvk {
               ++reprepareEpoch;
             }
           }
-          for (const translator::Channel::Result& result : results) {
+          for (const Channel::Result& result : results) {
             const auto found = byHandle.find(result.handle);
             if (found == byHandle.end()) {
-              continue;  // dropped here already (changed)
+              continue;  // dropped here already (changed, or switched off)
             }
             const auto object = objects.find(found->second);
             if (object == objects.end()) {
@@ -2571,23 +3420,30 @@ namespace dxvk {
               continue;
             }
             Object& o = object->second;
-            if (o.skinClass != 0) {
-              skinEvent(result.kind == translator::Channel::Kind::Rejected ? "rejected"
-                        : result.kind == translator::Channel::Kind::Released ? "released" : "retry", o);
+            if (o.skinClass != 0 && result.kind != Channel::Kind::Accepted) {
+              skinEvent(result.kind == Channel::Kind::Rejected ? "rejected"
+                        : result.kind == Channel::Kind::Released ? "released" : "retry", o);
             }
             switch (result.kind) {
-            case translator::Channel::Kind::Rejected:
+            case Channel::Kind::Accepted:
+              if (o.state == State::Pending) {
+                o.state = State::Direct;
+              }
+              break;
+            case Channel::Kind::Rejected:
+              // R4: the destroy also tells the CS thread to drop its fallback draw (a no-op for other handovers).
               batch->destroys.push_back(result.handle);
               dropHandle(o);
               o.rejects++;
-              o.backoffUntil = frame + translator::ChangeTest::backoffFrames(o.rejects);
+              // Back off: a draw the scene keeps rejecting is not handed over every few frames.
+              o.backoffUntil = frame + std::min(2048u, 32u << std::min(o.rejects, 6u));
               break;
-            case translator::Channel::Kind::Released:
+            case Channel::Kind::Released:
               // The CS thread keeps the entry until this destroy, so the object never goes missing in between.
               batch->destroys.push_back(result.handle);
               dropHandle(o);
               break;
-            case translator::Channel::Kind::Retry:
+            case Channel::Kind::Retry:
               batch->destroys.push_back(result.handle);
               dropHandle(o);
               break;
@@ -2602,12 +3458,14 @@ namespace dxvk {
             resetCandidates.clear();
           }
           batchTaken = false;
-          matcher.endFrame();
+          occurrence.clear();
+          slotCursors.clear();
           frameDraws.clear();
           framePreKeys.clear();
           framePasses.clear();
-          decalRank.endFrame();
-          fogOrder.endFrame();
+          queuedCameraValid = false;
+          decalRank = 0;
+          fogSeenThisFrame.clear();
           cameras.endFrame();
           ++frame;
           // Objects the game no longer draws are forgotten after a while (scene-owned ones only once released).
@@ -2624,7 +3482,17 @@ namespace dxvk {
             }
             // A slot is freed once nothing has drawn it for as long and its object is forgotten, so an anti-culled
             // object the scene still owns keeps its slot.
-            matcher.freeSlots(frame, [&](XXH64_hash_t key) { return objects.find(key) != objects.end(); });
+            for (auto it = slots.begin(); it != slots.end();) {
+              bool anyValid = false;
+              for (uint32_t i = 0; i < uint32_t(it->second.size()); ++i) {
+                PositionSlot& slot = it->second[i];
+                if (slot.valid && slot.lastFrame + 120 < frame && objects.find(slotKey(it->first, i)) == objects.end()) {
+                  slot.valid = false;
+                }
+                anyValid |= slot.valid;
+              }
+              it = anyValid ? std::next(it) : slots.erase(it);
+            }
             for (auto it = skinnedByClass.begin(); it != skinnedByClass.end();) {
               std::vector<XXH64_hash_t>& keys = it->second;
               const XXH64_hash_t skinClass = it->first;
@@ -2641,53 +3509,55 @@ namespace dxvk {
       D3D9FrontendApp::D3D9FrontendApp()
         : m_impl(std::make_shared<Impl>()) {
         frontend_ui::registerPanel(frontend_ui::Group::Geometry, &drawPanel);
-        frontend_ui::registerPanel(frontend_ui::Group::Heuristics, &drawHeuristicsPanel);
-        frontend_ui::registerPanel(frontend_ui::Group::TuningSections, &drawShaderSupportPanel);
-        frontend_ui::registerPanel(frontend_ui::Group::SelfChecks, &drawSelfChecksPanel);
       }
 
       void D3D9FrontendApp::connect(D3D9Frontend& cs) {
         m_impl->channel = cs.m_impl->channel;
       }
 
-      Decision D3D9FrontendApp::decide(const translator::DrawInputs& inputs, const translator::CameraInputs& camera, const PreparedState* prepared) {
+      bool D3D9FrontendApp::wantsInputs() const {
+        return D3D9V2Options::log() || D3D9V2Options::direct() || !m_impl->byHandle.empty();
+      }
+
+      Decision D3D9FrontendApp::decide(const D3D9DrawInputs& inputs, const CameraInputs& camera, bool neverHandOver,
+                                       const PreparedState* prepared) {
         if (D3D9V2Options::log()) {
           m_impl->wasActive = true;
           m_impl->observe(inputs);
         }
-        return m_impl->decide(inputs, camera, prepared);
+        return m_impl->decide(inputs, camera, neverHandOver, prepared);
+      }
+
+      bool D3D9FrontendApp::earlyChangeTestActive() const {
+        return frontends::d3d9::earlyChangeTestActive();
       }
 
       bool D3D9FrontendApp::statsActive() const {
         return D3D9V2Options::log();
       }
 
-      bool D3D9FrontendApp::earlyCheck(const translator::DrawInputs& identity, const translator::EarlyKey& key, translator::CameraInputs camera,
+      bool D3D9FrontendApp::capturedGeometryActive() const {
+        return frontends::d3d9::capturedGeometryActive();
+      }
+
+      bool D3D9FrontendApp::unorderedActive() const {
+        return frontends::d3d9::unorderedActive();
+      }
+
+      bool D3D9FrontendApp::lightsActive() const {
+        return frontends::d3d9::lightsActive();
+      }
+
+      bool D3D9FrontendApp::earlyCheck(const D3D9DrawInputs& identity, const EarlyKey& key, CameraInputs camera,
                                        const SkyDetectInputs& sky, Decision& decision, PreparedState& stored) {
         return m_impl->earlyCheck(identity, key, camera, sky, decision, stored, D3D9V2Options::log());
       }
 
-      uint32_t D3D9FrontendApp::perDrawRenderState() const {
-        return D3D9V2Options::perDrawRenderState();
-      }
-
-      uint32_t D3D9FrontendApp::perDrawMask() const {
-        return 1u << (D3D9V2Options::perDrawRenderStateBit() & 31u);
-      }
-
-      uint32_t D3D9FrontendApp::perDrawUnmarkedValue() const {
-        return D3D9V2Options::perDrawRenderStateUnmarkedValue();
-      }
-
-      Decision D3D9FrontendApp::perDraw(const translator::FogRecord& fog) {
+      void D3D9FrontendApp::notePerDrawPath(const FogInputs& fog) {
         m_impl->noteFog(fog);
-        Decision decision;
-        decision.skip = false;
-        decision.mode = CommitMode::PerDraw;
-        return decision;
       }
 
-      std::shared_ptr<translator::FrameBatch> D3D9FrontendApp::takeFrameBatch() {
+      std::shared_ptr<FrameBatch> D3D9FrontendApp::takeFrameBatch() {
         return m_impl->takeBatch();
       }
 
@@ -2707,6 +3577,44 @@ namespace dxvk {
         }
         m_impl->endStatsFrame();
       }
+
+#else
+
+      struct D3D9Frontend::Impl { };
+      struct D3D9FrontendApp::Impl { };
+      struct FrameBatch { };
+
+      D3D9Frontend::D3D9Frontend() { }
+
+      void D3D9Frontend::commit(RtxContext* ctx, const DrawParameters& params, DrawCallState& drawCallState,
+                                CommitMode, uint64_t) {
+        // The old path (the fallback until D3D9 v2 matches it; deleted in Phase 6).
+        ctx->commitGeometryToRT(params, drawCallState);
+      }
+
+      void D3D9Frontend::flush(RtxContext*, const std::shared_ptr<FrameBatch>&) { }
+
+      void D3D9Frontend::lights(RtxContext* ctx, const D3DLIGHT9* lights, uint32_t count, bool) {
+        ctx->addLights(lights, count);
+      }
+
+      D3D9FrontendApp::D3D9FrontendApp() { }
+      void D3D9FrontendApp::connect(D3D9Frontend&) { }
+      bool D3D9FrontendApp::wantsInputs() const { return false; }
+      Decision D3D9FrontendApp::decide(const D3D9DrawInputs&, const CameraInputs&, bool, const PreparedState*) { return Decision(); }
+      bool D3D9FrontendApp::earlyChangeTestActive() const { return false; }
+      bool D3D9FrontendApp::statsActive() const { return false; }
+      bool D3D9FrontendApp::capturedGeometryActive() const { return false; }
+      bool D3D9FrontendApp::unorderedActive() const { return false; }
+      bool D3D9FrontendApp::lightsActive() const { return false; }
+      bool D3D9FrontendApp::earlyCheck(const D3D9DrawInputs&, const EarlyKey&, CameraInputs, const SkyDetectInputs&, Decision&,
+                                       PreparedState&) { return false; }
+      void D3D9FrontendApp::notePerDrawPath(const FogInputs&) { }
+      std::shared_ptr<FrameBatch> D3D9FrontendApp::takeFrameBatch() { return nullptr; }
+      void D3D9FrontendApp::endFrame() { }
+      void D3D9FrontendApp::onDeviceReset() { }
+
+#endif
 
     } // namespace d3d9
   } // namespace frontends

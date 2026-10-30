@@ -24,18 +24,21 @@
 // relaxed cone on synthetic height fields. Soundness: the stored (quantised) cone never exceeds the brute-force one at
 // any texel (the hierarchical search skips bounds that cannot change the stored value, so its unquantised result may).
 // Tightness (stored / brute force, averaged) is reported, not asserted.
-// Also the conservative cones of a generator without its ray walk (rayStepsPerCandidate = 0) against a brute-force
-// conservative cone.
+// Also the conservative variant (no ray walk) against a brute-force conservative cone,
+// and the blended-terrain cone of pom_sccr_terrain.slangh (per-layer conservative cones combined with the layer
+// weights held fixed) against a brute-force conservative cone of the blended field.
 // Also the march's crossing refinement (bisections, a false-position step, a final secant): it keeps a
 // crossing bracketed and its bracket within the bisection bound.
 // Also the curvature correction's base surface (surface_interaction_sccr.slangh, copied below): its UV
 // expansion around a hit reproduces the half-strength Phong patch, is 0 at the vertices, stays within its bound on the
 // triangle, and matches a circular arc on a sphere.
+// Also blends reduced to their heaviest layers (sccrTerrainReduceLayers): the kept set and the
+// soundness of the reduced blend's cone.
 // Also the self-shadow march's early returns: the same visibility as the full refinement wherever a
 // crossing lies before the texel.
 // The generator's hierarchical search (square power-of-two maps): its conservative variant against the
 // brute-force conservative cone (sound, and exact up to one step of the stored quantisation; sound with the visit cap
-// too), and its mean cone and reads per texel against a windowed reference generator (windowedRatio below) and
+// too), and its mean cone and reads per texel against the old windowed generator (kept below as windowedRatio) and
 // coarse cones.
 
 #include <algorithm>
@@ -118,7 +121,7 @@ uint32_t farLevelsFor(int width, int height) {
   return farLevels;
 }
 
-// The windowed reference generator's pyramid levels: up to nearRadius * 2^levels >= the width.
+// The old generator's pyramid levels (before the hierarchical search): up to nearRadius * 2^levels >= the width.
 uint32_t windowedFarLevelsFor(int width, int height, uint32_t nearRadius) {
   const uint32_t w = uint32_t(width);
   uint32_t farLevels = 0;
@@ -319,8 +322,8 @@ float generateRatio(const std::vector<DepthField>& pyramid, int px, int py, int 
   return ratio;
 }
 
-// The windowed reference generator (a window walked in full, fixed rings of pyramid cells beyond it), before
-// quantization, to compare cone widths and reads. Its pyramid levels come from
+// The old generator (pom_cone_generate.comp.slang before the hierarchical search: a window walked in full, fixed rings
+// of pyramid cells beyond it), before quantisation, to compare cone widths and reads. Its pyramid levels come from
 // windowedFarLevelsFor; a deeper pyramid serves as well (it reads no further).
 float windowedRatio(const std::vector<DepthField>& pyramid, int px, int py, int radius, uint32_t raySteps,
                     uint32_t farLevels, uint64_t* reads = nullptr) {
@@ -475,7 +478,7 @@ float storedCone(float ratio) {
   return stored * stored;
 }
 
-// Cones generated without a ray walk (rayStepsPerCandidate = 0) never exceed the conservative cone.
+// The conservative variant (rayStepsPerCandidate = 0) never exceeds the conservative cone.
 void checkConservative(const std::string& name, const DepthField& field, int radius) {
   const uint32_t farLevels = farLevelsFor(field.width, field.height);
   const std::vector<DepthField> pyramid = buildPyramid(field, farLevels);
@@ -498,6 +501,139 @@ void checkConservative(const std::string& name, const DepthField& field, int rad
   }
   std::printf("  %-28s %3dx%-3d radius %2d, conservative, far levels %u: sound, tightness %.3f\n", name.c_str(),
               field.width, field.height, radius, farLevels, tightnessCount > 0 ? tightnessSum / tightnessCount : 1.0);
+}
+
+// Pom_sccr_terrain.slangh's cone for a blend of layers with fixed weights w_i (W = their sum, plus
+// the weight of layers without a height map, which are flat): depth D = sum_i w_i D_i / W, and from each layer's
+// conservative cone D_i(q) >= D_i(p) - |q - p| / c_i, so D(q) >= D(p) - |q - p| * sum_i (w_i / W) / c_i. The cone is
+// 1 / sum_i (w_i / W) / c_i (at least the smallest c_i); a layer with a stored cone of 0 makes it 0 (a linear step).
+// Checked against the exact conservative cone of the blended field. Also counts the texels where the same combination
+// of relaxed cones would be too wide (reported only: why terrain layers take the conservative variant).
+void checkBlend(const std::string& name, const std::vector<DepthField>& layers, const std::vector<float>& weights,
+                float flatWeight, int radius) {
+  const DepthField& first = layers[0];
+  const uint32_t farLevels = farLevelsFor(first.width, first.height);
+  float weightSum = flatWeight;
+  for (const float w : weights) {
+    weightSum += w;
+  }
+  std::vector<std::vector<DepthField>> pyramids;
+  for (const DepthField& layer : layers) {
+    pyramids.push_back(buildPyramid(layer, farLevels));
+  }
+  DepthField blend;
+  blend.width = first.width;
+  blend.height = first.height;
+  blend.depth.assign(first.depth.size(), 0.0f);
+  for (size_t i = 0; i < blend.depth.size(); ++i) {
+    for (size_t layer = 0; layer < layers.size(); ++layer) {
+      blend.depth[i] += weights[layer] * layers[layer].depth[i] / weightSum;
+    }
+  }
+
+  constexpr float kNoBound = 1e30f;
+  int relaxedTooWide = 0;
+  double tightnessSum = 0.0;
+  int tightnessCount = 0;
+  for (int y = 0; y < blend.height; ++y) {
+    for (int x = 0; x < blend.width; ++x) {
+      float slope = 0.0f;
+      float relaxedSlope = 0.0f;
+      bool linear = false;
+      bool relaxedLinear = false;
+      for (size_t layer = 0; layer < layers.size(); ++layer) {
+        const float cone = storedCone(generateRatio(pyramids[layer], x, y, radius, 0, farLevels));
+        const float relaxedCone = storedCone(generateRatio(pyramids[layer], x, y, radius, 8, farLevels));
+        if (cone > 0.0f) {
+          slope += weights[layer] / weightSum / cone;
+        } else {
+          linear = true;
+        }
+        if (relaxedCone > 0.0f) {
+          relaxedSlope += weights[layer] / weightSum / relaxedCone;
+        } else {
+          relaxedLinear = true;
+        }
+      }
+      const float combined = linear ? 0.0f : (slope > 0.0f ? 1.0f / slope : kNoBound);
+      const float relaxedCombined = relaxedLinear ? 0.0f : (relaxedSlope > 0.0f ? 1.0f / relaxedSlope : kNoBound);
+      const float reference = bruteForceConservativeRatio(blend, x, y, kNoBound);
+      if (combined > reference * (1.0f + 1e-4f) + 1e-6f) {
+        std::cerr << name << ": texel (" << x << ", " << y << ") blended cone " << combined << " > brute force "
+                  << reference << std::endl;
+        throw std::runtime_error("blended terrain cone is not conservative");
+      }
+      if (relaxedCombined > reference * (1.0f + 1e-4f) + 1e-6f) {
+        ++relaxedTooWide;
+      }
+      if (reference > 0.0f && reference < kNoBound) {
+        tightnessSum += std::min(combined, reference) / reference;
+        ++tightnessCount;
+      }
+    }
+  }
+  std::printf("  %-28s %3dx%-3d radius %2d, %zu layers + flat %.2f: sound, tightness %.3f, relaxed too wide at %d texels\n",
+              name.c_str(), blend.width, blend.height, radius, layers.size(), flatWeight / weightSum,
+              tightnessCount > 0 ? tightnessSum / tightnessCount : 1.0, relaxedTooWide);
+}
+
+// CPU copy of sccrTerrainReduceLayers (pom_sccr_terrain.slangh): the maxLayers layers with the
+// largest weights (ties: the lower index) are kept, the others leave the blend with their weight. Returns the kept mask.
+std::vector<bool> reduceLayers(const std::vector<float>& weights, uint32_t maxLayers) {
+  std::vector<bool> keep(weights.size(), true);
+  if (maxLayers == 0 || weights.size() <= maxLayers) {
+    return keep;
+  }
+  for (size_t i = 0; i < weights.size(); ++i) {
+    uint32_t rank = 0;
+    for (size_t j = 0; j < weights.size(); ++j) {
+      if (j != i && (weights[j] > weights[i] || (weights[j] == weights[i] && j < i))) {
+        ++rank;
+      }
+    }
+    keep[i] = rank < maxLayers;
+  }
+  return keep;
+}
+
+// The reduced blend is a blend of the kept layers with their own weights and the flat weight unchanged (W minus the
+// dropped weights), so checkBlend on it checks the reduced field's cone exactly as the shader computes it. Also checks
+// that the kept set is the top maxLayers, and prints how far the reduced field lies from the full one (in depth units).
+void checkReducedBlend(const std::string& name, const std::vector<DepthField>& layers, const std::vector<float>& weights,
+                       float flatWeight, int radius, uint32_t maxLayers) {
+  const std::vector<bool> keep = reduceLayers(weights, maxLayers);
+  std::vector<DepthField> keptLayers;
+  std::vector<float> keptWeights;
+  float smallestKept = 1e30f, largestDropped = -1.0f;
+  for (size_t i = 0; i < layers.size(); ++i) {
+    if (keep[i]) {
+      keptLayers.push_back(layers[i]);
+      keptWeights.push_back(weights[i]);
+      smallestKept = std::min(smallestKept, weights[i]);
+    } else {
+      largestDropped = std::max(largestDropped, weights[i]);
+    }
+  }
+  if (keptLayers.size() != std::min<size_t>(layers.size(), maxLayers) || largestDropped > smallestKept) {
+    throw std::runtime_error(name + ": reduced layers are not the heaviest");
+  }
+  float fullSum = flatWeight, keptSum = flatWeight;
+  for (size_t i = 0; i < layers.size(); ++i) {
+    fullSum += weights[i];
+    keptSum += keep[i] ? weights[i] : 0.0f;
+  }
+  float maxDifference = 0.0f;
+  for (size_t t = 0; t < layers[0].depth.size(); ++t) {
+    float full = 0.0f, reduced = 0.0f;
+    for (size_t i = 0; i < layers.size(); ++i) {
+      full += weights[i] * layers[i].depth[t] / fullSum;
+      reduced += keep[i] ? weights[i] * layers[i].depth[t] / keptSum : 0.0f;
+    }
+    maxDifference = std::max(maxDifference, std::abs(full - reduced));
+  }
+  std::printf("  %-28s top %u of %zu layers: field moves by at most %.3f of the depth\n", name.c_str(), maxLayers,
+              layers.size(), maxDifference);
+  checkBlend(name + " top " + std::to_string(maxLayers), keptLayers, keptWeights, flatWeight, radius);
 }
 
 // pom_cone_coarse.comp.slang's ring (POM_CONE_COARSE_RING) and its levels (PomConeMapManager::recordCoarse): the
@@ -1295,6 +1431,354 @@ void checkBaseSurface() {
   std::printf("  base surface: expansion error %.2e of the bound, sagitta error %.2f%%\n", worstExpansion, worstSagitta * 100.0);
 }
 
+// Live terrain weights (pom_sccr_terrain.slangh, PomLiveLayeredConeField). A terrain-like
+// blend: height layers that tile every UV unit, per-vertex layer weights on a grid (bilinear between vertices, as the
+// FNV weight maps reproduce the game's per-vertex blend), and a flat layer. Rays are aimed at relief points q* of the
+// true field D(q) = sum_i w_i(q) D_i(q) / W(q) from many directions; a march whose weights are held at the ray's mesh
+// point (the old field, PomLayeredConeField) and the live march are compared:
+// - rigidity: where nothing occludes q* (a dense march of the true field finds it first), how far each march's hit
+//   lies from q*. The relief is rigid when the hit does not depend on the direction the texel is seen from; the frozen
+//   march's error is the sliding. Asserted: the live march finds q* within the refinement's precision on all but a
+//   handful of rays, and its mean error is far below the frozen one.
+// - crossings: on random rays, how often the live march's hit lies beyond the dense reference's first crossing (a
+//   step that passed a crossing), with the weight-slope term G and without it. Asserted: rare with G.
+struct TerrainModel {
+  std::vector<DepthField> layers;               // height layers
+  std::vector<std::vector<float>> storedCones;  // per layer and texel: the stored conservative cone (G squared)
+  int gridSize = 0;                             // vertices per side; vertex (i, j) at uv (i, j) * spacing
+  float spacing = 0.0f;
+  int layerCount = 0;                           // height layers + 1 flat layer (the last)
+  std::vector<float> vertexWeights;             // gridSize^2 * layerCount, normalised per vertex
+
+  std::vector<float> weightsAt(float u, float v) const {
+    const float fx = std::clamp(u / spacing, 0.0f, float(gridSize - 1));
+    const float fy = std::clamp(v / spacing, 0.0f, float(gridSize - 1));
+    const int x0 = std::min(int(fx), gridSize - 2);
+    const int y0 = std::min(int(fy), gridSize - 2);
+    const float tx = fx - x0, ty = fy - y0;
+    std::vector<float> w(layerCount);
+    for (int l = 0; l < layerCount; ++l) {
+      auto at = [&](int x, int y) { return vertexWeights[(size_t(y) * gridSize + x) * layerCount + l]; };
+      w[l] = (at(x0, y0) * (1 - tx) + at(x0 + 1, y0) * tx) * (1 - ty) + (at(x0, y0 + 1) * (1 - tx) + at(x0 + 1, y0 + 1) * tx) * ty;
+    }
+    return w;
+  }
+
+  // The cone a layer sample reads: the smallest stored cone of the four texels the bilinear sample blends.
+  float coneAt(size_t layer, float u, float v) const {
+    const DepthField& field = layers[layer];
+    const int x0 = int(std::floor(u * field.width - 0.5f));
+    const int y0 = int(std::floor(v * field.height - 0.5f));
+    float cone = 1e30f;
+    for (int dy = 0; dy <= 1; ++dy) {
+      for (int dx = 0; dx <= 1; ++dx) {
+        const int wx = (((x0 + dx) % field.width) + field.width) % field.width;
+        const int wy = (((y0 + dy) % field.height) + field.height) % field.height;
+        cone = std::min(cone, storedCones[layer][size_t(wy) * field.width + wx]);
+      }
+    }
+    return cone;
+  }
+};
+
+// A field as PomLiveLayeredConeField (live) or PomLayeredConeField (frozen weights) computes it. keep: the height layers
+// kept; dropped height layers leave W.
+struct TerrainFieldModel {
+  const TerrainModel* model = nullptr;
+  bool live = true;
+  std::vector<float> frozenWeights;
+  std::vector<bool> keep;
+  float weightSlope = 0.0f;
+
+  float depthAt(float u, float v, float* coneOut) const {
+    const std::vector<float> w = live ? model->weightsAt(u, v) : frozenWeights;
+    const size_t heightLayers = model->layers.size();
+    float weightSum = 0.0f, depth = 0.0f, slope = 0.0f;
+    bool linear = false;
+    for (int l = 0; l < model->layerCount; ++l) {
+      const bool isHeight = size_t(l) < heightLayers;
+      if ((isHeight && !keep[l]) || w[l] <= 0.0f) {
+        continue;
+      }
+      weightSum += w[l];
+      if (!isHeight) {
+        continue;
+      }
+      depth += w[l] * sampleBilinear(model->layers[l], u, v);
+      const float cone = model->coneAt(l, u, v);
+      if (cone > 0.0f) {
+        slope += w[l] / cone;
+      } else {
+        linear = true;
+      }
+    }
+    const float inv = weightSum > 1e-5f ? 1.0f / weightSum : 0.0f;
+    slope = slope * inv + weightSlope;
+    if (coneOut != nullptr) {
+      *coneOut = linear ? 0.0f : (slope * 16.0f > 1.0f ? 1.0f / slope : 16.0f);
+    }
+    return depth * inv;
+  }
+};
+
+// CPU copy of pomConeStepMarchRefined (pom_sccr.slangh), over a TerrainFieldModel.
+MarchPoint terrainMarch(const TerrainFieldModel& field, MarchPoint start, float du, float dv, float minStep,
+                        uint32_t coneSteps, uint32_t binarySteps, bool& crossed, int* samples = nullptr) {
+  const float rayRatio = std::hypot(du, dv);
+  const uint32_t maxSteps = coneSteps + uint32_t(std::ceil(1.0f / minStep)) + 1u;
+  MarchPoint position = start, prev = start;
+  float gap = 0.0f, prevGap = 0.0f;
+  bool hasPrev = false;
+  crossed = false;
+  for (uint32_t i = 0; i < maxSteps; ++i) {
+    float cone = 0.0f;
+    gap = field.depthAt(position.u, position.v, &cone) - position.z;
+    if (samples != nullptr) {
+      ++*samples;
+    }
+    if (gap <= 0.0f) {
+      crossed = true;
+      break;
+    }
+    if (position.z >= 1.0f) {
+      break;
+    }
+    float advance = minStep;
+    if (i < coneSteps && cone > 0.0f) {
+      advance = std::max(cone * gap / (rayRatio + cone), minStep);
+    }
+    advance = std::min(advance, 1.0f - position.z);
+    prev = position;
+    prevGap = gap;
+    hasPrev = true;
+    position = { position.u + du * advance, position.v + dv * advance, position.z + advance };
+  }
+  if (!crossed || !hasPrev) {
+    return position;
+  }
+  MarchPoint above = prev, below = position;
+  float aboveGap = prevGap, belowGap = gap;
+  auto gapOf = [&](const MarchPoint& p) { return field.depthAt(p.u, p.v, nullptr) - p.z; };
+  const uint32_t bisections = binarySteps > 0 ? binarySteps - 1 : 0;
+  for (uint32_t j = 0; j < bisections; ++j) {
+    const MarchPoint middle = mix(above, below, 0.5f);
+    const float middleGap = gapOf(middle);
+    if (middleGap > 0.0f) { above = middle; aboveGap = middleGap; } else { below = middle; belowGap = middleGap; }
+  }
+  if (binarySteps > 0) {
+    const MarchPoint secant = mix(above, below, std::clamp(aboveGap / std::max(aboveGap - belowGap, 1e-6f), 0.0f, 1.0f));
+    const float secantGap = gapOf(secant);
+    if (secantGap > 0.0f) { above = secant; aboveGap = secantGap; } else { below = secant; belowGap = secantGap; }
+  }
+  return mix(above, below, std::clamp(aboveGap / std::max(aboveGap - belowGap, 1e-6f), 0.0f, 1.0f));
+}
+
+// The first crossing of the true (live, every layer) field by dense steps from start, refined by bisection.
+bool denseFirstCrossing(const TerrainFieldModel& field, MarchPoint start, float du, float dv, MarchPoint& hit) {
+  constexpr int kSteps = 4096;
+  MarchPoint prev = start;
+  float prevGap = field.depthAt(start.u, start.v, nullptr) - start.z;
+  if (prevGap <= 0.0f) {
+    hit = start;
+    return true;
+  }
+  for (int k = 1; k <= kSteps; ++k) {
+    const float z = float(k) / kSteps;
+    const MarchPoint p { start.u + du * z, start.v + dv * z, start.z + z };
+    const float gap = field.depthAt(p.u, p.v, nullptr) - p.z;
+    if (gap <= 0.0f) {
+      MarchPoint a = prev, b = p;
+      for (int j = 0; j < 20; ++j) {
+        const MarchPoint m = mix(a, b, 0.5f);
+        if (field.depthAt(m.u, m.v, nullptr) - m.z > 0.0f) { a = m; } else { b = m; }
+      }
+      hit = b;
+      return true;
+    }
+    prev = p;
+    prevGap = gap;
+  }
+  return false;
+}
+
+// Total variation of the blend's shares between two weight vectors (sccrTerrainShareVariation).
+float shareVariation(const std::vector<float>& a, const std::vector<float>& b, const std::vector<bool>& inBlend) {
+  float sumA = 0.0f, sumB = 0.0f;
+  for (size_t l = 0; l < a.size(); ++l) {
+    if (inBlend[l]) { sumA += a[l]; sumB += b[l]; }
+  }
+  float tv = 0.0f;
+  for (size_t l = 0; l < a.size(); ++l) {
+    if (inBlend[l]) {
+      tv += std::abs((sumA > 1e-5f ? a[l] / sumA : 0.0f) - (sumB > 1e-5f ? b[l] / sumB : 0.0f));
+    }
+  }
+  return tv;
+}
+
+// The live field of a march from start to end (sccrTerrainLiveFieldCreate with probes start, start, end): every height
+// layer kept (terrainMaxLayers 0), G from the share variation over the segment times the safety factor (1).
+TerrainFieldModel liveFieldFor(const TerrainModel& model, MarchPoint start, float du, float dv, float safety) {
+  TerrainFieldModel field;
+  field.model = &model;
+  field.live = true;
+  field.keep.assign(model.layers.size(), true);
+  const std::vector<bool> inBlend(model.layerCount, true);
+  const float length = std::hypot(du, dv);
+  if (length > 1e-6f) {
+    const float tv = shareVariation(model.weightsAt(start.u, start.v), model.weightsAt(start.u + du, start.v + dv), inBlend);
+    field.weightSlope = safety * 0.5f * tv / length;
+  }
+  return field;
+}
+
+void checkLiveWeights(const std::string& name, const TerrainModel& model, float totalHeight) {
+  std::mt19937 rng(321);
+  std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
+  TerrainFieldModel truth;
+  truth.model = &model;
+  truth.live = true;
+  truth.keep.assign(model.layers.size(), true);
+  const float extent = model.spacing * float(model.gridSize - 1);
+  const float minStep = 1.0f / 64.0f;
+  const float texel = 1.0f / float(model.layers[0].width);
+
+  // Rigidity.
+  double frozenError = 0.0, liveError = 0.0, frozenMax = 0.0, liveMax = 0.0;
+  int rigidRays = 0, liveOff = 0;
+  for (int trial = 0; trial < 3000; ++trial) {
+    const MarchPoint target0 { extent * (0.2f + 0.6f * uniform(rng)), extent * (0.2f + 0.6f * uniform(rng)), 0.0f };
+    const float targetDepth = truth.depthAt(target0.u, target0.v, nullptr);
+    const MarchPoint target { target0.u, target0.v, targetDepth };
+    const float angle = uniform(rng) * 2.0f * kPi;
+    const float viewZ = 0.1f + 0.8f * uniform(rng); // 26 to 84 degrees from the normal
+    const float slope = std::sqrt(1.0f - viewZ * viewZ) / viewZ * totalHeight;
+    const float du = std::cos(angle) * slope, dv = std::sin(angle) * slope;
+    // The ray's mesh point (the mesh is the top of the field, depth 0).
+    const MarchPoint start { target.u - du * targetDepth, target.v - dv * targetDepth, 0.0f };
+    MarchPoint reference;
+    if (!denseFirstCrossing(truth, start, du, dv, reference) ||
+        std::hypot(reference.u - target.u, reference.v - target.v) > 0.01f * texel) {
+      continue; // occluded (or grazing the field): q* is not what this ray sees
+    }
+    TerrainFieldModel frozen;
+    frozen.model = &model;
+    frozen.live = false;
+    frozen.frozenWeights = model.weightsAt(start.u, start.v);
+    frozen.keep.assign(model.layers.size(), true);
+    bool crossed = false;
+    const MarchPoint frozenHit = terrainMarch(frozen, start, du, dv, minStep, 16, 5, crossed);
+    const MarchPoint liveHit = terrainMarch(liveFieldFor(model, start, du, dv, 1.0f), start, du, dv, minStep, 16, 5, crossed);
+    const double fe = std::hypot(frozenHit.u - target.u, frozenHit.v - target.v) / texel;
+    const double le = std::hypot(liveHit.u - target.u, liveHit.v - target.v) / texel;
+    frozenError += fe;
+    liveError += le;
+    frozenMax = std::max(frozenMax, fe);
+    liveMax = std::max(liveMax, le);
+    if (le > 0.5) {
+      ++liveOff;
+    }
+    ++rigidRays;
+  }
+  if (rigidRays < 500) {
+    throw std::runtime_error(name + ": too few unoccluded rays for the rigidity check");
+  }
+  const double frozenMean = frozenError / rigidRays, liveMean = liveError / rigidRays;
+  // Also in texels of a 1024-wide layer map (texel * 1024 / width), the size of a game's layer textures.
+  const double toGameTexels = 1024.0 / double(model.layers[0].width);
+  std::printf("  %-28s live weights, rigidity over %d rays (hit to the aimed relief point, texels of a 1024 map): "
+              "frozen mean %.2f max %.1f, live mean %.3f max %.1f (%d over half a test texel)\n",
+              name.c_str(), rigidRays, frozenMean * toGameTexels, frozenMax * toGameTexels, liveMean * toGameTexels,
+              liveMax * toGameTexels, liveOff);
+  if (liveOff > rigidRays / 200 || liveMean > 0.05 || liveMean * 10.0 > frozenMean) {
+    throw std::runtime_error(name + ": live terrain weights do not give a rigid relief");
+  }
+
+  // Crossings passed by a step, with and without the weight-slope term, and the march samples (before refinement) of
+  // each and of the frozen march.
+  int passedWithSlope = 0, passedWithout = 0, rays = 0;
+  int samplesWithSlope = 0, samplesWithout = 0, samplesFrozen = 0, passedFrozen = 0;
+  for (int trial = 0; trial < 3000; ++trial) {
+    const MarchPoint start { extent * (0.2f + 0.6f * uniform(rng)), extent * (0.2f + 0.6f * uniform(rng)), 0.0f };
+    const float angle = uniform(rng) * 2.0f * kPi;
+    const float viewZ = 0.1f + 0.8f * uniform(rng);
+    const float slope = std::sqrt(1.0f - viewZ * viewZ) / viewZ * totalHeight;
+    const float du = std::cos(angle) * slope, dv = std::sin(angle) * slope;
+    MarchPoint reference;
+    if (!denseFirstCrossing(truth, start, du, dv, reference)) {
+      continue;
+    }
+    ++rays;
+    {
+      TerrainFieldModel frozen;
+      frozen.model = &model;
+      frozen.live = false;
+      frozen.frozenWeights = model.weightsAt(start.u, start.v);
+      frozen.keep.assign(model.layers.size(), true);
+      bool crossed = false;
+      const MarchPoint hit = terrainMarch(frozen, start, du, dv, minStep, 16, 5, crossed, &samplesFrozen);
+      // The same count for the frozen field against its own reference: what the layer cones alone let pass.
+      MarchPoint frozenReference;
+      if (denseFirstCrossing(frozen, start, du, dv, frozenReference) && hit.z > frozenReference.z + minStep / 16.0f + 1e-4f) {
+        ++passedFrozen;
+      }
+    }
+    for (const float safety : { 1.0f, 0.0f }) {
+      bool crossed = false;
+      const MarchPoint hit = terrainMarch(liveFieldFor(model, start, du, dv, safety), start, du, dv, minStep, 16, 5, crossed,
+                                          safety > 0.0f ? &samplesWithSlope : &samplesWithout);
+      // Beyond the first crossing by more than the refinement's precision (a step of minStep bisected 4 times).
+      if (hit.z > reference.z + minStep / 16.0f + 1e-4f) {
+        ++(safety > 0.0f ? passedWithSlope : passedWithout);
+      }
+    }
+  }
+  std::printf("  %-28s live weights, %d rays: a step passed the first crossing on %d with the weight slope, %d without "
+              "(frozen field, its own crossing: %d); samples per march: frozen %.2f, live %.2f, live without the weight slope %.2f\n",
+              name.c_str(), rays, passedWithSlope, passedWithout, passedFrozen, double(samplesFrozen) / std::max(rays, 1),
+              double(samplesWithSlope) / std::max(rays, 1), double(samplesWithout) / std::max(rays, 1));
+  if (passedWithSlope > rays / 200) {
+    throw std::runtime_error(name + ": the live terrain march passes crossings");
+  }
+}
+
+TerrainModel makeTerrainModel(const std::vector<DepthField>& layers, int gridSize, float spacing, bool sharp, uint32_t seed) {
+  TerrainModel model;
+  model.layers = layers;
+  model.gridSize = gridSize;
+  model.spacing = spacing;
+  model.layerCount = int(layers.size()) + 1;
+  for (const DepthField& layer : layers) {
+    std::vector<float> cones(layer.depth.size());
+    for (int y = 0; y < layer.height; ++y) {
+      for (int x = 0; x < layer.width; ++x) {
+        cones[size_t(y) * layer.width + x] = storedCone(bruteForceConservativeRatio(layer, x, y, 1.0f));
+      }
+    }
+    model.storedCones.push_back(std::move(cones));
+  }
+  std::mt19937 rng(seed);
+  std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
+  model.vertexWeights.assign(size_t(gridSize) * gridSize * model.layerCount, 0.0f);
+  for (int v = 0; v < gridSize * gridSize; ++v) {
+    float* w = &model.vertexWeights[size_t(v) * model.layerCount];
+    if (sharp) {
+      // Painted land: one layer per vertex (sometimes the flat one), so weights swap fully from vertex to vertex.
+      w[std::min(int(uniform(rng) * model.layerCount), model.layerCount - 1)] = 1.0f;
+    } else {
+      float sum = 0.0f;
+      for (int l = 0; l < model.layerCount; ++l) {
+        w[l] = uniform(rng) * uniform(rng);
+        sum += w[l];
+      }
+      for (int l = 0; l < model.layerCount; ++l) {
+        w[l] /= sum;
+      }
+    }
+  }
+  return model;
+}
+
 void run() {
   std::cout << std::endl << "Begin cone generator tests" << std::endl;
 
@@ -1346,7 +1830,7 @@ void run() {
     }
   }
 
-  // Cones generated without a ray walk, on the same fields and windows.
+  // The conservative variant, on the same fields and windows.
   const Config conservativeConfigs[] = {
     { 32, 32, 8, 0 },  // far field
     { 32, 32, 2, 0 },  // far field, small window
@@ -1360,6 +1844,66 @@ void run() {
       });
       checkConservative(shape.name, field, config.radius);
     }
+  }
+
+  // Blends of conservative layer cones, as pom_sccr_terrain.slangh combines them. Shapes by index:
+  // 0 plateau, 1 steps, 2 sine, 3 spikes, 4 noise.
+  struct Blend {
+    std::string name;
+    std::vector<size_t> shapes;
+    std::vector<float> weights;
+    float flatWeight;
+  };
+  const Blend blends[] = {
+    { "sine+steps", { 2, 1 }, { 0.7f, 0.3f }, 0.0f },
+    { "noise+plateau", { 4, 0 }, { 0.5f, 0.5f }, 0.0f },
+    { "spikes+sine+flat", { 3, 2 }, { 0.5f, 0.25f }, 0.25f },
+    { "plateau+steps+noise", { 0, 1, 4 }, { 0.2f, 0.3f, 0.5f }, 0.0f },
+  };
+  const Config blendConfigs[] = {
+    { 32, 32, 8, 0 },  // far field
+    { 24, 24, 4, 0 },  // window bound
+  };
+  for (const Config& config : blendConfigs) {
+    for (const Blend& blend : blends) {
+      std::vector<DepthField> layers;
+      for (const size_t shape : blend.shapes) {
+        layers.push_back(makeField(config.width, config.height, [&](int x, int y) {
+          return shapes[shape].heightAt(x, y, config.width, config.height);
+        }));
+      }
+      checkBlend(blend.name, layers, blend.weights, blend.flatWeight, config.radius);
+    }
+  }
+
+  // Blends reduced to their heaviest layers (sccrTerrainReduceLayers), with a tie at the cut.
+  const Blend wideBlends[] = {
+    { "4 layers", { 0, 1, 2, 4 }, { 0.1f, 0.2f, 0.3f, 0.4f }, 0.0f },
+    { "5 layers+flat, tie", { 3, 2, 1, 0, 4 }, { 0.2f, 0.2f, 0.2f, 0.15f, 0.05f }, 0.2f },
+  };
+  for (const Blend& blend : wideBlends) {
+    std::vector<DepthField> layers;
+    for (const size_t shape : blend.shapes) {
+      layers.push_back(makeField(32, 32, [&](int x, int y) { return shapes[shape].heightAt(x, y, 32, 32); }));
+    }
+    for (const uint32_t maxLayers : { 3u, 2u }) {
+      checkReducedBlend(blend.name, layers, blend.weights, blend.flatWeight, 8, maxLayers);
+    }
+  }
+
+  // Live terrain weights (PomLiveLayeredConeField): sine, noise and steps layers and a flat one,
+  // tiling every UV unit, per-vertex weights every 0.25 UV (painted: one layer per vertex; mixed: random blends).
+  // Depths 0.026 and 0.08 UV: a march at 80 degrees travels about 0.6 and 1.8 vertex spacings.
+  {
+    std::vector<DepthField> terrainLayers;
+    for (const size_t shape : { size_t(2), size_t(4), size_t(1) }) {
+      terrainLayers.push_back(makeField(32, 32, [&](int x, int y) { return shapes[shape].heightAt(x, y, 32, 32); }));
+    }
+    const TerrainModel painted = makeTerrainModel(terrainLayers, 9, 0.25f, true, 7);
+    const TerrainModel mixed = makeTerrainModel(terrainLayers, 9, 0.25f, false, 8);
+    checkLiveWeights("painted, depth 0.026", painted, 0.026f);
+    checkLiveWeights("painted, depth 0.08", painted, 0.08f);
+    checkLiveWeights("mixed, depth 0.026", mixed, 0.026f);
   }
 
   // Coarse cones (pom_cone_coarse.comp.slang), alone and mixed with generated tiles. The manager uses cells of 8 up to

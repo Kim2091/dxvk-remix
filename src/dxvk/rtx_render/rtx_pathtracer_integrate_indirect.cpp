@@ -157,7 +157,7 @@
 #include <rtx_shaders/integrate_indirect_sharc_query_wboit_omm2.h>
 #include <rtx_shaders/integrate_indirect_sharc_query_ser_omm2.h>
 #include <rtx_shaders/integrate_indirect_sharc_query_ser_wboit_omm2.h>
-// The SHARC slim levels.
+// rtx.integrateIndirect.slimVariants.
 #include <rtx_shaders/integrate_indirect_sharc_update4_wboit_slim.h>
 #include <rtx_shaders/integrate_indirect_sharc_update4_wboit_lean.h>
 #include <rtx_shaders/integrate_indirect_sharc_update8_wboit_slim.h>
@@ -168,14 +168,14 @@
 #include <rtx_shaders/integrate_indirect_sharc_query_ser_wboit_lean.h>
 #include <rtx_shaders/integrate_indirect_sharc_query_closesthit_wboit_slim.h>
 #include <rtx_shaders/integrate_indirect_sharc_query_closesthit_wboit_lean.h>
-// The assembly slim levels.
+// rtx.integrateIndirect.slimAssembly.
 #include <rtx_shaders/integrate_nee_plain_slim.h>
 #include <rtx_shaders/integrate_nee_plain_lean.h>
 #include <rtx_shaders/integrate_nee_nrc_slim.h>
 #include <rtx_shaders/integrate_nee_nrc_lean.h>
 #include <rtx_shaders/integrate_nee_restir_gi_slim.h>
 #include <rtx_shaders/integrate_nee_restir_gi_lean.h>
-// rtx.integrateIndirect.slimKeepPom and the non-SHARC slim levels.
+// rtx.integrateIndirect.slimKeepPom / slimNonSharc.
 #include <rtx_shaders/integrate_nee_plain_leanpom.h>
 #include <rtx_shaders/integrate_nee_nrc_leanpom.h>
 #include <rtx_shaders/integrate_nee_restir_gi_leanpom.h>
@@ -238,29 +238,30 @@ namespace dxvk {
     return ommEnabled && RtxOptions::foliageRaysOmm2StateActive();
   }
 
-  // The SHARC (update and query), non-SHARC TraceRay and assembly variant tables
+  // rtx.shader.variantTables, the SHARC (update and query), non-SHARC TraceRay and assembly tables
   // (rtx_fork_variant_tables.h). Derived from the slim shader defines, independently of the selectors, which stay as the
   // check.
   namespace {
     using IndirectSlimLevel = DxvkPathtracerIntegrateIndirect::SlimLevel;
 
     enum IndirectVariantKeyBit : uint32_t {
-      kIndKeyNotValidating      = 1u << 0, // rtx.frameFeatures.validate off
-      kIndKeyWboit              = 1u << 1, // the slim update / query / hit shaders are WBOIT variants
-      kIndKeyNoOmm2             = 1u << 2, // no OMM 2-state foliage variant
-      kIndKeyNeeCacheOnly       = 1u << 3, // INDIRECT_SLIM_NEE_CACHE_ONLY: secondary NEE always takes the NEE cache
-      kIndKeyNeeCache           = 1u << 4, // the non-SHARC slim hit shaders are NEE-cache variants
-      kIndKeyKeepPomOption      = 1u << 5, // rtx.integrateIndirect.slimKeepPom
-      kIndKeyTranslucentShadows = 1u << 6, // rtx.enableIndirectTranslucentShadows
-      kIndKeyPomNeeCache        = 1u << 7, // cb.pomEnableNEECache: POM can attenuate the assembly's NEE-cache shadow ray
+      kIndKeySlimOption         = 1u << 0, // the sub-pass's option (slimVariants / slimNonSharc / slimAssembly)
+      kIndKeyNotValidating      = 1u << 1, // rtx.frameFeatures.validate off
+      kIndKeyWboit              = 1u << 2, // the slim update / query / hit shaders are WBOIT variants
+      kIndKeyNoOmm2             = 1u << 3, // no OMM 2-state foliage variant
+      kIndKeyNeeCacheOnly       = 1u << 4, // INDIRECT_SLIM_NEE_CACHE_ONLY: secondary NEE always takes the NEE cache
+      kIndKeyNeeCache           = 1u << 5, // the non-SHARC slim hit shaders are NEE-cache variants
+      kIndKeyKeepPomOption      = 1u << 6, // rtx.integrateIndirect.slimKeepPom
+      kIndKeyTranslucentShadows = 1u << 7, // rtx.enableIndirectTranslucentShadows
+      kIndKeyPomNeeCache        = 1u << 8, // cb.pomEnableNEECache: POM can attenuate the assembly's NEE-cache shadow ray
     };
     const char* const kIndKeyNames[] = {
-      "notValidating", "wboit", "noOmm2", "neeCacheOnly", "neeCache", "keepPomOption", "translucentShadows", "pomNeeCache",
+      "slimOption", "notValidating", "wboit", "noOmm2", "neeCacheOnly", "neeCache", "keepPomOption", "translucentShadows", "pomNeeCache",
     };
     constexpr uint32_t kIndKeyNameCount = sizeof(kIndKeyNames) / sizeof(kIndKeyNames[0]);
-    constexpr uint32_t kIndKeySharcRequired = kIndKeyNotValidating | kIndKeyWboit | kIndKeyNoOmm2 | kIndKeyNeeCacheOnly;
+    constexpr uint32_t kIndKeySharcRequired = kIndKeySlimOption | kIndKeyNotValidating | kIndKeyWboit | kIndKeyNoOmm2 | kIndKeyNeeCacheOnly;
     constexpr uint32_t kIndKeyNonSharcRequired = kIndKeySharcRequired | kIndKeyNeeCache;
-    constexpr uint32_t kIndKeyAssemblyRequired = kIndKeyNotValidating;
+    constexpr uint32_t kIndKeyAssemblyRequired = kIndKeySlimOption | kIndKeyNotValidating;
     // INDIRECT_SLIM_LEAN_VISIBILITY: no translucent / thin-opaque hit on the secondary NEE ray.
     constexpr uint32_t kIndRemovesLean = RtFrameFeatures::kSceneTranslucentDynamic | RtFrameFeatures::kSceneThinOpaque;
     constexpr uint32_t kIndRemovesPortals = RtFrameFeatures::kScenePortalsActive;
@@ -326,15 +327,16 @@ namespace dxvk {
     }
 
     uint32_t sharcVariantModeKey(const RtFrameFeatures& f) {
-      return indirectVariantCommonModeKey(f);
+      return indirectVariantCommonModeKey(f) | (DxvkPathtracerIntegrateIndirect::slimVariants() ? kIndKeySlimOption : 0u);
     }
 
     uint32_t nonSharcVariantModeKey(const RtFrameFeatures& f, const bool useNeeCache) {
-      return indirectVariantCommonModeKey(f) | (useNeeCache ? kIndKeyNeeCache : 0u);
+      return indirectVariantCommonModeKey(f) | (DxvkPathtracerIntegrateIndirect::slimNonSharc() ? kIndKeySlimOption : 0u) |
+             (useNeeCache ? kIndKeyNeeCache : 0u);
     }
 
     uint32_t assemblyVariantModeKey(const RtFrameFeatures& f) {
-      return indirectVariantCommonModeKey(f);
+      return indirectVariantCommonModeKey(f) | (DxvkPathtracerIntegrateIndirect::slimAssembly() ? kIndKeySlimOption : 0u);
     }
 
     // The mode keys configured at startup. Options are read as at runtime; what only the frame decides (the
@@ -658,8 +660,8 @@ namespace dxvk {
     GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, IntegrateNEEPlainShader, integrate_nee_plain);
     GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, IntegrateNEEShader, integrate_nee_nrc);
     GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, IntegrateNEEShader, integrate_nee_restir_gi);
-    // The assembly slim levels of the configured mode only.
-    {
+    // rtx.integrateIndirect.slimAssembly, only the configured mode's variants.
+    if (slimAssembly()) {
       const IntegrateIndirectMode mode = RtxOptions::integrateIndirectMode();
       const bool nrcMode = mode == IntegrateIndirectMode::NeuralRadianceCache;
       const bool restirGiMode = mode == IntegrateIndirectMode::ReSTIRGI;
@@ -668,9 +670,14 @@ namespace dxvk {
       if (slimKeepPom()) {
         getAssemblyShader(nrcMode, restirGiMode, SlimLevel::LeanPom);
       }
-      // Every assembly entry of the configured mode key (POM in the NEE cache on and off) plus Full. Today the lines
-      // above already request these; this follows the table when entries are added.
-      const uint32_t key = indirectConfiguredCommonModeKey();
+    }
+    // rtx.shader.variantTables, every assembly entry of the configured mode key (POM in the NEE cache
+    // on and off) plus Full. Today the lines above already request these; this follows the table when entries are added.
+    if (RtxOptions::Shader::variantTables()) {
+      const IntegrateIndirectMode mode = RtxOptions::integrateIndirectMode();
+      const bool nrcMode = mode == IntegrateIndirectMode::NeuralRadianceCache;
+      const bool restirGiMode = mode == IntegrateIndirectMode::ReSTIRGI;
+      const uint32_t key = indirectConfiguredCommonModeKey() | (slimAssembly() ? kIndKeySlimOption : 0u);
       for (const VariantTableEntry& entry : kAssemblyVariantEntries) {
         if (variantEntryMatchesModeKey(entry, key) || variantEntryMatchesModeKey(entry, key | kIndKeyPomNeeCache)) {
           getAssemblyShader(nrcMode, restirGiMode, (SlimLevel) entry.level);
@@ -737,9 +744,9 @@ namespace dxvk {
         }
       }
 
-      // The non-SHARC slim levels this configuration can bind (see
+      // rtx.integrateIndirect.slimNonSharc, only the levels this configuration can bind (see
       // selectNonSharcSlimLevel): Slim / Lean have POM off, the POM-kept levels follow pomEnabled.
-      if (RtxOptions::integrateIndirectMode() != IntegrateIndirectMode::Sharc &&
+      if (slimNonSharc() && RtxOptions::integrateIndirectMode() != IntegrateIndirectMode::Sharc &&
           RtxOptions::renderPassIntegrateIndirectRaytraceMode() == RaytraceMode::TraceRay &&
           useNeeCache && wboitEnabled && !portalsEnabled && !useFoliageRaysOmm2StateVariant(ommEnabled)) {
         pipelineManager.registerRaytracingShaders(getPipelineShaders(false, serEnabled, ommEnabled, true, false, false, nrcEnabled, true, SlimLevel::Slim));
@@ -826,7 +833,7 @@ namespace dxvk {
           ? GET_SHADER_VARIANT(VK_SHADER_STAGE_RAYGEN_BIT_KHR, IntegrateIndirectSharcUpdateShader, integrate_indirect_sharc_update8_wboit_leanpom)
           : GET_SHADER_VARIANT(VK_SHADER_STAGE_RAYGEN_BIT_KHR, IntegrateIndirectSharcUpdateShader, integrate_indirect_sharc_update8_wboit_slimpom)));
     } else if (slimLevel != SlimLevel::Full) {
-      // The slim levels (WBOIT, no OMM 2-state; see selectSharcSlimLevel).
+      // rtx.integrateIndirect.slimVariants (WBOIT, no OMM 2-state; see selectSharcSlimLevel).
       const bool lean = slimLevel == SlimLevel::Lean;
       shaders.addGeneralShader(depth4
         ? (lean
@@ -916,7 +923,7 @@ namespace dxvk {
   void DxvkPathtracerIntegrateIndirect::prewarmSharcShaders(DxvkPipelineManager& pipelineManager) const {
     // Without prewarming, the SHARC pipelines would compile on first use, a multi-second hitch.
     // Register the update and query pipelines this configuration can bind (POM on and off, as for the
-    // other modes, and the slim levels).
+    // other modes; slim levels when rtx.integrateIndirect.slimVariants is on).
     if (!RtxSharc::checkIsSupported(m_device)) {
       return;
     }
@@ -924,7 +931,7 @@ namespace dxvk {
     const bool serEnabled = RtxOptions::isShaderExecutionReorderingInPathtracerIntegrateIndirectEnabled();
     const bool wboitEnabled = RtxOptions::wboitEnabled();
     const bool portalsEnabled = RtxOptions::rayPortalModelTextureHashes().size() > 0;
-    const bool slimPossible = wboitEnabled && !useFoliageRaysOmm2StateVariant(ommEnabled);
+    const bool slimPossible = slimVariants() && wboitEnabled && !useFoliageRaysOmm2StateVariant(ommEnabled);
     const bool slimPomPossible = slimPossible && slimKeepPom();
     // rtx.sharc.deferredFlush: the _df variants replace the inline ones while the option is on and they exist.
     const bool deferredFlush = sharcDeferredFlushPossible(ommEnabled, wboitEnabled);
@@ -973,7 +980,7 @@ namespace dxvk {
 
   DxvkPathtracerIntegrateIndirect::SlimLevel DxvkPathtracerIntegrateIndirect::selectSharcSlimLevel(
     const RtFrameFeatures& features, const bool ommEnabled, const bool includePortals, const bool wboitEnabled) {
-    if (!wboitEnabled || includePortals || useFoliageRaysOmm2StateVariant(ommEnabled)) {
+    if (!slimVariants() || !wboitEnabled || includePortals || useFoliageRaysOmm2StateVariant(ommEnabled)) {
       return SlimLevel::Full;
     }
     // The update / query raygen and hit POM code runs only while the frame's POM mode is on.
@@ -991,7 +998,7 @@ namespace dxvk {
     const bool useNeeCache, const bool includePortals, const bool wboitEnabled) {
     // Variants exist for TraceRay with the NEE cache, WBOIT, no portals and no OMM 2-state (plain / NRC; ReSTIR GI uses
     // the plain TraceRay shaders). Everything else keeps the full shaders.
-    if (useRayQuery || !useNeeCache || !wboitEnabled || includePortals || useFoliageRaysOmm2StateVariant(ommEnabled)) {
+    if (!slimNonSharc() || useRayQuery || !useNeeCache || !wboitEnabled || includePortals || useFoliageRaysOmm2StateVariant(ommEnabled)) {
       return SlimLevel::Full;
     }
     // The raygen / hit POM code runs only while the frame's POM mode is on (same as SHARC).
@@ -1034,6 +1041,9 @@ namespace dxvk {
 
   DxvkPathtracerIntegrateIndirect::SlimLevel DxvkPathtracerIntegrateIndirect::selectAssemblySlimLevel(
     const RtFrameFeatures& features) {
+    if (!slimAssembly()) {
+      return SlimLevel::Full;
+    }
     // The assembly's only POM code is the POM attenuation of its NEE-cache shadow ray (visibility.slangh), which needs
     // cb.pomMode != Off and pomOpaqueSurfaceEncountered = cb.pomEnableNEECache && height texture (integrate_nee.slangh).
     // It never takes the RIS fallback, so INDIRECT_SLIM_NEE_CACHE_ONLY does not apply.
@@ -1044,7 +1054,7 @@ namespace dxvk {
   }
 
   Rc<DxvkShader> DxvkPathtracerIntegrateIndirect::getAssemblyShader(const bool nrcEnabled, const bool restirGiEnabled, const SlimLevel slimLevel) {
-    // The assembly slim levels (see selectAssemblySlimLevel; SlimPom is mapped to Full).
+    // rtx.integrateIndirect.slimAssembly levels (see selectAssemblySlimLevel; SlimPom is mapped to Full).
     const bool lean = slimLevel == SlimLevel::Lean;
     if (nrcEnabled && !restirGiEnabled) {
       switch (slimLevel) {
@@ -1088,7 +1098,7 @@ namespace dxvk {
   void DxvkPathtracerIntegrateIndirect::logSlimLevels(const uint32_t frameId) {
     // Log the slim level each pass bound when it changes, at most once per 60 frames so a level that
     // flips every frame does not flood the log (the settled state is still logged within 60 frames).
-    // Each pass also carries its variant table entry text (empty where no table picks the level).
+    // With rtx.shader.variantTables each pass also carries its table entry text (empty otherwise).
     if (m_frameSlimLevels == m_loggedSlimLevels && m_frameVariantInfo == m_loggedVariantInfo) {
       return;
     }
@@ -1238,7 +1248,7 @@ namespace dxvk {
 
     DxvkRaytracingPipelineShaders shaders;
 
-    // The slim levels (selectSharcSlimLevel guarantees WBOIT, no portals
+    // rtx.integrateIndirect.slimVariants (selectSharcSlimLevel guarantees WBOIT, no portals
     // and no OMM 2-state; Slim / Lean also no POM).
     if (slimLevel != SlimLevel::Full) {
       const bool lean = slimLevelIsLean(slimLevel);
@@ -1369,8 +1379,10 @@ namespace dxvk {
       }
       {
         SlimLevel updateSlimLevel = selectSharcSlimLevel(ctx, rtOutput, ommEnabled, includePortals, wboitEnabled);
-        // The variant table picks the level; the rule above still runs as the check.
-        updateSlimLevel = selectSharcVariantLevel(ctx, SlimPass::SharcUpdate, updateSlimLevel);
+        // rtx.shader.variantTables picks the level; the rule above still runs as the check.
+        if (RtxOptions::Shader::variantTables()) {
+          updateSlimLevel = selectSharcVariantLevel(ctx, SlimPass::SharcUpdate, updateSlimLevel);
+        }
         noteSlimLevel(SlimPass::SharcUpdate, updateSlimLevel);
         // The same update through TraceRay with SER, where the variants exist:
         // the deferred flush is bound, a Full / Slim / Lean level (the POM-kept levels keep the inline update), and for Full no
@@ -1409,8 +1421,10 @@ namespace dxvk {
       sharc.bindResources(*ctx);
 
       SlimLevel querySlimLevel = selectSharcSlimLevel(ctx, rtOutput, ommEnabled, includePortals, wboitEnabled);
-      // The variant table picks the level; the rule above still runs as the check.
-      querySlimLevel = selectSharcVariantLevel(ctx, SlimPass::Integration, querySlimLevel);
+      // rtx.shader.variantTables picks the level; the rule above still runs as the check.
+      if (RtxOptions::Shader::variantTables()) {
+        querySlimLevel = selectSharcVariantLevel(ctx, SlimPass::Integration, querySlimLevel);
+      }
       noteSlimLevel(SlimPass::Integration, querySlimLevel);
       ctx->bindRaytracingPipelineShaders(getSharcQueryPipelineShaders(serEnabled, ommEnabled, includePortals, pomEnabled, wboitEnabled, querySlimLevel));
       ctx->traceRays(rayDims.width, rayDims.height, rayDims.depth);
@@ -1531,13 +1545,13 @@ namespace dxvk {
         dispatchSharc(ctx, rtOutput, rayDims, serEnabled, ommEnabled, includePortals, pomEnabled, wboitEnabled);
         return;
       }
-      // The non-SHARC slim levels (TraceRay only; Full for the other modes).
+      // rtx.integrateIndirect.slimNonSharc (TraceRay only; Full for the other modes).
       const bool traceRayMode = RtxOptions::renderPassIntegrateIndirectRaytraceMode() == RaytraceMode::TraceRay;
       SlimLevel slimLevel = traceRayMode
         ? selectNonSharcSlimLevel(ctx, rtOutput.m_raytraceArgs, false, ommEnabled, neeCacheEnabled, includePortals, wboitEnabled)
         : SlimLevel::Full;
-      // The variant table picks the level; the rule above still runs as the check.
-      if (traceRayMode) {
+      // rtx.shader.variantTables picks the level; the rule above still runs as the check.
+      if (traceRayMode && RtxOptions::Shader::variantTables()) {
         slimLevel = selectNonSharcVariantLevel(ctx, neeCacheEnabled, slimLevel);
       }
       noteSlimLevel(SlimPass::Integration, slimLevel);
@@ -1639,8 +1653,10 @@ namespace dxvk {
     ctx->setFramePassStage(RtxFramePassStage::NEE_Integration);
     ctx->bindCommonRayTracingResources(rtOutput);
     SlimLevel assemblySlimLevel = selectAssemblySlimLevel(ctx, rtOutput.m_raytraceArgs);
-    // The variant table picks the level; the rule above still runs as the check.
-    assemblySlimLevel = selectAssemblyVariantLevel(ctx, assemblySlimLevel);
+    // rtx.shader.variantTables picks the level; the rule above still runs as the check.
+    if (RtxOptions::Shader::variantTables()) {
+      assemblySlimLevel = selectAssemblyVariantLevel(ctx, assemblySlimLevel);
+    }
     noteSlimLevel(SlimPass::Assembly, assemblySlimLevel);
     dispatchNEE(ctx, AssemblyResources(rtOutput), assemblySlimLevel);
     ctx->recordGpuStageTiming("IndirectAssembly");
@@ -1742,7 +1758,7 @@ namespace dxvk {
 
     DxvkRaytracingPipelineShaders shaders;
 
-    // The non-SHARC slim levels. selectNonSharcSlimLevel guarantees TraceRay, NEE cache,
+    // rtx.integrateIndirect.slimNonSharc. selectNonSharcSlimLevel guarantees TraceRay, NEE cache,
     // WBOIT, no portals and no OMM 2-state; Slim / Lean also POM off (so pomEnabled is false).
     if (slimLevel != SlimLevel::Full) {
       assert(!useRayQuery && useNeeCache && wboitEnabled && !includePortals);

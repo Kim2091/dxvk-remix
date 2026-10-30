@@ -244,7 +244,7 @@ enum class FroxelConsumerCacheQuality : int {
     RTX_OPTION_ARGS("rtx.volumetrics", float, waterFogDensityThreshold, 0.065f,
                "The fog density threshold for determining when to use physical volumetrics vs fixed function fog.\n"
                "Values below this threshold will use physical volumetrics, while values above will fall back to fixed function fog.\n"
-               "The default is tuned for a game whose fixed function fog is used for underwater.",
+               "This threshold was created specifically for Portal RTX's underwater fixed function fog.",
                args.minValue = 0.0f);
     RTX_OPTION_ARGS("rtx.volumetrics", float, fogRemapMaxDistanceMinMeters, 1.0f,
                "A value controlling the \"max distance\" fixed function fog parameter's minimum remapping bound.\n"

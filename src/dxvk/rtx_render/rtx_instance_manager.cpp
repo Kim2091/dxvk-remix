@@ -36,7 +36,10 @@
 #include "rtx_materials.h"
 #include "rtx_ray_portal_manager.h"
 #include "rtx_terrain_baker.h"
+#include "rtx_fork_d3d9_identity.h"
+#include "rtx_fork_fnv_material.h"
 
+#include "../d3d9/d3d9_state.h"
 #include "rtx_matrix_helpers.h"
 #include "dxvk_scoped_annotation.h"
 
@@ -65,7 +68,7 @@ namespace dxvk {
     return dot(cross(x, y), z) < 0;
   }
 
-  static uint32_t determineInstanceFlags(const SceneDraw& drawCall, const RtSurface& surface) {
+  static uint32_t determineInstanceFlags(const DrawCallState& drawCall, const RtSurface& surface) {
     // Determine if the view inverts face winding globally
     const Matrix4 worldToProjection = drawCall.getTransformData().viewToProjection * drawCall.getTransformData().worldToView;
     const bool worldToProjectionMirrored = isMirrorTransform(worldToProjection);
@@ -158,7 +161,7 @@ namespace dxvk {
   namespace {
     template<int RtInstanceSize> struct CheckRtInstanceSize {
       // The second line of the build error should contain the new size of RtInstance in the template argument, i.e. `dxvk::CheckRtInstanceSize<newSize>`
-      static_assert(RtInstanceSize == 824,"RtInstance size has changed.  Fix the copy constructor above this message, then update the expected size.");
+      static_assert(RtInstanceSize == 840,"RtInstance size has changed.  Fix the copy constructor above this message, then update the expected size.");
     };
     CheckRtInstanceSize<sizeof(RtInstance)> _rtInstanceSizeTest;
   }
@@ -190,6 +193,8 @@ namespace dxvk {
     surface.previousPositionBufferIndex = geo.previousPositionBufferIndex;
     surface.indexBufferIndex    = geo.indexBufferIndex;
     surface.indexStride         = geo.indexBuffer.stride();
+    // No shell slot here; AccelManager's surface upload writes it into every record
+    // (SccrShellManager::patchSurfaceRecord).
   }
 
   void RtInstance::copyInstanceDataFrom(const RtInstance& src) {
@@ -231,7 +236,7 @@ namespace dxvk {
     //   m_primInstanceOwner, buildGeometries, buildRanges,
     //   billboardIndices, indexOffsets, m_blasDirty,
     //   m_billboardGeometryDirty, m_emitterMotionState,
-    //   m_accelBucketUid, m_retainedPinHandle, m_retainedPinGeneration
+    //   m_accelBucketUid, m_retainedPinHandle, m_retainedPinGeneration, m_retainedV2Tag
   }
 
   void RtInstance::updateFromReference(const RtInstance& src, const bool preserveTransforms) {
@@ -457,10 +462,10 @@ namespace dxvk {
       m_linkedBlas->printDebugInfo("(from RtInstance)");
       Logger::warn("=== End BLAS Entry Debug Info ===");
       
-      // Print SceneDraw info
-      Logger::warn("=== SceneDraw Debug Info ===");
+      // Print DrawCallState info
+      Logger::warn("=== DrawCallState Debug Info ===");
       m_linkedBlas->input.printDebugInfo("(from RtInstance)");
-      Logger::warn("=== End SceneDraw Debug Info ===");
+      Logger::warn("=== End DrawCallState Debug Info ===");
     }
     
     // Print RtSurface info
@@ -583,17 +588,29 @@ namespace dxvk {
 
   bool InstanceManager::relocateExternally(RtInstance& instance, const Matrix4& objectToWorld, CameraType::Enum cameraType,
                                            float worldSpaceUiOffset, bool notifyScene, bool* outMoved) {
+    return relocate(instance, objectToWorld, cameraType, worldSpaceUiOffset, notifyScene, outMoved, false);
+  }
+
+  bool InstanceManager::relocateInstancerExternally(RtInstance& instance, const Matrix4& objectToWorld, CameraType::Enum cameraType,
+                                                    float worldSpaceUiOffset, bool notifyScene, bool* outMoved) {
+    return relocate(instance, objectToWorld, cameraType, worldSpaceUiOffset, notifyScene, outMoved, true);
+  }
+
+  bool InstanceManager::relocate(RtInstance& instance, const Matrix4& objectToWorld, CameraType::Enum cameraType,
+                                 float worldSpaceUiOffset, bool notifyScene, bool* outMoved, bool allowInstancer) {
     *outMoved = false;
     const uint32_t frame = m_device->getCurrentFrameId();
     BlasEntry* blas = instance.getBlas();
     // Everything updateInstance would derive differently from a plain move goes to the caller's full path:
     // - already updated this frame (updateInstance would merge / moveAgain instead of move),
     // - geometry rebuilt this frame (previous positions would feed motion vectors),
+    // - point instancers (per-instance transforms are part of the draw state),
     // - the world-space UI background offset (applied to the transform on the full path),
     // - a mirroring change (m_isObjectToWorldMirrored feeds the merged-BLAS facing).
     if (blas == nullptr ||
         instance.getFrameLastUpdated() == frame ||
         blas->frameLastUpdated == frame ||
+        (instance.surface.instancesToObject != nullptr && !allowInstancer) ||
         (worldSpaceUiOffset != 0.f && instance.testCategoryFlags(InstanceCategories::WorldMatte)) ||
         isMirrorTransform(objectToWorld) != instance.m_isObjectToWorldMirrored) {
       return false;
@@ -777,7 +794,7 @@ namespace dxvk {
 
   RtInstance* InstanceManager::processSceneObject(
     const CameraManager& cameraManager, const RayPortalManager& rayPortalManager,
-    BlasEntry& blas, const SceneDraw& drawCall, const MaterialData& materialData, RtInstance* existingInstance,
+    BlasEntry& blas, const DrawCallState& drawCall, const MaterialData& materialData, RtInstance* existingInstance,
     const RtSurface::AlphaState* alphaOverride, const LegacySurfaceDesc* legacyOverride) {
 
     // If no existing instance is provided, this is a genuinely new draw call and we need to create a fresh instance.
@@ -795,6 +812,9 @@ namespace dxvk {
       blas.linkInstance(currentInstance);
       currentInstance->m_blasDirty = true;
       notifySceneChanged();
+      if (D3d9Identity::statsActive()) {
+        D3d9Identity::noteRelink();
+      }
     }
 
     updateInstance(*currentInstance, cameraManager, blas, drawCall, &materialData, alphaOverride, legacyOverride);
@@ -802,12 +822,12 @@ namespace dxvk {
     return currentInstance;
   }
 
-  RtSurface::AlphaState InstanceManager::calculateAlphaState(const SceneDraw& drawCall, const MaterialData& materialData) {
+  RtSurface::AlphaState InstanceManager::calculateAlphaState(const DrawCallState& drawCall, const MaterialData& materialData) {
     // The derivation is shared with frontends (rtx_fork_material_derivation.h).
     return deriveAlphaState(FixedFunctionAlphaInput::fromLegacyMaterial(drawCall.getMaterialData()), materialData, drawCall.getCategoryFlags());
   }
 
-  void InstanceManager::mergeInstanceHeuristics(RtInstance& instanceToModify, const SceneDraw& drawCall, const RtSurface::AlphaState& alphaState) const {
+  void InstanceManager::mergeInstanceHeuristics(RtInstance& instanceToModify, const DrawCallState& drawCall, const RtSurface::AlphaState& alphaState) const {
     // "Opaqueness" takes priority!
     if (
       (alphaState.isFullyOpaque || alphaState.alphaTestType == AlphaTestType::kAlways) &&
@@ -873,7 +893,7 @@ namespace dxvk {
   }
 
   // Returns true if the instance was modified
-  bool InstanceManager::applyDeveloperOptions(RtInstance& currentInstance, const SceneDraw& drawCall) {
+  bool InstanceManager::applyDeveloperOptions(RtInstance& currentInstance, const DrawCallState& drawCall) {
     if (!RtxOptions::enableInstanceDebuggingTools()) {
       return false;
     }
@@ -920,7 +940,7 @@ namespace dxvk {
   void InstanceManager::updateInstance(RtInstance& currentInstance,
                                        const CameraManager& cameraManager,
                                        const BlasEntry& blas,
-                                       const SceneDraw& drawCall,
+                                       const DrawCallState& drawCall,
                                        const MaterialData* materialData,
                                        const RtSurface::AlphaState* alphaOverride,
                                        const LegacySurfaceDesc* legacyOverride) {
@@ -1038,7 +1058,7 @@ namespace dxvk {
             materialData = &tmpMaterialData;
             // For worldspace UI, we want to show the UI (unlit) in the world.  So configure the blend mode if blending is used accordingly.
             tmpMaterialData.getOpaqueMaterialData().setEnableEmission(true);
-            tmpMaterialData.getOpaqueMaterialData().setEmissiveIntensity(2.0f);
+            tmpMaterialData.getOpaqueMaterialData().setEmissiveIntensity(RtxOptions::worldSpaceUiEmissiveIntensity());
             tmpMaterialData.getOpaqueMaterialData().setEmissiveColorTexture(tmpMaterialData.getOpaqueMaterialData().getAlbedoOpacityTexture());
           } else if (currentInstance.surface.alphaState.emissiveBlend && RtxOptions::enableEmissiveBlendEmissiveOverride() && useLegacyAlphaState) {
             // Here we need to do deep copy and patch the material
@@ -1065,7 +1085,7 @@ namespace dxvk {
         // Re-derived on every draw call this frame, since the game recomputes this data per eye pose.
         //
         // texTransform is the D3D9 texture-stage transform matrix, repurposed by the game as a vessel
-        // to smuggle out eye data unrelated to any real texture transform (see SceneDraw::isEye()
+        // to smuggle out eye data unrelated to any real texture transform (see DrawCallState::isEye()
         // for how this gets detected). Laid out row-major (texTransform.data[row], row 0-3; each row's
         // .x/.y/.z/.w are its 4 columns), the rows/columns mean:
         //  - data[0..2].x: eyeRightU, a world-space "right" basis direction for the eye's flat UV
@@ -1229,7 +1249,41 @@ namespace dxvk {
       // All other fully opaques go to the primary TLAS as opaque.
       currentInstance.m_geometryFlags = VK_GEOMETRY_OPAQUE_BIT_KHR;
     }
-    
+
+    // For a draw whose albedo is listed in rtx.fnvProtocol.logMaterialTextures, the alpha
+    // state the instance is traced with and the geometry / instance flags that decide whether its any-hit alpha test
+    // runs, logged when the instance is created or the flags change. At most 20000 lines per session.
+    {
+      const fast_unordered_set& watched = FnvMaterialProtocol::logMaterialTextures();
+      const bool createdNow = currentInstance.m_frameCreated == m_device->getCurrentFrameId();
+      if (!watched.empty() && (createdNow || previousGeometryFlags != currentInstance.m_geometryFlags ||
+                               previousInstanceFlags != currentInstance.m_vkInstance.flags) &&
+          lookupHash(watched, drawCall.getMaterialData().getHash())) {
+        static uint32_t s_instanceWatchLines = 0;
+        if (s_instanceWatchLines < 20000) {
+          ++s_instanceWatchLines;
+          const RtSurface::AlphaState& a = currentInstance.surface.alphaState;
+          const LegacyMaterialData& legacy = drawCall.getMaterialData();
+          const uint32_t instanceFlagsNow = currentInstance.m_vkInstance.flags; // a bit-field: copied, not bound
+          const uint32_t instanceFlagsBefore = previousInstanceFlags;
+          Logger::info(str::format("[InstanceWatch] frame=", m_device->getCurrentFrameId(), " instance=", currentInstance.getId(),
+                                   createdNow ? " created" : " changed", " albedo=0x", std::hex, legacy.getHash(), std::dec,
+                                   " | draw alphaTest=", legacy.alphaTestEnabled ? 1 : 0,
+                                   " func=", static_cast<int>(legacy.alphaTestCompareOp),
+                                   " ref=", static_cast<uint32_t>(legacy.alphaTestReferenceValue),
+                                   " blend=", legacy.blendMode.enableBlending ? 1 : 0,
+                                   " | traced alphaTestType=", static_cast<int>(a.alphaTestType),
+                                   " ref=", static_cast<uint32_t>(a.alphaTestReferenceValue),
+                                   " fullyOpaque=", a.isFullyOpaque ? 1 : 0, " blendingDisabled=", a.isBlendingDisabled ? 1 : 0,
+                                   " blendType=", static_cast<int>(a.blendType),
+                                   " | geometryFlags=0x", std::hex, currentInstance.m_geometryFlags,
+                                   " (was 0x", previousGeometryFlags, ") instanceFlags=0x", instanceFlagsNow,
+                                   " (was 0x", instanceFlagsBefore, ")", std::dec,
+                                   " firstUpdateThisFrame=", isFirstUpdateThisFrame ? 1 : 0));
+        }
+      }
+    }
+
     // Enable backface culling for Portals to avoid additional hits to the back of Portals
     if (currentInstance.m_materialType == MaterialDataType::RayPortal) {
       currentInstance.m_vkInstance.flags &= ~VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
@@ -1279,6 +1333,56 @@ namespace dxvk {
 
       currentInstance.m_vkInstance.mask = mask;
     }
+
+    // How the runtime traces each decal-category instance (DECAL_* from the Remix API
+    // or an rtx.decalTextures list). One line per (game texture, route, alpha state, mask, facing flags), at most 1024 a
+    // session. A decal is drawn only as "decal (unordered TLAS)": the deferred decal kernel blends it onto the surface
+    // the primary ray resolved, and only where the ray hits the decal's FRONT face (resolve.slangh, rayInteraction.frontHit)
+    // with an opacity above 0.001. A fully opaque decal-category surface is traced as plain opaque geometry.
+    if (currentInstance.getCategoryFlags().any(DECAL_CATEGORY_FLAGS)) {
+      const RtSurface::AlphaState& a = currentInstance.surface.alphaState;
+      const XXH64_hash_t game = drawCall.externalPickingTextureHash != kEmptyHash ?
+        drawCall.externalPickingTextureHash : drawCall.getMaterialData().getHash();
+      const uint32_t vkFlags = currentInstance.m_vkInstance.flags; // a bit-field: copied, not bound
+      const uint32_t vkMask = currentInstance.m_vkInstance.mask;
+      const bool cullDisabled = (vkFlags & VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR) != 0;
+      const bool flipFacing = (vkFlags & VK_GEOMETRY_INSTANCE_TRIANGLE_FLIP_FACING_BIT_KHR) != 0;
+      uint64_t key = game;
+      key = key * 0x100000001B3ull ^ (uint64_t(a.isDecal) | uint64_t(currentInstance.m_isUnordered) << 1 |
+                                      uint64_t(a.isBlendingDisabled) << 2 | uint64_t(a.isFullyOpaque) << 3 |
+                                      uint64_t(cullDisabled) << 4 | uint64_t(flipFacing) << 5 |
+                                      uint64_t(currentInstance.m_isHidden) << 6 | uint64_t(a.alphaTestType) << 8 |
+                                      uint64_t(a.blendType) << 12 | uint64_t(vkMask) << 16);
+      static std::mutex s_decalLogMutex;
+      static std::unordered_set<uint64_t> s_decalLogged;
+      bool logIt = false;
+      bool lastLine = false;
+      {
+        std::lock_guard<std::mutex> lock(s_decalLogMutex);
+        logIt = s_decalLogged.size() < 1024 && s_decalLogged.insert(key).second;
+        lastLine = logIt && s_decalLogged.size() == 1024;
+      }
+      if (logIt) {
+        const char* route = a.isDecal
+          ? (currentInstance.m_isUnordered ? "decal (unordered TLAS, blended onto the surface beneath)"
+                                           : "decal flag set but NOT in the unordered TLAS")
+          : (a.isFullyOpaque ? "NOT a decal: fully opaque (no blend, no alpha test), traced as plain opaque geometry"
+                             : (a.isBlendingDisabled ? "NOT a decal: alpha-tested occluder in the primary TLAS"
+                                                     : "NOT a decal: alpha-blended in the primary TLAS"));
+        Logger::info(str::format("[DecalInstance] frame=", m_device->getCurrentFrameId(), " instance=", currentInstance.getId(),
+                                 " game=0x", std::hex, game, " material=0x", drawCall.getMaterialData().getHash(),
+                                 " categories=0x", currentInstance.getCategoryFlags().raw(), std::dec,
+                                 " -> ", route,
+                                 " | blending=", a.isBlendingDisabled ? "off" : "on", " blendType=", static_cast<int>(a.blendType),
+                                 " alphaTest=", static_cast<int>(a.alphaTestType), " ref=", static_cast<uint32_t>(a.alphaTestReferenceValue),
+                                 " fullyOpaque=", a.isFullyOpaque ? 1 : 0,
+                                 " | mask=0x", std::hex, vkMask, std::dec, " hidden=", currentInstance.m_isHidden ? 1 : 0,
+                                 " cullDisabled=", cullDisabled ? 1 : 0, " flipFacing=", flipFacing ? 1 : 0,
+                                 " decalSortOrder=", static_cast<uint32_t>(currentInstance.surface.decalSortOrder),
+                                 lastLine ? " (last [DecalInstance] line)" : ""));
+      }
+    }
+
     // This flag translates to a flip of VK_GEOMETRY_INSTANCE_TRIANGLE_FLIP_FACING_BIT_KHR when the instance
     // is a separate BLAS instance, and to nothing if it's a part of a merged BLAS.
     // The reason is in this bit of Vulkan spec:
@@ -1375,7 +1479,7 @@ namespace dxvk {
 
   void InstanceManager::preserveInstance(
       RtInstance& instance,
-      const SceneDraw& drawCall,
+      const DrawCallState& drawCall,
       const MaterialData* materialData,
       bool hasTransformChanged,
       bool hasPreviousPositions,

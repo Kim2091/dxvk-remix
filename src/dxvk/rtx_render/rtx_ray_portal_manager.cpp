@@ -26,6 +26,7 @@
 #include "rtx_ray_portal_manager.h"
 
 #include "rtx_context.h"
+#include "../d3d9/d3d9_state.h"
 #include "../util/util_vector.h"
 #include "../util/util_matrix.h"
 #include "rtx_intersection_test_helpers.h"

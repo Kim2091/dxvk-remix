@@ -397,7 +397,7 @@ namespace dxvk {
     DxvkExt khrSurface                      = { VK_KHR_SURFACE_EXTENSION_NAME,                          DxvkExtMode::Required };
     DxvkExt khrDeviceProperties2            = { VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME, DxvkExtMode::Required };
     DxvkExt khrDebugReport                  = { VK_EXT_DEBUG_REPORT_EXTENSION_NAME,                     DxvkExtMode::Required };
-    // HDR10 output (rtx.tonemap.hdr.enable): the ST.2084 swapchain color space.
+    // HDR10 output (rtx.tonemap.hdr.enable): the ST.2084 swapchain colour space.
     DxvkExt extSwapchainColorSpace          = { VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME,            DxvkExtMode::Optional };
     // NV-DXVK start: DLFG integration
     DxvkExt khrExternalMemoryCapabilities   = { VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME,     DxvkExtMode::Optional };

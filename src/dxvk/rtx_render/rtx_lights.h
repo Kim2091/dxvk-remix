@@ -511,6 +511,17 @@ struct RtLight {
     return m_cachedInitialHash;
   }
 
+  // The host's asset key of a game light (LightUtils::legacyAssetKey), or kEmptyHash.
+  // Replacements, captures and the light picker name a light by its initial hash, so a key replaces it.
+  XXH64_hash_t getAssetKey() const {
+    return m_assetKey;
+  }
+
+  void setAssetKey(XXH64_hash_t key) {
+    m_assetKey = key;
+    m_cachedInitialHash = key;
+  }
+
   uint32_t getStableIdentity() const {
     return m_stableIdentity;
   }
@@ -684,6 +695,7 @@ private:
   };
 
   XXH64_hash_t m_cachedInitialHash = 0;
+  XXH64_hash_t m_assetKey = 0;
   uint32_t m_stableIdentity = kInvalidLightIdentity;
 
   // Used to associate parts of a replacement heirarchy.

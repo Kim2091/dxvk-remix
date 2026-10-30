@@ -39,10 +39,10 @@
 //   again from its texture coordinates) against a brute-force walk of the light ray: a pit occluded by its rim after a
 //   crossing, the same pit lit under a steep light, a level field lit through the top of a neighbour (exit distance),
 //   and a concave crease whose far slope occludes a low light.
-// - shadow exits: a smoothed low-poly boulder (box-projected UVs, welded seams) at one and two triangle sizes of depth, viewed
+// - 12.14: a smoothed low-poly boulder (box-projected UVs, welded seams) at one and two triangle sizes of depth, viewed
 //   at grazing angles all around its outline: no limits with the default budget (32 prisms), bounded steps and
 //   crossings, outer exits only where the ray really leaves the mesh, carved rays never deeper than the relief, limits
-//   never shaded where they stopped (and with a budget of 8 prisms, rare once rising rays count as exits), and six grazing
+//   never shaded where they stopped (and with the old 8 prisms, rare once rising rays count as exits), and six grazing
 //   rays against the brute-force walk.
 // The shell data (welded directions, adjacency, fold limits) is built here by brute force with the conventions of
 // sccr_shell_args.h, not by the GPU kernel's copy (test_sccr_shell.cpp checks that). Object space is world space here
@@ -1170,7 +1170,7 @@ struct ShadowResult {
   float rampStep = 0.0f;
   float progressRate = 0.0f;
   float t = 0.0f;
-  // sccrShellShadowExit: where an OUTER march left the shell, and that prism's outward normal.
+  // 12.14 (sccrShellShadowExit): where an OUTER march left the shell, and that prism's outward normal.
   bool exited = false;
   Float3 exitPosition {};
   Float3 exitNormal {};
@@ -1498,7 +1498,7 @@ void testShadowCrossing() {
   const float exitT = 0.6f * worldDepth / light.z;
   check(std::fabs(shadow.t - exitT) < 2e-3f * worldDepth,
         "shadow crossing: leaves at the top (" + std::to_string(shadow.t) + " against " + std::to_string(exitT) + ")");
-  // The scene's shadow ray starts at the exit, on the neighbour's top (z = 0) lifted along its outward normal
+  // 12.14: the scene's shadow ray starts at the exit, on the neighbour's top (z = 0) lifted along its outward normal
   // (+z) by kSccrShellShadowExitOffset x D: above the mesh, and the light leaves through that face outwards.
   check(shadow.exited && std::fabs(shadow.exitPosition.z) < 2e-4f * worldDepth,
         "shadow crossing: exit on the top (z " + std::to_string(shadow.exitPosition.z) + ")");
@@ -1664,8 +1664,8 @@ float meshDistance(const Mesh& mesh, Float3 q) {
   return best;
 }
 
-// Grazing views of a smoothed low-poly boulder (many small curved triangles, box-projected UVs with welded
-// seams) at strong depth, a case where a budget of 8 prisms runs out all along the outline.
+// 12.14: grazing views of a smoothed low-poly boulder (many small curved triangles, box-projected UVs with welded
+// seams) at strong depth, the in-game case where the old default of 8 prisms ran out all along the outline.
 void testBoulderGrazing() {
   const Mesh mesh = boulder(3, 1.0f);
   const ShellData data = buildShell(mesh);
@@ -1754,7 +1754,7 @@ void testBoulderGrazing() {
         check(tooDeep == 0, name + ": no carved ray deeper than the relief reaches");
         check(pingPong * 200u <= rays, name + ": walks that cross straight back stay rare (" + std::to_string(pingPong) + ")");
       } else {
-        // With 8 prisms, limits remain only where the ray was not rising out of the shell.
+        // The old default: limits remain only where the ray was not rising out of the shell.
         check(limits * 20u <= rays, name + ": with 8 prisms, limits stay rare (" + std::to_string(limits) + ")");
       }
     }

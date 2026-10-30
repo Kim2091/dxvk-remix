@@ -23,6 +23,12 @@
 
 #include "dxvk_device.h"
 #include "rtx_fork_camera_origin.h"
+#include "../../util/log/log.h"
+#include "../../util/util_string.h"
+
+namespace {
+  constexpr float kFovToleranceRadians = 0.001f;
+}
 
 namespace dxvk {
 
@@ -40,6 +46,94 @@ namespace dxvk {
   void CameraManager::onFrameEnd() {
     m_lastSetCameraType = CameraType::Unknown;
     m_decompositionCache.clear();
+  }
+
+  CameraType::Enum CameraManager::processCameraData(const DrawCallState& input) {
+    // If theres no real camera data here - bail
+    if (isIdentityExact(input.getTransformData().viewToProjection)) {
+      return input.testCategoryFlags(InstanceCategories::Sky) ? CameraType::Sky : CameraType::Unknown;
+    }
+
+    switch (RtxOptions::fusedWorldViewMode()) {
+    case FusedWorldViewMode::None:
+      if (input.getTransformData().objectToView == input.getTransformData().objectToWorld && !isIdentityExact(input.getTransformData().objectToView)) {
+        return input.testCategoryFlags(InstanceCategories::Sky) ? CameraType::Sky : CameraType::Unknown;
+      }
+      break;
+    case FusedWorldViewMode::View:
+      if (Logger::logLevel() >= LogLevel::Warn) {
+        // Check if World is identity
+        ONCE_IF_FALSE(isIdentityExact(input.getTransformData().objectToWorld),
+                      Logger::warn("[RTX-Compatibility] Fused world-view tranform set to View but World transform is not identity!"));
+      }
+      break;
+    case FusedWorldViewMode::World:
+      if (Logger::logLevel() >= LogLevel::Warn) {
+        // Check if View is identity
+        ONCE_IF_FALSE(isIdentityExact(input.getTransformData().objectToView),
+                      Logger::warn("[RTX-Compatibility] Fused world-view tranform set to World but View transform is not identity!"));
+      }
+      break;
+    }
+
+    // Get camera params
+    DecomposeProjectionParams decomposeProjectionParams = getOrDecomposeProjection(input.getTransformData().viewToProjection);
+
+    // Filter invalid cameras, extreme shearing
+    static auto isFovValid = [](float fovA) {
+      return fovA >= kFovToleranceRadians;
+    };
+    static auto areFovsClose = [](float fovA, const RtCamera& cameraB) {
+      return std::abs(fovA - cameraB.getFov()) < kFovToleranceRadians;
+    };
+
+    if (std::abs(decomposeProjectionParams.shearX) > 0.01f || !isFovValid(decomposeProjectionParams.fov)) {
+      ONCE(Logger::warn("[RTX] CameraManager: rejected an invalid camera"));
+      return input.getCategoryFlags().test(InstanceCategories::Sky) ? CameraType::Sky : CameraType::Unknown;
+    }
+
+
+    auto isViewModel = [this](float fov, float maxZ, uint32_t frameId) {
+      if (RtxOptions::ViewModel::enable()) {
+        // Note: max Z check is the top-priority
+        if (maxZ <= RtxOptions::ViewModel::maxZThreshold()) {
+          return true;
+        }
+        if (getCamera(CameraType::Main).isValid(frameId)) {
+          // FOV is different from Main camera => assume that it's a ViewModel one
+          if (!areFovsClose(fov, getCamera(CameraType::Main))) {
+            return true;
+          }
+        }
+      }
+      return false;
+    };
+
+    const uint32_t frameId = m_device->getCurrentFrameId();
+
+    // The draw is classified against the host's camera when that camera is applied first.
+    if (!input.isDrawingToRaytracedRenderTarget && !input.testCategoryFlags(InstanceCategories::Sky)) {
+      applyHeldFallbackCamera(decomposeProjectionParams.fov, "draw");
+    }
+
+    auto cameraType = CameraType::Main;
+    if (input.isDrawingToRaytracedRenderTarget) {
+      cameraType = CameraType::RenderToTexture;
+    } else if (input.testCategoryFlags(InstanceCategories::Sky)) {
+      cameraType = CameraType::Sky;
+    } else if (isViewModel(decomposeProjectionParams.fov, input.maxZ, frameId)) {
+      cameraType = CameraType::ViewModel;
+    }
+    
+    // Check fov consistency across frames
+    if (frameId > 0) {
+      if (getCamera(cameraType).isValid(frameId - 1) && !areFovsClose(decomposeProjectionParams.fov, getCamera(cameraType))) {
+        ONCE(Logger::warn("[RTX] CameraManager: FOV of a camera changed between frames"));
+      }
+    }
+
+    applyFrameCamera(cameraType, input.getTransformData().worldToView, input.getTransformData().viewToProjection);
+    return cameraType;
   }
 
   void CameraManager::applyFrameCamera(CameraType::Enum cameraType, const Matrix4& worldToView, const Matrix4& viewToProjection) {
@@ -87,6 +181,35 @@ namespace dxvk {
     m_lastSetCameraType = cameraType;
   }
 
+  void CameraManager::applyDrawCamera(CameraType::Enum cameraType, const Matrix4& worldToView, const Matrix4& viewToProjection) {
+    // processCameraData applies the held camera ahead of every draw that is neither a render-to-texture nor a sky draw,
+    // and only a Main or view-model draw can find Main unset.
+    if (cameraType == CameraType::Main || cameraType == CameraType::ViewModel) {
+      applyHeldFallbackCamera(getOrDecomposeProjection(viewToProjection).fov, "frontend");
+    }
+    applyFrameCamera(cameraType, worldToView, viewToProjection);
+  }
+
+  bool CameraManager::applyHeldFallbackCamera(float drawFov, const char* source) {
+    // REMIXAPI_CAMERA_FRAME_EVENT_FALLBACK: the host stated this frame's view and no draw has set the Main
+    // camera yet. A draw with that FOV is the world camera itself and sets Main as always; a draw with another FOV
+    // (a first-person draw on a frame whose world camera the host stated) must not become the frame's camera.
+    const uint32_t frameId = m_device->getCurrentFrameId();
+    if (!m_fallbackCameraHeld || m_fallbackCameraFrameId != frameId || getCamera(CameraType::Main).isValid(frameId) ||
+        std::abs(drawFov - m_fallbackFov) < kFovToleranceRadians) {
+      return false;
+    }
+    m_fallbackCameraHeld = false;
+    applyFrameCamera(CameraType::Main, m_fallbackWorldToView, m_fallbackViewToProjection);
+    if (m_fallbackAheadLogs < 8) {
+      ++m_fallbackAheadLogs;
+      Logger::info(str::format("[RTX] Frame ", frameId, ": the host's fallback camera (FOV ", m_fallbackFov,
+                               " rad) set the Main camera ahead of a ", source, " camera with FOV ", drawFov,
+                               " rad. First 8 are logged."));
+    }
+    return true;
+  }
+
   bool CameraManager::isCameraCutThisFrame() const {
     return m_lastCameraCutFrameId == m_device->getCurrentFrameId();
   }
@@ -105,27 +228,58 @@ namespace dxvk {
     }
   }
 
+  void CameraManager::holdFallbackCamera(const Matrix4& worldToView, const Matrix4& viewToProjection) {
+    m_fallbackWorldToView = worldToView;
+    m_fallbackViewToProjection = viewToProjection;
+    m_fallbackFov = getOrDecomposeProjection(viewToProjection).fov;
+    m_fallbackCameraFrameId = m_device->getCurrentFrameId();
+    m_fallbackCameraHeld = true;
+  }
+
+  bool CameraManager::takeFallbackCamera(Matrix4& worldToView, Matrix4& viewToProjection) {
+    if (!m_fallbackCameraHeld) {
+      return false;
+    }
+    m_fallbackCameraHeld = false;
+    // This frame's, or one that arrived after the previous frame's ray tracing.
+    if (m_device->getCurrentFrameId() - m_fallbackCameraFrameId > 1) {
+      return false;
+    }
+    worldToView = m_fallbackWorldToView;
+    viewToProjection = m_fallbackViewToProjection;
+    return true;
+  }
+
   void CameraManager::processExternalCamera(CameraType::Enum type,
                                             const Matrix4& worldToView,
                                             const Matrix4& viewToProjection,
                                             const Vector3* worldOrigin,
                                             const Matrix4d* preciseWorldToView) {
     if (worldOrigin != nullptr && type < CameraType::Count) {
-      // Ported from BetaRT (sambow23/dxvk-remix-gmod, commit 11761453a). Shift last frame's camera
-      // into this frame's render origin before update() turns it into the previous camera, so an origin move is
-      // neither motion nor a camera cut. Only once per frame: update() ignores a second call in the same frame.
-      RtCamera& camera = getCamera(type);
-      if (camera.getLastUpdateFrame() != m_device->getCurrentFrameId()) {
-        const Vector3 previousHistoryOffset = fork_camera_origin::calculatePreviousCameraHistoryOffset(
-          m_externalCameraOriginValid[type], m_externalCameraOrigins[type], *worldOrigin);
-        if (previousHistoryOffset != Vector3(0.0f)) {
-          camera.applyArtificialWorldOffset(previousHistoryOffset);
-        }
-        m_externalCameraOrigins[type] = *worldOrigin;
-        m_externalCameraOriginValid[type] = true;
+      if (type == CameraType::Main) {
+        m_apiWorldOriginSeen = true;
       }
+      applyHostWorldOrigin(type, *worldOrigin);
     }
     updateExternalCamera(type, worldToView, viewToProjection, preciseWorldToView);
+  }
+
+  bool CameraManager::applyHostWorldOrigin(CameraType::Enum type, const Vector3& worldOrigin) {
+    // Ported from BetaRT (sambow23/dxvk-remix-gmod betart-numos3, commit 11761453a): shift last frame's camera
+    // into this frame's render origin before update() turns it into the previous camera, so an origin move is
+    // neither motion nor a camera cut. Only once per frame: update() ignores a second call in the same frame.
+    RtCamera& camera = getCamera(type);
+    if (camera.getLastUpdateFrame() == m_device->getCurrentFrameId()) {
+      return false;
+    }
+    const Vector3 previousHistoryOffset = fork_camera_origin::calculatePreviousCameraHistoryOffset(
+      m_externalCameraOriginValid[type], m_externalCameraOrigins[type], worldOrigin);
+    if (previousHistoryOffset != Vector3(0.0f)) {
+      camera.applyArtificialWorldOffset(previousHistoryOffset);
+    }
+    m_externalCameraOrigins[type] = worldOrigin;
+    m_externalCameraOriginValid[type] = true;
+    return true;
   }
 
   void CameraManager::processExternalCamera(CameraType::Enum type,

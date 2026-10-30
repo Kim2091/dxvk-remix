@@ -46,7 +46,6 @@
 #include "rtx_numos.h"
 #include "rtx_numos_settings.h"
 #include "rtx_option_manager.h"
-#include "rtx_stress.h"
 
 namespace dxvk {
   RtxInitializer::RtxInitializer(DxvkDevice* device)
@@ -126,7 +125,6 @@ namespace dxvk {
 
     // Need to promote all of the hardware support Options before prewarming shaders.
     RtxOptionManager::applyPendingValues(m_device, /* forceOnChange */ true);
-    RtxStress::apply();
 
     // The prewarm reads SER support through RtxOptions before RtxContext records it.
     // SER SPIR-V must never reach a driver without VK_NV_ray_tracing_invocation_reorder.

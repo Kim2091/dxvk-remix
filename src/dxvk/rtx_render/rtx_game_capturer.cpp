@@ -33,6 +33,7 @@
 #include "rtx_texture_manager.h"
 #include "rtx_fork_hooks.h"
 #include "rtx_asset_replacer.h"
+#include "rtx_scene_interface.h"
 
 #include "../dxvk_device.h"
 
@@ -317,7 +318,9 @@ namespace dxvk {
       switch (rtLight.getType()) {
       default:
       case RtLightType::Sphere:
-        captureSphereLight(rtLight.getSphereLight());
+        // A host asset key names the light as replacements look it up.
+        captureSphereLight(rtLight.getSphereLight(),
+                           rtLight.getAssetKey() != kEmptyHash ? rtLight.getAssetKey() : rtLight.getSphereLight().getHash());
         break;
       case RtLightType::Rect:
         // Todo: Handle Rect lights
@@ -348,8 +351,7 @@ namespace dxvk {
     }
   }
 
-  void GameCapturer::captureSphereLight(const dxvk::RtSphereLight& rtLight) {
-    const auto hash = rtLight.getHash();
+  void GameCapturer::captureSphereLight(const dxvk::RtSphereLight& rtLight, const XXH64_hash_t hash) {
     pxr::GfRotation  rotation;
     rotation.SetIdentity();
     if (m_pCap->sphereLights.count(hash) == 0) {
@@ -589,12 +591,13 @@ namespace dxvk {
     const XXH64_hash_t matHash = rtInstance.getMaterialDataHash();
 
     // API meshes use their API handle as the hash, as the runtime replacement lookup does.
+    // rtx.scene.assetKeys: a host asset key is what replacements are looked up with, so the capture uses it too.
     XXH64_hash_t meshHash = 0;
-    // A host asset key is what replacements are looked up with, so the capture uses it too.
-    const AssetResolver& resolver = ctx->getCommonObjects()->getSceneManager().getAssetReplacer()->assetResolver();
+    const AssetResolver* resolver = scene::Options::assetKeys()
+      ? &ctx->getCommonObjects()->getSceneManager().getAssetReplacer()->assetResolver() : nullptr;
     if (pBlas->input.getGeometryData().externalMesh != nullptr) {
       meshHash = reinterpret_cast<XXH64_hash_t>(pBlas->input.getGeometryData().externalMesh);
-      if (const AssetResolver::AssetKey* key = resolver.meshKey(meshHash)) {
+      if (const AssetResolver::AssetKey* key = resolver != nullptr ? resolver->meshKey(meshHash) : nullptr) {
         if (key->key != 0) {
           meshHash = key->key;
         }
@@ -610,9 +613,19 @@ namespace dxvk {
     // For API materials, use the MaterialData hash (what runtime uses for replacement lookup).
     // For D3D9 materials this equals matHash, but for API-submitted materials the two differ.
     XXH64_hash_t materialLookupHash = material.getHash();
-    if (const AssetResolver::AssetKey* key = resolver.materialKey(materialLookupHash)) {
-      if (key->key != 0) {
-        materialLookupHash = key->key;
+    const AssetResolver::AssetKey* materialKey = resolver != nullptr ? resolver->materialKey(materialLookupHash) : nullptr;
+    if (materialKey != nullptr && materialKey->key != 0) {
+      materialLookupHash = materialKey->key;
+    } else if (pBlas->input.getGeometryData().externalMesh != nullptr) {
+      // An API material whose albedo is an imported game texture is captured under that texture's D3D9 image hash,
+      // the key a D3D9 draw of the texture and the texture picker use. Replacements are looked up by it too.
+      const uint32_t albedoIndex = rtInstance.getAlbedoOpacityTextureIndex();
+      const auto& textureTable = ctx->getCommonObjects()->getTextureManager().getTextureTable();
+      if (albedoIndex != kSurfaceMaterialInvalidTextureIndex && albedoIndex < textureTable.size()) {
+        const XXH64_hash_t gameTextureHash = fork_hooks::gameTextureHash(textureTable[albedoIndex]);
+        if (gameTextureHash != kEmptyHash) {
+          materialLookupHash = gameTextureHash;
+        }
       }
     }
 
@@ -1180,7 +1193,9 @@ namespace dxvk {
     exportPrep.meta.exeName = env::getExeName();
     exportPrep.meta.iconPath = BASE_DIR + exportPrep.meta.exeName + "_icon.bmp";
     exportPrep.meta.geometryHashRule = RtxOptions::geometryAssetHashRuleString();
-    exportPrep.meta.assetKeyDerivation = str::format(AssetResolver::kKeyDerivationVersion);
+    if (scene::Options::assetKeys()) {
+      exportPrep.meta.assetKeyDerivation = str::format(AssetResolver::kKeyDerivationVersion);
+    }
     exportPrep.meta.metersPerUnit = metersPerUnit() > 0.f ? metersPerUnit() : RtxOptions::sceneScale();
     exportPrep.meta.timeCodesPerSecond = framesPerSecond;
     exportPrep.meta.startTimeCode = 0.0;

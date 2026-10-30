@@ -21,7 +21,7 @@
 */
 #include "material_translator.h"
 
-#include <utility>
+#include "../../dxvk/rtx_render/rtx_scene_manager.h"
 
 namespace dxvk {
   namespace translator {
@@ -56,8 +56,8 @@ namespace dxvk {
       return desc;
     }
 
-    MaterialTranslation MaterialTranslator::translate(MaterialData&& material, const FixedFunctionState& state) {
-      MaterialTranslation out { std::move(material) };
+    MaterialTranslation MaterialTranslator::translate(SceneManager& scene, const DrawCallState& draw, const FixedFunctionState& state) {
+      MaterialTranslation out { scene.resolveDrawMaterial(draw) };
       out.alphaState = translateAlphaState(state, out.material);
       out.legacySurface = translateLegacySurface(state);
       return out;

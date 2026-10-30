@@ -5,6 +5,7 @@
 
 #include "d3d9_util.h"
 #include "d3d9_buffer.h"
+#include "d3d9_texture.h"
 
 #include "d3d9_rtx_utils.h"
 #include "d3d9_device.h"
@@ -13,24 +14,6 @@
 #include "../util/util_math.h"
 
 namespace dxvk {
-  namespace {
-    Vector4 toVector4(const D3DCOLORVALUE& c) {
-      return Vector4(c.r, c.g, c.b, c.a);
-    }
-
-    FixedFunctionMaterial toFixedFunctionMaterial(const D3DMATERIAL9& material) {
-      FixedFunctionMaterial result;
-      result.diffuse = toVector4(material.Diffuse);
-      result.ambient = toVector4(material.Ambient);
-      result.specular = toVector4(material.Specular);
-      result.emissive = toVector4(material.Emissive);
-      result.power = material.Power;
-      return result;
-    }
-  }
-
-  static_assert(sizeof(FixedFunctionMaterial) == sizeof(D3DMATERIAL9));
-
   bool getMinMaxBoneIndices(const uint8_t* pBoneIndices, uint32_t stride, uint32_t vertexCount, uint32_t numBonesPerVertex, int& minBoneIndex, int& maxBoneIndex) {
     ScopedCpuProfileZone();
     if (vertexCount == 0)
@@ -235,17 +218,67 @@ namespace dxvk {
     m.alphaSrcFactor = NormalizeFactor(m.alphaSrcFactor);
     m.alphaDstFactor = NormalizeFactor(m.alphaDstFactor);
 
-    materialData.fixedFunctionMaterial = toFixedFunctionMaterial(d3d9State.material);
+    materialData.d3dMaterial = d3d9State.material;
 
     // Allow the users to configure vertex color as baked lighting for legacy draw calls.
     materialData.isVertexColorBakedLighting = RtxOptions::vertexColorIsBakedLighting();
+
+    // FNV legacy material protocol v2 (render states 149/169/177).
+    captureFnvLegacyProtocol(d3d9State, materialData.fnvProtocol);
   }
 
+  // FNV legacy material protocol v2 -- see rtx_fork_fnv_material.h. Reads the texture slots named by render
+  // state 149 straight from device state (the FFP binning in D3D9Rtx::processTextures stops at the first
+  // COLOROP = DISABLE stage, which the wrapper uses on stages 1+). Leaves the capture inactive when RS 149 is absent.
+  void captureFnvLegacyProtocol(const Direct3DState9& d3d9State, FnvLegacyProtocol& protocol) {
+    protocol = FnvLegacyProtocol {};
 
-  // The neutral fog modes take D3DFOGMODE's values. A render state holds any DWORD, and an unknown value converts
-  // unchanged, so the fog hash keeps its bits.
-  static_assert(uint32_t(frontend::FogMode::None) == D3DFOG_NONE && uint32_t(frontend::FogMode::Exp) == D3DFOG_EXP &&
-                uint32_t(frontend::FogMode::Exp2) == D3DFOG_EXP2 && uint32_t(frontend::FogMode::Linear) == D3DFOG_LINEAR);
+    if (!FnvMaterialProtocol::enable()) {
+      return;
+    }
+
+    const uint32_t modifier = FnvLegacyProtocol::readSlot(d3d9State.renderStates[FnvLegacyProtocol::kRsModifier]);
+    if (modifier == 0) {
+      return;
+    }
+
+    auto captureSlot = [&](uint32_t shift, bool allowSrgb, TextureRef& out, bool* outHasAlpha = nullptr) {
+      const uint32_t slot = (modifier >> shift) & FnvLegacyProtocol::kSlotMask;
+      if (slot == FnvLegacyProtocol::kSlotAbsent || slot >= caps::TextureStageCount) {
+        return;
+      }
+      IDirect3DBaseTexture9* baseTexture = d3d9State.textures[slot];
+      if (baseTexture == nullptr) {
+        return;
+      }
+      D3D9CommonTexture* texture = GetCommonTexture(baseTexture);
+      if (texture == nullptr || texture->GetType() != D3DRTYPE_TEXTURE) {
+        return;
+      }
+      const bool srgb = allowSrgb && (d3d9State.samplerStates[slot][D3DSAMP_SRGBTEXTURE] & 0x1);
+      out = TextureRef(texture->GetSampleView(srgb));
+      if (outHasAlpha != nullptr) {
+        // Decided from the game's D3D9 format: DXT1 / X8R8G8B8 & co. carry no usable alpha (gloss) channel.
+        *outHasAlpha = FnvMaterialProtocol::d3d9FormatHasGlossAlpha(uint32_t(texture->Desc()->Format));
+      }
+    };
+
+    captureSlot(FnvLegacyProtocol::kDiffuseSlotShift, true, protocol.diffuseTexture);
+    if (!protocol.diffuseTexture.isValid() || protocol.diffuseTexture.getImageHash() == kEmptyHash) {
+      // Spec: the protocol applies only when the diffuse slot is valid; otherwise the draw converts like upstream.
+      protocol = FnvLegacyProtocol {};
+      return;
+    }
+
+    captureSlot(FnvLegacyProtocol::kNormalSlotShift, false, protocol.normalTexture, &protocol.normalHasAlpha);
+    captureSlot(FnvLegacyProtocol::kGlowSlotShift, true, protocol.glowTexture);
+    captureSlot(FnvLegacyProtocol::kHeightSlotShift, false, protocol.heightTexture);
+
+    protocol.modifier = modifier;
+    protocol.glossBits = FnvLegacyProtocol::readSlot(d3d9State.renderStates[FnvLegacyProtocol::kRsGloss]);
+    protocol.emittance = FnvLegacyProtocol::readSlot(d3d9State.renderStates[FnvLegacyProtocol::kRsEmittance]);
+  }
+
 
   void setFogState(D3D9DeviceEx* pDevice, FogState& fogState) {
     const Direct3DState9& d3d9State = *pDevice->GetRawState();
@@ -257,13 +290,13 @@ namespace dxvk {
       float end = bit::cast<float>(d3d9State.renderStates[D3DRS_FOGEND]);
       float start = bit::cast<float>(d3d9State.renderStates[D3DRS_FOGSTART]);
 
-      fogState.mode = static_cast<frontend::FogMode>(d3d9State.renderStates[D3DRS_FOGTABLEMODE] != D3DFOG_NONE ? d3d9State.renderStates[D3DRS_FOGTABLEMODE] : d3d9State.renderStates[D3DRS_FOGVERTEXMODE]);
+      fogState.mode = d3d9State.renderStates[D3DRS_FOGTABLEMODE] != D3DFOG_NONE ? d3d9State.renderStates[D3DRS_FOGTABLEMODE] : d3d9State.renderStates[D3DRS_FOGVERTEXMODE];
       fogState.color = color.xyz();
       fogState.scale = 1.0f / (end - start);
       fogState.end = end;
       fogState.density = bit::cast<float>(d3d9State.renderStates[D3DRS_FOGDENSITY]);
     } else {
-      fogState.mode = frontend::FogMode::None;
+      fogState.mode = D3DFOG_NONE;
     }
   }
 }

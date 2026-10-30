@@ -1,7 +1,7 @@
-// Checks the color grade math (src/dxvk/rtx_render/rtx_color_grade_math.h):
-// - the built-in presets fold into exactly the fixed reference grade matrices below,
+// Checks the colour grade math (src/dxvk/rtx_render/rtx_color_grade_math.h):
+// - the built-in presets fold into exactly the matrices the tone map shader hard-coded before grades became data,
 //   and the tone curve chart's CPU mirror gives the same values through either path;
-// - the built-ins' anchor and shoulder give exactly the reference curve (anchor 0.18, shoulder 0.01),
+// - the built-ins' anchor and shoulder give exactly the curve the shader hard-coded (anchor 0.18, shoulder 0.01),
 //   and any anchor and shoulder in range give the shader's curve, which rises monotonically below the peak;
 // - the neutral grade is the identity;
 // - blends converge to their target, end exactly on it, and a new target during a blend does not jump;
@@ -25,7 +25,7 @@ namespace {
     }
   }
 
-  // The fixed reference matrices of the Warm Amber and Olive Green grades (rtx.tonemap.grade 0 and 1).
+  // The grade matrices tonemap_operator.slangh held before the grade became data (rtx.tonemap.grade 0 and 1).
   const Mat3 kOldWarmAmber { { { 1.095973f, -0.059536f, 0.149696f },
                                { -0.028776f, 1.016891f, -0.009769f },
                                { 0.002389f, 0.008034f, 0.655857f } } };
@@ -70,7 +70,7 @@ namespace {
     return 0.2126f * color[0] + 0.7152f * color[1] + 0.0722f * color[2];
   }
 
-  // The reference chart value, from a switch on the grade enum. 2 is None.
+  // The chart's value before: the grade switch on the enum. 2 was None.
   float oldChart(float exposed, float peak, int grade, bool basis) {
     Vec3 color { exposed, exposed, exposed };
     if (grade == 0) {
@@ -135,13 +135,13 @@ namespace {
 }
 
 int main() {
-  // Built-ins: the folded constants are bit for bit the reference matrices, with no contrast.
+  // Built-ins: the folded constants are bit for bit the old matrices, with no contrast.
   const auto& presets = builtIns();
   check(presets.size() == 3, "three built-in presets");
   const Mat3 identity = Params {}.matrix;
   check(toGpu(presets[0].params).rows == identity, "None folds to the identity");
-  check(toGpu(presets[1].params).rows == kOldWarmAmber, "Warm Amber folds to the reference matrix");
-  check(toGpu(presets[2].params).rows == kOldOliveGreen, "Olive Green folds to the reference matrix");
+  check(toGpu(presets[1].params).rows == kOldWarmAmber, "Warm Amber folds to the old matrix");
+  check(toGpu(presets[2].params).rows == kOldOliveGreen, "Olive Green folds to the old matrix");
   for (const auto& b : presets) {
     check(toGpu(b.params).contrast == 1.0f, "built-ins have no contrast");
     check(toGpu(b.params).anchor == 0.18f, "built-ins have the anchor the shader hard-coded");
@@ -214,7 +214,7 @@ int main() {
     check(clamped(p).anchor == 0.18f && clamped(p).shoulder == 0.01f, "a non-finite anchor or shoulder takes the default");
   }
 
-  // The chart through the reference switch and through the constants, for every built-in, with and without the basis.
+  // The chart through the old switch and through the constants, for every built-in, with and without the basis.
   const int oldIndex[3] = { 2, 0, 1 };
   for (int b = 0; b < 3; ++b) {
     for (int basis = 0; basis < 2; ++basis) {

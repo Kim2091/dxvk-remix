@@ -29,13 +29,14 @@ namespace dxvk {
 
 XXH64_hash_t LegacyMaterialData::computeIdentityHash() const {
   // Only fields consumed by determineMaterialData(), mergeLegacyMaterial(), and
-  // InstanceManager surface alpha/blend setup. Fixed-function material colours, color-source
+  // InstanceManager surface alpha/blend setup. D3DMATERIAL9 constants, color-source
   // intermediates, texture slots, and alphaTestEnabled are excluded.
   struct LegacyMaterialIdentityHashData {
     XXH64_hash_t colorTextureHash0;
     XXH64_hash_t colorTextureHash1;
     XXH64_hash_t samplerHash0;
     XXH64_hash_t samplerHash1;
+    XXH64_hash_t fnvProtocolHash; // kEmptyHash unless the FNV material protocol is active
     uint32_t alphaTestCompareOp;
     uint32_t tFactor;
     uint32_t blendEnableBlending;
@@ -63,6 +64,7 @@ XXH64_hash_t LegacyMaterialData::computeIdentityHash() const {
   data.colorTextureHash1 = colorTextures[1].getImageHash();
   data.samplerHash0 = samplers[0].ptr() != nullptr ? samplers[0]->info().calculateHash() : kEmptyHash;
   data.samplerHash1 = samplers[1].ptr() != nullptr ? samplers[1]->info().calculateHash() : kEmptyHash;
+  data.fnvProtocolHash = fnvProtocol.computeHash();
   data.alphaTestCompareOp = static_cast<uint32_t>(alphaTestCompareOp);
   data.tFactor = tFactor;
   data.blendEnableBlending = static_cast<uint32_t>(blendMode.enableBlending);
@@ -88,6 +90,7 @@ XXH64_hash_t LegacyMaterialData::computeIdentityHash() const {
       &LegacyMaterialIdentityHashData::colorTextureHash1,
       &LegacyMaterialIdentityHashData::samplerHash0,
       &LegacyMaterialIdentityHashData::samplerHash1,
+      &LegacyMaterialIdentityHashData::fnvProtocolHash,
       &LegacyMaterialIdentityHashData::alphaTestCompareOp,
       &LegacyMaterialIdentityHashData::tFactor,
       &LegacyMaterialIdentityHashData::blendEnableBlending,
@@ -212,6 +215,8 @@ template<> OpaqueMaterialData LegacyMaterialData::as() const {
     ignoreAlphaChannel = lookupHash(RtxOptions::ignoreAlphaOnTextures(), getHash());
   }
   opaqueMat.setIgnoreAlphaChannel(ignoreAlphaChannel);
+  // FNV legacy material protocol v2 (no-op unless render state 149 was set for this draw).
+  FnvMaterialProtocol::applyToOpaque(fnvProtocol, opaqueMat);
   return opaqueMat;
 }
 

@@ -64,7 +64,8 @@ HRESULT Direct3DStateBlock9_LSS::GetDevice(IDirect3DDevice9** ppDevice) {
   if (ppDevice == nullptr) {
     return D3DERR_INVALIDCALL;
   }
-  m_pDevice->reportDevice(ppDevice);
+  m_pDevice->AddRef();
+  (*ppDevice) = m_pDevice;
   return S_OK;
 }
 
@@ -213,7 +214,7 @@ HRESULT Direct3DStateBlock9_LSS::Apply() {
   {
     ClientMessage { Commands::IDirect3DStateBlock9_Apply, getId() };
   }
-  // The server's state now holds the block's values; the sent-state shadow no longer knows it.
+  // The server's state now holds the block's values; the sent-state shadow (A3a) no longer knows it.
   m_pDevice->invalidateSentState();
   return S_OK;
 }

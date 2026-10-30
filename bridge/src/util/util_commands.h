@@ -37,7 +37,7 @@ namespace Commands {
     Bridge_Any,
     Bridge_Response,
     Bridge_DebugMessage,
-    // A run of state setter records, see IsBatchableState() and util_bridgecommand.h StateMessage.
+    // A3b: a run of state setter records, see IsBatchableState() and util_bridgecommand.h StateMessage.
     Bridge_StatePacket,
     // Publishes the next part of a streamed command's data (see Commands::DataStreamed).
     Bridge_DataChunk,
@@ -57,7 +57,29 @@ namespace Commands {
     RemixApi_RegisterDevice,
     RemixApi_SetGameValue,
     RemixApi_GetGameValue,
-    // Color grading (remix_c.h). SetColorGrade is asynchronous; the others wait for the server's answer.
+    // Retained instances (remix_c.h). Handles are allocated by the client.
+    RemixApi_CreateRetainedInstance,
+    RemixApi_CreateRetainedInstances,
+    RemixApi_UpdateRetainedInstance,
+    RemixApi_UpdateRetainedInstances,
+    RemixApi_DestroyRetainedInstances,
+    RemixApi_DrawRetainedInstances,
+    // D3D9 texture import (remix_c.h). The texture handle is allocated by the client.
+    RemixApi_ImportD3D9Texture,
+    RemixApi_QueryD3D9TextureImport,
+    // Host settings (remix_c.h). Setting handles are allocated by the client.
+    RemixApi_QueryHostSettings,
+    RemixApi_RegisterHostSetting,
+    RemixApi_GetHostSettingsGeneration,
+    RemixApi_GetHostSettingValue,
+    RemixApi_SetHostSettingValue,
+    RemixApi_ClearHostSettings,
+    RemixApi_PollHostSettings,
+    // SetupCamera (async; type, view, projection, ParameterizedEXT, FrameEventsEXT -- fixed layout).
+    RemixApi_SetupCamera,
+    // SetCameraMediumMaterial (async; material handle uid, 0 clears the medium).
+    RemixApi_SetCameraMediumMaterial,
+    // Colour grading (remix_c.h). SetColorGrade is asynchronous; the others wait for the server's answer.
     RemixApi_SetColorGradePreset,
     RemixApi_SetColorGrade,
     RemixApi_MixColorGradePresets,
@@ -507,6 +529,23 @@ namespace Commands {
     case RemixApi_RegisterDevice: return "RemixApi_RegisterDevice";
     case RemixApi_SetGameValue: return "RemixApi_SetGameValue";
     case RemixApi_GetGameValue: return "RemixApi_GetGameValue";
+    case RemixApi_CreateRetainedInstance: return "RemixApi_CreateRetainedInstance";
+    case RemixApi_CreateRetainedInstances: return "RemixApi_CreateRetainedInstances";
+    case RemixApi_UpdateRetainedInstance: return "RemixApi_UpdateRetainedInstance";
+    case RemixApi_UpdateRetainedInstances: return "RemixApi_UpdateRetainedInstances";
+    case RemixApi_DestroyRetainedInstances: return "RemixApi_DestroyRetainedInstances";
+    case RemixApi_DrawRetainedInstances: return "RemixApi_DrawRetainedInstances";
+    case RemixApi_ImportD3D9Texture: return "RemixApi_ImportD3D9Texture";
+    case RemixApi_QueryD3D9TextureImport: return "RemixApi_QueryD3D9TextureImport";
+    case RemixApi_QueryHostSettings: return "RemixApi_QueryHostSettings";
+    case RemixApi_RegisterHostSetting: return "RemixApi_RegisterHostSetting";
+    case RemixApi_GetHostSettingsGeneration: return "RemixApi_GetHostSettingsGeneration";
+    case RemixApi_GetHostSettingValue: return "RemixApi_GetHostSettingValue";
+    case RemixApi_SetHostSettingValue: return "RemixApi_SetHostSettingValue";
+    case RemixApi_ClearHostSettings: return "RemixApi_ClearHostSettings";
+    case RemixApi_PollHostSettings: return "RemixApi_PollHostSettings";
+    case RemixApi_SetupCamera: return "RemixApi_SetupCamera";
+    case RemixApi_SetCameraMediumMaterial: return "RemixApi_SetCameraMediumMaterial";
     case RemixApi_SetColorGradePreset: return "RemixApi_SetColorGradePreset";
     case RemixApi_SetColorGrade: return "RemixApi_SetColorGrade";
     case RemixApi_MixColorGradePresets: return "RemixApi_MixColorGradePresets";
@@ -924,7 +963,7 @@ namespace Commands {
     return (flags & FlagBits::DataIsReserved) != 0;
   }
 
-  // Device state setters that may travel as records of a Bridge_StatePacket. They take no flags, answer
+  // A3b: device state setters that may travel as records of a Bridge_StatePacket. They take no flags, answer
   // nothing unless sendAllServerResponses is set (then packets hold one record each) and only change device state.
   // The server rejects any other command inside a packet.
   inline bool IsBatchableState(D3D9Command command) {

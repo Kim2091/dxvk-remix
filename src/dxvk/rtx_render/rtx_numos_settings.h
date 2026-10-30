@@ -1,6 +1,6 @@
 #pragma once
 
-// Fork: NUMOS's settings (submodules/numos, settings_fields.inl) as Remix options.
+// NUMOS's settings (submodules/numos, settings_fields.inl) as Remix options.
 //
 // Every numos::settingInfos() entry is registered at static initialisation as an RtxOption under its
 // own key (rtx.atmosphere.*, rtx.atmosphere.moonN.*), with its default, range, description and

@@ -1,4 +1,4 @@
-// Standalone contract/lifetime smoke test. Does not launch a game.
+// Standalone contract/lifetime smoke test. Does not launch Fallout 4.
 #include <windows.h>
 #include <d3d9.h>
 #include <d3d11.h>

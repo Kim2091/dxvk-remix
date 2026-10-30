@@ -25,6 +25,8 @@
 
 #include "dxvk_device.h"
 #include "dxvk_context.h"
+#include "../d3d9/d3d9_state.h"
+#include "../d3d9/d3d9_spec_constants.h"
 
 // NV-DXVK start: FSR FG integration
 #include "rtx_render/rtx_fork_hooks.h"
@@ -2893,6 +2895,9 @@ namespace dxvk {
     uint32_t            index,
     uint32_t            value) {
     ScopedCpuProfileZone();
+    // NV-DXVK start: terrain baking
+    static_assert(D3D9SpecConstantId::Count <= DxvkLimits::MaxNumSpecConstants);
+    // NV-DXVK end
     auto& specConst =
       pipeline == VK_PIPELINE_BIND_POINT_GRAPHICS
       ? m_state.gp.state.sc.specConstants[index]
@@ -2902,38 +2907,6 @@ namespace dxvk {
 
     if (specConst != value) {
       specConst = value;
-
-      m_flags.set(
-        pipeline == VK_PIPELINE_BIND_POINT_GRAPHICS
-        ? DxvkContextFlag::GpDirtyPipelineState
-        : pipeline == VK_PIPELINE_BIND_POINT_COMPUTE
-          ? DxvkContextFlag::CpDirtyPipelineState
-          : DxvkContextFlag::RpDirtyPipelineState);
-    }
-  }
-
-
-  const DxvkScInfo& DxvkContext::getSpecConstantsInfo(VkPipelineBindPoint pipeline) const {
-    return
-      pipeline == VK_PIPELINE_BIND_POINT_GRAPHICS
-      ? m_state.gp.state.sc
-      : pipeline == VK_PIPELINE_BIND_POINT_COMPUTE
-      ? m_state.cp.state.sc
-      : m_state.rp.state.sc;
-  }
-
-  void DxvkContext::setSpecConstantsInfo(
-    VkPipelineBindPoint pipeline,
-    const DxvkScInfo& newSpecConstantInfo) {
-    DxvkScInfo& specConstantInfo =
-      pipeline == VK_PIPELINE_BIND_POINT_GRAPHICS
-      ? m_state.gp.state.sc
-      : pipeline == VK_PIPELINE_BIND_POINT_COMPUTE
-      ? m_state.cp.state.sc
-      : m_state.rp.state.sc;
-
-    if (specConstantInfo != newSpecConstantInfo) {
-      specConstantInfo = newSpecConstantInfo;
 
       m_flags.set(
         pipeline == VK_PIPELINE_BIND_POINT_GRAPHICS

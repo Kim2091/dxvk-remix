@@ -21,10 +21,6 @@ struct D3D9ScenarioArgs {
   bool overlay = false;
   // --overlay-first: with --overlay, the blended pass is drawn first and the opaque pass second.
   bool overlayFirst = false;
-  // --clean: bad-values sends the same draws with valid values, for a reference run.
-  bool clean = false;
-  // --precombined: ring-static puts world * view into WORLD and leaves VIEW identity.
-  bool precombined = false;
 };
 
 // Runs one scenario on a device made by <runtime>/d3d9.dll. Returns the process exit code.

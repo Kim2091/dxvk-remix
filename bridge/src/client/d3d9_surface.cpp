@@ -27,9 +27,11 @@
 #include "d3d9_texture.h"
 #include "d3d9_cubetexture.h"
 
+#include "client_memory_stats.h"
 #include "d3d9_surfacebuffer_helper.h"
 #include "util_bridge_assert.h"
 #include "util_gdi.h"
+#include "util_texdiag.h"
 
 Direct3DSurface9_LSS::Direct3DSurface9_LSS(BaseDirect3DDevice9Ex_LSS* const pDevice,
                                            const D3DSURFACE_DESC& desc, bool isBackBuffer)
@@ -49,10 +51,11 @@ Direct3DSurface9_LSS::~Direct3DSurface9_LSS() {
     const auto surfaceSize =
       bridge_util::calcTotalSizeOfRect(m_desc.Width, m_desc.Height, m_desc.Format);
 
-    g_totalSurfaceShadow -= surfaceSize;
+    const uint64_t total = ClientMemoryStats::surfaceShadowBytes.fetch_sub(surfaceSize) - surfaceSize;
+    ClientMemoryStats::surfaceShadows.fetch_sub(1);
     Logger::trace(format_string("Releasing shadow of surface [%p] "
-                                "(size: %zd, total surface shadow size: %zd)",
-                                this, surfaceSize, g_totalSurfaceShadow));
+                                "(size: %zd, total surface shadow size: %llu)",
+                                this, surfaceSize, total));
   }
 }
 
@@ -223,10 +226,11 @@ bool Direct3DSurface9_LSS::lock(D3DLOCKED_RECT& lockedRect, const RECT* pRect, c
   } else {
     if (!m_shadow) {
       m_shadow.reset(new uint8_t[surfaceSize]);
-      g_totalSurfaceShadow += surfaceSize;
+      const uint64_t total = ClientMemoryStats::surfaceShadowBytes.fetch_add(surfaceSize) + surfaceSize;
+      ClientMemoryStats::surfaceShadows.fetch_add(1);
       Logger::trace(format_string("Allocated a shadow for surface [%p] "
-                                  "(size: %zd, total surface shadow size: %zd)",
-                                  this, surfaceSize, g_totalSurfaceShadow));
+                                  "(size: %zd, total surface shadow size: %llu)",
+                                  this, surfaceSize, total));
     }
 
     const size_t byteOffset = bridge_util::calcImageByteOffset(lockedRect.Pitch, rect, m_desc.Format);
@@ -296,6 +300,21 @@ void Direct3DSurface9_LSS::sendDataToServer(const LockInfo& lockInfo) const {
         }
         c.end_data_blob();
         row += blobRows;
+      }
+    }
+
+    // [TexDiag] (util_texdiag.h): fingerprint the rows exactly as sent; the server logs the same for this uid.
+    const uint32_t diagMinWidth = GlobalOptions::getTextureUploadDiagnostics();
+    if (diagMinWidth != 0) {
+      const auto [diagWidth, diagHeight] = getRectDimensions(lockInfo.rect);
+      if (diagWidth >= diagMinWidth) {
+        const size_t diagRowSize = bridge_util::calcRowSize((uint32_t) diagWidth, m_desc.Format);
+        const uint32_t diagRows = bridge_util::calcStride((uint32_t) diagHeight, m_desc.Format);
+        const auto stats = bridge_util::texdiag::analyzeRows((const uint8_t*) lockInfo.lockedRect.pBits,
+                                                             (size_t) lockInfo.lockedRect.Pitch, diagRowSize, diagRows);
+        bridge_util::texdiag::logRowStats("client", (uint32_t) c.get_uid(), (uint32_t) getId(),
+                                          (uint32_t) m_desc.Format, lockInfo.rect.left, lockInfo.rect.top,
+                                          lockInfo.rect.right, lockInfo.rect.bottom, lockInfo.flags, diagRowSize, stats);
       }
     }
   }

@@ -29,7 +29,7 @@
 // (weldEpsilon) on a cube whose split copies drift in the last bits; the fold guard's limits (phase 5 of the build) on
 // cube corners, a subdivided cube's edges, a concave L (an open floor and wall, and a closed L-shaped block), a thin slab
 // (low-poly: its corners cap the depth below half the thickness, so the relief cannot punch through; subdivided: the
-// interior of its big faces is unlimited, so a depth above the thickness punches through there) and the
+// interior of its big faces is unlimited, so a depth above the thickness punches through there, risk R5) and the
 // cylinder; and, for every mesh, that prisms built with depths clamped to the limits stay valid (the march's own
 // determinant test) at any material depth. The CPU copy of the build is rtx_fork_sccr_shell_cpu.cpp; keep it in step
 // with the shader and sccr_shell_args.h.
@@ -464,7 +464,7 @@ void testClosedL() {
 // at (1 - u)(1 - 10 u) = 1/4, u = 0.0730, d = 0.0632. Every vertex gets that limit; the top and bottom shells then sink
 // 2 d / sqrt(3) = 0.073 together, less than the thickness: the relief cannot punch through. Subdivided (4 x 4 per
 // face): the vertex in the middle of each big face has no limit, so a depth above the thickness punches through there
-// (the fold guard is local).
+// (risk R5, documented: the fold guard is local).
 void testThinSlab() {
   {
     const Mesh mesh = makeBox({ 1, 1, 0.1f }, 1);
@@ -485,7 +485,7 @@ void testThinSlab() {
         unlimitedTop += r.depthLimits[v].first == kNoLimit ? 1u : 0u;
       }
     }
-    check(unlimitedTop > 0, "subdivided slab: the middle of the top face is unlimited (punch-through possible)");
+    check(unlimitedTop > 0, "subdivided slab: the middle of the top face is unlimited (punch-through possible, R5)");
     checkFoldGuard(mesh, r, "subdivided slab");
   }
 }

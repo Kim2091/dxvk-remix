@@ -21,11 +21,17 @@
 */
 #include <ppl.h>
 #include <intrin.h>
+#include <cmath>
+#include <string>
 #include "rtx_draw_call_tracker.h"
 #include "translator/rtx_translator_lifetime.h"
 #include "rtx_options.h"
 #include "rtx_ray_portal_manager.h"
 #include "rtx_intersection_test.h"
+#include "rtx_fork_d3d9_alpha.h"
+#include "rtx_fork_d3d9_identity.h"
+#include "rtx_fork_d3d9_identity_trace.h"
+#include "rtx_fork_fnv_material.h"
 #include "dxvk_device.h"
 #include "dxvk_perf_counters.h"
 #include "../util/util_struct_hash.h"
@@ -63,16 +69,56 @@ namespace dxvk {
     }
   }
 
+  // A lookup whose material (a D3D9 draw's albedo image hash) is listed in
+  // rtx.fnvProtocol.logMaterialTextures is logged whenever its exact identity match fails, with how it compares to the
+  // instance it was matched to (or, for a new instance, to the nearest instance of the same topology, claimed this
+  // frame or not). Instance churn on a picked surface -- a new instance every few frames, or one instance handed from
+  // placement to placement -- then reads straight from the log: which of transform / vertex positions / material
+  // changed, and how far the match moved. At most 20000 lines per session.
+  static bool trackerWatched(const ReplacementInstance::LookupKey& key) {
+    const fast_unordered_set& watched = FnvMaterialProtocol::logMaterialTextures();
+    return !watched.empty() && lookupHash(watched, key.materialHash);
+  }
+
+  static void logTrackerWatch(const char* outcome, const ReplacementInstance::LookupKey& key, const ReplacementInstance* other,
+                              float distSqr, uint32_t frameId) {
+    static uint32_t s_lines = 0;
+    if (s_lines >= 20000) {
+      return;
+    }
+    ++s_lines;
+    std::string otherDesc = " other=none";
+    if (other != nullptr) {
+      const Vector4& t = other->objectToWorld[3];
+      otherDesc = str::format(" other: ri=", other->id, " created=", other->frameCreated, " lastSeen=", other->frameLastSeen,
+                              " dist=", distSqr >= 0.f ? std::sqrt(distSqr) : -1.f,
+                              " sameXform=", std::memcmp(&other->objectToWorld, &key.transform, sizeof(Matrix4)) == 0 ? 1 : 0,
+                              " sameVtx=", other->vertexPositionHash == key.vertexPositionHash ? 1 : 0,
+                              " sameMat=", other->materialHash == key.materialHash ? 1 : 0,
+                              " sameIdentity=", other->identityHash == key.identityHash ? 1 : 0,
+                              " sameTexXform=", (std::memcmp(&other->textureTransform, &key.textureTransform, sizeof(Matrix4)) == 0 &&
+                                                 other->texgenMode == key.texgenMode) ? 1 : 0,
+                              " pos=(", t.x, ", ", t.y, ", ", t.z, ")",
+                              " vtx=0x", std::hex, other->vertexPositionHash, std::dec);
+    }
+    const Vector4& p = key.transform[3];
+    Logger::info(str::format("[TrackerWatch] frame=", frameId, " ", outcome,
+                             " material=0x", std::hex, key.materialHash, " topology=0x", key.spatialMapHash,
+                             " identity=0x", key.identityHash, " vtx=0x", key.vertexPositionHash, std::dec,
+                             " pos=(", p.x, ", ", p.y, ", ", p.z, ") centroid=(", key.worldPos.x, ", ", key.worldPos.y, ", ",
+                             key.worldPos.z, ")", otherDesc));
+  }
+
   DrawCallTracker::DrawCallTracker(DxvkDevice* device)
     : m_device(device) {
   }
 
   uint32_t DrawCallTracker::frameId() const {
-    return m_device->getCurrentFrameId();
+    return m_frameOverride != nullptr ? *m_frameOverride : m_device->getCurrentFrameId();
   }
 
   XXH64_hash_t DrawCallTracker::computeIdentityHash(
-      const SceneDraw& drawCallState,
+      const DrawCallState& drawCallState,
       const MaterialData* overrideMaterialData) {
     struct IdentityHashData{
       XXH64_hash_t geoHash;
@@ -136,6 +182,7 @@ namespace dxvk {
       const ReplacementInstance::LookupKey& key,
       ReplacementSpatialMap* moveInAssetMap) {
     noteRekeyOrDestroy(match);
+    reportToRetainedV2(match);
     m_identityHashMap.erase(match->identityHash);
     match->identityHash = key.identityHash;
     match->vertexPositionHash = key.vertexPositionHash;
@@ -155,7 +202,7 @@ namespace dxvk {
     for (size_t i = 0; i < m_replacementInstances.size();) {
       ReplacementInstance* replacementInstance = m_replacementInstances[i].get();
       if (replacementInstance->spatialMapHash == spatialMapKey) {
-        destroyReplacementInstance(replacementInstance);
+        destroyReplacementInstance(replacementInstance, D3d9Identity::DestroyReason::Replacements);
         std::swap(m_replacementInstances[i], m_replacementInstances.back());
         m_replacementInstances.pop_back();
         continue;
@@ -189,6 +236,9 @@ namespace dxvk {
         match->dirtyFlags.clr(ReplacementInstance::kLookupDriftMask);
       }
       perf::countD3D9(perf::D3D9Ctr::TrackerExact);
+      if (m_identityLookup != nullptr) {
+        D3d9Identity::noteExact(*match, *m_identityLookup, currentFrameId);
+      }
       return match;
     }
 
@@ -216,8 +266,15 @@ namespace dxvk {
         // Compute diff before reassociation. Transform/vertex/spatialMap match
         // by construction here; only material can diverge (l2Filter requires
         // material match, so usually nothing differs at this point).
+        if (trackerWatched(key)) {
+          logTrackerWatch("l2-same-transform", key, exactTransformMatch, 0.f, currentFrameId);
+        }
         computeDirtyFlags(exactTransformMatch, key);
+        if (m_identityLookup != nullptr) {
+          D3d9Identity::noteL2Match(*exactTransformMatch, *m_identityLookup, currentFrameId, false, -1.f, uniqueObjectDistanceSqr);
+        }
         noteRekeyOrDestroy(exactTransformMatch);
+        reportToRetainedV2(exactTransformMatch);
         m_identityHashMap.erase(exactTransformMatch->identityHash);
         exactTransformMatch->identityHash = key.identityHash;
         m_identityHashMap[key.identityHash] = exactTransformMatch;
@@ -235,17 +292,77 @@ namespace dxvk {
         // transform differs (otherwise we would have hit the exact-transform
         // branch above); other fields may also have changed.
         ReplacementInstance* match = const_cast<ReplacementInstance*>(nearestMatch);
+        if (trackerWatched(key)) {
+          logTrackerWatch("l2-moved", key, match, nearestDistSqr, currentFrameId);
+        }
         computeDirtyFlags(match, key);
+        if (m_identityLookup != nullptr) {
+          D3d9Identity::noteL2Match(*match, *m_identityLookup, currentFrameId, true, nearestDistSqr, uniqueObjectDistanceSqr);
+        }
         perf::countD3D9(perf::D3D9Ctr::TrackerSpatial);
         return reassociateMatch(match, key, &spatialMapIter->second);
       }
 
     }
 
+    // [D3d9Alpha]: why no previous instance was matched (detailed logging only).
+    if (D3d9Alpha::statsActive()) {
+      D3d9Alpha::TrackerCreateReason reason = D3d9Alpha::TrackerCreateReason::NewTopology;
+      if (spatialMapIter != m_assetSpatialMaps.end()) {
+        float distSqr = FLT_MAX;
+        const auto unmatched = [&](const ReplacementInstance* candidate) {
+          return candidate->frameLastSeen != currentFrameId;
+        };
+        reason = spatialMapIter->second.getNearestData(key.worldPos, uniqueObjectDistanceSqr, distSqr, unmatched) != nullptr
+          ? D3d9Alpha::TrackerCreateReason::MaterialMismatch
+          : D3d9Alpha::TrackerCreateReason::NoneInRange;
+      }
+      D3d9Alpha::noteTrackerCreation(reason, key.spatialMapHash, key.materialHash);
+    }
+
+    // rtx.d3d9Identity.log: the nearest instance of this topology not matched yet this frame, any material.
+    // The spatial map searches the 2x2x2 cells around the position (cell = 2x uniqueObjectDistance), so distances
+    // beyond 1x are only partly covered.
+    bool identityTopologyKnown = false;
+    bool identityMaterialBlocked = false;
+    float identityNearestDistSqr = -1.f;
+    if (m_identityLookup != nullptr && spatialMapIter != m_assetSpatialMaps.end()) {
+      identityTopologyKnown = true;
+      float distSqr = FLT_MAX;
+      const auto unmatched = [&](const ReplacementInstance* candidate) {
+        return candidate->frameLastSeen != currentFrameId;
+      };
+      if (spatialMapIter->second.getNearestData(key.worldPos, 16.f * uniqueObjectDistanceSqr, distSqr, unmatched) != nullptr) {
+        identityNearestDistSqr = distSqr;
+        identityMaterialBlocked = distSqr <= uniqueObjectDistanceSqr;
+      }
+    }
+
+    // A new instance for a watched material, against the nearest instance of its topology
+    // whether or not a draw already claimed it this frame (lastSeen = this frame means it did).
+    if (trackerWatched(key)) {
+      const ReplacementInstance* nearestAny = nullptr;
+      float nearestAnyDistSqr = -1.f;
+      if (spatialMapIter != m_assetSpatialMaps.end()) {
+        float distSqr = FLT_MAX;
+        nearestAny = spatialMapIter->second.getNearestData(key.worldPos, 16.f * uniqueObjectDistanceSqr, distSqr,
+                                                           [](const ReplacementInstance*) { return true; });
+        if (nearestAny != nullptr) {
+          nearestAnyDistSqr = distSqr;
+        }
+      }
+      logTrackerWatch(spatialMapIter == m_assetSpatialMaps.end() ? "new (topology unseen)" : "new", key, nearestAny,
+                      nearestAnyDistSqr, currentFrameId);
+    }
+
     // Level 3: no match — create a new ReplacementInstance.
     auto newReplacementInstance = std::make_unique<ReplacementInstance>(
         key, m_nextReplacementInstanceId++, currentFrameId);
     ReplacementInstance* replacementInstance = newReplacementInstance.get();
+    if (m_identityLookup != nullptr) {
+      D3d9Identity::noteCreated(*replacementInstance, *m_identityLookup, currentFrameId, identityTopologyKnown,
+                                identityMaterialBlocked, identityNearestDistSqr, uniqueObjectDistanceSqr);
+    }
 
     m_identityHashMap[key.identityHash] = replacementInstance;
 
@@ -260,9 +377,10 @@ namespace dxvk {
   }
 
   ReplacementInstance* DrawCallTracker::findOrCreateReplacementInstance(
-      const SceneDraw& drawCallState,
+      const DrawCallState& drawCallState,
       const RayPortalManager& rayPortalManager,
-      const MaterialData* overrideMaterialData) {
+      const MaterialData* overrideMaterialData,
+      bool hasReplacements) {
     // Tracking hash uses topology only (indices + geometry descriptor), matching how the
     // baseline grouped instances by BlasEntry (topological hash). The material hash is used
     // as a filter in the spatial search, not as part of the key — this allows matching
@@ -282,7 +400,19 @@ namespace dxvk {
       drawCallState.getTransformData().texgenMode
     };
 
-    ReplacementInstance* result = findOrCreateReplacementInstance(key);
+    // rtx.d3d9Identity.log / traceFrames: identity inputs for the classifier hooks in the lookup below, and the
+    // identity trace's record of this lookup.
+    const bool stats = D3d9Identity::statsActive();
+    const bool tracing = D3d9IdentityTrace::recording();
+    D3d9Identity::Lookup identityLookup;
+    if (stats || tracing) {
+      D3d9Identity::buildLookup(drawCallState, overrideMaterialData != nullptr ? overrideMaterialData->getHash() : kEmptyHash,
+                                topologyHash, key.worldPos, identityLookup);
+    }
+    if (tracing) {
+      D3d9IdentityTrace::recordDraw(frameId(), identityLookup, key, drawCallState.getGeometryData().boundingBox, hasReplacements);
+    }
+    ReplacementInstance* result = findOrCreateKeyed(key, stats ? &identityLookup : nullptr);
 
     // Portal-aware matching for ViewModel draw calls: if the normal lookup created a
     // brand-new ReplacementInstance (no existing prims), try matching through portals.
@@ -296,6 +426,15 @@ namespace dxvk {
       }
     }
 
+    return result;
+  }
+
+  ReplacementInstance* DrawCallTracker::findOrCreateKeyed(
+      const ReplacementInstance::LookupKey& key,
+      const D3d9Identity::Lookup* identityLookup) {
+    m_identityLookup = identityLookup;
+    ReplacementInstance* result = findOrCreateReplacementInstance(key);
+    m_identityLookup = nullptr;
     return result;
   }
 
@@ -336,7 +475,7 @@ namespace dxvk {
             virtualPos, uniqueObjectDistanceSqr, nearestDistSqr, portalFilter);
 
         if (portalMatch != nullptr) {
-          destroyReplacementInstance(newInstance);
+          destroyReplacementInstance(newInstance, D3d9Identity::DestroyReason::Portal);
           // When this code was written, newInstance would always be the last element
           // of m_replacementInstances. If this assert fires, that assumption is no
           // longer true. Either restore that assumption, or change this code to search
@@ -355,12 +494,17 @@ namespace dxvk {
     return nullptr;
   }
 
-  void DrawCallTracker::destroyReplacementInstance(ReplacementInstance* replacementInstance) {
+  void DrawCallTracker::destroyReplacementInstance(ReplacementInstance* replacementInstance, D3d9Identity::DestroyReason reason) {
     if (!replacementInstance) {
       return;
     }
 
+    if (D3d9Identity::statsActive()) {
+      D3d9Identity::noteDestroyed(*replacementInstance, reason, frameId());
+    }
+
     noteRekeyOrDestroy(replacementInstance);
+    reportToRetainedV2(replacementInstance);
     m_identityHashMap.erase(replacementInstance->identityHash);
 
     eraseFromSpatialMap(m_assetSpatialMaps, replacementInstance->spatialMapHash,
@@ -387,11 +531,6 @@ namespace dxvk {
     lifetime.currentFrame = currentFrame;
     lifetime.forceCollect = forceGC;
     const uint32_t numFramesToKeepObjects = lifetime.framesToKeepObjects;
-    // Geometry that is new every frame is drawn under a new instance every frame, so its last instance is stale as soon
-    // as a frame does not draw it.
-    const auto isStale = [&](const ReplacementInstance& ri) {
-      return ri.frameLastSeen + (ri.newGeometryEveryFrame ? 1u : numFramesToKeepObjects) <= currentFrame;
-    };
 
     // rtx.parallelScenePrepScans: the stale replacement instances are found on worker threads, and the
     // loop below then only reads their flags. The flags move with the instances when the loop swap-removes one.
@@ -408,7 +547,8 @@ namespace dxvk {
             _mm_prefetch(reinterpret_cast<const char*>(&m_replacementInstances[i + 8]->frameLastSeen), _MM_HINT_T0);
           }
           const ReplacementInstance& ri = *m_replacementInstances[i];
-          stale[i] = isStale(ri) ? 1 : 0;
+          stale[i] = (ri.frameLastSeen + numFramesToKeepObjects <= currentFrame ||
+                      (ri.handedToScene && ri.frameLastSeen < currentFrame)) ? 1 : 0;
         }
       });
     }
@@ -420,7 +560,9 @@ namespace dxvk {
       }
       ReplacementInstance* replacementInstance = m_replacementInstances[i].get();
 
-      if (isStale(*replacementInstance)) {
+      // An instance whose object the scene took over goes in the first frame without a draw.
+      const bool handedToScene = replacementInstance->handedToScene && replacementInstance->frameLastSeen < currentFrame;
+      if (replacementInstance->frameLastSeen + numFramesToKeepObjects <= currentFrame || handedToScene) {
         // translator::LifetimePolicy (shared with the scene's transient lane).
         translator::UnseenObject unseen;
         unseen.frameLastSeen = replacementInstance->frameLastSeen;
@@ -431,10 +573,15 @@ namespace dxvk {
         unseen.geometryBounds = &replacementInstance->geometryBoundingBox;
         unseen.lightBounds = &replacementInstance->lightBoundingBox;
         unseen.objectToWorld = &replacementInstance->objectToWorld;
-        const bool keepAlive = !replacementInstance->newGeometryEveryFrame && translator::LifetimePolicy::keepUnseen(unseen, lifetime);
+        const bool neverKeepUnseen = handedToScene;
+        const bool keepAlive = !neverKeepUnseen && translator::LifetimePolicy::keepUnseen(unseen, lifetime);
+        const bool beforeKeptCut = lifetime.seenBeforeKeptCut(replacementInstance->frameLastSeen);
 
         if (!keepAlive) {
-          destroyReplacementInstance(replacementInstance);
+          if (beforeKeptCut) {
+            D3d9Identity::noteCollectedAfterKeptCut(); // rtx.d3d9Identity.log
+          }
+          destroyReplacementInstance(replacementInstance, D3d9Identity::DestroyReason::Gc);
           std::swap(m_replacementInstances[i], m_replacementInstances.back());
           m_replacementInstances.pop_back();
           if (useStaleFlags) {
@@ -452,6 +599,7 @@ namespace dxvk {
     ++m_retainedSteadyEpoch;
     ++m_retainedSteadyClearEpoch;
     m_retainedSteadyInvalidations.clear();
+    ++m_clearGeneration;
     m_identityHashMap.clear();
     m_assetSpatialMaps.clear();
     m_replacementInstances.clear();

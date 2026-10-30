@@ -1,4 +1,4 @@
-// The Remix API's color grading exports (remix_c.h, "Color grading"). They translate the C structs and
+// The Remix API's colour grading exports (remix_c.h, "Colour grading"). They translate the C structs and
 // hand the requests to the runtime's grade controller (rtx_color_grade.h), which is safe to call from any thread.
 
 #include <cmath>
@@ -6,7 +6,7 @@
 
 #include <remix/remix_c.h>
 
-#include "../../dxvk/rtx_render/rtx_color_grade.h"
+#include "rtx_color_grade.h"
 
 namespace {
   using dxvk::ColorGrade;

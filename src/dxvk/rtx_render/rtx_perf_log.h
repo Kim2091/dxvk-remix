@@ -45,6 +45,26 @@ namespace dxvk {
                "Splits the GBuffer [PerfGpu] stage into its sub-passes: GBufferPrimaryRays, GBufferDecals, "
                "GBufferPSRPrepare, GBufferReflectionPSR and GBufferTransmissionPSR. The GBuffer stage then reads about "
                "0. Costs a few timestamps on sampled frames.");
+    RTX_OPTION("rtx.profile", bool, sccrCostTest, false,
+               "Runs the SCCR shell cost test once, then turns itself off: with detailed logging on and the displacement mode\n"
+               "SCCR, it cycles through three configurations (everything on; shell self-shadows off; shell tracing off),\n"
+               "sccrCostTestCycles times, and logs one [PerfFrame]/[PerfGpu]/[PerfDisp] block per step and a [SccrCostTest]\n"
+               "summary. Stand still while it runs. The shell settings are restored at the end, or when it is turned off early.");
+    RTX_OPTION("rtx.profile", uint32_t, sccrCostTestStepFrames, 600, "SCCR shell cost test: measured frames per step.");
+    RTX_OPTION("rtx.profile", uint32_t, sccrCostTestSettleFrames, 120,
+               "SCCR shell cost test: frames dropped after each switch (shell data rebuilds, GPU samples read back late).");
+    RTX_OPTION("rtx.profile", uint32_t, sccrCostTestCycles, 3, "SCCR shell cost test: how many times the steps run.");
+    RTX_OPTION("rtx.profile", bool, sccrAbTest, false,
+               "Runs an A/B test once, then turns itself off: with detailed logging on and the displacement mode SCCR, it turns\n"
+               "shell tracing on and runs its steps sccrAbTestCycles times, with the cost\n"
+               "test's settle and step frames, and logs one block per step and a [SccrCostTest] summary (B - A per cycle).\n"
+               "One option: A, then B. Several (sccrAbTestOption): every option at A, then each one alone at B, then all at B.\n"
+               "The options' values and the shell settings are restored at the end.");
+    RTX_OPTION("rtx.profile", std::string, sccrAbTestOption, std::string("rtx.displacement.shell.shadows"),
+               "What sccrAbTest switches: up to 8 options (full names) separated by commas. A bare name is a bool option, A\n"
+               "False and B True; name=A/B gives the two values of any option, e.g.\n"
+               "rtx.displacement.shell.maxShadowPrisms=4/2.");
+    RTX_OPTION("rtx.profile", uint32_t, sccrAbTestCycles, 4, "SCCR A/B test: how many A, B pairs run.");
     RTX_OPTION("rtx.profile", float, spikeThresholdMs, 50.f,
                "A frame is logged as a [Spike] when it takes longer than this, in ms, and longer than "
                "rtx.profile.spikeMedianMultiplier times the median of the last 60 frames. At low frame rates the median "
@@ -187,18 +207,27 @@ namespace dxvk {
       // retainedMs split: full replays (submitExternalDraw) vs the rest (preserve path + bookkeeping).
       double retainedFullMs = 0.0;
       uint32_t retainedFull = 0, retainedPreserved = 0, retainedSkipped = 0, retainedSteady = 0, retainedPinned = 0;
-      // Retained entries whose transform was applied to their instances directly.
-      uint32_t retainedMoved = 0;
-      // The retained scene's entries by lane, entries built, instances settled and instances stamped for opacity
-      // micromap work.
-      uint32_t sceneDirect = 0, sceneLegacy = 0, sceneCreated = 0, sceneSettled = 0, sceneOmmPending = 0;
-      // The transient lane's DrawInstance draws kept, moved, re-posed, built, declined (external-draw path), and
+      // rtx.retained.useV2: replays run by the second implementation, and its per-frame counts (entries whose
+      // transform was applied directly, entries evaluated, holds released).
+      uint32_t retainedV2Replays = 0, retainedMoved = 0, retainedAwake = 0, retainedReleased = 0;
+      // rtx.scene.directRetained: frames the scene ran, its entries by lane, entries built, instances settled and
+      // instances stamped for opacity micromap work.
+      uint32_t retainedV3Replays = 0, sceneDirect = 0, sceneLegacy = 0, sceneCreated = 0, sceneSettled = 0, sceneOmmPending = 0;
+      // rtx.scene.directTransient: DrawInstance draws kept, moved, re-posed, built, declined (external-draw path), and
       // unseen entries kept / collected.
       uint32_t transientKept = 0, transientMoved = 0, transientPosed = 0, transientBuilt = 0, transientDeclined = 0;
       uint32_t transientUnseenKept = 0, transientCollected = 0;
       uint32_t transientBuiltNew = 0, transientBuiltMovedFull = 0, transientBuiltDescription = 0, transientBuiltAssets = 0, transientBuiltBlocked = 0;
-      uint32_t sceneServiced = 0;
-      uint32_t lightSlotsUploaded = 0;  // light buffer slots written (changed only while the layout is stable)
+      uint32_t sceneServiced = 0;  // rtx.scene.directServices
+      uint32_t lightSlotsUploaded = 0;  // light buffer slots written (rtx.scene.explicitLights: changed only)
+      // Standard D3D9 draw path on the CS thread (RtxContext::commitGeometryToRT), all draws since the last frame.
+      double d3d9CommitMs = 0.0;       // whole commitGeometryToRT
+      double d3d9FutureWaitMs = 0.0;   // finalizePendingFutures (waits for the geometry workers' hashes)
+      double d3d9SkyTerrainMs = 0.0;   // camera, tryHandleSky, bakeTerrain
+      double d3d9SubmitMs = 0.0;       // SceneManager::submitDrawState
+      double d3d9PreserveMs = 0.0, d3d9DynamicMs = 0.0;       // submitDrawState split by path
+      double d3d9GeometryMs = 0.0, d3d9InstanceMs = 0.0;      // dynamic path: geometry / instance processing
+      uint32_t d3d9Commits = 0;
       uint32_t renderW = 0, renderH = 0, outputW = 0, outputH = 0;
       bool dlssNr = false;
     };
@@ -207,6 +236,14 @@ namespace dxvk {
     static void syncGlobals();
 
     bool active() const { return detailedLogging(); }
+
+    static constexpr uint32_t kCostTestSteps = 3;
+    // The A/B test's most options: one baseline step, one step per option and one with all of them.
+    static constexpr uint32_t kAbTestMaxOptions = 8;
+    static constexpr uint32_t kTestMaxSteps = kAbTestMaxOptions + 2;
+    // The cost test's progress for the dev menu. Returns false when it is not running; cycle and step
+    // count from 0. stepName stays valid while the test runs.
+    static bool sccrCostTestProgress(uint32_t& cycle, uint32_t& cycles, uint32_t& step, uint32_t& steps, const char*& stepName);
 
     // Called once per ray traced frame at the end of injectRTX.
     void onFrame(RtxContext& ctx, const CpuFrame& cpu);
@@ -235,18 +272,35 @@ namespace dxvk {
       std::vector<std::pair<uint16_t, float>> gpuStages;
     };
 
+    // The displacement settings a [PerfFrame] interval ran with, so an in-game A/B ladder labels itself.
+    struct DispConfig {
+      uint32_t mode = 0, maxSteps = 0, maxPrisms = 0, maxShadowPrisms = 0;
+      float shellMaxDistance = 0.f;
+      bool shell = false, shellShadows = false, liveWeights = false;
+      bool operator==(const DispConfig& o) const {
+        return mode == o.mode && maxSteps == o.maxSteps && maxPrisms == o.maxPrisms && maxShadowPrisms == o.maxShadowPrisms &&
+               shellMaxDistance == o.shellMaxDistance && shell == o.shell && shellShadows == o.shellShadows &&
+               liveWeights == o.liveWeights;
+      }
+    };
+
     struct Window {
       uint32_t frames = 0;
+      DispConfig disp;
+      bool dispSet = false, dispChanged = false;
       uint32_t firstFrameId = 0;
       std::vector<float> frameMs, gpuBusyMs, latencyWaitMs, csExecMs, csIdleMs, appOnCsMs, cpuOnGpuMs;
       std::vector<float> injectMs, scenePrepMs, retainedMs, apiDrawMs, texUploadMs, flushMs;
       std::vector<float> apiDrawGeometryMs, apiDrawInstanceMs;
       std::vector<float> flushEndMs, flushSubmitMs, flushBeginMs, retainedFullMs;
+      std::vector<float> d3d9CommitMs, d3d9FutureWaitMs, d3d9SkyTerrainMs, d3d9SubmitMs, d3d9PreserveMs, d3d9DynamicMs;
+      std::vector<float> d3d9GeometryMs, d3d9InstanceMs;
+      uint64_t d3d9Commits = 0;
       uint64_t d3d9CtrStart[uint32_t(perf::D3D9Ctr::Count)] = {};
       uint64_t d3d9CpuNsStart = 0, d3d9FramesStart = 0, optionLocksStart = 0;
       uint64_t retainedFull = 0, retainedPreserved = 0, retainedSkipped = 0, retainedSteady = 0, retainedPinned = 0;
-      uint64_t retainedMoved = 0;
-      uint64_t sceneDirect = 0, sceneLegacy = 0, sceneCreated = 0, sceneSettled = 0, sceneOmmPending = 0;
+      uint64_t retainedV2Replays = 0, retainedMoved = 0, retainedAwake = 0, retainedReleased = 0;
+      uint64_t retainedV3Replays = 0, sceneDirect = 0, sceneLegacy = 0, sceneCreated = 0, sceneSettled = 0, sceneOmmPending = 0;
       uint64_t transientKept = 0, transientMoved = 0, transientPosed = 0, transientBuilt = 0, transientDeclined = 0;
       uint64_t transientUnseenKept = 0, transientCollected = 0;
       uint64_t transientBuiltNew = 0, transientBuiltMovedFull = 0, transientBuiltDescription = 0, transientBuiltAssets = 0, transientBuiltBlocked = 0;
@@ -264,6 +318,32 @@ namespace dxvk {
       uint32_t stallCountStart = 0;
       Changes changes;
     };
+
+    // The cost test (rtx.profile.sccrCostTest). While it runs it owns the interval logging.
+    enum class CostTestState { Idle, Settle, Measure };
+    enum class CostTestAction { NotRunning, Running, RestartWindow, LogAndRestart };
+    CostTestAction costTestFrame();
+    void costTestLogSummary();
+    void costTestApplyStep(uint32_t step);
+    void costTestFinish(const char* why);
+    CostTestState m_ctState = CostTestState::Idle;
+    uint32_t m_ctCycle = 0, m_ctStep = 0, m_ctFrames = 0;
+    bool m_ctSavedShell = false, m_ctSavedShadows = false;
+    bool m_ctSummaryPending = false;
+    // A/B mode (rtx.profile.sccrAbTest): the options, their A and B values and their values before the test. One
+    // option: two steps, A then B. Several: every option at A, each alone at B, all at B.
+    struct AbOption { std::string name, a, b, saved; };
+    bool m_ctAb = false;
+    std::vector<AbOption> m_ctAbOptions;
+    uint32_t steps() const {
+      return !m_ctAb ? kCostTestSteps : m_ctAbOptions.size() <= 1 ? 2u : uint32_t(m_ctAbOptions.size()) + 2u;
+    }
+    bool abParse(const std::string& list);
+    std::string abSummary() const;
+    uint32_t cycles() const;
+    // Per step, one entry per finished cycle: the measured Remix GPU p50, and each stage's p50 by label index.
+    std::array<std::vector<float>, kTestMaxSteps> m_ctTotalP50;
+    std::array<std::vector<std::vector<float>>, kTestMaxSteps> m_ctStageP50;
 
     uint16_t labelIndex(const char* label);
     void logInterval(RtxContext& ctx);

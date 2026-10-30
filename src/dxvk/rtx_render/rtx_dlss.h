@@ -105,6 +105,11 @@ namespace dxvk {
 
     static DLSSProfile getAutoProfile(uint32_t displayWidth, uint32_t displayHeight);
 
+    // Logs the render size NGX returned for a profile.
+    // Warns when it is well above the profile's usual scale, which means a driver-level DLSS override sets the size.
+    static void logRenderSize(const char* upscaler, DLSSProfile profile, const uint32_t displaySize[2],
+                              const uint32_t optimalSize[2], const uint32_t minSize[2], const uint32_t maxSize[2]);
+
     void initializeDLSS(Rc<DxvkContext> pRenderContext);
 
     bool useDlssAutoExposure() const;

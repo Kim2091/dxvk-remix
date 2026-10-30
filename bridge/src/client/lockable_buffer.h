@@ -24,6 +24,7 @@
 #include "util_bridgecommand.h"
 #include "util_sharedheap.h"
 
+#include "client_memory_stats.h"
 #include "d3d9_util.h"
 
 #include <d3d9.h>
@@ -53,7 +54,6 @@ class LockableBuffer: public Direct3DResource9_LSS<T> {
 
   const bool m_bUseSharedHeap = false;
   std::unique_ptr<uint8_t[]> m_shadow;
-  inline static size_t g_totalBufferShadow = 0;
 
 public:
   DescType getDesc() {
@@ -73,11 +73,12 @@ private:
 
   void initShadowMem() {
     m_shadow = std::make_unique<uint8_t[]>(m_desc.Size);
-    g_totalBufferShadow += m_desc.Size;
+    const uint64_t total = ClientMemoryStats::bufferShadowBytes.fetch_add(m_desc.Size) + m_desc.Size;
+    ClientMemoryStats::bufferShadows.fetch_add(1);
     Logger::trace(format_string("Allocated a shadow for dynamic %s buffer [%p] "
-                                "(size: %zd, total shadow size: %zd)",
+                                "(size: %zd, total shadow size: %llu)",
                                 bIsVertexBuffer ? "vertex" : "index",
-                                this, m_desc.Size, g_totalBufferShadow));
+                                this, m_desc.Size, total));
   }
 
 protected:
@@ -103,11 +104,12 @@ protected:
         SharedHeap::deallocate(m_bufferId);
       }
     } else if (m_shadow) {
-      g_totalBufferShadow -= m_desc.Size;
+      const uint64_t total = ClientMemoryStats::bufferShadowBytes.fetch_sub(m_desc.Size) - m_desc.Size;
+      ClientMemoryStats::bufferShadows.fetch_sub(1);
       Logger::trace(format_string("Released shadow of dynamic %s buffer [%p] "
-                                  "(size: %zd, total shadow size: %zd)",
+                                  "(size: %zd, total shadow size: %llu)",
                                   bIsVertexBuffer ? "vertex" : "index",
-                                  this, m_desc.Size, g_totalBufferShadow));
+                                  this, m_desc.Size, total));
     }
   }
 

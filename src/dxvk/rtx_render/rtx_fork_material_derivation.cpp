@@ -2,6 +2,7 @@
 
 #include "rtx_fork_material_derivation.h"
 
+#include <atomic>
 #include <cstring>
 
 #include "rtx_options.h"
@@ -209,8 +210,25 @@ namespace dxvk {
     } else {
       out.invertedBlend = false;
       out.emissiveBlend = false;
+
+      // A decal-category surface that alpha-tests without blending is a decal. As alpha-tested geometry in the primary
+      // TLAS it would hole the coplanar surface beneath it: a cut-out texel continues the ray from an origin pushed
+      // through the decal plane, past that surface. As a decal it is blended onto the surface the primary ray resolves,
+      // and with blending disabled its opacity is the alpha test result, 0 or 1. Fully opaque decal-category surfaces
+      // have no cut-out texel and stay as they are.
+      if (out.alphaTestType != AlphaTestType::kAlways && categories.any(DECAL_CATEGORY_FLAGS)) {
+        out.isDecal = true;
+        static std::atomic<bool> s_loggedTestOnlyDecal { false };
+        if (!s_loggedTestOnlyDecal.exchange(true, std::memory_order_relaxed)) {
+          Logger::info(str::format("[DecalRoute] decal-category surface without blending (alpha test ",
+                                   static_cast<int>(out.alphaTestType), " ref ", static_cast<uint32_t>(out.alphaTestReferenceValue),
+                                   ", material 0x", std::hex, material.getHash(), std::dec,
+                                   ") routed as a decal."
+                                   " Logged once."));
+        }
+      }
     }
-    
+
     // Set the fully opaque flag
     // Note: Fully opaque surfaces can only be signaled when no blending or alpha testing is done as well as no translucency material wise is used.
     // This is important for signaling when to not use the opacity channel in materials when it is not being used for anything.

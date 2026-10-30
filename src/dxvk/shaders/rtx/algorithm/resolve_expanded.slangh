@@ -172,6 +172,14 @@ uint resolveIterationRayFlags(uint flags, uint8_t interactionIteration, bool las
   payload.coneRadius = ray.coneRadius;                                                    \
   payload.direction = ray.direction;                                                      \
                                                                                           \
+  /* rtx.resolveKeepsCoplanarSurfaces: the triangle the last iteration continued past */  \
+  /* and the origin on its near side (g_resolveCoplanarContinue in resolve.h). */          \
+  bool coplanarPending = false;                                                           \
+  float3 coplanarOrigin = float3(0.0f, 0.0f, 0.0f);                                       \
+  uint coplanarInstance = 0u;                                                             \
+  uint coplanarGeometry = 0u;                                                             \
+  uint coplanarPrimitive = 0u;                                                            \
+                                                                                          \
   /* Loop until a surface is resolved, or the maximum interaction count is hit */         \
   uint8_t interactionIteration;                                                           \
   for (interactionIteration = uint8_t(1);; ++interactionIteration)                        \
@@ -213,6 +221,20 @@ uint resolveIterationRayFlags(uint flags, uint8_t interactionIteration, bool las
       {                                                                                   \
         softOmmTraceFlags = softOmmResolveFlags(SOFT_OMM_RESOLVE_PASS_ID, softOmmRequestedFlags, softOmmSkipMode); \
       }                                                                                   \
+      /* After a cut-out texel the iteration traces from the near side of that hit. */    \
+      /* FORCE_OPAQUE is dropped so that every non-opaque candidate except the triangle */ \
+      /* passed is committed, which keeps a surface lying in the same plane. Opaque */    \
+      /* geometry is committed by the traversal as usual. The software micromap modes */  \
+      /* keep the origin pushed through the surface. */                                   \
+      const bool coplanarSkip = coplanarPending &&                                        \
+        softOmmTraversalMode == SOFT_OMM_TRAVERSAL_NONE && softOmmSkipMode == SOFT_OMM_SKIP_NONE && \
+        (softOmmTraceFlags & (RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_CULL_NON_OPAQUE)) != 0u;   \
+      if (coplanarSkip)                                                                   \
+      {                                                                                   \
+        currentRay.Origin = coplanarOrigin;                                               \
+        payload.origin = coplanarOrigin;                                                  \
+        softOmmTraceFlags &= ~uint(RAY_FLAG_FORCE_OPAQUE);                                \
+      }                                                                                   \
       rayQuery.TraceRayInline(                                                            \
         topLevelAS,                                                                       \
         softOmmTraceFlags,                                                                \
@@ -232,6 +254,15 @@ uint resolveIterationRayFlags(uint flags, uint8_t interactionIteration, bool las
             {                                                                             \
               rayQuery.CommitNonOpaqueTriangleHit();                                      \
             }                                                                             \
+          }                                                                               \
+        }                                                                                 \
+        else if (coplanarSkip && rayQuery.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE) \
+        {                                                                                 \
+          if (rayQuery.CandidateInstanceIndex() != coplanarInstance ||                    \
+              rayQuery.CandidateGeometryIndex() != coplanarGeometry ||                    \
+              rayQuery.CandidatePrimitiveIndex() != coplanarPrimitive)                    \
+          {                                                                               \
+            rayQuery.CommitNonOpaqueTriangleHit();                                        \
           }                                                                               \
         }                                                                                 \
       };                                                                                  \
@@ -277,7 +308,25 @@ uint resolveIterationRayFlags(uint flags, uint8_t interactionIteration, bool las
       RAY_HIT_INFO_CREATE_RAY_QUERY_COMMITTED(rayHitInfo, rayQuery)                       \
                                                                                           \
       /* Call the hit function */                                                         \
+      g_resolveCoplanarContinue = false;                                                  \
       hitFunction(extraArgs, rayHitInfo, payload);                                        \
+                                                                                          \
+      /* A continuation that lands on the spot it started from hit a twin of the triangle it */\
+      /* skipped (two triangles in one place, such as a double-sided card). Skipping only one */\
+      /* of them would bounce between the two until the interactions run out, so that texel */\
+      /* steps through the plane instead. */                                              \
+      const bool coplanarTwin = coplanarSkip &&                                           \
+        length(g_resolveCoplanarOrigin - coplanarOrigin) <=                               \
+          1.0e-3f * max(1.0f, length(coplanarOrigin));                                    \
+      coplanarPending = g_resolveCoplanarContinue && rayHitInfo.hasHit &&                 \
+                        cb.resolveKeepsCoplanarSurfaces != 0u && !coplanarTwin;           \
+      if (coplanarPending)                                                                \
+      {                                                                                   \
+        coplanarOrigin = g_resolveCoplanarOrigin;                                         \
+        coplanarInstance = rayQuery.CommittedInstanceIndex();                             \
+        coplanarGeometry = rayQuery.CommittedGeometryIndex();                             \
+        coplanarPrimitive = rayQuery.CommittedPrimitiveIndex();                           \
+      }                                                                                   \
     }                                                                                     \
                                                                                           \
     /* Check if the resolve loop should continue */                                       \

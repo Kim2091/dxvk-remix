@@ -205,11 +205,6 @@ namespace dxvk {
       return m_type->memType.propertyFlags;
     }
 
-    // Returns the index of the Vulkan memory type the memory was allocated from.
-    uint32_t memoryTypeIndex() const {
-      return m_type->memTypeId;
-    }
-
     /**
      * \brief Memory object
      * 

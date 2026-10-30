@@ -52,9 +52,9 @@ public:
     , m_cmdMemSize(sizeof(Header)* cmdQueueSize + CommandQueue::getExtraMemoryRequirements())
     , m_dataMemSize(memSize - m_cmdMemSize)
     , serverDataPos(static_cast<int64_t*>(sharedMem->data()))
-    , clientDataExpectedPos(reinterpret_cast<int64_t*>(static_cast<uint8_t*>(sharedMem->data()) + kCacheLineSize))
+    , clientDataExpectedPos(serverDataPos + 1)
     , serverResetPosRequired(reinterpret_cast<bool*>(clientDataExpectedPos + 1))
-    // The command queue and the data queue follow the reserved space of the 3 fields above
+    // Offsetting shared memory to account for 3 pointers used above
     , commands(new CommandQueue(name + "Command",
                                 reinterpret_cast<void*>(
                                   reinterpret_cast<uintptr_t>(sharedMem->data()) +
@@ -114,11 +114,9 @@ public:
   const HANDLE                       hCmdSpaceAvailable;
   mutable std::mutex                 m_mutex;
 
-  // Extra storage needed for the data queue synchronization fields. The server writes serverDataPos after every
-  // command, so it has a cache line to itself; clientDataExpectedPos and serverResetPosRequired share the next one.
-  static constexpr size_t kCacheLineSize = 64;
-  static constexpr size_t kReservedSpace = kCacheLineSize +
-    align<size_t>(sizeof(int64_t) + sizeof(bool), kCacheLineSize);
+  // Extra storage needed for data queue synchronization params
+  static constexpr size_t kReservedSpace = align<size_t>(sizeof(*serverDataPos) +
+    sizeof(*clientDataExpectedPos) + sizeof(*serverResetPosRequired), 64);
 };
 using WriterChannel = IpcChannel<bridge_util::Accessor::Writer>;
 using ReaderChannel = IpcChannel<bridge_util::Accessor::Reader>;

@@ -108,9 +108,7 @@ namespace dxvk {
         continue;
       }
       const std::shared_ptr<MaterialData> keepAlive = fork_hooks::externalDrawMaterialReplacement(replacer, material);
-      // A frontend-resolved draw is tagged for light conversion by its legacy material, as on the external-draw path.
-      const XXH64_hash_t lightHash = state.frontendResolved ? state.drawCall.getMaterialData().getHash() : material->getHash();
-      if (material->getParticleSystemDesc() != nullptr || RtxOptions::shouldConvertToLight(lightHash)) {
+      if (material->getParticleSystemDesc() != nullptr || RtxOptions::shouldConvertToLight(material->getHash())) {
         return false;
       }
     }
@@ -210,7 +208,7 @@ namespace dxvk {
     for (size_t i = 0; i < submeshes.size(); ++i) {
       std::shared_ptr<MaterialData> keepAlive;
       const MaterialData& material = m_scene.prepareExternalSubmeshDrawCall(state, submeshesRef, i, keepAlive);
-      const SceneDraw& drawCall = state.drawCall;
+      const DrawCallState& drawCall = state.drawCall;
       Submesh& sub = entry.subs[i];
       if (material.getIgnored()) {
         continue;
@@ -219,13 +217,9 @@ namespace dxvk {
       key.mesh = reinterpret_cast<uintptr_t>(state.mesh);
       key.submesh = uint32_t(i);
       key.material = drawCall.materialIndependentGeometry ? drawCall.geometryShareKey : drawCall.getMaterialData().getHash();
-      key.owner = entry.skinned || state.deforming ? entry.id : 0;
-      bool jumped = false;
-      Geometry* geometry = m_retained.acquireGeometry(ctx, key, drawCall, &jumped);
+      key.owner = entry.skinned ? entry.id : 0;
+      Geometry* geometry = m_retained.acquireGeometry(ctx, key, drawCall);
       sub.geometry = geometry;
-      if (state.deforming) {
-        geometry->blas.deforming = true;
-      }
 
       RtInstance* existing = i < previous.size() ? previous[i].instance : nullptr;
       if (existing != nullptr && existing->isMarkedForGC()) {
@@ -243,9 +237,6 @@ namespace dxvk {
       sub.instance = instance;
       if (instance == nullptr) {
         continue;
-      }
-      if (jumped) {
-        instance->teleport(instance->surface.objectToWorld, instance->surface.objectToWorld);
       }
       instance->setSceneOwnedHandle(entry.id);
       m_scene.trackObjectPickingMeta(drawCall, instance->surface.objectPickingValue);
@@ -270,7 +261,7 @@ namespace dxvk {
       if (sub.instance == nullptr || sub.instance->getBlas() == nullptr) {
         continue;
       }
-      const SceneDraw& input = sub.instance->getBlas()->input;
+      const DrawCallState& input = sub.instance->getBlas()->input;
       m_scene.preserveInstance(*sub.instance, &input);
       m_scene.m_instanceManager.preserveInstance(*sub.instance, input, nullptr);
       m_scene.trackObjectPickingMeta(input, sub.instance->surface.objectPickingValue);
@@ -307,10 +298,10 @@ namespace dxvk {
   }
 
   bool TransientLane::draw(const Rc<DxvkContext>& ctx, ExternalDrawState& state) {
-    if (state.retainedHandle != 0) {
+    if (!m_enabled || state.retainedHandle != 0) {
       return false;
     }
-    const std::shared_ptr<const std::vector<RasterGeometry>> submeshesRef = m_scene.externalSubmeshes(state);
+    const std::shared_ptr<const std::vector<RasterGeometry>> submeshesRef = m_scene.m_pReplacer->accessExternalMesh(state.mesh);
     if (submeshesRef == nullptr || submeshesRef->empty()) {
       return false;  // the external-draw path logs it
     }
@@ -365,8 +356,8 @@ namespace dxvk {
               continue;
             }
             bool instanceMoved = false;
-            if (!m_scene.m_instanceManager.relocateExternally(*sub.instance, objectToWorld, entry->cameraType,
-                                                              uiOffset, true, &instanceMoved)) {
+            if (!m_scene.m_instanceManager.relocateInstancerExternally(*sub.instance, objectToWorld, entry->cameraType,
+                                                                       uiOffset, true, &instanceMoved)) {
               refused = true;
               break;
             }
@@ -457,6 +448,22 @@ namespace dxvk {
       erase(id);
     }
     m_stats.collected += uint32_t(dead.size());
+  }
+
+  void TransientLane::applyOption(bool enabled) {
+    if (enabled == m_enabled) {
+      return;
+    }
+    m_enabled = enabled;
+    if (!enabled) {
+      // The next frame's draws take the external-draw path; these are collected before that frame's TLAS.
+      for (auto& [id, entry] : m_entries) {
+        release(entry);
+      }
+      m_entries.clear();
+      m_byKey.clear();
+    }
+    Logger::info(str::format("[SceneTransient] rtx.scene.directTransient ", enabled ? "on" : "off"));
   }
 
   void TransientLane::onInstanceFreed(const RtInstance& instance) {

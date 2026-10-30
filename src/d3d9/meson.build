@@ -63,8 +63,6 @@ d3d9_src = [
   'd3d9_shader.h',
   'd3d9_shader_permutations.h',
   'd3d9_shader_validator.h',
-  'd3d9_shared_res.cpp',
-  'd3d9_shared_res.h',
   'd3d9_spec_constants.h',
   'd3d9_state.cpp',
   'd3d9_state.h',
@@ -102,27 +100,21 @@ d3d9_src = [
 #
 # Note dxgi_src, not dxgi_common_src: the latter is a three-file subset of the
 # former, and including both would duplicate every symbol in it.
-unified_src = d3d9_src + frontend_d3d9_record_src + frontend_api_src
-unified_args = []
-if get_option('enable_d3d9_frontend')
-  unified_src += frontend_d3d9_src
-else
-  unified_args += [ '-DREMIX_D3D9_FRONTEND=0' ]
-endif
+unified_src = d3d9_src + frontend_d3d9_src
 unified_deps = [ dxso_dep, dxvk_dep, util_dep, sentry_dep ]
 unified_shaders = [ glsl_generator.process(d3d9_shaders) ]
 if get_option('enable_d3d11')
-  unified_src += dxgi_src + d3d11_src + d3d10_src + frontend_api_d3d11_src
+  unified_src += dxgi_src + d3d11_src + d3d10_src
   unified_deps += [ lib_dxgi, dxbc_dep ]
   unified_shaders += [ d3d11_compiled_shaders ]
 endif
 
 d3d9_dll = shared_library('d3d9', unified_src, dxvk_version, unified_shaders, d3d9_res,
   name_prefix         : '',
+  cpp_args            : frontend_d3d9_args,
 
   link_with           : [ util_lib ],
   link_args           : [ usd_plugin_delay_load_args, fsr3_delay_load_args ],
-  cpp_args            : unified_args,
   dependencies        : unified_deps,
   include_directories : [ dxvk_include_path, dxvk_shader_include_path, usd_include_paths, remix_api_include_path, include_directories('../dxvk'), include_directories('../dxgi') ],
   objects             : not dxvk_is_msvc ? 'd3d9' + def_spec_ext : [],

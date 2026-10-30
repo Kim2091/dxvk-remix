@@ -106,6 +106,17 @@ namespace dxvk {
     uint32_t stickyBits(const RtFrameFeatures& f) {
       return (f.counts.stickyThinOpaque ? 1u : 0u) | (f.counts.stickyThinFilm ? 2u : 0u) | (f.counts.stickyRayPortal ? 4u : 0u);
     }
+
+    bool frameFeaturesLogWanted() {
+      return DxvkPathtracerGbuffer::slimVariants() ||
+             DxvkPathtracerIntegrateDirect::slimVariants() ||
+             DxvkPathtracerIntegrateIndirect::slimVariants() ||
+             DxvkPathtracerIntegrateIndirect::slimNonSharc() ||
+             DxvkPathtracerIntegrateIndirect::slimAssembly() ||
+             RtxOptions::FrameFeatures::liveMaterialCounts() ||
+             RtxOptions::FrameFeatures::validate() ||
+             RtxOptions::CoreMaterial::census();
+    }
   }
 
   RtFrameFeatures computeFrameFeatures(RtxContext& ctx, const RaytraceArgs& args) {
@@ -154,8 +165,8 @@ namespace dxvk {
     // Material bits. The direct integrator's variant table reads kSceneRaytracedRenderTarget.
     scene |= f.counts.translucent > 0 ? RtFrameFeatures::kSceneTranslucentInstance : 0u;
     scene |= f.counts.raytracedRenderTarget > 0 ? RtFrameFeatures::kSceneRaytracedRenderTarget : 0u;
-    // Exact from the legacy records (kept on frames that skip the upload). While they are not current, every frame
-    // may have legacy surfaces and eyes.
+    // Exact from the surfaces with rtx.coreMaterial.legacyRecord (kept on frames that skip the upload). Otherwise
+    // conservative, every frame may have legacy surfaces and eyes.
     bool anyLegacy = true, anyTextureOps = true, anyEye = true;
     if (!sceneManager.getCoreMaterialLegacyBits(anyLegacy, anyTextureOps, anyEye)) {
       anyLegacy = true;
@@ -165,7 +176,7 @@ namespace dxvk {
     scene |= anyLegacy ? RtFrameFeatures::kSceneLegacySurface : 0u;
     scene |= anyTextureOps ? RtFrameFeatures::kSceneTextureOps : 0u;
     scene |= anyEye ? RtFrameFeatures::kSceneEye : 0u;
-    // Class bits from the core upload's class counts, kept on frames that skip the upload.
+    // Class bits from the core upload's class counts (rtx.coreMaterial.build), kept on frames that skip the upload.
     f.counts.coreClassesValid = sceneManager.getCoreMaterialClassCounts(f.counts.coreClasses);
     if (f.counts.coreClassesValid) {
       scene |= f.counts.coreClasses[1] > 0 ? RtFrameFeatures::kSceneClassTranslucent : 0u;
@@ -233,6 +244,9 @@ namespace dxvk {
   }
 
   void logFrameFeatures(const RtFrameFeatures& f) {
+    if (!frameFeaturesLogWanted()) {
+      return;
+    }
     const uint32_t sticky = stickyBits(f);
     if (s_logged.valid && s_logged.scene == f.scene && s_logged.mode == f.mode && s_logged.lightTypes == f.lightTypes &&
         s_logged.sticky == sticky && s_logged.live == f.liveMaterialCounts) {

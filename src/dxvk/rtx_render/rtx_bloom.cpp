@@ -84,9 +84,9 @@ namespace dxvk {
   }
 
   void DxvkBloom::showEffectSettings() {
-    RemixGui::DragFloat("Intensity##bloom", &burnIntensityObject(), 0.05f, 0.f, 5.f, "%.2f");
-    RemixGui::DragFloat("Threshold##bloom", &luminanceThresholdObject(), 0.05f, 0.f, 100.f, "%.2f");
-    RemixGui::SliderInt("Radius##bloom", &stepsObject(), 4, MaxBloomSteps);
+    RemixGui::DragFloat("Intensity##bloom", &intensityObject(), 0.005f, 0.f, 1.f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
+    RemixGui::DragFloat("Radius##bloom", &radiusObject(), 0.005f, 0.f, 1.f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
+    RemixGui::SliderInt("Steps##bloom", &stepsObject(), 2, MaxBloomSteps);
   }
 
   void DxvkBloom::dispatch(Rc<RtxContext> ctx, 
@@ -110,10 +110,15 @@ namespace dxvk {
     };
     static_assert(MaxBloomSteps == std::size(res) - 1);
 
-    const int bloomDepth = std::clamp(steps(), 1, MaxBloomSteps);
+    const int bloomDepth = std::clamp(steps(), 2, MaxBloomSteps);
+
+    // Froyok: clamp-to-border (black) for the downsamples, so bright areas leaving the screen fade out, and
+    // clamp-to-edge (linearSampler) for the upsamples, which keeps the corners from darkening.
+    const Rc<DxvkSampler> borderSampler = ctx->getResourceManager().getSampler(
+      VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER);
 
     for (int i = 0; i < bloomDepth; i++) {
-      dispatchDownsampleStep(ctx, linearSampler, *res[i], *res[i + 1], i == 0);
+      dispatchDownsampleStep(ctx, borderSampler, *res[i], *res[i + 1]);
     }
 
     for (int i = bloomDepth; i > 1; i--) {
@@ -125,10 +130,9 @@ namespace dxvk {
 
   void DxvkBloom::dispatchDownsampleStep(
     Rc<DxvkContext> ctx,
-    const Rc<DxvkSampler>& linearSampler,
+    const Rc<DxvkSampler>& borderSampler,
     const Resources::Resource& inputBuffer,
-    const Resources::Resource& outputBuffer,
-    bool initial) {
+    const Resources::Resource& outputBuffer) {
     ScopedGpuProfileZone(ctx, "Bloom Downsample");
 
     const VkExtent3D inputSize = inputBuffer.image->info().extent;
@@ -139,13 +143,12 @@ namespace dxvk {
     pushArgs.inputSizeInverse = { 1.0f / float(inputSize.width), 1.0f / float(inputSize.height) };
     pushArgs.downsampledOutputSize = { outputSize.width, outputSize.height };
     pushArgs.downsampledOutputSizeInverse = { 1.0f / float(outputSize.width), 1.0f / float(outputSize.height) };
-    pushArgs.threshold = initial ? std::max(0.01f, luminanceThreshold()) : -1;
     ctx->pushConstants(0, sizeof(pushArgs), &pushArgs);
 
     const VkExtent3D workgroups = util::computeBlockCount(outputSize, VkExtent3D{ 16, 16, 1 });
 
     ctx->bindResourceView(BLOOM_DOWNSAMPLE_INPUT, inputBuffer.view, nullptr);
-    ctx->bindResourceSampler(BLOOM_DOWNSAMPLE_INPUT, linearSampler);
+    ctx->bindResourceSampler(BLOOM_DOWNSAMPLE_INPUT, borderSampler);
     ctx->bindResourceView(BLOOM_DOWNSAMPLE_OUTPUT, outputBuffer.view, nullptr);
     ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, BloomDownsampleShader::getShader());
     ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
@@ -166,6 +169,7 @@ namespace dxvk {
     pushArgs.inputSizeInverse = { 1.f / float(inputSize.width), 1.f / float(inputSize.height) };
     pushArgs.upsampledOutputSize = { outputSize.width, outputSize.height };
     pushArgs.upsampledOutputSizeInverse = { 1.f / float(outputSize.width), 1.f / float(outputSize.height) };
+    pushArgs.radius = std::clamp(radius(), 0.0f, 1.0f);
 
     ctx->pushConstants(0, sizeof(pushArgs), &pushArgs);
 
@@ -192,7 +196,7 @@ namespace dxvk {
     BloomCompositeArgs pushArgs = {};
     pushArgs.imageSize = { outputSize.width, outputSize.height };
     pushArgs.imageSizeInverse = { 1.f / float(outputSize.width), 1.f / float(outputSize.height) };
-    pushArgs.intensity = 0.01f * std::max(burnIntensity(), 0.0f);
+    pushArgs.intensity = std::clamp(intensity(), 0.0f, 1.0f);
     ctx->pushConstants(0, sizeof(pushArgs), &pushArgs);
 
     VkExtent3D workgroups = util::computeBlockCount(outputSize, VkExtent3D{ 16 , 16, 1 });
@@ -227,6 +231,6 @@ namespace dxvk {
   }
 
   bool DxvkBloom::isEnabled() const {
-    return enable() && burnIntensity() > 0.f;
+    return enable() && intensity() > 0.f;
   }
 }

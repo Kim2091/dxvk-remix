@@ -1,6 +1,6 @@
 #pragma once
 
-// The color grade controller: presets, the grade on screen, and blends between grades.
+// The colour grade controller: presets, the grade on screen, and blends between grades.
 //
 // A preset is a text file in rtx.tonemap.gradePresetDirectory (default rtx-remix/colorgrade in the game folder),
 // one per preset, named <preset name>.conf, in the same key = value syntax as rtx.conf and the weather presets:
@@ -31,7 +31,7 @@ namespace dxvk {
   class ColorGrade {
   public:
     RTX_OPTION_ARGS("rtx.tonemap", std::string, gradePreset, std::string("None"),
-                    "The color grade preset the tone mapper applies: a built-in one (None, Warm Amber, Olive Green) or a "
+                    "The colour grade preset the tone mapper applies: a built-in one (None, Warm Amber, Olive Green) or a "
                     "preset file in rtx.tonemap.gradePresetDirectory, by name. A game's rtx.conf can set the default. "
                     "The Remix API can show other grades while the game runs; changing this option shows this preset again.",
                     args.flags = RtxOptionFlags::UserSetting);
@@ -39,7 +39,7 @@ namespace dxvk {
                "How long the grade takes to blend to a newly picked rtx.tonemap.gradePreset, in seconds. 0 = at once. "
                "Remix API calls give their own blend time.");
     RTX_OPTION("rtx.tonemap", std::string, gradePresetDirectory, std::string("rtx-remix/colorgrade"),
-               "Folder of the color grade preset files (<name>.conf), relative to the game's folder unless absolute.");
+               "Folder of the colour grade preset files (<name>.conf), relative to the game's folder unless absolute.");
 
     // The constants of the grade on screen for this frame. The first call of a frame advances the blend by the
     // frame's time, later calls of the same frame return the same constants.

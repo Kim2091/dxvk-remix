@@ -35,7 +35,7 @@ namespace remixapi {
   extern bool g_remix_initialized;
   extern HMODULE g_remix_dll;
 
-  // A color grading export of the runtime, looked up by name once. Returns null, and logs once, when the runtime
+  // A colour grading export of the runtime, looked up by name once. Returns null, and logs once, when the runtime
   // has no such export.
   template<typename Pfn>
   Pfn colorGradeFn(const char* name) {

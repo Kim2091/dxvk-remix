@@ -269,7 +269,7 @@ namespace dxvk {
 
       maxDecalSortOrder = std::max(maxDecalSortOrder, surf.decalSortOrder);
       unfit |= surf.decalSortOrder > 0xFFu;
-      // Class 3 uses the legacy record, so only classes 0-2 must fit the core record's widths.
+      // Class 3 keeps the old path, so only classes 0-2 must fit the core record's widths.
       set(kCatUnfit, unfit && materialClass != 3);
 
       for (uint32_t cat = 0; cat < kCatCount; cat++) {

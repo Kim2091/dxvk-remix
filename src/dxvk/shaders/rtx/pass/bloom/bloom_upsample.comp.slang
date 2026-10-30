@@ -21,9 +21,11 @@
 */
 #include "rtx/pass/bloom/bloom.h"
 
+// The next smaller level, already combined. Sampled with clamp-to-edge, which keeps the corners from darkening.
 layout(binding = BLOOM_UPSAMPLE_INPUT)
 Sampler2D InColorBuffer;
 
+// This level's downsample, replaced in place by the combined result.
 layout(binding = BLOOM_UPSAMPLE_OUTPUT)
 RWTexture2D<float4> OutColorBuffer;
 
@@ -35,12 +37,12 @@ float2 calcUV(const uint2 upsampledPix)
   return (float2(upsampledPix) + float2(0.5)) * cb.upsampledOutputSizeInverse;
 }
 
+// 3x3 tent (9 taps) over the smaller level, in its texels.
 float3 upsample(const uint2 upsampledPix)
 {
   const float2 centerUV = calcUV(upsampledPix);
   float3 result = float3(0);
-  
-  // 3x3 Gaussian blur kernel
+
   result += 1.0 / 16.0 * InColorBuffer.SampleLevel(centerUV + float2(-1,-1) * cb.inputSizeInverse, 0).rgb;
   result += 2.0 / 16.0 * InColorBuffer.SampleLevel(centerUV + float2( 0,-1) * cb.inputSizeInverse, 0).rgb;
   result += 1.0 / 16.0 * InColorBuffer.SampleLevel(centerUV + float2( 1,-1) * cb.inputSizeInverse, 0).rgb;
@@ -63,6 +65,8 @@ void main(uint2 ipos : SV_DispatchThreadID)
     return;
   }
 
-  // add, do not overwrite
-  OutColorBuffer[ipos] = OutColorBuffer[ipos] + float4(upsample(ipos), 0);
+  // Froyok: lerp the current level towards the upsampled smaller one rather than adding to it, so the chain stays
+  // normalised whatever the number of levels. `radius` sets how much the wider levels count.
+  const float3 current = OutColorBuffer[ipos].rgb;
+  OutColorBuffer[ipos] = float4(lerp(current, upsample(ipos), cb.radius), 0);
 }

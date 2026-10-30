@@ -1,5 +1,9 @@
 #include "com_guid.h"
 
+#include "../../d3d11/d3d11_interfaces.h"
+
+#include "../../dxgi/dxgi_interfaces.h"
+
 std::ostream& operator << (std::ostream& os, REFIID guid) {
   os << std::hex << std::setfill('0')
      << std::setw(8) << guid.Data1 << '-';

@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-#include "../util/com/com_include.h"
+#include "./com/com_include.h"
 
 #include <d3d11_4.h>
 

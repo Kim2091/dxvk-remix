@@ -29,6 +29,9 @@
 // - slots: results of the other query types. The client sends GetData without waiting (FlagBits::AsyncResult); the
 //   server runs the real GetData and writes hresult + data, then publishes the request's sequence number. The client
 //   returns S_FALSE until its sequence number appears, and sends a new request after an S_FALSE answer.
+// - hostSettingsGeneration: the low 32 bits of the runtime's host-settings generation, written by the server at each
+//   Present once the client has polled host settings. remixapi_PollHostSettings answers an unchanged generation from it
+//   without a round trip.
 //
 // Layout is identical in the 32-bit client and the 64-bit server (only 32-bit fields).
 
@@ -51,7 +54,9 @@ namespace bridge_util {
     static constexpr uint32_t kMaxSlots = 4096;
 
     std::atomic<uint32_t> issuedProcessedUid;
-    uint32_t pad[15];  // keep the slots off the counter's cache line
+    std::atomic<uint32_t> hostSettingsGeneration;
+    std::atomic<uint32_t> hostSettingsPublished;  // nonzero once hostSettingsGeneration is written
+    uint32_t pad[13];  // keep the slots off the counters' cache line
     QueryResultSlot slots[kMaxSlots];
   };
 

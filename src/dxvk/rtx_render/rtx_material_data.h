@@ -286,6 +286,27 @@ struct name##Data {                                                             
     return m_ignoreAlphaChannelOverride;                                                             \
   }                                                                                                  \
                                                                                                      \
+  /* Shader decode options for the captured textures, */                                             \
+  /* see OPAQUE_SURFACE_MATERIAL_FLAG_* in shared_constants.h. Only meaningful for opaque. */        \
+  void setForkFnvFlags(const uint32_t flags) {                                                       \
+    m_forkFnvFlags = flags;                                                                          \
+    updateCachedHash();                                                                              \
+  }                                                                                                  \
+                                                                                                     \
+  uint32_t getForkFnvFlags() const {                                                                 \
+    return m_forkFnvFlags;                                                                           \
+  }                                                                                                  \
+                                                                                                     \
+  /* Terrain-layers extension (remixapi_MaterialInfoTerrainLayersEXT). Only meaningful for opaque. */      \
+  void setTerrainLayers(std::shared_ptr<const TerrainLayersMaterialData> terrainLayers) {            \
+    m_terrainLayers = std::move(terrainLayers);                                                      \
+    updateCachedHash();                                                                              \
+  }                                                                                                  \
+                                                                                                     \
+  const std::shared_ptr<const TerrainLayersMaterialData>& getTerrainLayers() const {                 \
+    return m_terrainLayers;                                                                          \
+  }                                                                                                  \
+                                                                                                     \
 private:                                                                                             \
                                                                                                      \
   struct Ranges {                                                                                    \
@@ -307,6 +328,14 @@ private:                                                                        
     XXH64_hash_t h = 0;                                                                              \
     X_TEXTURES(WRITE_TEXTURE_HASH)                                                                   \
     X_CONSTANTS(WRITE_CONSTANT_HASH)                                                                 \
+    /* Only folded in when set, so materials without these keep their upstream hash. */              \
+    if (m_forkFnvFlags != 0) {                                                                       \
+      h = XXH64(&m_forkFnvFlags, sizeof(m_forkFnvFlags), h);                                         \
+    }                                                                                                \
+    if (m_terrainLayers) {                                                                           \
+      const XXH64_hash_t terrainHash = m_terrainLayers->getHash();                                   \
+      h = XXH64(&terrainHash, sizeof(terrainHash), h);                                               \
+    }                                                                                                \
     m_cachedHash = h;                                                                                \
   }                                                                                                  \
                                                                                                      \
@@ -320,9 +349,53 @@ private:                                                                        
   XXH64_hash_t m_cachedHash { 0 };                                                                   \
   Rc<DxvkSampler> m_samplerOverride = nullptr;                                                       \
   bool m_ignoreAlphaChannelOverride = false;                                                         \
+  uint32_t m_forkFnvFlags = 0;                                                                       \
+  std::shared_ptr<const TerrainLayersMaterialData> m_terrainLayers;                                  \
 };
 
 namespace dxvk {
+  // Terrain-layers extension payload of an opaque material (remixapi_MaterialInfoTerrainLayersEXT).
+  // Immutable once built; shared between copies of the owning MaterialData.
+  struct TerrainLayersMaterialData {
+    static constexpr uint32_t kMaxLayers = 8;
+
+    uint32_t layerCount = 0;
+    TextureRef albedoTextures[kMaxLayers];
+    TextureRef normalTextures[kMaxLayers];
+    // Per-layer height maps; POM depth comes from the owning opaque material's displaceIn/Out.
+    TextureRef heightTextures[kMaxLayers];
+    TextureRef weightTextures[2];
+    TextureRef tintTexture;
+    float weightUvScale[2] = { 1.f, 1.f };
+    float weightUvOffset[2] = { 0.f, 0.f };
+    bool normalsRgbTangentSpace = false;
+    // Bit i = normalTextures[i] has a real alpha channel (FnvMaterialProtocol::textureHasGlossAlpha), decided
+    // from the resolved texture's format when the material is created. Whether it is read as gloss is decided later
+    // (rtx.fnvProtocol.normalAlphaMode), when the GPU material is built.
+    uint32_t normalHasAlphaMask = 0;
+
+    XXH64_hash_t getHash() const {
+      XXH64_hash_t h = XXH64(&layerCount, sizeof(layerCount), 0);
+      auto addTexture = [&h](const TextureRef& tex) {
+        const XXH64_hash_t texHash = tex.getImageHash();
+        h = XXH64(&texHash, sizeof(texHash), h);
+      };
+      for (uint32_t i = 0; i < kMaxLayers; ++i) {
+        addTexture(albedoTextures[i]);
+        addTexture(normalTextures[i]);
+        addTexture(heightTextures[i]);
+      }
+      addTexture(weightTextures[0]);
+      addTexture(weightTextures[1]);
+      addTexture(tintTexture);
+      h = XXH64(weightUvScale, sizeof(weightUvScale), h);
+      h = XXH64(weightUvOffset, sizeof(weightUvOffset), h);
+      h = XXH64(&normalsRgbTangentSpace, sizeof(normalsRgbTangentSpace), h);
+      h = XXH64(&normalHasAlphaMask, sizeof(normalHasAlphaMask), h);
+      return h;
+    }
+  };
+
   REMIX_MATERIAL(OpaqueMaterial, LIST_OPAQUE_MATERIAL_CONSTANTS, LIST_OPAQUE_MATERIAL_TEXTURES, LIST_OPAQUE_MATERIAL_PARAMS)
   REMIX_MATERIAL(TranslucentMaterial, LIST_TRANSLUCENT_MATERIAL_CONSTANTS, LIST_TRANSLUCENT_MATERIAL_TEXTURES, LIST_TRANSLUCENT_MATERIAL_PARAMS)
   REMIX_MATERIAL(RayPortalMaterial, LIST_PORTAL_MATERIAL_CONSTANTS, LIST_PORTAL_MATERIAL_TEXTURES, LIST_PORTAL_MATERIAL_PARAMS)

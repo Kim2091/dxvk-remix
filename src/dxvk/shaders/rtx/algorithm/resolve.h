@@ -60,6 +60,13 @@ static const uint8_t resolveModeTranslucencyTransmissionApprox = uint8_t(1 << 6)
 // Non-decal surfaces get the previously encountered decals applied on top of them.
 static const uint8_t resolveModeDecalMaterialBlending = uint8_t(1 << 7);
 
+// rtx.resolveKeepsCoplanarSurfaces. resolveVertex sets these when it continues past a cut-out or see-through texel of an
+// opaque-material hit, with the hit point offset to the side the ray came from. The ray query resolve loop
+// (resolve_expanded.slangh) then traces the next iteration from that origin and skips only the triangle just passed,
+// so a surface in the same plane, such as the wall under an overlay, is still hit. The TraceRay path ignores them.
+static bool g_resolveCoplanarContinue = false;
+static float3 g_resolveCoplanarOrigin = float3(0.0f, 0.0f, 0.0f);
+
 // Resolve Helper Structures
 // Todo: Potentially reduce duplication between these structures and the integrator path state as much is in common between them.
 

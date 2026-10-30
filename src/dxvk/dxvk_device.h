@@ -551,13 +551,6 @@ namespace dxvk {
             uint64_t                  cachedReflexFrameId = 0);
     // NV-DXVK end
 
-    // Submits a command list like submitCommandList without semaphores.
-    // The status gets the submission's result once the submission thread has submitted it to the Vulkan queue.
-    // The caller sets it to VK_NOT_READY first, so waitForSubmission can wait for that.
-    void submitCommandListWithStatus(
-      const Rc<DxvkCommandList>&      commandList,
-            DxvkSubmitStatus*         status);
-
     /**
      * \brief Locks submission queue
      * 

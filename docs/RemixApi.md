@@ -6,9 +6,6 @@ grouped by purpose. The header itself
 ([`public/include/remix/remix_c.h`](../public/include/remix/remix_c.h))
 is the source of truth; this page exists to make it discoverable.
 
-To move an integration from the public `rebased-9-19` runtime to this API, see
-[`RemixApi-Migration.md`](RemixApi-Migration.md).
-
 For SDK setup and the high-level mental model, see
 [`RemixSDK.md`](RemixSDK.md). For per-subsystem string-keyed conventions
 that ride on top of the API (weather, etc.), see the
@@ -160,90 +157,6 @@ DXGI-shared D3D11 texture for cross-API compositing.
 
 ---
 
-## External frame
-
-### `remixapi_ConfigureExternalFrame` (named export)
-
-```c
-remixapi_ErrorCode remixapi_ConfigureExternalFrame(remixapi_ExternalFrameEXT* frame);
-```
-
-Shares the presented frame with another Vulkan device, in the same process
-or another one, without a CPU readback. An editor uses it to show Remix's
-output in its own viewport. It is not a slot in `remixapi_Interface`; resolve
-it with `GetProcAddress(dll, "remixapi_ConfigureExternalFrame")`.
-
-Call it after `Startup`, on the thread that calls `Present`. Set `sType` to
-`REMIXAPI_STRUCT_TYPE_EXTERNAL_FRAME_EXT` (`0x4E560003`) and `version` to
-`REMIXAPI_EXTERNAL_FRAME_VERSION` (1). On success the runtime fills in:
-
-| Field | Value |
-| :-- | :-- |
-| `width`, `height` | The back buffer size. |
-| `format` | `VK_FORMAT_R8G8B8A8_UNORM`. |
-| `memoryTypeIndex`, `allocationSize` | Of the dedicated allocation. Use both for the import. |
-| `deviceUUID` | `VkPhysicalDeviceIDProperties::deviceUUID` of the runtime's device. The consumer must use the same physical device. |
-| `memoryHandle` | NT handle, `VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT`. |
-| `readySemaphore`, `releasedSemaphore` | NT handles of binary semaphores, `VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT`. |
-
-The handles are new and belong to the caller, which duplicates them into the
-consumer process and closes its own. The consumer creates its image with the
-same parameters the runtime used: 2D, one mip, one layer, no flags, optimal
-tiling, exclusive sharing, usage `TRANSFER_SRC | TRANSFER_DST | SAMPLED`,
-`VkExternalMemoryImageCreateInfo` with the OPAQUE_WIN32 type, and binds the
-imported memory through a dedicated allocation.
-
-Every `Present` while the export is on:
-
-1. copies the back buffer into the image, right before the swapchain blit;
-2. releases the image to `VK_QUEUE_FAMILY_EXTERNAL` in `VK_IMAGE_LAYOUT_GENERAL`;
-3. signals `readySemaphore` in the same submission.
-
-When `Present` returns, the submission that signals `readySemaphore` is
-already in the Vulkan queue, so the consumer can submit its wait at once.
-While the export is on, `Present` waits on the CPU for the runtime's command
-stream and submission threads to reach that submission. It never waits for
-the GPU.
-
-From the second frame on, the copy waits on `releasedSemaphore` on the GPU
-first, and acquires the image from `VK_QUEUE_FAMILY_EXTERNAL` in `GENERAL`.
-The consumer, for each ready: waits on `readySemaphore`, acquires the image
-from `VK_QUEUE_FAMILY_EXTERNAL` in `GENERAL`, reads it, releases it to
-`VK_QUEUE_FAMILY_EXTERNAL` in `GENERAL` and signals `releasedSemaphore`. The
-runtime never writes the image twice without a released in between, so a
-consumer that stops answering stalls the runtime's graphics queue. Stop the
-export before the consumer goes away.
-
-The image holds the back buffer: the frame after tone mapping and upscaling,
-in the presented, display-encoded values. It does not hold the developer menu
-or other overlays drawn into the swapchain image, or frames made by frame
-generation (DLSS-G or FSR 3). With frame generation on, the export carries the
-rendered frames only. A back buffer resized without a new call is scaled into
-the existing image.
-
-`frame == NULL` stops the export. A new call replaces the image and the
-semaphores, for example after the window was resized. The runtime frees its
-references to the old set once its own GPU work on it is done. It does not wait
-for the old set's last released, and the consumer keeps whatever it imported.
-
-Returns:
-
-- `REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED` before `Startup`.
-- `REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS` for a wrong `sType`.
-- `REMIXAPI_ERROR_CODE_INCOMPATIBLE_VERSION` for an unknown `version`.
-- `REMIXAPI_ERROR_CODE_FEATURE_UNAVAILABLE` (`0x4E560001`) when the device has
-  no `VK_KHR_external_memory_win32` or `VK_KHR_external_semaphore_win32`, when
-  the device presents into an external swapchain (`forceNoVkSwapchain`), or when
-  the back buffer is multisampled, sRGB or floating point.
-- `REMIXAPI_ERROR_CODE_GENERAL_FAILURE` when the image or semaphores cannot be
-  created or exported.
-
-If the back buffer stops being copyable later, the export stops with a warning
-in the log. The developer menu's Development tab shows the state as
-"External frame: off", the size, or "unavailable" with the reason.
-
----
-
 ## Camera
 
 ### `SetupCamera`
@@ -360,8 +273,26 @@ Chain it on `remixapi_MeshInfo` or `remixapi_MaterialInfo` to give the
 asset a stable key. Mods, captures and caches then use `key` instead of
 the mesh hash or the material's content hash. `aliases` lists the keys
 older host versions produced, so mods made against them keep matching.
-Replacements are looked up by key, then by each alias in order. A
-runtime that predates the struct ignores it.
+Replacements are looked up by key, then by each alias in order. The
+struct is honoured while `rtx.scene.assetKeys` is on (default off).
+A runtime that predates it ignores it.
+
+Captures write a keyed mesh as `mesh_<key>` and a keyed material as
+`mat_<key>`. An API material without a key whose albedo was imported from
+the game's D3D9 device (`remixapi_ImportD3D9Texture`) is captured as
+`mat_<D3D9 image hash>`, the name a D3D9 draw of the texture has, and is
+looked up by it after its content hash.
+
+The bridge forwards the struct on `remixapi_MeshInfo` (the key and the
+aliases, not `assetName`). It does not forward it on `remixapi_MaterialInfo`.
+
+**D3D9 point lights.** A D3D9 host can give a point light a key in fields a
+point light does not use. With `Falloff` = 4932953.0, `Direction.x`,
+`Direction.y` and `Direction.z` hold bits 0-21, 22-42 and 43-63 of the key,
+each as an exact non-negative integer. While `rtx.scene.assetKeys` is on,
+the light's replacements are looked up by the key instead of its position
+hash, the light picker shows it, and captures write the light as
+`light_<key>`. A keyed light keeps its replacement while it moves.
 
 ---
 
@@ -511,7 +442,7 @@ For the full list of available keys, see [`RtxOptions.md`](../RtxOptions.md).
 For the architecture (config layers, priority, persistence), see
 [`RemixConfig.md`](RemixConfig.md). For fork-side `rtx.*` namespaces
 that exist specifically as plugin-tuning surfaces (e.g.
-`rtx.weather.*`), see [Convention namespaces](#convention-namespaces).
+`rtx.weather.preset.*`), see [Convention namespaces](#convention-namespaces).
 
 ---
 
@@ -539,7 +470,7 @@ buffer. Missing keys return `REMIXAPI_ERROR_CODE_SUCCESS` with
 
 Keys are not namespace-validated by the runtime — plugins choose them.
 The convention used by fork-side subsystems is a leading double
-underscore, for example `__mcrtx.world_origin.x`. See
+underscore: `__weather.target`, `__weather.blend_seconds`, etc. See
 [Convention namespaces](#convention-namespaces) for the registry.
 
 ---
@@ -598,7 +529,7 @@ the full output. The set keeps compositing every frame, over any
 
 ---
 
-## Color grading (named exports)
+## Colour grading (named exports)
 
 ```c
 remixapi_ErrorCode remixapi_SetColorGradePreset(const char* name, float blendSeconds);
@@ -608,7 +539,7 @@ remixapi_ErrorCode remixapi_GetColorGrade(remixapi_ColorGradeEXT* out);
 remixapi_ErrorCode remixapi_SaveColorGradePreset(const char* name, const remixapi_ColorGradeEXT* grade);
 ```
 
-The tone mapper applies a color grade to the linear scene color before
+The tone mapper applies a colour grade to the linear scene colour before
 the tone curve. These calls pick, set, mix, read and save grades. They are
 named exports, not members of `remixapi_Interface`: resolve each with
 `GetProcAddress`. 32-bit games reach them through the bridge, which
@@ -758,6 +689,29 @@ guidance as compaction.
 
 ---
 
+## Diagnostics
+
+### `remixapi_fork_ReplayIdentityTrace` (named export)
+
+```c
+remixapi_ErrorCode remixapi_fork_ReplayIdentityTrace(
+    const wchar_t*                      path,
+    remixapi_fork_IdentityReplayResult* result);
+```
+
+A tool entry point, not part of the plugin contract. `remix_replay
+--identity-trace` resolves it with `GetProcAddress`. It replays a D3D9
+identity trace recorded with `rtx.d3d9Identity.traceFrames` through a
+separate draw-call tracker of its own, with the runtime's current options, on the
+calling thread. It needs a started runtime and presents nothing.
+`result` receives the replayed frame and draw counts and the match
+breakdown (exact, matched, created, destroyed, clears). The declaration
+and result struct live in
+`src/dxvk/rtx_render/rtx_fork_d3d9_identity_trace_format.h`, not in
+`remix_c.h`.
+
+---
+
 ## Convention namespaces
 
 The two string-keyed channels above (`SetConfigVariable` and
@@ -768,8 +722,8 @@ independently of the typed C API.
 
 | Namespace | Channel | Reference |
 | :-- | :-- | :-- |
-| `rtx.atmosphere.*`, `rtx.weather.*` | `SetConfigVariable` | [`RemixSkyAPI.md`](RemixSkyAPI.md) |
-| `__mcrtx.world_origin.x/y/z` | `SetGameValue` (read while `rtx.worldOrigin.enable` is on) | [`RemixApi-Migration.md`](RemixApi-Migration.md#49-game-values) |
+| `__weather.*`, `__sky.*` | `SetGameValue` / `GetGameValue` | [`RemixSkyAPI.md`](RemixSkyAPI.md) |
+| `rtx.weather.preset.*` | `SetConfigVariable` | [`RemixSkyAPI.md`](RemixSkyAPI.md) |
 
 When a new fork-side subsystem starts publishing a `__<ns>.*`
 GameStateStore convention or a `rtx.<ns>.*` ConfigVariable namespace
@@ -787,13 +741,6 @@ The runtime exports `REMIXAPI_VERSION_MAJOR`, `REMIXAPI_VERSION_MINOR`,
 `remixapi_InitializeLibrary` and check the return for
 `REMIXAPI_ERROR_CODE_INCOMPATIBLE_VERSION`.
 
-The API version is 1.0.0. The runtime accepts a caller with the same major
-and a minor no higher than its own. It also accepts a 0.1000.x caller (the
-header of `rebased-9-19` and rc1), whose interface table and structs are the
-same as 1.0's, and rejects every other 0.x caller (NVIDIA dxvk-remix and other
-forks). The patch is not compared. The bridge client applies the same rule. See
-[`RemixApi-Migration.md`](RemixApi-Migration.md#2-version-and-compatibility).
-
 `remixapi_StructType` values are append-only — never reorder. Adding
 new EXT structs is a minor-version event; changing the layout of an
 existing struct is a major-version event.
@@ -805,7 +752,6 @@ For the dated change log, see
 
 ## See also
 
-- [`RemixApi-Migration.md`](RemixApi-Migration.md) — moving an integration from `rebased-9-19` to this API.
 - [`RemixSDK.md`](RemixSDK.md) — SDK setup, mental model, minimal C example.
 - [`RemixApiChangelog.md`](RemixApiChangelog.md) — dated API change log.
 - [`RemixConfig.md`](RemixConfig.md) — `RtxOptions` config-layer architecture.

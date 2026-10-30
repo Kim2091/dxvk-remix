@@ -59,5 +59,6 @@ At most 32 clash lines are written per change. The Remix menu's **Enhancements >
 ## Limits
 
 - A material replacement keyed by an API material's content hash and one keyed by its game texture hash replace the same surface without clashing; the content hash is looked up first ([CHANGELOG](../docs/CHANGELOG.md), 2026-10-20).
+- With `rtx.scene.assetKeys`, an API mesh or a D3D9 light that has a host asset key is replaced by that key, and a capture names it by the key too ([RemixModPackaging.md](RemixModPackaging.md#what-the-names-are)).
 - Secret replacement variants (`mesh hash + variant id`) do not take part in clash resolution.
 - Changing an ownership file takes effect at the next **Reload Enhancements** or restart.

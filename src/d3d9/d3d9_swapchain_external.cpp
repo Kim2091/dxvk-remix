@@ -30,7 +30,7 @@
 
 
 namespace dxvk {
-  bool g_combineGuiInFinalColor = true;
+  extern bool g_combineGuiInFinalColor = true;
 
   D3D9SwapchainExternal::D3D9SwapchainExternal(
         D3D9DeviceEx* pDevice,

@@ -124,6 +124,7 @@ namespace dxvk {
         SAMPLER3D(COMPOSITE_VALUE_NOISE_SAMPLER)
         SAMPLER2D(COMPOSITE_SKY_LIGHT_TEXTURE)
         TEXTURE2D(COMPOSITE_ATMOSPHERE_FOREGROUND_INPUT)
+        TEXTURE2D(COMPOSITE_ATMOSPHERE_FOREGROUND_EMISSION_DEPTH_INPUT)
         TEXTURE2D(COMPOSITE_SECONDARY_HIT_DISTANCE_INPUT)
         // Sky provider (NUMOS): cloud composite and aerial perspective.
         CONSTANT_BUFFER(COMPOSITE_SKY_ARGS)
@@ -350,6 +351,7 @@ namespace dxvk {
     ctx->bindResourceView(COMPOSITE_SHARED_RADIANCE_RG_INPUT, rtOutput.m_sharedRadianceRG.view, nullptr);
     ctx->bindResourceView(COMPOSITE_SHARED_RADIANCE_B_INPUT, rtOutput.m_sharedRadianceB.view, nullptr);
     ctx->bindResourceView(COMPOSITE_ATMOSPHERE_FOREGROUND_INPUT, rtOutput.m_atmosphereForeground.view, nullptr);
+    ctx->bindResourceView(COMPOSITE_ATMOSPHERE_FOREGROUND_EMISSION_DEPTH_INPUT, rtOutput.m_atmosphereForegroundEmissionDepth.view, nullptr);
     ctx->bindResourceView(COMPOSITE_SECONDARY_HIT_DISTANCE_INPUT, rtOutput.m_secondaryHitDistance.view, nullptr);
     
     ctx->bindResourceView(COMPOSITE_PRIMARY_ATTENUATION_INPUT, rtOutput.m_primaryAttenuation.view, nullptr);
@@ -442,7 +444,7 @@ namespace dxvk {
       // Pre-exposure (rtx_pre_exposure.h): the fog colour is radiance.
       const float colorScale = fogColorScale() * PreExposure::get();
       auto& fog = settings.fog;
-      compositeArgs.fogMode = static_cast<uint32_t>(fog.mode);
+      compositeArgs.fogMode = fog.mode;
       compositeArgs.fogApplyToSky = fogApplyToSky();
       compositeArgs.fogColor = { fog.color.x * colorScale, fog.color.y * colorScale, fog.color.z * colorScale };
       // Todo: Scene scale stuff ignored for now because scene scale stuff is not actually functioning properly. Add back in if it's ever fixed.

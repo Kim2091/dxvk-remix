@@ -29,7 +29,6 @@
 
 #include <cstdint>
 #include <chrono>
-#include <functional>
 #include <optional>
 #include <array>
 #include "rtx_options.h"
@@ -46,11 +45,16 @@ namespace dxvk {
   class TerrainBaker;
   struct ExternalDrawState;
 
-  namespace frontend {
-    struct RasterDrawInfo;
-    struct RasterPass;
-    struct RasterResult;
-  }
+  struct D3D9RtxVertexCaptureData;
+  struct D3D9SharedPS;
+  
+  struct DrawParameters {
+    uint32_t vertexCount = 0;
+    uint32_t indexCount = 0;
+    uint32_t instanceCount = 0;
+    uint32_t firstIndex = 0;
+    uint32_t vertexOffset = 0;
+  };
 
   // Forward declarations of the hooks that need friend access to RtxContext private members.
   // See rtx_fork_hooks.h.
@@ -75,10 +79,6 @@ namespace dxvk {
    * This is where the actual rendering commands are
    * recorded.
    */
-
-  // The bound a scene-command drain emitted now on `device`'s command stream applies retained commands up to
-  // (SceneCommandQueue::issued). API threads only.
-  uint64_t sceneCommandsIssued(DxvkDevice& device);
 
   class RtxContext : public DxvkContext {
 
@@ -111,24 +111,55 @@ namespace dxvk {
 
     void onPresent(Rc<DxvkImage> targetImage = nullptr);
 
+    /**
+      * \brief Set D3D9 specific constant buffers
+      *
+      * \param [in] vsFixedFunctionConstants: resource idx of the constant buffer for FF vertex shaders
+      * \param [in] psFixedFunctionConstants: resource idx of the constant buffer for FF pixel shaders
+      * \param [in] vertexCaptureCB: constant buffer for vertex capture
+      */
+    void setConstantBuffers(const uint32_t vsFixedFunctionConstants, const uint32_t psFixedFunctionConstants, Rc<DxvkBuffer> vertexCaptureCB);
+
+    /**
+      * \brief Adds a batch of lights to the scene context
+      *
+      * \param [in] pLights: array of light structures
+      * \param [in] numLights: number of lights
+      */
+    void addLights(const D3DLIGHT9* pLights, const uint32_t numLights);
+
     void clearRenderTarget(const Rc<DxvkImageView>& imageView, VkImageAspectFlags clearAspects, VkClearValue clearValue);
     void clearImageView(const Rc<DxvkImageView>& imageView, VkOffset3D offset, VkExtent3D extent, VkImageAspectFlags aspect, VkClearValue value);
 
-    // The raster services' passes (frontend::RasterService). Each calls draw once per pass, with the pass's target
-    // bound, and restores the render targets and viewports afterwards.
-    void rasterizeSky(const frontend::RasterDrawInfo& info, const std::function<void(const frontend::RasterPass&)>& draw);
-    void bakeTerrain(const frontend::RasterDrawInfo& info, const std::function<void(const frontend::RasterPass&)>& draw,
-                     frontend::RasterResult& result);
+    void commitGeometryToRT(const DrawParameters& params, DrawCallState& drawCallState);
+    // D3D9 frontend: commitGeometryToRT in two halves. prepare: futures, camera, sky,
+    // terrain bake and the transform fix-ups; false = nothing to submit. submit: SceneManager::submitDrawState.
+    // skinningCamera: the camera whose view decomposes fixed-function skinned matrices (the draw's own, when the frontend
+    // classified it). CameraType::Count takes the last camera set.
+    bool prepareGeometryForRT(const DrawParameters& params, DrawCallState& drawCallState, const MaterialData*& overrideMaterialData,
+                              CameraType::Enum skinningCamera = CameraType::Count);
+    void submitPreparedGeometry(DrawCallState& drawCallState, const MaterialData* overrideMaterialData);
+    // rtx.d3d9v2.skyService: tryHandleSky's raster half for a sky-camera draw the scene owns (its hidden
+    // instance): the sky matte / probe replay of the game's draw, nothing submitted. false: not a rasterized sky draw (a
+    // 3D-skybox draw, reprojected by tryHandleSky instead), nothing done.
+    bool rasterizeSkyDraw(const DrawParameters& params, const DrawCallState& drawCallState);
+    // tryHandleSky's "force raster" rule: false = a 3D-skybox draw (reprojected into the main camera, not rasterized).
+    bool skyDrawRasterizes(const DrawCallState& drawCallState);
+    // rtx.d3d9v2.skybox3d: prepareGeometryForRT for a 3D-skybox draw the frontend owns: futures and camera
+    // only (no tryHandleSky queue, no terrain bake). false = nothing to describe (futures invalid, or not a sky draw).
+    bool prepareSkyboxGeometry(DrawCallState& drawCallState);
+    // tryHandleSky's reprojection of sky-camera transforms into the main camera (scale, near / far match). false: the
+    // main camera was not updated this frame (allowStaleMainCamera: or the last).
+    bool reprojectSkyToMain(DrawCallTransforms& skyTransform, bool allowStaleMainCamera);
+    // rtx.d3d9v2.terrain: the terrain bake of a terrain draw the scene owns (the raster replay into the
+    // bake cascades), with the futures finalized first; sets the draw's baked texture transform / texgen. Returns the
+    // baker's material, or null (baking off, not terrain, or nothing baked).
+    const MaterialData* bakeTerrainDraw(const DrawParameters& params, DrawCallState& drawCallState);
     void commitExternalGeometryToRT(std::unique_ptr<ExternalDrawState> state);
     void commitRetainedExternalGeometry(const Vector3& sceneOrigin);
-    // Applies every retained command queued by the API threads, in order; a frame marker
+    // rtx.scene.commandQueue: applies every retained command queued by the API threads, in order; a frame marker
     // among them runs commitRetainedExternalGeometry. CS thread.
-    // Applies the retained commands queued up to `bound`, a SceneCommandQueue::issued() value taken on the API thread
-    // when the drain was emitted.
-    void drainSceneCommands(uint64_t bound);
-
-    // The bound of the next injectRTX drain, taken on the thread that emitted the injection.
-    void setInjectionSceneCommandBound(uint64_t bound) { m_injectionSceneCommandBound = bound; }
+    void drainSceneCommands();
 
     // An image handed over from another API was written with barriers that
     // did not name ray tracing. The next frame emits one barrier for all.
@@ -169,7 +200,14 @@ namespace dxvk {
     void getDenoiseArgs(NrdArgs& outPrimaryDirectNrdArgs, NrdArgs& outPrimaryIndirectNrdArgs, NrdArgs& outSecondaryNrdArgs);
     void updateRaytraceArgsConstantBuffer(Resources::RaytracingOutput& rtOutput, const VkExtent3D& downscaledExtent, const VkExtent3D& targetExtent);
 
+    D3D9RtxVertexCaptureData& allocAndMapVertexCaptureConstantBuffer();
+    D3D9FixedFunctionVS& allocAndMapFixedFunctionVSConstantBuffer();
+    D3D9SharedPS& allocAndMapPSSharedStateConstantBuffer();
+
     static bool checkIsShaderExecutionReorderingSupported(DxvkDevice& device);
+
+    const DxvkScInfo& getSpecConstantsInfo(VkPipelineBindPoint pipeline) const;
+    void setSpecConstantsInfo(VkPipelineBindPoint pipeline, const DxvkScInfo& newSpecConstantInfo);
 
     bool useRayReconstruction() const;
 
@@ -222,19 +260,6 @@ namespace dxvk {
     virtual void updateRaytracingShaderResources() override;
 
   private:
-    // SceneCommandQueue::issued() when the next injectRTX was emitted (setInjectionSceneCommandBound).
-    uint64_t m_injectionSceneCommandBound = 0;
-    // The highest drain bound applied so far; a drain never goes below it.
-    uint64_t m_sceneCommandsApplied = 0;
-    // Device frame of the last retained frame marker applied, and how many it applied: one per device frame, two when
-    // the first was held over from the frame before (so a backlog shrinks).
-    uint32_t m_sceneFrameMarkerFrame = UINT32_MAX;
-    uint32_t m_sceneFrameMarkers = 0;
-    uint32_t m_sceneFrameMarkerLimit = 1;
-    bool m_sceneFrameMarkerHeld = false;
-    // Drained device frames by how many frame markers they applied (0, 1, 2+), for the [SceneQueue] line.
-    uint32_t m_sceneFrameMarkerCounts[3] = {};
-
     // This enum is for internal use only.
     // There is a mode called UpscalerType in RtxOptions, but it doesn't contain DLSS-RR because RR is considered as a special mode of DLSS.
     enum class InternalUpscaler {
@@ -343,14 +368,18 @@ namespace dxvk {
     void dispatchFrameInterpolation(const Rc<DxvkImage>& finalOutput);
     void dispatchScreenOverlay(Resources::RaytracingOutput& rtOutput);
     void updateMetrics(const float gpuIdleTimeMilliseconds) const;
-    void rasterizeToSkyMatte(const frontend::RasterDrawInfo& info, const std::function<void(const frontend::RasterPass&)>& draw,
-                             frontend::RasterPass& pass);
+    void rasterizeToSkyMatte(const DrawParameters& params, const DrawCallState& drawCallState);
     void initSkyProbe();
-    void rasterizeToSkyProbe(const frontend::RasterDrawInfo& info, const std::function<void(const frontend::RasterPass&)>& draw,
-                             frontend::RasterPass& pass);
-    // The sky matte and probe formats from the bound render target, and the probe's views.
-    void initSkyTargets();
+    void rasterizeToSkyProbe(const DrawParameters& params, const DrawCallState& drawCallState);
+    void rasterizeSky(const DrawParameters& params, const DrawCallState& drawCallState);
+    enum class TryHandleSkyResult {
+      Default,
+      SkipSubmit,
+    };
+    TryHandleSkyResult tryHandleSky(const DrawParameters* originalParams, DrawCallState* originalDrawCallState /* can be std::move-d */);
+    void initSkyTargets();                                       // tryHandleSky's render-target setup for a sky draw
 
+    void bakeTerrain(const DrawParameters& params, DrawCallState& drawCallState, const MaterialData** outOverrideMaterialData);
 
     InternalUpscaler getCurrentFrameUpscaler();
 
@@ -358,6 +387,18 @@ namespace dxvk {
     InternalUpscaler m_previousUpscaler = InternalUpscaler::None;
 
     uint32_t m_frameLastInjected = kInvalidFrameIndex;
+
+    // rtx.retained.replayAtInjection: a DrawRetainedInstances that arrived after this frame's injection,
+    // held for the start of the next one (with the scene origin it carried).
+    bool m_retainedReplayDeferred = false;
+    Vector3 m_retainedDeferredOrigin { 0.f, 0.f, 0.f };
+    // rtx.retained.diagnosticFrames: replays in the current window, those that arrived after the frame's
+    // injection, and those deferred to the next injection.
+    uint32_t m_retainedDiagReplays = 0;
+    uint32_t m_retainedDiagLate = 0;
+    uint32_t m_retainedDiagDeferred = 0;
+    uint32_t m_retainedDiagLastLogFrame = 0;
+    void replayRetainedExternalGeometry(const Vector3& sceneOrigin);
     bool m_captureStateForRTX = true;
 
     Rc<DxvkImage> m_skyProbeImage;
@@ -389,6 +430,14 @@ namespace dxvk {
     RtxPerfLog m_perfLog;
     RtxPerfLog::CpuFrame m_perfCpu;
     bool m_perfCpuActive = false;
+    // [PerfCpu] d3d9.*: phases of one standard D3D9 draw commit (detailed logging only).
+    struct D3D9CommitTiming {
+      double futureWaitMs = 0.0, skyTerrainMs = 0.0, submitMs = 0.0;
+    };
+    void commitGeometryToRTImpl(const DrawParameters& params, DrawCallState& drawCallState, D3D9CommitTiming* pTiming);
+    bool prepareGeometryForRTImpl(const DrawParameters& params, DrawCallState& drawCallState,
+                                  const MaterialData*& overrideMaterialData, D3D9CommitTiming* pTiming,
+                                  CameraType::Enum skinningCamera = CameraType::Count);
     bool m_importedImageBarrierPending = false;
     uint64_t m_cachedReflexFrameId = 0;
 
@@ -402,14 +451,18 @@ namespace dxvk {
     bool m_triggerDelayedTerminate = false;
     uint32_t m_screenshotFrameNum = -1;
     uint32_t m_terminateAppFrameNum = -1;
+    uint32_t m_framesWithoutValidScene = 0;
     IntegrateIndirectMode m_prevIntegrateIndirectMode = IntegrateIndirectMode::Count;
 
+    DxvkRaytracingInstanceState m_rtState;
 
     struct {
       std::atomic<uint64_t>           signalValue = 1;
       Rc<sync::Fence>                 signal = new sync::Fence{};
       std::vector<std::future<void>>  asyncTasks = {};
     } m_objectPickingReadback {};
+
+    std::vector<DrawCallState> m_delayedRayTracedSky;
 
     // Screen overlay state - populated by remixapi_DrawScreenOverlay via setScreenOverlayData,
     // consumed and cleared by dispatchScreenOverlay once per frame.

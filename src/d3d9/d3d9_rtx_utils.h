@@ -7,6 +7,7 @@
 namespace dxvk {
   struct DxvkVertexInputState;
   class DxvkBuffer;
+  struct FnvLegacyProtocol;
 
   /**
     * \brief: Gets the min and max bone indices referenced in a vertex buffer
@@ -41,6 +42,9 @@ namespace dxvk {
     * \param [out] materialData: material data structure to update
     */
   void setLegacyMaterialState(D3D9DeviceEx* pDevice, const bool alphaSwizzle, LegacyMaterialData& materialData);
+
+  // Decodes the FNV legacy material protocol v2 (render states 149/169/177), see rtx_fork_fnv_material.h.
+  void captureFnvLegacyProtocol(const Direct3DState9& d3d9State, FnvLegacyProtocol& protocol);
 
   /**
     * \brief: This function creates a legacy state object by taking the Direct3D 9 state information

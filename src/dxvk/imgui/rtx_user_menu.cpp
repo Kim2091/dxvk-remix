@@ -34,7 +34,7 @@
 #include "rtx_render/rtx_context.h"
 #include "rtx_render/rtx_options.h"
 #include "rtx_render/rtx_dlss.h"
-#include "rtx_render/rtx_neural_uplift.h"
+#include "rtx_render/rtx_dlss_neural_rendering.h"
 #include "rtx_render/rtx_dlfg.h"
 #include "rtx_render/rtx_reflex.h"
 #include "rtx_render/rtx_ray_reconstruction.h"
@@ -151,10 +151,8 @@ namespace dxvk {
   };
 
   namespace {
-    // The color of section titles and of the frame rate limit's status: the theme's accent.
-    ImVec4 accentColor() {
-      return ImGui::GetStyleColorVec4(ImGuiCol_CheckMark);
-    }
+    // The colour of section titles and of the frame rate limit's status.
+    constexpr ImVec4 kAccentColor { 0.46f, 0.73f, 0.0f, 1.0f };
 
     // A tab splits its sections into two columns only from this width, in font sizes, so each column keeps
     // room for its labels and values.
@@ -205,19 +203,19 @@ namespace dxvk {
 
       ImGui::SameLine();
       if (limit > 0) {
-        ImGui::TextColored(accentColor(), "Limited to %u fps", limit);
+        ImGui::TextColored(kAccentColor, "Limited to %u fps", limit);
       } else {
         ImGui::TextDisabled("Not limited");
       }
     }
 
-    // Draws a section title in the accent color on a line that runs to the right edge of the column.
+    // Draws a section title in the accent colour on a line that runs to the right edge of the column.
     void sectionHeader(const char* text) {
       ImGui::Spacing();
       const ImVec2 start = ImGui::GetCursorScreenPos();
       const float rightX = start.x + ImGui::GetContentRegionAvail().x;
       ImGui::SetCursorScreenPos(ImVec2(start.x + ImGui::GetFontSize() * 0.5f, start.y));
-      ImGui::TextColored(accentColor(), "%s", text);
+      ImGui::TextColored(kAccentColor, "%s", text);
 
       const ImVec2 textMin = ImGui::GetItemRectMin();
       const ImVec2 textMax = ImGui::GetItemRectMax();
@@ -232,7 +230,7 @@ namespace dxvk {
     }
 
     // Lays a tab's sections out in two columns when the tab is wide enough, and in one column otherwise.
-    // All labeled controls in a column get the same label width, so the controls line up.
+    // All labelled controls in a column get the same label width, so the controls line up.
     class SectionColumns {
     public:
       SectionColumns(const char* id, bool allowSplit) {
@@ -347,7 +345,7 @@ namespace dxvk {
     const std::string windowTitle = str::format(productNameWithVersion(), " Graphics Settings###", m_userGraphicsWindowTitle);
     ImGui::OpenPopup(windowTitle.c_str(), ImGuiPopupFlags_NoOpenOverExistingPopup);
 
-    // The window opens centered at about half the screen's width and 70% of its height, and can be moved
+    // The window opens centred at about half the screen's width and 70% of its height, and can be moved
     // and resized while it is open.
     const float windowWidth = std::min(viewport->Size.x * 0.95f,
                                        std::max(std::min(viewport->Size.x * 0.5f, viewport->Size.y * 0.85f), 600.0f * uiScale));
@@ -359,7 +357,7 @@ namespace dxvk {
     // The padding follows the font, so the layout keeps its proportions at every output size.
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(fontSize * 0.75f, fontSize * 0.5f));
 
-    // The window uses the background color of the other menus, but nearly opaque, so the text keeps its contrast
+    // The window uses the background colour of the other menus, but nearly opaque, so the text keeps its contrast
     // over a bright scene.
     ImVec4 backgroundColor = ImGui::GetStyleColorVec4(ImGuiCol_WindowBg);
     backgroundColor.w = std::max(backgroundColor.w, 0.92f);
@@ -525,7 +523,7 @@ namespace dxvk {
     ImGui::PopStyleColor(2);
     RemixGui::SetTooltipToLastWidgetOnHover("Resets all user settings to their default values.");
 
-    // Save takes the theme's accent color while there are unsaved changes, and is disabled otherwise.
+    // Save takes the theme's accent colour while there are unsaved changes, and is disabled otherwise.
     ImGui::SameLine();
     ImGui::BeginDisabled(!unsavedChanges);
     if (unsavedChanges) {
@@ -749,11 +747,11 @@ namespace dxvk {
     {
       sectionHeader("Neural Generation Settings");
 
-      DxvkNeuralUplift& neuralUplift = common->metaNeuralUplift();
-      if (neuralUplift.isSupported()) {
-        ImGui::TextWrapped("Neural enhancement of the final image. It costs significant GPU time.");
+      DlssNeuralRendering& dlssNeuralRendering = common->metaDlssNeuralRendering();
+      if (dlssNeuralRendering.supportsDlssNeuralRendering()) {
+        ImGui::TextWrapped("Neural enhancement of the final image. Each pass costs significant GPU time.");
         ImGui::PushID("DLSS 3D-Guided Neural Generation");
-        neuralUplift.showImguiSettings(false);
+        dlssNeuralRendering.showDlssNeuralRenderingImguiSettings(false);
         ImGui::PopID();
       } else {
         ImGui::BeginDisabled();
@@ -766,6 +764,7 @@ namespace dxvk {
       sectionHeader("Game Settings");
       host_settings::showUserMenuSettings();
     }
+
     sectionHeader("Screenshots");
 
     if (ImGui::Button("Take Screenshot")) {
@@ -956,7 +955,7 @@ namespace dxvk {
     bullet("Game Setup: how the renderer reads the game. Step 1 sorts the game's textures into categories. Step 2 holds "
            "scene parameters, and its Sky section has the sky, clouds, haze, night and weather pages.");
     bullet("Enhancements: the replacement asset mods that are loaded, and the capture tools.");
-    bullet("About: the version, the credits and the licenses.");
+    bullet("About: the version, the credits and the licences.");
     bullet("Dev Settings: tools for developers, such as performance logging, camera controls, option layers and UI "
            "options.");
     bullet("Plugin: appears only when a plugin adds a page of its own.");

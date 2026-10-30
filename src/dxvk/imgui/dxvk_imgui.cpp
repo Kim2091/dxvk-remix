@@ -54,7 +54,6 @@
 #include "rtx_render/rtx_hash_collision_detection.h"
 #include "rtx_render/rtx_options.h"
 #include "rtx_render/rtx_pipeline_stats.h"
-#include "rtx_render/rtx_stress.h"
 #include "rtx_render/rtx_fork_api_recorder.h"
 #include "rtx_render/rtx_scene_interface.h"
 #include "rtx_render/rtx_terrain_baker.h"
@@ -71,7 +70,6 @@
 #include "../util/rc/util_rc_ptr.h"
 #include "../util/util_math.h"
 #include "../util/util_global_time.h"
-#include "../util/util_stress.h"
 #include "rtx_render/rtx_opacity_micromap_manager.h"
 #include "rtx_render/rtx_bridge_message_channel.h"
 #include "dxvk_imgui_about.h"
@@ -82,6 +80,7 @@
 #include "rtx_render/rtx_mod_usd.h"
 #include "rtx_render/rtx_option_manager.h"
 #include "dxvk_scoped_annotation.h"
+#include "../../d3d9/d3d9_rtx.h"
 #include "dxvk_memory_tracker.h"
 #include "rtx_render/rtx_particle_system.h"
 #include "rtx_render/rtx_point_instancer_system.h"
@@ -92,7 +91,7 @@
 #include "rtx_render/rtx_fork_variant_tables.h"
 #include "rtx_render/rtx_fork_camera_origin.h"
 #include "rtx_render/rtx_fork_d3d9_alpha.h"
-#include "rtx_render/rtx_frontend_ui.h"
+#include "rtx_render/rtx_fork_d3d9_identity.h"
 #include "rtx_render/rtx_host_settings.h"
 #include "rtx_render/rtx_vram_budget.h"
 #include "rtx_render/rtx_session_log.h"
@@ -535,7 +534,6 @@ namespace dxvk {
       {ImGUI::Theme::Toolkit,  "Default Theme"},
       {ImGUI::Theme::Legacy,   "Legacy Theme"},
       {ImGUI::Theme::Nvidia,   "NVIDIA Theme"},
-      {ImGUI::Theme::RemixPlus, "Remix Plus Theme"},
   });
 
   // Styles 
@@ -1497,8 +1495,11 @@ namespace dxvk {
 
     ImFont* titleFont = m_largeFont != nullptr ? m_largeFont : ImGui::GetFont();
     ImFont* bodyFont = m_regularFont != nullptr ? m_regularFont : ImGui::GetFont();
-    const float titleSize = titleFont->FontSize;
-    const float bodySize = bodyFont->FontSize;
+    // The fonts are sized for the menu at 1080p; the screen scales them with the output height so the text reads at a
+    // distance on any resolution.
+    const float textScale = std::max(1.0f, size.y / 1080.0f) * 1.75f;
+    const float titleSize = titleFont->FontSize * textScale;
+    const float bodySize = bodyFont->FontSize * textScale;
 
     const auto drawCentered = [&](ImFont* font, float fontSize, float y, ImU32 color, const std::string& text) {
       const ImVec2 textSize = font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, text.c_str());
@@ -1519,13 +1520,13 @@ namespace dxvk {
     y += bodySize * 2.4f;
 
     // The bar.
-    const float barWidth = std::min(size.x * 0.5f, 900.0f);
+    const float barWidth = std::min(size.x * 0.6f, 900.0f * textScale);
     const float barHeight = std::max(bodySize * 0.9f, 10.0f);
     const ImVec2 barMin(origin.x + (size.x - barWidth) * 0.5f, y);
     const ImVec2 barMax(barMin.x + barWidth, barMin.y + barHeight);
-    drawList->AddRectFilled(barMin, barMax, ImGui::GetColorU32(ImGuiCol_FrameBg), barHeight * 0.5f);
+    drawList->AddRectFilled(barMin, barMax, IM_COL32(45, 47, 52, 255), barHeight * 0.5f);
     if (fraction > 0.0f) {
-      drawList->AddRectFilled(barMin, ImVec2(barMin.x + barWidth * fraction, barMax.y), ImGui::GetColorU32(ImGuiCol_CheckMark), barHeight * 0.5f);
+      drawList->AddRectFilled(barMin, ImVec2(barMin.x + barWidth * fraction, barMax.y), IM_COL32(118, 185, 0, 255), barHeight * 0.5f);
     }
     y += barHeight + bodySize * 0.9f;
 
@@ -1716,30 +1717,6 @@ namespace dxvk {
       RtxSessionLog::screenshotRequestObject().setDeferred(stem);
     }
     RemixGui::SetTooltipToLastWidgetOnHover("Saves the next frame as a PNG in the screenshots folder of the log folder, for a bug report. The image is the game's frame with its own interface, without this menu.");
-
-    if (ImGui::Button("Take Screenshot")) {
-      ctx->getCommonObjects()->metaScreenshot().request();
-    }
-    RemixGui::SetTooltipToLastWidgetOnHover("Saves the next frame as a PNG, with the game's interface and without this menu. "
-                                            "With HDR output active, an HDR PNG and an SDR PNG are saved.");
-    RemixGui::InputKeyBind("Screenshot Key", &RtxScreenshot::hotkeyObject());
-    RemixGui::InputText("Screenshot Folder", &RtxScreenshot::folderObject());
-
-    {
-      const FrameExportStatus exportStatus = ctx->getCommonObjects()->metaFrameExport().status();
-      switch (exportStatus.state) {
-      case FrameExportState::Off:
-        ImGui::TextUnformatted("External frame: off");
-        break;
-      case FrameExportState::Exporting:
-        ImGui::Text("External frame: %ux%u", exportStatus.width, exportStatus.height);
-        break;
-      case FrameExportState::Unavailable:
-        ImGui::Text("External frame: unavailable: %s", RtxFrameExport::describe(exportStatus.reason));
-        break;
-      }
-    }
-    RemixGui::SetTooltipToLastWidgetOnHover("Whether a host application receives the presented frame through remixapi_ConfigureExternalFrame, and at which size. The shared frame never contains this menu.");
 
     RemixGui::Separator();
 
@@ -2070,6 +2047,7 @@ namespace dxvk {
         ImGui::Unindent();
       }
       RemixGui::Checkbox("Hash Collision Detection", &HashCollisionDetectionOptions::enableObject());
+      RemixGui::Checkbox("Validate CPU index data", &RtxOptions::validateCPUIndexDataObject());
       RemixGui::Checkbox("Keep Compiled Pipelines Between Runs (restart required)", &DxvkPipelineCache::persistObject());
       RemixGui::SetTooltipToLastWidgetOnHover(
         "rtx.pipelineCache.persist. Restart required: the cache file is opened at device creation, so a change takes effect\n"
@@ -2081,7 +2059,11 @@ namespace dxvk {
         "starts a fresh one. Applies at the next save (when shader compiles settle, and at shutdown).");
 
       ImGui::Indent();
-      showDeveloperSection(ctx);
+      if (RemixGui::CollapsingHeader("Remix API Recording", collapsingHeaderClosedFlags)) {
+        ImGui::Indent();
+        ApiRecorder::showImguiSettings();
+        ImGui::Unindent();
+      }
       ImGui::Unindent();
 
 #ifdef REMIX_DEVELOPMENT
@@ -2337,7 +2319,6 @@ namespace dxvk {
       RemixGui::Checkbox("Always Developer Menu", &RtxOptions::defaultToAdvancedUIObject());
 
       RemixGui::InputText("Product Name", &productNameObject());
-      RemixGui::InputText("Donate Link", &donateUrlObject());
 
       if (RemixGui::SliderFloat("Background Alpha", &backgroundAlphaObject(), 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp)) {
         adjustStyleBackgroundAlpha(backgroundAlpha());
@@ -2347,12 +2328,6 @@ namespace dxvk {
       if (RemixGui::Checkbox("Use Large UI", &largeUiModeObject())) {
         m_pendingUIOptionsScroll = true;
       }
-
-      RemixGui::Checkbox("Problem Notice", &FaultNotice::enableObject());
-      ImGui::BeginDisabled(!FaultNotice::enable());
-      RemixGui::InputText("Problem Notice Help Text", &FaultNotice::supportTextObject());
-      RemixGui::InputText("Problem Notice Help Link", &FaultNotice::supportUrlObject());
-      ImGui::EndDisabled();
 
       {
         constexpr float indent = 60.0f;
@@ -3315,7 +3290,9 @@ namespace dxvk {
 
       if (RemixGui::CollapsingHeader("Heuristics", collapsingHeaderClosedFlags)) {
         ImGui::Indent();
-        frontend_ui::drawPanels(frontend_ui::Group::Heuristics);
+        RemixGui::Checkbox("Orthographic Is UI", &D3D9Rtx::orthographicIsUIObject());
+        RemixGui::Checkbox("Pre-Transformed Vertices Is UI", &D3D9Rtx::preTransformedVerticesIsUIObject());
+        RemixGui::Checkbox("Allow Cubemaps", &D3D9Rtx::allowCubemapsObject());
         RemixGui::Checkbox("Always Calculate AABB (For Instance Matching)", &RtxOptions::enableAlwaysCalculateAABBObject());
         RemixGui::Checkbox("Skip Sky Fog Values", &RtxOptions::fogIgnoreSkyObject());
         RemixGui::Checkbox("Recompute Texture Hash On Write", &RtxOptions::recomputeTextureHashOnWriteObject());
@@ -3331,7 +3308,15 @@ namespace dxvk {
         ImGui::Unindent();
       }
 
-      frontend_ui::drawPanels(frontend_ui::Group::TuningSections);
+      if (RemixGui::CollapsingHeader("Shader Support (Experimental)", collapsingHeaderClosedFlags)) {
+        ImGui::Indent();
+        RemixGui::Checkbox("Capture Vertices from Shader", &D3D9Rtx::useVertexCaptureObject());
+        RemixGui::Checkbox("Capture Normals from Shader", &D3D9Rtx::useVertexCapturedNormalsObject());
+        RemixGui::Checkbox("Capture Texcoords from Shader", &D3D9Rtx::useVertexCapturedTexcoordsObject());
+        RemixGui::Separator();
+        RemixGui::Checkbox("Use World Transforms", &D3D9Rtx::useWorldMatricesForShadersObject());
+        ImGui::Unindent();
+      }
 
       if (RemixGui::CollapsingHeader("View Model", collapsingHeaderClosedFlags)) {
         ImGui::Indent();
@@ -3396,10 +3381,10 @@ namespace dxvk {
         }
 
         constexpr static const char* fogModes[] = {
-          "None",
-          "Exp",
-          "Exp2",
-          "Linear",
+          "D3DFOG_NONE",
+          "D3DFOG_EXP",
+          "D3DFOG_EXP2",
+          "D3DFOG_LINEAR",
         };
 
         {
@@ -3664,87 +3649,6 @@ namespace dxvk {
     style->Colors[ImGuiCol_ModalWindowDimBg] = ImVec4(0.00f, 0.00f, 0.00f, 0.56f);
   }
 
-  void ImGUI::setRemixPlusStyle(ImGuiStyle* dst) {
-    ImGuiStyle* style = dst ? dst : &ImGui::GetStyle();
-
-    // Spacing and rounding from the default theme; plum, rose and cream colors.
-    // Text is cream on dark plum fills. Bright rose is used only where no text sits on top of it.
-    setToolkitStyle(style);
-
-    const ImVec4 cream     = ImVec4(0.980f, 0.953f, 0.925f, 1.00f);
-    const ImVec4 soft      = ImVec4(0.910f, 0.871f, 0.886f, 1.00f);
-    const ImVec4 muted     = ImVec4(0.580f, 0.510f, 0.560f, 1.00f);
-    const ImVec4 rose      = ImVec4(0.957f, 0.729f, 0.816f, 1.00f);
-    const ImVec4 roseLight = ImVec4(1.000f, 0.835f, 0.894f, 1.00f);
-    const ImVec4 roseDim   = ImVec4(0.725f, 0.518f, 0.604f, 1.00f);
-    const ImVec4 roseDeep  = ImVec4(0.478f, 0.267f, 0.400f, 1.00f);
-    const ImVec4 roseDark  = ImVec4(0.361f, 0.200f, 0.310f, 1.00f);
-    const ImVec4 plumBlack = ImVec4(0.071f, 0.047f, 0.078f, 1.00f);
-    const ImVec4 plum      = ImVec4(0.110f, 0.075f, 0.125f, 1.00f);
-    const ImVec4 plumFrame = ImVec4(0.251f, 0.165f, 0.275f, 1.00f);
-    const ImVec4 plumField = ImVec4(0.345f, 0.235f, 0.373f, 1.00f);
-    const ImVec4 plumHover = ImVec4(0.431f, 0.290f, 0.459f, 1.00f);
-    const ImVec4 plumLine  = ImVec4(0.290f, 0.200f, 0.282f, 1.00f);
-    const ImVec4 frameLine = ImVec4(0.765f, 0.635f, 0.761f, 1.00f);
-
-    auto withAlpha = [](ImVec4 c, float a) { c.w = a; return c; };
-
-    style->Colors[ImGuiCol_Text] = cream;
-    style->Colors[ImGuiCol_TextDisabled] = muted;
-    style->Colors[ImGuiCol_WindowBg] = withAlpha(plumBlack, backgroundAlpha());
-    style->Colors[ImGuiCol_ChildBg] = withAlpha(plum, 0.86f);
-    style->Colors[ImGuiCol_PopupBg] = plum;
-    // Fields and checkboxes stand out from the window by a lighter fill and a light border.
-    style->Colors[ImGuiCol_Border] = frameLine;
-    style->Colors[ImGuiCol_BorderShadow] = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
-    style->Colors[ImGuiCol_FrameBg] = plumField;
-    style->Colors[ImGuiCol_FrameBgHovered] = plumHover;
-    style->Colors[ImGuiCol_FrameBgActive] = roseDeep;
-    style->Colors[ImGuiCol_TitleBg] = plumBlack;
-    style->Colors[ImGuiCol_TitleBgActive] = plumBlack;
-    style->Colors[ImGuiCol_TitleBgCollapsed] = withAlpha(plum, 0.98f);
-    style->Colors[ImGuiCol_MenuBarBg] = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
-    style->Colors[ImGuiCol_ScrollbarBg] = ImVec4(0.00f, 0.00f, 0.00f, 0.24f);
-    style->Colors[ImGuiCol_ScrollbarGrab] = plumLine;
-    style->Colors[ImGuiCol_ScrollbarGrabHovered] = roseDeep;
-    style->Colors[ImGuiCol_ScrollbarGrabActive] = roseDim;
-    style->Colors[ImGuiCol_CheckMark] = roseLight;
-    style->Colors[ImGuiCol_SliderGrab] = roseDim;
-    style->Colors[ImGuiCol_SliderGrabActive] = rose;
-    style->Colors[ImGuiCol_Button] = plumFrame;
-    style->Colors[ImGuiCol_ButtonHovered] = roseDeep;
-    style->Colors[ImGuiCol_ButtonActive] = roseDark;
-    style->Colors[ImGuiCol_Header] = plumFrame;
-    style->Colors[ImGuiCol_HeaderHovered] = roseDeep;
-    style->Colors[ImGuiCol_HeaderActive] = roseDark;
-    style->Colors[ImGuiCol_Separator] = plumLine;
-    style->Colors[ImGuiCol_SeparatorHovered] = roseDim;
-    style->Colors[ImGuiCol_SeparatorActive] = rose;
-    style->Colors[ImGuiCol_ResizeGrip] = withAlpha(plumLine, 0.60f);
-    style->Colors[ImGuiCol_ResizeGripHovered] = roseDim;
-    style->Colors[ImGuiCol_ResizeGripActive] = rose;
-    style->Colors[ImGuiCol_Tab] = withAlpha(plumBlack, 0.60f);
-    style->Colors[ImGuiCol_TabHovered] = roseDeep;
-    style->Colors[ImGuiCol_TabActive] = roseDeep;
-    style->Colors[ImGuiCol_TabUnfocused] = withAlpha(plumBlack, 0.40f);
-    style->Colors[ImGuiCol_TabUnfocusedActive] = roseDark;
-    style->Colors[ImGuiCol_PlotLines] = roseDim;
-    style->Colors[ImGuiCol_PlotLinesHovered] = rose;
-    style->Colors[ImGuiCol_PlotHistogram] = roseDim;
-    style->Colors[ImGuiCol_PlotHistogramHovered] = rose;
-    style->Colors[ImGuiCol_TableHeaderBg] = plumFrame;
-    style->Colors[ImGuiCol_TableBorderStrong] = plumLine;
-    style->Colors[ImGuiCol_TableBorderLight] = withAlpha(plumLine, 0.54f);
-    style->Colors[ImGuiCol_TableRowBg] = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
-    style->Colors[ImGuiCol_TableRowBgAlt] = withAlpha(plumFrame, 0.50f);
-    style->Colors[ImGuiCol_TextSelectedBg] = withAlpha(roseDeep, 0.80f);
-    style->Colors[ImGuiCol_DragDropTarget] = rose;
-    style->Colors[ImGuiCol_NavHighlight] = rose;
-    style->Colors[ImGuiCol_NavWindowingHighlight] = withAlpha(soft, 0.70f);
-    style->Colors[ImGuiCol_NavWindowingDimBg] = withAlpha(plumBlack, 0.40f);
-    style->Colors[ImGuiCol_ModalWindowDimBg] = withAlpha(plumBlack, 0.60f);
-  }
-
   std::string ImGUI::productVersion() {
     const std::string tag = remixBuildTag();
     const size_t space = tag.find_last_of(' ');
@@ -3764,6 +3668,31 @@ namespace dxvk {
     return donateUrl().rfind("https://", 0) == 0;
   }
 
+  // A pink heart with two white sparkles, one font size square, drawn as shapes because the menu fonts have no emoji.
+  static void drawSparklingHeart() {
+    const float size = ImGui::GetFontSize();
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    ImGui::Dummy(ImVec2(size, size));
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+
+    const ImU32 pink = IM_COL32(255, 94, 160, 255);
+    const float r = size * 0.24f;
+    const float top = p.y + size * 0.38f;
+    draw->AddCircleFilled(ImVec2(p.x + size * 0.32f, top), r, pink, 16);
+    draw->AddCircleFilled(ImVec2(p.x + size * 0.62f, top), r, pink, 16);
+    draw->AddTriangleFilled(ImVec2(p.x + size * 0.10f, top + r * 0.35f), ImVec2(p.x + size * 0.84f, top + r * 0.35f),
+                            ImVec2(p.x + size * 0.47f, p.y + size * 0.92f), pink);
+
+    const ImU32 white = IM_COL32(255, 255, 255, 255);
+    auto sparkle = [&](float cx, float cy, float arm) {
+      const float waist = arm * 0.22f;
+      draw->AddQuadFilled(ImVec2(cx, cy - arm), ImVec2(cx + waist, cy), ImVec2(cx, cy + arm), ImVec2(cx - waist, cy), white);
+      draw->AddQuadFilled(ImVec2(cx - arm, cy), ImVec2(cx, cy - waist), ImVec2(cx + arm, cy), ImVec2(cx, cy + waist), white);
+    };
+    sparkle(p.x + size * 0.86f, p.y + size * 0.16f, size * 0.16f);
+    sparkle(p.x + size * 0.36f, p.y + size * 0.34f, size * 0.08f);
+  }
+
   // Draws nothing when rtx.gui.donateUrl holds no https link.
   void ImGUI::showDonateButton(const ImVec2& buttonSize) {
     if (!hasDonateLink()) {
@@ -3773,12 +3702,18 @@ namespace dxvk {
     const bool stacked = buttonSize.x > 0.0f;
     if (stacked) {
       constexpr const char* kText = "Help keep this project going";
-      const float textOffset = (buttonSize.x - ImGui::CalcTextSize(kText).x) * 0.5f;
+      const float spacing = ImGui::GetStyle().ItemInnerSpacing.x;
+      const float lineWidth = ImGui::CalcTextSize(kText).x + spacing + ImGui::GetFontSize();
+      const float textOffset = (buttonSize.x - lineWidth) * 0.5f;
       ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(textOffset, 0.0f));
       ImGui::TextUnformatted(kText);
+      ImGui::SameLine(0.0f, spacing);
+      drawSparklingHeart();
     } else {
       ImGui::AlignTextToFramePadding();
-      ImGui::TextUnformatted("Help keep this project going:");
+      ImGui::TextUnformatted("Help keep this project going");
+      ImGui::SameLine(0.0f, ImGui::GetStyle().ItemInnerSpacing.x);
+      drawSparklingHeart();
       ImGui::SameLine();
     }
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, std::max(ImGui::GetStyle().FrameRounding, ImGui::GetFontSize() * 0.3f));
@@ -3829,10 +3764,6 @@ namespace dxvk {
     
     case Theme::Nvidia:
       setNvidiaStyle(style);
-      break;
-
-    case Theme::RemixPlus:
-      setRemixPlusStyle(style);
       break;
     }
   }
@@ -4074,309 +4005,6 @@ namespace dxvk {
     ImGui::End();
   }
 
-  void ImGUI::showDeveloperSection(const Rc<DxvkContext>& ctx) {
-    if (RemixGui::CollapsingHeader("Frontend and Scene Paths", collapsingHeaderClosedFlags)) {
-      ImGui::Indent();
-      ImGui::TextWrapped("Set these paths in rtx.conf before the game starts. Switching a path while a scene is loaded is not supported.");
-      if (ImGui::TreeNode("D3D9 Frontend")) {
-        frontend_ui::drawPanels(frontend_ui::Group::Geometry);
-        ImGui::TreePop();
-      }
-      if (ImGui::TreeNode("Scene Interface")) {
-        RemixGui::Checkbox("Scene: Origin Shift as One Event", &scene::Options::originShiftEventObject());
-        RemixGui::Checkbox("Scene: Origin Shift Translates Merged BLAS (no rebuild)", &RtxOptions::originTranslationObject());
-        RemixGui::Checkbox("API: External Preserve Path", &RtxOptions::enableExternalPreservePathObject());
-        ImGui::TreePop();
-      }
-      ImGui::Unindent();
-    }
-
-    if (RemixGui::CollapsingHeader("Shader Variants", collapsingHeaderClosedFlags)) {
-      ImGui::Indent();
-      RemixGui::Checkbox("Slim Indirect Variants Keep POM", &DxvkPathtracerIntegrateIndirect::slimKeepPomObject());
-      showVariantTablesImguiSettings();
-      showFrameFeaturesImguiSettings();
-      RemixGui::Checkbox("Log Pipeline Shader Stats (restart required)", &RtxPipelineStats::logPipelineStatsObject());
-      RemixGui::SetTooltipToLastWidgetOnHover(
-        "rtx.debug.logPipelineStats. Restart required: the Vulkan extension is enabled at device creation, and pipelines are\n"
-        "created early and cached, so toggling this in a running game does nothing until the next launch (save rtx.conf first).\n"
-        "When on, every compute / ray tracing / graphics pipeline logs one [PipelineStats] line per executable to remix-dxvk.log:\n"
-        "register count, spills / local memory, instruction count, binary size, subgroup size (whatever the driver reports).");
-      ImGui::Unindent();
-    }
-
-    if (RemixGui::CollapsingHeader("Self-Checks and Logs", collapsingHeaderClosedFlags)) {
-      ImGui::Indent();
-      RemixGui::Checkbox("Material Census Log", &RtxOptions::CoreMaterial::censusObject());
-      RemixGui::Checkbox("Core Material Self-Check (CPU)", &RtxOptions::CoreMaterial::selfCheckObject());
-      RemixGui::Checkbox("Core Material GPU Check", &RtxOptions::CoreMaterial::gpuCheckObject());
-      RemixGui::Separator();
-      RemixGui::DragInt("Self-Check Incremental Bookkeeping Every N Frames (0 = off)", &RtxOptions::accelIncrementalSelfCheckFramesObject(), 1.f, 0, 100000);
-      RemixGui::DragInt("Log Top N Meshes Dirtying Merged BLAS (0 = off)", &RtxOptions::accelDirtyLogTopNObject(), 1.f, 0, 256);
-      RemixGui::DragInt("API Retained: Self-Check Steady Path Every N Frames (0 = off)", &RtxOptions::retainedSteadySelfCheckFramesObject(), 1.f, 0, 100000);
-      RemixGui::DragInt("Scene: Self-Check Every N Frames (0 = off)", &scene::Options::selfCheckFramesObject(), 1.f, 0, 100000);
-      RemixGui::Checkbox("Log Sampled GPU Stage Timings (verbose)", &RtxContext::gpuStagesObject());
-      frontend_ui::drawPanels(frontend_ui::Group::SelfChecks);
-      ImGui::Unindent();
-    }
-
-    if (RemixGui::CollapsingHeader("Stress Mode", collapsingHeaderClosedFlags)) {
-      ImGui::Indent();
-      ImGui::TextWrapped("Random delays on the worker, command stream and scene command threads, and early slot reuse, to "
-                         "expose timing and lifetime bugs. Slows everything down. The seed is logged as [Stress].");
-      RemixGui::DragInt("Longest Delay (us, 0 = off)", &RtxStress::delayUsObject(), 10.f, 0, 100000);
-      RemixGui::DragFloat("Delay Chance", &RtxStress::delayChanceObject(), 0.01f, 0.f, 1.f);
-      RemixGui::Checkbox("Force Early Slot Reuse", &RtxStress::forceSlotReuseObject());
-      RemixGui::DragInt("Seed (0 = from the clock)", &RtxStress::seedObject(), 1.f, 0, INT32_MAX);
-      ImGui::Text("Delays injected: %llu", static_cast<unsigned long long>(stress::delaysInjected()));
-      ImGui::Unindent();
-    }
-
-    if (RemixGui::CollapsingHeader("Opacity Micromap Diagnostics", collapsingHeaderClosedFlags)) {
-      ImGui::Indent();
-      RemixGui::Checkbox("OMM: Log Triangle Opacity Census ([AlphaBake])", &RtxOptions::censusObject());
-      RemixGui::Checkbox("OMM: Census Counts Micro-Triangle States", &RtxOptions::censusMicroStatesObject());
-      RemixGui::SetTooltipToLastWidgetOnHover(
-        "rtx.alphaBake.censusMicroStates. Needs the census above. Adds the share of transparent / opaque / unknown\n"
-        "micro-triangles inside mixed and uniform triangles to the [AlphaBake] census lines (micromaps baked after it is set).");
-      RemixGui::Combo("OMM: Software Micromaps", &RtxOptions::softwareOmmObject(), "Off\0Only Without the Extension\0Always (No Hardware OMM)\0");
-      RemixGui::SetTooltipToLastWidgetOnHover(
-        "rtx.alphaBake.softwareOmm. Bakes opacity micromaps as usual but keeps them as shader-readable stores instead of\n"
-        "building hardware micromaps ([SoftOmm] log lines). Changing it restarts the micromap cache.");
-      RemixGui::Checkbox("OMM: Simulate a GPU Without the Extension (restart)", &RtxOptions::softwareOmmSimulateNoExtensionObject());
-      RemixGui::SetTooltipToLastWidgetOnHover(
-        "rtx.alphaBake.softwareOmmSimulateNoExtension. Read once at startup: VK_EXT_opacity_micromap is then treated as\n"
-        "unsupported (no hardware micromaps, no micromap pipeline flags).");
-      RemixGui::Checkbox("OMM: Software Micromaps in Visibility Rays", &RtxOptions::softwareOmmVisibilityObject());
-      RemixGui::SetTooltipToLastWidgetOnHover(
-        "rtx.alphaBake.softwareOmmVisibility. Shadow / NEE candidates on surfaces with software micromap data skip transparent\n"
-        "micro-triangles and commit opaque ones without the alpha test, as hardware micromaps do.");
-      RemixGui::Checkbox("OMM: Software Micromaps in Resolve Loops (skip transparent)", &RtxOptions::softwareOmmResolveSkipObject());
-      RemixGui::SetTooltipToLastWidgetOnHover(
-        "rtx.alphaBake.softwareOmmResolveSkip. Primary and PSR resolves re-trace past transparent micro-triangles\n"
-        "without the hit function, and emulate the final CULL_NON_OPAQUE iteration, as hardware micromaps do.");
-      RemixGui::Checkbox("OMM: Software Micromaps in Resolve Loops: Indirect Too", &RtxOptions::softwareOmmResolveSkipIndirectObject());
-      RemixGui::SetTooltipToLastWidgetOnHover(
-        "rtx.alphaBake.softwareOmmResolveSkipIndirect. Also skips in the indirect resolves (integration and SHaRC update /\n"
-        "query). Acts only with the option above on. Off by default because it adds GPU time in the indirect passes.");
-      RemixGui::DragInt("OMM: Software Micromaps in Traversal (pass mask)", &RtxOptions::softwareOmmTraversalObject(), 0.05f, 0, 7);
-      RemixGui::SetTooltipToLastWidgetOnHover(
-        "rtx.alphaBake.softwareOmmTraversal. Bitmask: 1 = G-buffer (primary + PSR), 2 = SHaRC update, 4 = indirect integration\n"
-        "(add the bits, 7 = all). Ray query resolves only (indirect needs rtx.renderPassIntegrateIndirectRaytraceMode = Ray Query).\n"
-        "The resolve trace drops FORCE_OPAQUE and skips transparent micro-triangles inside traversal (no re-trace); everything\n"
-        "else is committed as before. Replaces the resolve-loop skip above in those passes. 0 = off.");
-      RemixGui::Checkbox("OMM: Log Software Micromap Candidate Counters ([SoftOmm])", &RtxOptions::softwareOmmCountersObject());
-      RemixGui::Checkbox("OMM: Run bary2index Self-Test", &RtxOptions::softwareOmmSelfTestObject());
-      RemixGui::SetTooltipToLastWidgetOnHover(
-        "rtx.alphaBake.softwareOmmSelfTest. Each switch to on runs the check once and logs [SoftOmm] bary2index self-test lines.");
-      RemixGui::Checkbox("OMM: Split API Point Instancers Between Scene Lanes", &scene::Options::directInstancerSplitObject());
-      RemixGui::SetTooltipToLastWidgetOnHover(
-        "rtx.scene.directInstancerSplit. The scene owns the point-instanced API submeshes of every second mesh, and the\n"
-        "rest stay on the retained path. With Detailed Performance Logging, [D3d9Alpha] pointInstancers compares both lanes.");
-      ImGui::Unindent();
-    }
-
-    if (RemixGui::CollapsingHeader("Live TLAS / Trace Readout", collapsingHeaderClosedFlags)) {
-      ImGui::Indent();
-      RemixGui::Checkbox("Enable Readout##livetrace", &RtxPerfLog::liveTraceReadoutObject());
-      static bool lastOn = false, lastMinimize = false, lastFastTrace = false;
-      static float lastCellSize = -1.f;
-      if (!RtxPerfLog::liveTraceReadout()) {
-        lastOn = false;
-      } else {
-        SceneManager& scene = ctx->getCommonObjects()->getSceneManager();
-        const uint32_t frameId = ctx->getDevice()->getCurrentFrameId();
-        // Restart the averages whenever the BLAS layout settings change; skip the rebuild frames.
-        static constexpr uint32_t kSettleFrames = 120;
-        const bool minimize = RtxOptions::minimizeBlasMerging();
-        const bool fastTrace = RtxOptions::preferFastTraceForStaticMergedBlas();
-        const float cellSize = RtxOptions::effectiveMergedBucketCellSize();
-        if (!lastOn || minimize != lastMinimize || fastTrace != lastFastTrace || cellSize != lastCellSize) {
-          RtxPerfLog::resetLiveTrace(frameId, kSettleFrames);
-          lastMinimize = minimize;
-          lastFastTrace = fastTrace;
-          lastCellSize = cellSize;
-        }
-        lastOn = true;
-
-        RemixGui::Checkbox("Minimize BLAS Merging##livetrace", &RtxOptions::minimizeBlasMergingObject());
-        RemixGui::DragFloat("Merged BLAS World Cell Size (0 = off)##livetrace", &RtxOptions::mergedBucketCellSizeObject(), 64.f, 0.f, 1000000.f, "%.0f");
-        RemixGui::Checkbox("Fast-Trace Flags for Static Merged BLAS##livetrace", &RtxOptions::preferFastTraceForStaticMergedBlasObject());
-        if (ImGui::Button("Reset Averages##livetrace")) {
-          RtxPerfLog::resetLiveTrace(frameId, 0);
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Log Snapshot ([TlasAB])##livetrace")) {
-          RtxPerfLog::logLiveTrace(scene);
-        }
-
-        const RtxPerfLog::TlasCounts c = RtxPerfLog::gatherTlasCounts(scene);
-        ImGui::Text("TLAS instances: %u  (opaque %u, unordered %u, SSS %u, point-instancer slots %u)",
-                    c.opaque + c.unordered + c.sss + c.piSlots, c.opaque, c.unordered, c.sss, c.piSlots);
-        ImGui::Text("Merged BLAS: %u holding %u instances, %llu prims   Per-geometry BLAS: %u   TLAS: %.1f MiB",
-                    c.mergedBlas, c.mergedInstances, (unsigned long long) c.mergedPrims, c.perGeomBlas,
-                    double(c.tlasBytes) / (1024.0 * 1024.0));
-
-        const RtxPerfLog::LiveTraceSnapshot snap = RtxPerfLog::liveTraceSnapshot();
-        if (snap.samples == 0) {
-          ImGui::TextUnformatted(snap.settling ? "GPU times: waiting for BLASes to settle..." : "GPU times: no samples yet");
-        } else {
-          ImGui::Text("GPU times, average of %u samples: trace stages %.2f ms, whole sequence %.2f ms",
-                      snap.samples, snap.traceMs, snap.measuredMs);
-          for (const RtxPerfLog::LiveTraceStage& st : snap.stages) {
-            if (st.avgMs < 0.01) {
-              continue;
-            }
-            const bool highlight = st.trace || std::strcmp(st.label, "TlasBuild") == 0 || std::strcmp(st.label, "BlasBuild") == 0;
-            if (highlight) {
-              ImGui::Text("  %-32s %6.2f ms%s", st.label, st.avgMs, st.trace ? "  (trace)" : "");
-            } else {
-              ImGui::TextDisabled("  %-32s %6.2f ms", st.label, st.avgMs);
-            }
-          }
-        }
-      }
-      ImGui::Unindent();
-    }
-
-    if (RemixGui::CollapsingHeader("Experimental", collapsingHeaderClosedFlags)) {
-      ImGui::Indent();
-      ImGui::TextWrapped("Options that measured no gain or still wait for an A/B. They are off by default.");
-      RemixGui::DragInt("Indirect: Skip Cutouts From Bounce (-1 off)", &RtxOptions::cullNonOpaqueFromBounceObject(), 0.1f, -1, 15, "%d", sliderFlags);
-      RemixGui::Checkbox("Indirect: Skip Cutouts On Diffuse Rays", &RtxOptions::cullNonOpaqueOnDiffuseRaysObject());
-      RemixGui::Combo("Indirect: Cutout Fast-Ray Mode", &RtxOptions::fastRayModeObject(),
-        "Cull Non-Opaque (fastest, leaks)\0OMM 2-State (keeps coverage)\0");
-      RemixGui::Checkbox("Fast-Trace Flags for Static Per-Geometry BLAS", &RtxOptions::preferFastTraceForStaticBlasObject());
-      RemixGui::Checkbox("Fast-Trace Flags for Static Merged BLAS", &RtxOptions::preferFastTraceForStaticMergedBlasObject());
-      RemixGui::SetTooltipToLastWidgetOnHover(
-        "rtx.preferFastTraceForStaticMergedBlas. Applies when a merged BLAS is next built: buckets that are already built\n"
-        "keep their flags, so compare after a restart or a cell change (enter / leave a building, fast travel).");
-      ShadowRays::showImguiSettings();
-      ImGui::Unindent();
-    }
-
-    if (RemixGui::CollapsingHeader("Remix API Recording", collapsingHeaderClosedFlags)) {
-      ImGui::Indent();
-      ApiRecorder::showImguiSettings();
-      ImGui::Unindent();
-    }
-  }
-
-  void ImGUI::showSccrSettings(DxvkObjects* common) {
-    const bool sccrShellOn = SccrShellManager::enable();
-    ImGui::Separator();
-    ImGui::TextWrapped("SCCR: cone-stepped relief from the height maps. Shell tracing keeps deep relief on the mesh instead of sliding.");
-
-    // The quality levels write the march budgets under Advanced. Editing one there shows Custom.
-    static const char* const kSccrQualityNames[] = { "High", "Medium", "Low" };
-    const SccrShellManager::Quality currentQuality = SccrShellManager::qualityLevel();
-    const int currentLevel = static_cast<int>(currentQuality);
-    if (ImGui::BeginCombo("SCCR Quality", currentQuality == SccrShellManager::Quality::Custom ? "Custom" : kSccrQualityNames[currentLevel])) {
-      for (int level = 0; level < int(std::size(kSccrQualityNames)); ++level) {
-        if (ImGui::Selectable(kSccrQualityNames[level], level == currentLevel)) {
-          SccrShellManager::setQualityLevel(static_cast<SccrShellManager::Quality>(level));
-        }
-      }
-      ImGui::EndCombo();
-    }
-    if (ImGui::IsItemHovered()) {
-      ImGui::SetTooltip("High is the default. Medium and Low take fewer march steps and hand off to plain SCCR sooner,\n"
-                        "for slower GPUs. The graphics presets set this too. Changing a march setting under Advanced shows Custom.");
-    }
-
-    RemixGui::Checkbox("SCCR Shell Tracing", &SccrShellManager::enableObject());
-
-    const PomConeMapManager::Progress coneProgress = common->metaPomConeMaps().progress();
-    ImGui::Text("Cone maps ready: %u of %u", coneProgress.fullMaps, coneProgress.liveMaps);
-    if (sccrShellOn) {
-      const SccrShellManager::Stats shellStats = common->metaSccrShell().stats();
-      ImGui::Text("Shell tracing on %u of %u displaced surfaces", shellStats.boundSurfaces, shellStats.eligibleSurfaces);
-      if (RtxOptions::Displacement::referenceWorldUnitsPerUv() <= 0.0f) {
-        ImGui::TextWrapped("Shell tracing needs Reference World Units per UV above 0 (Advanced, Depth).");
-      }
-    }
-
-    if (!RemixGui::CollapsingHeader("SCCR Advanced", collapsingHeaderClosedFlags)) {
-      return;
-    }
-    ImGui::Indent();
-
-    ImGui::Separator();
-    ImGui::TextUnformatted("Relief march");
-    RemixGui::DragInt("Cone Steps", &RtxOptions::Displacement::coneStepsObject(), 1.f, 1, 64, "%d", sliderFlags);
-    RemixGui::DragInt("Binary Steps", &RtxOptions::Displacement::binaryStepsObject(), 1.f, 0, 16, "%d", sliderFlags);
-    RemixGui::DragInt("Shadow Cone Steps", &RtxOptions::Displacement::coneShadowStepsObject(), 1.f, 1, 64, "%d", sliderFlags);
-    RemixGui::DragInt("Indirect Shadow Steps (0 = full)", &RtxOptions::Displacement::indirectShadowStepsObject(), 1.f, 0, 16, "%d", sliderFlags);
-    RemixGui::DragFloat("Indirect Shadow Footprint Scale", &RtxOptions::Displacement::indirectShadowFootprintScaleObject(), 0.05f, 0.0f, 8.0f, "%.2f", sliderFlags);
-    RemixGui::Checkbox("Step LOD", &RtxOptions::Displacement::enableStepLodObject());
-    RemixGui::DragFloat("Step LOD Scale", &RtxOptions::Displacement::stepLodScaleObject(), 0.05f, 0.25f, 8.0f, "%.2f", sliderFlags);
-    RemixGui::Checkbox("Curvature Correction", &RtxOptions::Displacement::enableCurvatureCorrectionObject());
-    RemixGui::DragFloat("Curvature Scale", &RtxOptions::Displacement::curvatureScaleObject(), 0.01f, 0.0f, 2.0f, "%.2f", sliderFlags);
-    RemixGui::Checkbox("Stable Triangle Frame", &RtxOptions::Displacement::enableStableFrameObject());
-    RemixGui::Checkbox("Depth Offset (depth and motion at the relief)", &RtxOptions::Displacement::enableDepthOffsetObject());
-
-    ImGui::Separator();
-    ImGui::TextUnformatted("Depth");
-    // Shell tracing forces world-unit depth on and the zero plane off (rtx_context.cpp).
-    ImGui::BeginDisabled(sccrShellOn);
-    RemixGui::Checkbox("World-Unit Depth", &RtxOptions::Displacement::enableWorldUnitDepthObject());
-    ImGui::EndDisabled();
-    RemixGui::DragFloat("Reference World Units per UV", &RtxOptions::Displacement::referenceWorldUnitsPerUvObject(), 1.0f, 1.0f, 100000.0f, "%.1f", sliderFlags);
-    RemixGui::DragFloat("Max World Depth Scale", &RtxOptions::Displacement::maxWorldUnitDepthScaleObject(), 0.05f, 1.0f, 16.0f, "%.2f", sliderFlags);
-    ImGui::BeginDisabled(sccrShellOn);
-    RemixGui::DragFloat("Zero Plane (-1 = as authored)", &RtxOptions::Displacement::zeroPlaneObject(), 0.01f, -1.0f, 1.0f, "%.2f", sliderFlags);
-    ImGui::EndDisabled();
-    if (sccrShellOn) {
-      ImGui::TextWrapped("Shell tracing is on: world-unit depth is always on and the zero plane is ignored (the mesh is the top of the relief, which only goes inwards).");
-    }
-
-    ImGui::Separator();
-    ImGui::TextUnformatted("Cone maps");
-    ImGui::TextWrapped("Until a map's cones are ready, SCCR marches in linear steps of 1/N like Raymarched POM (N set by Max Iterations).");
-    RemixGui::Combo("Cone Quality", &PomConeMapManager::qualityObject(), "Full (generated cones)\0Coarse only (comparison)\0");
-    const bool coarseOnlyCones = PomConeMapManager::quality() == PomConeMapManager::ConeQuality::CoarseOnly;
-    ImGui::Text("Cone maps: %u full, %u coarse, %u linear (of %u)", coneProgress.fullMaps, coneProgress.coarseMaps,
-                coneProgress.liveMaps - coneProgress.fullMaps - coneProgress.coarseMaps, coneProgress.liveMaps);
-    ImGui::Text("Queue: %u maps, %llu tiles to generate, %zu MB", coneProgress.pendingMaps,
-                static_cast<unsigned long long>(coneProgress.tilesRemaining),
-                (coneProgress.derivedBytes + (size_t(1) << 19)) >> 20);
-    // A request to the manager, not an option write (see PomConeMapManager::bakeNow). Nothing generates in coarse-only
-    // quality.
-    ImGui::BeginDisabled(coarseOnlyCones);
-    if (ImGui::Button("Bake now")) {
-      common->metaPomConeMaps().requestBake();
-    }
-    ImGui::EndDisabled();
-    ImGui::SameLine();
-    ImGui::TextUnformatted(coarseOnlyCones ? "Generation paused: coarse-only cone quality." :
-                           common->metaPomConeMaps().baking() ? "Baking: generation budget lifted until the queue is empty." :
-                           "Generates every queued cone map at a higher budget.");
-
-    ImGui::Separator();
-    ImGui::TextUnformatted("Shell tracing");
-    ImGui::BeginDisabled(!sccrShellOn);
-    RemixGui::DragFloat("Shell Hand-off Distance", &SccrShellManager::maxDistanceObject(), 10.0f, 0.0f, 100000.0f, "%.0f", sliderFlags);
-    RemixGui::DragInt("Shell Max Prisms Crossed", &SccrShellManager::maxPrismsObject(), 1.f, 0, 64, "%d", sliderFlags);
-    RemixGui::DragInt("Shell Max Steps", &SccrShellManager::maxStepsObject(), 1.f, 1, 1024, "%d", sliderFlags);
-    RemixGui::Checkbox("Shell Fold Guard", &SccrShellManager::foldGuardObject());
-    RemixGui::Checkbox("Shell Self-Shadows (march through the prisms)", &SccrShellManager::shadowsObject());
-    ImGui::BeginDisabled(!SccrShellManager::shadows());
-    RemixGui::DragInt("Shell Max Shadow Prisms", &SccrShellManager::maxShadowPrismsObject(), 1.f, 0, 255, "%d", sliderFlags);
-    ImGui::EndDisabled();
-    RemixGui::DragFloat("Shell Weld Tolerance (of mesh size)", &SccrShellManager::weldEpsilonObject(), 0.000001f, 0.0f, 0.01f, "%.6f", sliderFlags);
-    RemixGui::DragInt("Shell Memory Cap (MB)", &SccrShellManager::maxMBObject(), 1.f, 1, 4096, "%d", sliderFlags);
-    RemixGui::DragInt("Shell Triangles Built per Frame", &SccrShellManager::buildTrianglesPerFrameObject(), 1000.f, 1000, 10000000, "%d", sliderFlags);
-    ImGui::EndDisabled();
-    if (sccrShellOn) {
-      const SccrShellManager::Stats shellStats = common->metaSccrShell().stats();
-      ImGui::Text("%u meshes, %u buffers, %.1f of %u MB; %u waiting (%u over the cap), %u dynamic surfaces",
-                  shellStats.boundMeshes, shellStats.cachedBuffers, double(shellStats.bytes) / double(1 << 20),
-                  SccrShellManager::maxMB(), shellStats.pendingBuilds, shellStats.overBudgetBuilds, shellStats.dynamicSurfaces);
-    }
-
-    ImGui::Unindent();
-  }
-
   void ImGUI::showRenderingSettings(const Rc<DxvkContext>& ctx) {
     ImGui::PushItemWidth(largeUiMode() ? m_largeWindowWidgetWidth : m_regularWindowWidgetWidth);
     auto common = ctx->getCommonObjects();
@@ -4476,18 +4104,14 @@ namespace dxvk {
       RemixGui::Checkbox("Allow Full Screen Exclusive?", &RtxOptions::allowFSEObject());
       RemixGui::Checkbox("Show DXVK HUD (Alt+H)", &RtxOptions::showDxvkHudObject());
 
-      // Deliberately not gated on a support query. The driver-core capability parameters are
-      // exactly what is missing on the machines the snippet backend exists to serve, so hiding
-      // the section behind them would hide the fix along with the problem; the panel reports
-      // availability in its own status line instead.
-      {
-        auto& neuralUplift = common->metaNeuralUplift();
+      auto& dlssNeuralRendering = common->metaDlssNeuralRendering();
+      if (dlssNeuralRendering.supportsDlssNeuralRendering()) {
         RemixGui::Separator();
 
         if (RemixGui::CollapsingHeader("DLSS 3D-Guided Neural Generation [Experimental]", collapsingHeaderClosedFlags)) {
           ImGui::Indent();
           ImGui::PushID("DLSS 3D-Guided Neural Generation");
-          neuralUplift.showImguiSettings(true);
+          dlssNeuralRendering.showDlssNeuralRenderingImguiSettings(true);
           ImGui::PopID();
           ImGui::Unindent();
         }
@@ -4509,6 +4133,7 @@ namespace dxvk {
         RemixGui::DragInt("Max PSR Interactions", &RtxOptions::psrRayMaxInteractionsObject(), 1.0f, 1, 255, "%d", sliderFlags);
         RemixGui::DragInt("Max Secondary Interactions", &RtxOptions::secondaryRayMaxInteractionsObject(), 1.0f, 1, 255, "%d", sliderFlags);
         RemixGui::Checkbox("Last Interaction Skips Cutouts", &RtxOptions::resolveFinalInteractionSkipsNonOpaqueObject());
+        RemixGui::Checkbox("Cutouts Keep Coplanar Surfaces", &RtxOptions::resolveKeepsCoplanarSurfacesObject());
         RemixGui::Checkbox("Separate Unordered Approximations", &RtxOptions::enableSeparateUnorderedApproximationsObject());
         RemixGui::Checkbox("Direct Translucent Shadows", &RtxOptions::enableDirectTranslucentShadowsObject());
         RemixGui::Checkbox("Direct Alpha Blended Shadows", &RtxOptions::enableDirectAlphaBlendShadowsObject());
@@ -4895,47 +4520,6 @@ namespace dxvk {
       ImGui::Unindent();
     }
 
-    if (RemixGui::CollapsingHeader("Geometry", collapsingHeaderClosedFlags)) {
-      ImGui::Indent();
-
-      RemixGui::Checkbox("Enable Triangle Culling (Globally)", &RtxOptions::enableCullingObject());
-      RemixGui::Checkbox("Enable Triangle Culling (Override Secondary Rays)", &RtxOptions::enableCullingInSecondaryRaysObject());
-      RemixGui::Separator();
-      RemixGui::DragInt("Min Prims in Dynamic BLAS", &RtxOptions::minPrimsInDynamicBLASObject(), 1.f, 100, 0);
-      RemixGui::DragInt("Max Prims in Merged BLAS", &RtxOptions::maxPrimsInMergedBLASObject(), 1.f, 100, 0);
-      RemixGui::Checkbox("Force Merge All Meshes", &RtxOptions::forceMergeAllMeshesObject());
-      RemixGui::Checkbox("Minimize BLAS Merging", &RtxOptions::minimizeBlasMergingObject());
-      if (RemixGui::CollapsingHeader("Acceleration Structure Tuning", collapsingHeaderClosedFlags)) {
-        ImGui::Indent();
-        RemixGui::DragInt("Share Small BLAS at N Instances (0 = off)", &RtxOptions::minInstancesToShareSmallBlasObject(), 1.f, 0, 4096);
-        RemixGui::DragInt("BLAS Build Scratch Budget (MB, 0 = unlimited)", &RtxOptions::maxBlasBuildScratchMBObject(), 1.f, 0, 16384);
-        RemixGui::DragInt("Min Frames Between OMM Rebinds (0 = next frame)", &RtxOptions::ommRebindIntervalFramesObject(), 1.f, 0, 600);
-        RemixGui::DragInt("Own BLAS for Moved Geometry, Frames (0 = off)", &RtxOptions::ownBlasForMovedInstancesFramesObject(), 1.f, 0, 100000);
-        RemixGui::DragInt("Own BLAS for Hidden/Shown Geometry, Frames (0 = off)", &RtxOptions::ownBlasForToggledInstancesFramesObject(), 1.f, 0, 100000);
-        RemixGui::DragInt("Own BLAS for Chronically Dirty Geometry After N Frames (0 = off)", &RtxOptions::ownBlasForChronicallyDirtyFramesObject(), 1.f, 0, 1000);
-        RemixGui::DragInt("Chronically Dirty Geometry: Keep Own BLAS for N Frames", &RtxOptions::ownBlasChronicallyDirtyHoldFramesObject(), 1.f, 1, 100000);
-        RemixGui::DragInt("Max Prims per Merged BLAS Bucket (0 = unlimited)", &RtxOptions::maxPrimsPerMergedBucketObject(), 1024.f, 0, 16777216);
-        RemixGui::DragFloat("Merged BLAS World Cell Size (0 = off)", &RtxOptions::mergedBucketCellSizeObject(), 64.f, 0.f, 1000000.f, "%.0f");
-        RemixGui::Checkbox("Auto Cell Size from Scene Scale (when size is 0)", &RtxOptions::autoCellSizeObject());
-        ImGui::TextDisabled("Effective cell size: %.1f", RtxOptions::effectiveMergedBucketCellSize());
-        RemixGui::DragInt("Static Clusters: Young Instance Frames", &RtxOptions::clusterYoungFramesObject(), 1.f, 0, 1000);
-        RemixGui::DragInt("Static Clusters: Young Folds per Frame", &RtxOptions::clusterFoldsPerFrameObject(), 0.1f, 1, 64);
-        RemixGui::Checkbox("Compact Stable BLAS", &RtxOptions::compactStableBlasObject());
-        RemixGui::DragInt("Compact BLAS Unchanged for N Frames", &RtxOptions::compactStableBlasFramesObject(), 1.f, 1, 100000);
-        RemixGui::DragInt("Rebuild BLAS After N Refits (0 = never)", &RtxOptions::maxBlasRefitsBeforeRebuildObject(), 1.f, 0, 100000);
-        RemixGui::DragInt("Frames to Keep Instances", &RtxOptions::numFramesToKeepInstancesObject(), 1.f, 1, 10000);
-        RemixGui::DragInt("Frames to Keep BLAS / Geometry", &RtxOptions::numFramesToKeepBLASObject(), 1.f, 1, 10000);
-        RemixGui::DragInt("Frames to Keep Pooled BLAS (0 = as above)", &RtxOptions::numFramesToKeepMergedBlasObject(), 1.f, 0, 10000);
-        RemixGui::Combo("API Retained: Hidden Instances", &RtxOptions::retainedHiddenPolicyObject(),
-          "Release (age out)\0Keep ray traced\0Keep resident, not ray traced\0");
-        ImGui::Unindent();
-      }
-      RemixGui::Separator();
-      RemixGui::Checkbox("Portals: Virtual Instance Matching", &RtxOptions::useRayPortalVirtualInstanceMatchingObject());
-      RemixGui::Checkbox("Portals: Fade In Effect", &RtxOptions::enablePortalFadeInEffectObject());
-      ImGui::Unindent();
-    }
-
     if (RemixGui::CollapsingHeader("Shadow Terminator Fix", collapsingHeaderClosedFlags)) {
       ImGui::Indent();
       RemixGui::Checkbox("Enable Terminator Offset", &RtxOptions::ShadowTerminator::enableOffsetObject());
@@ -5158,7 +4742,9 @@ namespace dxvk {
     if (RemixGui::CollapsingHeader("Displacement [Experimental]", collapsingHeaderClosedFlags)) {
       ImGui::Indent();
       ImGui::TextWrapped("Warning: This is currently implemented using POM with a simple height map, displacing inwards.  The implementation may change in the future, which could include changes to the texture format or displacing outwards.\nRaymarched POM will use a simple raymarch algorithm, and will show artifacts on thin features and at oblique angles.\nQuadtree POM depends on custom mipmaps with maximums instead of averages, which can be generated using `generate_max_mip.py`.");
+      // NV-DXVK start: SCCR displacement mode (pom_sccr.slangh)
       RemixGui::Combo("Mode", &RtxOptions::Displacement::modeObject(), "Off\0Raymarched POM\0Quadtree POM\0SCCR (Silhouette Curvature-Corrected Cone Relief)\0");
+      // NV-DXVK end
       RemixGui::Checkbox("Enable Direct Lighting", &RtxOptions::Displacement::enableDirectLightingObject());
       RemixGui::Checkbox("Enable Indirect Lighting", &RtxOptions::Displacement::enableIndirectLightingObject());
       RemixGui::Checkbox("Enable Indirect Hit", &RtxOptions::Displacement::enableIndirectHitObject());
@@ -5169,9 +4755,187 @@ namespace dxvk {
       RemixGui::DragFloat("Displacement In Factor", &RtxOptions::Displacement::displacementInFactorObject(), 0.01f, 0.0f, 20.0f);
       RemixGui::DragFloat("Displacement Out Factor", &RtxOptions::Displacement::displacementOutFactorObject(), 0.01f, 0.0f, 20.0f);
       RemixGui::DragInt("Max Iterations", &RtxOptions::Displacement::maxIterationsObject(), 1.f, 1, 256, "%d", sliderFlags);
+      // NV-DXVK start: SCCR displacement mode
       if (RtxOptions::Displacement::mode() == DisplacementMode::SCCR) {
-        showSccrSettings(common);
+        const bool sccrShellOn = SccrShellManager::enable();
+        ImGui::Separator();
+        ImGui::TextWrapped("SCCR: cone-stepped relief from the height maps. Shell tracing keeps deep relief on the mesh instead of sliding.");
+
+        // The quality levels write the march budgets under Advanced. Editing one there shows Custom.
+        static const char* const kSccrQualityNames[] = { "High", "Medium", "Low" };
+        const SccrShellManager::Quality currentQuality = SccrShellManager::qualityLevel();
+        const int currentLevel = static_cast<int>(currentQuality);
+        if (ImGui::BeginCombo("SCCR Quality", currentQuality == SccrShellManager::Quality::Custom ? "Custom" : kSccrQualityNames[currentLevel])) {
+          for (int level = 0; level < int(std::size(kSccrQualityNames)); ++level) {
+            if (ImGui::Selectable(kSccrQualityNames[level], level == currentLevel)) {
+              SccrShellManager::setQualityLevel(static_cast<SccrShellManager::Quality>(level));
+            }
+          }
+          ImGui::EndCombo();
+        }
+        if (ImGui::IsItemHovered()) {
+          ImGui::SetTooltip("High is the default. Medium and Low take fewer march steps and hand off to plain SCCR sooner,\n"
+                            "for slower GPUs. The graphics presets set this too. Changing a march setting under Advanced shows Custom.");
+        }
+
+        RemixGui::Checkbox("SCCR Shell Tracing", &SccrShellManager::enableObject());
+        ImGui::BeginDisabled(!sccrShellOn);
+        RemixGui::Checkbox("SCCR Real Geometry for Smooth Meshes", &SccrTessManager::enableObject());
+        ImGui::EndDisabled();
+
+        // One status line each.
+        const PomConeMapManager::Progress coneProgress = common->metaPomConeMaps().progress();
+        ImGui::Text("Cone maps ready: %u of %u", coneProgress.fullMaps, coneProgress.liveMaps);
+        if (sccrShellOn) {
+          const SccrShellManager::Stats shellStats = common->metaSccrShell().stats();
+          ImGui::Text("Shell tracing on %u of %u displaced surfaces", shellStats.boundSurfaces, shellStats.eligibleSurfaces);
+          if (RtxOptions::Displacement::referenceWorldUnitsPerUv() <= 0.0f) {
+            ImGui::TextWrapped("Shell tracing needs Reference World Units per UV above 0 (Advanced, Depth).");
+          }
+        }
+        if (SccrTessManager::active()) {
+          const SccrTessManager::Stats tessStats = common->metaSccrTess().stats();
+          ImGui::Text("Real geometry on %u meshes (%.2f M triangles, %.1f of %u MB); %u waiting", tessStats.boundMeshes,
+                      double(tessStats.cachedTriangles) / 1.0e6, double(tessStats.bytes) / double(1 << 20), SccrTessManager::maxMB(),
+                      tessStats.pendingBuilds);
+        } else if (SccrTessManager::enable()) {
+          ImGui::TextWrapped("Real geometry needs shell tracing on and Reference World Units per UV above 0.");
+        }
+
+        if (RemixGui::CollapsingHeader("SCCR Advanced", collapsingHeaderClosedFlags)) {
+          ImGui::Indent();
+
+          ImGui::Separator();
+          ImGui::TextUnformatted("Relief march");
+          RemixGui::DragInt("Cone Steps", &RtxOptions::Displacement::coneStepsObject(), 1.f, 1, 64, "%d", sliderFlags);
+          RemixGui::DragInt("Binary Steps", &RtxOptions::Displacement::binaryStepsObject(), 1.f, 0, 16, "%d", sliderFlags);
+          RemixGui::DragInt("Shadow Cone Steps", &RtxOptions::Displacement::coneShadowStepsObject(), 1.f, 1, 64, "%d", sliderFlags);
+          RemixGui::DragInt("Indirect Shadow Steps (0 = full)", &RtxOptions::Displacement::indirectShadowStepsObject(), 1.f, 0, 16, "%d", sliderFlags);
+          RemixGui::DragFloat("Indirect Shadow Footprint Scale", &RtxOptions::Displacement::indirectShadowFootprintScaleObject(), 0.05f, 0.0f, 8.0f, "%.2f", sliderFlags);
+          RemixGui::Checkbox("Step LOD", &RtxOptions::Displacement::enableStepLodObject());
+          RemixGui::DragFloat("Step LOD Scale", &RtxOptions::Displacement::stepLodScaleObject(), 0.05f, 0.25f, 8.0f, "%.2f", sliderFlags);
+          RemixGui::Checkbox("Curvature Correction", &RtxOptions::Displacement::enableCurvatureCorrectionObject());
+          RemixGui::DragFloat("Curvature Scale", &RtxOptions::Displacement::curvatureScaleObject(), 0.01f, 0.0f, 2.0f, "%.2f", sliderFlags);
+          RemixGui::Checkbox("Stable Triangle Frame", &RtxOptions::Displacement::enableStableFrameObject());
+          RemixGui::Checkbox("Depth Offset (depth and motion at the relief)", &RtxOptions::Displacement::enableDepthOffsetObject());
+
+          ImGui::Separator();
+          ImGui::TextUnformatted("Depth");
+          // Shell tracing forces world-unit depth on and the zero plane off (rtx_context.cpp).
+          ImGui::BeginDisabled(sccrShellOn);
+          RemixGui::Checkbox("World-Unit Depth", &RtxOptions::Displacement::enableWorldUnitDepthObject());
+          ImGui::EndDisabled();
+          RemixGui::DragFloat("Reference World Units per UV", &RtxOptions::Displacement::referenceWorldUnitsPerUvObject(), 1.0f, 1.0f, 100000.0f, "%.1f", sliderFlags);
+          RemixGui::DragFloat("Max World Depth Scale", &RtxOptions::Displacement::maxWorldUnitDepthScaleObject(), 0.05f, 1.0f, 16.0f, "%.2f", sliderFlags);
+          ImGui::BeginDisabled(sccrShellOn);
+          RemixGui::DragFloat("Zero Plane (-1 = as authored)", &RtxOptions::Displacement::zeroPlaneObject(), 0.01f, -1.0f, 1.0f, "%.2f", sliderFlags);
+          ImGui::EndDisabled();
+          if (sccrShellOn) {
+            ImGui::TextWrapped("Shell tracing is on: world-unit depth is always on and the zero plane is ignored (the mesh is the top of the relief, which only goes inwards).");
+          }
+
+          ImGui::Separator();
+          ImGui::TextUnformatted("Terrain");
+          RemixGui::DragInt("Terrain Max Layers (0 = all)", &RtxOptions::Displacement::terrainMaxLayersObject(), 1.f, 0, 8, "%d", sliderFlags);
+          RemixGui::Checkbox("Terrain Live Weights", &RtxOptions::Displacement::terrainLiveWeightsObject());
+
+          ImGui::Separator();
+          ImGui::TextUnformatted("Cone maps");
+          ImGui::TextWrapped("Until a map's cones are ready, SCCR marches in linear steps of 1/N like Raymarched POM (N set by Max Iterations).");
+          RemixGui::Combo("Cone Quality", &PomConeMapManager::qualityObject(), "Full (generated cones)\0Coarse only (comparison)\0");
+          RemixGui::Checkbox("Level Height Maps", &PomConeMapManager::levelHeightMapsObject());
+          const bool coarseOnlyCones = PomConeMapManager::quality() == PomConeMapManager::ConeQuality::CoarseOnly;
+          ImGui::Text("Cone maps: %u full, %u coarse, %u linear (of %u)", coneProgress.fullMaps, coneProgress.coarseMaps,
+                      coneProgress.liveMaps - coneProgress.fullMaps - coneProgress.coarseMaps, coneProgress.liveMaps);
+          ImGui::Text("Queue: %u maps, %llu tiles to generate, %zu MB", coneProgress.pendingMaps,
+                      static_cast<unsigned long long>(coneProgress.tilesRemaining),
+                      (coneProgress.derivedBytes + (size_t(1) << 19)) >> 20);
+          // A request to the manager, not an option write: see PomConeMapManager::bakeNow. Nothing generates in coarse-only
+          // quality.
+          ImGui::BeginDisabled(coarseOnlyCones);
+          if (ImGui::Button("Bake now")) {
+            common->metaPomConeMaps().requestBake();
+          }
+          ImGui::EndDisabled();
+          ImGui::SameLine();
+          ImGui::TextUnformatted(coarseOnlyCones ? "Generation paused: coarse-only cone quality." :
+                                 common->metaPomConeMaps().baking() ? "Baking: generation budget lifted until the queue is empty." :
+                                 "Generates every queued cone map at a higher budget.");
+
+          // SCCR shell tracing (rtx_fork_sccr_shell.h, sccr_shell_march.slangh): data and the prism march.
+          ImGui::Separator();
+          ImGui::TextUnformatted("Shell tracing");
+          ImGui::BeginDisabled(!sccrShellOn);
+          RemixGui::DragFloat("Shell Hand-off Distance", &SccrShellManager::maxDistanceObject(), 10.0f, 0.0f, 100000.0f, "%.0f", sliderFlags);
+          RemixGui::DragInt("Shell Max Prisms Crossed", &SccrShellManager::maxPrismsObject(), 1.f, 0, 64, "%d", sliderFlags);
+          RemixGui::DragInt("Shell Max Steps", &SccrShellManager::maxStepsObject(), 1.f, 1, 1024, "%d", sliderFlags);
+          RemixGui::Checkbox("Shell Fold Guard", &SccrShellManager::foldGuardObject());
+          RemixGui::Checkbox("Shell Self-Shadows (march through the prisms)", &SccrShellManager::shadowsObject());
+          ImGui::BeginDisabled(!SccrShellManager::shadows());
+          RemixGui::DragInt("Shell Max Shadow Prisms", &SccrShellManager::maxShadowPrismsObject(), 1.f, 0, 255, "%d", sliderFlags);
+          ImGui::EndDisabled();
+          RemixGui::DragFloat("Shell Weld Tolerance (of mesh size)", &SccrShellManager::weldEpsilonObject(), 0.000001f, 0.0f, 0.01f, "%.6f", sliderFlags);
+          RemixGui::DragInt("Shell Memory Cap (MB)", &SccrShellManager::maxMBObject(), 1.f, 1, 4096, "%d", sliderFlags);
+          RemixGui::DragInt("Shell Triangles Built per Frame", &SccrShellManager::buildTrianglesPerFrameObject(), 1000.f, 1000, 10000000, "%d", sliderFlags);
+          ImGui::EndDisabled();
+          if (sccrShellOn) {
+            const SccrShellManager::Stats shellStats = common->metaSccrShell().stats();
+            ImGui::Text("%u meshes, %u buffers, %.1f of %u MB; %u waiting (%u over the cap), %u dynamic surfaces",
+                        shellStats.boundMeshes, shellStats.cachedBuffers, double(shellStats.bytes) / double(1 << 20),
+                        SccrShellManager::maxMB(), shellStats.pendingBuilds, shellStats.overBudgetBuilds, shellStats.dynamicSurfaces);
+          }
+
+          // SCCR real geometry (rtx_fork_sccr_tess.h): smooth meshes (rocks) get their relief as real triangles once.
+          ImGui::Separator();
+          ImGui::TextUnformatted("Real geometry");
+          ImGui::BeginDisabled(!SccrTessManager::enable());
+          RemixGui::DragFloat("Triangle Size (world units)", &SccrTessManager::targetEdgeObject(), 0.1f, 0.5f, 100.0f, "%.1f", sliderFlags);
+          RemixGui::DragFloat("Rounding (Phong shape)", &SccrTessManager::phongShapeObject(), 0.01f, 0.0f, 1.0f, "%.2f", sliderFlags);
+          RemixGui::DragFloat("Build Distance", &SccrTessManager::buildDistanceObject(), 10.0f, 0.0f, 100000.0f, "%.0f", sliderFlags);
+          RemixGui::DragInt("Memory Cap (MB)", &SccrTessManager::maxMBObject(), 1.f, 1, 16384, "%d", sliderFlags);
+          RemixGui::DragInt("Max Segments per Edge", &SccrTessManager::maxSegmentsObject(), 1.f, 1, 64, "%d", sliderFlags);
+          RemixGui::DragInt("Max Triangles per Mesh", &SccrTessManager::maxTrianglesPerMeshObject(), 1000.f, 1000, 4000000, "%d", sliderFlags);
+          ImGui::EndDisabled();
+          if (SccrTessManager::active()) {
+            const SccrTessManager::Stats tessStats = common->metaSccrTess().stats();
+            ImGui::Text("%u of %u candidate instances; %u waiting for data, %u unsupported, %u hard-edged (kept on shell tracing)",
+                        tessStats.boundInstances, tessStats.candidateInstances, tessStats.waitingForData,
+                        tessStats.unsupportedMeshes, tessStats.hardEdgedMeshes);
+          }
+
+          // rtx.profile.sccrCostTest (rtx_perf_log.cpp). It drives the shell options itself while it
+          // runs.
+          ImGui::Separator();
+          ImGui::TextUnformatted("Performance tests");
+          {
+            uint32_t testCycle = 0, testCycles = 0, testStep = 0, testSteps = 0;
+            const char* testStepName = "";
+            if (RtxPerfLog::sccrCostTestProgress(testCycle, testCycles, testStep, testSteps, testStepName)) {
+              ImGui::TextWrapped("Shell test running, stand still: cycle %u of %u, step %u of %u (%s).", testCycle + 1,
+                                 testCycles, testStep + 1, testSteps, testStepName);
+              if (ImGui::Button("Stop Shell Test")) {
+                RtxPerfLog::sccrCostTestObject().setDeferred(false);
+                RtxPerfLog::sccrAbTestObject().setDeferred(false);
+              }
+            } else {
+              if (ImGui::Button("Run Shell Cost Test (stand still, about 5 minutes)")) {
+                RtxPerfLog::detailedLoggingObject().setDeferred(true);
+                RtxPerfLog::sccrCostTestObject().setDeferred(true);
+                Logger::info("[SccrCostTest] cost test requested from the dev menu");
+              }
+              if (ImGui::Button("Run A/B Test (stand still, about 20 s per step and cycle)")) {
+                RtxPerfLog::detailedLoggingObject().setDeferred(true);
+                RtxPerfLog::sccrAbTestObject().setDeferred(true);
+                Logger::info(str::format("[SccrCostTest] A/B test of ", RtxPerfLog::sccrAbTestOption(), " requested from the dev menu"));
+              }
+              ImGui::SameLine();
+              ImGui::TextUnformatted(RtxPerfLog::sccrAbTestOption().c_str());
+            }
+          }
+          ImGui::Unindent();
+        }
       }
+      // NV-DXVK end
       ImGui::Unindent();
     }
 

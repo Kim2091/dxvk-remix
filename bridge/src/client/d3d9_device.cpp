@@ -80,7 +80,6 @@ void Direct3DDevice9Ex_LSS<EnableSync>::onDestroy() {
   // At this point the underlying d3d9 device's refcount should be 0 and device released
   assert(getRef<D3DRefCounted::Ref::Object>() == 0 &&
          "Destroying an LSS device object with underlying D3D9 object refcount > 0!");
-  unregisterLiveDevice();
    ClientMessage c { Commands::IDirect3DDevice9Ex_Destroy, getId() };
 }
 
@@ -188,11 +187,6 @@ UINT Direct3DDevice9Ex_LSS<EnableSync>::GetAvailableTextureMem() {
   LogFunctionCall();
   
   DeviceBridge::ResponseTransaction responseTransaction;
-  BRIDGE_DEVICE_LOCKGUARD();
-  const ULONGLONG now = GetTickCount64();
-  if (m_textureMemValid && now - m_textureMemTick < kTextureMemRefreshMs) {
-    return m_textureMem;
-  }
 
   UID currentUID = 0;
   {
@@ -204,9 +198,6 @@ UINT Direct3DDevice9Ex_LSS<EnableSync>::GetAvailableTextureMem() {
   UINT mem = (UINT) DeviceBridge::get_data();
   DeviceBridge::pop_front();
 
-  m_textureMem = mem;
-  m_textureMemTick = now;
-  m_textureMemValid = true;
   return mem;
 }
 
@@ -218,11 +209,6 @@ HRESULT Direct3DDevice9Ex_LSS<EnableSync>::EvictManagedResources() {
   DeviceBridge::ResponseTransaction responseTransaction;
 
   UID currentUID = 0;
-  {
-    BRIDGE_DEVICE_LOCKGUARD();
-    m_textureMemValid = false;
-  }
-
   // Send command to server and wait for response
   {
     ClientMessage c(Commands::IDirect3DDevice9Ex_EvictManagedResources, getId());
@@ -243,10 +229,8 @@ HRESULT Direct3DDevice9Ex_LSS<EnableSync>::GetDirect3D(IDirect3D9** ppD3D9) {
   {
     {
       BRIDGE_DEVICE_LOCKGUARD();
-      if (!reportOuterDirect3D(ppD3D9)) {
-        (*ppD3D9) = m_pDirect3D;
-        m_pDirect3D->AddRef();
-      }
+      (*ppD3D9) = m_pDirect3D;
+      m_pDirect3D->AddRef();
     }
     if (GlobalOptions::getSendReadOnlyCalls()) {
       ClientMessage { Commands::IDirect3DDevice9Ex_GetDirect3D, getId() };
@@ -375,19 +359,16 @@ BOOL Direct3DDevice9Ex_LSS<EnableSync>::ShowCursor(BOOL bShow) {
   LogFunctionCall();
 
   DeviceBridge::ResponseTransaction responseTransaction;
-  // The previous visibility is known here, so the call is sent without waiting for the server.
-  BRIDGE_DEVICE_LOCKGUARD();
-  const BOOL prevShow = std::exchange(m_cursorVisible, bShow);
+
   UID currentUID = 0;
   {
     ClientMessage c(Commands::IDirect3DDevice9Ex_ShowCursor, getId());
     currentUID = c.get_uid();
     c.send_data(bShow);
   }
-  if (GlobalOptions::getSendAllServerResponses()) {
-    WAIT_FOR_SERVER_RESPONSE("ShowCursor()", prevShow, currentUID);
-    DeviceBridge::pop_front();
-  }
+  WAIT_FOR_SERVER_RESPONSE("ShowCursor()", false, currentUID);
+  BOOL prevShow = (BOOL) DeviceBridge::get_data();
+  DeviceBridge::pop_front();
 
   return prevShow;
 }
@@ -466,9 +447,8 @@ HRESULT Direct3DDevice9Ex_LSS<EnableSync>::Reset(D3DPRESENT_PARAMETERS* pPresent
     releaseInternalObjects();
     // Reset all device state to default values and init implicit/internal objects
     ResetState();
-    // The server resets its state too: forget what was sent
+    // The server resets its state too: forget what was sent (A3a)
     invalidateSentState();
-    m_textureMemValid = false;
     const auto presParam = Direct3DSwapChain9_LSS::sanitizePresentationParameters(*pPresentationParameters, getCreateParams());
     m_presParams = presParam;
     WndProc::unset();
@@ -1060,7 +1040,7 @@ HRESULT Direct3DDevice9Ex_LSS<EnableSync>::SetRenderTarget(DWORD RenderTargetInd
       currentUID = c.get_uid();
       c.send_many(RenderTargetIndex, id);
     }
-    // D3D9 resets the viewport and scissor rect to the new target on index 0
+    // D3D9 resets the viewport and scissor rect to the new target on index 0 (A3a)
     if (RenderTargetIndex == 0) {
       m_sentState.invalidateViewportAndScissor();
     }
@@ -1467,7 +1447,7 @@ HRESULT Direct3DDevice9Ex_LSS<EnableSync>::SetLight(DWORD Index, CONST D3DLIGHT9
         m_state.lights[Index] = *pLight;
       }
     }
-    // Always sent, even when redundant: every SetLight of an enabled light makes the runtime re-emit the
+    // Always sent, even when redundant (A3a): every SetLight of an enabled light makes the runtime re-emit the
     // frame's game lights (D3D9Rtx DirtyLights), and game lights that are not re-emitted can age out.
     {
       StateMessage c(Commands::IDirect3DDevice9Ex_SetLight, getId());
@@ -1512,7 +1492,7 @@ HRESULT Direct3DDevice9Ex_LSS<EnableSync>::LightEnable(DWORD LightIndex, BOOL bE
         m_state.bLightEnables[LightIndex] = bEnable;
       }
     }
-    // Always sent, like SetLight.
+    // Always sent, like SetLight (A3a).
     {
       StateMessage c(Commands::IDirect3DDevice9Ex_LightEnable, getId());
       currentUID = c.get_uid();
@@ -2059,7 +2039,7 @@ HRESULT Direct3DDevice9Ex_LSS<EnableSync>::SetTexture(DWORD Stage, IDirect3DBase
       m_state.textureTypes[idx] = type;
     }
   }
-  // Client object ids are never reused, so an equal id is the same texture
+  // Client object ids are never reused, so an equal id is the same texture (A3a)
   if (!mustSend(Commands::IDirect3DDevice9Ex_SetTexture,
                 [&](SentState& s) { return s.texture(Stage, (uint32_t) pD3DObject); })) {
     return S_OK;
@@ -2753,7 +2733,7 @@ HRESULT Direct3DDevice9Ex_LSS<EnableSync>::SetVertexShaderConstantF(UINT StartRe
         Vector4fCount);
   }
   if (SUCCEEDED(hresult)) {
-    // Only the registers that differ from what the server has (the narrowed sub-range) are sent
+    // A3a: only the registers that differ from what the server has (the narrowed sub-range) are sent
     uint32_t start = StartRegister, count = Vector4fCount;
     const float* data = pConstantData;
     if (!mustSend(Commands::IDirect3DDevice9Ex_SetVertexShaderConstantF,
@@ -3613,9 +3593,8 @@ HRESULT Direct3DDevice9Ex_LSS<EnableSync>::ResetEx(D3DPRESENT_PARAMETERS* pPrese
     BRIDGE_DEVICE_LOCKGUARD();
     // Clear all device state and release implicit/internal objects
     releaseInternalObjects(false);
-    // The server resets its state: forget what was sent
+    // The server resets its state: forget what was sent (A3a)
     invalidateSentState();
-    m_textureMemValid = false;
 
     const auto presParam = Direct3DSwapChain9_LSS::sanitizePresentationParameters(*pPresentationParameters, getCreateParams());
     m_presParams = presParam;

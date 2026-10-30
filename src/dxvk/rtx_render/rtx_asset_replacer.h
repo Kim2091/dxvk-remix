@@ -516,7 +516,7 @@ namespace dxvk {
   };
 
   struct AssetReplacer {
-    // Host asset keys and aliases of API meshes and materials.
+    // rtx.scene.assetKeys: host asset keys and aliases of API meshes and materials.
     AssetResolver& assetResolver() { return m_assetResolver; }
     const AssetResolver& assetResolver() const { return m_assetResolver; }
 
@@ -617,8 +617,7 @@ namespace dxvk {
     // (remixapi_MeshInfoRefreshGeometryEXT) instead of ignoring the repeated registration. The previous
     // topology and layout hashes are kept, so the draw-call cache keeps the same BlasEntry and the scene
     // manager takes its kUpdateBVH history path. Callers must be on the render (CS) thread.
-    // Returns false when a live handle's registration was dropped.
-    bool registerExternalMesh(remixapi_MeshHandle handle, std::vector<RasterGeometry>&& submeshes,
+    void registerExternalMesh(remixapi_MeshHandle handle, std::vector<RasterGeometry>&& submeshes,
                               bool refreshGeometry = false);
     // Shared pointer because destroyExternalMesh can erase the entry while
     // cached draw calls still point into it.

@@ -16,13 +16,9 @@
 #include "../util/util_math.h"
 #include "d3d9_rtx_utils.h"
 #include "d3d9_texture.h"
-#include "../dxvk/rtx_render/rtx_frontend_interface.h"
 #include "../dxvk/rtx_render/rtx_terrain_baker.h"
-#include "../dxvk/rtx_render/rtx_types.h"
+#include "../dxvk/rtx_render/rtx_scene_interface.h"
 #include "../dxvk/dxvk_perf_counters.h"
-#if REMIX_D3D9_FRONTEND
-#include "../frontends/d3d9/d3d9_camera.h"
-#endif
 
 #include <algorithm>
 #include <cassert>
@@ -37,13 +33,13 @@ namespace dxvk {
   #define CATEGORIES_REQUIRE_DRAW_CALL_STATE  InstanceCategories::Sky, InstanceCategories::Terrain
   #define CATEGORIES_REQUIRE_GEOMETRY_COPY    InstanceCategories::Terrain, InstanceCategories::WorldUI
 
-#if REMIX_D3D9_FRONTEND
+#ifdef REMIX_FRONTEND_D3D9_V2
   namespace {
-    // A draw's camera inputs as the D3D9 frontend's CS-thread preparation sees them. In rtx.fusedWorldViewMode View the
+    // A draw's camera inputs as RtxContext::prepareGeometryForRTImpl sees them. In rtx.fusedWorldViewMode View the
     // world-view matrix becomes the world matrix and the camera is identity. In World mode the D3D9 matrices already
     // have that form.
-    translator::CameraInputs frontendCameraInputs(const DrawCallTransforms& transforms) {
-      translator::CameraInputs camera;
+    frontends::d3d9::CameraInputs frontendCameraInputs(const DrawCallTransforms& transforms) {
+      frontends::d3d9::CameraInputs camera;
       const bool fusedView = RtxOptions::fusedWorldViewMode() == FusedWorldViewMode::View;
       camera.worldToView = fusedView ? Matrix4() : transforms.worldToView;
       camera.viewToProjection = transforms.viewToProjection;
@@ -55,32 +51,14 @@ namespace dxvk {
   }
 #endif
 
-  namespace {
-    // True when processVertices may copy the element for ray tracing. The color is taken only for some textures, so it
-    // counts as taken.
-    bool takenForRayTracing(const D3DVERTEXELEMENT9& element, DWORD texcoordIndex) {
-      switch (element.Usage) {
-      case D3DDECLUSAGE_POSITIONT:
-      case D3DDECLUSAGE_POSITION:
-      case D3DDECLUSAGE_BLENDWEIGHT:
-      case D3DDECLUSAGE_BLENDINDICES:
-      case D3DDECLUSAGE_NORMAL:
-      case D3DDECLUSAGE_COLOR:
-        return element.UsageIndex == 0;
-      case D3DDECLUSAGE_TEXCOORD:
-        return texcoordIndex <= MAXD3DDECLUSAGEINDEX && element.UsageIndex == texcoordIndex;
-      default:
-        return false;
-      }
-    }
-  }
-
-  // Without the D3D9 frontend, no device converts its draws.
   D3D9Rtx::D3D9Rtx(D3D9DeviceEx* d3d9Device, bool enableDrawCallConversion)
     : m_rtStagingData(d3d9Device->GetDXVKDevice(), "RtxStagingDataAlloc: D3D9", (VkMemoryPropertyFlagBits) (VK_MEMORY_PROPERTY_HOST_CACHED_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
     , m_parent(d3d9Device)
-    , m_enableDrawCallConversion(REMIX_D3D9_FRONTEND && enableDrawCallConversion)
-    , m_pGeometryWorkers(REMIX_D3D9_FRONTEND && enableDrawCallConversion ? std::make_unique<GeometryProcessor>(numGeometryProcessingThreads(), "geometry-processing") : nullptr) {
+    , m_enableDrawCallConversion(enableDrawCallConversion)
+    , m_pGeometryWorkers(enableDrawCallConversion ? std::make_unique<GeometryProcessor>(numGeometryProcessingThreads(), "geometry-processing") : nullptr) {
+    if (enableDrawCallConversion) {
+      scene::Options::useD3D9Defaults();
+    }
   }
 
   void D3D9Rtx::SkinningMatrixPool::clear() {
@@ -88,63 +66,47 @@ namespace dxvk {
     m_nextIndexInBlock = 0;
   }
 
-  D3D9Rtx::SkinningMatrixPool::Staged::Staged(Block& block, const Matrix4* pMatrices)
-    : m_pBlock(&block)
-    , m_pMatrices(pMatrices) {
-    m_pBlock->m_readers.fetch_add(1, std::memory_order_relaxed);
-  }
-
-  D3D9Rtx::SkinningMatrixPool::Staged::Staged(Staged&& other) noexcept
-    : m_pBlock(std::exchange(other.m_pBlock, nullptr))
-    , m_pMatrices(std::exchange(other.m_pMatrices, nullptr)) {
-  }
-
-  D3D9Rtx::SkinningMatrixPool::Staged::~Staged() {
-    if (m_pBlock != nullptr) {
-      m_pBlock->m_readers.fetch_sub(1, std::memory_order_release);
-    }
-  }
-
-  D3D9Rtx::SkinningMatrixPool::Staged D3D9Rtx::SkinningMatrixPool::stageBones(const Matrix4* source, size_t matrixCount) {
+  const Matrix4* D3D9Rtx::SkinningMatrixPool::stageBones(const Matrix4* source, size_t matrixCount) {
     assert(matrixCount <= kMatricesPerBlock);
     if (matrixCount == 0) {
-      return Staged();
-    }
-    // Under stress (rtx.debug.stress.forceSlotReuse) every copy starts at the first block that no task reads.
-    if (stress::active() && stress::forceSlotReuse()) {
-      clear();
+      return nullptr;
     }
     for (;;) {
-      if (m_blockIndex == m_blocks.size()) {
+      if (m_blocks.empty()) {
         m_blocks.push_back(std::make_unique<Block>());
-      }
-
-      // A block is entered only when no task of an earlier frame still reads from it.
-      const bool stillRead = m_nextIndexInBlock == 0 && m_blocks[m_blockIndex]->m_readers.load(std::memory_order_acquire) != 0;
-      if (stillRead || m_nextIndexInBlock + matrixCount > kMatricesPerBlock) {
+        m_blockIndex = 0;
+        m_nextIndexInBlock = 0;
+      } else if (m_nextIndexInBlock + matrixCount > kMatricesPerBlock) {
         ++m_blockIndex;
         m_nextIndexInBlock = 0;
+        if (m_blockIndex == m_blocks.size()) {
+          m_blocks.push_back(std::make_unique<Block>());
+        }
         continue;
       }
       break;
     }
-    Block& block = *m_blocks[m_blockIndex];
-    Matrix4* const dest = block.m_matrices.data() + m_nextIndexInBlock;
+    Matrix4* const dest = m_blocks[m_blockIndex]->m_matrices.data() + m_nextIndexInBlock;
     memcpy(dest, source, matrixCount * sizeof(Matrix4));
     m_nextIndexInBlock += matrixCount;
-    return Staged(block, dest);
+    return dest;
   }
 
   void D3D9Rtx::Initialize() {
-#if REMIX_D3D9_FRONTEND
     // D3D9 frontend: the app-thread half reads what the CS-thread half did with its handovers.
     m_frontendApp.connect(m_frontend);
-#endif
 
     m_vsVertexCaptureData = m_parent->CreateConstantBuffer(false,
                                         sizeof(D3D9RtxVertexCaptureData),
                                         DxsoProgramType::VertexShader,
                                         DxsoConstantBuffers::VSVertexCaptureData);
+
+    // Get constant buffer bindings from D3D9
+    m_parent->EmitCs([vertexCaptureCB = m_vsVertexCaptureData](DxvkContext* ctx) {
+      const uint32_t vsFixedFunctionConstants = computeResourceSlotId(DxsoProgramType::VertexShader, DxsoBindingType::ConstantBuffer, DxsoConstantBuffers::VSFixedFunction);
+      const uint32_t psSharedStateConstants = computeResourceSlotId(DxsoProgramType::PixelShader, DxsoBindingType::ConstantBuffer, DxsoConstantBuffers::PSShared);
+      static_cast<RtxContext*>(ctx)->setConstantBuffers(vsFixedFunctionConstants, psSharedStateConstants, vertexCaptureCB);
+    });
   }
 
   const Direct3DState9& D3D9Rtx::d3d9State() const {
@@ -314,27 +276,6 @@ namespace dxvk {
     });
   }
 
-  bool D3D9Rtx::verticesInRange(const VertexContext vertexContext[caps::MaxStreams], int vertexIndexOffset, uint32_t vertexCount) const {
-    if (vertexCount == 0) {
-      return true;
-    }
-    for (const auto& element : d3d9State().vertexDecl->GetElements()) {
-      const VertexContext& ctx = vertexContext[element.Stream];
-      if (ctx.mappedSlice.handle == VK_NULL_HANDLE || !takenForRayTracing(element, m_texcoordIndex)) {
-        continue;
-      }
-      // 64-bit, so a large index or a negative base vertex cannot wrap around. The last vertex has to hold the element,
-      // not a whole stride.
-      const int64_t first = int64_t(ctx.offset) + int64_t(ctx.stride) * vertexIndexOffset;
-      const int64_t end = first + int64_t(ctx.stride) * (int64_t(vertexCount) - 1) + int64_t(element.Offset) +
-                          int64_t(GetDecltypeSize(D3DDECLTYPE(element.Type)));
-      if (first < 0 || end > int64_t(ctx.mappedSlice.length) || end - first > int64_t(UINT32_MAX)) {
-        return false;
-      }
-    }
-    return true;
-  }
-
   void D3D9Rtx::processVertices(const VertexContext vertexContext[caps::MaxStreams], int vertexIndexOffset, RasterGeometry& geoData) {
     DxvkBufferSlice streamCopies[caps::MaxStreams] {};
 
@@ -349,10 +290,13 @@ namespace dxvk {
       ScopedCpuProfileZoneN("Process Vertices");
       const int32_t vertexOffset = ctx.offset + ctx.stride * vertexIndexOffset;
       const uint32_t numVertexBytes = ctx.stride * geoData.vertexCount;
-      // verticesInRange lets the last vertex end after its elements, so its stride can reach past the buffer. Such a
-      // stream is copied, with the bytes past the buffer zeroed.
-      const uint32_t availableBytes = uint32_t(std::min<int64_t>(int64_t(numVertexBytes),
-                                                                 int64_t(ctx.mappedSlice.length) - int64_t(vertexOffset)));
+
+      // Validating index data here, vertexCount and vertexIndexOffset accounts for the min/max indices
+      if (RtxOptions::validateCPUIndexData()) {
+        if (ctx.mappedSlice.length < vertexOffset + numVertexBytes) {
+          throw DxvkError("Invalid draw call");
+        }
+      }
 
       // TODO: Simplify this by refactoring RasterGeometry to contain an array of RasterBuffer's
       RasterBuffer* targetBuffer = nullptr;
@@ -381,7 +325,7 @@ namespace dxvk {
       case D3DDECLUSAGE_COLOR:
         if (element.UsageIndex == 0 &&
             !RtxOptions::ignoreAllVertexColorBakedLighting()) {
-          const XXH64_hash_t colorHash = m_activeDrawCallState.materialData.getColorTexture().getImageHash();
+          const XXH64_hash_t colorHash = m_activeDrawCallState.materialData.colorTextures[0].getImageHash();
           if (!getTextureListInfo(colorHash)->ignoreBakedLighting) {
             targetBuffer = &geoData.color0Buffer;
           }
@@ -406,13 +350,13 @@ namespace dxvk {
           const bool isOrphan = !(ctx.buffer.getSliceHandle() == ctx.mappedSlice);
           const bool canUseBuffer = ctx.canUseBuffer && m_forceGeometryCopy == false;
 
-          if (canUseBuffer && !isOrphan && availableBytes == numVertexBytes) {
+          if (canUseBuffer && !isOrphan) {
             // Use the buffer directly if it is not an orphan
             if (ctx.pVBO != nullptr && ctx.pVBO->NeedsUpload())
               m_parent->FlushBuffer(ctx.pVBO);
 
             streamCopies[element.Stream] = ctx.buffer.subSlice(vertexOffset, numVertexBytes);
-          } else if (canUseBuffer && numVertexBytes > kMinSizeToClone && availableBytes == numVertexBytes) {
+          } else if (canUseBuffer && numVertexBytes > kMinSizeToClone) {
             // Create a clone for the orphaned physical slice
             auto clone = ctx.buffer.buffer()->clone();
             clone->rename(ctx.mappedSlice);
@@ -423,10 +367,7 @@ namespace dxvk {
             // Acquire prevents the staging allocator from re-using this memory
             streamCopies[element.Stream].buffer()->acquire(DxvkAccess::Read);
 
-            memcpy(streamCopies[element.Stream].mapPtr(0), (uint8_t*) ctx.mappedSlice.mapPtr + vertexOffset, availableBytes);
-            if (availableBytes < numVertexBytes) {
-              memset(static_cast<uint8_t*>(streamCopies[element.Stream].mapPtr(0)) + availableBytes, 0, numVertexBytes - availableBytes);
-            }
+            memcpy(streamCopies[element.Stream].mapPtr(0), (uint8_t*) ctx.mappedSlice.mapPtr + vertexOffset, numVertexBytes);
           }
         }
 
@@ -500,7 +441,6 @@ namespace dxvk {
     if (m_flags.test(D3D9RtxFlag::DirtyLights)) {
       m_flags.clr(D3D9RtxFlag::DirtyLights);
 
-#if REMIX_D3D9_FRONTEND
       std::vector<D3DLIGHT9> activeLightsRT;
       for (auto idx : d3d9State().enabledLightIndices) {
         if (idx == UINT32_MAX)
@@ -508,11 +448,10 @@ namespace dxvk {
         activeLightsRT.push_back(d3d9State().lights[idx].value());
       }
 
-      // The frontend translates them.
-      m_parent->EmitCs([activeLightsRT, this](DxvkContext* ctx) {
-          m_frontend.lights(static_cast<RtxContext*>(ctx), activeLightsRT.data(), uint32_t(activeLightsRT.size()));
+      // R9 (rtx.d3d9v2.lights): the frontend translates them, or hands them to the old path.
+      m_parent->EmitCs([activeLightsRT, this, translate = m_frontendApp.lightsActive()](DxvkContext* ctx) {
+          m_frontend.lights(static_cast<RtxContext*>(ctx), activeLightsRT.data(), uint32_t(activeLightsRT.size()), translate);
         });
-#endif
     }
   }
 
@@ -777,10 +716,8 @@ namespace dxvk {
         uint32_t offset;
         uint32_t stride;
         uint32_t canUseBuffer;
-        uint32_t pad;  // explicit, so no indeterminate padding byte is hashed
       } streamKey = { stream.pVBO, stream.pVBO ? stream.pVBO->remixContentVersion : 0ull,
-                      stream.offset, stream.stride, stream.canUseBuffer ? 1u : 0u, 0u };
-      static_assert(sizeof(streamKey) == 32, "no implicit padding");
+                      stream.offset, stream.stride, stream.canUseBuffer ? 1u : 0u };
 
       // A stream backed by inline data rather than a buffer object cannot be versioned.
       if (stream.pVBO == nullptr && stream.stride != 0) {
@@ -790,13 +727,9 @@ namespace dxvk {
       key = XXH3_64bits_withSeed(&streamKey, sizeof(streamKey), key);
     }
 
-    // The vertex declaration places the regions in the streams, and the first texture stage's texcoord index picks the
-    // texcoord element (processVertices), so a draw of the same bytes with another of either hashes other data.
-    const D3D9VertexDecl* decl = d3d9State().vertexDecl.ptr();
     struct {
       const void* ibo;
       uint64_t iboContentVersion;
-      XXH64_hash_t declaration;
       uint32_t indexType;
       uint32_t startIndex;
       uint32_t indexCount;
@@ -804,19 +737,15 @@ namespace dxvk {
       uint32_t maxIndexValue;
       int32_t vertexIndexOffset;
       uint32_t topology;
-      uint32_t texcoordIndex;
     } drawKey = { indexContext.ibo,
                   indexContext.ibo ? indexContext.ibo->remixContentVersion : 0ull,
-                  decl != nullptr ? decl->GetRemixElementsHash() : 0ull,
                   (uint32_t) indexContext.indexType,
                   startIndex,
                   geoData.indexCount,
                   geoData.vertexCount,
                   maxIndexValue,
                   vertexIndexOffset,
-                  (uint32_t) geoData.topology,
-                  uint32_t(m_texcoordIndex) };
-    static_assert(sizeof(drawKey) == 56, "no implicit padding");
+                  (uint32_t) geoData.topology };
 
     key = XXH3_64bits_withSeed(&drawKey, sizeof(drawKey), key);
 
@@ -896,9 +825,6 @@ namespace dxvk {
     // The packet we'll send to RtxContext with information about geometry
     RasterGeometry& geoData = m_activeDrawCallState.geometryData;
     geoData = {};
-    m_activeDrawCallState.futureGeometryHashes = Future<GeometryHashes>();
-    m_activeDrawCallState.futureBoundingBox = Future<AxisAlignedBoundingBox>();
-    m_activeDrawCallState.futureSkinningData = Future<SkinningData>();
     geoData.cullMode = DecodeCullMode(D3DCULL(d3d9State().renderStates[D3DRS_CULLMODE]));
     geoData.frontFace = VK_FRONT_FACE_CLOCKWISE;
     geoData.topology = DecodeInputAssemblyState(drawContext.PrimitiveType).primitiveTopology;
@@ -972,19 +898,10 @@ namespace dxvk {
     // Max offseted index value within a buffer slice that geoData contains
     const uint32_t maxOffsetedIndex = maxIndex - minIndex;
 
-    // A draw whose indices reach past its vertex buffers would read past them here and on the GPU, so it is not ray
-    // traced. D3D9 draws it, so it stays a raster draw.
-    if (!verticesInRange(vertexContext, vertexIndexOffset, geoData.vertexCount)) {
-      ONCE(Logger::info("[RTX-Compatibility-Info] Rasterized a draw without ray tracing it: its indices reach past its vertex buffer."));
-      frontend::reportInput(*m_parent->GetDXVKDevice(), SceneInput::VertexRange);
-      return PrepareDrawFlag::PreserveDrawCallAndItsState;
-    }
-
     // Copy all the vertices into a staging buffer.  Assign fields of the geoData structure.
     {
       const perf::ApiScope perfVerticesScope { perf::Api::D3D9Vertices }; // [PerfApi] rtx.profile.detailedLogging
-      m_activeDrawCallState.dynamicSource = false; // set by processVertices
-      m_preparedVertexOffset = vertexIndexOffset;
+      m_activeDrawCallState.dynamicSource = false; // set by processVertices (rtx.d3d9Identity.log)
       processVertices(vertexContext, vertexIndexOffset, geoData);
     }
 
@@ -997,8 +914,8 @@ namespace dxvk {
       buildGeometryHashMemoizationKey(geoData, vertexContext, indexContext, drawContext.StartIndex,
                                       vertexIndexOffset, maxOffsetedIndex);
 
-    m_activeDrawCallState.futureGeometryHashes = computeHash(geoData, maxOffsetedIndex, geometryHashMemoizationKey);
-    m_activeDrawCallState.futureBoundingBox = computeAxisAlignedBoundingBox(geoData);
+    geoData.futureGeometryHashes = computeHash(geoData, maxOffsetedIndex, geometryHashMemoizationKey);
+    geoData.futureBoundingBox = computeAxisAlignedBoundingBox(geoData);
     
     // Process skinning data
     m_activeDrawCallState.futureSkinningData = processSkinning(geoData);
@@ -1026,9 +943,7 @@ namespace dxvk {
       m_activeDrawCallState.programmablePixelShaderInfo = d3d9State().pixelShader->GetCommonShader()->GetInfo();
     }
     
-    m_activeDrawCallState.cameraType = translator::CameraClass::Unknown;
-    m_activeDrawCallState.vertexBlend = !m_parent->UseProgrammableVS() && d3d9State().renderStates[D3DRS_VERTEXBLEND] != D3DVBF_DISABLE;
-    m_activeDrawCallState.hasSkinningView = false;
+    m_activeDrawCallState.cameraType = CameraType::Unknown;
 
     m_activeDrawCallState.minZ = std::clamp(d3d9State().viewport.MinZ, 0.0f, 1.0f);
     m_activeDrawCallState.maxZ = std::clamp(d3d9State().viewport.MaxZ, 0.0f, 1.0f);
@@ -1041,7 +956,7 @@ namespace dxvk {
                                                        m_seenCameraPositions);
 
     if (RtxOptions::fogIgnoreSky() && m_activeDrawCallState.categories.test(InstanceCategories::Sky)) {
-      m_activeDrawCallState.fogState.mode = frontend::FogMode::None;
+      m_activeDrawCallState.fogState.mode = D3DFOG_NONE;
     }
 
     // Ignore sky draw calls that are being drawn to a Raytraced Render Target
@@ -1063,33 +978,21 @@ namespace dxvk {
     m_parent->Flush();
 
     // Send command to inject RTX
-#if REMIX_D3D9_FRONTEND
-    m_parent->EmitCs([cReflexFrameId = GetReflexFrameId(), this, batch = m_frontendApp.takeFrameBatch(),
-                      cBound = sceneCommandsIssued(*m_parent->GetDXVKDevice())](DxvkContext* ctx) {
+    m_parent->EmitCs([cReflexFrameId = GetReflexFrameId(), this, batch = m_frontendApp.takeFrameBatch()](DxvkContext* ctx) {
       m_frontend.flush(static_cast<RtxContext*>(ctx), batch);
-      static_cast<RtxContext*>(ctx)->setInjectionSceneCommandBound(cBound);
       static_cast<RtxContext*>(ctx)->injectRTX(cReflexFrameId);
     });
-#else
-    m_parent->EmitCs([cReflexFrameId = GetReflexFrameId(), cBound = sceneCommandsIssued(*m_parent->GetDXVKDevice())](DxvkContext* ctx) {
-      static_cast<RtxContext*>(ctx)->setInjectionSceneCommandBound(cBound);
-      static_cast<RtxContext*>(ctx)->injectRTX(cReflexFrameId);
-    });
-#endif
   }
 
   void D3D9Rtx::CommitGeometryToRT(const DrawContext& drawContext) {
-#if REMIX_D3D9_FRONTEND
     ScopedCpuProfileZone();
     const frontends::d3d9::Decision decision = std::exchange(m_frontendDecision, frontends::d3d9::Decision());
     if (decision.skip) {
-      // Nothing is queued: the scene owns this object and nothing changed, or the frontend dropped the draw. The draw's
-      // hash futures are dropped unread (the workers still run them and release their buffer references). Only the per-draw parts
+      // rtx.d3d9v2.direct: the scene owns this object and nothing changed. Nothing is queued; the draw's hash futures
+      // are dropped unread (the workers still run them and release their buffer references). Only the per-draw parts
       // are cleared: the rest of the state carries across draws (the clip plane is recomputed only when
       // DirtyClipPlanes is set), so resetting all of it lost an enabled user clip plane for every later draw.
       m_activeDrawCallState.geometryData = RasterGeometry();
-      m_activeDrawCallState.futureGeometryHashes = Future<GeometryHashes>();
-      m_activeDrawCallState.futureBoundingBox = Future<AxisAlignedBoundingBox>();
       m_activeDrawCallState.futureSkinningData = Future<SkinningData>();
       return;
     }
@@ -1116,7 +1019,6 @@ namespace dxvk {
         m_frontend.commit(static_cast<RtxContext*>(ctx), params, drawCallState, mode, handle);
       }
     });
-#endif
   }
 
   void D3D9Rtx::submitActiveDrawCallState() {
@@ -1132,8 +1034,10 @@ namespace dxvk {
   Future<SkinningData> D3D9Rtx::processSkinning(const RasterGeometry& geoData) {
     ScopedCpuProfileZone();
 
+    static const auto kEmptySkinningFuture = Future<SkinningData>();
+
     if (m_parent->UseProgrammableVS()) {
-      return Future<SkinningData>();
+      return kEmptySkinningFuture;
     }
 
     // Some games set vertex blend without enough data to actually do the blending, handle that logic below.
@@ -1143,15 +1047,15 @@ namespace dxvk {
     const bool indexedVertexBlend = hasBlendIndices && d3d9State().renderStates[D3DRS_INDEXEDVERTEXBLENDENABLE];
 
     if (d3d9State().renderStates[D3DRS_VERTEXBLEND] == D3DVBF_DISABLE) {
-      return Future<SkinningData>();
+      return kEmptySkinningFuture;
     }
 
     if (d3d9State().renderStates[D3DRS_VERTEXBLEND] != D3DVBF_0WEIGHTS) {
       if (!hasBlendWeight) {
-        return Future<SkinningData>();
+        return kEmptySkinningFuture;
       }
     } else if (!indexedVertexBlend) {
-      return Future<SkinningData>();
+      return kEmptySkinningFuture;
     }
 
     // We actually have skinning data now, process it!
@@ -1169,7 +1073,7 @@ namespace dxvk {
     HashQuery blendIndices;
     // Analyze the vertex data and find the min and max bone indices used in this mesh.
     // The min index is used to detect a case when vertex blend is enabled but there is just one bone used in the mesh,
-    // so we can drop the skinning pass. That is processed in DrawCallState::finalizeSkinningData.
+    // so we can drop the skinning pass. That is processed in RtxContext::commitGeometryToRT(...)
     if (indexedVertexBlend && geoData.blendIndicesBuffer.defined()) {
       auto& buffer = geoData.blendIndicesBuffer;
 
@@ -1192,9 +1096,10 @@ namespace dxvk {
     const uint32_t startBoneTransform = GetTransformIndex(D3DTS_WORLDMATRIX(0));
 
     const uint32_t nMat = maxBone + 1;
-    SkinningMatrixPool::Staged bones = m_stagedBones.stageBones(d3d9State().transforms.data() + startBoneTransform, nMat);
+    const Matrix4* const boneMatrices = m_stagedBones.stageBones(
+        d3d9State().transforms.data() + startBoneTransform, nMat);
 
-    return m_pGeometryWorkers->ScheduleOrRun([bones = std::move(bones), nMat, blendIndices, numBonesPerVertex, vertexCount]()->SkinningData {
+    return m_pGeometryWorkers->Schedule([boneMatrices, blendIndices, numBonesPerVertex, vertexCount]()->SkinningData {
       ScopedCpuProfileZone();
       uint32_t numBones = numBonesPerVertex;
 
@@ -1220,11 +1125,8 @@ namespace dxvk {
       SkinningData skinningData;
       skinningData.pBoneMatrices.reserve(numBones);
 
-      // Blend indices can name bones above the highest world matrix the game has set, which are not staged. Those
-      // matrices are still at their initial identity in the D3D9 state.
-      const Matrix4* const boneMatrices = bones.matrices();
       for (uint32_t n = 0; n < numBones; n++) {
-        skinningData.pBoneMatrices.push_back(n < nMat ? boneMatrices[n] : Matrix4());
+        skinningData.pBoneMatrices.push_back(boneMatrices[n]);
       }
 
       skinningData.minBoneIndex = minBoneIndex;
@@ -1424,10 +1326,11 @@ namespace dxvk {
 
       // Cache the slot we want to bind
       const bool srgb = d3d9State().samplerStates[stage][D3DSAMP_SRGBTEXTURE] & 0x1;
+      m_activeDrawCallState.materialData.colorTextures[textureID] = TextureRef(pTexInfo->GetSampleView(srgb));
+      m_activeDrawCallState.materialData.samplers[textureID] = sampler;
+
       auto shaderSampler = RemapStateSamplerShader(stage);
-      static_assert(kInvalidResourceSlot == 0, "LegacyMaterialData marks a texture without a slot with 0.");
-      m_activeDrawCallState.materialData.setColorTexture(textureID, TextureRef(pTexInfo->GetSampleView(srgb)), sampler,
-        computeResourceSlotId(shaderSampler.first, DxsoBindingType::Image, uint32_t(shaderSampler.second)));
+      m_activeDrawCallState.materialData.colorTextureSlot[textureID] = computeResourceSlotId(shaderSampler.first, DxsoBindingType::Image, uint32_t(shaderSampler.second));
 
       ++textureID;
     }
@@ -1443,10 +1346,21 @@ namespace dxvk {
 
       // The cached categories include the SmoothNormals bit.
       m_activeDrawCallState.setupCategoriesForTexture(&getTextureListInfo(textureHash)->categories);
+
+      // FNV legacy material protocol v2, render state 42 = raw InstanceCategories bits for this draw.
+      // Merged here (not in getCategoryFlags) so every testCategoryFlags() consumer below and downstream sees it.
+      if (FnvMaterialProtocol::enable()) {
+        const uint32_t protocolCategories =
+          FnvLegacyProtocol::readSlot(d3d9State().renderStates[FnvLegacyProtocol::kRsCategoryFlags]) &
+          ((1u << uint32_t(InstanceCategories::Count)) - 1u);
+        if (protocolCategories != 0) {
+          m_activeDrawCallState.modifyCategoryFlags().set(CategoryFlags(protocolCategories));
+        }
+      }
       // rtx.trackHashUsageOnlyWhenNeeded: no per-draw command while no hash checker component reads it.
-      if (textureHash != kEmptyHash && frontend::assetUseWanted()) {
+      if (textureHash != kEmptyHash && SceneManager::s_hashUsageTrackingWanted.load(std::memory_order_relaxed)) {
         m_parent->EmitCs([textureHash](DxvkContext* ctx) {
-          frontend::SceneInterface { *static_cast<RtxContext*>(ctx) }.reportAssetUse(frontend::AssetUse::Material, textureHash);
+          static_cast<RtxContext*>(ctx)->getSceneManager().trackReplacementMaterialHash(textureHash);
         });
       }
       
@@ -1487,7 +1401,6 @@ namespace dxvk {
       return PrepareDrawFlag::PreserveDrawCallAndItsState;
     }
 
-#if REMIX_D3D9_FRONTEND
     const perf::ApiScope perfPrepareScope { perf::Api::D3D9PrepareRT }; // [PerfApi] rtx.profile.detailedLogging
     m_parent->PrepareTextures();
 
@@ -1528,41 +1441,34 @@ namespace dxvk {
     if (!prepareDrawHead(context, flags)) {
       return countPrepareOutcome(flags);
     }
-    const bool perDraw = perDrawMarked();
-    if (!perDraw && tryEarlySkip(indices, vertices, context, flags)) {
+    const bool perDrawPath = hostKeepsPerDrawPath();
+    if (!perDrawPath && m_frontendApp.earlyChangeTestActive() && tryEarlySkip(indices, vertices, context, flags)) {
       return countPrepareOutcome(flags);
     }
     flags = prepareDrawBody(indices, vertices, context);
-    if ((flags & PrepareDrawFlag::CommitToRayTracing) && perDraw) {
-      m_frontendDecision = m_frontendApp.perDraw(frontendFog());
-    } else if (flags & PrepareDrawFlag::CommitToRayTracing) {
+    if ((flags & PrepareDrawFlag::CommitToRayTracing) && perDrawPath) {
+      notePerDrawPath();
+    } else if ((flags & PrepareDrawFlag::CommitToRayTracing) && m_frontendApp.wantsInputs()) {
       observeFrontendInputs(indices, vertices, context, false, flags);
     }
     return countPrepareOutcome(flags);
-#else
-    return PrepareDrawFlag::PreserveDrawCallAndItsState;
-#endif
   }
 
-#if REMIX_D3D9_FRONTEND
-  namespace {
-    // Rings and CPU-refilled buffers. Their draws move through the buffer, so they are identified by the coarse key,
-    // or for an index ring by the content of the drawn range.
-    bool dynamicBuffer(const D3D9CommonBuffer& buffer) {
-      return (buffer.Desc()->Usage & D3DUSAGE_DYNAMIC) != 0 || buffer.remixDiscards > 1;
-    }
-  }
-
-  void D3D9Rtx::fillFrontendIdentity(translator::DrawInputs& in, const IndexContext& indexContext,
+  void D3D9Rtx::fillFrontendIdentity(frontends::d3d9::D3D9DrawInputs& in, const IndexContext& indexContext,
                                      const VertexContext vertexContext[caps::MaxStreams], const DrawContext& drawContext,
                                      bool userPointer) {
-    using translator::DrawInputs;
-    for (uint32_t i = 0; i < caps::MaxStreams && i < DrawInputs::kMaxStreams; i++) {
+    using frontends::d3d9::D3D9DrawInputs;
+    // Rings and CPU-refilled buffers. Their draws move through the buffer, so they are identified by the coarse key,
+    // or for an index ring by the content of the drawn range.
+    const auto dynamicBuffer = [](const D3D9CommonBuffer& buffer) {
+      return (buffer.Desc()->Usage & D3DUSAGE_DYNAMIC) != 0 || buffer.remixDiscards > 1;
+    };
+    for (uint32_t i = 0; i < caps::MaxStreams && i < D3D9DrawInputs::kMaxStreams; i++) {
       const VertexContext& stream = vertexContext[i];
       if (stream.pVBO != nullptr) {
         in.streams[i].buffer = { stream.pVBO->remixResourceId, stream.pVBO->remixContentVersion };
         if (dynamicBuffer(*stream.pVBO)) {
-          in.flags |= DrawInputs::kDynamicSource;
+          in.flags |= D3D9DrawInputs::kDynamicSource;  // R5
         }
       } else if (!(userPointer && i == 0)) {
         continue;
@@ -1579,9 +1485,9 @@ namespace dxvk {
         const XXH64_hash_t content = hashIndexRange(indexContext, drawContext);
         if (content != 0) {
           in.indices.version = content;
-          in.flags |= DrawInputs::kIndexContent;
+          in.flags |= D3D9DrawInputs::kIndexContent;
         } else {
-          in.flags |= DrawInputs::kDynamicSource;
+          in.flags |= D3D9DrawInputs::kDynamicSource;
         }
       }
     }
@@ -1610,10 +1516,10 @@ namespace dxvk {
       }
       in.vsConstants = m_frontendVsConstantsHash;
       if (m_parent->m_vsShaderMasks.samplerMask & m_parent->m_activeTextures) {
-        in.flags |= DrawInputs::kVertexTextures;
+        in.flags |= D3D9DrawInputs::kVertexTextures;
       }
       if (useVertexCapture()) {
-        // The capture output is object space through the inverses of these (prepareVertexCapture), so a change of
+        // R6: the capture output is object space through the inverses of these (prepareVertexCapture), so a change of
         // any of them changes the captured positions even with the same constants. The world matrix is included so a
         // captured draw is never treated as a move.
         const Matrix4* t = d3d9State().transforms.data();
@@ -1629,7 +1535,7 @@ namespace dxvk {
       in.declaration = d3d9State().vertexDecl->GetRemixElementsHash();
     }
     in.extra = hashDrawExtras();
-    // Fixed-function skinning, the bone matrices the draw's vertices use (a new pose is a change). When the blend
+    // R5: fixed-function skinning, the bone matrices the draw's vertices use (a new pose is a change). When the blend
     // indices cannot be read, every bone set so far is hashed.
     if (!programmableVS && d3d9State().renderStates[D3DRS_VERTEXBLEND] != D3DVBF_DISABLE) {
       uint32_t firstBone = 0;
@@ -1659,9 +1565,9 @@ namespace dxvk {
       in.skinFirstBone = firstBone;
       in.skinBoneCount = rangeKnown ? boneCount : 0;
     }
-    in.flags |= (userPointer ? DrawInputs::kUserPointer | DrawInputs::kDynamicSource : 0)
-             | (programmableVS ? DrawInputs::kProgrammableVS : 0)
-             | (!programmableVS && d3d9State().renderStates[D3DRS_VERTEXBLEND] != D3DVBF_DISABLE ? DrawInputs::kSkinned : 0);
+    in.flags |= (userPointer ? D3D9DrawInputs::kUserPointer | D3D9DrawInputs::kDynamicSource : 0)
+             | (programmableVS ? D3D9DrawInputs::kProgrammableVS : 0)
+             | (!programmableVS && d3d9State().renderStates[D3DRS_VERTEXBLEND] != D3DVBF_DISABLE ? D3D9DrawInputs::kSkinned : 0);
   }
 
   bool D3D9Rtx::usedBoneRange(const VertexContext vertexContext[caps::MaxStreams], const DrawContext& drawContext,
@@ -1767,56 +1673,6 @@ namespace dxvk {
     return key.hash;
   }
 
-  void D3D9Rtx::describeContent(translator::DrawInputs& in, const IndexContext& indexContext,
-                                const VertexContext vertexContext[caps::MaxStreams]) const {
-    using translator::DrawInputs;
-    // The range processVertices copied. The geometry hashes are computed on the geometry workers and are not ready on
-    // this thread, so a dynamic stream's range is hashed here.
-    const uint64_t vertexCount = m_activeDrawCallState.getGeometryData().vertexCount;
-    if (vertexCount == 0) {
-      return;
-    }
-    uint64_t versions[DrawInputs::kMaxStreams] = {};
-    for (uint32_t i = 0; i < caps::MaxStreams && i < DrawInputs::kMaxStreams; i++) {
-      const VertexContext& stream = vertexContext[i];
-      if (!(in.streamMask & (1u << i)) || stream.pVBO == nullptr) {
-        continue;
-      }
-      const int64_t start = int64_t(stream.offset) + int64_t(stream.stride) * int64_t(m_preparedVertexOffset);
-      const uint64_t size = uint64_t(stream.stride) * vertexCount;
-      if (dynamicBuffer(*stream.pVBO)) {
-        const VkDeviceSize length = stream.mappedSlice.length;
-        if (stream.mappedSlice.mapPtr == nullptr || stream.stride == 0 || start < 0 || uint64_t(start) >= length) {
-          return;
-        }
-        // As in processVertices, the last vertex's stride may reach past the buffer.
-        const size_t available = size_t(std::min<uint64_t>(size, length - uint64_t(start)));
-        const uint8_t* pData = static_cast<const uint8_t*>(stream.mappedSlice.mapPtr) + start;
-        versions[i] = XXH3_64bits_withSeed(pData, available, size) | 1;
-      } else {
-        // A buffer the application does not rewrite: its version and the range read from it.
-        const uint64_t parts[3] = { in.streams[i].buffer.version, uint64_t(start), size };
-        versions[i] = XXH3_64bits(parts, sizeof(parts)) | 1;
-      }
-    }
-    uint64_t indexVersion = in.indices.version;
-    if (indexContext.ibo != nullptr && !(in.flags & DrawInputs::kIndexContent)) {
-      if (dynamicBuffer(*indexContext.ibo)) {
-        return;
-      }
-      const uint64_t parts[3] = { in.indices.version, in.startIndex, in.primitiveCount };
-      indexVersion = XXH3_64bits(parts, sizeof(parts)) | 1;
-    }
-
-    for (uint32_t i = 0; i < DrawInputs::kMaxStreams; i++) {
-      if (versions[i] != 0) {
-        in.streams[i].buffer.version = versions[i];
-      }
-    }
-    in.indices.version = indexVersion;
-    in.flags |= DrawInputs::kContent;
-  }
-
   XXH64_hash_t D3D9Rtx::hashDrawExtras() const {
     const struct {
       DWORD clipPlaneEnable;
@@ -1825,22 +1681,16 @@ namespace dxvk {
     static_assert(sizeof(head) == 7 * 4, "no implicit padding");
     XXH64_hash_t h = XXH3_64bits(&head, sizeof(head));
     h = XXH3_64bits_withSeed(d3d9State().clipPlanes.data(), sizeof(d3d9State().clipPlanes), h);
-    // The texcoord index of each stage picks the texcoord element that preparation reads (processTextures).
-    std::array<DWORD, caps::TextureStageCount> texcoordIndices;
-    for (uint32_t stage = 0; stage < caps::TextureStageCount; ++stage) {
-      texcoordIndices[stage] = d3d9State().textureStages[stage][DXVK_TSS_TEXCOORDINDEX];
-    }
-    h = XXH3_64bits_withSeed(texcoordIndices.data(), sizeof(texcoordIndices), h);
     return XXH3_64bits_withSeed(d3d9State().streamFreq.data(), sizeof(d3d9State().streamFreq), h);
   }
 
-  translator::EarlyKey D3D9Rtx::buildEarlyKey(const translator::DrawInputs& in, const Matrix4& objectToWorld) const {
+  frontends::d3d9::EarlyKey D3D9Rtx::buildEarlyKey(const frontends::d3d9::D3D9DrawInputs& in, const Matrix4& objectToWorld) const {
     // A superset of what prepareDrawBody reads. A false "changed" costs one
     // preparation; a false "same" would freeze a change, which rtx.d3d9v2.earlyChangeTestSelfCheckFrames looks for.
-    using translator::DrawInputs;
+    using frontends::d3d9::D3D9DrawInputs;
     const Direct3DState9& s = d3d9State();
     XXH64_hash_t h = in.objectKey();
-    for (uint32_t i = 0; i < DrawInputs::kMaxStreams; ++i) {
+    for (uint32_t i = 0; i < D3D9DrawInputs::kMaxStreams; ++i) {
       if (in.streamMask & (1u << i)) {
         h = XXH3_64bits_withSeed(&in.streams[i].buffer.version, sizeof(uint64_t), h);
       }
@@ -1865,7 +1715,7 @@ namespace dxvk {
     h = XXH3_64bits_withSeed(s.renderStates.data(), sizeof(s.renderStates), h);
     h = XXH3_64bits_withSeed(s.textureStages.data(), sizeof(s.textureStages), h);
     h = XXH3_64bits_withSeed(&s.material, sizeof(s.material), h);
-    // Vertex capture: the VS constants in use and the matrices the capture constants invert (fillFrontendIdentity).
+    // R6, vertex capture: the VS constants in use and the matrices the capture constants invert (fillFrontendIdentity).
     h = XXH3_64bits_withSeed(&in.vsConstants, sizeof(in.vsConstants), h);
     for (uint32_t i = 0; i < 8; ++i) {
       const Matrix4& t = s.transforms[GetTransformIndex(D3DTRANSFORMSTATETYPE(D3DTS_TEXTURE0 + i))];
@@ -1891,7 +1741,7 @@ namespace dxvk {
       h = XXH3_64bits_withSeed(s.samplerStates[idx].data(), sizeof(s.samplerStates[idx]), h);
       signature = XXH3_64bits_withSeed(&bound.hash, sizeof(bound.hash), signature);
     }
-    translator::EarlyKey key;
+    frontends::d3d9::EarlyKey key;
     key.signature = signature;
     key.preKeyNoWorld = h;
     key.preKey = XXH3_64bits_withSeed(&objectToWorld, sizeof(objectToWorld), h);
@@ -1899,63 +1749,61 @@ namespace dxvk {
     return key;
   }
 
-  bool D3D9Rtx::perDrawMarked() const {
-    const uint32_t state = m_frontendApp.perDrawRenderState();
-    if (state == 0 || state >= d3d9State().renderStates.size()) {
-      return false;
-    }
-    const uint32_t value = d3d9State().renderStates[state];
-    const uint32_t unmarked = m_frontendApp.perDrawUnmarkedValue();
-    return (unmarked == 0 || value != unmarked) && (value & m_frontendApp.perDrawMask()) != 0;
+  bool D3D9Rtx::hostKeepsPerDrawPath() const {
+    return FnvMaterialProtocol::enable() &&
+           (FnvLegacyProtocol::readSlot(d3d9State().renderStates[FnvLegacyProtocol::kRsCategoryFlags]) &
+            FnvLegacyProtocol::kPerDrawPath) != 0;
   }
 
-  translator::FogRecord D3D9Rtx::frontendFog() const {
+  void D3D9Rtx::notePerDrawPath() {
     const FogState& fog = m_activeDrawCallState.getFogState();
-    translator::FogRecord record;
-    record.mode = static_cast<uint32_t>(fog.mode);
-    record.color = fog.color;
-    record.scale = fog.scale;
-    record.end = fog.end;
-    record.density = fog.density;
-    return record;
+    frontends::d3d9::FogInputs in;
+    in.mode = fog.mode;
+    in.color[0] = fog.color.x;
+    in.color[1] = fog.color.y;
+    in.color[2] = fog.color.z;
+    in.scale = fog.scale;
+    in.end = fog.end;
+    in.density = fog.density;
+    m_frontendApp.notePerDrawPath(in);
   }
 
-  void D3D9Rtx::sendFrontendCamera(const frontends::d3d9::Decision& decision, const Matrix4& worldToView, const Matrix4& viewToProjection,
-                                   const frontends::d3d9::CameraSource& source) {
-    m_activeDrawCallState.hasSkinningView = decision.hasSkinningView;
-    m_activeDrawCallState.skinningViewThisFrame = decision.skinningViewThisFrame;
-    m_activeDrawCallState.skinningWorldToView = decision.skinningWorldToView;
+  void D3D9Rtx::sendFrontendCamera(const frontends::d3d9::Decision& decision, const Matrix4& worldToView, const Matrix4& viewToProjection) {
     if (decision.cameraType == frontends::d3d9::Decision::kNoCamera) {
       return;
     }
-    m_activeDrawCallState.cameraType = translator::CameraClass(decision.cameraType);
+    m_activeDrawCallState.cameraType = CameraType::Enum(decision.cameraType);
     if (decision.feedCamera) {
-      m_parent->EmitCs([type = translator::CameraClass(decision.cameraType), worldToView, viewToProjection, source](DxvkContext* ctx) {
-        frontends::d3d9::applyDrawCamera(*static_cast<RtxContext*>(ctx), translator::toView(type), worldToView, viewToProjection, source);
+      // As prepareGeometryForRTImpl ahead of processCameraData: a pending host origin first, then the camera with the
+      // host's fallback rule.
+      m_parent->EmitCs([type = CameraType::Enum(decision.cameraType), worldToView, viewToProjection](DxvkContext* ctx) {
+        SceneManager& sceneManager = static_cast<RtxContext*>(ctx)->getSceneManager();
+        sceneManager.applyPendingHostWorldOrigin();
+        sceneManager.getCameraManager().applyDrawCamera(type, worldToView, viewToProjection);
       });
     }
   }
 
   bool D3D9Rtx::tryEarlySkip(const IndexContext& indexContext, const VertexContext vertexContext[caps::MaxStreams],
                              const DrawContext& drawContext, PrepareDrawFlags& flags) {
+#ifdef REMIX_FRONTEND_D3D9_V2
     using namespace frontends::d3d9;
-    using translator::DrawInputs;
-    // Fixed-function draws, and vertex-captured shader draws. Skinned and UP draws change by definition and are
-    // always prepared.
+    // Fixed-function draws, and (R6, rtx.d3d9v2.capturedGeometry) vertex-captured shader draws. Skinned and UP draws
+    // change by definition and are always prepared.
     const bool programmableVS = m_parent->UseProgrammableVS();
-    if (programmableVS && !useVertexCapture()) {
+    if (programmableVS && !(useVertexCapture() && m_frontendApp.capturedGeometryActive())) {
       return false;
     }
     const perf::ApiScope perfPreKeyScope { perf::Api::D3D9PreKey }; // [PerfApi] rtx.profile.detailedLogging
     const bool timed = m_frontendApp.statsActive();
     const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
 
-    DrawInputs identity;
+    D3D9DrawInputs identity;
     fillFrontendIdentity(identity, indexContext, vertexContext, drawContext, false);
-    // Changing data (dynamic / user-pointer streams), fixed-function bones (not in the pre-key) and vertex shaders
+    // Changing data (dynamic / user-pointer streams, R5), fixed-function bones (not in the pre-key) and vertex shaders
     // that sample textures (whose content the pre-key cannot see) are always prepared.
     if (!identity.versioned() ||
-        (identity.flags & (DrawInputs::kDynamicSource | DrawInputs::kSkinned | DrawInputs::kVertexTextures))) {
+        (identity.flags & (D3D9DrawInputs::kDynamicSource | D3D9DrawInputs::kSkinned | D3D9DrawInputs::kVertexTextures))) {
       return false;
     }
     // The transforms as processRenderState derives them (shader draws use the world matrix only with
@@ -1967,14 +1815,14 @@ namespace dxvk {
     transforms.viewToProjection = d3d9State().transforms[GetTransformIndex(D3DTS_PROJECTION)];
     transforms.objectToView = transforms.worldToView * transforms.objectToWorld;
     transforms.sanitize();
-    translator::CameraInputs camera = frontendCameraInputs(transforms);
+    CameraInputs camera = frontendCameraInputs(transforms);
     // A world matrix the CS thread rebuilds from the reference camera depends on more than the pre-key holds, so such a
     // draw is always prepared (decide compares the reference camera).
     if (camera.preCombined) {
       return false;
     }
 
-    translator::EarlyKey key = buildEarlyKey(identity, camera.objectToWorld);
+    EarlyKey key = buildEarlyKey(identity, camera.objectToWorld);
     if (timed) {
       key.preKeyNs = std::max<uint64_t>(1, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - start).count()));
@@ -2002,56 +1850,58 @@ namespace dxvk {
     emitDirtyLights();
     DrawCallState::trackSkyCameraPosition(transforms.worldToView, stored.zWriteEnable, stored.blending, stored.skinned,
                                           m_activeDrawCallState.isDrawingToRaytracedRenderTarget, m_seenCameraPositions);
-    if (stored.colorTextureHash != kEmptyHash && frontend::assetUseWanted()) {
+    if (stored.colorTextureHash != kEmptyHash && SceneManager::s_hashUsageTrackingWanted.load(std::memory_order_relaxed)) {
       m_parent->EmitCs([textureHash = XXH64_hash_t(stored.colorTextureHash)](DxvkContext* ctx) {
-        frontend::SceneInterface { *static_cast<RtxContext*>(ctx) }.reportAssetUse(frontend::AssetUse::Material, textureHash);
+        static_cast<RtxContext*>(ctx)->getSceneManager().trackReplacementMaterialHash(textureHash);
       });
     }
-    m_activeDrawCallState.vertexBlend = false;  // a skinned draw is never skipped early
-    sendFrontendCamera(decision, camera.worldToView, camera.viewToProjection, frontendCameraSource(identity, stored, true));
+    sendFrontendCamera(decision, camera.worldToView, camera.viewToProjection);
     m_frontendDecision = decision;
     flags = PrepareDrawFlag::CommitToRayTracing | (stored.applyDrawState ? PrepareDrawFlag::ApplyDrawState : 0);
+
+    // A vertex-captured draw keeps its original draw, as the full preparation does. Its injected capture writes go to
+    // the sink, because the bound capture buffer belongs to an earlier draw whose geometry may be retained.
+    if (programmableVS && useVertexCapture()) {
+      if (!m_vertexCaptureSink.defined()) {
+        m_vertexCaptureSink = DxvkBufferSlice(createVertexCaptureBuffer(m_parent->GetDXVKDevice().ptr(), CACHE_LINE_SIZE));
+      }
+      m_parent->EmitCs([cSink = m_vertexCaptureSink](DxvkContext* ctx) {
+        ctx->bindResourceBuffer(getVertexCaptureBufferSlot(), cSink);
+      });
+      flags |= PrepareDrawFlag::PreserveDrawCallAndItsState;
+    }
     return true;
+#else
+    (void) indexContext; (void) vertexContext; (void) drawContext; (void) flags;
+    return false;
+#endif
   }
 
   void D3D9Rtx::observeFrontendInputs(const IndexContext& indexContext, const VertexContext vertexContext[caps::MaxStreams],
                                       const DrawContext& drawContext, bool userPointer, PrepareDrawFlags flags) {
-    using translator::DrawInputs;
-    DrawInputs in;
+#ifdef REMIX_FRONTEND_D3D9_V2
+    using frontends::d3d9::D3D9DrawInputs;
+    D3D9DrawInputs in;
     fillFrontendIdentity(in, indexContext, vertexContext, drawContext, userPointer);
-    if ((in.flags & DrawInputs::kDynamicSource) && !userPointer) {
-      describeContent(in, indexContext, vertexContext);
-    }
 
-    // Skip, hand over, update or drop.
+    // rtx.d3d9v2.direct: skip, hand over, feed the camera or take the old path.
     const DrawCallTransforms& transforms = m_activeDrawCallState.getTransformData();
-    translator::CameraInputs camera = frontendCameraInputs(transforms);
+    frontends::d3d9::CameraInputs camera = frontendCameraInputs(transforms);
 
     in.material = m_activeDrawCallState.getMaterialData().computeIdentityHash();
     in.objectToWorld = camera.objectToWorld;
-    in.anchor = camera.objectToWorld[3].xyz();
-    if (in.usesCoarseKey()) {
-      // The prepared geometry starts at the draw's lowest vertex (prepareDrawBody), which is the same vertex of the
-      // mesh wherever the draw sits in its buffer.
-      const RasterBuffer& positions = m_activeDrawCallState.getGeometryData().positionBuffer;
-      const VkFormat format = positions.defined() ? positions.vertexFormat() : VK_FORMAT_UNDEFINED;
-      const float* first = (format == VK_FORMAT_R32G32B32_SFLOAT || format == VK_FORMAT_R32G32B32A32_SFLOAT)
-        ? static_cast<const float*>(positions.mapPtr(size_t(positions.offsetFromSlice())))
-        : nullptr;
-      if (first != nullptr && std::isfinite(first[0]) && std::isfinite(first[1]) && std::isfinite(first[2])) {
-        in.anchor = (camera.objectToWorld * Vector4(first[0], first[1], first[2], 1.f)).xyz();
-      }
-    }
     in.textureTransform = transforms.textureTransform;
     in.texgenMode = uint32_t(transforms.texgenMode);
 
-    in.flags |= m_activeDrawCallState.vertexCaptured ? DrawInputs::kVertexCapture : 0;
+    in.flags |= m_activeDrawCallState.vertexCaptured ? D3D9DrawInputs::kVertexCapture : 0;
 
+    // Never handed over: blending (unless rtx.d3d9v2.unordered, R7).
+    const bool neverHandOver =
+      m_activeDrawCallState.getMaterialData().blendMode.enableBlending && !m_frontendApp.unorderedActive();
     camera.maxZ = m_activeDrawCallState.maxZ;
     camera.sky = m_activeDrawCallState.categories.test(InstanceCategories::Sky);
     camera.drawingToRaytracedRenderTarget = m_activeDrawCallState.isDrawingToRaytracedRenderTarget;
-    camera.skinned = (in.flags & DrawInputs::kSkinned) != 0;
-    // What this preparation derived, kept for later skips of the object.
+    // R1: what this preparation derived, kept for later skips of the object.
     frontends::d3d9::PreparedState prepared;
     prepared.categories = m_activeDrawCallState.getCategoryFlags().raw();
     prepared.colorTextureHash = m_activeDrawCallState.getMaterialData().getColorTexture().getImageHash();
@@ -2064,29 +1914,25 @@ namespace dxvk {
     prepared.raytracedRenderTarget = m_activeDrawCallState.isDrawingToRaytracedRenderTarget ||
                                      m_activeDrawCallState.isUsingRaytracedRenderTarget;
     prepared.skyAutoDetected = m_activeDrawCallState.skyAutoDetected;
-    prepared.fog = frontendFog();
-    m_frontendDecision = m_frontendApp.decide(in, camera, &prepared);
-    // The first draw of a camera type in this frame sends the camera, ahead of the
-    // draw's own commit. The queued state carries the frontend's camera type for the CS thread's parity check
-    // (the D3D9 frontend's CS-thread preparation overwrites it with its own classification).
-    sendFrontendCamera(m_frontendDecision, camera.worldToView, camera.viewToProjection, frontendCameraSource(in, prepared, false));
-  }
-
-  frontends::d3d9::CameraSource D3D9Rtx::frontendCameraSource(const translator::DrawInputs& in,
-                                                              const frontends::d3d9::PreparedState& prepared, bool early) const {
-    frontends::d3d9::CameraSource source;
-    source.drawCallId = m_activeDrawCallState.drawCallID;
-    source.vertexCount = in.numVertices;
-    source.primitiveCount = in.primitiveCount;
-    source.categories = prepared.categories;
-    source.textureHash = prepared.colorTextureHash;
-    source.skinned = (in.flags & translator::DrawInputs::kSkinned) != 0;
-    source.programmableVS = (in.flags & translator::DrawInputs::kProgrammableVS) != 0;
-    source.vertexCapture = (in.flags & translator::DrawInputs::kVertexCapture) != 0 || (source.programmableVS && useVertexCapture());
-    source.early = early;
-    return source;
-  }
+    {
+      const FogState& fog = m_activeDrawCallState.getFogState();  // R10
+      prepared.fog.mode = fog.mode;
+      prepared.fog.color[0] = fog.color.x;
+      prepared.fog.color[1] = fog.color.y;
+      prepared.fog.color[2] = fog.color.z;
+      prepared.fog.scale = fog.scale;
+      prepared.fog.end = fog.end;
+      prepared.fog.density = fog.density;
+    }
+    m_frontendDecision = m_frontendApp.decide(in, camera, neverHandOver, &prepared);
+    // rtx.d3d9v2.explicitCamera: the first draw of a camera type in this frame sends
+    // the camera, ahead of the draw's own commit; the queued state carries the frontend's camera type for the CS
+    // thread's parity check (prepareGeometryForRTImpl overwrites it with processCameraData's).
+    sendFrontendCamera(m_frontendDecision, camera.worldToView, camera.viewToProjection);
+#else
+    (void) indexContext; (void) vertexContext; (void) drawContext; (void) userPointer; (void) flags;
 #endif
+  }
 
   PrepareDrawFlags D3D9Rtx::countPrepareOutcome(const PrepareDrawFlags flags) {
     // [PerfD3D9] raytraced / rasterized / ignored (rtx.profile.detailedLogging only).
@@ -2110,7 +1956,6 @@ namespace dxvk {
       return PrepareDrawFlag::PreserveDrawCallAndItsState;
     }
 
-#if REMIX_D3D9_FRONTEND
     m_parent->PrepareTextures();
 
     // 'buffer' - contains vertex + index data (packed in that order)
@@ -2130,15 +1975,12 @@ namespace dxvk {
 
     const perf::ApiScope perfPrepareScope { perf::Api::D3D9PrepareRT }; // [PerfApi] rtx.profile.detailedLogging
     const PrepareDrawFlags flags = internalPrepareDraw(indices, vertices, drawContext);
-    if ((flags & PrepareDrawFlag::CommitToRayTracing) && perDrawMarked()) {
-      m_frontendDecision = m_frontendApp.perDraw(frontendFog());
-    } else if (flags & PrepareDrawFlag::CommitToRayTracing) {
+    if ((flags & PrepareDrawFlag::CommitToRayTracing) && hostKeepsPerDrawPath()) {
+      notePerDrawPath();
+    } else if ((flags & PrepareDrawFlag::CommitToRayTracing) && m_frontendApp.wantsInputs()) {
       observeFrontendInputs(indices, vertices, drawContext, true, flags);
     }
     return countPrepareOutcome(flags);
-#else
-    return PrepareDrawFlag::PreserveDrawCallAndItsState;
-#endif
   }
 
   void D3D9Rtx::ResetSwapChain(const D3DPRESENT_PARAMETERS& presentationParameters) {
@@ -2191,16 +2033,10 @@ namespace dxvk {
     m_parent->Flush();
 
     // Inform backend of end-frame
-#if REMIX_D3D9_FRONTEND
-    m_parent->EmitCs([currentReflexFrameId, targetImage, callInjectRtx, this, batch = m_frontendApp.takeFrameBatch()](DxvkContext* ctx) {
+    m_parent->EmitCs([currentReflexFrameId, targetImage, callInjectRtx, this, batch = m_frontendApp.takeFrameBatch()](DxvkContext* ctx) { 
       m_frontend.flush(static_cast<RtxContext*>(ctx), batch);
-      static_cast<RtxContext*>(ctx)->endFrame(currentReflexFrameId, targetImage, callInjectRtx);
+      static_cast<RtxContext*>(ctx)->endFrame(currentReflexFrameId, targetImage, callInjectRtx); 
     });
-#else
-    m_parent->EmitCs([currentReflexFrameId, targetImage, callInjectRtx](DxvkContext* ctx) {
-      static_cast<RtxContext*>(ctx)->endFrame(currentReflexFrameId, targetImage, callInjectRtx);
-    });
-#endif
 
     // Reset for the next frame
     m_rtxInjectTriggered = false;
@@ -2208,13 +2044,8 @@ namespace dxvk {
     m_seenCameraPositionsPrev = std::move(m_seenCameraPositions);
 
     m_stagedBones.clear();
-    if (m_pGeometryWorkers != nullptr && m_pGeometryWorkers->tasksRunByCaller() != 0) {
-      ONCE(Logger::info("[RTX] All geometry worker task slots were in use, so the D3D9 thread ran some geometry tasks itself."));
-    }
     ++m_d3d9FrameIndex;
-#if REMIX_D3D9_FRONTEND
     m_frontendApp.endFrame();
-#endif
 
     sampleThreadCpuForPerfLog();
   }
@@ -2240,9 +2071,7 @@ namespace dxvk {
   }
 
   void D3D9Rtx::onReset() {
-#if REMIX_D3D9_FRONTEND
     m_frontendApp.onDeviceReset();
-#endif
     if (m_windowInactive.load(std::memory_order_acquire)) {
       m_endingFramesWithoutPresent = true;
     }

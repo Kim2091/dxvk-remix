@@ -46,6 +46,11 @@ struct OpaqueMaterialArgs {
   float legacySpecularLevel = 1.f;
   float legacyFresnelGrazing = 1.f;
   // NV-DXVK end
+  // Roughness range of normal-alpha gloss maps (rtx.fnvProtocol.glossRoughnessMin/Max).
+  float fnvGlossRoughnessMin = 0.f;
+  float fnvGlossRoughnessMax = 1.f;
+  uint fnvPad0 = 0;
+  uint fnvPad1 = 0;
 };
 
 struct TranslucentMaterialArgs {

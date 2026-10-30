@@ -31,6 +31,7 @@
 #include <vector>
 
 #include <objbase.h>
+#include <shlobj.h>
 #include <wincodec.h>
 
 #include "rtx_screenshot_pq_icc.h"
@@ -44,9 +45,11 @@
 #include "../../util/log/log.h"
 #include "../../util/sync/sync_signal.h"
 #include "../../util/util_env.h"
+#include "../../util/util_filesys.h"
 #include "../../util/util_string.h"
 
 #pragma comment(lib, "windowscodecs")
+#pragma comment(lib, "shell32")
 
 namespace dxvk {
   namespace {
@@ -246,10 +249,10 @@ namespace dxvk {
           return {};
         }
         const char* type = reinterpret_cast<const char*>(&png[offset + 4]);
-        const bool colorChunk = std::memcmp(type, "gAMA", 4) == 0 || std::memcmp(type, "cHRM", 4) == 0 ||
+        const bool colourChunk = std::memcmp(type, "gAMA", 4) == 0 || std::memcmp(type, "cHRM", 4) == 0 ||
                                  std::memcmp(type, "sRGB", 4) == 0 || std::memcmp(type, "iCCP", 4) == 0 ||
                                  std::memcmp(type, "cICP", 4) == 0;
-        if (!colorChunk) {
+        if (!colourChunk) {
           out.insert(out.end(), png.begin() + offset, png.begin() + offset + chunkSize);
         }
         if (std::memcmp(type, "IHDR", 4) == 0) {
@@ -350,6 +353,39 @@ namespace dxvk {
       return str::fromws(std::filesystem::path(str::tows(path.c_str())).filename().c_str());
     }
 
+    // Writes the thumbnail file rtx.screenshot.thumbnailRequest describes, through a temporary file, so a reader
+    // never sees a partly written one. bgr holds 8-bit BGR rows from the top.
+    bool writeThumbnail(const std::string& request, uint32_t width, uint32_t height, const std::vector<uint8_t>& bgr) {
+      std::vector<uint8_t> out;
+      out.reserve(16 + request.size() + bgr.size());
+      out.insert(out.end(), { uint8_t('R'), uint8_t('T'), uint8_t('H'), uint8_t('B') });
+      for (const uint32_t v : { width, height, uint32_t(request.size()) }) {
+        for (uint32_t k = 0; k < 4; ++k) {
+          out.push_back(uint8_t(v >> (8 * k)));
+        }
+      }
+      out.insert(out.end(), request.begin(), request.end());
+      for (size_t i = 0; i + 2 < bgr.size(); i += 3) {
+        out.push_back(bgr[i + 2]);
+        out.push_back(bgr[i + 1]);
+        out.push_back(bgr[i + 0]);
+      }
+
+      std::error_code ec;
+      const std::filesystem::path folder = util::RtxFileSys::path(util::RtxFileSys::Logs).parent_path();
+      std::filesystem::create_directories(folder, ec);
+      const std::filesystem::path path = folder / L"thumbnail.rgb";
+      const std::filesystem::path temp = folder / L"thumbnail.rgb.tmp";
+      {
+        std::ofstream file(temp, std::ios::binary | std::ios::trunc);
+        file.write(reinterpret_cast<const char*>(out.data()), std::streamsize(out.size()));
+        if (!file.good()) {
+          return false;
+        }
+      }
+      return MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING) != FALSE;
+    }
+
     bool exists(const std::string& path) {
       std::error_code ec;
       return std::filesystem::exists(std::filesystem::path(str::tows(path.c_str())), ec);
@@ -372,6 +408,8 @@ namespace dxvk {
     std::tm time {};
     // The bug report screenshot's path, or empty.
     std::string markPath;
+    // The rtx.screenshot.thumbnailRequest value of a thumbnail, or empty.
+    std::string thumbnailRequest;
   };
 
   RtxScreenshot::RtxScreenshot(DxvkDevice* device)
@@ -400,8 +438,17 @@ namespace dxvk {
   std::string RtxScreenshot::resolveFolder() {
     // The bridge looks up the game's executable through a process snapshot, so the folder is looked up once.
     static const std::filesystem::path s_exeFolder = std::filesystem::path(str::tows(env::getExePath().c_str())).parent_path();
+    static const std::filesystem::path s_default = [] {
+      PWSTR pictures = nullptr;
+      std::filesystem::path path;
+      if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Pictures, 0, nullptr, &pictures)) && pictures != nullptr) {
+        path = std::filesystem::path(pictures) / L"RTX Remix" / str::tows(env::getExeBaseName().c_str());
+      }
+      CoTaskMemFree(pictures);
+      return path.empty() ? s_exeFolder / L"Screenshots" : path;
+    }();
     const std::string& option = folder();
-    std::filesystem::path path = option.empty() ? s_exeFolder / L"Screenshots" : std::filesystem::path(str::tows(option.c_str()));
+    std::filesystem::path path = option.empty() ? s_default : std::filesystem::path(str::tows(option.c_str()));
     if (path.is_relative()) {
       path = s_exeFolder / path;
     }
@@ -409,6 +456,8 @@ namespace dxvk {
   }
 
   void RtxScreenshot::capture(DxvkContext* ctx, const Rc<DxvkImage>& backBuffer, bool hdrOutput) {
+    serviceThumbnail(ctx);
+
     const bool user = m_requested.exchange(false);
     const std::string markPath = RtxSessionLog::takeScreenshotRequest();
     if (!user && markPath.empty()) {
@@ -478,6 +527,116 @@ namespace dxvk {
     m_queueCondition.notify_one();
   }
 
+  void RtxScreenshot::captureThumbnail(DxvkContext* ctx, const Rc<DxvkImage>& image) {
+    const PixelLayout layout = image != nullptr ? pixelLayout(image->info().format) : PixelLayout::Unsupported;
+    if (layout == PixelLayout::Unsupported || image->info().sampleCount != VK_SAMPLE_COUNT_1_BIT ||
+        (image->info().usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) == 0) {
+      if (!m_thumbnailWarned) {
+        m_thumbnailWarned = true;
+        Logger::warn(image == nullptr
+          ? std::string("[Screenshot] no thumbnail: there is no render target")
+          : str::format("[Screenshot] no thumbnail: the render target cannot be read back (Vulkan format ",
+                        uint32_t(image->info().format), ", ", uint32_t(image->info().sampleCount), " samples)"));
+      }
+      return;
+    }
+
+    const VkExtent3D source = image->info().extent;
+    const uint32_t width = std::clamp(thumbnailWidth(), 16u, std::max(16u, source.width));
+    const uint32_t height = std::max(1u, uint32_t(std::lround(double(width) * source.height / std::max(1u, source.width))));
+    if (m_thumbnailImage == nullptr || m_thumbnailImage->info().format != image->info().format ||
+        m_thumbnailImage->info().extent.width != width || m_thumbnailImage->info().extent.height != height) {
+      DxvkImageCreateInfo desc;
+      desc.type = VK_IMAGE_TYPE_2D;
+      desc.flags = 0;
+      desc.format = image->info().format;
+      desc.sampleCount = VK_SAMPLE_COUNT_1_BIT;
+      desc.extent = VkExtent3D { width, height, 1 };
+      desc.numLayers = 1;
+      desc.mipLevels = 1;
+      desc.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+      desc.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+      desc.access = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+      desc.tiling = VK_IMAGE_TILING_OPTIMAL;
+      desc.layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+      try {
+        m_thumbnailImage = ctx->getDevice()->createImage(desc, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                                                         DxvkMemoryStats::Category::RTXRenderTarget, "Screenshot thumbnail");
+      } catch (const DxvkError& e) {
+        m_thumbnailImage = nullptr;
+        m_thumbnailFrame = nullptr;
+        Logger::warn(str::format("[Screenshot] no thumbnail: creating its image failed (", e.message(), ")"));
+        return;
+      }
+    }
+
+    const VkImageSubresourceLayers subresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    VkImageBlit blit;
+    blit.srcSubresource = subresource;
+    blit.srcOffsets[0] = VkOffset3D { 0, 0, 0 };
+    blit.srcOffsets[1] = VkOffset3D { int32_t(source.width), int32_t(source.height), 1 };
+    blit.dstSubresource = subresource;
+    blit.dstOffsets[0] = VkOffset3D { 0, 0, 0 };
+    blit.dstOffsets[1] = VkOffset3D { int32_t(width), int32_t(height), 1 };
+    const VkComponentMapping identity = { VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+                                          VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY };
+    ctx->blitImage(m_thumbnailImage, identity, image, identity, blit, VK_FILTER_LINEAR);
+
+    // The tone mapping state is read now, so the conversion matches the frame even when it is written later.
+    auto frame = std::make_unique<Job>();
+    frame->layout = layout;
+    frame->width = width;
+    frame->height = height;
+    frame->hdr = DxvkToneMapping::hdrOutputActive() && layout == PixelLayout::Rgba16Float;
+    if (frame->hdr) {
+      frame->uiNits = DxvkToneMapping::hdrUiNitsClamped();
+      frame->conversion.sceneScale = DxvkToneMapping::hdrSceneToBackBufferScale();
+      frame->conversion.toneMapped = DxvkToneMapping::tonemappingEnabled();
+    }
+    m_thumbnailFrame = std::move(frame);
+  }
+
+  void RtxScreenshot::serviceThumbnail(DxvkContext* ctx) {
+    const std::string request = thumbnailRequest();
+    if (request.empty() || request == m_handledThumbnailRequest || m_thumbnailFrame == nullptr) {
+      return;
+    }
+    m_handledThumbnailRequest = request;
+
+    auto job = std::make_unique<Job>(*m_thumbnailFrame);
+    job->thumbnailRequest = request;
+
+    DxvkBufferCreateInfo info;
+    info.size = VkDeviceSize(job->width) * job->height * bytesPerPixel(job->layout);
+    info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    info.access = VK_ACCESS_TRANSFER_WRITE_BIT;
+    try {
+      job->buffer = ctx->getDevice()->createBuffer(info, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+                                                   DxvkMemoryStats::Category::RTXBuffer, "Screenshot thumbnail readback");
+    } catch (const DxvkError& e) {
+      Logger::warn(str::format("[Screenshot] no thumbnail: creating its readback buffer failed (", e.message(), ")"));
+      return;
+    }
+
+    const VkImageSubresourceLayers subresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    job->fence = new sync::Fence(0);
+    ctx->copyImageToBuffer(job->buffer, 0, 0, 0, m_thumbnailImage, subresource, VkOffset3D { 0, 0, 0 },
+                           m_thumbnailImage->info().extent);
+    ctx->emitMemoryBarrier(0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                           VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT);
+    ctx->signal(job->fence, 1);
+
+    {
+      std::lock_guard<std::mutex> lock(m_queueMutex);
+      if (!m_worker.joinable()) {
+        m_worker = std::thread([this] { runWorker(); });
+      }
+      m_queue.push_back(std::move(job));
+    }
+    m_queueCondition.notify_one();
+  }
+
   void RtxScreenshot::runWorker() {
     env::setThreadName("rtx-screenshot");
     while (true) {
@@ -507,6 +666,9 @@ namespace dxvk {
         }
         if (!job.markPath.empty()) {
           Logger::warn(str::format("[Mark] screenshot not saved: ", reason, " (", job.markPath, ")"));
+        }
+        if (!job.thumbnailRequest.empty()) {
+          Logger::warn(str::format("[Screenshot] thumbnail not saved: ", reason));
         }
         return;
       }
@@ -632,6 +794,10 @@ namespace dxvk {
         Logger::warn(str::format("[Screenshot] not saved: writing ", job.hdr ? hdrPath + " or " + sdrPath : sdrPath, " failed"));
         setHudMessage("Screenshot not saved", "The log has the details.", kSavedMessageSeconds);
       }
+    }
+
+    if (!job.thumbnailRequest.empty() && !writeThumbnail(job.thumbnailRequest, job.width, job.height, sdr)) {
+      Logger::warn("[Screenshot] thumbnail not saved: writing rtx-remix\\thumbnail.rgb failed");
     }
 
     if (!job.markPath.empty()) {

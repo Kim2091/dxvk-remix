@@ -30,6 +30,7 @@
 
 #include "rtx_types.h"
 #include "rtx_common_object.h"
+#include <d3d9types.h>
 
 namespace dxvk 
 {
@@ -53,7 +54,7 @@ public:
   explicit DrawCallCache(DxvkDevice* device);
   ~DrawCallCache();
 
-  CacheState get(const SceneDraw& drawCall, BlasEntry** out);
+  CacheState get(const DrawCallState& drawCall, BlasEntry** out);
 
   MultimapType& getEntries() {return m_entries;}
 
@@ -64,7 +65,7 @@ public:
 private:
   MultimapType m_entries;
 
-  BlasEntry* allocateEntry(XXH64_hash_t hash, const SceneDraw& drawCall);
+  BlasEntry* allocateEntry(XXH64_hash_t hash, const DrawCallState& drawCall);
 };
 
 }  // namespace nvvk

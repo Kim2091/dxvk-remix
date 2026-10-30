@@ -153,8 +153,20 @@ namespace dxvk {
           ++m_geometryHashCacheHits;
           perf::countD3D9(perf::D3D9Ctr::MemoHits);
 
-          // The memoized hashes are returned as a ready Future, which takes no worker task slot.
-          return Future<GeometryHashes>::ready(GeometryHashes(it->second));
+          if (geometryHashMemoInline()) {
+            // Served inline: no worker round trip. finalizeGeometryHashes() takes `hashes` as is.
+            geoData.hashes = it->second;
+            geoData.hashesPrecomputed = true;
+            return Future<GeometryHashes>();
+          }
+
+          // Future is single-consumption - get() clears its task pointer - so a stored Future cannot
+          // be handed out twice. Schedule a task that simply returns the memoized value instead: the
+          // dispatch is kept, but the buffer acquisition and the content hashing are both skipped.
+          const GeometryHashes cachedHashes = it->second;
+          return m_pGeometryWorkers->Schedule([cachedHashes]() -> GeometryHashes {
+            return cachedHashes;
+          });
         }
         perf::countD3D9(perf::D3D9Ctr::MemoSelfCheckRuns);
       } else {
@@ -195,12 +207,14 @@ namespace dxvk {
 
     // Assume the GPU changed the data via shaders, include the constant buffer data in hash
     XXH64_hash_t vertexShaderHash = kEmptyHash;
+    XXH64_hash_t vertexShaderBytecodeHash = kEmptyHash; // Side field for the D3D9 identity classifier only
     if (m_parent->UseProgrammableVS() && useVertexCapture()) {
       if (RtxOptions::geometryHashGenerationRule().test(HashComponents::GeometryDescriptor)) {
         const D3D9ConstantSets& cb = m_parent->m_consts[DxsoProgramTypes::VertexShader];
         const D3D9CommonShader* pVertexShader = d3d9State().vertexShader->GetCommonShader();
         // Hashed once when the shader was created.
         vertexShaderHash = pVertexShader->GetBytecodeHash();
+        vertexShaderBytecodeHash = vertexShaderHash;
         vertexShaderHash = XXH3_64bits_withSeed(&d3d9State().vsConsts.fConsts[0], cb.meta.maxConstIndexF * sizeof(float) * 4, vertexShaderHash);
         vertexShaderHash = XXH3_64bits_withSeed(&d3d9State().vsConsts.iConsts[0], cb.meta.maxConstIndexI * sizeof(int) * 4, vertexShaderHash);
         vertexShaderHash = XXH3_64bits_withSeed(&d3d9State().vsConsts.bConsts[0], cb.meta.maxConstIndexB * sizeof(uint32_t)/32, vertexShaderHash);
@@ -222,10 +236,10 @@ namespace dxvk {
       vertexLayoutHash = hashVertexLayout(geoData);
     }
 
-    return m_pGeometryWorkers->ScheduleOrRun([this, memoizationKey, vertexRegions, indexBufferRef = indexBufferRef.ptr(),
+    return m_pGeometryWorkers->Schedule([this, memoizationKey, vertexRegions, indexBufferRef = indexBufferRef.ptr(),
                                  pIndexData, indexStride, indexDataSize, indexCount,
                                  maxIndexValue, vertexShaderHash, geometryDescriptorHash,
-                                 vertexLayoutHash, selfCheck]() -> GeometryHashes {
+                                 vertexLayoutHash, selfCheck, vertexShaderBytecodeHash]() -> GeometryHashes {
       ScopedCpuProfileZone();
 
       GeometryHashes hashes;
@@ -234,6 +248,7 @@ namespace dxvk {
       hashes[HashComponents::GeometryDescriptor] = geometryDescriptorHash;
       hashes[HashComponents::VertexLayout] = vertexLayoutHash;
       hashes[HashComponents::VertexShader] = vertexShaderHash;
+      hashes.vertexShaderBytecode = vertexShaderBytecodeHash;
 
       // Index hash
       switch (indexStride) {
@@ -310,7 +325,7 @@ namespace dxvk {
     auto vertexBuffer = geoData.positionBuffer.buffer().ptr();
     vertexBuffer->incRef();
 
-    return m_pGeometryWorkers->ScheduleOrRun([pVertexData, vertexCount, vertexStride, vertexBuffer]()->AxisAlignedBoundingBox {
+    return m_pGeometryWorkers->Schedule([pVertexData, vertexCount, vertexStride, vertexBuffer]()->AxisAlignedBoundingBox {
       ScopedCpuProfileZone();
 
 #if defined(_M_ARM64) || defined(_M_ARM64EC)

@@ -6,10 +6,10 @@
 #include <algorithm>
 #include <cstdio>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "rtx_imgui.h"
-#include "rtx_instance_manager.h"
 #include "rtx_opacity_micromap_manager.h"
 #include "../dxvk_perf_counters.h"
 #include "../../util/log/log.h"
@@ -18,37 +18,30 @@
 namespace dxvk {
 
   namespace {
-    // Point-instancer opacity micromap state of one lane, summed over the interval's frames.
-    struct PointInstancerLane {
-      uint64_t groups = 0;         // per-geometry BLAS groups holding a point instancer
-      uint64_t shared = 0;         // groups with more than one instance
-      uint64_t bindTried = 0;      // groups that asked for a micromap
-      uint64_t bound = 0;          // groups that got one
-      uint64_t instances = 0;      // point-instancer instances
-      uint64_t placements = 0;     // their placements
-      uint64_t users = 0;          // instances that use opacity micromaps
-      uint64_t requested = 0;      // instances linked to a micromap request
-      uint64_t built = 0;          // instances whose micromap is built
-      uint64_t texelsWaiting = 0;  // instances whose request waits for texel footprints
-      uint64_t notCandidate = 0;   // users without a request that are not micromap candidates
-      uint64_t gates[uint32_t(D3d9Alpha::OmmGate::Count)] = {};  // candidates by the step they stopped at
+    struct TrackerTopologyStats {
+      uint32_t created[uint32_t(D3d9Alpha::TrackerCreateReason::Count)] = {};
+      XXH64_hash_t lastMaterial = 0;
+      uint32_t total() const {
+        uint32_t sum = 0;
+        for (uint32_t c : created) {
+          sum += c;
+        }
+        return sum;
+      }
     };
-    constexpr const char* kOmmGateNames[uint32_t(D3d9Alpha::OmmGate::Count)] = {
-      "noBlas", "newInstance", "retryWait", "throttled", "noBudget", "notUser", "texturesNotResident", "blacklisted",
-      "statsFull", "belowFilter", "registerFailed", "registered" };
-    enum Lane : uint32_t { kDirect = 0, kLegacy = 1, kLaneCount = 2 };
 
     // Written on the CS thread only (scene preparation and draw submission), read by the perf log on the same thread.
     struct Stats {
       uint32_t frames = 0;
       uint64_t sharedOmm[6] = {};        // by SharedOmmOutcome
       uint64_t sharedOmmInstances = 0;   // instances of the BLASes above
-      PointInstancerLane pointInstancers[kLaneCount];
-      uint64_t pointInstancerMixedGroups = 0;  // groups with instances of both lanes, counted under the direct lane
-      uint64_t unlinkedIdle[kLaneCount] = {};
-      uint64_t unlinkedIdlePointInstancers[kLaneCount] = {};
+      uint64_t trackerCreated[uint32_t(D3d9Alpha::TrackerCreateReason::Count)] = {};
+      std::unordered_map<XXH64_hash_t, TrackerTopologyStats> trackerByTopology;
     };
     Stats s_stats;
+
+    // Bounds the per-topology map between two log lines.
+    constexpr size_t kMaxTrackedTopologies = 4096;
   }
 
   bool D3d9Alpha::statsActive() {
@@ -64,52 +57,17 @@ namespace dxvk {
     s_stats.frames++;
   }
 
-  void D3d9Alpha::notePointInstancerGroup(const std::vector<RtInstance*>& instances, const OpacityMicromapManager& omm,
-                                          bool bindTried, bool bound) {
-    bool direct = false;
-    bool legacy = false;
-    for (const RtInstance* instance : instances) {
-      if (instance->surface.instancesToObject != nullptr) {
-        (instance->getSceneOwnedHandle() != 0 ? direct : legacy) = true;
+  void D3d9Alpha::noteTrackerCreation(TrackerCreateReason reason, XXH64_hash_t topologyHash, XXH64_hash_t materialHash) {
+    s_stats.trackerCreated[uint32_t(reason)]++;
+    auto it = s_stats.trackerByTopology.find(topologyHash);
+    if (it == s_stats.trackerByTopology.end()) {
+      if (s_stats.trackerByTopology.size() >= kMaxTrackedTopologies) {
+        return;
       }
+      it = s_stats.trackerByTopology.emplace(topologyHash, TrackerTopologyStats{}).first;
     }
-    if (!direct && !legacy) {
-      return;
-    }
-    s_stats.pointInstancerMixedGroups += (direct && legacy) ? 1 : 0;
-    PointInstancerLane& group = s_stats.pointInstancers[direct ? kDirect : kLegacy];
-    group.groups++;
-    group.shared += instances.size() > 1 ? 1 : 0;
-    group.bindTried += bindTried ? 1 : 0;
-    group.bound += bound ? 1 : 0;
-    for (const RtInstance* instance : instances) {
-      if (instance->surface.instancesToObject == nullptr) {
-        continue;
-      }
-      PointInstancerLane& lane = s_stats.pointInstancers[instance->getSceneOwnedHandle() != 0 ? kDirect : kLegacy];
-      const OpacityMicromapInstanceData& data = instance->getOpacityMicromapInstanceData();
-      lane.instances++;
-      lane.placements += instance->surface.instancesToObject->size();
-      lane.users += OpacityMicromapManager::usesOpacityMicromap(*instance) ? 1 : 0;
-      lane.requested += data.isOmmBuildRequestedAnyGeneration() ? 1 : 0;
-      lane.built += omm.getOmmReadiness(*instance) == 2 ? 1 : 0;
-      lane.texelsWaiting += data.waitsForTexelFootprints() ? 1 : 0;
-      lane.notCandidate += OpacityMicromapManager::usesOpacityMicromap(*instance) &&
-                           !data.isOmmBuildRequestedAnyGeneration() && !omm.isOmmCandidate(*instance) ? 1 : 0;
-    }
-  }
-
-  void D3d9Alpha::noteOmmCandidateGate(const RtInstance& instance, OmmGate gate) {
-    if (instance.surface.instancesToObject == nullptr) {
-      return;
-    }
-    s_stats.pointInstancers[instance.getSceneOwnedHandle() != 0 ? kDirect : kLegacy].gates[uint32_t(gate)]++;
-  }
-
-  void D3d9Alpha::noteOmmUnlinkedIdle(const RtInstance& instance) {
-    const uint32_t lane = instance.getSceneOwnedHandle() != 0 ? kDirect : kLegacy;
-    s_stats.unlinkedIdle[lane]++;
-    s_stats.unlinkedIdlePointInstancers[lane] += instance.surface.instancesToObject != nullptr ? 1 : 0;
+    it->second.created[uint32_t(reason)]++;
+    it->second.lastMaterial = materialHash;
   }
 
   void D3d9Alpha::logStats(const OpacityMicromapManager* omm) {
@@ -120,6 +78,7 @@ namespace dxvk {
       return std::string(buf);
     };
     const auto& so = s_stats.sharedOmm;
+    const auto& tc = s_stats.trackerCreated;
 
     // sharedOmm*: per frame, multi-instance per-geometry BLASes whose instances use OMMs, by outcome.
     // wouldBind = compatible while rtx.opacityMicromap.bindSharedBlas is off. builtNeverBound: micromaps in
@@ -133,32 +92,32 @@ namespace dxvk {
       " twoState=", perFrame(so[uint32_t(SharedOmmOutcome::TwoState)]),
       " instances=", perFrame(s_stats.sharedOmmInstances),
       " builtNeverBound=", omm ? omm->countBuiltNeverBound() : 0,
+      " | trackerCreated newTopology=", perFrame(tc[uint32_t(TrackerCreateReason::NewTopology)]),
+      " materialMismatch=", perFrame(tc[uint32_t(TrackerCreateReason::MaterialMismatch)]),
+      " noneInRange=", perFrame(tc[uint32_t(TrackerCreateReason::NoneInRange)]),
       " | bindSharedBlas=", bindSharedBlas() ? 1 : 0));
 
-    // Per frame, by lane. users, requested, built and texelsWaiting count point-instancer instances. unlinkedIdle
-    // counts every instance a bake unlinked from its micromap requests (pointInstancers: those that are one).
-    // notCandidate counts users without a request that the micromap manager no longer visits. gates counts the
-    // candidates the manager visited by the step they stopped at.
-    const auto laneLine = [&](uint32_t lane) {
-      const PointInstancerLane& l = s_stats.pointInstancers[lane];
-      std::string line = str::format("groups=", perFrame(l.groups), " shared=", perFrame(l.shared),
-        " bindTried=", perFrame(l.bindTried), " bound=", perFrame(l.bound),
-        " instances=", perFrame(l.instances), " placements=", perFrame(l.placements),
-        " users=", perFrame(l.users), " requested=", perFrame(l.requested), " built=", perFrame(l.built),
-        " texelsWaiting=", perFrame(l.texelsWaiting),
-        " unlinkedIdle=", perFrame(s_stats.unlinkedIdle[lane]),
-        " (pointInstancers ", perFrame(s_stats.unlinkedIdlePointInstancers[lane]), ")",
-        " notCandidate=", perFrame(l.notCandidate), " gates:");
-      for (uint32_t g = 0; g < uint32_t(OmmGate::Count); ++g) {
-        line += str::format(" ", kOmmGateNames[g], "=", perFrame(l.gates[g]));
+    const uint32_t topN = trackerCreationLogTopN();
+    if (topN != 0 && !s_stats.trackerByTopology.empty()) {
+      std::vector<std::pair<XXH64_hash_t, const TrackerTopologyStats*>> sorted;
+      sorted.reserve(s_stats.trackerByTopology.size());
+      for (const auto& [hash, entry] : s_stats.trackerByTopology) {
+        sorted.emplace_back(hash, &entry);
       }
-      return line;
-    };
-    if (s_stats.pointInstancers[kDirect].groups + s_stats.pointInstancers[kLegacy].groups +
-        s_stats.unlinkedIdle[kDirect] + s_stats.unlinkedIdle[kLegacy] != 0) {
-      Logger::info(str::format("[D3d9Alpha] pointInstancers direct: ", laneLine(kDirect),
-        " | legacy: ", laneLine(kLegacy),
-        " | mixedGroups=", perFrame(s_stats.pointInstancerMixedGroups)));
+      const size_t count = std::min<size_t>(topN, sorted.size());
+      std::partial_sort(sorted.begin(), sorted.begin() + count, sorted.end(), [](const auto& a, const auto& b) {
+        return a.second->total() > b.second->total();
+      });
+      std::string line = "[D3d9Alpha] trackerCreated top (topology hash: newTopology/materialMismatch/noneInRange, last material):";
+      for (size_t i = 0; i < count; ++i) {
+        const TrackerTopologyStats& e = *sorted[i].second;
+        line += str::format(" 0x", std::hex, sorted[i].first, std::dec, ": ",
+          e.created[uint32_t(TrackerCreateReason::NewTopology)], "/",
+          e.created[uint32_t(TrackerCreateReason::MaterialMismatch)], "/",
+          e.created[uint32_t(TrackerCreateReason::NoneInRange)],
+          " mat 0x", std::hex, e.lastMaterial, std::dec, ";");
+      }
+      Logger::info(line);
     }
 
     s_stats = Stats{};

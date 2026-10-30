@@ -21,6 +21,24 @@
 */
 #pragma once
 
+// See OPAQUE_SURFACE_MATERIAL_FLAG_FNV_LAYOUT.
+bool opaqueSurfaceMaterialIsFnvLayout(OpaqueSurfaceMaterial opaqueSurfaceMaterial)
+{
+  return (uint(opaqueSurfaceMaterial.flags) & OPAQUE_SURFACE_MATERIAL_FLAG_FNV_LAYOUT_MASK) == OPAQUE_SURFACE_MATERIAL_FLAG_FNV_LAYOUT;
+}
+
+uint opaqueSurfaceMaterialFnvFlags(OpaqueSurfaceMaterial opaqueSurfaceMaterial)
+{
+  return opaqueSurfaceMaterialIsFnvLayout(opaqueSurfaceMaterial) ? uint(opaqueSurfaceMaterial.roughnessFloorBits) : 0u;
+}
+
+uint opaqueSurfaceMaterialTerrainLayersIndex(OpaqueSurfaceMaterial opaqueSurfaceMaterial)
+{
+  return opaqueSurfaceMaterialIsFnvLayout(opaqueSurfaceMaterial)
+    ? (uint(opaqueSurfaceMaterial.specularMetalParams) | (uint(opaqueSurfaceMaterial.specularMetalTint) << 16))
+    : SURFACE_INDEX_INVALID;
+}
+
 // Opaque Surface Material Functions
 
 OpaqueSurfaceMaterial opaqueSurfaceMaterialCreate(MemoryPolymorphicSurfaceMaterial memoryPolymorphicSurfaceMaterial, const bool visibilityCheckOnly = false)
@@ -39,12 +57,30 @@ OpaqueSurfaceMaterial opaqueSurfaceMaterialCreate(MemoryPolymorphicSurfaceMateri
     opaqueSurfaceMaterial.anisotropy = 0.h;
     opaqueSurfaceMaterial.emissiveColorConstant = 0.h;
     opaqueSurfaceMaterial.emissiveIntensity = 0.h;
+    // The terrain-layers blend and the FNV flags only affect albedo/normal/roughness/emissive, never
+    // visibility: drop the FNV layout (the host-encoding flags are unaffected, their textures are invalid here).
+    if (opaqueSurfaceMaterialIsFnvLayout(opaqueSurfaceMaterial))
+    {
+      opaqueSurfaceMaterial.flags &= uint16_t(~uint(OPAQUE_SURFACE_MATERIAL_FLAG_FNV_LAYOUT_MASK));
+    }
     return opaqueSurfaceMaterial;
   }
   else
   {
     return reinterpret<OpaqueSurfaceMaterial>(memoryPolymorphicSurfaceMaterial);
   }
+}
+
+// Terrain Layers Material Functions
+TerrainLayersMaterial terrainLayersMaterialCreate(MemoryPolymorphicSurfaceMaterial memoryPolymorphicSurfaceMaterial)
+{
+  return reinterpret<TerrainLayersMaterial>(memoryPolymorphicSurfaceMaterial);
+}
+
+// Per-layer height maps of a terrain-layers entry.
+TerrainLayersHeightMaterial terrainLayersHeightMaterialCreate(MemoryPolymorphicSurfaceMaterial memoryPolymorphicSurfaceMaterial)
+{
+  return reinterpret<TerrainLayersHeightMaterial>(memoryPolymorphicSurfaceMaterial);
 }
 
 // Subsurface Material Functions

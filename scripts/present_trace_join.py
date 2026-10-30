@@ -2,7 +2,7 @@
 """Line a PresentMon capture up against Remix's per-present trace (rtx.present.traceCsv).
 
 Usage:
-  presentmon --process_name <game>.exe --qpc_time_ms --timed 20 --terminate_after_timed --output_file pm.csv
+  presentmon --process_name Fallout4.exe --qpc_time_ms --timed 20 --terminate_after_timed --output_file pm.csv
   (with rtx.present.traceCsv = True in rtx.conf or the dev menu, so rtx-remix/logs/remix-present-trace.csv is written)
   python scripts/present_trace_join.py pm.csv "<game dir>/rtx-remix/logs/remix-present-trace.csv" [--dump N]
 

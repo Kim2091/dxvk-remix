@@ -27,23 +27,16 @@
 #include "rtx_mipmap.h"
 #include "../util/util_struct_hash.h"
 
-#include <functional>
-
 namespace dxvk {
-  namespace frontend {
-    struct RasterDrawInfo;
-    struct RasterPass;
-  }
 
   class TerrainBaker {
   public:
     TerrainBaker() { }
     ~TerrainBaker() { }
 
-    // Bakes a frontend's draw into the cascades: draw runs once per cascade of every material channel baked.
-    // Returns true when the albedo channel was baked.
-    bool bakeDrawCall(Rc<RtxContext> rtxContext, const DxvkContextState& dxvkCtxState, const frontend::RasterDrawInfo& info,
-                      const std::function<void(const frontend::RasterPass&)>& draw, OpaqueMaterialData* replacementMaterial,
+    bool bakeDrawCall(Rc<RtxContext> rtxContext, const DxvkContextState& dxvkCtxState,
+                      DxvkRaytracingInstanceState& rtState, const DrawParameters& params,
+                      const DrawCallState& drawCallState, OpaqueMaterialData* replacementMaterial,
                       Matrix4& textureTransformOut);
     TerrainArgs getTerrainArgs() const;
 
@@ -172,17 +165,17 @@ namespace dxvk {
       float lastCascadeScale; // Scale applied on last cascade's size to expand it to cover the whole cascade map span
       uint32_t frameIndex = kInvalidFrameIndex;  // Frame index for which the parameters have been calculated
     };
-    bool gatherAndPreprocessReplacementTextures(Rc<RtxContext> ctx, const frontend::RasterDrawInfo& info, OpaqueMaterialData* replacementMaterial, std::vector<RtxGeometryUtils::TextureConversionInfo>& replacementTextures);
+    bool gatherAndPreprocessReplacementTextures(Rc<RtxContext> ctx, const DrawCallState& drawCallState, OpaqueMaterialData* replacementMaterial, std::vector<RtxGeometryUtils::TextureConversionInfo>& replacementTextures);
     void updateMaterialData(Rc<RtxContext> ctx);
     void onFrameBegin(Rc<RtxContext> ctx, const DxvkContextState& dxvkCtxState);
-    void registerTerrainMesh(Rc<RtxContext> ctx, const DxvkContextState& dxvkCtxState, const frontend::RasterDrawInfo& info);
+    void registerTerrainMesh(Rc<RtxContext> ctx, const DxvkContextState& dxvkCtxState, const DrawCallState& drawCallState);
     void calculateTerrainBBOX(const uint32_t currentFrameIndex);
     void calculateBakingParameters(Rc<RtxContext> ctx, const DxvkContextState& dxvkCtxState);
     void updateTextureFormat(const DxvkContextState& dxvkCtxState);
     void calculateCascadeMapResolution(const Rc<DxvkDevice>& device);
     const RtxMipmap::Resource& getTerrainTexture(Rc<DxvkContext> ctx, RtxTextureManager& textureManager, ReplacementMaterialTextureType::Enum textureType, uint32_t width, uint32_t height);
     void clearMaterialTexture(Rc<DxvkContext> ctx, ReplacementMaterialTextureType::Enum textureType);
-    static bool isPSReplacementSupportEnabled(const frontend::RasterDrawInfo& info);
+    static bool isPSReplacementSupportEnabled(const DrawCallState& drawCallState);
     VkClearColorValue getClearColor(ReplacementMaterialTextureType::Enum textureType);
 
     BakingParameters m_bakingParams;
@@ -206,7 +199,7 @@ namespace dxvk {
 
     class AxisAlignedBoundingBoxLink {
     public:
-      AxisAlignedBoundingBoxLink(const AxisAlignedBoundingBox& objectBounds, const Matrix4& objectToWorld);
+      AxisAlignedBoundingBoxLink(const DrawCallState& drawCallState);
       AxisAlignedBoundingBox calculateAABBInWorldSpace();
 
     private:

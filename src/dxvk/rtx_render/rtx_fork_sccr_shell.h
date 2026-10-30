@@ -84,9 +84,17 @@ namespace dxvk {
 
     // AccelManager's surface upload, right after RtSurface::writeGPUData wrote the Surface record that starts at record:
     // overwrites its data15.w with the slot of instance's shell buffer (0xFFFF without one). Read-only, so it may run on
-    // the upload's worker threads. Nothing changes the cache while the upload runs, since both run on the thread that
-    // records the frame, prepareFrame first.
+    // the upload's worker threads; nothing changes the cache while the upload runs (both run on the thread that records
+    // the frame, prepareFrame first). Then SccrTessManager::patchSurfaceRecord (real geometry) gets its turn.
     void patchSurfaceRecord(unsigned char* record, const RtInstance& instance) const;
+
+    // SCCR real geometry (SccrTessManager): whether instance may use a tessellated mesh, from draw state and material
+    // only (never whether the shell data exists yet, so the flag is stable): shell-eligible, fully opaque and opaque in
+    // the TLAS, no clip plane, not a view or player model, not a point instancer, one build geometry, texture coordinates from the buffer as they are (no transform,
+    // generation or sprite sheet). Two-sided draws qualify.
+    static bool isRealGeometryCandidate(const SceneManager& sceneManager, const RtInstance& instance);
+    // The shell buffer bound to instance's mesh this frame (null without one), for the tessellator.
+    Rc<DxvkBuffer> shellBufferFor(const RtInstance& instance) const;
 
     // The SCCR march budgets as one quality level. Custom means the budgets match none of the levels.
     enum class Quality { High, Medium, Low, Custom };
@@ -106,7 +114,7 @@ namespace dxvk {
 
     // For the settings UI and the log: the last frame's counts.
     struct Stats {
-      // Instances with an eligible material (opaque and displaced) on static geometry, and those of them whose
+      // Instances with an eligible material (opaque, displaced, not terrain) on static geometry, and those of them whose
       // mesh had shell data bound this frame.
       uint32_t eligibleSurfaces = 0;
       uint32_t boundSurfaces = 0;
@@ -122,12 +130,13 @@ namespace dxvk {
       size_t bytes = 0;
       // Why the other instances of the table got no shell data, one count per instance (diagnostics, so a zero above
       // explains itself in the log): no geometry linked; a material index outside the material cache; a material that
-      // is not opaque; an opaque one without displacement; skinned; vertices changed twice; eligible, but its mesh
-      // cannot be built (counted in eligibleSurfaces too).
+      // is not opaque; an opaque one without displacement; blended terrain (marches layer heights); skinned; vertices
+      // changed twice; eligible, but its mesh cannot be built (counted in eligibleSurfaces too).
       uint32_t noGeometry = 0;
       uint32_t noMaterial = 0;
       uint32_t notOpaque = 0;
       uint32_t notDisplaced = 0;
+      uint32_t terrain = 0;
       uint32_t skinnedSurfaces = 0;
       uint32_t animatedSurfaces = 0;
       uint32_t unsupportedSurfaces = 0;
@@ -147,7 +156,8 @@ namespace dxvk {
                "reflected (PSR) hits closer than rtx.displacement.shell.maxDistance. The outline stays the mesh's.\n"
                "While on, SCCR ignores the zero plane (the mesh is the top of the relief) and always uses world-unit "
                "depth, so rtx.displacement.referenceWorldUnitsPerUv must be above 0. SCCR mode only. Skinned and "
-               "vertex-animated meshes use plain SCCR. Turning it off, or leaving SCCR mode, frees the data.");
+               "vertex-animated meshes and blended terrain layers use plain SCCR. Turning it off, or leaving SCCR mode, "
+               "frees the data.");
     RTX_OPTION("rtx.displacement.shell", float, maxDistance, 2000.0f,
                "SCCR shell tracing: the hit distance, in world units, beyond which pixels use plain SCCR instead of the "
                "shell march. Nearer pixels also use plain SCCR where the whole relief depth is less than a pixel. 0 "
@@ -219,13 +229,16 @@ namespace dxvk {
 
     // Why an instance gets no shell data (Eligible: it does, once its mesh is built). The walk counts each reason
     // (Stats); patchSurfaceRecord asks the same question, so the two always agree.
-    enum class Eligibility { Eligible, NoGeometry, NoMaterial, NotOpaque, NotDisplaced, Skinned, Animated };
-    // Opaque and displaced. material may be null (an index outside the material cache).
-    static Eligibility classifyMaterial(const RtSurfaceMaterial* material);
+    enum class Eligibility { Eligible, NoGeometry, NoMaterial, NotOpaque, NotDisplaced, Terrain, Skinned, Animated };
+    // Opaque, displaced, and not blended terrain. material may be null (an index outside the material cache).
+    static Eligibility classifyMaterial(const SceneManager& sceneManager, const RtSurfaceMaterial* material);
     // Skinned, or vertices changed twice: plain SCCR.
     static Eligibility classifyGeometry(const BlasEntry& blas);
     // Both, for one instance of the table.
     static Eligibility classify(const SceneManager& sceneManager, const RtInstance& instance);
+    // For an Eligible instance: fully opaque and opaque in the opaque TLAS (no alpha test or blend, no clip plane, no
+    // forced non-opacity), not a view or player model. Draw state and material only.
+    static bool isSolidOpaque(const RtInstance& instance);
     static DataKey keyOf(const RaytraceGeometry& geometry);
     // The slot instance's record gets: valid only for an eligible material on static geometry whose mesh is cached.
     uint32_t slotFor(const RtInstance& instance) const;
@@ -262,6 +275,9 @@ namespace dxvk {
     std::chrono::steady_clock::time_point m_now {};
     // prepareFrame ran with shell tracing active this frame: patchSurfaceRecord binds data.
     bool m_frameActive = false;
+    // Some instance may still carry RtInstance::isRealGeometry from a frame with real geometry on (cleared once shell
+    // tracing is off).
+    bool m_flagsSet = false;
     bool m_wasActive = false;
     // The weldEpsilon the current data was built with (a change rebuilds everything).
     float m_builtWeldEpsilon = 0.0f;

@@ -1,6 +1,6 @@
 #pragma once
 
-// Fork: numos::IGpu over DXVK, the GPU half of the NUMOS sky provider (submodules/numos).
+// Implements numos::IGpu over DXVK, the GPU half of the NUMOS sky provider (submodules/numos).
 //
 // NUMOS records its passes through this interface while the frame's DxvkContext is bound
 // (beginFrame), and the rest of Remix reads NUMOS's outputs back as DXVK objects (view, buffer,
