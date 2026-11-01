@@ -653,6 +653,9 @@ namespace dxvk {
     if (check.ri->prims.size() != 1) {
       return fail("has a replacement instance with other than one prim");
     }
+    if (check.ri->activeReplacements != nullptr) {
+      return fail("has a replacement instance built from a USD mesh replacement");
+    }
     if (!check.ri->dirtyFlags.isClear()) {
       return fail("has a replacement instance with dirty flags");
     }

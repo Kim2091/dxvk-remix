@@ -21,6 +21,7 @@
 */
 #include "rtx_asset_data_manager.h"
 #include "rtx_utils.h"
+#include <atomic>
 #include <unordered_set>
 #include "rtx_options.h"
 #include "rtx_asset_package.h"
@@ -287,7 +288,10 @@ namespace dxvk {
                                   GENERIC_READ, FILE_SHARE_READ, NULL,
                                   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
         if (hFile == INVALID_HANDLE_VALUE) {
-          ONCE(Logger::warn(str::format("CreateFile fail (error=", GetLastError(), "): ", m_filename)));
+          static std::atomic<uint32_t> s_warningCount { 0 };
+          if (s_warningCount.fetch_add(1) < 64) {
+            Logger::warn(str::format("CreateFile fail (error=", GetLastError(), "): ", m_filename));
+          }
           return nullptr;
         }
         assert(GetFileSize(hFile, NULL) == m_fileSize);

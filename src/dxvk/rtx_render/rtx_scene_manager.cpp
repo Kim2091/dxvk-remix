@@ -1521,6 +1521,13 @@ namespace dxvk {
       ONCE(Logger::err("pReplacements should never be nullptr in SceneManager::drawReplacements"));
       return;
     }
+
+    // Prim slots are sized for one bucket, and an instance without a slot is never collected.
+    // Prims of a plain draw or of another bucket therefore go first.
+    if (replacementInstance->activeReplacements != pReplacements) {
+      replacementInstance->clear();
+    }
+
     // If the index contains an RtInstance, get a pointer to it.
     auto getExistingInstance = [replacementInstance](size_t idx) -> RtInstance* {
       if (replacementInstance->prims.size() <= idx) {
@@ -1554,7 +1561,8 @@ namespace dxvk {
           //  as part of this replacementInstance, so invoke setup and set the root.
           replacementInstance->setup(PrimInstance(instance, PrimInstance::Type::Instance), replacements.size(), pReplacements);
           instance->getPrimInstanceOwner().setReplacementInstance(replacementInstance, i, instance, PrimInstance::Type::Instance);
-        } else if (replacementInstance->prims[i].getUntyped() != instance) {
+        } else if (replacementInstance->prims.size() > i &&
+                   replacementInstance->prims[i].getUntyped() != instance) {
           instance->getPrimInstanceOwner().setReplacementInstance(replacementInstance, i, instance, PrimInstance::Type::Instance);
         }
       }
@@ -4278,8 +4286,10 @@ namespace dxvk {
     if (steady && verifySteady && replacementInstance != entry.steadyRI) {
       steadyMismatch("found a different replacement instance");
     }
+    // A prim of a USD replacement takes the full replay, which rebuilds it when the replacement has gone.
     if (replacementInstance == nullptr ||
         replacementInstance->prims.size() != 1 ||
+        replacementInstance->activeReplacements != nullptr ||
         !replacementInstance->dirtyFlags.isClear()) {
       return reject();
     }
@@ -5013,6 +5023,14 @@ namespace dxvk {
     state.drawCall.drawCallID = externalObjectPickingValue(state.drawCall, *replacementInstance);
 
     auto pReplacements = fork_hooks::externalDrawMeshReplacement(*m_pReplacer, meshHash);
+
+    // A plain draw owns one prim per submesh, and an instance without a slot is never collected.
+    // Prims of a replacement or of another submesh count therefore go first.
+    if (pReplacements == nullptr &&
+        (replacementInstance->activeReplacements != nullptr ||
+         (!replacementInstance->prims.empty() && replacementInstance->prims.size() != submeshes.size()))) {
+      replacementInstance->clear();
+    }
 
     // An external draw that has not drifted since its last full submission reuses the instances it produced
     // instead of re-deriving their draw state, as submitDrawState does for D3D9 draws.

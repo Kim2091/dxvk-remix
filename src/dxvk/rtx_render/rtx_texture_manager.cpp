@@ -983,6 +983,20 @@ namespace dxvk {
       for (const ReadyToCopy& ready : m_asyncThread->retrieveReadyToUploadTextures()) {
         const Rc<ManagedTexture>& tex = ready.dstTexture;
 
+        // A failed read leaves nothing to copy, and a new image would show uninitialized memory.
+        // The texture keeps the mips it has, and asks for the rest again on a later frame.
+        if (ready.mips.empty()) {
+          static std::atomic<uint32_t> s_warningCount { 0 };
+          if (s_warningCount.fetch_add(1) < 64) {
+            Logger::warn(str::format("Texture mips could not be read, keeping the current ones: ", tex->m_assetData->info().filename));
+          }
+          if (ready.stagingbuf) {
+            ready.stagingbuf->onSliceSubmitToCmd();
+          }
+          tex->m_state = tex->m_currentMipView != nullptr ? ManagedTexture::State::kVidMem : ManagedTexture::State::kFailed;
+          continue;
+        }
+
         tex->m_currentMipView = allocDeviceImage(m_device,
                                                  tex->m_assetData,
                                                  tex->imageCreateInfo(),

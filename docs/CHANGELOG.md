@@ -58,6 +58,12 @@ D3D9 point lights can carry the host's own identity in their unused spot fields,
 - `rtx.retained.useV2` (default off) is a second implementation of Remix API retained instances whose per-frame cost follows what changed.
 - Every graphics preset keeps `rtx.enableStochasticAlphaBlend` on, so hair and other blended surfaces keep soft edges on the Medium and Low presets.
 
+### Fix: a failed texture read no longer shows uninitialized memory
+When a mip could not be read from disk, the texture manager still swapped in a new image with nothing copied into it. The texture now keeps the mips it has and asks again later, and the log names the file.
+
+### Fix: toggling replacements stacks up replacement instances on API draws
+Turning enhanced assets off and on made replaced GPU-instanced draws create new instances every frame until the game slowed to a crawl, because the external-draw path kept a replacement instance's plain prims when a replacement appeared, so extra prims had no slot and were never collected. External draws now rebuild the replacement instance when its bucket or submesh count changes, in both directions, which also removes leftover replacement prims when replacements are turned off.
+
 ## 2026-10-28
 
 ### Developer menu: settings search
