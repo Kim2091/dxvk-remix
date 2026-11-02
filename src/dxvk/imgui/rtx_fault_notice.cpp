@@ -45,7 +45,10 @@ namespace dxvk {
   namespace {
     struct Problem {
       std::string id;
+      // The key the dismissal is stored under. It names the report the problem belongs to, so a later crash shows again.
+      std::string key;
       std::string text;
+      std::string detail;
     };
 
     const ImVec4 kTitleColor(1.0f, 0.62f, 0.2f, 1.0f);
@@ -82,11 +85,29 @@ namespace dxvk {
       return newest;
     }
 
-    void addProblem(std::string id, std::string text) {
-      if (s_logged.insert(id + '|' + text).second) {
-        Logger::warn(str::format("[Problem] ", text));
+    std::string fileName(const std::string& path) {
+      return str::fromws(std::filesystem::path(str::tows(path.c_str())).filename().c_str());
+    }
+
+    void addProblem(std::string id, std::string text, std::string detail = std::string(), std::string key = std::string()) {
+      if (s_logged.insert(id + '|' + text + '|' + detail).second) {
+        Logger::warn(str::format("[Problem] ", text, detail.empty() ? "" : " ", detail));
       }
-      s_problems.push_back({ std::move(id), std::move(text) });
+      s_problems.push_back({ std::move(id), std::move(key), std::move(text), std::move(detail) });
+    }
+
+    // Returns true for a problem that is a crash, whose report file the player is asked to send.
+    bool isCrash(const Problem& problem) {
+      return problem.id == "crash" || problem.id == "gpu-crash" || problem.id == "game-crashed";
+    }
+
+    // Returns the name a problem is dismissed under.
+    // A crash reported by the game integration belongs to the file it names.
+    std::string dismissKey(const Problem& problem) {
+      if (problem.id == "game-crashed" && !FaultNotice::uploadFile().empty()) {
+        return problem.id + '@' + fileName(FaultNotice::uploadFile());
+      }
+      return problem.key.empty() ? problem.id : problem.key;
     }
 
     // Runs once to check for crashes in the previous session and to find the folders the notice names.
@@ -108,19 +129,23 @@ namespace dxvk {
 
       if (sentry::crashedLastRun()) {
         s_newestDump = newestDump(dumps);
-        addProblem("crash", s_newestDump.empty()
-          ? std::string("The renderer crashed in the previous session.")
-          : str::format("The renderer crashed in the previous session. Its crash dump is ", str::fromws(s_newestDump.c_str()), "."));
+        addProblem("crash", "The game crashed last time.",
+          s_newestDump.empty() ? std::string() : str::format("Crash dump: ", str::fromws(s_newestDump.c_str()), "."),
+          s_newestDump.empty() ? std::string() : "crash@" + str::fromws(s_newestDump.filename().c_str()));
       }
 
       std::error_code ec;
-      if (std::filesystem::remove(gpuCrashMarkerPath(logsDir), ec)) {
-        addProblem("gpu-crash", "The GPU crashed (device lost) in the previous session.");
+      const std::filesystem::path marker = gpuCrashMarkerPath(logsDir);
+      const auto markerTime = std::filesystem::last_write_time(marker, ec);
+      const std::string markerKey = ec ? std::string() : str::format("gpu-crash@", markerTime.time_since_epoch().count());
+      if (std::filesystem::remove(marker, ec)) {
+        addProblem("gpu-crash", "The GPU crashed last time.", "The graphics device was lost (device lost).", markerKey);
       }
       s_runtimeCount = s_problems.size();
     }
 
     // Rebuilds the problem list when the game integration's report changes.
+    // Each line is id|text, or id|text|details.
     void update() {
       if (!s_started) {
         start();
@@ -135,9 +160,34 @@ namespace dxvk {
       for (std::string line; std::getline(lines, line);) {
         const size_t bar = line.find('|');
         if (bar != std::string::npos && bar > 0 && bar + 1 < line.size()) {
-          addProblem(line.substr(0, bar), line.substr(bar + 1));
+          std::string text = line.substr(bar + 1);
+          std::string detail;
+          const size_t second = text.find('|');
+          if (second != std::string::npos) {
+            detail = text.substr(second + 1);
+            text.resize(second);
+          }
+          if (!text.empty()) {
+            addProblem(line.substr(0, bar), std::move(text), std::move(detail));
+          }
         }
       }
+    }
+
+    // Returns the problems the notice shows now: not dismissed, and for the toast also not shown before.
+    // A problem the runtime and the game integration both report is listed once.
+    std::vector<const Problem*> visibleProblems(bool forToast) {
+      std::vector<const Problem*> visible;
+      for (const Problem& problem : s_problems) {
+        const std::string key = dismissKey(problem);
+        if (s_ignored.count(key) || (forToast && s_seen.count(key))) {
+          continue;
+        }
+        if (std::none_of(visible.begin(), visible.end(), [&](const Problem* other) { return other->text == problem.text; })) {
+          visible.push_back(&problem);
+        }
+      }
+      return visible;
     }
 
     // Starts Explorer with the given arguments, such as a folder, or /select, and a file.
@@ -145,24 +195,71 @@ namespace dxvk {
       ShellExecuteW(nullptr, L"open", L"explorer.exe", arguments.c_str(), nullptr, SW_SHOWNORMAL);
     }
 
-    void showProblemList(bool inMenu) {
-      ImGui::TextColored(kTitleColor, "Problem detected");
-      ImGui::TextWrapped("A problem was detected. The most likely cause is a conflict with another mod or a broken install:");
+    void showInExplorer(const std::string& file) {
+      runExplorer(L"/select,\"" + str::tows(file.c_str()) + L"\"");
+    }
+
+    // Returns the file to send with a report: the crashed session's file when the game integration named it, else the newest report.
+    std::string fileToSend() {
+      return FaultNotice::uploadFile().empty() ? ImGUI::reportFilePath() : FaultNotice::uploadFile();
+    }
+
+    // Returns " in <channel>", or nothing when the game integration names no channel.
+    std::string whereToSend() {
+      return FaultNotice::supportChannel().empty() ? std::string() : " in " + FaultNotice::supportChannel();
+    }
+
+    bool hasSupportLink() {
+      return FaultNotice::supportUrl().rfind("https://", 0) == 0;
+    }
+
+    void showSupportButton() {
+      ImGui::PushStyleColor(ImGuiCol_Text, kLinkColor);
+      if (ImGui::Button("Discord")) {
+        ShellExecuteW(nullptr, L"open", str::tows(FaultNotice::supportUrl().c_str()).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+      }
+      ImGui::PopStyleColor();
+      RemixGui::SetTooltipToLastWidgetOnHover("Opens the support chat in the web browser.");
+    }
+
+    // Draws the technical part, collapsed by default: problem details, the report file, the folders and the link.
+    void showDetails() {
+      if (!ImGui::CollapsingHeader("Details")) {
+        return;
+      }
+      RemixGui::Checkbox("Show Problem Notices", &FaultNotice::enableObject());
+
       for (const Problem& problem : s_problems) {
-        const bool ignored = s_ignored.count(problem.id) != 0;
-        if (!inMenu && (ignored || s_seen.count(problem.id))) {
-          continue;
+        if (!problem.detail.empty()) {
+          ImGui::TextWrapped("%s", problem.detail.c_str());
         }
-        ImGui::Bullet();
-        ImGui::TextWrapped("%s", problem.text.c_str());
-        if (inMenu && !ignored) {
-          ImGui::PushID(problem.id.c_str());
-          if (ImGui::SmallButton("Don't Show Again")) {
-            s_ignored.insert(problem.id);
-            std::ofstream(ignoredFilePath(), std::ios::app) << problem.id << '\n';
-          }
-          RemixGui::SetTooltipToLastWidgetOnHover("Hides this problem from the notice in this and later sessions.");
-          ImGui::PopID();
+      }
+
+      const std::string file = fileToSend();
+      if (!file.empty()) {
+        ImGui::TextWrapped("Report file: %s", file.c_str());
+        if (ImGui::SmallButton("Copy Path##reportFile")) {
+          ImGui::SetClipboardText(file.c_str());
+        }
+        ImGui::TextWrapped("The report file holds one session's logs, settings, load order, crash log and the screenshots "
+                           "taken with the mark key. To report the session you are playing, use Save Report Now in the "
+                           "Host Settings tab of the developer menu.");
+      }
+
+      ImGUI::showLogFolder(false);
+
+      if (!s_dumpFolder.empty()) {
+        if (ImGui::Button("Open Crash Dump Folder")) {
+          runExplorer(s_newestDump.empty() ? L"\"" + str::tows(s_dumpFolder.c_str()) + L"\"" : L"/select,\"" + s_newestDump.wstring() + L"\"");
+        }
+        RemixGui::SetTooltipToLastWidgetOnHover("Opens the folder of the crash dumps (.dmp), with the newest one selected after a crash.");
+        ImGui::TextWrapped("Crash dump folder: %s", s_dumpFolder.c_str());
+      }
+
+      if (hasSupportLink()) {
+        ImGui::TextWrapped("Support link: %s", FaultNotice::supportUrl().c_str());
+        if (ImGui::SmallButton("Copy Link")) {
+          ImGui::SetClipboardText(FaultNotice::supportUrl().c_str());
         }
       }
     }
@@ -174,16 +271,15 @@ namespace dxvk {
     }
     update();
 
-    bool anyNew = false;
-    for (const Problem& problem : s_problems) {
-      if (!s_ignored.count(problem.id) && !s_seen.count(problem.id)) {
-        anyNew = true;
-        if (menuOpen) {
-          s_seen.insert(problem.id);
-        }
-      }
+    const std::vector<const Problem*> visible = visibleProblems(true);
+    if (visible.empty()) {
+      return;
     }
-    if (!anyNew || menuOpen) {
+    // Opening a menu marks the problems as seen, which hides the toast until a new one arrives.
+    if (menuOpen) {
+      for (const Problem* problem : visible) {
+        s_seen.insert(dismissKey(*problem));
+      }
       return;
     }
 
@@ -198,26 +294,13 @@ namespace dxvk {
     constexpr ImGuiWindowFlags kFlags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
                                         ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoSavedSettings;
     if (ImGui::Begin("##faultNotice", nullptr, kFlags)) {
-      showProblemList(false);
-      const std::string& upload = uploadFile();
-      if (upload.empty()) {
-        ImGui::TextWrapped("Logs: %s", s_logFolder.c_str());
-        ImGui::TextWrapped("Crash dumps: %s", s_dumpFolder.c_str());
-      } else {
-        ImGui::TextWrapped("Upload this file: %s", upload.c_str());
-      }
-      if (!supportText().empty()) {
-        ImGui::TextWrapped("%s", supportText().c_str());
-      }
-      if (!supportUrl().empty()) {
-        ImGui::TextColored(kLinkColor, "%s", supportUrl().c_str());
+      ImGui::TextColored(kTitleColor, "Problem detected");
+      for (const Problem* problem : visible) {
+        ImGui::Bullet();
+        ImGui::TextWrapped("%s", problem->text.c_str());
       }
       const std::string menuKeys = buildKeyBindDescriptorStringForDisplay(RtxOptions::remixMenuKeyBinds());
-      if (upload.empty()) {
-        ImGui::TextWrapped("Press %s for buttons that open these folders and the link, and to hide this notice.", menuKeys.c_str());
-      } else {
-        ImGui::TextWrapped("Press %s for buttons that show this file and open the link, and to hide this notice.", menuKeys.c_str());
-      }
+      ImGui::TextWrapped("Press %s for help.", menuKeys.c_str());
     }
     ImGui::End();
     if (font != nullptr) {
@@ -226,57 +309,70 @@ namespace dxvk {
   }
 
   void FaultNotice::showSection() {
-    RemixGui::Checkbox("Show Problem Notices", &enableObject());
     update();
-    if (s_problems.empty()) {
-      ImGui::TextDisabled("No problems were detected in this session.");
-      return;
-    }
+    const std::vector<const Problem*> visible = visibleProblems(false);
 
     ImGui::PushID("faultNotice");
-    showProblemList(true);
-
-    const std::string& upload = uploadFile();
-    if (!upload.empty()) {
-      if (ImGui::Button("Show File to Upload")) {
-        runExplorer(L"/select,\"" + str::tows(upload.c_str()) + L"\"");
+    if (visible.empty()) {
+      if (ImGui::Button("Report a problem")) {
+        const std::string report = ImGUI::reportFilePath();
+        if (report.empty()) {
+          runExplorer(L"\"" + str::tows(s_logFolder.c_str()) + L"\"");
+        } else {
+          showInExplorer(report);
+        }
       }
-      RemixGui::SetTooltipToLastWidgetOnHover("Opens the folder of the file to attach to a bug report, with the file selected.");
-      ImGui::SameLine();
-      if (ImGui::SmallButton("Copy Path##upload")) {
-        ImGui::SetClipboardText(upload.c_str());
+      RemixGui::SetTooltipToLastWidgetOnHover("Opens the folder of the newest report file, with the file selected. Send that file when you report a problem.");
+      if (hasSupportLink()) {
+        ImGui::SameLine();
+        showSupportButton();
       }
-      ImGui::TextWrapped("File to upload: %s", upload.c_str());
-    }
-
-    ImGUI::showLogFolder(false);
-
-    if (ImGui::Button("Open Crash Dump Folder")) {
-      runExplorer(s_newestDump.empty() ? L"\"" + str::tows(s_dumpFolder.c_str()) + L"\"" : L"/select,\"" + s_newestDump.wstring() + L"\"");
-    }
-    RemixGui::SetTooltipToLastWidgetOnHover("Opens the folder of the crash dumps (.dmp), with the newest one selected after a crash.");
-    ImGui::SameLine();
-    if (ImGui::SmallButton("Copy Path##dumps")) {
-      ImGui::SetClipboardText(s_dumpFolder.c_str());
-    }
-    ImGui::TextWrapped("Crash dump folder: %s", s_dumpFolder.c_str());
-
-    if (!supportText().empty()) {
-      ImGui::TextWrapped("%s", supportText().c_str());
-    }
-    const std::string& url = supportUrl();
-    if (url.rfind("https://", 0) == 0) {
-      ImGui::PushStyleColor(ImGuiCol_Text, kLinkColor);
-      if (ImGui::Button(url.c_str())) {
-        ShellExecuteW(nullptr, L"open", str::tows(url.c_str()).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    } else {
+      ImGui::TextColored(kTitleColor, "Problem detected");
+      bool crashed = false;
+      for (const Problem* problem : visible) {
+        ImGui::Bullet();
+        ImGui::TextWrapped("%s", problem->text.c_str());
+        crashed = crashed || isCrash(*problem);
       }
-      ImGui::PopStyleColor();
-      RemixGui::SetTooltipToLastWidgetOnHover("Opens the link in the web browser.");
-      ImGui::SameLine();
-      if (ImGui::SmallButton("Copy Link")) {
-        ImGui::SetClipboardText(url.c_str());
+
+      const std::string file = crashed ? fileToSend() : std::string();
+      if (!file.empty()) {
+        ImGui::TextWrapped("To report it: send this file%s.", whereToSend().c_str());
+      } else if (crashed) {
+        ImGui::TextWrapped("To report it: see Details.");
+      } else if (hasSupportLink()) {
+        ImGui::TextWrapped("Need help? Ask%s.", whereToSend().empty() ? " in the support chat" : whereToSend().c_str());
       }
+
+      bool sameLine = false;
+      if (!file.empty()) {
+        if (ImGui::Button("Show file")) {
+          showInExplorer(file);
+        }
+        RemixGui::SetTooltipToLastWidgetOnHover("Opens the folder of the report file, with the file selected.");
+        sameLine = true;
+      }
+      if (hasSupportLink()) {
+        if (sameLine) {
+          ImGui::SameLine();
+        }
+        showSupportButton();
+        sameLine = true;
+      }
+      if (sameLine) {
+        ImGui::SameLine();
+      }
+      if (ImGui::Button("Dismiss")) {
+        std::ofstream ignored(ignoredFilePath(), std::ios::app);
+        for (const Problem* problem : visible) {
+          s_ignored.insert(dismissKey(*problem));
+          ignored << dismissKey(*problem) << '\n';
+        }
+      }
+      RemixGui::SetTooltipToLastWidgetOnHover("Hides this notice. It stays hidden for this report; a new problem shows again.");
     }
+    showDetails();
     ImGui::PopID();
   }
 

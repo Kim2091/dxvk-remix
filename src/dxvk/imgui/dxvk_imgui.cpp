@@ -1107,6 +1107,10 @@ namespace dxvk {
     }
   }
 
+  std::string ImGUI::reportFilePath() {
+    return reportFile();
+  }
+
   void ImGUI::showLogFolder(bool withReportHelp) {
     if (withReportHelp) {
       if (logHelpText().empty()) {

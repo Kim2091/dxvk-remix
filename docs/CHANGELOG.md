@@ -58,6 +58,15 @@ D3D9 point lights can carry the host's own identity in their unused spot fields,
 - `rtx.retained.useV2` (default off) is a second implementation of Remix API retained instances whose per-frame cost follows what changed.
 - Every graphics preset keeps `rtx.enableStochasticAlphaBlend` on, so hair and other blended surfaces keep soft edges on the Medium and Low presets.
 
+### The user menu's problem section is short and plain
+The Problems and Logs sections of the user menu General tab are now one Help section. With no problem it is one line, a Report a problem button (opens the newest report file's folder with the file selected) and a Discord button. After a crash in the previous session it says in one sentence what happened, then "To report it: send this file", with Show file, Discord and one Dismiss. Exception codes, addresses, the log and crash dump folders, the virtual file system note and the Save Report Now pointer moved into a Details section that is closed by default. A dismissal now belongs to that crash's report, so a later crash shows again. The on-screen toast shows only the short sentences. The problem list accepts an optional third field, `id|text|details`.
+- Options: added `rtx.faultNotice.supportChannel` (default empty, set by the game integration); removed `rtx.faultNotice.supportText`. Both only change the menu text, so the graphics presets do not set them.
+
+### Fix: a colour grade could send NaN pixels into DLSS-NR
+With a grade that has negative matrix terms, such as Warm Amber, the tone curve could return a channel below zero, and the DLSS-NR fast tone mapping pass turned it into a NaN in the network's input. That pass now clamps to 0 to 1 before the gamma encode. The inverse pass matches it and keeps the original HDR colour at the affected pixels. Shader change, so the first launch recompiles those two shaders.
+- Options: none.
+- Commits: the commit that adds this entry.
+
 ### Fix: a failed texture read no longer shows uninitialized memory
 When a mip could not be read from disk, the texture manager still swapped in a new image with nothing copied into it. The texture now keeps the mips it has and asks again later, and the log names the file.
 

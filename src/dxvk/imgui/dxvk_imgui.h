@@ -102,6 +102,8 @@ namespace dxvk {
     // Draws the Open Log Folder button and the folder that really holds the logs.
     // With withReportHelp, it also draws rtx.gui.logHelpText above them and the rtx.gui.reportFile buttons below.
     static void showLogFolder(bool withReportHelp = true);
+    // The full path of the newest report file the game integration set in rtx.gui.reportFile, or empty.
+    static std::string reportFilePath();
     static void SetFogStates(const fast_unordered_cache<FogState>& fogStates, XXH64_hash_t usedFogHash);
 
     void switchMenu(UIType type, bool force = false);
@@ -304,7 +306,7 @@ namespace dxvk {
                "Empty shows a short generic instruction.");
     RTX_OPTION_FLAG("rtx.gui", std::string, reportFile, std::string(""), RtxOptionFlags::NoSave,
                     "Set by the game integration (remix API SetConfigVariable): the full path of the newest report file, such as a zip of a session's logs. "
-                    "When set, the log section of the menus names the file and gets buttons that show it in Explorer and copy its path.");
+                    "When set, the log section of the developer menu names the file with buttons that show it in Explorer and copy its path, and the user menu's Report a problem button opens its folder.");
 
     // The release version: the last word of the build ID when it starts with a digit ("1.0.4" from
     // "Game Release 1.0.4"), else empty.

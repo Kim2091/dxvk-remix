@@ -776,11 +776,8 @@ namespace dxvk {
     RemixGui::InputText("Screenshot Folder", &RtxScreenshot::folderObject());
     ImGui::TextWrapped("Saved to: %s", RtxScreenshot::resolveFolder().c_str());
 
-    sectionHeader("Problems");
+    sectionHeader("Help");
     FaultNotice::showSection();
-
-    sectionHeader("Logs");
-    showLogFolder();
   }
 
   void ImGUI::showUserRenderingSettings(const Rc<DxvkContext>& ctx) {
