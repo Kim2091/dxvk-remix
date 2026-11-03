@@ -21,6 +21,7 @@
  */
 
 #include <cmath>
+#include <cstddef>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -158,8 +159,17 @@ remixapi_ErrorCode REMIXAPI_CALL remixapi_CreateMaterial(
         case REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_SUBSURFACE_EXT:
         {
           auto* pOpaqueSubsurfaceMat = static_cast<const remixapi_MaterialInfoOpaqueSubsurfaceEXT* const>(infoItr);
+          remixapi_MaterialInfoOpaqueSubsurfaceEXT opaqueSubsurfaceMat = { };
+          // The diffusion profile fields (subsurfaceDiffusionProfile onwards) were added at 0.5.1.
+          // An app built against an older header passes the shorter struct: copy only that prefix.
+          if (g_appRemixApiVersion < REMIXAPI_VERSION_MAKE(0, 5, 1)) {
+            std::memcpy(&opaqueSubsurfaceMat, pOpaqueSubsurfaceMat,
+                        offsetof(remixapi_MaterialInfoOpaqueSubsurfaceEXT, subsurfaceDiffusionProfile));
+          } else {
+            opaqueSubsurfaceMat = *pOpaqueSubsurfaceMat;
+          }
           send(c, Bool::True);
-          serializeAndSend<serialize::MaterialInfoOpaqueSubsurface>(c, *pOpaqueSubsurfaceMat);
+          serializeAndSend<serialize::MaterialInfoOpaqueSubsurface>(c, opaqueSubsurfaceMat);
           break;
         }
         case REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_TRANSLUCENT_EXT:
