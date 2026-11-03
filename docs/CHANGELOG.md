@@ -73,6 +73,12 @@ When a mip could not be read from disk, the texture manager still swapped in a n
 ### Fix: toggling replacements stacks up replacement instances on API draws
 Turning enhanced assets off and on made replaced GPU-instanced draws create new instances every frame until the game slowed to a crawl, because the external-draw path kept a replacement instance's plain prims when a replacement appeared, so extra prims had no slot and were never collected. External draws now rebuild the replacement instance when its bucket or submesh count changes, in both directions, which also removes leftover replacement prims when replacements are turned off.
 
+### SER SHARC update on frames with displacement
+On a frame with displacement the SHARC update ran inline with POM compiled in, so it marched the height field at every hit on a displaced surface although `rtx.displacement.enableIndirectHit` was off, and it got no SER. With the option on, such frames bind the existing Full TraceRay and SER update, whose hit shader has no POM, as SHARC query hits already do. The launch from the primary surface keeps its POM attenuation.
+- Options: added `rtx.integrateIndirect.sharcUpdateSerWithPom` (default off). Not set by the graphics presets: the screenshots so far show no difference above frame noise, from one exterior view only.
+- Measured: New Vegas, Goodsprings exterior at a low sun, 1485x835 with DLSS-RR: GPU frame 39.1 to 32.9 ms, IndirectSharcUpdate 8.3-9.5 to 2.7 ms (in-run A/B, two phases on between three off). Screenshots from one camera differ no more between on and off than between two off phases. Interiors not measured.
+- Commits: the commit that adds this entry.
+
 ## 2026-10-28
 
 ### Developer menu: settings search
