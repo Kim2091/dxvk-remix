@@ -216,15 +216,20 @@ namespace dxvk {
     AutoShaderPipelinePrewarmer::prewarmComputePipelines(pipelineManager);
 
     // The prewarm always registers every pipeline the active settings use. The pipeline cache decides whether they
-    // load or compile. It is keyed on the GPU, the driver and the runtime build, so an update compiles them all.
+    // load or compile. It is keyed on the GPU and the driver, so an update compiles only the shaders it changed.
     const DxvkPipelineCache::LoadResult cacheResult = pipelineManager.pipelineCache()->loadResult();
     const char* expectation =
       cacheResult == DxvkPipelineCache::LoadResult::Loaded ? "they should load from the caches" :
       cacheResult == DxvkPipelineCache::LoadResult::Disabled ? "only the driver's own cache can serve them" :
       "a full compile is expected";
+    // Pipelines marked for a background compile (the NUMOS passes) are not part of the prewarm: no frame waits for them.
+    const uint32_t background = pipelineManager.backgroundShaderCompilationCount();
     Logger::info(str::format("[ShaderPrewarm] startup prewarm: ", pipelineManager.remixShaderQueuedCount() - m_startupPrewarmQueuedBase,
                              " pipelines queued for the active settings; ", DxvkPipelineCache::describe(cacheResult),
-                             ", so ", expectation));
+                             ", so ", expectation,
+                             background > 0
+                               ? str::format(". ", background, " more compile in the background, and no frame waits for them")
+                               : std::string()));
   }
 
   void RtxInitializer::registerPrewarmShaders() {

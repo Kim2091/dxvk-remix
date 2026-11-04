@@ -76,6 +76,13 @@ namespace dxvk {
                "Lets rtx.integrateIndirect.slimVariants, slimNonSharc and slimAssembly use reduced shaders with "
                "displacement compiled in while the frame uses displacement. Otherwise displacement forces the full "
                "shaders. The image is the same.");
+    RTX_OPTION("rtx.integrateIndirect", bool, sharcUpdateSerWithPom, false,
+               "Uses the TraceRay and SER SHARC update on frames with displacement while "
+               "rtx.displacement.enableIndirectHit is off. Update hits on displaced surfaces then skip the displacement "
+               "march, as SHARC query hits already do, and the launch from the primary surface keeps its displacement "
+               "attenuation. Saves GPU time in IndirectSharcUpdate. Cached radiance on displaced surfaces can differ "
+               "slightly. Needs SER, the deferred flush and the full update shaders, so "
+               "rtx.integrateIndirect.slimKeepPom keeps the inline update.");
 
     explicit DxvkPathtracerIntegrateIndirect(DxvkDevice* device);
     ~DxvkPathtracerIntegrateIndirect() = default;

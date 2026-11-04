@@ -24,8 +24,10 @@
 
 namespace numos {
   struct FrameOutputs;
+  struct Settings;
   struct WeatherSnapshot;
   class Renderer;
+  enum class PassId : uint32_t;
 }
 
 struct RaytraceArgs;  // shared C++/Slang struct, global namespace
@@ -62,7 +64,8 @@ namespace dxvk {
     // True while rtx.skyMode selects NUMOS and its shaders loaded.
     bool active() const;
 
-    // Registers every NUMOS pass for compilation while rtx.skyMode selects NUMOS (RtxInitializer's shader prewarm).
+    // Registers every NUMOS pass the settings can dispatch for compilation while rtx.skyMode selects NUMOS
+    // (RtxInitializer's shader prewarm). Only the selected cloud render variant is registered.
     void prewarmShaders();
 
     void beginFrame(RtxContext& ctx, RaytraceArgs& constants);
@@ -91,6 +94,12 @@ namespace dxvk {
     struct Impl;  // NUMOS types stay out of this header, which dxvk_objects.h spreads everywhere
 
     void loadNightSky();
+    // Whether the pass's pipeline has compiled. Never waits for the compile.
+    bool pipelineReady(RtxContext& ctx, numos::PassId pass);
+    // Whether every pass NUMOS cannot render without has its pipeline compiled.
+    bool corePipelinesReady(RtxContext& ctx);
+    // Switches off, in this frame's settings, the optional passes whose pipelines are still compiling.
+    void holdBackUncompiledPasses(RtxContext& ctx, numos::Settings& settings);
     void syncLights(RtxContext& ctx, const numos::FrameOutputs& outputs);
     void dropLights();
     void gatherLocalLights(RtxContext& ctx);

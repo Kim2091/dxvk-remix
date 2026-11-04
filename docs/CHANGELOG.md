@@ -73,6 +73,27 @@ When a mip could not be read from disk, the texture manager still swapped in a n
 ### Fix: toggling replacements stacks up replacement instances on API draws
 Turning enhanced assets off and on made replaced GPU-instanced draws create new instances every frame until the game slowed to a crawl, because the external-draw path kept a replacement instance's plain prims when a replacement appeared, so extra prims had no slot and were never collected. External draws now rebuild the replacement instance when its bucket or submesh count changes, in both directions, which also removes leftover replacement prims when replacements are turned off.
 
+### NUMOS cloud shaders compile in seconds
+NUMOS `cloud_render` took 80-90 s to compile in the NVIDIA driver and 97 minutes on an RX 6700 XT, because every call site of its cloud march and sample step was inlined into one huge shader. NUMOS now calls each from a single place, so the shipped shader shrinks from 6.36 MB to 0.48 MB of SPIR-V and compiles in 2-3 s on an RTX 5080 Laptop and about 10 s on a Radeon 610M. The arithmetic is unchanged (NUMOS ee9da93).
+- Options: none.
+
+### The pipeline cache survives runtime updates
+The saved `.remix-pipeline-cache` was discarded whenever the runtime DLL changed, so every update compiled every Remix pipeline again, over 90 minutes on an RX 6700 XT. The file is now checked against the GPU and driver only, as the Vulkan pipeline cache data itself is: the driver keys each pipeline by its shader code and state, so an update compiles only the shaders it changed. Files saved by earlier builds load too. The `rtx.pipelineCache.maxSizeMB` cap still applies, so a cache that outgrows it across many updates is dropped and rebuilt.
+- Options: none.
+
+### NUMOS shaders compile in the background
+The prewarm wait screen no longer waits for the NUMOS passes, and frames no longer skip ray tracing while they compile. On an RX 6700 XT with a cold cache the wait screen stayed up 101 minutes, and closed one second after `cloud_render` finished. The NUMOS passes still start compiling at startup, but no frame waits for them. Until NUMOS's small core passes are ready the sky has no NUMOS sky, sun or moon, as when its shaders fail to load. Until the on-screen cloud pass is ready the directly visible sky has no clouds. Until the cloud dome pass is ready reflections and indirect light have no clouds. These passes are held back by switching off, for that frame only, the NUMOS settings that dispatch them, so NUMOS restarts their temporal history when they first run. The log names each held-back pass and when it becomes ready. The pipeline cache still saves only once no compile is in flight.
+- Options: none.
+
+### The shader prewarm compiles one NUMOS cloud render variant
+The startup prewarm compiled both on-screen cloud passes, `cloud_render` and `cloud_render_fast`, although a frame uses only the one `rtx.atmosphere.cloudPerformancePreset` selects. Both are very large shaders: `cloud_render` alone took 97 minutes to compile on an RX 6700 XT. The prewarm now registers only the selected variant (the reference variant while `rtx.atmosphere.cloudProfilingMode` is 9), and the other compiles when a setting change selects it.
+- Options: none.
+
+### SER SHARC update on frames with displacement
+On a frame with displacement the SHARC update ran inline with POM compiled in, so it marched the height field at every hit on a displaced surface although `rtx.displacement.enableIndirectHit` was off, and it got no SER. With the option on, such frames bind the existing Full TraceRay and SER update, whose hit shader has no POM, as SHARC query hits already do. The launch from the primary surface keeps its POM attenuation.
+- Options: added `rtx.integrateIndirect.sharcUpdateSerWithPom` (default off). Not set by the graphics presets: the screenshots so far show no difference above frame noise, from one exterior view only.
+- Measured: New Vegas, Goodsprings exterior at a low sun, 1485x835 with DLSS-RR: GPU frame 39.1 to 32.9 ms, IndirectSharcUpdate 8.3-9.5 to 2.7 ms (in-run A/B, two phases on between three off). Screenshots from one camera differ no more between on and off than between two off phases. Interiors not measured.
+
 ## 2026-10-28
 
 ### Developer menu: settings search
