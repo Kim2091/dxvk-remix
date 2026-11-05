@@ -31,5 +31,7 @@
 # the same as other GLSL files such as .vert and .frag.
 *.comp linguist-language=GLSL
 
-# Git Bash does not run scripts with CRLF line endings.
-tools/remix_replay/*.sh text eol=lf
+# Bash does not run scripts with CRLF line endings, on Linux or in Git Bash.
+*.sh text eol=lf
+scripts-common/xwin/* text eol=lf
+scripts-common/packman/packman text eol=lf

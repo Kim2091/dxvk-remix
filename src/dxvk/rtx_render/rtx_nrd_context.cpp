@@ -1103,8 +1103,8 @@ namespace dxvk {
   }
 
   NrdArgs NRDContext::getNrdArgs() const {
-    constexpr float denoisingRangeLimit = 500000.0f;
-    assert(nrd::CommonSettings{}.denoisingRange == denoisingRangeLimit && "NRD's default denoising range has changed");
+    static_assert(nrd::CommonSettings{}.denoisingRange == 500000.0f, "NRD's default settings has changed, denoisingRange must be re-evaluated");
+    constexpr float denoisingRangeLimit = nrd::CommonSettings{}.denoisingRange;
 
     constexpr float missLinearViewZ = denoisingRangeLimit + 1.0f;
     static_assert(missLinearViewZ > denoisingRangeLimit && missLinearViewZ - denoisingRangeLimit > 0.01f);

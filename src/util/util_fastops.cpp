@@ -32,14 +32,15 @@
 
 #define SSE_ENABLE ((fast::g_simdSupportLevel != fast::SIMD::None) && 1)
 
+// Clang needs the target features on each function that uses the intrinsics, and cannot force-inline such a function into a caller without them.
 #if defined(__clang__)
-#define FAST_TARGET_AVX2 __attribute__((target("avx2")))
-#define FAST_TARGET_AVX512 __attribute__((target("avx512f,avx512bw")))
-#define FAST_TARGET_BMI2 __attribute__((target("bmi,bmi2")))
+#define FAST_TARGET_AVX2 __attribute__((target("avx2"))) inline
+#define FAST_TARGET_AVX512 __attribute__((target("avx512f,avx512bw"))) inline
+#define FAST_TARGET_BMI2 __attribute__((target("bmi,bmi2"))) inline
 #else
-#define FAST_TARGET_AVX2
-#define FAST_TARGET_AVX512
-#define FAST_TARGET_BMI2
+#define FAST_TARGET_AVX2 __forceinline
+#define FAST_TARGET_AVX512 __forceinline
+#define FAST_TARGET_BMI2 __forceinline
 #endif
 
 namespace fast {
@@ -337,7 +338,7 @@ namespace fast {
   }
 
 #if !defined(NO_AVX)
-  FAST_TARGET_AVX2 inline void findMinMax16_AVX2(const uint32_t count, const uint16_t* data, uint32_t& minOut, uint32_t& maxOut) {
+  FAST_TARGET_AVX2 void findMinMax16_AVX2(const uint32_t count, const uint16_t* data, uint32_t& minOut, uint32_t& maxOut) {
     const uint32_t numLanes = 16;
     const uint32_t alignedCount = dxvk::alignDown(count, numLanes);
     uint16_t minOut16 = data[0];
@@ -383,7 +384,7 @@ namespace fast {
   }
 
 #if !defined(NO_AVX)
-  FAST_TARGET_AVX2 inline void findMinMaxWithsentinelValue16_AVX2(const uint32_t count, const uint16_t* data, uint32_t& minOut, uint32_t& maxOut, const uint16_t sentinelValue) {
+  FAST_TARGET_AVX2 void findMinMaxWithsentinelValue16_AVX2(const uint32_t count, const uint16_t* data, uint32_t& minOut, uint32_t& maxOut, const uint16_t sentinelValue) {
     const uint32_t numLanes = 16;
     const uint32_t alignedCount = dxvk::alignDown(count, numLanes);
     uint16_t minOut16 = data[0];
@@ -491,7 +492,7 @@ namespace fast {
     }
   }
 #if !defined(NO_AVX)
-  FAST_TARGET_AVX2 inline void findMinMax32_AVX2(const uint32_t count, const uint32_t* data, uint32_t& minOut, uint32_t& maxOut) {
+  FAST_TARGET_AVX2 void findMinMax32_AVX2(const uint32_t count, const uint32_t* data, uint32_t& minOut, uint32_t& maxOut) {
     const uint32_t numLanes = 8;
     const uint32_t alignedCount = dxvk::alignDown(count, numLanes);
 
@@ -530,7 +531,7 @@ namespace fast {
     }
   }
 #if !defined(NO_AVX)
-  FAST_TARGET_AVX2 inline void findMinMaxWithsentinelValue32_AVX2(const uint32_t count, const uint32_t* data, uint32_t& minOut, uint32_t& maxOut, const uint32_t sentinelValue) {
+  FAST_TARGET_AVX2 void findMinMaxWithsentinelValue32_AVX2(const uint32_t count, const uint32_t* data, uint32_t& minOut, uint32_t& maxOut, const uint32_t sentinelValue) {
     const uint32_t numLanes = 8;
     const uint32_t alignedCount = dxvk::alignDown(count, numLanes);
     minOut = data[0];
@@ -759,7 +760,7 @@ namespace fast {
     }
   }
 #if !defined(NO_AVX)
-  FAST_TARGET_AVX2 inline void copySubtract16_AVX2(uint16_t* dstData, const uint16_t* srcData, const uint32_t count, const uint16_t value, const bool ignoreSentinel, const uint16_t sentinelValue) {
+  FAST_TARGET_AVX2 void copySubtract16_AVX2(uint16_t* dstData, const uint16_t* srcData, const uint32_t count, const uint16_t value, const bool ignoreSentinel, const uint16_t sentinelValue) {
     const uint32_t numLanes = 16;
     const uint32_t alignedCount = dxvk::alignDown(count, numLanes);
 
@@ -790,7 +791,7 @@ namespace fast {
     }
   }
   
-  FAST_TARGET_AVX2 inline void copySubtract32_AVX2(uint32_t* dstData, const uint32_t* srcData, const uint32_t count, const uint32_t value, const bool ignoreSentinel, const uint32_t sentinelValue) {
+  FAST_TARGET_AVX2 void copySubtract32_AVX2(uint32_t* dstData, const uint32_t* srcData, const uint32_t count, const uint32_t value, const bool ignoreSentinel, const uint32_t sentinelValue) {
     const uint32_t numLanes = 8;
     const uint32_t alignedCount = dxvk::alignDown(count, numLanes);
 
@@ -820,7 +821,7 @@ namespace fast {
       dstData[i] = srcData[i] - ((ignoreSentinel && srcData[i] == sentinelValue) ? 0 : value);
     }
   }
-  FAST_TARGET_AVX512 inline void copySubtract16_AVX512(uint16_t* dstData, const uint16_t* srcData, const uint32_t count, const uint16_t value, const bool ignoreSentinel, const uint16_t sentinelValue) {
+  FAST_TARGET_AVX512 void copySubtract16_AVX512(uint16_t* dstData, const uint16_t* srcData, const uint32_t count, const uint16_t value, const bool ignoreSentinel, const uint16_t sentinelValue) {
     const uint32_t numLanes = 32;
     const uint32_t alignedCount = dxvk::alignDown(count, numLanes);
 
@@ -849,7 +850,7 @@ namespace fast {
       dstData[i] = srcData[i] - ((ignoreSentinel && srcData[i] == sentinelValue) ? 0 : value);
     }
   }
-  FAST_TARGET_AVX512 inline void copySubtract32_AVX512(uint32_t* dstData, const uint32_t* srcData, const uint32_t count, const uint32_t value, const bool ignoreSentinel, const uint32_t sentinelValue) {
+  FAST_TARGET_AVX512 void copySubtract32_AVX512(uint32_t* dstData, const uint32_t* srcData, const uint32_t count, const uint32_t value, const bool ignoreSentinel, const uint32_t sentinelValue) {
     const uint32_t numLanes = 16;
     const uint32_t alignedCount = dxvk::alignDown(count, numLanes);
 
@@ -994,7 +995,7 @@ namespace fast {
 
 #if !defined(NO_AVX)
   template<typename T>
-  FAST_TARGET_BMI2 inline T findNthBit_BMI2(const T num, const T n) {
+  FAST_TARGET_BMI2 T findNthBit_BMI2(const T num, const T n) {
     return _tzcnt_u32(_pdep_u32(1 << n, num));
   }
 #endif

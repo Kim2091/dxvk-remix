@@ -621,6 +621,7 @@ generated_dxvk_shaders = glsl_generator.process(dxvk_shaders)
 rtx_shaders = custom_target(
   'rtx_shaders',
   build_by_default: true,
+  build_always_stale: true,
   output: ['_built_shaders.txt'],
   command: [ python_interpreter ] + rtx_shaders_command_arguments
 )

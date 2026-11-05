@@ -8,8 +8,12 @@ c_ld = '@GLOBAL_SOURCE_ROOT@/scripts-common/xwin/lld-link'
 cpp_ld = '@GLOBAL_SOURCE_ROOT@/scripts-common/xwin/lld-link'
 
 [built-in options]
+# clang-cl reports many warnings that MSVC's default warning level does not, so they stay warnings here;
+# MSVC builds keep werror.
+werror = false
 c_args = ['/clang:-fuse-ld=lld']
-cpp_args = ['/clang:-fuse-ld=lld', '/clang:-msse4.1']
+# MSVC's default warning level leaves deprecation warnings (C4996) off, so they are off here too.
+cpp_args = ['/clang:-fuse-ld=lld', '/clang:-msse4.1', '/clang:-Wno-deprecated-declarations']
 
 [properties]
 needs_exe_wrapper = true
