@@ -115,8 +115,13 @@ release_build = get_option('release_build')
 if release_build
   if dxvk_is_msvc
     # Trims the source root from __FILE__, which absolute include paths such as USD's would otherwise embed.
-    # The prefix has no trailing backslash, so a quoted argument cannot end in an escaped quote.
-    add_global_arguments('/d1trimfile:' + meson.global_source_root().replace('/', '\\'), language : ['c', 'cpp'])
+    if dxvk_compiler.get_id() == 'msvc'
+      # The prefix has no trailing backslash, so a quoted argument cannot end in an escaped quote.
+      add_global_arguments('/d1trimfile:' + meson.global_source_root().replace('/', '\\'), language : ['c', 'cpp'])
+    else
+      # clang-cl has no /d1trimfile. A prefix map trims the same root from __FILE__ and the debug info.
+      add_global_arguments('/clang:-ffile-prefix-map=' + global_src_root_norm + '=', language : ['c', 'cpp'])
+    endif
     # Records only the PDB file name in the debug directory.
     add_global_link_arguments('/PDBALTPATH:%_PDB%', language : ['c', 'cpp'])
   endif
@@ -429,7 +434,7 @@ rtx_shaders_runtime_command_arguments = rtx_shaders_command_arguments + [ '-bina
 
 # A release build runs spirv-opt over the embedded shaders. The runtime recompilation arguments above do not include it.
 if release_build
-  spirv_opt = find_program('external/spirv_tools/spirv-opt')
+  spirv_opt = find_program(build_os == 'windows' ? 'external/spirv_tools/spirv-opt' : 'scripts-common/wine-spirv-opt.sh')
   rtx_shaders_command_arguments += [ '-spirvopt', fs.as_posix(spirv_opt.full_path()) ]
 endif
 
@@ -596,11 +601,14 @@ fsr_dll_path = join_paths(global_src_root_norm, 'submodules/FidelityFX-SDK/Kits/
 nrd_build_dir = join_paths(current_build_dir_norm, 'nrd')
 if cpu_family != 'aarch64'
   message('Building NRD...')
-  nrd_build_out = run_command(python_interpreter,
-    [join_paths(global_src_root_norm, 'scripts-common/build_nrd.py'),
-     '--source', join_paths(global_src_root_norm, 'submodules/nrd'),
-     '--build', nrd_build_dir],
-    check: true)
+  nrd_build_args = [join_paths(global_src_root_norm, 'scripts-common/build_nrd.py'),
+    '--source', join_paths(global_src_root_norm, 'submodules/nrd'),
+    '--build', nrd_build_dir]
+  # Off Windows, NRD is cross-built with the same clang-cl wrappers as the runtime.
+  if build_os != 'windows'
+    nrd_build_args += ['--xwin-tools', join_paths(global_src_root_norm, 'scripts-common/xwin')]
+  endif
+  nrd_build_out = run_command(python_interpreter, nrd_build_args, check: true)
   message(nrd_build_out.stdout().strip())
 endif
 nrd_lib_path = join_paths(nrd_build_dir, 'bin')
@@ -758,16 +766,14 @@ if dxvk_is_ninja or dxvk_is_woa_ec
     install_data(join_paths(usd_lib_path, 'bin', get_option('buildtype') == 'debug' ? 'tbbmalloc_debug.dll' : 'tbbmalloc.dll'), install_dir : output_path, install_tag: target_suffix)
     install_data(join_paths(usd_lib_path, 'bin', get_option('buildtype') == 'debug' ? 'tbb12_debug.dll' : 'tbb12.dll'), install_dir : output_path, install_tag: target_suffix)
     # Python DLL not needed for nopy USD build
-    if dxvk_is_msvc and build_os == 'windows'
-      install_data(join_paths(global_src_root_norm, 'src', 'usd-plugins', 'plugInfo.json'), install_dir : join_paths(output_path, 'usd', 'plugins'), install_tag: target_suffix)
+    install_data(join_paths(global_src_root_norm, 'src', 'usd-plugins', 'plugInfo.json'), install_dir : join_paths(output_path, 'usd', 'plugins'), install_tag: target_suffix)
 
-      # install USD plugins
-      meson.add_install_script(
-        join_paths(global_src_root_norm, 'scripts-common/install_usd_plugins.bat'),
-        output_path,
-        install_tag: target_suffix
-      )
-    endif
+    # install USD plugins
+    meson.add_install_script(
+      join_paths(global_src_root_norm, 'scripts-common/install_usd_plugins' + script_extension),
+      output_path,
+      install_tag: target_suffix
+    )
 
     install_data(join_paths(nrc_dll_path, nrc_dll_name), install_dir : output_path, install_tag: target_suffix)
     install_data(join_paths(nrc_dll_path, 'cudart64_13.dll'), install_dir : output_path, install_tag: target_suffix)

@@ -266,15 +266,16 @@ git submodule update --init --recursive   # if you cloned without --recursive
 **Linux cross-build with clang-cl.** Linux can build the x64 Windows runtime directly with clang-cl. This is a
 cross-build: the output is still `d3d9.dll`, not a native Linux library. Only the x64 target is supported.
 
-Install Git, LLVM/clang (including `clang-cl`, `lld-link`, `llvm-lib` and `llvm-rc`), Meson, Ninja, Python 3, Wine,
-curl or wget, and Rust/Cargo. For example:
+Install Git, LLVM/clang (including `clang-cl`, `lld-link`, `llvm-lib` and `llvm-rc`), a native C++ compiler, Meson,
+Ninja, CMake 3.30+, Python 3, Wine, curl or wget, and Rust/Cargo. CMake builds NRD, whose shader tool and DXC run
+natively. If the distribution's CMake is older, `pip install --user cmake` has a current one. For example:
 
 ```bash
 # Arch Linux
-sudo pacman -S --needed base-devel git clang lld llvm meson ninja python wine rust curl
+sudo pacman -S --needed base-devel git clang lld llvm meson ninja cmake python wine rust curl
 
 # Ubuntu/Debian
-sudo apt install build-essential git clang lld llvm meson ninja-build python3 wine64 cargo curl
+sudo apt install build-essential git clang lld llvm meson ninja-build cmake python3 wine64 cargo curl
 ```
 
 Install [xwin](https://github.com/Jake-Shadle/xwin) and use it to get the Microsoft CRT and Windows SDK files.

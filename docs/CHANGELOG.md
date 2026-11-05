@@ -64,6 +64,12 @@ Every graphics preset now selects the SHARC radiance cache on any GPU with its d
 - Not covered: a 64-bit atomics fallback for GPUs without `shaderBufferInt64Atomics`. Not yet run on AMD or Intel GPUs.
 - Commits: the commit that adds this entry.
 - Docs: [SharcRadianceCache.md](../documentation/SharcRadianceCache.md)
+## 2026-11-14
+
+### Linux cross-build with clang-cl
+The x64 runtime can be built on Linux with clang-cl, lld-link and the Microsoft CRT and Windows SDK files from xwin, and Wine runs the Windows-only build tools (slangc, glslangValidator, spirv-val, spirv-opt and nv_xxd). NRD.dll is cross-built with the same clang-cl wrappers, while its ShaderMake shader tool and DXC run natively. The output is the same Windows `d3d9.dll`, and the README has the setup steps. Thanks to CR (sambow23) for the pull request.
+- Options: none added. A Linux build uses the new `build-win64-clang.txt` cross file.
+- Commits: CR's "Add native Linux clang-cl build support" and the commit that adds this entry.
 
 ## 2026-11-06
 

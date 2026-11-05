@@ -16,7 +16,8 @@ xwin_include_args=(
 compile_only=false
 has_link=false
 for arg in "$@"; do
-  if [[ "${arg,,}" == "/c" ]]; then
+  # CMake compiles with -c and ends the options with --, after which every argument is an input file.
+  if [[ "${arg,,}" == "/c" || "${arg}" == "-c" || "${arg}" == "--" ]]; then
     compile_only=true
   elif [[ "${arg,,}" == "/link" ]]; then
     has_link=true
