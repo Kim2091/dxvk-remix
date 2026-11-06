@@ -94,6 +94,11 @@ On a frame with displacement the SHARC update ran inline with POM compiled in, s
 - Options: added `rtx.integrateIndirect.sharcUpdateSerWithPom` (default off). Not set by the graphics presets: the screenshots so far show no difference above frame noise, from one exterior view only.
 - Measured: New Vegas, Goodsprings exterior at a low sun, 1485x835 with DLSS-RR: GPU frame 39.1 to 32.9 ms, IndirectSharcUpdate 8.3-9.5 to 2.7 ms (in-run A/B, two phases on between three off). Screenshots from one camera differ no more between on and off than between two off phases. Interiors not measured.
 
+### Subsurface shadow rays stop at the first hit
+The three shadow rays of the diffusion-profile subsurface path (the profile sample, the transmission boundary term and the single-scattering sample) searched for the closest hit, although nothing reads their hit distance. They now stop at the first confirmed opaque hit. Occlusion and attenuation are the same in either mode up to float rounding, so the image does not change.
+- Options: none. Preset-independent: a pure performance fix that is always on.
+- Commits: the commit that adds this entry.
+
 ## 2026-10-28
 
 ### Developer menu: settings search
