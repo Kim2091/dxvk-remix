@@ -94,6 +94,11 @@ On a frame with displacement the SHARC update ran inline with POM compiled in, s
 - Options: added `rtx.integrateIndirect.sharcUpdateSerWithPom` (default off). Not set by the graphics presets: the screenshots so far show no difference above frame noise, from one exterior view only.
 - Measured: New Vegas, Goodsprings exterior at a low sun, 1485x835 with DLSS-RR: GPU frame 39.1 to 32.9 ms, IndirectSharcUpdate 8.3-9.5 to 2.7 ms (in-run A/B, two phases on between three off). Screenshots from one camera differ no more between on and off than between two off phases. Interiors not measured.
 
+### Fix: the pipeline cache is rewritten only when it can have changed
+The background save ran whenever pipelines had been created, and a pipeline built from a cache hit counts as created, so every burst of hits rewrote the whole cache file without adding anything to it. It now runs when a pipeline missed the cache or reported no creation feedback, and a save that failed is retried.
+- Options: none.
+- Commits: the commit that adds this entry.
+
 ## 2026-10-28
 
 ### Developer menu: settings search

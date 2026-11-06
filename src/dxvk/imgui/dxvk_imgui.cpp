@@ -2060,7 +2060,8 @@ namespace dxvk {
       RemixGui::DragInt("Pipeline Cache Max Size (MB)", &DxvkPipelineCache::maxSizeMBObject(), 16.f, 64, 65536);
       RemixGui::SetTooltipToLastWidgetOnHover(
         "rtx.pipelineCache.maxSizeMB. A cache larger than this is not saved, and the old file is removed so the next run\n"
-        "starts a fresh one. Applies at the next save (when shader compiles settle, and at shutdown).");
+        "starts a fresh one. Applies at the next save: when shader compiles that changed the cache settle, or at\n"
+        "shutdown if the cache changed since the last save.");
 
       ImGui::Indent();
       if (RemixGui::CollapsingHeader("Remix API Recording", collapsingHeaderClosedFlags)) {

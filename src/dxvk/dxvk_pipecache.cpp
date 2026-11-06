@@ -68,7 +68,7 @@ namespace dxvk {
   DxvkPipelineCache::~DxvkPipelineCache() {
     if (m_saveThread.joinable())
       m_saveThread.join();
-    if (!m_path.empty() && m_created.load() != m_createdAtLastSave)
+    if (!m_path.empty() && (cacheChanges() != m_changesAtLastSave || m_saveFailed.load()))
       save();
     logSummary();
     m_vkd->vkDestroyPipelineCache(
@@ -129,14 +129,14 @@ namespace dxvk {
   }
 
 
-  void DxvkPipelineCache::save() {
+  bool DxvkPipelineCache::save() {
     size_t size = 0;
     std::vector<uint8_t> data;
     // No pipeline is created while the data is read out (see lockForCreate).
     std::unique_lock<std::shared_mutex> useLock(m_useLock);
     for (int attempt = 0; attempt < 4 && data.empty(); ++attempt) {
       if (m_vkd->vkGetPipelineCacheData(m_vkd->device(), m_handle, &size, nullptr) != VK_SUCCESS)
-        return;
+        return false;
       data.resize(size);
       const VkResult vr = m_vkd->vkGetPipelineCacheData(m_vkd->device(), m_handle, &size, data.data());
       if (vr == VK_SUCCESS) {
@@ -144,19 +144,19 @@ namespace dxvk {
       } else {
         data.clear();
         if (vr != VK_INCOMPLETE)
-          return;
+          return false;
       }
     }
     useLock.unlock();
     if (data.empty())
-      return;
+      return false;
 
     const std::string path = str::fromws(m_path.c_str());
     if (data.size() > size_t(maxSizeMB()) * 1024 * 1024) {
       Logger::warn(str::format("[PipelineCache] ", data.size() / (1024 * 1024), " MB is over rtx.pipelineCache.maxSizeMB; "
                                "not saved, and the old file is removed so the next run starts a fresh one"));
       std::remove(path.c_str());
-      return;
+      return true;
     }
 
     Header header = {};
@@ -177,7 +177,7 @@ namespace dxvk {
     if (!written) {
       Logger::warn(str::format("[PipelineCache] could not write ", temporary));
       std::remove(temporary.c_str());
-      return;
+      return false;
     }
 #ifdef _WIN32
     const bool replaced = ::MoveFileExW(str::tows(temporary.c_str()).c_str(), m_path.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
@@ -187,9 +187,10 @@ namespace dxvk {
     if (!replaced) {
       Logger::warn(str::format("[PipelineCache] could not replace ", path));
       std::remove(temporary.c_str());
-      return;
+      return false;
     }
     Logger::info(str::format("[PipelineCache] saved ", data.size() / (1024 * 1024), " MB to ", path));
+    return true;
   }
 
 
@@ -265,25 +266,32 @@ namespace dxvk {
   void DxvkPipelineCache::onFrame(uint32_t compilesInFlight) {
     if (compilesInFlight != 0 || m_saving.load())
       return;
-    const uint32_t created = m_created.load();
-    if (created == m_createdAtLastSave)
-      return;
     // The compiles have settled: one summary per burst.
     logSummary();
     if (m_path.empty())
       return;
-    // At most one background save every 30 s; the first burst (the startup prewarm) saves at once.
+    const uint32_t changes = cacheChanges();
+    const bool retry = m_saveFailed.load() && m_failedSaves.load() < kMaxSaveRetries;
+    if (changes == m_changesAtLastSave && !retry)
+      return;
+    // At most one background save every 30 s; the first burst that changed the cache saves at once.
     const auto now = dxvk::high_resolution_clock::now();
-    if (m_createdAtLastSave != 0 && std::chrono::duration<double>(now - m_lastSave).count() < 30.0)
+    if (m_changesAtLastSave != 0 && std::chrono::duration<double>(now - m_lastSave).count() < 30.0)
       return;
     if (m_saveThread.joinable())
       m_saveThread.join();
-    m_createdAtLastSave = created;
+    m_changesAtLastSave = changes;
     m_lastSave = now;
     m_saving.store(true);
     m_saveThread = dxvk::thread([this] () {
       env::setThreadName("dxvk-pipecache");
-      save();
+      if (save()) {
+        m_saveFailed.store(false);
+        m_failedSaves.store(0);
+      } else {
+        m_failedSaves.fetch_add(1);
+        m_saveFailed.store(true);
+      }
       m_saving.store(false);
     });
   }
