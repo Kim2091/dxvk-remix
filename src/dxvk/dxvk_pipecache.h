@@ -94,7 +94,8 @@ namespace dxvk {
     CompileCounts compileCounts() const;
 
     // Once per frame (render thread): logs the hit / miss summary and saves in the background once the
-    // runtime's compiles have settled (`compilesInFlight` 0) after pipelines were added since the last save.
+    // runtime's compiles have settled (`compilesInFlight` 0) after the driver cache can have gained data since the last
+    // save (a pipeline missed it or reported no creation feedback), or to retry a save that failed.
     void onFrame(uint32_t compilesInFlight);
 
     // Whether creation feedback (core in Vulkan 1.3) can be chained into pipeline create infos.
@@ -127,11 +128,18 @@ namespace dxvk {
     std::atomic<uint32_t>   m_misses { 0 };
     std::atomic<uint32_t>   m_unknown { 0 };
     std::atomic<uint64_t>   m_missMicroseconds { 0 };
-    uint32_t                m_createdAtLastSave = 0;
+    // What the driver cache can have gained: a pipeline that missed it or reported no creation feedback (a compiled
+    // pipeline is always one of those). Hits change nothing.
+    uint32_t cacheChanges() const {
+      return m_misses.load() + m_unknown.load();
+    }
+    uint32_t                m_changesAtLastSave = 0;
     uint32_t                m_createdAtLastSummary = 0;
     dxvk::high_resolution_clock::time_point m_lastSave;
     dxvk::thread            m_saveThread;
     std::atomic<bool>       m_saving { false };
+    std::atomic<bool>       m_saveFailed { false };    // the last save did not reach the file
+    std::atomic<uint32_t>   m_failedSaves { 0 };       // failed saves in a row (retried up to kMaxSaveRetries)
     std::atomic<bool>       m_startupPrewarmDone { false };
     std::atomic<uint32_t>   m_lateCompiles { 0 };
     LoadResult              m_loadResult = LoadResult::Disabled;
@@ -145,7 +153,9 @@ namespace dxvk {
 
     void computeIdentity(DxvkDevice* device);
     std::vector<uint8_t> load();
-    void save();
+    static constexpr uint32_t kMaxSaveRetries = 3;
+    // True when the cache reached the file, or was too large and was removed on purpose.
+    bool save();
     void logSummary();
 
   };
