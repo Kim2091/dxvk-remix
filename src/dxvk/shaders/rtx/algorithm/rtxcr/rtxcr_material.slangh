@@ -17,6 +17,11 @@
 #define MAX_SSS_SAMPLE_COUNT 1
 #endif
 
+// The visibility mode of the shadow rays this file traces (the diffusion-profile sample, the transmission boundary term and
+// the single-scattering sample). None of their callers reads the hit distance, only hasOpaqueHit and the attenuation, and
+// those are the same without the closest-hit search, so the ray query stops at the first confirmed opaque hit.
+#define SSS_SAMPLE_VISIBILITY_MODE visibilityModeEnablePom | visibilityModeEnableTranslucentMaterials | visibilityModeEnableSubsurfaceMaterials
+
 struct SssTracingResult
 {
   MinimalSurfaceInteraction sssMinimalSurfaceInteraction;
@@ -215,7 +220,7 @@ SssDiffusionProfileResult evalSssDiffusionProfile(
     MinimalSurfaceInteraction sssMinimalSurfaceInteraction = sssTracingResult.sssMinimalSurfaceInteraction;
 
     // Trace Visibilty Ray
-    const VisibilityResult visibility = traceVisibilityRay<visibilityModeEnablePom | visibilityModeAccurateHitDistance | visibilityModeEnableTranslucentMaterials | visibilityModeEnableSubsurfaceMaterials>(
+    const VisibilityResult visibility = traceVisibilityRay<SSS_SAMPLE_VISIBILITY_MODE>(
       sssMinimalSurfaceInteraction,
       sssLightSample.position, rayMask,
       sampledTransportPortalIndex, geometryFlags.portalSpace, geometryFlags.pomOpaqueSurfaceEncountered,
@@ -345,7 +350,7 @@ float3 evalSingleScatteringTransmission(
       /// Visibility Check
 
       // Trace Visibilty Ray
-      const VisibilityResult visibility = traceVisibilityRay<visibilityModeEnablePom | visibilityModeAccurateHitDistance | visibilityModeEnableTranslucentMaterials | visibilityModeEnableSubsurfaceMaterials>(
+      const VisibilityResult visibility = traceVisibilityRay<SSS_SAMPLE_VISIBILITY_MODE>(
         transmissionTracingResult.sssMinimalSurfaceInteraction,
         transmissionLightSample.position, rayMask,
         sampledTransportPortalIndex, geometryFlags.portalSpace, geometryFlags.pomOpaqueSurfaceEncountered,
@@ -442,7 +447,7 @@ float3 evalSingleScatteringTransmission(
       /// Visibility Check
 
       // Trace Visibilty Ray
-      const VisibilityResult singleScatteringVisibility = traceVisibilityRay<visibilityModeEnablePom | visibilityModeAccurateHitDistance | visibilityModeEnableTranslucentMaterials | visibilityModeEnableSubsurfaceMaterials>(
+      const VisibilityResult singleScatteringVisibility = traceVisibilityRay<SSS_SAMPLE_VISIBILITY_MODE>(
         singleScatteringTracingResult.sssMinimalSurfaceInteraction,
         singleScatteringLightSample.position, rayMask,
         sampledTransportPortalIndex, geometryFlags.portalSpace, geometryFlags.pomOpaqueSurfaceEncountered,
