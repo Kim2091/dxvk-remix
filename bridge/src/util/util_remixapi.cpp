@@ -354,7 +354,12 @@ void MaterialInfoOpaque::_dtor() {
                                          subsurfaceTransmittanceColor, \
                                          subsurfaceMeasurementDistance, \
                                          subsurfaceSingleScatteringAlbedo, \
-                                         subsurfaceVolumetricAnisotropy
+                                         subsurfaceVolumetricAnisotropy, \
+                                         subsurfaceDiffusionProfile, \
+                                         subsurfaceRadius, \
+                                         subsurfaceRadiusScale, \
+                                         subsurfaceMaxSampleRadius, \
+                                         subsurfaceRadiusTexture
 uint32_t MaterialInfoOpaqueSubsurface::_calcSize() const {
   return fold_helper::calcSize(MaterialInfoOpaqueSubsurfaceVars);
 }
@@ -369,6 +374,7 @@ void MaterialInfoOpaqueSubsurface::_dtor() {
   delete subsurfaceTransmittanceTexture;
   delete subsurfaceThicknessTexture;
   delete subsurfaceSingleScatteringAlbedoTexture;
+  delete subsurfaceRadiusTexture;
 }
 
 
