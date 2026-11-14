@@ -94,6 +94,10 @@ On a frame with displacement the SHARC update ran inline with POM compiled in, s
 - Options: added `rtx.integrateIndirect.sharcUpdateSerWithPom` (default off). Not set by the graphics presets: the screenshots so far show no difference above frame noise, from one exterior view only.
 - Measured: New Vegas, Goodsprings exterior at a low sun, 1485x835 with DLSS-RR: GPU frame 39.1 to 32.9 ms, IndirectSharcUpdate 8.3-9.5 to 2.7 ms (in-run A/B, two phases on between three off). Screenshots from one camera differ no more between on and off than between two off phases. Interiors not measured.
 
+### Fix: no crash or hang when the window is minimized during a present
+When acquiring a swap chain image returned suboptimal or out of date while the window had a zero-sized client area, for example during alt-tab or a minimize, the present recreated a swap chain that could not exist. With suboptimal it then read the semaphores of the destroyed swap chain, and the runtime crashed with `std::out_of_range` in `Presenter::getSync`. With out of date it retried in a busy loop until the window was restored. The present now skips the frame until the window is restored, still firing its frame latency signal. A New Vegas RTX player on an Intel Arc B580 hit the crash.
+- Options: none.
+
 ### Subsurface shadow rays stop at the first hit
 The three shadow rays of the diffusion-profile subsurface path (the profile sample, the transmission boundary term and the single-scattering sample) searched for the closest hit, although nothing reads their hit distance. They now stop at the first confirmed opaque hit. Occlusion and attenuation are the same in either mode up to float rounding, so the image does not change.
 - Options: none. Preset-independent: a pure performance fix that is always on.
