@@ -98,6 +98,11 @@ On a frame with displacement the SHARC update ran inline with POM compiled in, s
 When acquiring a swap chain image returned suboptimal or out of date while the window had a zero-sized client area, for example during alt-tab or a minimize, the present recreated a swap chain that could not exist. With suboptimal it then read the semaphores of the destroyed swap chain, and the runtime crashed with `std::out_of_range` in `Presenter::getSync`. With out of date it retried in a busy loop until the window was restored. The present now skips the frame until the window is restored, still firing its frame latency signal. A New Vegas RTX player on an Intel Arc B580 hit the crash.
 - Options: none.
 
+### Fix: the pipeline cache is rewritten only when it can have changed
+The background save ran whenever pipelines had been created, and a pipeline built from a cache hit counts as created, so every burst of hits rewrote the whole cache file without adding anything to it. It now runs when a pipeline missed the cache or reported no creation feedback, and a save that failed is retried.
+- Options: none.
+- Commits: the commit that adds this entry.
+
 ## 2026-10-28
 
 ### Developer menu: settings search
