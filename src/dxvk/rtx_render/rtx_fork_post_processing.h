@@ -16,13 +16,10 @@ namespace dxvk {
 
   class RtxPostProcessingStack {
   public:
-    // updateAutoExposure is forwarded to RtxContext::dispatchToneMapping. It has no default, because
-    // DLSS-NR dispatches auto exposure itself and a default of true would dispatch it twice.
     static void dispatch(
       Rc<RtxContext> ctx,
       Resources::RaytracingOutput& rtOutput,
-      bool performSRGBConversion,
-      bool updateAutoExposure);
+      bool performSRGBConversion);
 
     static void showSettings(const Rc<DxvkContext>& ctx);
 

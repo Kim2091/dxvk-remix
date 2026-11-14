@@ -59,14 +59,11 @@ namespace dxvk {
 
     // Dispatches the post-processing stack. The stack keeps the HDR/display-space boundary,
     // and the developer UI can reorder the effects that allow it.
-    // updateAutoExposure is forwarded to RtxContext::dispatchToneMapping.
-    // The frame renderer passes false when DLSS-NR already dispatched auto-exposure this frame.
     // Implementation in rtx_fork_post_processing.cpp.
     void dispatchPostProcessingStack(
       Rc<RtxContext> ctx,
       Resources::RaytracingOutput& rtOutput,
-      bool performSRGBConversion,
-      bool updateAutoExposure);
+      bool performSRGBConversion);
 
     // Draws the ordered post-processing stack UI with the effect settings beneath it.
     // Implementation in rtx_fork_post_processing.cpp.

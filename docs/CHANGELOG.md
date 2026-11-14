@@ -103,6 +103,10 @@ Primary rays that hit a lens are remapped through it, so a scope, reflex sight o
 - Options: added the `rtx.lens.*` options, including `rtx.lens.magnificationScale`, `chromaticFringe`, `edgeBlur`, the `rtx.lens.debugLens.*` test lens and `rtx.lens.debugView`.
 - Docs: [Lens.md](../documentation/Lens.md)
 
+### Auto exposure: steady when the first-person weapon fills the view
+The Halo meter now ignores first-person surfaces even without view model copies, holds the exposure for a moment when the weapon's share of the frame spikes (aiming, recoil, reloading, looking down) instead of jumping, and meters before the lens overlay so a scope's own darkening does not count. Walking into a dark building with a weapon out still adapts.
+- Options: added `rtx.autoExposure.halo.excludeViewModelHoldThreshold` (default 0.85) and `rtx.autoExposure.halo.excludeViewModelSpikeMargin` (default 0.15).
+
 ## 2026-10-28
 
 ### Developer menu: settings search

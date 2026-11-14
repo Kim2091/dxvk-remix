@@ -86,7 +86,8 @@ The composite gives a cloud-covered lens pixel the cloud's depth at the virtual 
 
 The field stop, exit pupil falloff, vignette, glass tint and reticle are applied by `lens_overlay.comp.slang` to the
 upscaled linear output, after denoising and upscaling and before post-processing. They never enter the G-buffer or
-any history. The overlay traces nothing. It tests the unjittered camera ray of each output pixel against the lenses.
+any history. Auto exposure meters the output just before the overlay, so lens pixels are metered at full
+transmission. The overlay traces nothing. It tests the unjittered camera ray of each output pixel against the lenses.
 
 - The apparent angle `theta` is measured between the camera ray and `A`, as tangents along `U` and `V`.
 - The field stop passes `tan(theta)` below the field stop tangent, with a soft edge `rtx.lens.softEdgePixels` wide.

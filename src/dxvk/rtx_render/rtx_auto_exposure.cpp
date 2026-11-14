@@ -57,6 +57,7 @@ namespace dxvk {
         TEXTURE2D(AUTO_EXPOSURE_HALO_ALBEDO_INPUT)
         TEXTURE2D(AUTO_EXPOSURE_HALO_LINEAR_VIEW_Z_INPUT)
         TEXTURE2D(AUTO_EXPOSURE_HALO_SHARED_FLAGS_INPUT)
+        TEXTURE2D(AUTO_EXPOSURE_HALO_PRIMARY_SURFACE_FLAGS_INPUT)
         RW_TEXTURE2D(AUTO_EXPOSURE_HALO_PARTIALS_INPUT_OUTPUT)
       END_PARAMETER()
     };
@@ -100,6 +101,13 @@ namespace dxvk {
       RemixGui::DragFloat("Exposure Ceiling", &maxEvObject(),        0.1f,   0.0f,  24.0f, "%.1f EV", ImGuiSliderFlags_AlwaysClamp);
       RemixGui::Checkbox("Meter Lighting (divide albedo out)", &demodulateAlbedoObject());
       RemixGui::Checkbox("Exclude View Model", &excludeViewModelObject());
+      ImGui::BeginDisabled(!excludeViewModel());
+      RemixGui::DragFloat("View Model Hold Threshold", &excludeViewModelHoldThresholdObject(), 0.01f, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+      RemixGui::SetTooltipToLastWidgetOnHover("The exposure holds while the view model covers more than this share of the metered frame.");
+      RemixGui::DragFloat("View Model Spike Margin", &excludeViewModelSpikeMarginObject(), 0.01f, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+      RemixGui::SetTooltipToLastWidgetOnHover("The exposure holds for up to half a second while the view model's share of the metered frame "
+                                              "jumps this far above its average over the last second, as when a sight kicks back.");
+      ImGui::EndDisabled();
       RemixGui::Checkbox("Addon-Faithful Sky (no floor / hold)", &addonFaithfulObject());
       ImGui::BeginDisabled(addonFaithful());
       RemixGui::DragFloat("Sky Weight Max",       &skyWeightMaxObject(), 0.01f,  0.0f,   1.0f, "%.2f",    ImGuiSliderFlags_AlwaysClamp);
@@ -160,7 +168,8 @@ namespace dxvk {
     desc.access &= ~VK_ACCESS_TRANSFER_READ_BIT;
 
     // Meter state: (adapted exposure, has-metered flag). The per-tile partials are sized lazily.
-    viewInfo.format = desc.format = VK_FORMAT_R32G32_SFLOAT;
+    // The state also holds the running average of the excluded view model share and the current spike's held time.
+    viewInfo.format = desc.format = VK_FORMAT_R32G32B32A32_SFLOAT;
     viewInfo.usage = desc.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     m_haloState.image = device()->createImage(desc, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXRenderTarget, "autoexposure halo meter state");
     m_haloState.view = device()->createImageView(m_haloState.image, viewInfo);
@@ -183,7 +192,8 @@ namespace dxvk {
     desc.access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
     desc.tiling = VK_IMAGE_TILING_OPTIMAL;
     desc.layout = VK_IMAGE_LAYOUT_UNDEFINED;
-    desc.extent = VkExtent3D { groupsX, groupsY, 1 };
+    // Two texels per tile: the meter without the excluded view model pixels, then the metered weight with them.
+    desc.extent = VkExtent3D { groupsX * 2, groupsY, 1 };
     // (sum w*log, sum w, surface centre weight, total centre weight) per tile.
     desc.format = VK_FORMAT_R32G32B32A32_SFLOAT;
     desc.usage = VK_IMAGE_USAGE_STORAGE_BIT;
@@ -259,6 +269,8 @@ namespace dxvk {
     }
     args.demodulateAlbedo = demodulateAlbedo() ? 1u : 0u;
     args.excludeViewModel = excludeViewModel() ? 1u : 0u;
+    args.viewModelHoldThreshold = std::clamp(excludeViewModelHoldThreshold(), 0.0f, 1.0f);
+    args.viewModelSpikeMargin = std::clamp(excludeViewModelSpikeMargin(), 0.0f, 1.0f);
     if (addonFaithful()) {
       // The addon: sky at full weight whatever its brightness, no mean floor, no hold.
       args.skyWeightMax = 1.0f;
@@ -281,6 +293,7 @@ namespace dxvk {
       dt = std::clamp(dt, 0.0f, 0.25f);
       const float speedValue = speed() > 0.0f ? speed() : 0.0f;
       args.adaptation = 1.0f - std::exp(-dt * speedValue);
+      args.frameSeconds = dt;
     }
 
     ctx->pushConstants(0, sizeof(args), &args);
@@ -292,6 +305,7 @@ namespace dxvk {
       ctx->bindResourceView(AUTO_EXPOSURE_HALO_ALBEDO_INPUT, rtOutput.m_primaryAlbedo.view, nullptr);
       ctx->bindResourceView(AUTO_EXPOSURE_HALO_LINEAR_VIEW_Z_INPUT, rtOutput.m_primaryLinearViewZ.view, nullptr);
       ctx->bindResourceView(AUTO_EXPOSURE_HALO_SHARED_FLAGS_INPUT, rtOutput.m_sharedFlags.view, nullptr);
+      ctx->bindResourceView(AUTO_EXPOSURE_HALO_PRIMARY_SURFACE_FLAGS_INPUT, rtOutput.m_primarySurfaceFlags.view, nullptr);
       ctx->bindResourceView(AUTO_EXPOSURE_HALO_PARTIALS_INPUT_OUTPUT, m_haloPartials.view, nullptr);
       ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, AutoExposureHaloMeterShader::getShader());
       ctx->dispatch(groups.width, groups.height, 1);

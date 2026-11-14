@@ -138,6 +138,7 @@ struct RtSurface {
     flags0 |= isVertexColorBakedLighting ? (1 << 1) : 0;
     flags0 |= isHighlightHostile ? (1 << 2) : 0;
     flags0 |= isHeatSource ? (1 << 3) : 0;
+    flags0 |= isFirstPerson ? (1 << 4) : 0;
     // NOTE: Spare flags bits here
 
     writeGPUHelper(data, offset, flags0);
@@ -363,6 +364,8 @@ struct RtSurface {
   // The lens highlight and thermal categories (InstanceCategories::HighlightHostile and HeatSource).
   bool isHighlightHostile = false;
   bool isHeatSource = false;
+  // The instance is drawn with the view model camera: the player's own weapon, hands and sight body.
+  bool isFirstPerson = false;
   bool skipSurfaceInteractionSpritesheetAdjustment = false;
 
   RtTextureArgSource textureColorArg1Source = RtTextureArgSource::Texture;

@@ -335,8 +335,7 @@ namespace dxvk {
   void RtxPostProcessingStack::dispatch(
     Rc<RtxContext> ctx,
     Resources::RaytracingOutput& rtOutput,
-    bool performSRGBConversion,
-    bool updateAutoExposure) {
+    bool performSRGBConversion) {
     ScopedCpuProfileZone();
     RtxExternalEffects::instance().ensureLoaded(ctx->getDevice().ptr());
     // A finished recompile is swapped in here, before the loop, so the two dispatches of one effect
@@ -373,9 +372,7 @@ namespace dxvk {
         ctx->dispatchPostFxDof(rtOutput);
         break;
       case EffectId::Tonemapping:
-        // Explicitly forwarded, never defaulted: false here means DLSS-NR
-        // already ran auto exposure for this frame.
-        ctx->dispatchToneMapping(rtOutput, updateAutoExposure);
+        ctx->dispatchToneMapping(rtOutput);
         break;
       case EffectId::NtscVhs:
         ctx->dispatchPostFxNtsc(rtOutput);
@@ -773,10 +770,8 @@ namespace dxvk {
     void dispatchPostProcessingStack(
       Rc<RtxContext> ctx,
       Resources::RaytracingOutput& rtOutput,
-      bool performSRGBConversion,
-      bool updateAutoExposure) {
-      RtxPostProcessingStack::dispatch(
-        ctx, rtOutput, performSRGBConversion, updateAutoExposure);
+      bool performSRGBConversion) {
+      RtxPostProcessingStack::dispatch(ctx, rtOutput, performSRGBConversion);
     }
 
     void showPostProcessingStackSettings(const Rc<DxvkContext>& ctx) {

@@ -317,6 +317,12 @@ struct Surface
     get { return packedFlagGet(data0b.z, 1 << 3); }
   }
 
+  // The instance is drawn with the view model camera. It is set whether or not view model copies are traced.
+  property bool isFirstPerson
+  {
+    get { return packedFlagGet(data0b.z, 1 << 4); }
+  }
+
   property uint16_t hashPacked
   {
     get { return data0b.w; }

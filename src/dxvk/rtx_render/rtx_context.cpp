@@ -888,11 +888,22 @@ namespace dxvk {
         dust.simulateAndDraw(this, m_state, rtOutput);
         recordGpuStageTiming("DustParticles");
 
+        // Auto exposure meters the upscaled scene before the lens overlay and the post-processing stack, so the
+        // overlay's darkening of lens pixels (field stop, exit pupil, vignette, edge effects) and the post effects
+        // never move it. The overlay, DLSS-NR and the tone mapper use this frame's exposure.
+        {
+          DxvkAutoExposure& autoExposure = m_common->metaAutoExposure();
+          autoExposure.dispatch(this,
+            getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER),
+            rtOutput, GlobalTime::get().deltaTimeMs());
+          recordGpuStageTiming("AutoExposureHaloMeter");
+        }
+
         // The lens overlay works on the upscaled image, so its masks and reticle never enter any history.
         getSceneManager().getLensManager().dispatchOverlay(this, rtOutput);
 
         // DLSS-NR stays outside the ordered post-processing stack. It must see linear HDR before any
-        // stack member runs, it dispatches auto exposure itself, and "Post FX Enabled" must not gate it.
+        // stack member runs, and "Post FX Enabled" must not gate it.
         const bool dlssNrEnabled = dispatchDlssNR(rtOutput);
         recordGpuStageTiming("DlssNR");
         m_perfCpu.dlssNr = dlssNrEnabled;
@@ -902,9 +913,7 @@ namespace dxvk {
         // captures (WAR for TREX-553: NVTT implicitly applies sRGB during dds->png conversion
         // for 16bit float formats).
         const bool performSRGBConversion = !captureScreenImage && g_allowSrgbConversionForOutput;
-        // DLSS-NR already dispatched auto exposure above, so the tonemapper must not dispatch it again.
-        fork_hooks::dispatchPostProcessingStack(
-          this, rtOutput, performSRGBConversion, /* updateAutoExposure */ !dlssNrEnabled);
+        fork_hooks::dispatchPostProcessingStack(this, rtOutput, performSRGBConversion);
         recordGpuStageTiming("PostProcessing");
 
         // Composite the Remix C API screen overlay after tone mapping and display encoding,
@@ -2901,11 +2910,7 @@ namespace dxvk {
     }
 
     DxvkToneMapping& toneMapper = m_common->metaToneMapping();
-    DxvkAutoExposure& autoExposure = m_common->metaAutoExposure();
-    autoExposure.dispatch(this,
-      getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER),
-      rtOutput, GlobalTime::get().deltaTimeMs());
-    recordGpuStageTiming("AutoExposureHaloMeter");
+    const DxvkAutoExposure& autoExposure = m_common->metaAutoExposure();
 
     // DLSS-NR operates in SDR space; inverse tone mapping restores HDR for downstream post-processing.
     toneMapper.dispatchFastToneMapping(
@@ -2926,7 +2931,7 @@ namespace dxvk {
     return true;
   }
 
-  void RtxContext::dispatchToneMapping(const Resources::RaytracingOutput& rtOutput, bool updateAutoExposure) {
+  void RtxContext::dispatchToneMapping(const Resources::RaytracingOutput& rtOutput) {
     ScopedCpuProfileZone();
 
     if (m_common->metaDebugView().debugViewIdx() == DEBUG_VIEW_PRE_TONEMAP_OUTPUT) {
@@ -2937,16 +2942,11 @@ namespace dxvk {
     this->spillRenderPass(false);
     this->unbindComputePipeline();
 
+    // Auto exposure was dispatched before the lens overlay.
     DxvkAutoExposure& autoExposure = m_common->metaAutoExposure();
-    // [PerfGpu] stamps around auto exposure and the tonemap. Each stamp closes the interval since the
-    // previous one, so the stack effects ahead of the tonemap get their own label first.
+    // [PerfGpu] stamps around the tonemap. Each stamp closes the interval since the previous one, so the stack
+    // effects ahead of the tonemap get their own label first.
     recordGpuStageTiming("PostFxPreTonemap");
-    if (updateAutoExposure) {
-      autoExposure.dispatch(this,
-        getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER),
-        rtOutput, GlobalTime::get().deltaTimeMs());
-      recordGpuStageTiming("AutoExposureHaloMeter");
-    }
 
     setFramePassStage(RtxFramePassStage::ToneMapping);
     // Operator-only tonemapping. sRGB conversion and dithering are done by dispatchSRGBDither, so the

@@ -39,7 +39,9 @@
 * by an 18% card.
 *
 * Inputs: the post-upscale linear HDR output before exposure, PrimaryAlbedo at render
-* resolution (sky counts as albedo 1), and the view-model bit of SharedFlags as the mask.
+* resolution (sky counts as albedo 1), and the view-model bits of SharedFlags and PrimarySurfaceFlags as the mask.
+* Each tile also writes its metered weight with the view model included, so the resolve can hold the exposure while
+* the view model covers most of the frame.
 */
 #include "rtx/pass/tonemap/tonemapping.h"
 
@@ -54,6 +56,9 @@ Texture2D<float> PrimaryLinearViewZ;
 
 layout(r16ui, binding = AUTO_EXPOSURE_HALO_SHARED_FLAGS_INPUT)
 Texture2D<uint16_t> SharedFlags;
+
+layout(r8ui, binding = AUTO_EXPOSURE_HALO_PRIMARY_SURFACE_FLAGS_INPUT)
+Texture2D<uint> PrimarySurfaceFlags;
 
 // Per tile: x = sum(w * log), y = sum(w), z = sum of centre weight over in-scene surface
 // (non-sky, non-view-model) pixels, w = sum of centre weight over all pixels. z / w is the
@@ -76,11 +81,16 @@ static const uint kMeterThreads = AUTO_EXPOSURE_HALO_TILE * AUTO_EXPOSURE_HALO_T
 // GeometryFlags::isViewModel is bit 2. It is read directly to avoid the headers
 // rtx/utility/geometry_flags.slangh pulls in.
 static const uint kGeometryFlagIsViewModel = 1u << 2;
+// MotionBlurSurfaceFlags::isFirstPerson is bit 4 of PrimarySurfaceFlags: the surface is drawn with the view model
+// camera, also when no view model copy is traced.
+static const uint kSurfaceFlagIsFirstPerson = 1u << 4;
 
 groupshared float g_meterLogSum[kMeterThreads];
 groupshared float g_meterWeightSum[kMeterThreads];
 groupshared float g_meterSurfaceSum[kMeterThreads];
 groupshared float g_meterCentreSum[kMeterThreads];
+// The metered weight with the view model included.
+groupshared float g_meterAllWeightSum[kMeterThreads];
 
 float meterWeight(uint2 pixel, uint2 size)
 {
@@ -105,6 +115,7 @@ void meterReduce(uint index)
       g_meterWeightSum[index] += g_meterWeightSum[index + stride];
       g_meterSurfaceSum[index] += g_meterSurfaceSum[index + stride];
       g_meterCentreSum[index] += g_meterCentreSum[index + stride];
+      g_meterAllWeightSum[index] += g_meterAllWeightSum[index + stride];
     }
     GroupMemoryBarrierWithGroupSync();
   }
@@ -120,6 +131,7 @@ void main(uint2 id : SV_DispatchThreadID, uint2 group : SV_GroupID, uint index :
   float weight = 0.0f;
   float weightedLog = 0.0f;
   float surfaceWeight = 0.0f;
+  float allWeight = 0.0f;
   float centreWeight = 0.0f;
 
   if (all(id < size))
@@ -153,7 +165,11 @@ void main(uint2 id : SV_DispatchThreadID, uint2 group : SV_GroupID, uint index :
 
     // The view model gets zero weight, so it adds to neither the log sum nor the divisor.
     float inScene = 1.0f;
-    if (cb.excludeViewModel != 0 && (uint(SharedFlags[gbufferPixel]) & kGeometryFlagIsViewModel) != 0)
+    // A pixel seen through a lens shows the world, and its primary surface is not first person.
+    const bool isViewModel =
+      (uint(SharedFlags[gbufferPixel]) & kGeometryFlagIsViewModel) != 0 ||
+      (PrimarySurfaceFlags[gbufferPixel] & kSurfaceFlagIsFirstPerson) != 0;
+    if (cb.excludeViewModel != 0 && isViewModel)
     {
       inScene = 0.0f;
     }
@@ -171,7 +187,8 @@ void main(uint2 id : SV_DispatchThreadID, uint2 group : SV_GroupID, uint index :
         : 1.0f;
       skyFactor = saturate(cb.skyWeightMax) * ramp;
     }
-    weight = finitePixel ? centreWeight * inScene * skyFactor : 0.0f;
+    allWeight = finitePixel ? centreWeight * skyFactor : 0.0f;
+    weight = allWeight * inScene;
     weightedLog = weight * log(max(average, kMeterFloor));
     surfaceWeight = primaryMiss ? 0.0f : centreWeight * inScene;
   }
@@ -180,10 +197,12 @@ void main(uint2 id : SV_DispatchThreadID, uint2 group : SV_GroupID, uint index :
   g_meterWeightSum[index] = weight;
   g_meterSurfaceSum[index] = surfaceWeight;
   g_meterCentreSum[index] = centreWeight;
+  g_meterAllWeightSum[index] = allWeight;
   meterReduce(index);
 
   if (index == 0u)
   {
-    OutPartials[group] = float4(g_meterLogSum[0], g_meterWeightSum[0], g_meterSurfaceSum[0], g_meterCentreSum[0]);
+    OutPartials[uint2(group.x * 2u, group.y)] = float4(g_meterLogSum[0], g_meterWeightSum[0], g_meterSurfaceSum[0], g_meterCentreSum[0]);
+    OutPartials[uint2(group.x * 2u + 1u, group.y)] = float4(0.0f, g_meterAllWeightSum[0], 0.0f, 0.0f);
   }
 }

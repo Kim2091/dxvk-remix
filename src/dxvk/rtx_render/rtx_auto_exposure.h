@@ -114,7 +114,19 @@ namespace dxvk {
                "count as albedo 1. This is the addon's behaviour. Turn it off only to compare.");
     RTX_OPTION("rtx.autoExposure.halo", bool, excludeViewModel, true,
                "Halo Meter: ignores view model pixels (the first-person weapon and hands), like the addon's "
-               "first-person meter mask.");
+               "first-person meter mask. Pixels drawn with the view model camera count as view model also when no "
+               "view model copy is traced. Pixels seen through a lens are metered. While the view model's share of the "
+               "metered frame spikes (rtx.autoExposure.halo.excludeViewModelSpikeMargin) or exceeds "
+               "rtx.autoExposure.halo.excludeViewModelHoldThreshold, the exposure holds for up to half a second.");
+    RTX_OPTION_ARGS("rtx.autoExposure.halo", float, excludeViewModelHoldThreshold, 0.85f,
+                    "Halo Meter: the share of the metered frame, from 0 to 1, above which excluded view model pixels make "
+                    "the exposure hold for up to half a second instead of adapting. 1 never holds this way.",
+                    args.minValue = 0.0f, args.maxValue = 1.0f);
+    RTX_OPTION_ARGS("rtx.autoExposure.halo", float, excludeViewModelSpikeMargin, 0.15f,
+                    "Halo Meter: how far, from 0 to 1, the view model's share of the metered frame must rise above its "
+                    "average over about the last second to hold the exposure for up to half a second, as when a sight "
+                    "kicks back into the frame. The average resets on camera cuts. 1 never holds this way.",
+                    args.minValue = 0.0f, args.maxValue = 1.0f);
     RTX_OPTION("rtx.autoExposure.halo", float, skyWeightMax, 1.0f,
                "Halo Meter: the metering weight of a bright sky pixel relative to scene surfaces. The weight fades with "
                "the sky's own brightness between rtx.autoExposure.halo.skyLumLow and skyLumHigh, so a day sky counts, "

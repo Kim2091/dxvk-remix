@@ -57,6 +57,7 @@ struct ToneMappingGradeArgs {
 #define AUTO_EXPOSURE_HALO_PARTIALS_INPUT_OUTPUT          4
 #define AUTO_EXPOSURE_HALO_STATE_INPUT_OUTPUT             5
 #define AUTO_EXPOSURE_HALO_EXPOSURE_OUTPUT                6
+#define AUTO_EXPOSURE_HALO_PRIMARY_SURFACE_FLAGS_INPUT    7
 
 // Tile edge of the Halo meter's first pass (16x16 threads, one partial per tile).
 // Kept in step with the addon's kMeterTile.
@@ -93,6 +94,14 @@ struct ToneMappingHaloMeterArgs {
   float compensationNightStops;
   float compensationNightEv;
   float compensationDayEv;
+
+  // Hold the exposure while the excluded view model is more than this share of the metered weight.
+  float viewModelHoldThreshold;
+  // Hold the exposure while the excluded view model share is this much above its running average.
+  float viewModelSpikeMargin;
+  // The frame time in seconds, clamped like the adaptation's.
+  float frameSeconds;
+  uint  pad0;
 };
 
 // Inputs for the apply-tonemapping pass (exposure, the tone curve in tonemap_operator.slangh,

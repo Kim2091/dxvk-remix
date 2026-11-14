@@ -370,6 +370,7 @@ namespace dxvk {
   bool RtInstance::setFrameLastUpdated(const uint32_t frameIndex) {
     if (m_frameLastUpdated != frameIndex) {
       m_seenCameraTypes.clrAll();
+      surface.isFirstPerson = false;
 
       m_frameLastUpdated = frameIndex;
 
@@ -392,6 +393,11 @@ namespace dxvk {
 
     if (settingNewCameraType)
       m_seenCameraTypes.set(cameraType);
+
+    // Every draw of the frame that registers the view model camera marks the instance first person.
+    if (cameraType == CameraType::ViewModel) {
+      surface.isFirstPerson = true;
+    }
 
     return settingNewCameraType;
   }

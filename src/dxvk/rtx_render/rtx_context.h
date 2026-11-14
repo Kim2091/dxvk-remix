@@ -64,8 +64,7 @@ namespace dxvk {
     void dispatchPostProcessingStack(
       Rc<RtxContext> ctx,
       Resources::RaytracingOutput& rtOutput,
-      bool performSRGBConversion,
-      bool updateAutoExposure);
+      bool performSRGBConversion);
     void dispatchScreenOverlay(RtxContext&, Resources::RaytracingOutput&);
     bool isFsrUpscalerActive(RtxContext&);
     void dispatchFsrUpscale(RtxContext&, const Resources::RaytracingOutput&);
@@ -356,7 +355,7 @@ namespace dxvk {
     void dispatchXeSS(const Resources::RaytracingOutput& rtOutput);
     void dispatchTemporalAA(const Resources::RaytracingOutput& rtOutput);
     bool dispatchDlssNR(const Resources::RaytracingOutput& rtOutput);
-    void dispatchToneMapping(const Resources::RaytracingOutput& rtOutput, bool updateAutoExposure = true);
+    void dispatchToneMapping(const Resources::RaytracingOutput& rtOutput);
     void dispatchBloom(const Resources::RaytracingOutput& rtOutput);
     void dispatchPostFxMotionBlur(Resources::RaytracingOutput& rtOutput);
     void dispatchPostFxDof(Resources::RaytracingOutput& rtOutput);
