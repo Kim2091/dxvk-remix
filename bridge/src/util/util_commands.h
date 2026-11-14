@@ -85,6 +85,7 @@ namespace Commands {
     RemixApi_MixColorGradePresets,
     RemixApi_GetColorGrade,
     RemixApi_SaveColorGradePreset,
+    RemixApi_GetVramStats,
 
     Bridge_SharedHeap_AddSeg,
     Bridge_SharedHeap_Alloc,
@@ -551,6 +552,7 @@ namespace Commands {
     case RemixApi_MixColorGradePresets: return "RemixApi_MixColorGradePresets";
     case RemixApi_GetColorGrade: return "RemixApi_GetColorGrade";
     case RemixApi_SaveColorGradePreset: return "RemixApi_SaveColorGradePreset";
+    case RemixApi_GetVramStats: return "RemixApi_GetVramStats";
 
     case Bridge_SharedHeap_AddSeg: return "SharedHeap_AddSeg";
     case Bridge_SharedHeap_Alloc: return "SharedHeap_Alloc";

@@ -914,6 +914,9 @@ void sendHostString(ClientMessage& c, const char* s) {
 
 extern "C" {
 
+  // remix_c.h declares no function for this slot, so the definition below needs this declaration.
+  DLLEXPORT remixapi_ErrorCode __stdcall remixapi_GetVramStats(remixapi_VramStats* out_stats);
+
   DLLEXPORT remixapi_ErrorCode __stdcall remixapi_InitializeLibrary(
     const remixapi_InitializeLibraryInfo* info,
     remixapi_Interface*                   out_result) {
@@ -971,6 +974,7 @@ extern "C" {
       interf.UpdateLightDefinition        = remixapi_UpdateLightDefinition;
       interf.SetGameValue                 = remixapi_SetGameValue;
       interf.GetGameValue                 = remixapi_GetGameValue;
+      interf.GetVramStats                 = remixapi_GetVramStats;
       // interf.dxvk_GetExternalSwapchain = remixapi_dxvk_GetExternalSwapchain;
       // interf.dxvk_GetVkImage = remixapi_dxvk_GetVkImage;
       // interf.dxvk_CopyRenderingOutput = remixapi_dxvk_CopyRenderingOutput;
@@ -1112,6 +1116,50 @@ extern "C" {
       const uint32_t value_size = DeviceBridge::get_data(&value_ptr);
       (void) value_size;
       memcpy(out_buffer, value_ptr, actual);
+    }
+    DeviceBridge::pop_front();
+    return result;
+  }
+
+  // The server answers with the result and, on success, kVramStatsWords uint64 words: the twelve uint64 fields of
+  // remixapi_VramStats in declaration order, then forkTextureCacheCount widened to 64 bits. Field by field, so the
+  // x86 and x64 struct layouts need not agree.
+  static constexpr uint32_t kVramStatsWords = 13;
+
+  DLLEXPORT remixapi_ErrorCode __stdcall remixapi_GetVramStats(remixapi_VramStats* out_stats) {
+    ASSERT_REMIXAPI_PFN_TYPE(remixapi_GetVramStats);
+    if (out_stats == nullptr) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+
+    DeviceBridge::ResponseTransaction responseTransaction;
+    UID currentUID = 0;
+    {
+      ClientMessage c(Commands::RemixApi_GetVramStats);
+      currentUID = c.get_uid();
+    }
+    WAIT_FOR_SERVER_RESPONSE("remixapi_GetVramStats", REMIXAPI_ERROR_CODE_GENERAL_FAILURE, currentUID);
+    const remixapi_ErrorCode result = static_cast<remixapi_ErrorCode>(DeviceBridge::get_data());
+    if (result == REMIXAPI_ERROR_CODE_SUCCESS) {
+      void* words = nullptr;
+      const uint32_t size = DeviceBridge::get_data(&words);
+      if (size == sizeof(uint64_t) * kVramStatsWords) {
+        uint64_t w[kVramStatsWords];
+        memcpy(w, words, sizeof(w));
+        out_stats->totalAllocatedBytes = w[0];
+        out_stats->totalUsedBytes = w[1];
+        out_stats->poolRetainedBytes = w[2];
+        out_stats->usedReplacementGeometryBytes = w[3];
+        out_stats->usedBufferBytes = w[4];
+        out_stats->usedAccelerationStructureBytes = w[5];
+        out_stats->usedOpacityMicromapBytes = w[6];
+        out_stats->usedMaterialTextureBytes = w[7];
+        out_stats->usedRenderTargetBytes = w[8];
+        out_stats->driverAllocatedBytes = w[9];
+        out_stats->driverBudgetBytes = w[10];
+        out_stats->forkTextureCacheCount = static_cast<uint32_t>(w[12]);
+        // w[11] is reserved for the next uint64 field; the bridge sends it as 0.
+      }
     }
     DeviceBridge::pop_front();
     return result;

@@ -144,6 +144,9 @@ namespace dxvk {
       }
     }
     size_t entryCount() const { return m_entries.size(); }
+    // Geometry replaced under its key and kept until its last user is unlinked.
+    size_t retiredGeometryCount() const { return m_retiredGeometry.size(); }
+    size_t geometryCount() const { return m_geometry.size(); }
     // rtx.scene.directTransient (rtx_scene_transient.h).
     TransientLane& transient() { return *m_transient; }
 

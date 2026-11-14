@@ -4218,6 +4218,34 @@ void ProcessDeviceCommandQueue() {
         break;
       }
 
+      case RemixApi_GetVramStats:
+      {
+        // The client's remixapi_GetVramStats reads the result and, on success, 13 uint64 words in its order.
+        remixapi_VramStats stats = {};
+        remixapi_ErrorCode result = REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+        if (remixapi::g_remix.GetVramStats) {
+          result = remixapi::g_remix.GetVramStats(&stats);
+        } else {
+          static bool s_warned = false;
+          if (!s_warned) {
+            s_warned = true;
+            Logger::err("[RemixApi_GetVramStats] GetVramStats function pointer is null in g_remix.");
+          }
+        }
+        ServerMessage c(Commands::Bridge_Response, currentUID);
+        c.send_data(static_cast<uint32_t>(result));
+        if (result == REMIXAPI_ERROR_CODE_SUCCESS) {
+          const uint64_t words[13] = {
+            stats.totalAllocatedBytes, stats.totalUsedBytes, stats.poolRetainedBytes, stats.usedReplacementGeometryBytes,
+            stats.usedBufferBytes, stats.usedAccelerationStructureBytes, stats.usedOpacityMicromapBytes,
+            stats.usedMaterialTextureBytes, stats.usedRenderTargetBytes, stats.driverAllocatedBytes, stats.driverBudgetBytes,
+            0, stats.forkTextureCacheCount,
+          };
+          c.send_data(sizeof(words), words);
+        }
+        break;
+      }
+
       case RemixApi_SaveColorGradePreset:
       {
         void* namePtr = nullptr;

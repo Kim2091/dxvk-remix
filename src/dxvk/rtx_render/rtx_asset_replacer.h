@@ -628,6 +628,12 @@ namespace dxvk {
     void destroyExternalMesh(remixapi_MeshHandle handle);
     // True while at least one remixapi-created mesh is still registered.
     [[nodiscard]] bool hasExternalMeshes() const { return !m_extMeshes.empty(); }
+    // Calls fn(handle, submeshes) for every registered Remix API mesh. The memory log reads it.
+    template<typename Fn> void forEachExternalMesh(Fn&& fn) const {
+      for (const auto& [handle, submeshes] : m_extMeshes) {
+        fn(handle, *submeshes);
+      }
+    }
 
   private:
     void updateSecretReplacements();

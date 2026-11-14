@@ -5480,6 +5480,7 @@ namespace dxvk {
 
     // Geometry copies: every BlasEntry holds a device-local index copy and one vertex
     // buffer, two for geometry that has ever been refit (skinned, morphs) to keep history.
+    const size_t drawCallCacheEntries = m_drawCallCache.getEntries().size();
     uint32_t entries = 0, doubleBuffered = 0, shared = 0, unlinked = 0;
     size_t linkedInstances = 0;
     VkDeviceSize indexBytes = 0, vertexBytes = 0, historyBytes = 0;
@@ -5536,6 +5537,52 @@ namespace dxvk {
       " | TLAS ", mib(as.tlasBytes), ", frame buffers ", mib(as.frameBufferBytes),
       " | sum ", mib(accounted),
       " | retained ", m_retainedExternalDraws.size(), " (", retainedHidden, " hidden)"));
+
+    // The mesh-side memory that a long session can grow, by owner: the Remix API meshes' own buffers (replaced on every
+    // geometry refresh), the BlasEntries of the draw call cache and of the retained scene (live and retired), and the
+    // allocator's bytes per category over every heap. A category that climbs across a session points at its owner.
+    {
+      size_t apiMeshes = 0, apiSubmeshes = 0, apiSkinned = 0;
+      VkDeviceSize apiDeviceLocalBytes = 0, apiHostBytes = 0;
+      std::unordered_set<const DxvkBuffer*> apiBuffers;
+      auto countBuffer = [&](const DxvkBufferSlice& slice) {
+        if (!slice.defined() || !apiBuffers.insert(slice.buffer().ptr()).second) {
+          return;
+        }
+        const bool deviceLocal = (slice.buffer()->memFlags() & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+        (deviceLocal ? apiDeviceLocalBytes : apiHostBytes) += slice.buffer()->info().size;
+      };
+      m_pReplacer->forEachExternalMesh([&](remixapi_MeshHandle, const std::vector<RasterGeometry>& submeshes) {
+        apiMeshes++;
+        for (const RasterGeometry& geometry : submeshes) {
+          apiSubmeshes++;
+          apiSkinned += geometry.blendWeightBuffer.defined() ? 1 : 0;
+          countBuffer(geometry.positionBuffer);
+          countBuffer(geometry.indexBuffer);
+          countBuffer(geometry.blendWeightBuffer);
+          countBuffer(geometry.blendIndicesBuffer);
+        }
+      });
+
+      VkDeviceSize rtxBuffer = 0, sceneGeometry = 0, accel = 0, omm = 0;
+      const VkPhysicalDeviceMemoryProperties memoryProperties = m_device->adapter()->memoryProperties();
+      for (uint32_t heap = 0; heap < memoryProperties.memoryHeapCount; heap++) {
+        const DxvkMemoryStats stats = m_device->getMemoryStats(heap);
+        rtxBuffer += stats.usedByCategory(DxvkMemoryStats::Category::RTXBuffer);
+        sceneGeometry += stats.usedByCategory(DxvkMemoryStats::Category::RTXSceneGeometry);
+        accel += stats.usedByCategory(DxvkMemoryStats::Category::RTXAccelerationStructure);
+        omm += stats.usedByCategory(DxvkMemoryStats::Category::RTXOpacityMicromap);
+      }
+
+      Logger::info(str::format(
+        "[MeshMem] frame ", frameId,
+        " | api meshes ", apiMeshes, " (", apiSubmeshes, " submeshes, ", apiSkinned, " skinned), buffers ", apiBuffers.size(),
+        " device-local ", mib(apiDeviceLocalBytes), " host ", mib(apiHostBytes),
+        " | blas entries: draw call cache ", drawCallCacheEntries, ", retained ", m_retainedScene->geometryCount(),
+        " (", m_retainedScene->retiredGeometryCount(), " retired), retained entries ", m_retainedScene->entryCount(),
+        " | allocator used: RTXBuffer ", mib(rtxBuffer), ", scene geometry ", mib(sceneGeometry), ", accel ", mib(accel),
+        ", OMM ", mib(omm)));
+    }
 
     // BLAS/TLAS build activity since the last line. "dirty" counts cached merged buckets
     // invalidated, by the first cause found in each; "rebuilt/refit/skipped" counts the merged

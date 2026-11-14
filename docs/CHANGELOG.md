@@ -107,6 +107,10 @@ Primary rays that hit a lens are remapped through it, so a scope, reflex sight o
 The Halo meter now ignores first-person surfaces even without view model copies, holds the exposure for a moment when the weapon's share of the frame spikes (aiming, recoil, reloading, looking down) instead of jumping, and meters before the lens overlay so a scope's own darkening does not count. Walking into a dark building with a weapon out still adapts.
 - Options: added `rtx.autoExposure.halo.excludeViewModelHoldThreshold` (default 0.85) and `rtx.autoExposure.halo.excludeViewModelSpikeMargin` (default 0.15).
 
+### VRAM diagnostics
+New log figures for long-session VRAM growth: a `[MeshMem]` line next to `[AccelMem]` (the Remix API meshes and their buffers, the draw call cache's and the retained scene's BlasEntries, the allocator's used bytes per category), and allocator chunk figures per chunk class in `[VramBudget]` and in a new "Allocator Chunks" view under Rendering, VRAM Budget. The bridge now forwards `remixapi_GetVramStats`, so 32-bit hosts can read VRAM by category. Allocation behavior is unchanged.
+- Options: none.
+
 ## 2026-10-28
 
 ### Developer menu: settings search
