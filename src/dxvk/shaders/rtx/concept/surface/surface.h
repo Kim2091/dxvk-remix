@@ -305,6 +305,18 @@ struct Surface
     set { data0b.z = newValue ? packedFlagSet(data0b.z, 1 << 1) : packedFlagUnset(data0b.z, 1 << 1); }
   }
 
+  // The instance has the HighlightHostile category, so lenses that highlight outline it.
+  property bool isHighlightHostile
+  {
+    get { return packedFlagGet(data0b.z, 1 << 2); }
+  }
+
+  // The instance has the HeatSource category, so thermal lenses show it hot.
+  property bool isHeatSource
+  {
+    get { return packedFlagGet(data0b.z, 1 << 3); }
+  }
+
   property uint16_t hashPacked
   {
     get { return data0b.w; }

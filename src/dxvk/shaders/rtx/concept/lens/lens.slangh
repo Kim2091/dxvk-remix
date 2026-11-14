@@ -1,0 +1,362 @@
+/*
+* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+#pragma once
+
+// Lens functions. The including pass must declare cb as RaytraceArgs.
+// The maths is described in documentation/Lens.md.
+
+#include "rtx/concept/lens/lens.h"
+#include "rtx/concept/camera/camera.slangh"
+
+// A camera ray remapped by a lens.
+struct LensPrimaryRay
+{
+  // kLensSlotInvalid when the camera ray passes through no lens.
+  uint slot;
+  // The distance from the ray origin to the eyepiece plane along the camera ray.
+  float eyeDistance;
+  float magnification;
+  vec3 origin;
+  vec3 direction;
+};
+
+// The previous frame's view of a point or direction seen through a lens.
+struct LensReprojection
+{
+  // The previous eye-side direction from the previous camera.
+  vec3 previousEyeDirection;
+  // The previous virtual position: along the previous eye-side direction, at the previous virtual distance.
+  vec3 previousVirtualPosition;
+  // False when the lens has no history or the previous camera ray missed the previous eyepiece.
+  bool historyValid;
+};
+
+bool lensAnyActive()
+{
+  return cb.lensMask != 0;
+}
+
+bool lensAnyPreviousActive()
+{
+  return cb.previousLensMask != 0;
+}
+
+// Returns the distance along the ray to the lens' eyepiece plane.
+// Returns a negative value when the ray does not travel toward the objective.
+float lensEyepiecePlaneDistance(LensArgs lens, vec3 origin, vec3 direction)
+{
+  const float axialDirection = dot(direction, lens.axis);
+
+  if (axialDirection <= 0.0f)
+  {
+    return -1.0f;
+  }
+
+  return dot(lens.eyepieceCenter - origin, lens.axis) / axialDirection;
+}
+
+// Returns how far a point is from the aperture's center, where the aperture's outline is at 1. The point is along the
+// lens' right and up directions, in units of the eyepiece radius for the window or of the field stop for the stop.
+// A circle has radius 1.
+// A rectangle has half height 1 and half width the aperture aspect.
+// A binocular aperture is the union of two circles of radius 1 centered the aperture aspect to either side of the
+// axis. Each point measures to the nearer center, so the outline is the union's and the seam adds no darkening.
+float lensApertureDistance(LensArgs lens, vec2 position)
+{
+  if (lens.aperture == lensApertureRectangle)
+  {
+    return max(abs(position.x) / lens.apertureAspect, abs(position.y));
+  }
+
+  if (lens.aperture == lensApertureBinocular)
+  {
+    const vec2 circleCenter = vec2(lens.apertureAspect, 0.0f);
+
+    return min(length(position - circleCenter), length(position + circleCenter));
+  }
+
+  return length(position);
+}
+
+bool lensIsInsideEyepiece(LensArgs lens, vec3 origin, vec3 direction, float planeDistance)
+{
+  if (planeDistance <= 0.0f)
+  {
+    return false;
+  }
+
+  const vec3 offset = origin + direction * planeDistance - lens.eyepieceCenter;
+  const vec2 windowPosition = vec2(dot(offset, lens.right), dot(offset, lens.up)) / max(lens.eyepieceRadius, 1e-6f);
+
+  return lensApertureDistance(lens, windowPosition) < 1.0f;
+}
+
+// Maps an eye-side direction to the magnified direction leaving the objective.
+// The transverse direction is kept and the tangent of its angle to the axis is divided by the magnification.
+vec3 lensMagnifyDirection(LensArgs lens, vec3 eyeDirection)
+{
+  const float axialDirection = max(dot(eyeDirection, lens.axis), 1e-6f);
+  const vec3 transverseDirection = eyeDirection - axialDirection * lens.axis;
+
+  return normalize(lens.axis + transverseDirection / (axialDirection * lens.magnification));
+}
+
+// Maps a direction leaving the objective back to the eye-side direction, the inverse of lensMagnifyDirection.
+// Returns false when the direction does not point out of the objective.
+bool lensUnmagnifyDirection(LensArgs lens, vec3 objectiveDirection, out vec3 eyeDirection)
+{
+  const float axialDirection = dot(objectiveDirection, lens.axis);
+  const vec3 transverseDirection = objectiveDirection - axialDirection * lens.axis;
+
+  eyeDirection = objectiveDirection;
+
+  if (axialDirection <= 1e-6f)
+  {
+    return false;
+  }
+
+  eyeDirection = normalize(lens.axis + transverseDirection * (lens.magnification / axialDirection));
+
+  return true;
+}
+
+// Returns the slot of the nearest lens whose eyepiece the ray passes through.
+// Returns kLensSlotInvalid when the ray passes through no lens.
+// The previous frame's lenses are tested when previousFrame is set.
+// Pass-through lenses, which leave camera rays unchanged, are tested only when includePassThrough is set.
+uint lensFindSlotOfKind(vec3 origin, vec3 direction, bool previousFrame, bool includePassThrough)
+{
+  uint mask = previousFrame ? cb.previousLensMask : cb.lensMask;
+  const uint slotBase = previousFrame ? kMaxLenses : 0u;
+  uint nearestSlot = kLensSlotInvalid;
+  float nearestDistance = 3.402823466e+38f;
+
+  while (mask != 0u)
+  {
+    const uint slot = firstbitlow(mask);
+    mask &= mask - 1u;
+
+    const LensArgs lens = cb.lenses[slotBase + slot];
+
+    if (!includePassThrough && (lens.flags & lensFlagPassThrough) != 0u)
+    {
+      continue;
+    }
+
+    const float planeDistance = lensEyepiecePlaneDistance(lens, origin, direction);
+
+    // A lens must be clearly nearer to replace one already found, so lenses at the same distance (overlapping
+    // binocular eyepieces) resolve to the lower slot instead of flickering between them.
+    if (planeDistance < nearestDistance * 0.999f && lensIsInsideEyepiece(lens, origin, direction, planeDistance))
+    {
+      nearestDistance = planeDistance;
+      nearestSlot = slot;
+    }
+  }
+
+  return nearestSlot;
+}
+
+// Returns the slot of the nearest lens that remaps the ray and whose eyepiece the ray passes through.
+// Returns kLensSlotInvalid when the ray passes through no such lens.
+uint lensFindSlot(vec3 origin, vec3 direction, bool previousFrame)
+{
+  return lensFindSlotOfKind(origin, direction, previousFrame, false);
+}
+
+// Returns the camera ray remapped by the current frame's lens in the given slot.
+// The ray does not need to pass through the eyepiece disc, so rim pixels can be remapped
+// with a ray that differs slightly from the one that classified them.
+LensPrimaryRay lensCreatePrimaryRayForSlot(uint slot, vec3 cameraOrigin, vec3 cameraDirection)
+{
+  const LensArgs lens = cb.lenses[slot];
+
+  LensPrimaryRay lensRay;
+  lensRay.slot = slot;
+  lensRay.eyeDistance = max(lensEyepiecePlaneDistance(lens, cameraOrigin, cameraDirection), 0.0f);
+  lensRay.magnification = lens.magnification;
+  lensRay.origin = lens.objectiveCenter;
+  lensRay.direction = lensMagnifyDirection(lens, cameraDirection);
+
+  return lensRay;
+}
+
+// Returns the camera ray remapped by the nearest lens it passes through.
+// Returns the camera ray itself with slot kLensSlotInvalid when it passes through no lens.
+LensPrimaryRay lensCreatePrimaryRay(vec3 cameraOrigin, vec3 cameraDirection)
+{
+  const uint slot = lensAnyActive() ? lensFindSlot(cameraOrigin, cameraDirection, false) : kLensSlotInvalid;
+
+  if (slot != kLensSlotInvalid)
+  {
+    return lensCreatePrimaryRayForSlot(slot, cameraOrigin, cameraDirection);
+  }
+
+  LensPrimaryRay lensRay;
+  lensRay.slot = kLensSlotInvalid;
+  lensRay.eyeDistance = 0.0f;
+  lensRay.magnification = 1.0f;
+  lensRay.origin = cameraOrigin;
+  lensRay.direction = cameraDirection;
+
+  return lensRay;
+}
+
+// Returns the slot of the lens the pixel's jittered camera ray passes through, as the G-buffer pass traced it.
+// Returns kLensSlotInvalid for pixels outside every lens.
+// The previous frame's camera and lenses are used when previousFrame is set.
+uint lensSlotAtPixel(ivec2 pixelCoordinate, bool previousFrame)
+{
+  if (previousFrame ? !lensAnyPreviousActive() : !lensAnyActive())
+  {
+    return kLensSlotInvalid;
+  }
+
+  const vec3 origin = previousFrame ? cameraGetPreviousWorldPosition(cb.camera) : cameraGetWorldPosition(cb.camera);
+  const vec3 direction = previousFrame
+    ? cameraPixelCoordinateToPrevDirection(cb.camera, pixelCoordinate, true).worldDirection
+    : cameraPixelCoordinateToDirection(cb.camera, pixelCoordinate, true).worldDirection;
+
+  return lensFindSlot(origin, direction, previousFrame);
+}
+
+// Returns the slot of the lens of any kind that the pixel's jittered camera ray passes through.
+// Returns kLensSlotInvalid for pixels outside every lens.
+uint lensAnyKindSlotAtPixel(ivec2 pixelCoordinate)
+{
+  if (!lensAnyActive())
+  {
+    return kLensSlotInvalid;
+  }
+
+  const vec3 origin = cameraGetWorldPosition(cb.camera);
+  const vec3 direction = cameraPixelCoordinateToDirection(cb.camera, pixelCoordinate, true).worldDirection;
+
+  return lensFindSlotOfKind(origin, direction, false, true);
+}
+
+// Returns the lens features of a pixel for the G-buffer, see lensFeatureHeatMask and lensFeatureHighlight.
+// A hit passes its surface's highlight and heat source categories, its emitted luminance and its normal.
+// A miss passes isHit false and is cold.
+uint lensCreatePixelFeatures(
+  ivec2 pixelCoordinate, bool isHit, bool isHighlighted, bool isHeatSource, float emissiveLuminance, vec3 normal)
+{
+  const uint slot = lensAnyKindSlotAtPixel(pixelCoordinate);
+
+  if (slot == kLensSlotInvalid || ((cb.lensFeatureMask >> slot) & 1u) == 0u)
+  {
+    return 0u;
+  }
+
+  const LensArgs lens = cb.lenses[slot];
+  uint features = 0u;
+
+  if (isHit && isHighlighted && (lens.flags & lensFlagHighlight) != 0u)
+  {
+    features |= lensFeatureHighlight;
+  }
+
+  if (isHit && lens.visionMode == lensVisionModeThermal)
+  {
+    // Heat sources are hot, emissive surfaces are warm, and the rest is at ambient temperature with a small sun term.
+    const float kAmbientHeat = 0.3f;
+    const float kEmissiveHeat = 0.75f;
+    const float kHeatSourceHeat = 1.0f;
+    const float emissiveWarmth = emissiveLuminance / (emissiveLuminance + 1.0f);
+    float heat = kAmbientHeat + lens.sunWeight * saturate(dot(normal, lens.sunDirection));
+    heat = max(heat, lerp(kAmbientHeat, kEmissiveHeat, emissiveWarmth));
+    heat = isHeatSource ? kHeatSourceHeat : heat;
+
+    features |= uint(saturate(heat) * 255.0f + 0.5f) & lensFeatureHeatMask;
+  }
+
+  return features;
+}
+
+// Returns the primary ray cone spread angle of the pixel. Lens pixels get the screen spread divided by the magnification.
+float lensPrimarySpreadAngle(ivec2 pixelCoordinate, float screenSpreadAngle)
+{
+  const uint slot = lensSlotAtPixel(pixelCoordinate, false);
+
+  if (slot == kLensSlotInvalid)
+  {
+    return screenSpreadAngle;
+  }
+
+  return screenSpreadAngle / cb.lenses[slot].magnification;
+}
+
+bool lensSlotHasHistory(uint slot)
+{
+  return ((cb.previousLensMask >> slot) & 1u) != 0u && (cb.lenses[slot].flags & lensFlagDiscardHistory) == 0u;
+}
+
+// Reprojects a direction leaving the current lens' objective through the previous frame's lens in the same slot.
+LensReprojection lensReprojectDirection(uint slot, vec3 objectiveDirection)
+{
+  const LensArgs previousLens = cb.lenses[kMaxLenses + slot];
+  const vec3 previousCameraPosition = cameraGetPreviousWorldPosition(cb.camera);
+
+  LensReprojection reprojection;
+
+  bool valid = lensSlotHasHistory(slot);
+  vec3 previousEyeDirection;
+  valid = lensUnmagnifyDirection(previousLens, objectiveDirection, previousEyeDirection) && valid;
+
+  const float planeDistance = lensEyepiecePlaneDistance(previousLens, previousCameraPosition, previousEyeDirection);
+  valid = lensIsInsideEyepiece(previousLens, previousCameraPosition, previousEyeDirection, planeDistance) && valid;
+
+  reprojection.previousEyeDirection = previousEyeDirection;
+  reprojection.previousVirtualPosition = previousCameraPosition + previousEyeDirection * max(planeDistance, 0.0f);
+  reprojection.historyValid = valid;
+
+  return reprojection;
+}
+
+// Reprojects a world position seen through the current lens in the given slot into the previous frame.
+// The position must already include the surface's own motion into the previous frame.
+LensReprojection lensReprojectPosition(uint slot, vec3 previousWorldPosition)
+{
+  const LensArgs previousLens = cb.lenses[kMaxLenses + slot];
+  const vec3 objectiveToPosition = previousWorldPosition - previousLens.objectiveCenter;
+  const float objectiveDistance = length(objectiveToPosition);
+  const vec3 objectiveDirection = objectiveDistance > 0.0f ? objectiveToPosition / objectiveDistance : previousLens.axis;
+
+  LensReprojection reprojection = lensReprojectDirection(slot, objectiveDirection);
+
+  // The previous virtual distance is the eye-to-eyepiece distance plus the objective-to-position distance.
+  reprojection.previousVirtualPosition += reprojection.previousEyeDirection * objectiveDistance;
+
+  return reprojection;
+}
+
+// Returns true when the previous camera ray in the given direction passed through any of the previous frame's lenses.
+// A pixel outside every current lens whose previous pixel was inside one has history from lens pixels.
+bool lensPreviousDirectionInsideAnyLens(vec3 previousEyeDirection)
+{
+  if (!lensAnyPreviousActive())
+  {
+    return false;
+  }
+
+  return lensFindSlot(cameraGetPreviousWorldPosition(cb.camera), previousEyeDirection, true) != kLensSlotInvalid;
+}

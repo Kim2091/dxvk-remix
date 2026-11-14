@@ -210,7 +210,8 @@ void main(int2 thread_id : SV_DispatchThreadID)
 
   // Calculate reflection sample weight
   float reflectionWeight = 0;
-  if (cb.enableReSTIRGIReflectionReprojection > 0 && surface.portalSpace == PORTAL_SPACE_NONE)
+  // Reflection reprojection assumes the camera's own projection, which lens pixels do not have.
+  if (cb.enableReSTIRGIReflectionReprojection > 0 && surface.portalSpace == PORTAL_SPACE_NONE && surface.lensSlot == kLensSlotInvalid)
   {
     float roughWeight = 1.0 - surface.opaqueSurfaceMaterialInteraction.isotropicRoughness;
     const float normalDotOutputDirection = dot(surface.opaqueSurfaceMaterialInteraction.shadingNormal, surface.minimalRayInteraction.viewDirection);

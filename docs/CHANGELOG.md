@@ -98,6 +98,11 @@ On a frame with displacement the SHARC update ran inline with POM compiled in, s
 When acquiring a swap chain image returned suboptimal or out of date while the window had a zero-sized client area, for example during alt-tab or a minimize, the present recreated a swap chain that could not exist. With suboptimal it then read the semaphores of the destroyed swap chain, and the runtime crashed with `std::out_of_range` in `Presenter::getSync`. With out of date it retried in a busy loop until the window was restored. The present now skips the frame until the window is restored, still firing its frame latency signal. A New Vegas RTX player on an Intel Arc B580 hit the crash.
 - Options: none.
 
+### Lenses: path-traced scopes, sights and binoculars
+Primary rays that hit a lens are remapped through it, so a scope, reflex sight or binocular shows a magnified, path-traced view of the world with its own motion vectors and history. A host sends lenses with the main camera through the Remix API (`remixapi_CameraInfoLensEXT`), and mods can place them on replacement meshes in USD (`RemixLensAPI`). Lenses support reticles (built in, from a texture, first focal plane, with labels and a rangefinder), marking colors, night and thermal vision with grain, glare, dirt, reticle parallax, eyepiece edge optics, a black surround and a binocular aperture. NUMOS clouds are magnified and reprojected through the lens, and the bridge forwards every lens field.
+- Options: added the `rtx.lens.*` options, including `rtx.lens.magnificationScale`, `chromaticFringe`, `edgeBlur`, the `rtx.lens.debugLens.*` test lens and `rtx.lens.debugView`.
+- Docs: [Lens.md](../documentation/Lens.md)
+
 ## 2026-10-28
 
 ### Developer menu: settings search

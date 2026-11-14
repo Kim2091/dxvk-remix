@@ -134,4 +134,14 @@ class "RemixInstanceCategoryAPI" (
         displayGroup = "Remix Categories"
         displayName = "Hair Cards"
     )
+    bool remix_category:highlight_hostile = 0 (
+        doc = "Textures on draw calls whose directly visible surfaces are outlined in lenses that highlight.\nSee rtx.lens.highlightOnAllLenses and documentation/Lens.md."
+        displayGroup = "Remix Categories"
+        displayName = "Highlight Hostile"
+    )
+    bool remix_category:heat_source = 0 (
+        doc = "Textures on draw calls that are hot in thermal lens images.\nOther surfaces are warm when emissive and otherwise at ambient temperature with a small sun term."
+        displayGroup = "Remix Categories"
+        displayName = "Heat Source"
+    )
 }

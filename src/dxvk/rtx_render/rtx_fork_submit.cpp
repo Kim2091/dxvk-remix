@@ -129,6 +129,8 @@ namespace fork_hooks {
       applyCategory(RtxOptions::antiCullingTextures(), InstanceCategories::IgnoreAntiCulling);
       applyCategory(RtxOptions::motionBlurMaskOutTextures(), InstanceCategories::IgnoreMotionBlur);
       applyCategory(RtxOptions::hideInstanceTextures(), InstanceCategories::Hidden);
+      applyCategory(RtxOptions::highlightHostileTextures(), InstanceCategories::HighlightHostile);
+      applyCategory(RtxOptions::heatSourceTextures(), InstanceCategories::HeatSource);
     }
   }
 

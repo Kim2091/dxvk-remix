@@ -26,6 +26,7 @@
 #include "rtx_asset_replacer.h"
 #include "rtx_light_manager.h"
 #include "rtx_lights.h"
+#include "rtx_lens.h"
 #include "rtx_objectpicking.h"
 #include "rtx_option.h"
 #include "rtx_globals.h"
@@ -946,8 +947,10 @@ namespace {
       if (flags & REMIXAPI_INSTANCE_CATEGORY_BIT_PARTICLE_EMITTER)         { result.set(InstanceCategories::ParticleEmitter); }
       if (flags & REMIXAPI_INSTANCE_CATEGORY_BIT_SMOOTH_NORMALS)            { result.set(InstanceCategories::SmoothNormals); }
       if (flags & REMIXAPI_INSTANCE_CATEGORY_BIT_HAIR_CARDS)                { result.set(InstanceCategories::HairCards); }
+      if (flags & REMIXAPI_INSTANCE_CATEGORY_BIT_HIGHLIGHT_HOSTILE)         { result.set(InstanceCategories::HighlightHostile); }
+      if (flags & REMIXAPI_INSTANCE_CATEGORY_BIT_HEAT_SOURCE)               { result.set(InstanceCategories::HeatSource); }
       
-      static_assert((int)InstanceCategories::Count == 25, "Instance categories changed, please update Remix SDK");
+      static_assert((int)InstanceCategories::Count == 27, "Instance categories changed, please update Remix SDK");
       return result;
     }
 
@@ -1704,6 +1707,210 @@ namespace {
     return REMIXAPI_ERROR_CODE_SUCCESS;
   }
 
+  // A lens chained on the main camera (remixapi_CameraInfoLensEXT), with the id the lens manager knows it by.
+  struct ApiLens {
+    uint64_t id;
+    dxvk::LensDesc desc;
+  };
+
+  // The host's id is hashed and tagged with bit 62, so it differs from the ids of mod USD lenses, which have bit 63
+  // set, and from the debug camera lens' id.
+  uint64_t toLensId(uint64_t hostId) {
+    return (XXH3_64bits(&hostId, sizeof(hostId)) & ~(3ull << 62)) | (1ull << 62);
+  }
+
+  bool isFinite(const remixapi_CameraInfoLensEXT& ext) {
+    const float values[] = {
+      ext.eyepieceCenter.x, ext.eyepieceCenter.y, ext.eyepieceCenter.z,
+      ext.axis.x, ext.axis.y, ext.axis.z,
+      ext.up.x, ext.up.y, ext.up.z,
+      ext.eyepieceRadius, ext.objectiveDistance, ext.objectiveRadius, ext.magnification, ext.fieldStopDegrees,
+      ext.eyeRelief,
+      ext.tint.x, ext.tint.y, ext.tint.z,
+      ext.reticleColor.x, ext.reticleColor.y, ext.reticleColor.z,
+      ext.reticleRadiance, ext.reticleLineWidth,
+      ext.apertureAspect, ext.minMagnification, ext.referenceMagnification,
+      ext.markingColor.x, ext.markingColor.y, ext.markingColor.z, ext.markingRadiance, ext.markingOpacity,
+      ext.parallaxDistance, ext.glareStrength, ext.dirtStrength,
+      ext.reticleAccentColor.x, ext.reticleAccentColor.y, ext.reticleAccentColor.z, ext.reticleAccentRadiance,
+      ext.edgeGlowColor.x, ext.edgeGlowColor.y, ext.edgeGlowColor.z, ext.edgeGlowStrength, ext.edgeShade,
+      ext.edgeTint.x, ext.edgeTint.y, ext.edgeTint.z,
+      ext.nightTint.x, ext.nightTint.y, ext.nightTint.z, ext.nightGain,
+    };
+    return std::all_of(std::begin(values), std::end(values), [](float v) { return std::isfinite(v); });
+  }
+
+  // Zero fields take the LensDesc defaults, so a host can leave out what it does not know.
+  dxvk::LensDesc toLensDesc(const remixapi_CameraInfoLensEXT& ext) {
+    using namespace dxvk;
+
+    LensDesc desc;
+    desc.pose.eyepieceCenter = convert::tovec3(ext.eyepieceCenter);
+    desc.pose.axis = convert::tovec3(ext.axis);
+    desc.pose.up = convert::tovec3(ext.up);
+    desc.eyepieceRadius = ext.eyepieceRadius;
+    desc.objectiveDistance = ext.objectiveDistance;
+    desc.objectiveRadius = ext.objectiveRadius;
+    desc.eyeRelief = ext.eyeRelief;
+    desc.reticleColor = convert::tovec3(ext.reticleColor);
+    desc.reticleRadiance = ext.reticleRadiance;
+    if (ext.magnification != 0.f) {
+      desc.magnification = ext.magnification;
+    }
+    if (ext.fieldStopDegrees != 0.f) {
+      desc.fieldStopDegrees = ext.fieldStopDegrees;
+    }
+    if (ext.tint.x != 0.f || ext.tint.y != 0.f || ext.tint.z != 0.f) {
+      desc.tint = convert::tovec3(ext.tint);
+    }
+    if (ext.reticleLineWidth != 0.f) {
+      desc.reticleLineWidth = ext.reticleLineWidth;
+    }
+    if (ext.apertureAspect > 0.f) {
+      desc.apertureAspect = ext.apertureAspect;
+    }
+    switch (ext.reticle) {
+    case REMIXAPI_CAMERA_LENS_RETICLE_CROSSHAIR: desc.reticle = LensReticle::Crosshair; break;
+    case REMIXAPI_CAMERA_LENS_RETICLE_DUPLEX: desc.reticle = LensReticle::Duplex; break;
+    case REMIXAPI_CAMERA_LENS_RETICLE_DOT: desc.reticle = LensReticle::Dot; break;
+    case REMIXAPI_CAMERA_LENS_RETICLE_CIRCLE_DOT: desc.reticle = LensReticle::CircleDot; break;
+    case REMIXAPI_CAMERA_LENS_RETICLE_MIL_DOT: desc.reticle = LensReticle::MilDot; break;
+    case REMIXAPI_CAMERA_LENS_RETICLE_GERMAN: desc.reticle = LensReticle::German; break;
+    case REMIXAPI_CAMERA_LENS_RETICLE_DROP: desc.reticle = LensReticle::Drop; break;
+    case REMIXAPI_CAMERA_LENS_RETICLE_STADIA: desc.reticle = LensReticle::Stadia; break;
+    case REMIXAPI_CAMERA_LENS_RETICLE_FRAME: desc.reticle = LensReticle::Frame; break;
+    case REMIXAPI_CAMERA_LENS_RETICLE_GRID: desc.reticle = LensReticle::Grid; break;
+    case REMIXAPI_CAMERA_LENS_RETICLE_DIAL: desc.reticle = LensReticle::Dial; break;
+    case REMIXAPI_CAMERA_LENS_RETICLE_TEXTURE: desc.reticle = LensReticle::Texture; break;
+    default: desc.reticle = LensReticle::None; break;
+    }
+    desc.kind = ext.kind == REMIXAPI_CAMERA_LENS_KIND_REFLEX ? LensKind::Reflex : LensKind::Telescopic;
+    switch (ext.aperture) {
+    case REMIXAPI_CAMERA_LENS_APERTURE_RECTANGLE: desc.aperture = LensAperture::Rectangle; break;
+    case REMIXAPI_CAMERA_LENS_APERTURE_BINOCULAR: desc.aperture = LensAperture::Binocular; break;
+    default: desc.aperture = LensAperture::Circle; break;
+    }
+    switch (ext.visionMode) {
+    case REMIXAPI_CAMERA_LENS_VISION_NIGHT: desc.visionMode = LensVisionMode::Night; break;
+    case REMIXAPI_CAMERA_LENS_VISION_THERMAL: desc.visionMode = LensVisionMode::Thermal; break;
+    default: desc.visionMode = LensVisionMode::None; break;
+    }
+    desc.highlightHostiles = (ext.lensFlags & REMIXAPI_CAMERA_LENS_FLAG_HIGHLIGHT_HOSTILES) != 0;
+    desc.occludeOutside = (ext.lensFlags & REMIXAPI_CAMERA_LENS_FLAG_OCCLUDE_OUTSIDE) != 0;
+    desc.noGrain = (ext.lensFlags & REMIXAPI_CAMERA_LENS_FLAG_NO_GRAIN) != 0;
+    desc.firstFocalPlane = (ext.lensFlags & REMIXAPI_CAMERA_LENS_FLAG_FIRST_FOCAL_PLANE) != 0;
+    desc.markingColor = convert::tovec3(ext.markingColor);
+    desc.markingRadiance = ext.markingRadiance;
+    desc.parallaxDistance = std::max(ext.parallaxDistance, 0.f);
+    desc.glareStrength = std::clamp(ext.glareStrength, 0.f, 1.f);
+    desc.dirtStrength = std::clamp(ext.dirtStrength, 0.f, 1.f);
+    if (ext.markingOpacity > 0.f) {
+      desc.markingOpacity = ext.markingOpacity;
+    }
+    desc.referenceMagnification = ext.referenceMagnification > 0.f ? ext.referenceMagnification
+      : ext.minMagnification > 0.f ? ext.minMagnification
+      : 0.f;
+    // The path is copied here, on the host's thread, so the host's string may go away after SetupCamera returns.
+    if (ext.reticleTexture != nullptr && ext.reticleTexture[0] != L'\0') {
+      try {
+        desc.reticleTexture = std::filesystem::path(ext.reticleTexture).string();
+      } catch (const std::exception&) {
+        // A path the narrow encoding cannot hold draws no texture.
+        desc.reticleTexture.clear();
+      }
+    }
+    desc.reticleAccentColor = convert::tovec3(ext.reticleAccentColor);
+    desc.reticleAccentRadiance = ext.reticleAccentRadiance;
+    desc.edgeGlowColor = convert::tovec3(ext.edgeGlowColor);
+    desc.edgeGlowStrength = ext.edgeGlowStrength;
+    desc.edgeShade = ext.edgeShade;
+    if (ext.edgeTint.x != 0.f || ext.edgeTint.y != 0.f || ext.edgeTint.z != 0.f) {
+      desc.edgeTint = convert::tovec3(ext.edgeTint);
+    }
+    desc.nightTint = convert::tovec3(ext.nightTint);
+    if (ext.nightGain > 0.f) {
+      desc.nightGain = ext.nightGain;
+    }
+    desc.reticleLabels = (ext.markings & REMIXAPI_CAMERA_LENS_MARKING_LABELS) != 0;
+    desc.rangefinder = (ext.markings & REMIXAPI_CAMERA_LENS_MARKING_RANGEFINDER) != 0;
+    return desc;
+  }
+
+  // Returns the lenses chained on the camera.
+  // Lenses with id 0 or a non-finite value are left out.
+  std::vector<ApiLens> findCameraLenses(const remixapi_CameraInfo& info) {
+    std::vector<ApiLens> lenses;
+    struct Header { remixapi_StructType sType; void* pNext; };
+    for (const Header* h = static_cast<const Header*>(info.pNext); h != nullptr; h = static_cast<const Header*>(h->pNext)) {
+      if (h->sType == REMIXAPI_STRUCT_TYPE_NONE) {
+        break;
+      }
+      if (h->sType != REMIXAPI_STRUCT_TYPE_CAMERA_INFO_LENS_EXT) {
+        continue;
+      }
+      const auto& ext = *reinterpret_cast<const remixapi_CameraInfoLensEXT*>(h);
+      if (ext.id == 0 || !isFinite(ext)) {
+        static bool s_warned = false;
+        if (!s_warned) {
+          s_warned = true;
+          dxvk::Logger::warn("[remixapi_SetupCamera] Skipped a remixapi_CameraInfoLensEXT with id 0 or a non-finite value.");
+        }
+        continue;
+      }
+      lenses.push_back(ApiLens { toLensId(ext.id), toLensDesc(ext) });
+    }
+    return lenses;
+  }
+
+  // The poses of the lenses hosts chain on the main camera, kept for a frame for motion vectors.
+  // Only the CS thread uses it.
+  class ApiLensHistory {
+  public:
+    // Adds the frame's lenses to the lens manager, each with its pose on the previous frame when it had one.
+    // originShift is the translation of the frame's origin shift event, if there is one.
+    void addLenses(dxvk::LensManager& lensManager, const std::vector<ApiLens>& lenses, uint32_t frameId,
+                   const dxvk::Vector3* originShift) {
+      if (frameId != m_frameId) {
+        m_frameId = frameId;
+        for (auto it = m_poses.begin(); it != m_poses.end();) {
+          it = it->second.frameId + 1 == frameId ? std::next(it) : m_poses.erase(it);
+        }
+      }
+
+      for (const ApiLens& lens : lenses) {
+        auto it = m_poses.find(lens.id);
+        // A lens sent twice in a frame is added once.
+        if (it != m_poses.end() && it->second.frameId == frameId) {
+          continue;
+        }
+
+        dxvk::LensPose previousPose;
+        const dxvk::LensPose* pPreviousPose = nullptr;
+        if (it != m_poses.end()) {
+          previousPose = it->second.pose;
+          if (originShift != nullptr) {
+            previousPose.eyepieceCenter += *originShift;
+          }
+          pPreviousPose = &previousPose;
+        }
+
+        lensManager.addLens(lens.id, lens.desc, pPreviousPose);
+        m_poses[lens.id] = PoseEntry { lens.desc.pose, frameId };
+      }
+    }
+
+  private:
+    struct PoseEntry {
+      dxvk::LensPose pose;
+      uint32_t frameId;
+    };
+
+    std::unordered_map<uint64_t, PoseEntry> m_poses;
+    uint32_t m_frameId = UINT32_MAX;
+  };
+
+  ApiLensHistory s_apiLensHistory;
+
   remixapi_ErrorCode REMIXAPI_CALL remixapi_SetupCamera(
     const remixapi_CameraInfo* info) {
     REMIX_FORK_RECORD(SetupCamera, info);
@@ -1731,9 +1938,16 @@ namespace {
       if (info->type != REMIXAPI_CAMERA_TYPE_WORLD) {
         return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
       }
+      // Lenses sent with a fallback camera are world space, so they are added whichever camera becomes the main one.
+      std::vector<ApiLens> lenses = findCameraLenses(*info);
       auto devLock = remixDevice->LockDevice();
-      remixDevice->EmitCs([cWorldToView = camera.worldToView, cViewToProjection = camera.viewToProjection](dxvk::DxvkContext* ctx) {
+      remixDevice->EmitCs([cWorldToView = camera.worldToView, cViewToProjection = camera.viewToProjection,
+                           cLenses = std::move(lenses)](dxvk::DxvkContext* ctx) {
         ctx->getCommonObjects()->getSceneManager().getCameraManager().holdFallbackCamera(cWorldToView, cViewToProjection);
+        if (!cLenses.empty() && dxvk::LensManager::enable()) {
+          s_apiLensHistory.addLenses(ctx->getCommonObjects()->getSceneManager().getLensManager(), cLenses,
+                                     ctx->getDevice()->getCurrentFrameId(), nullptr);
+        }
       });
       return REMIXAPI_ERROR_CODE_SUCCESS;
     }
@@ -1753,9 +1967,20 @@ namespace {
         camera.originShift = convert::tovec3(events->originShift);
       }
     }
+    // Lenses (remixapi_CameraInfoLensEXT) belong to the main camera. They reach the lens manager on the CS thread,
+    // after the camera, so they land in the frame the camera is for.
+    std::vector<ApiLens> lenses;
+    if (info->type == REMIXAPI_CAMERA_TYPE_WORLD) {
+      lenses = findCameraLenses(*info);
+    }
     auto devLock = remixDevice->LockDevice();
-    remixDevice->EmitCs([cCamera = std::move(camera)](dxvk::DxvkContext* ctx) {
+    remixDevice->EmitCs([cCamera = std::move(camera), cLenses = std::move(lenses)](dxvk::DxvkContext* ctx) {
       dxvk::frontend::SceneInterface { *static_cast<dxvk::RtxContext*>(ctx) }.setupCamera(cCamera);
+      if (!cLenses.empty() && dxvk::LensManager::enable()) {
+        const bool originShifted = (cCamera.events & dxvk::frontend::kFrameEventOriginShift) != 0;
+        s_apiLensHistory.addLenses(ctx->getCommonObjects()->getSceneManager().getLensManager(), cLenses,
+                                   ctx->getDevice()->getCurrentFrameId(), originShifted ? &cCamera.originShift : nullptr);
+      }
     });
     return REMIXAPI_ERROR_CODE_SUCCESS;
   }

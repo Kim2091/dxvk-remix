@@ -121,6 +121,9 @@
 #define GBUFFER_BINDING_COMPACT_PSR_LIST                                        152
 #define GBUFFER_BINDING_COMPACT_PSR_ARGS                                        153
 
+// The per-pixel lens features (lens.h), written while RaytraceArgs.lensFeatureMask is nonzero.
+#define GBUFFER_BINDING_LENS_FEATURES_OUTPUT                                    154
+
 
 #define GBUFFER_MIN_BINDING                         GBUFFER_BINDING_LINEAR_WRAP_SAMPLER
 

@@ -60,6 +60,7 @@
 #include "rtx_render/rtx_neural_radiance_cache.h"
 #include "rtx_render/rtx_nsight_capture.h"
 #include "rtx_render/rtx_ray_reconstruction.h"
+#include "rtx_render/rtx_lens.h"
 #include "rtx_render/rtx_xess.h"
 #include "rtx_render/rtx_rtxdi_rayquery.h"
 #include "rtx_render/rtx_restir_gi_rayquery.h"
@@ -210,6 +211,8 @@ namespace dxvk {
     {"ignorelights", "Ignore Lights (optional)", &RtxOptions::ignoreLightsObject()},
     {"particletextures", "Particle Texture (optional)", &RtxOptions::particleTexturesObject()},
     {"haircardtextures", "Hair Cards Texture (optional)", &RtxOptions::hairCardTexturesObject()},
+    {"highlighthostiletextures", "Lens Highlight Texture (optional)", &RtxOptions::highlightHostileTexturesObject()},
+    {"heatsourcetextures", "Heat Source Texture (optional)", &RtxOptions::heatSourceTexturesObject()},
     {"beamtextures", "Beam Texture (optional)", &RtxOptions::beamTexturesObject()},
     {"lightconvertertextures", "Add Light to Textures (optional)", &RtxOptions::lightConverterObject()},
     {"decaltextures", "Decal Texture (optional)", &RtxOptions::decalTexturesObject()},
@@ -4963,6 +4966,13 @@ namespace dxvk {
       ImGui::TextWrapped("When a screen in-game is displaying the rasterized results of another camera, this can be used to raytrace that scene.\nNote that the render target texture containing the rasterized results needs to be set to `raytracedRenderTargetTextures` in the texture selection menu.");
 
       RemixGui::Checkbox("Enable Raytraced Render Targets", &RtxOptions::RaytracedRenderTarget::enableObject());
+      ImGui::Unindent();
+    }
+
+    if (RemixGui::CollapsingHeader("Lens", collapsingHeaderClosedFlags)) {
+      ImGui::Indent();
+      ImGui::TextWrapped("Lenses are discs where camera rays are traced as magnified rays, as through a telescopic sight.");
+      LensManager::showImguiSettings();
       ImGui::Unindent();
     }
 

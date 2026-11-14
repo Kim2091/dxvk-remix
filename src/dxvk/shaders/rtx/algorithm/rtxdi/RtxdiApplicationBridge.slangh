@@ -41,6 +41,7 @@
 #include "rtx/algorithm/volume_integrator_helpers.slangh"
 #include "rtx/pass/sparse_rendering/compact_active_pixels.slangh"
 #include "rtx/algorithm/rtxdi/rtxdi_reservoir_pages.slangh"
+#include "rtx/concept/lens/lens.slangh"
 
 static const uint kReprojectionConfidenceHistoryLength = 16;
 
@@ -130,6 +131,8 @@ struct RAB_Surface
   PortalSpace2BitsType portalSpace;
   bool isViewModel;
   uint8_t objectMask;
+  // The slot of the lens the surface is seen through, kLensSlotInvalid outside every lens.
+  uint lensSlot;
 
   float3 virtualWorldPosition;
 };
@@ -176,9 +179,10 @@ float RAB_GetSurfaceLinearDepth(RAB_Surface surface)
   return surface.hitDistance;
 }
 
+// Returns the portal space with the lens slot above it, so reuse never crosses a lens rim or a portal.
 uint RAB_GetSurfacePortalSpace(RAB_Surface surface)
 {
-  return surface.portalSpace;
+  return uint(surface.portalSpace) | (((surface.lensSlot + 1u) & 0x7u) << 2);
 }
 
 bool RAB_IsSurfaceInCombinedPortalSpace(RAB_Surface surface)
@@ -207,6 +211,7 @@ RAB_Surface RAB_EmptySurface()
   surface.portalSpace = PORTAL_SPACE_NONE;
   surface.isViewModel = false;
   surface.objectMask = 0;
+  surface.lensSlot = kLensSlotInvalid;
   surface.virtualWorldPosition = 0;
   return surface;
 }
@@ -358,6 +363,7 @@ RAB_Surface RAB_GetGBufferSurface(ivec2 pixel, bool previousFrame)
     surface.portalSpace = uint8_t(((normalPortalData >> 15) & 0x2) | (normalPortalData & 0x1));
     normalPortalData &= 0xfffefffe;
     surface.opaqueSurfaceMaterialInteraction.shadingNormal = UnpackOctahedralNormal(asfloat(normalPortalData));
+    surface.lensSlot = lensSlotAtPixel(pixel, true);
 #endif
 
     return surface;
@@ -396,6 +402,7 @@ RAB_Surface RAB_GetGBufferSurface(ivec2 pixel, bool previousFrame)
   surface.portalSpace = geometryFlags.portalSpace;
   surface.isViewModel = geometryFlags.isViewModel;
   surface.objectMask = geometryFlags.objectMask;
+  surface.lensSlot = lensSlotAtPixel(pixel, false);
   surface.hitDistance = PrimaryHitDistance[pixel].x;
 
   const float3 cameraPositon = cameraGetWorldPosition(cb.camera);
@@ -580,7 +587,8 @@ float getProjectionFactor(vec3 cameraPositon, vec3 surfacePosition, vec3 surface
 
 bool RAB_ShouldDiscardEnlargedPixel(inout RAB_RandomSamplerState rng, RAB_Surface surface, float3 virtualMotionVector)
 {
-  if (cb.teleportationPortalIndex != 0 || surface.portalSpace == PORTAL_SPACE_PORTAL_COMBINED)
+  // A lens pixel's virtual position does not lie on its real surface, so the projected size test does not apply.
+  if (cb.teleportationPortalIndex != 0 || surface.portalSpace == PORTAL_SPACE_PORTAL_COMBINED || surface.lensSlot != kLensSlotInvalid)
     return false;
   
   vec3 geometryNormal = surface.minimalSurfaceInteraction.geometryNormal;

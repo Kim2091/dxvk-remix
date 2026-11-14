@@ -174,6 +174,7 @@ namespace dxvk {
     , m_lightManager(device)
     , m_graphManager()
     , m_rayPortalManager(device, this)
+    , m_lensManager(device)
     , m_drawCallCache(device)
     , m_drawCallTracker(device)
     , m_bindlessResourceManager(device)
@@ -197,6 +198,8 @@ namespace dxvk {
       m_accelManager.onInstanceFreed(instance);
       m_retainedV2->onInstanceFreed(*instance);
       m_retainedScene->onInstanceFreed(*instance);
+      std::lock_guard lock { m_lensAnchorMutex };
+      m_lensAnchors.erase(instance);
     });
     m_drawCallTracker.setRetainedV2Listener([](void* owner, uint64_t ticket) {
       static_cast<RetainedInstanceStore*>(owner)->onReplacementInstanceGone(ticket);
@@ -1570,12 +1573,155 @@ namespace dxvk {
 
     processReplacementLights(input, pReplacements.get(), replacementInstance);
     processReplacementGraphs(ctx, input, pReplacements.get(), replacementInstance);
+    updateLensAnchor(*input, pReplacements, *replacementInstance);
 
     replacementInstance->recalculateBoundingBox(
         input->getTransformData().objectToWorld,
         &input->getGeometryData().boundingBox);
   }
   
+  namespace {
+    // Returns the lens moved by a transform, which may be projective.
+    // Lengths are measured on the moved lens, so they follow the transform's scale.
+    LensDesc transformLens(const LensDesc& lens, const Matrix4d& lensToWorld) {
+      auto transformPoint = [&lensToWorld](const Vector3d& point) {
+        const Vector4d result = lensToWorld * Vector4d(point.x, point.y, point.z, 1.0);
+        const double w = std::abs(result.w) > 1e-12 ? result.w : 1.0;
+        return Vector3d(result.x / w, result.y / w, result.z / w);
+      };
+
+      const Vector3d center { lens.pose.eyepieceCenter };
+      const Vector3d authoredUp { lens.pose.up };
+      const Vector3d axis = safeNormalize(Vector3d { lens.pose.axis }, Vector3d(0.0, 0.0, -1.0));
+      const Vector3d up = safeNormalize(authoredUp - axis * dot(authoredUp, axis), Vector3d(0.0, 1.0, 0.0));
+
+      // The directions are sampled one eyepiece radius from the center, where a projective transform is close to linear.
+      const double step = std::max(static_cast<double>(lens.eyepieceRadius), 1e-4);
+      const Vector3d worldCenter = transformPoint(center);
+      double axisLength;
+      const Vector3d worldAxis = safeNormalizeGetLength(transformPoint(center + axis * step) - worldCenter, Vector3d(0.0, 0.0, -1.0), axisLength);
+      double upLength;
+      const Vector3d worldUp = safeNormalizeGetLength(transformPoint(center + up * step) - worldCenter, Vector3d(0.0, 1.0, 0.0), upLength);
+      const float axisScale = static_cast<float>(axisLength / step);
+      const float radiusScale = static_cast<float>(upLength / step);
+
+      LensDesc result = lens;
+      result.pose.eyepieceCenter = Vector3 { worldCenter };
+      result.pose.axis = Vector3 { worldAxis };
+      result.pose.up = Vector3 { worldUp };
+      result.eyepieceRadius = lens.eyepieceRadius * radiusScale;
+      result.objectiveRadius = lens.objectiveRadius * radiusScale;
+      result.objectiveDistance = lens.objectiveDistance * axisScale;
+      result.eyeRelief = lens.eyeRelief * axisScale;
+      result.parallaxDistance = lens.parallaxDistance * axisScale;
+      return result;
+    }
+  }
+
+  void SceneManager::updateLensAnchor(const DrawCallState& input, const std::shared_ptr<const ReplacementBucket>& pReplacements,
+                                      const ReplacementInstance& replacementInstance) {
+    const std::vector<AssetReplacement>& replacements = pReplacements->replacements;
+    const bool hasLens = std::any_of(replacements.begin(), replacements.end(), [](const AssetReplacement& replacement) {
+      return replacement.type == AssetReplacement::eLens && replacement.lensData.has_value();
+    });
+    if (!hasLens) {
+      return;
+    }
+
+    const DrawCallTransforms& inputTransforms = input.getTransformData();
+    if (inputTransforms.instancesFromHost && inputTransforms.instancesToObject != nullptr &&
+        !inputTransforms.instancesToObject->empty()) {
+      ONCE(Logger::warn("[Lens] A mesh replacement with lenses replaces a draw that the host GPU-instances. Its lenses are not placed."));
+      return;
+    }
+
+    // The anchor is the first mesh instance with a single transform: the original draw, or a mesh prim that is not
+    // a point instancer prototype.
+    const RtInstance* anchor = nullptr;
+    Matrix4d objectToAnchor;
+    for (size_t i = 0; i < replacements.size() && i < replacementInstance.prims.size(); ++i) {
+      const AssetReplacement& replacement = replacements[i];
+      const RtInstance* instance = replacementInstance.prims[i].getInstance();
+      if (instance == nullptr) {
+        continue;
+      }
+      if (replacement.includeOriginal) {
+        anchor = instance;
+        break;
+      }
+      if (replacement.type == AssetReplacement::eMesh &&
+          (replacement.instancesToObject == nullptr || replacement.instancesToObject->empty())) {
+        anchor = instance;
+        objectToAnchor = inverse(Matrix4d { replacement.replacementToObject });
+        break;
+      }
+    }
+
+    if (anchor == nullptr) {
+      ONCE(Logger::warn("[Lens] A mesh replacement with lenses has no mesh to place them on. Its lenses are not placed."));
+      return;
+    }
+
+    LensAnchor lensAnchor;
+    lensAnchor.bucket = pReplacements;
+    for (size_t i = 0; i < replacements.size(); ++i) {
+      const AssetReplacement& replacement = replacements[i];
+      if (replacement.type == AssetReplacement::eLens && replacement.lensData.has_value()) {
+        lensAnchor.lensToAnchor.emplace_back(static_cast<uint32_t>(i), objectToAnchor * Matrix4d { replacement.replacementToObject });
+      }
+    }
+
+    std::lock_guard lock { m_lensAnchorMutex };
+    m_lensAnchors[anchor] = std::move(lensAnchor);
+  }
+
+  void SceneManager::addReplacementLenses() {
+    ScopedCpuProfileZone();
+
+    const uint32_t frameId = m_device->getCurrentFrameId();
+    if (!LensManager::enable() || m_lensesAddedFrameId == frameId) {
+      return;
+    }
+    m_lensesAddedFrameId = frameId;
+
+    std::lock_guard lock { m_lensAnchorMutex };
+    for (const auto& [anchor, lensAnchor] : m_lensAnchors) {
+      if (anchor->isHidden() || anchor->isMarkedForGC() || lensAnchor.bucket->stale) {
+        continue;
+      }
+
+      // A view model reference is traced as its view model copy, so its lenses go where the copy is.
+      Matrix4d anchorToWorld;
+      Matrix4d prevAnchorToWorld;
+      const bool hasViewModelCopy = m_instanceManager.getViewModelTransforms(*anchor, anchorToWorld, prevAnchorToWorld);
+      // An instance drawn with the view model camera is first person even when view model copies are off.
+      const bool firstPerson = hasViewModelCopy || anchor->isCameraRegistered(CameraType::ViewModel);
+      if (!hasViewModelCopy) {
+        // No ray hits an instance with a zero mask, such as a view model reference without a copy.
+        if (anchor->getVkInstance().mask == 0) {
+          continue;
+        }
+        anchorToWorld = Matrix4d { anchor->getTransform() };
+        prevAnchorToWorld = Matrix4d { anchor->getPrevTransform() };
+      }
+
+      for (const auto& [index, lensToAnchor] : lensAnchor.lensToAnchor) {
+        const LensReplacement& lens = *lensAnchor.bucket->replacements[index].lensData;
+        if (lens.firstPersonOnly && !firstPerson) {
+          continue;
+        }
+
+        const LensDesc current = transformLens(lens.desc, anchorToWorld * lensToAnchor);
+        const LensDesc previous = transformLens(lens.desc, prevAnchorToWorld * lensToAnchor);
+
+        // The top bit keeps these ids apart from the ids of the lens manager's own lenses.
+        const struct { uint64_t instanceId; uint64_t lensIndex; } key { anchor->getId(), index };
+        const uint64_t id = XXH3_64bits(&key, sizeof(key)) | (1ull << 63);
+        m_lensManager.addLens(id, current, &previous.pose);
+      }
+    }
+  }
+
   void SceneManager::processReplacementLights(
       const DrawCallState* input, const ReplacementBucket* pReplacements,
       ReplacementInstance* replacementInstance) {
@@ -3626,6 +3772,8 @@ namespace dxvk {
 
     m_instanceManager.findPortalForVirtualInstances(m_cameraManager, m_rayPortalManager);
     m_instanceManager.createViewModelInstances(ctx, m_cameraManager, m_rayPortalManager);
+    // Lenses are placed after the view model instances exist, with the transforms the TLAS instances get.
+    addReplacementLenses();
     m_instanceManager.createPlayerModelVirtualInstances(ctx, m_cameraManager, m_rayPortalManager);
 
     prepPhase(2);
@@ -5113,13 +5261,15 @@ namespace dxvk {
         renderMaterialData = *ownMaterial;
       }
       drawReplacements(ctx, &replacementDrawCall, pReplacements, renderMaterialData, replacementInstance);
-      // rtx.scene.directRetained: drawReplacements does not mark the replacement instance seen, so a second
-      // replaced draw of the same mesh this frame could take it over through the tracker's nearest-neighbour match
-      // (two retained instances fighting over one, both invisible), and the unseen-instance GC recreates it every
-      // few frames. Marked seen here for retained draws (in their own spatial map, see above) while the scene
-      // interface is on. Without the scene interface, and for per-frame draws, the instance is not marked: marking a
-      // GPU-instanced one seen piles up point-instancer batches.
-      if (retainedOwnMap) {
+      // drawReplacements does not mark the replacement instance seen. Unmarked, a second replaced draw of the same
+      // mesh this frame could take it over through the tracker's nearest-neighbour match, and the end of the frame
+      // treats it as gone, so the original and the replacement prims vanish. It is marked here, as on the D3D9 path,
+      // except for a per-frame draw the host GPU-instances: marking one of those piles up point-instancer batches
+      // (see docs/HANDOFF-phase2-fo4.md).
+      const DrawCallTransforms& drawTransforms = state.drawCall.getTransformData();
+      const bool hostInstanced = drawTransforms.instancesFromHost && drawTransforms.instancesToObject != nullptr &&
+        !drawTransforms.instancesToObject->empty();
+      if (retainedOwnMap || !hostInstanced) {
         replacementInstance->frameLastSeen = m_device->getCurrentFrameId();
       }
       return;

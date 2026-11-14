@@ -33,6 +33,7 @@
 #include "rtx/utility/demodulate_helpers.slangh"
 #include "rtx/utility/debug_view_helpers.slangh"
 #include "rtx/concept/camera/camera.slangh"
+#include "rtx/concept/lens/lens.slangh"
 #include "rtx/concept/surface/alpha_blend_surface.slangh"
 #include "rtx/utility/geometry_flags.slangh"
 
@@ -712,7 +713,8 @@ static const float kCloudMotionVectorBandHalfWidth = 0.15f;
 // so a cloud edge does not flicker between the two layers. The depth switches in the middle of the band,
 // because a blended depth would describe a surface that is not there.
 // The cloud sits at the cloud render's transmittance-weighted mean distance and is reprojected as a static
-// world-space point, which leaves out its drift with the wind.
+// world-space point, which leaves out its drift with the wind. Through a lens the cloud render marches the
+// magnified ray, so the cloud is reprojected through the lens like the lens image (see Lens.md).
 // Returns the motion vector's cloud weight.
 float applyCloudMotionVectors(uint2 pixelCoordinate, float cloudCoverage)
 {
@@ -740,7 +742,18 @@ float applyCloudMotionVectors(uint2 pixelCoordinate, float cloudCoverage)
   // projection for depth and the unjittered previous projection for motion.
   const float distanceWorld = numosKmToWorld(depthKm.y, skyArgs);
   const vec3 direction = cameraPixelCoordinateToDirection(cb.camera, pixelCoordinate, false).worldDirection;
-  const vec3 cloudPosition = cameraGetWorldPosition(cb.camera) + direction * distanceWorld;
+  vec3 cloudPosition = cameraGetWorldPosition(cb.camera) + direction * distanceWorld;
+  vec3 previousCloudPosition = cloudPosition;
+
+  // A lens pixel's depth is taken at the virtual distance, and its previous position is the previous virtual position.
+  const uint lensSlot = lensSlotAtPixel(ivec2(pixelCoordinate), false);
+  if (lensSlot != kLensSlotInvalid)
+  {
+    const LensPrimaryRay lensRay = lensCreatePrimaryRayForSlot(lensSlot, cameraGetWorldPosition(cb.camera), direction);
+    const LensReprojection reprojection = lensReprojectPosition(lensSlot, lensRay.origin + lensRay.direction * distanceWorld);
+    cloudPosition = cameraGetWorldPosition(cb.camera) + direction * (lensRay.eyeDistance + distanceWorld);
+    previousCloudPosition = reprojection.previousVirtualPosition;
+  }
 
   const vec4 clip = mul(cb.camera.worldToProjectionJittered, vec4(cloudPosition, 1.0f));
   float cloudDepth = clip.z / clip.w;
@@ -749,7 +762,7 @@ float applyCloudMotionVectors(uint2 pixelCoordinate, float cloudCoverage)
   cloudDepth = missDepth >= 0.5f ? min(cloudDepth, missDepth) : max(cloudDepth, missDepth);
 
   const vec2 ndc = cameraPixelCoordinateToNDC(cb.camera, pixelCoordinate);
-  const vec2 cloudMotion = cameraCalcMotionVectorPixel(cb.camera, ndc, cameraWorldPosToPrevNDC(cb.camera, cloudPosition));
+  const vec2 cloudMotion = cameraCalcMotionVectorPixel(cb.camera, ndc, cameraWorldPosToPrevNDC(cb.camera, previousCloudPosition));
 
   const bool cloudDominates = weight >= 0.5f;
   PrimaryScreenSpaceMotionVector[pixelCoordinate] = lerp(PrimaryScreenSpaceMotionVector[pixelCoordinate], cloudMotion, weight);

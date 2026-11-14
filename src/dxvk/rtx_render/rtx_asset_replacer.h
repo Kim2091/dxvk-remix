@@ -33,6 +33,7 @@
 #include "rtx_mod_manager.h"
 #include "rtx_utils.h"
 #include "rtx_lights_data.h"
+#include "rtx_lens_types.h"
 
 namespace dxvk {
   class DxvkContext;
@@ -59,6 +60,7 @@ namespace dxvk {
       eMesh,
       eLight,
       eGraph,
+      eLens,
       eNone,
     };
     Categorizer categories;
@@ -68,6 +70,7 @@ namespace dxvk {
 
     std::optional<RtxParticleSystemDesc> particleSystem;
     std::optional<LightData> lightData;
+    std::optional<LensReplacement> lensData;
     // Shared pointer because multiple AssetReplacements can use the same material.
     // Set to null if the mesh should use the original material instead
     std::shared_ptr<MaterialData> materialData;

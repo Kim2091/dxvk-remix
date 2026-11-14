@@ -3967,6 +3967,77 @@ void ProcessDeviceCommandQueue() {
         const uint32_t eventFlags = DeviceBridge::get_data();
         float* originShift = nullptr;
         const uint32_t originShiftLen = DeviceBridge::get_data((void**) &originShift);
+        // CameraInfoLensEXT: the client's kCameraLensWords words per lens, at most kMaxCameraLenses.
+        constexpr uint32_t kCameraLensWords = 58;
+        constexpr uint32_t kMaxCameraLenses = 8;
+        const uint32_t lensCount = DeviceBridge::get_data();
+        std::array<remixapi_CameraInfoLensEXT, kMaxCameraLenses> lenses = {};
+        // The reticle texture paths, kept until SetupCamera returns.
+        std::array<std::wstring, kMaxCameraLenses> lensTexturePaths;
+        uint32_t validLenses = 0;
+        for (uint32_t i = 0; i < lensCount; ++i) {
+          uint32_t* words = nullptr;
+          const uint32_t wordsLen = DeviceBridge::get_data((void**) &words);
+          const uint32_t pathBytes = DeviceBridge::get_data();
+          wchar_t* path = nullptr;
+          uint32_t pathLen = 0;
+          if (pathBytes != 0) {
+            pathLen = DeviceBridge::get_data((void**) &path);
+          }
+          if (!words || wordsLen != kCameraLensWords * sizeof(uint32_t) || validLenses >= kMaxCameraLenses) {
+            continue;
+          }
+          // The client's wchar_t is UTF-16, as the server's is on Windows.
+          if (path != nullptr && pathLen >= sizeof(wchar_t)) {
+            lensTexturePaths[validLenses].assign(path, pathLen / sizeof(wchar_t) - 1);
+          }
+          float values[23];
+          memcpy(values, &words[3], sizeof(values));
+          remixapi_CameraInfoLensEXT& lens = lenses[validLenses++];
+          lens.sType = REMIXAPI_STRUCT_TYPE_CAMERA_INFO_LENS_EXT;
+          lens.id = uint64_t(words[0]) | (uint64_t(words[1]) << 32);
+          lens.reticle = words[2];
+          lens.eyepieceCenter = remixapi_Float3D { values[0], values[1], values[2] };
+          lens.axis = remixapi_Float3D { values[3], values[4], values[5] };
+          lens.up = remixapi_Float3D { values[6], values[7], values[8] };
+          lens.eyepieceRadius = values[9];
+          lens.objectiveDistance = values[10];
+          lens.objectiveRadius = values[11];
+          lens.magnification = values[12];
+          lens.fieldStopDegrees = values[13];
+          lens.eyeRelief = values[14];
+          lens.tint = remixapi_Float3D { values[15], values[16], values[17] };
+          lens.reticleColor = remixapi_Float3D { values[18], values[19], values[20] };
+          lens.reticleRadiance = values[21];
+          lens.reticleLineWidth = values[22];
+          lens.kind = words[26];
+          lens.aperture = words[27];
+          memcpy(&lens.apertureAspect, &words[28], sizeof(float));
+          lens.visionMode = words[29];
+          lens.lensFlags = words[30];
+          memcpy(&lens.minMagnification, &words[31], sizeof(float));
+          float values2[16];
+          memcpy(values2, &words[32], sizeof(values2));
+          lens.reticleAccentColor = remixapi_Float3D { values2[0], values2[1], values2[2] };
+          lens.reticleAccentRadiance = values2[3];
+          lens.edgeGlowColor = remixapi_Float3D { values2[4], values2[5], values2[6] };
+          lens.edgeGlowStrength = values2[7];
+          lens.edgeShade = values2[8];
+          lens.edgeTint = remixapi_Float3D { values2[9], values2[10], values2[11] };
+          lens.nightTint = remixapi_Float3D { values2[12], values2[13], values2[14] };
+          lens.nightGain = values2[15];
+          lens.markings = words[48];
+          memcpy(&lens.referenceMagnification, &words[49], sizeof(float));
+          float markingValues[8];
+          memcpy(markingValues, &words[50], sizeof(markingValues));
+          lens.markingColor = remixapi_Float3D { markingValues[0], markingValues[1], markingValues[2] };
+          lens.markingRadiance = markingValues[3];
+          lens.markingOpacity = markingValues[4];
+          lens.parallaxDistance = markingValues[5];
+          lens.glareStrength = markingValues[6];
+          lens.dirtStrength = markingValues[7];
+          lens.reticleTexture = lensTexturePaths[validLenses - 1].empty() ? nullptr : lensTexturePaths[validLenses - 1].c_str();
+        }
 
         if (!view || viewLen != sizeof(info.view) || !projection || projectionLen != sizeof(info.projection)) {
           Logger::err("[RemixApi_SetupCamera] Malformed camera matrices; call dropped.");
@@ -3997,6 +4068,10 @@ void ProcessDeviceCommandQueue() {
           events.originShift = remixapi_Float3D { originShift[0], originShift[1], originShift[2] };
           *tail = &events;
           tail = &events.pNext;
+        }
+        for (uint32_t i = 0; i < validLenses; ++i) {
+          *tail = &lenses[i];
+          tail = &lenses[i].pNext;
         }
 
         if (!remixapi::g_remix.SetupCamera) {

@@ -419,6 +419,8 @@ namespace dxvk {
 
     setIf(InstanceCategories::ParticleEmitter, lookupHash(RtxOptions::particleEmitterTextures(), textureHash));
     setIf(InstanceCategories::HairCards, lookupHash(RtxOptions::hairCardTextures(), textureHash));
+    setIf(InstanceCategories::HighlightHostile, lookupHash(RtxOptions::highlightHostileTextures(), textureHash));
+    setIf(InstanceCategories::HeatSource, lookupHash(RtxOptions::heatSourceTextures(), textureHash));
     return result;
   }
 

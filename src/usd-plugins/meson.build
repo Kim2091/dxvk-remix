@@ -41,3 +41,4 @@ endforeach
 # Each plugin lives in a subdir; install_usd_plugins.bat walks those subdirs at install time.
 subdir('RemixParticleSystem')
 subdir('RemixCategories')
+subdir('RemixLens')

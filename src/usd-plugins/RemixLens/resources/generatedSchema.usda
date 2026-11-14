@@ -1,0 +1,346 @@
+#usda 1.0
+(
+    """Canonical codeless schema for RemixLensAPI.
+    Edit this file directly. test_lens_schema verifies its properties against the reader contract."""
+)
+
+class "RemixLensAPI" (
+    doc = """
+        Places a lens, an analytic magnifier such as the eyepiece of a telescopic sight, on a mesh replacement.
+        Apply it to an Xform under the replacement. The prim's origin is the eyepiece center, its local -Z axis
+        is the optical axis pointing out of the objective, and its local +Y axis is the reticle's up direction.
+        Lengths are in the prim's local units and follow its transform. See documentation/Lens.md.
+    """
+)
+{
+    float lens:eyepieceRadius = 0 (
+        doc = "The radius of the eyepiece disc. Camera rays through this disc are traced as magnified rays. 0 disables the lens."
+        displayGroup = "Lens"
+        displayName = "Eyepiece Radius"
+        customData = {
+            dictionary limits = {
+                dictionary hard = {
+                    float minimum = 0
+                }
+            }
+        }
+    )
+    float lens:objectiveDistance = 0 (
+        doc = "The distance from the eyepiece to the objective along the optical axis. Magnified rays start at the objective, so it belongs just in front of the front glass."
+        displayGroup = "Lens"
+        displayName = "Objective Distance"
+        customData = {
+            dictionary limits = {
+                dictionary hard = {
+                    float minimum = 0
+                }
+            }
+        }
+    )
+    float lens:objectiveRadius = 0 (
+        doc = "The radius of the objective. The exit pupil radius is this divided by the magnification."
+        displayGroup = "Lens"
+        displayName = "Objective Radius"
+        customData = {
+            dictionary limits = {
+                dictionary hard = {
+                    float minimum = 0
+                }
+            }
+        }
+    )
+    float lens:magnification = 4 (
+        doc = "The angular magnification. rtx.lens.magnificationScale multiplies it at runtime."
+        displayGroup = "Lens"
+        displayName = "Magnification"
+        customData = {
+            dictionary limits = {
+                dictionary hard = {
+                    float minimum = 0.01
+                    float maximum = 100
+                }
+            }
+        }
+    )
+    float lens:fieldStopDegrees = 18 (
+        doc = "The apparent field stop half-angle, in degrees."
+        displayGroup = "Lens"
+        displayName = "Field Stop (degrees)"
+        customData = {
+            dictionary limits = {
+                dictionary hard = {
+                    float minimum = 0.1
+                    float maximum = 89
+                }
+            }
+        }
+    )
+    float lens:eyeRelief = 0 (
+        doc = "The ideal distance of the eye behind the eyepiece, where the exit pupil sits."
+        displayGroup = "Lens"
+        displayName = "Eye Relief"
+        customData = {
+            dictionary limits = {
+                dictionary hard = {
+                    float minimum = 0
+                }
+            }
+        }
+    )
+    color3f lens:tint = (1, 1, 1) (
+        doc = "The transmission tint of the lens glass."
+        displayGroup = "Lens"
+        displayName = "Glass Tint"
+    )
+    uniform token lens:reticle = "none" (
+        doc = "The reticle: none, crosshair, duplex, dot, circleDot, milDot, german, drop, stadia, frame, grid, dial, or texture (the image of lens:reticleTexture)."
+        displayGroup = "Reticle"
+        displayName = "Reticle"
+        allowedTokens = ["none", "crosshair", "duplex", "dot", "circleDot", "milDot", "german", "drop", "stadia", "frame", "grid", "dial", "texture"]
+    )
+    color3f lens:reticleColor = (0, 0, 0) (
+        doc = "The color of the reticle. Lit (radiance above 0) it is the emitted color; unlit it is ink that passes this share of the image, so black is opaque."
+        displayGroup = "Reticle"
+        displayName = "Reticle Color"
+    )
+    float lens:reticleRadiance = 0 (
+        doc = "The emitted radiance of the reticle. 0 draws a black reticle."
+        displayGroup = "Reticle"
+        displayName = "Reticle Radiance"
+        customData = {
+            dictionary limits = {
+                dictionary hard = {
+                    float minimum = 0
+                }
+            }
+        }
+    )
+    float lens:reticleLineWidth = 0.004 (
+        doc = "The half-width of a reticle line, as a fraction of the field stop radius."
+        displayGroup = "Reticle"
+        displayName = "Reticle Line Width"
+        customData = {
+            dictionary limits = {
+                dictionary hard = {
+                    float minimum = 0
+                    float maximum = 0.5
+                }
+            }
+        }
+    )
+    uniform token lens:visionMode = "none" (
+        doc = "The vision mode of the lens image: none, night (amplified, phosphor green, bloom and grain) or thermal (heat from the HeatSource category, emissive surfaces and the sun)."
+        displayGroup = "Lens"
+        displayName = "Vision Mode"
+        allowedTokens = ["none", "night", "thermal"]
+    )
+    uniform token lens:kind = "telescopic" (
+        doc = "telescopic: camera rays are traced as magnified rays from the objective, with the exit pupil, field stop and vignette. reflex: no exit pupil, field stop or vignette, and the reticle is drawn at infinity inside the window. A reflex lens with an objective distance restarts camera rays at the objective, and one without leaves them unchanged."
+        displayGroup = "Lens"
+        displayName = "Kind"
+        allowedTokens = ["telescopic", "reflex"]
+    )
+    uniform token lens:aperture = "circle" (
+        doc = "The window shape: circle (radius lens:eyepieceRadius), rectangle (half height lens:eyepieceRadius) or binocular (two circles of radius lens:eyepieceRadius, their centers lens:apertureAspect radii to either side of the axis, showing one image)."
+        displayGroup = "Lens"
+        displayName = "Aperture"
+        allowedTokens = ["circle", "rectangle", "binocular"]
+    )
+    float lens:apertureAspect = 1 (
+        doc = "The width over the height of a rectangular window, or the offset of each circle's center from the axis of a binocular window, in radii."
+        displayGroup = "Lens"
+        displayName = "Aperture Aspect"
+        customData = {
+            dictionary limits = {
+                dictionary hard = {
+                    float minimum = 0.01
+                }
+            }
+        }
+    )
+    uniform bool lens:highlightHostiles = 0 (
+        doc = "When true, directly visible surfaces with the HighlightHostile category are outlined in the lens image."
+        displayGroup = "Lens"
+        displayName = "Highlight Hostiles"
+    )
+    color3f lens:reticleAccentColor = (0, 0, 0) (
+        doc = "The color of the mil-dot dots and center dots."
+        displayGroup = "Reticle"
+        displayName = "Reticle Accent Color"
+    )
+    float lens:reticleAccentRadiance = 0 (
+        doc = "The emitted radiance of the accent, as a displayed value. 0 draws the accent as unlit ink."
+        displayGroup = "Reticle"
+        displayName = "Reticle Accent Radiance"
+        customData = {
+            dictionary limits = {
+                dictionary hard = {
+                    float minimum = 0
+                }
+            }
+        }
+    )
+    color3f lens:edgeGlowColor = (0, 0, 0) (
+        doc = "The color of the glow ring at the field stop."
+        displayGroup = "Edge"
+        displayName = "Edge Glow Color"
+    )
+    float lens:edgeGlowStrength = 0 (
+        doc = "The strength of the glow ring at the field stop, as a displayed value. 0 draws no ring."
+        displayGroup = "Edge"
+        displayName = "Edge Glow Strength"
+        customData = {
+            dictionary limits = {
+                dictionary hard = {
+                    float minimum = 0
+                }
+            }
+        }
+    )
+    float lens:edgeShade = 0 (
+        doc = "How much the lens image darkens toward the field stop, from 0 to 1."
+        displayGroup = "Edge"
+        displayName = "Edge Shade"
+        customData = {
+            dictionary limits = {
+                dictionary hard = {
+                    float minimum = 0
+                    float maximum = 1
+                }
+            }
+        }
+    )
+    color3f lens:edgeTint = (1, 1, 1) (
+        doc = "The color multiplied into the lens image toward the field stop. White leaves it unchanged."
+        displayGroup = "Edge"
+        displayName = "Edge Tint"
+    )
+    color3f lens:nightTint = (0, 0, 0) (
+        doc = "The night vision phosphor color. Black uses rtx.lens.nightVision.phosphorColor."
+        displayGroup = "Lens"
+        displayName = "Night Tint"
+    )
+    float lens:nightGain = 1 (
+        doc = "A multiplier on the metered night vision gain."
+        displayGroup = "Lens"
+        displayName = "Night Gain"
+        customData = {
+            dictionary limits = {
+                dictionary hard = {
+                    float minimum = 0
+                }
+            }
+        }
+    )
+    uniform token lens:markings = "none" (
+        doc = "Text on the reticle: none, labels (the grid's range labels and the frame's scale numbers), rangefinder (the distance in meters to the surface at the reticle center) or labelsRangefinder."
+        displayGroup = "Reticle"
+        displayName = "Markings"
+        allowedTokens = ["none", "labels", "rangefinder", "labelsRangefinder"]
+    )
+    uniform bool lens:firstFocalPlane = 0 (
+        doc = "When true, the reticle is in the first focal plane: it grows with the magnification, by the magnification over lens:referenceMagnification."
+        displayGroup = "Reticle"
+        displayName = "First Focal Plane"
+    )
+    float lens:referenceMagnification = 0 (
+        doc = "The magnification at which a first focal plane reticle has its authored size. 0 keeps the reticle's size."
+        displayGroup = "Reticle"
+        displayName = "Reference Magnification"
+        customData = {
+            dictionary limits = {
+                dictionary hard = {
+                    float minimum = 0
+                }
+            }
+        }
+    )
+    color3f lens:markingColor = (0, 0, 0) (
+        doc = "The color of the labels and the rangefinder readout. Black draws them in the accent."
+        displayGroup = "Reticle"
+        displayName = "Marking Color"
+    )
+    float lens:markingRadiance = 0 (
+        doc = "The markings' emitted radiance, as a displayed value. 0 draws them lit or as ink, as the accent is."
+        displayGroup = "Reticle"
+        displayName = "Marking Radiance"
+        customData = {
+            dictionary limits = {
+                dictionary hard = {
+                    float minimum = 0
+                }
+            }
+        }
+    )
+    float lens:markingOpacity = 1 (
+        doc = "How opaque the markings are, from 0 to 1."
+        displayGroup = "Reticle"
+        displayName = "Marking Opacity"
+        customData = {
+            dictionary limits = {
+                dictionary hard = {
+                    float minimum = 0
+                    float maximum = 1
+                }
+            }
+        }
+    )
+    float lens:parallaxDistance = 0 (
+        doc = "The distance at which the reticle has no parallax, in the prim's units. With the eye off the axis, the reticle shifts against targets at other distances. 0 puts the reticle at infinity."
+        displayGroup = "Reticle"
+        displayName = "Parallax Distance"
+        customData = {
+            dictionary limits = {
+                dictionary hard = {
+                    float minimum = 0
+                }
+            }
+        }
+    )
+    float lens:glareStrength = 0 (
+        doc = "Subtle veiling glare and a faint flare from bright light near the lens' axis, from 0 to 1."
+        displayGroup = "Lens"
+        displayName = "Glare Strength"
+        customData = {
+            dictionary limits = {
+                dictionary hard = {
+                    float minimum = 0
+                    float maximum = 1
+                }
+            }
+        }
+    )
+    float lens:dirtStrength = 0 (
+        doc = "Procedural dirt and smudges on the eyepiece, seen mainly where glare lights them, from 0 to 1."
+        displayGroup = "Lens"
+        displayName = "Dirt Strength"
+        customData = {
+            dictionary limits = {
+                dictionary hard = {
+                    float minimum = 0
+                    float maximum = 1
+                }
+            }
+        }
+    )
+    asset lens:reticleTexture = @@ (
+        doc = "The image of a texture reticle. It covers the square from -1 to 1 of reticle space, where the field stop's radius is 1. Its alpha is the ink."
+        displayGroup = "Reticle"
+        displayName = "Reticle Texture"
+    )
+    uniform bool lens:noGrain = 0 (
+        doc = "When true, the lens' vision mode draws no grain. Everything else about the mode stays."
+        displayGroup = "Lens"
+        displayName = "No Grain"
+    )
+    uniform bool lens:occludeOutside = 0 (
+        doc = "When true, everything outside every lens is black while this lens is active, as behind a binocular or scope mask, and the lens windows fade into it with a soft edge."
+        displayGroup = "Lens"
+        displayName = "Occlude Outside"
+    )
+    uniform bool lens:firstPersonOnly = 0 (
+        doc = "When true, only first-person (view model) instances of the mesh get the lens. Other instances of the same mesh, such as one carried by another character, get none."
+        displayGroup = "Lens"
+        displayName = "First Person Only"
+    )
+}

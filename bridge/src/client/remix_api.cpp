@@ -22,6 +22,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <cwchar>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -653,9 +654,24 @@ remixapi_ErrorCode REMIXAPI_CALL remixapi_DrawLightInstance(remixapi_LightHandle
   return REMIXAPI_ERROR_CODE_SUCCESS;
 }
 
+// The words of one CameraInfoLensEXT in a SetupCamera message: the id's low and high halves, reticle, then
+// eyepieceCenter, axis, up (xyz each), eyepieceRadius, objectiveDistance, objectiveRadius, magnification,
+// fieldStopDegrees, eyeRelief, tint (xyz), reticleColor (xyz), reticleRadiance and reticleLineWidth as float bits,
+// then kind, aperture, apertureAspect (float bits), visionMode, lensFlags and minMagnification (float bits),
+// then reticleAccentColor (xyz), reticleAccentRadiance, edgeGlowColor (xyz), edgeGlowStrength, edgeShade,
+// edgeTint (xyz), nightTint (xyz) and nightGain as float bits, then markings, referenceMagnification (float bits),
+// markingColor (xyz), markingRadiance and markingOpacity as float bits, and parallaxDistance, glareStrength and
+// dirtStrength as float bits.
+// The words are followed by the reticleTexture path's size in bytes, terminator included, and, when it is not 0, the
+// path as UTF-16.
+static constexpr uint32_t kCameraLensWords = 58;
+// The most lenses one SetupCamera message carries. The runtime traces at most 4 per frame.
+static constexpr uint32_t kMaxCameraLenses = 8;
+
 // One async message with a fixed layout, field by field (the x86 and x64 struct layouts need not agree):
 // type, view, projection, then ParameterizedEXT and FrameEventsEXT each as a presence word plus its data,
-// sent zeroed when absent. Other extensions are skipped.
+// sent zeroed when absent, then the CameraInfoLensEXT count and kCameraLensWords words per lens.
+// Other extensions are skipped.
 remixapi_ErrorCode REMIXAPI_CALL remixapi_SetupCamera(const remixapi_CameraInfo* info) {
   ASSERT_REMIXAPI_PFN_TYPE(remixapi_SetupCamera);
   if (!info || info->sType != REMIXAPI_STRUCT_TYPE_CAMERA_INFO) {
@@ -663,6 +679,8 @@ remixapi_ErrorCode REMIXAPI_CALL remixapi_SetupCamera(const remixapi_CameraInfo*
   }
   const remixapi_CameraInfoParameterizedEXT* params = nullptr;
   const remixapi_CameraInfoFrameEventsEXT* events = nullptr;
+  const remixapi_CameraInfoLensEXT* lenses[kMaxCameraLenses] = {};
+  uint32_t lensCount = 0;
   {
     const void* infoItr = info;
     while (auto* const pNext = getPNext(infoItr)) {
@@ -674,6 +692,29 @@ remixapi_ErrorCode REMIXAPI_CALL remixapi_SetupCamera(const remixapi_CameraInfo*
         case REMIXAPI_STRUCT_TYPE_CAMERA_INFO_FRAME_EVENTS_EXT:
           events = static_cast<const remixapi_CameraInfoFrameEventsEXT*>(pNext);
           break;
+        case REMIXAPI_STRUCT_TYPE_CAMERA_INFO_LENS_EXT:
+        {
+          // Hosts look for the log line's text in this image to learn that lenses are forwarded. Its first
+          // parenthesized part says that the kind, aperture, vision mode and flag fields are forwarded too, and its
+          // second that the accent, edge and night tint fields are, its third that markings is, and its fourth that
+          // referenceMagnification and reticleTexture are, its fifth that the marking color fields are, and its sixth
+          // that parallaxDistance, glareStrength and dirtStrength are.
+          static bool s_loggedLenses = false;
+          if (!s_loggedLenses) {
+            s_loggedLenses = true;
+            Logger::info("[remixapi_SetupCamera] Forwarding CameraInfoLensEXT (kind, aperture, vision modes) (accent, edge, night tint) (markings) (reticle texture) (marking color) (parallax, glass)");
+          }
+          if (lensCount < kMaxCameraLenses) {
+            lenses[lensCount++] = static_cast<const remixapi_CameraInfoLensEXT*>(pNext);
+          } else {
+            static bool s_warnedLensCount = false;
+            if (!s_warnedLensCount) {
+              s_warnedLensCount = true;
+              Logger::warn("[remixapi_SetupCamera] More CameraInfoLensEXT than one message carries. Skipping the rest.");
+            }
+          }
+          break;
+        }
         default:
           Logger::warn("[remixapi_SetupCamera] Unsupported pNext sType. Skipping.");
           break;
@@ -709,6 +750,56 @@ remixapi_ErrorCode REMIXAPI_CALL remixapi_SetupCamera(const remixapi_CameraInfo*
     c.send_data(events ? 1u : 0u);
     c.send_data(events ? static_cast<uint32_t>(events->flags) : 0u);
     c.send_data(static_cast<uint32_t>(sizeof(originShift)), originShift);
+    c.send_data(lensCount);
+    for (uint32_t i = 0; i < lensCount; ++i) {
+      const remixapi_CameraInfoLensEXT& lens = *lenses[i];
+      const float values[] = {
+        lens.eyepieceCenter.x, lens.eyepieceCenter.y, lens.eyepieceCenter.z,
+        lens.axis.x, lens.axis.y, lens.axis.z,
+        lens.up.x, lens.up.y, lens.up.z,
+        lens.eyepieceRadius, lens.objectiveDistance, lens.objectiveRadius, lens.magnification,
+        lens.fieldStopDegrees, lens.eyeRelief,
+        lens.tint.x, lens.tint.y, lens.tint.z,
+        lens.reticleColor.x, lens.reticleColor.y, lens.reticleColor.z,
+        lens.reticleRadiance, lens.reticleLineWidth,
+      };
+      const float values2[] = {
+        lens.reticleAccentColor.x, lens.reticleAccentColor.y, lens.reticleAccentColor.z, lens.reticleAccentRadiance,
+        lens.edgeGlowColor.x, lens.edgeGlowColor.y, lens.edgeGlowColor.z, lens.edgeGlowStrength, lens.edgeShade,
+        lens.edgeTint.x, lens.edgeTint.y, lens.edgeTint.z,
+        lens.nightTint.x, lens.nightTint.y, lens.nightTint.z, lens.nightGain,
+      };
+      const float markingValues[] = {
+        lens.markingColor.x, lens.markingColor.y, lens.markingColor.z, lens.markingRadiance, lens.markingOpacity,
+        lens.parallaxDistance, lens.glareStrength, lens.dirtStrength,
+      };
+      static_assert(3 + sizeof(values) / sizeof(float) + 6 + sizeof(values2) / sizeof(float) + 2 +
+                    sizeof(markingValues) / sizeof(float) == kCameraLensWords,
+                    "The lens layout must fill kCameraLensWords.");
+      uint32_t words[kCameraLensWords] = {};
+      words[0] = static_cast<uint32_t>(lens.id);
+      words[1] = static_cast<uint32_t>(lens.id >> 32);
+      words[2] = lens.reticle;
+      memcpy(&words[3], values, sizeof(values));
+      words[26] = lens.kind;
+      words[27] = lens.aperture;
+      memcpy(&words[28], &lens.apertureAspect, sizeof(float));
+      words[29] = lens.visionMode;
+      words[30] = lens.lensFlags;
+      memcpy(&words[31], &lens.minMagnification, sizeof(float));
+      memcpy(&words[32], values2, sizeof(values2));
+      words[48] = lens.markings;
+      memcpy(&words[49], &lens.referenceMagnification, sizeof(float));
+      memcpy(&words[50], markingValues, sizeof(markingValues));
+      c.send_data(static_cast<uint32_t>(sizeof(words)), words);
+      const uint32_t pathBytes = lens.reticleTexture != nullptr
+        ? static_cast<uint32_t>((wcslen(lens.reticleTexture) + 1) * sizeof(wchar_t))
+        : 0u;
+      c.send_data(pathBytes);
+      if (pathBytes != 0) {
+        c.send_data(pathBytes, lens.reticleTexture);
+      }
+    }
   }
   return REMIXAPI_ERROR_CODE_SUCCESS;
 }

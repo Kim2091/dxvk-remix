@@ -139,4 +139,11 @@ struct CompositeArgs {
   // The depth a primary miss writes (RaytraceArgs::clearColorDepth). Cloud depth never lies beyond it.
   float cloudMotionVectorMissDepth;
   uint cloudMotionVectorPad;
+
+  // The lenses of this frame and the previous frame (RaytraceArgs::lenses), for the functions in lens.slangh.
+  LensArgs lenses[kMaxLenses * 2];
+  uint lensMask;
+  uint previousLensMask;
+  uint lensFeatureMask;
+  uint lensPad;
 };

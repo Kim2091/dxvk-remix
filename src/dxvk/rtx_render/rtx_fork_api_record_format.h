@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <cwchar>
 #include <type_traits>
 
 #include <remix/remix_c.h>
@@ -303,6 +304,51 @@ namespace remix_record {
     io.pod(s.originShift);
   }
 
+  template<class IO> void ioExt(IO& io, remixapi_CameraInfoLensEXT& s) {
+    io.pod(s.id);
+    io.pod(s.eyepieceCenter);
+    io.pod(s.axis);
+    io.pod(s.up);
+    io.pod(s.eyepieceRadius);
+    io.pod(s.objectiveDistance);
+    io.pod(s.objectiveRadius);
+    io.pod(s.magnification);
+    io.pod(s.fieldStopDegrees);
+    io.pod(s.eyeRelief);
+    io.pod(s.tint);
+    io.pod(s.reticle);
+    io.pod(s.reticleColor);
+    io.pod(s.reticleRadiance);
+    io.pod(s.reticleLineWidth);
+    io.pod(s.kind);
+    io.pod(s.aperture);
+    io.pod(s.apertureAspect);
+    io.pod(s.visionMode);
+    io.pod(s.lensFlags);
+    io.pod(s.minMagnification);
+    io.pod(s.reticleAccentColor);
+    io.pod(s.reticleAccentRadiance);
+    io.pod(s.edgeGlowColor);
+    io.pod(s.edgeGlowStrength);
+    io.pod(s.edgeShade);
+    io.pod(s.edgeTint);
+    io.pod(s.nightTint);
+    io.pod(s.nightGain);
+    io.pod(s.markings);
+    io.pod(s.referenceMagnification);
+    // reticleTexture as a counted wchar_t array (terminator included).
+    uint32_t pathLength = (!io.reading() && s.reticleTexture != nullptr) ? uint32_t(std::wcslen(s.reticleTexture) + 1) : 0u;
+    const wchar_t* path = s.reticleTexture;
+    io.podArray(path, pathLength);
+    s.reticleTexture = pathLength != 0 ? path : nullptr;
+    io.pod(s.markingColor);
+    io.pod(s.markingRadiance);
+    io.pod(s.markingOpacity);
+    io.pod(s.parallaxDistance);
+    io.pod(s.glareStrength);
+    io.pod(s.dirtStrength);
+  }
+
   template<class IO> void ioExt(IO& io, remixapi_AssetKeyEXT& s) {
     io.pod(s.key);
     io.podArray(s.aliases_values, s.aliases_count);
@@ -544,6 +590,7 @@ namespace remix_record {
   X(REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_MATERIAL_OVERRIDE_EXT,  remixapi_InstanceInfoMaterialOverrideEXT)\
   X(REMIXAPI_STRUCT_TYPE_CAMERA_INFO_PARAMETERIZED_EXT,        remixapi_CameraInfoParameterizedEXT)     \
   X(REMIXAPI_STRUCT_TYPE_CAMERA_INFO_FRAME_EVENTS_EXT,         remixapi_CameraInfoFrameEventsEXT)       \
+  X(REMIXAPI_STRUCT_TYPE_CAMERA_INFO_LENS_EXT,                remixapi_CameraInfoLensEXT)              \
   X(REMIXAPI_STRUCT_TYPE_ASSET_KEY_EXT,                        remixapi_AssetKeyEXT)                    \
   X(REMIXAPI_STRUCT_TYPE_MESH_INFO_REFRESH_GEOMETRY_EXT,       remixapi_MeshInfoRefreshGeometryEXT)     \
   X(REMIXAPI_STRUCT_TYPE_TEXTURE_INFO_HOST_IMPORT_EXT,         remixapi_TextureInfoHostImportEXT)

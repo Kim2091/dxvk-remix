@@ -136,6 +136,8 @@ struct RtSurface {
     uint16_t flags0 = 0;
     flags0 |= normalFormat == VK_FORMAT_R32_UINT ? 1 : 0;
     flags0 |= isVertexColorBakedLighting ? (1 << 1) : 0;
+    flags0 |= isHighlightHostile ? (1 << 2) : 0;
+    flags0 |= isHeatSource ? (1 << 3) : 0;
     // NOTE: Spare flags bits here
 
     writeGPUHelper(data, offset, flags0);
@@ -358,6 +360,9 @@ struct RtSurface {
   bool isTextureFactorBlend = false;
   bool isVertexColorBakedLighting = true;
   bool isMotionBlurMaskOut = false;
+  // The lens highlight and thermal categories (InstanceCategories::HighlightHostile and HeatSource).
+  bool isHighlightHostile = false;
+  bool isHeatSource = false;
   bool skipSurfaceInteractionSpritesheetAdjustment = false;
 
   RtTextureArgSource textureColorArg1Source = RtTextureArgSource::Texture;

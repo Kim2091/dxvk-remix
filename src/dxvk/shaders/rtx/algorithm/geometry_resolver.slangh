@@ -32,6 +32,7 @@
 #include "rtx/algorithm/sky_provider.slangh"
 #include "rtx/concept/camera/camera.slangh"
 #include "rtx/concept/ray/ray.slangh"
+#include "rtx/concept/lens/lens.slangh"
 #include "rtx/concept/surface/surface.slangh"
 #include "rtx/concept/surface_material/surface_material.slangh"
 #include "rtx/concept/surface_material/opaque_surface_material_interaction.slangh"
@@ -127,18 +128,100 @@ GeometryResolverState geometryResolverStateCreateEmpty(u16vec2 pixelCoordinate)
   return geometryResolverState;
 }
 
-vec2 calcMotionVectorForRayMiss(const uvec2 pixelCoordinate)
+// Returns the value of PrimaryDisocclusionThresholdMix that makes DLSS-RR discard a pixel's history.
+// Without DLSS-RR it selects the alternate disocclusion threshold.
+float geometryResolverDisocclusionDiscardValue()
+{
+  // Set value of 10000.f that forces RR to discard history.
+  // Set the log value of 10000.f since RR uses log scale. RR prepass will revert the log operation after blurring the values.
+  const float kDLSSRRDisocclusionThresholdValue =
+    cb.setLogValueForDisocclusionMaskForDLSSRR
+    ? 9.2103403719762 // == log(10000.f)
+    : 10000.f;
+
+  return
+    GBUFFER_FEATURE_DLSSRR && cb.enableDLSSRR
+      ? kDLSSRRDisocclusionThresholdValue
+      : 1.f;
+}
+
+// Lens history discards are written only for DLSS-RR, the one denoiser with a per-pixel discard input.
+bool geometryResolverLensHistoryDiscardActive()
+{
+  return GBUFFER_FEATURE_DLSSRR && cb.enableDLSSRR;
+}
+
+// Replaces the virtual motion of a hit seen through a lens with the motion through the previous frame's lens,
+// so the previous virtual position projects to the previous pixel (documentation/Lens.md, section Motion).
+// Returns true for lens pixels.
+// Sets historyDiscard when the pixel's history is from the other side of a lens rim.
+bool geometryResolverLensReprojectHit(
+  uvec2 pixelCoordinate, Ray originalCameraRay, float depthHitDistance, vec3 virtualHitPosition,
+  inout vec3 virtualMotion, out bool historyDiscard)
+{
+  historyDiscard = false;
+
+  const uint lensSlot = lensSlotAtPixel(ivec2(pixelCoordinate), false);
+
+  if (lensSlot == kLensSlotInvalid)
+  {
+    if (lensAnyPreviousActive())
+    {
+      const vec3 previousEyeVector = virtualHitPosition + virtualMotion - cameraGetPreviousWorldPosition(cb.camera);
+      historyDiscard = lensPreviousDirectionInsideAnyLens(normalize(previousEyeVector));
+    }
+
+    return false;
+  }
+
+  const LensPrimaryRay lensRay = lensCreatePrimaryRayForSlot(lensSlot, originalCameraRay.origin, originalCameraRay.direction);
+  const vec3 lensHitPosition = lensRay.origin + lensRay.direction * max(depthHitDistance - lensRay.eyeDistance, 0.0f);
+  const LensReprojection reprojection = lensReprojectPosition(lensSlot, lensHitPosition + virtualMotion);
+
+  virtualMotion = reprojection.previousVirtualPosition - virtualHitPosition;
+  historyDiscard = !reprojection.historyValid;
+
+  return true;
+}
+
+vec2 calcMotionVectorForRayMiss(const uvec2 pixelCoordinate, out bool lensHistoryDiscard)
 {
   // Note: Slightly incorrect to be using the current frame's camera for deriving the previous NDC values if the resolution changes between
   // frames, but this case shouldn't really be a major concern.
   const Ray previousCameraRay = rayCreatePrimaryFromPixel(cb.camera, pixelCoordinate, false);
+  vec3 previousDirection = previousCameraRay.direction;
+  lensHistoryDiscard = false;
+
+  // A miss through a lens is reprojected through the previous frame's lens.
+  const uint lensSlot = lensSlotAtPixel(ivec2(pixelCoordinate), false);
+
+  if (lensSlot != kLensSlotInvalid)
+  {
+    const LensPrimaryRay lensRay = lensCreatePrimaryRayForSlot(lensSlot, previousCameraRay.origin, previousCameraRay.direction);
+    const LensReprojection reprojection = lensReprojectDirection(lensSlot, lensRay.direction);
+
+    previousDirection = reprojection.previousEyeDirection;
+    lensHistoryDiscard = !reprojection.historyValid;
+  }
+  else
+  {
+    lensHistoryDiscard = lensPreviousDirectionInsideAnyLens(previousCameraRay.direction);
+  }
+
   // Note: 0 used for w component here to represent a pure direction quantity (as misses are purely directional).
-  vec4 prevNDC = mul(cb.camera.prevWorldToProjection, vec4(previousCameraRay.direction, 0.0f));
+  vec4 prevNDC = mul(cb.camera.prevWorldToProjection, vec4(previousDirection, 0.0f));
   prevNDC /= prevNDC.w;
 
   const vec2 ndc = cameraPixelCoordinateToNDC(cb.camera, pixelCoordinate);
 
   return cameraCalcMotionVectorPixel(cb.camera, ndc, prevNDC.xy);
+}
+
+vec2 calcMotionVectorForRayMiss(const uvec2 pixelCoordinate)
+{
+  bool lensHistoryDiscard;
+
+  return calcMotionVectorForRayMiss(pixelCoordinate, lensHistoryDiscard);
 }
 
 void geometryResolverStoreDlssNrControlMask(
@@ -150,6 +233,19 @@ void geometryResolverStoreDlssNrControlMask(
 
 // Geometry Resolver Vertex Functions
 
+// Writes the pixel's lens features while a lens needs them (documentation/Lens.md, "Vision modes and highlighting").
+void geometryResolverWriteLensFeatures(
+  uvec2 pixelCoordinate, bool isHit, bool isHighlighted, bool isHeatSource, float emissiveLuminance, vec3 normal)
+{
+  if (cb.lensFeatureMask == 0u)
+  {
+    return;
+  }
+
+  LensFeatures[pixelCoordinate] =
+    lensCreatePixelFeatures(ivec2(pixelCoordinate), isHit, isHighlighted, isHeatSource, emissiveLuminance, normal);
+}
+
 void geometryResolverOutputMiss<
   let PRIMARY_SURFACE : bool,
   let SELECTED_INTEGRATION_SURFACE : bool>(
@@ -159,10 +255,15 @@ void geometryResolverOutputMiss<
 
   if (PRIMARY_SURFACE)
   {
+    geometryResolverWriteLensFeatures(pixelCoordinate, false, false, false, 0.0f, vec3(0.0f));
+    bool lensHistoryDiscard;
     PrimaryHitDistance[pixelCoordinate] = missHitDistance;
-    PrimaryScreenSpaceMotionVector[pixelCoordinate] = calcMotionVectorForRayMiss(pixelCoordinate);
+    PrimaryScreenSpaceMotionVector[pixelCoordinate] = calcMotionVectorForRayMiss(pixelCoordinate, lensHistoryDiscard);
     PrimarySurfaceFlags[pixelCoordinate] = 0;
-    PrimaryDisocclusionThresholdMix[pixelCoordinate] = 0;
+    PrimaryDisocclusionThresholdMix[pixelCoordinate] =
+      lensHistoryDiscard && geometryResolverLensHistoryDiscardActive()
+        ? geometryResolverDisocclusionDiscardValue()
+        : 0.0f;
     PrimaryDepth[pixelCoordinate] = cb.clearColorDepth;
 
     if (cb.enableDlssNrControlMask)
@@ -298,9 +399,17 @@ void geometryResolverOutputSurface<
   // Output Linear View Z (Primary/secondary surface coherent)
 
   // Note: Using virtual hit distance accumulated through PSR and Ray Portals used to calculate a virtual hit position
-  const vec3 virtualHitPosition = rayEvaluate(originalCameraRay, geometryResolverDepthHitDistance(virtualHitDistance, surfaceInteraction));
+  const float depthHitDistance = geometryResolverDepthHitDistance(virtualHitDistance, surfaceInteraction);
+  const vec3 virtualHitPosition = rayEvaluate(originalCameraRay, depthHitDistance);
   const float linearViewZ = cameraWorldPosToLinearViewZ(cb.camera, virtualHitPosition);
   float primaryDepth = 0.0f;
+
+  // Note: Virtual motion used to account for the ray traversing ray portals and through PSR interactions.
+  vec3 virtualMotion = quaternionTransformVector(accumulatedRotation, surfaceInteraction.motion, true);
+
+  bool lensHistoryDiscard;
+  const bool isLensPixel = geometryResolverLensReprojectHit(
+    pixelCoordinate, originalCameraRay, depthHitDistance, virtualHitPosition, virtualMotion, lensHistoryDiscard);
 
   if (PRIMARY_SURFACE)
   {
@@ -314,19 +423,11 @@ void geometryResolverOutputSurface<
     imageStore(PrimaryLinearViewZ, pixelCoordinate, linearViewZ);
     imageStore(PrimaryHitDistance, pixelCoordinate, virtualHitDistance);
 
-    // Set value of 10000.f that forces RR to discard history.
-    // Set the log value of 10000.f since RR uses log scale. RR prepass will revert the log operation after blurring the values.
-    const float kDLSSRRDisocclusionThresholdValue =
-      cb.setLogValueForDisocclusionMaskForDLSSRR
-      ? 9.2103403719762 // == log(10000.f)
-      : 10000.f;
-    const float kDisocclusionThresholdValue =
-      GBUFFER_FEATURE_DLSSRR && cb.enableDLSSRR
-      ? kDLSSRRDisocclusionThresholdValue
-      : 1.f;
+    const float kDisocclusionThresholdValue = geometryResolverDisocclusionDiscardValue();
     const bool discardRRHistory =
       surface.hasMaterialChanged ||
-      (surface.isAnimatedWater && cb.invalidateHistoryForAnimatedWater);
+      (surface.isAnimatedWater && cb.invalidateHistoryForAnimatedWater) ||
+      (lensHistoryDiscard && geometryResolverLensHistoryDiscardActive());
 
     // Note: Fully use an alternate disocclusion threshold when specified, done by setting the mix value to 1.0 (this mixes
     // between the standard and alternate disocclusion threshold specified in the denoiser's settings).
@@ -346,9 +447,6 @@ void geometryResolverOutputSurface<
   // Note: Technically part of the Surface Interaction, just not something we'd want to deserialize in other passes which would mean we'd need yet
   // another structure for this. To avoid that, just output it like this for now.
 
-  // Note: Virtual motion used to account for the ray traversing ray portals and through PSR interactions.
-  const vec3 virtualMotion = quaternionTransformVector(accumulatedRotation, surfaceInteraction.motion, true);
-  
   if (PRIMARY_SURFACE)
   {
     if (cb.writePrimaryVirtualMotionVector)
@@ -364,7 +462,8 @@ void geometryResolverOutputSurface<
     // When forcing static-scene motion vectors, reproject the precise current NDC + depth into the
     // previous frame (camera motion accounted for) instead of reprojecting the imprecise absolute
     // world position (see cameraCalcStaticSceneMotionVectorPixel).
-    if (cb.forceStaticSceneMotionVectors)
+    // A lens pixel keeps its lens motion, which a camera-only reprojection cannot express.
+    if (cb.forceStaticSceneMotionVectors && !isLensPixel)
     {
       motionVectorPixel = cameraCalcStaticSceneMotionVectorPixel(cb.camera, ndc, primaryDepth);
     }
@@ -374,6 +473,9 @@ void geometryResolverOutputSurface<
 
     const float luminance = calcBt709Luminance(radiance);
     const bool isRadianceOutput = luminance > 0.0f;
+
+    geometryResolverWriteLensFeatures(
+      pixelCoordinate, true, surface.isHighlightHostile, surface.isHeatSource, luminance, surfaceInteraction.geometryNormal);
 
     // Write out screen-space static bit in surface flags
     MotionBlurSurfaceFlags motionBlurSurfaceFlags;
@@ -541,7 +643,8 @@ void geometryResolverDLSSRROutputSurface(
   const Ray originalCameraRay = rayCreatePrimaryFromPixel(cb.camera, pixelCoordinate, false);
 
   // Note: Using virtual hit distance accumulated through PSR and Ray Portals used to calculate a virtual hit position
-  const vec3 virtualHitPosition = rayEvaluate(originalCameraRay, geometryResolverDepthHitDistance(virtualHitDistance, surfaceInteraction));
+  const float depthHitDistance = geometryResolverDepthHitDistance(virtualHitDistance, surfaceInteraction);
+  const vec3 virtualHitPosition = rayEvaluate(originalCameraRay, depthHitDistance);
   const float linearViewZ = cameraWorldPosToLinearViewZ(cb.camera, virtualHitPosition);
 
   const float4 projectionSpacePosition = mul(cb.camera.worldToProjectionJittered, float4(virtualHitPosition, 1.f));
@@ -553,14 +656,18 @@ void geometryResolverDLSSRROutputSurface(
   // another structure for this. To avoid that, just output it like this for now.
 
   // Note: Virtual motion used to account for the ray traversing ray portals and through PSR interactions.
-  const vec3 virtualMotion = quaternionTransformVector(accumulatedRotation, surfaceInteraction.motion, true);
-  
+  vec3 virtualMotion = quaternionTransformVector(accumulatedRotation, surfaceInteraction.motion, true);
+
+  bool lensHistoryDiscard;
+  const bool isLensPixel = geometryResolverLensReprojectHit(
+    pixelCoordinate, originalCameraRay, depthHitDistance, virtualHitPosition, virtualMotion, lensHistoryDiscard);
+
   const vec2 prevNDC = cameraWorldPosToPrevNDC(cb.camera, virtualHitPosition + virtualMotion);
 
   vec2 ndc = cameraPixelCoordinateToNDC(cb.camera, pixelCoordinate);
   vec2 motionVectorPixel = cameraCalcMotionVectorPixel(cb.camera, ndc, prevNDC);
 
-  if (cb.forceStaticSceneMotionVectors)
+  if (cb.forceStaticSceneMotionVectors && !isLensPixel)
   {
     motionVectorPixel = cameraCalcStaticSceneMotionVectorPixel(cb.camera, ndc, depth);
   }
@@ -1992,10 +2099,13 @@ void geometryResolverVertex(
   // Note: Done before resolveVertex so attenuation from unordered objects
   // between the origin and the hit point can be accumulated in advance.
 
+  // Lens pixels have a narrower ray cone, so texture filtering picks the finer mips that magnification needs.
+  const float primarySpreadAngle = lensPrimarySpreadAngle(ivec2(geometryResolverState.pixelCoordinate), cb.screenSpacePixelSpreadHalfAngle);
+
   Ray unorderedResolveRay;
   unorderedResolveRay.origin = geometryResolverState.origin;
   unorderedResolveRay.coneRadius = geometryResolverState.coneRadius;
-  unorderedResolveRay.spreadAngle = cb.screenSpacePixelSpreadHalfAngle;
+  unorderedResolveRay.spreadAngle = primarySpreadAngle;
   unorderedResolveRay.direction = geometryResolverState.direction;
   unorderedResolveRay.tMax = rayHitInfo.hasHit ? rayHitInfo.hitDistance * kUnorderedResolveRayLengthening : floatMax;
 
@@ -2071,8 +2181,8 @@ void geometryResolverVertex(
     surface, surfaceInteraction,
     polymorphicSurfaceMaterialInteraction,
     radianceAttenuation, emissiveRadiance,
-    decalMemory, decalEmissiveRadiance, 
-    cb.screenSpacePixelSpreadHalfAngle,
+    decalMemory, decalEmissiveRadiance,
+    primarySpreadAngle,
     isStochasticAlphaBlend, firstRayPortal,
     geometryResolverState.pomOpaqueSurfaceEncountered,
     isRaytracedRenderTarget,
@@ -2645,7 +2755,7 @@ bool isRefractionDistorted(GeometryPSRResolverState geometryPSRResolverState, Su
   // Check if the current surface point's screen space projection position is significantly different from the pixel position.
   const uvec2 pixelCoordinate = geometryPSRResolverState.pixelCoordinate;
   vec3 virtualPosition = surfaceInteraction.position;
-  if (geometryPSRResolverState.portalSpace != PORTAL_SPACE_NONE)
+  if (geometryPSRResolverState.portalSpace != PORTAL_SPACE_NONE || lensSlotAtPixel(ivec2(pixelCoordinate), false) != kLensSlotInvalid)
   {
     const Ray originalCameraRay = rayCreatePrimaryFromPixel(cb.camera, pixelCoordinate, false);
     virtualPosition = rayEvaluate(originalCameraRay, geometryPSRResolverState.accumulatedHitDistance);
@@ -3121,8 +3231,8 @@ void geometryPSRResolverVertex(
       const Ray originalCameraRay = rayCreatePrimaryFromPixel(cb.camera, pixelCoordinate, false);
 
       // Note: Using virtual hit distance accumulated through PSR and Ray Portals used to calculate a virtual hit position
-      const vec3 virtualHitPosition = rayEvaluate(originalCameraRay,
-        geometryResolverDepthHitDistance(geometryPSRResolverState.accumulatedHitDistance, surfaceInteraction));
+      const float depthHitDistance = geometryResolverDepthHitDistance(geometryPSRResolverState.accumulatedHitDistance, surfaceInteraction);
+      const vec3 virtualHitPosition = rayEvaluate(originalCameraRay, depthHitDistance);
       const float4 projectionSpacePosition = mul(cb.camera.worldToProjectionJittered, float4(virtualHitPosition, 1.f));
       const float depth = projectionSpacePosition.z / projectionSpacePosition.w;
       imageStore(PrimaryDepthDLSSRR, pixelCoordinate, depth);
@@ -3130,13 +3240,17 @@ void geometryPSRResolverVertex(
       // Output Motion Vector (Primary/secondary surface coherent)
       // Note: Virtual motion used to account for the ray traversing ray portals and through PSR interactions.
       vec3 virtualMotion = quaternionTransformVector(geometryPSRResolverState.accumulatedRotation, surfaceInteraction.motion, true);
-      
+
+      bool lensHistoryDiscard;
+      const bool isLensPixel = geometryResolverLensReprojectHit(
+        pixelCoordinate, originalCameraRay, depthHitDistance, virtualHitPosition, virtualMotion, lensHistoryDiscard);
+
       const vec2 prevNDC = cameraWorldPosToPrevNDC(cb.camera, virtualHitPosition + virtualMotion);
 
       vec2 ndc = cameraPixelCoordinateToNDC(cb.camera, pixelCoordinate);
       vec2 motionVectorPixel = cameraCalcMotionVectorPixel(cb.camera, ndc, prevNDC);
 
-      if (cb.forceStaticSceneMotionVectors)
+      if (cb.forceStaticSceneMotionVectors && !isLensPixel)
       {
         motionVectorPixel = cameraCalcStaticSceneMotionVectorPixel(cb.camera, ndc, depth);
       }
@@ -3187,6 +3301,24 @@ void preprocessPrimaryRayState(inout Ray originalCameraRay, inout GeometryResolv
 
   if (cb.startInMediumMaterialIndex != SURFACE_INDEX_INVALID) {
     geometryResolverState.insideMedium = true;
+  }
+
+  // A camera ray through a lens is traced from the objective along the magnified direction (documentation/Lens.md).
+  // The distance to the eyepiece starts the virtual hit distance, as the distance to a ray portal does.
+  // Lens rays skip the view model and the player model, which hold the scope itself.
+  if (lensAnyActive())
+  {
+    const LensPrimaryRay lensRay = lensCreatePrimaryRay(originalCameraRay.origin, originalCameraRay.direction);
+
+    if (lensRay.slot != kLensSlotInvalid)
+    {
+      originalCameraRay.origin = lensRay.origin;
+      originalCameraRay.direction = lensRay.direction;
+      originalCameraRay.spreadAngle /= lensRay.magnification;
+      geometryResolverState.accumulatedHitDistance = lensRay.eyeDistance;
+      geometryResolverState.directionAltered = true;
+      rayMask &= ~(OBJECT_MASK_ALL_VIEWMODEL | OBJECT_MASK_ALL_PLAYER_MODEL);
+    }
   }
 
   geometryResolverState.rayMask = rayMask;
@@ -3489,23 +3621,28 @@ vec4 geometryResolverReconstructSinglePortalAccumulatedRotation(PortalSpace2Bits
 //   radiance' = e_u + a_u * radiance, attenuation' = a_u * attenuation, the bias mask, the atmosphere foreground.
 // It runs before the decal blending below, which then scales its emissive delta by the patched attenuation.
 // Emission that resolveVertex added at the hit is attenuated by the particles in front of it.
-// It is bound only on slim levels (no portals, so the camera ray is the primary ray), with PSR Prepare,
-// and without a debug view or picking.
+// It is bound only on slim levels (no portals, so the camera ray, remapped by any lens, is the primary ray),
+// with PSR Prepare, and without a debug view or picking.
 void geometryResolverDeferredUnorderedParticles(ivec2 pixelCoordinate, bool isMiss, float primaryHitDistance)
 {
   // The primary loop's first-segment arguments (preprocessPrimaryRayState, geometryResolverVertex).
   const Ray cameraRay = rayCreatePrimaryFromPixel(cb.camera, pixelCoordinate);
+  const LensPrimaryRay lensRay = lensCreatePrimaryRay(cameraRay.origin, cameraRay.direction);
   Ray unorderedResolveRay;
-  unorderedResolveRay.origin = cameraRay.origin;
+  unorderedResolveRay.origin = lensRay.origin;
   unorderedResolveRay.coneRadius = cameraRay.coneRadius;
-  unorderedResolveRay.spreadAngle = cb.screenSpacePixelSpreadHalfAngle;
-  unorderedResolveRay.direction = cameraRay.direction;
-  unorderedResolveRay.tMax = isMiss ? floatMax : primaryHitDistance * kUnorderedResolveRayLengthening;
+  unorderedResolveRay.spreadAngle = cb.screenSpacePixelSpreadHalfAngle / lensRay.magnification;
+  unorderedResolveRay.direction = lensRay.direction;
+  unorderedResolveRay.tMax = isMiss ? floatMax : max(primaryHitDistance - lensRay.eyeDistance, 0.0f) * kUnorderedResolveRayLengthening;
 
   uint8_t rayMask = OBJECT_MASK_ALL | OBJECT_MASK_VIEWMODEL | OBJECT_MASK_PLAYER_MODEL_VIRTUAL;
   if (cb.enablePlayerModelInPrimarySpace)
   {
     rayMask |= OBJECT_MASK_PLAYER_MODEL;
+  }
+  if (lensRay.slot != kLensSlotInvalid)
+  {
+    rayMask &= ~(OBJECT_MASK_ALL_VIEWMODEL | OBJECT_MASK_ALL_PLAYER_MODEL);
   }
   const uint8_t resolveMode =
     resolveModeAlteredDirectionNotify |
@@ -3610,11 +3747,21 @@ void geometryResolverApplyUnorderedDecalsPass(ivec2 pixelCoordinate) {
   unorderedResolveRay.direction = -minimalRayInteraction.viewDirection;
   unorderedResolveRay.spreadAngle = cb.screenSpacePixelSpreadHalfAngle;
   float localHitDistance = primaryHitDistance;
+
+  // A lens pixel's ray starts at the objective, and its virtual hit distance includes the distance to the eyepiece.
+  const uint lensSlot = lensSlotAtPixel(pixelCoordinate, false);
+  if (lensSlot != kLensSlotInvalid)
+  {
+    const LensPrimaryRay lensRay = lensCreatePrimaryRayForSlot(lensSlot, primaryRay.origin, primaryRay.direction);
+    localHitDistance = max(primaryHitDistance - lensRay.eyeDistance, 0.0f);
+    unorderedResolveRay.spreadAngle /= lensRay.magnification;
+  }
+
   unorderedResolveRay.origin =
-    minimalSurfaceInteraction.position - vec3(unorderedResolveRay.direction) * primaryHitDistance;
+    minimalSurfaceInteraction.position - vec3(unorderedResolveRay.direction) * localHitDistance;
   unorderedResolveRay.coneRadius = max(
     0.0f,
-    minimalRayInteraction.coneRadius - unorderedResolveRay.spreadAngle * primaryHitDistance);
+    minimalRayInteraction.coneRadius - unorderedResolveRay.spreadAngle * localHitDistance);
   geometryResolverTryReconstructSinglePortalUnorderedRay(
     primaryRay,
     minimalRayInteraction,

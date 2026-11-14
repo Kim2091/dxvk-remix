@@ -521,6 +521,11 @@ public:
   // Creates view model instances and their virtual counterparts
   void createViewModelInstances(Rc<DxvkContext> ctx, const CameraManager& cameraManager, const RayPortalManager& rayPortalManager);
 
+  // Returns the transforms that place a view model reference instance where its view model copy is traced, this frame
+  // and the previous frame. They include the perspective correction, which can be projective.
+  // Returns false when the reference has no view model copy this frame.
+  bool getViewModelTransforms(const RtInstance& reference, Matrix4d& objectToWorld, Matrix4d& prevObjectToWorld) const;
+
   void createPlayerModelVirtualInstances(Rc<DxvkContext> ctx, const CameraManager& cameraManager, const RayPortalManager& rayPortalManager);
 
   void findPortalForVirtualInstances(const CameraManager& cameraManager, const RayPortalManager& rayPortalManager);
@@ -563,6 +568,11 @@ private:
   std::unordered_map<RtInstance*, RtInstance*> m_persistentViewModelInstances;
   std::unordered_map<RtInstance*, RtInstance*> m_persistentVirtualViewModelInstances;
   std::unordered_map<RtInstance*, RtInstance*> m_persistentPlayerModelClones;
+
+  // The view model perspective correction of the frame m_viewModelCorrectionFrameId, and of the frame before it.
+  Matrix4d m_viewModelCorrection;
+  Matrix4d m_prevViewModelCorrection;
+  uint32_t m_viewModelCorrectionFrameId = kInvalidFrameIndex;
 
   // Removes persistent entries whose references are no longer active and
   // marks the associated derived instances for GC.

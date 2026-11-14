@@ -1037,6 +1037,8 @@ namespace dxvk {
         currentInstance.surface.isTextureFactorBlend = legacySurface.isTextureFactorBlend;
         currentInstance.surface.isVertexColorBakedLighting = legacySurface.isVertexColorBakedLighting;
         currentInstance.surface.isMotionBlurMaskOut = currentInstance.testCategoryFlags(InstanceCategories::IgnoreMotionBlur);
+        currentInstance.surface.isHighlightHostile = currentInstance.testCategoryFlags(InstanceCategories::HighlightHostile);
+        currentInstance.surface.isHeatSource = currentInstance.testCategoryFlags(InstanceCategories::HeatSource);
 
         // Note: Skip the spritesheet adjustment logic in the surface interaction when using Ray Portal materials as this logic
         // is done later in the Surface Material Interaction (and doing it in both places will just double up the animation).
@@ -1678,6 +1680,10 @@ namespace dxvk {
     const auto perspectiveCorrection = camera.getViewToWorld(false) * (camera.getProjectionToView() * viewModelProjectionMatrix * scaleMatrix) * viewModelCamera.getWorldToView(false);
     const auto prevPerspectiveCorrection = camera.getPreviousViewToWorld(false) * (camera.getPreviousProjectionToView() * previousViewModelProjectionMatrix * scaleMatrix) * viewModelCamera.getPreviousWorldToView(false);
 
+    m_viewModelCorrection = perspectiveCorrection;
+    m_prevViewModelCorrection = prevPerspectiveCorrection;
+    m_viewModelCorrectionFrameId = m_device->getCurrentFrameId();
+
     // Create any valid view model instances from the list of candidates
     std::vector<RtInstance*> viewModelInstances;
     std::unordered_set<RtInstance*> activeViewModelReferences;
@@ -1704,6 +1710,28 @@ namespace dxvk {
 
     // Create virtual instances for the view model instances
     createRayPortalVirtualViewModelInstances(viewModelInstances, cameraManager, rayPortalManager);
+  }
+
+  bool InstanceManager::getViewModelTransforms(const RtInstance& reference, Matrix4d& objectToWorld, Matrix4d& prevObjectToWorld) const {
+    const auto it = m_persistentViewModelInstances.find(const_cast<RtInstance*>(&reference));
+    if (it == m_persistentViewModelInstances.end()) {
+      return false;
+    }
+
+    const uint32_t frameId = m_device->getCurrentFrameId();
+    const RtInstance* viewModelInstance = it->second;
+    if (viewModelInstance->isMarkedForGC() || viewModelInstance->getFrameLastUpdated() != frameId) {
+      return false;
+    }
+
+    // createViewModelInstance applies the correction to the transform, or to the vertices when it is projective.
+    objectToWorld = Matrix4d(reference.getTransform());
+    prevObjectToWorld = Matrix4d(reference.getPrevTransform());
+    if (RtxOptions::ViewModel::perspectiveCorrection() && m_viewModelCorrectionFrameId == frameId) {
+      objectToWorld = m_viewModelCorrection * objectToWorld;
+      prevObjectToWorld = m_prevViewModelCorrection * prevObjectToWorld;
+    }
+    return true;
   }
 
   static bool isInsidePlayerModel(const Vector3& playerModelPosition, const Vector3& instancePosition) {

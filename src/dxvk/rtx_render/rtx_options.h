@@ -242,6 +242,12 @@ namespace dxvk {
     RTX_OPTION("rtx", fast_unordered_set, hairCardTextures, {},
                   "Textures on draw calls that should be treated as alpha-tested hair cards.\n"
                   "Tagged materials preserve fine texture detail, render as cutouts instead of alpha blends, and disable backface culling.");
+    RTX_OPTION("rtx", fast_unordered_set, highlightHostileTextures, {},
+                  "Textures on draw calls whose directly visible surfaces are outlined in lenses that highlight.\n"
+                  "See rtx.lens.highlightOnAllLenses and documentation/Lens.md.");
+    RTX_OPTION("rtx", fast_unordered_set, heatSourceTextures, {},
+                  "Textures on draw calls that are hot in thermal lens images.\n"
+                  "Other surfaces are warm when emissive and otherwise at ambient temperature with a small sun term.");
     RTX_OPTION("rtx", float, hairCardMipBias, -32.0f,
                "The mip level bias applied to textures on materials tagged as hair cards. Large negative values preserve thin strand detail at a distance.");
     RTX_OPTION("rtx", float, hairCardRoughnessScale, 1.0f,

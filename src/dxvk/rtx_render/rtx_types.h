@@ -720,6 +720,8 @@ enum class InstanceCategories : uint32_t {
   ParticleEmitter,
   SmoothNormals,
   HairCards,
+  HighlightHostile,
+  HeatSource,
 
   Count,
 };

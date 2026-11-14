@@ -17,6 +17,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `requestHostRelease` is set from level 2 (High) by default.
 
 ### Added
+- 2026-11-07: `REMIXAPI_CAMERA_LENS_FLAG_NO_GRAIN` (0x8) for `remixapi_CameraInfoLensEXT::lensFlags`: the
+  lens' vision mode draws no grain. The struct is unchanged.
+- 2026-11-07: `remixapi_CameraInfoLensEXT` gains `parallaxDistance` (world units), `glareStrength`
+  and `dirtStrength` (0 to 1) at its end. 0 turns each off. The struct is still unreleased, so
+  nothing is versioned.
+- 2026-11-07: `remixapi_CameraInfoLensEXT` gains `markingColor`, `markingRadiance` and
+  `markingOpacity` at its end, for the labels and the rangefinder readout. A zero color uses
+  the accent, a zero opacity means 1. The struct is still unreleased, so nothing is versioned.
+- 2026-11-07: `remixapi_CameraInfoLensEXT` gains `referenceMagnification` (float) and
+  `reticleTexture` (`remixapi_Path`, a file path or `0x<hex>` for a `remixapi_CreateTexture`
+  texture) at its end, with `REMIXAPI_CAMERA_LENS_FLAG_FIRST_FOCAL_PLANE` (0x4) and
+  `REMIXAPI_CAMERA_LENS_RETICLE_TEXTURE` (12). The runtime copies the path during
+  `SetupCamera`. The struct is still unreleased, so nothing is versioned.
+- 2026-11-07: `REMIXAPI_CAMERA_LENS_APERTURE_BINOCULAR` (2): two circles of `eyepieceRadius`
+  whose centers sit `apertureAspect` radii to either side of the axis, showing one image. The
+  struct is unchanged.
+- 2026-11-07: `REMIXAPI_CAMERA_LENS_FLAG_OCCLUDE_OUTSIDE` (0x2) for
+  `remixapi_CameraInfoLensEXT::lensFlags`: everything outside every lens is black while the
+  lens is active. The struct is unchanged.
+- 2026-11-07: `remixapi_CameraInfoLensEXT` gains `markings` at its end, with
+  `REMIXAPI_CAMERA_LENS_MARKING_LABELS` (0x1) and `REMIXAPI_CAMERA_LENS_MARKING_RANGEFINDER`
+  (0x2). The struct is still unreleased, so nothing is versioned.
+- 2026-11-07: `remixapi_CameraInfoLensEXT` gains `reticleAccentColor`,
+  `reticleAccentRadiance`, `edgeGlowColor`, `edgeGlowStrength`, `edgeShade`, `edgeTint`,
+  `nightTint` and `nightGain` at its end, with the reticles `_GERMAN` (6), `_DROP` (7),
+  `_STADIA` (8), `_FRAME` (9), `_GRID` (10) and `_DIAL` (11). The struct is still
+  unreleased, so the earlier fields keep their offsets and nothing is versioned. Zero means
+  the default for every new field. See `documentation/Lens.md`, "Overlay".
+- 2026-11-06: `remixapi_CameraInfoLensEXT` gains `kind`, `aperture`, `apertureAspect`,
+  `visionMode`, `lensFlags` and `minMagnification` at its end, with
+  `REMIXAPI_CAMERA_LENS_KIND_*`, `REMIXAPI_CAMERA_LENS_APERTURE_*`,
+  `REMIXAPI_CAMERA_LENS_VISION_*`, `REMIXAPI_CAMERA_LENS_FLAG_HIGHLIGHT_HOSTILES` and the
+  reticles `_DOT`, `_CIRCLE_DOT` and `_MIL_DOT`. The struct was not released before, so
+  the earlier fields keep their offsets and nothing is versioned. New instance categories
+  `REMIXAPI_INSTANCE_CATEGORY_BIT_HIGHLIGHT_HOSTILE` (1 << 30) and
+  `REMIXAPI_INSTANCE_CATEGORY_BIT_HEAT_SOURCE` (1 << 29), from the top of the field.
+  See `documentation/Lens.md`, "Kinds and apertures" and "Vision modes and highlighting".
+- 2026-11-06: `remixapi_CameraInfoLensEXT`
+  (`REMIXAPI_STRUCT_TYPE_CAMERA_INFO_LENS_EXT` = `0x4E560005`) and
+  `REMIXAPI_CAMERA_LENS_RETICLE_NONE`, `_CROSSHAIR` and `_DUPLEX`, chained on the main
+  camera's `remixapi_CameraInfo`, several per camera. Each is a lens for that frame, in
+  world space. The runtime keeps each id's previous pose for motion vectors. A runtime
+  that predates the struct ignores it, so `REMIXAPI_VERSION` is unchanged. See
+  `documentation/Lens.md`, "Lenses from the Remix API". The bridge forwards up to 8
+  per camera (the client logs "Forwarding CameraInfoLensEXT").
 - 2026-10-27: the bridge forwards `remixapi_InstanceInfoGpuInstancingEXT` on
   `DrawInstance` and the retained-instance calls (the client logs "Forwarding
   InstanceInfoGpuInstancingEXT"), so 32-bit hosts can GPU-instance a mesh.

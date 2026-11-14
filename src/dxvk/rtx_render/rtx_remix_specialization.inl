@@ -102,6 +102,7 @@ namespace pnext::detail {
     remixapi_CameraInfo,
     remixapi_CameraInfoParameterizedEXT,
     remixapi_CameraInfoFrameEventsEXT,
+    remixapi_CameraInfoLensEXT,
     remixapi_CameraMediumInfo,
     remixapi_TextureInfo
   >;
@@ -136,6 +137,7 @@ namespace pnext::detail {
   template<> constexpr auto ToEnum< remixapi_CameraInfo                     > = REMIXAPI_STRUCT_TYPE_CAMERA_INFO;
   template<> constexpr auto ToEnum< remixapi_CameraInfoParameterizedEXT     > = REMIXAPI_STRUCT_TYPE_CAMERA_INFO_PARAMETERIZED_EXT;
   template<> constexpr auto ToEnum< remixapi_CameraInfoFrameEventsEXT       > = REMIXAPI_STRUCT_TYPE_CAMERA_INFO_FRAME_EVENTS_EXT;
+  template<> constexpr auto ToEnum< remixapi_CameraInfoLensEXT              > = REMIXAPI_STRUCT_TYPE_CAMERA_INFO_LENS_EXT;
   template<> constexpr auto ToEnum< remixapi_CameraMediumInfo               > = REMIXAPI_STRUCT_TYPE_CAMERA_MEDIUM_INFO;
   template<> constexpr auto ToEnum< remixapi_TextureInfo                    > = REMIXAPI_STRUCT_TYPE_TEXTURE_INFO;
 
@@ -164,5 +166,6 @@ namespace pnext::detail {
   template<>           struct Root< remixapi_InstanceInfoMaterialOverrideEXT>{ using Type = remixapi_InstanceInfo;              };
   template<>           struct Root< remixapi_CameraInfoParameterizedEXT     >{ using Type = remixapi_CameraInfo;                };
   template<>           struct Root< remixapi_CameraInfoFrameEventsEXT       >{ using Type = remixapi_CameraInfo;                };
+  template<>           struct Root< remixapi_CameraInfoLensEXT              >{ using Type = remixapi_CameraInfo;                };
   // clang-format on
 }

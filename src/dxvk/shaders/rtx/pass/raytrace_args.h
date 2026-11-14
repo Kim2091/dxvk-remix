@@ -30,6 +30,7 @@
 #include "rtx/concept/camera/camera.slangh"
 #include "rtx/concept/ray_portal/ray_portal.slangh"
 #endif
+#include "rtx/concept/lens/lens.h"
 
 #include "rtx/pass/nrd_args.h"
 #include "rtx/pass/nrc_args.h"
@@ -174,6 +175,9 @@ struct RaytraceArgs {
   Camera renderTargetCamera;
 
   SparseRenderingArgs sparseRenderingArgs;
+
+  // The first kMaxLenses lenses are for this frame, the second kMaxLenses are for the previous frame (see lens.h).
+  LensArgs lenses[kMaxLenses * 2];
 
   // ------------------------- Structs above this line, non structs below this line -----------------------------------
 
@@ -570,6 +574,14 @@ struct RaytraceArgs {
   // rtx.resolveKeepsCoplanarSurfaces. 1 = a ray query resolve iteration after a cut-out texel skips only the
   // triangle passed instead of starting behind its plane (resolve_expanded.slangh).
   uint resolveKeepsCoplanarSurfaces;
+
+  // Bit i of lensMask is set when lens slot i is active this frame.
+  // Bit i of previousLensMask is set when lens slot i was active on the previous frame.
+  uint lensMask;
+  uint previousLensMask;
+  // Bit i is set when lens slot i needs per-pixel lens features: it is thermal or highlights.
+  // The G-buffer pass writes the features for every pixel while it is nonzero.
+  uint lensFeatureMask;
 
   // NOTE: Add structs to the top section of RaytraceArgs, not the bottom.
   // NOTE: bool does not work in debug builds, use uint instead.

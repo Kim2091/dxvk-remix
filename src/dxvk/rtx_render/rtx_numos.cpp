@@ -32,6 +32,48 @@ namespace dxvk {
 
   namespace {
     numos::Vector3 toNumos(const Vector3& v) { return numos::Vector3(v.x, v.y, v.z); }
+    numos::Vector3 toNumos(const vec3& v) { return numos::Vector3(v.x, v.y, v.z); }
+
+    numos::LensGeometry toNumosLens(const LensArgs& lens) {
+      numos::LensGeometry geometry;
+      geometry.eyepieceCenter = toNumos(lens.eyepieceCenter);
+      geometry.eyepieceRadius = lens.eyepieceRadius;
+      // The clouds know circles and rectangles. A binocular eyepiece is sent as the rectangle around both circles,
+      // whose corners lie outside the eyepiece where the image is not magnified.
+      if (lens.aperture == lensApertureRectangle) {
+        geometry.apertureAspect = lens.apertureAspect;
+      } else if (lens.aperture == lensApertureBinocular) {
+        geometry.apertureAspect = lens.apertureAspect + 1.0f;
+      } else {
+        geometry.apertureAspect = 0.0f;
+      }
+      geometry.axis = toNumos(lens.axis);
+      geometry.right = toNumos(lens.right);
+      geometry.up = toNumos(lens.up);
+      geometry.objectiveCenter = toNumos(lens.objectiveCenter);
+      geometry.magnification = lens.magnification;
+      return geometry;
+    }
+
+    // The lenses the primary rays were remapped by this frame (RaytraceArgs::lenses), by slot. Pass-through
+    // lenses leave camera rays unchanged, so the clouds see past them.
+    void setNumosLenses(numos::FrameInputs& in, const RaytraceArgs& constants) {
+      static_assert(numos::kMaxLenses == kMaxLenses, "NUMOS and the runtime must have the same lens slots.");
+      for (uint32_t slot = 0; slot < kMaxLenses; ++slot) {
+        const LensArgs& current = constants.lenses[slot];
+        const LensArgs& previous = constants.lenses[kMaxLenses + slot];
+        numos::Lens& lens = in.lenses[slot];
+        lens.active = ((constants.lensMask >> slot) & 1u) != 0u && (current.flags & lensFlagPassThrough) == 0u;
+        lens.previousActive = ((constants.previousLensMask >> slot) & 1u) != 0u && (previous.flags & lensFlagPassThrough) == 0u;
+        lens.historyValid = lens.active && lens.previousActive && (current.flags & lensFlagDiscardHistory) == 0u;
+        if (lens.active) {
+          lens.current = toNumosLens(current);
+        }
+        if (lens.previousActive) {
+          lens.previous = toNumosLens(previous);
+        }
+      }
+    }
     Vector3 toRemix(const numos::Vector3& v) { return Vector3(v.x, v.y, v.z); }
 
     // External view indices of NumosGpu.
@@ -409,6 +451,7 @@ namespace dxvk {
       ? RtxGlobalVolumetrics::froxelMaxDistanceMeters() * RtxOptions::getMeterToWorldUnitScale() : 0.0f;
     in.hostLocalLightInjection = false;
     in.debugViewActive = ctx.getCommonObjects()->metaDebugView().getDebugViewIndex() != DEBUG_VIEW_DISABLED;
+    setNumosLenses(in, constants);
     in.weather = nullptr;
 
     m_impl->renderer.beginFrame(m_impl->gpu, in);

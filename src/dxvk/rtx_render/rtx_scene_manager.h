@@ -49,6 +49,7 @@
 #include "rtx_instance_manager.h"
 #include "rtx_accel_manager.h"
 #include "rtx_ray_portal_manager.h"
+#include "rtx_lens.h"
 #include "rtx_bindless_resource_manager.h"
 #include "rtx_objectpicking.h"
 #include "rtx_mod_manager.h"
@@ -365,6 +366,8 @@ public:
   const LightManager& getLightManager() const { return m_lightManager; }
   const GraphManager& getGraphManager() const { return m_graphManager; }
   const RayPortalManager& getRayPortalManager() const { return m_rayPortalManager; }
+  const LensManager& getLensManager() const { return m_lensManager; }
+  LensManager& getLensManager() { return m_lensManager; }
   const BindlessResourceManager& getBindlessResourceManager() const { return m_bindlessResourceManager; }
   OpacityMicromapManager* getOpacityMicromapManager() const { return m_opacityMicromapManager.get(); }
   // Bindless index of the per-surface software micromap table, UINT32_MAX = none.
@@ -592,6 +595,13 @@ private:
 
   void drawReplacements(Rc<DxvkContext> ctx, const DrawCallState* input, const std::shared_ptr<const ReplacementBucket>& pReplacements, MaterialData& renderMaterialData, ReplacementInstance* replacementInstance);
 
+  // Registers the lenses of a mesh replacement on one of the mesh instances it drew, its anchor.
+  // See documentation/Lens.md, "Lenses in mod USD".
+  void updateLensAnchor(const DrawCallState& input, const std::shared_ptr<const ReplacementBucket>& pReplacements,
+                        const ReplacementInstance& replacementInstance);
+  // Adds the lenses of every live anchor to the lens manager, placed as their anchor instance is traced.
+  void addReplacementLenses();
+
   // Build the per-replacement DrawCallState used by both the dynamic (drawReplacements) and
   // preserve (syncPreservedReplacementMeshesState) paths so they always feed the same input
   // into the BlasEntry / processDrawCallState. Returns std::nullopt for replacement types
@@ -683,6 +693,18 @@ private:
   LightManager m_lightManager;
   GraphManager m_graphManager;
   RayPortalManager m_rayPortalManager;
+  LensManager m_lensManager;
+
+  // The lenses carried by a mesh replacement instance, keyed by its anchor instance.
+  struct LensAnchor {
+    std::shared_ptr<const ReplacementBucket> bucket;
+    // The index of each lens in the bucket, with its transform to the anchor instance's object space.
+    std::vector<std::pair<uint32_t, Matrix4d>> lensToAnchor;
+  };
+  std::mutex m_lensAnchorMutex;
+  std::unordered_map<const RtInstance*, LensAnchor> m_lensAnchors;
+  uint32_t m_lensesAddedFrameId = kInvalidFrameIndex;
+
   BindlessResourceManager m_bindlessResourceManager;
   std::unique_ptr<OpacityMicromapManager> m_opacityMicromapManager;
   std::unique_ptr<CoreMaterialBuilder> m_coreMaterials; // rtx.coreMaterial.build, null while off

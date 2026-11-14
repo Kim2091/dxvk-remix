@@ -84,6 +84,7 @@
 #include "../../lssusd/usd_mesh_importer.h"
 #include "../../lssusd/usd_common.h"
 #include "../../lssusd/mod_asset_keys.h"
+#include "../../lssusd/remix_lens_names.h"
 #include "graph/rtx_graph_usd_parser.h"
 
 namespace fs = std::filesystem;
@@ -159,6 +160,7 @@ private:
   std::optional<RtxParticleSystemDesc> processParticleSystem(Args& args, const pxr::UsdPrim& prim);
 
   void processLight(Args& args, const pxr::UsdPrim& lightPrim, const bool isOverride);
+  void processLens(Args& args, const pxr::UsdPrim& lensPrim);
   void processGraph(Args& args, const uint32_t index);
   bool processReplacement(Args& args);
   void processReplacementRecursive(Args& args, const pxr::UsdPrim& prim, bool isRoot = false);
@@ -872,6 +874,155 @@ void UsdMod::Impl::processLight(Args& args, const pxr::UsdPrim& lightPrim, const
   }
 }
 
+namespace {
+  template<typename T>
+  T getLensAttribute(const pxr::UsdPrim& prim, const char* name, const T& fallback) {
+    T value;
+    const pxr::UsdAttribute attribute = prim.GetAttribute(pxr::TfToken(name));
+    if (attribute.IsValid() && attribute.Get(&value)) {
+      return value;
+    }
+    return fallback;
+  }
+
+  Vector3 getLensColor(const pxr::UsdPrim& prim, const char* name, const Vector3& fallback) {
+    const pxr::GfVec3f color = getLensAttribute(prim, name, pxr::GfVec3f(fallback.x, fallback.y, fallback.z));
+    return Vector3(color[0], color[1], color[2]);
+  }
+
+  LensReticle parseLensReticle(const pxr::TfToken& token) {
+    if (token.GetString() == "crosshair") {
+      return LensReticle::Crosshair;
+    }
+    if (token.GetString() == "duplex") {
+      return LensReticle::Duplex;
+    }
+    if (token.GetString() == "dot") {
+      return LensReticle::Dot;
+    }
+    if (token.GetString() == "circleDot") {
+      return LensReticle::CircleDot;
+    }
+    if (token.GetString() == "milDot") {
+      return LensReticle::MilDot;
+    }
+    if (token.GetString() == "german") {
+      return LensReticle::German;
+    }
+    if (token.GetString() == "drop") {
+      return LensReticle::Drop;
+    }
+    if (token.GetString() == "stadia") {
+      return LensReticle::Stadia;
+    }
+    if (token.GetString() == "frame") {
+      return LensReticle::Frame;
+    }
+    if (token.GetString() == "grid") {
+      return LensReticle::Grid;
+    }
+    if (token.GetString() == "dial") {
+      return LensReticle::Dial;
+    }
+    if (token.GetString() == "texture") {
+      return LensReticle::Texture;
+    }
+    return LensReticle::None;
+  }
+
+  LensVisionMode parseLensVisionMode(const pxr::TfToken& token) {
+    if (token.GetString() == "night") {
+      return LensVisionMode::Night;
+    }
+    if (token.GetString() == "thermal") {
+      return LensVisionMode::Thermal;
+    }
+    return LensVisionMode::None;
+  }
+}
+
+void UsdMod::Impl::processLens(Args& args, const pxr::UsdPrim& lensPrim) {
+  // The lens is placed like the replacement's meshes, relative to the root's parent.
+  bool resetXformStack; // unused
+  const pxr::GfMatrix4f lensToRoot = pxr::GfMatrix4f(args.xformCache.ComputeRelativeTransform(lensPrim, args.rootPrim.GetParent(), &resetXformStack));
+  const auto& replacementToObjectAsArray = reinterpret_cast<const float(&)[4][4]>(lensToRoot);
+
+  LensReplacement lens;
+  LensDesc& desc = lens.desc;
+  desc.pose.eyepieceCenter = Vector3(0.f, 0.f, 0.f);
+  desc.pose.axis = Vector3(0.f, 0.f, -1.f);
+  desc.pose.up = Vector3(0.f, 1.f, 0.f);
+  desc.eyepieceRadius = getLensAttribute(lensPrim, lens_usd::kEyepieceRadius, 0.f);
+  desc.objectiveDistance = getLensAttribute(lensPrim, lens_usd::kObjectiveDistance, 0.f);
+  desc.objectiveRadius = getLensAttribute(lensPrim, lens_usd::kObjectiveRadius, 0.f);
+  desc.magnification = getLensAttribute(lensPrim, lens_usd::kMagnification, 4.f);
+  desc.fieldStopDegrees = getLensAttribute(lensPrim, lens_usd::kFieldStopDegrees, 18.f);
+  desc.eyeRelief = getLensAttribute(lensPrim, lens_usd::kEyeRelief, 0.f);
+  desc.tint = getLensColor(lensPrim, lens_usd::kTint, Vector3(1.f, 1.f, 1.f));
+  desc.reticle = parseLensReticle(getLensAttribute(lensPrim, lens_usd::kReticle, pxr::TfToken("none")));
+  desc.reticleColor = getLensColor(lensPrim, lens_usd::kReticleColor, Vector3(0.f, 0.f, 0.f));
+  desc.reticleRadiance = getLensAttribute(lensPrim, lens_usd::kReticleRadiance, 0.f);
+  desc.reticleLineWidth = getLensAttribute(lensPrim, lens_usd::kReticleLineWidth, 0.004f);
+  desc.kind = getLensAttribute(lensPrim, lens_usd::kKind, pxr::TfToken("telescopic")).GetString() == "reflex"
+    ? LensKind::Reflex
+    : LensKind::Telescopic;
+  {
+    const std::string aperture = getLensAttribute(lensPrim, lens_usd::kAperture, pxr::TfToken("circle")).GetString();
+    desc.aperture = aperture == "rectangle" ? LensAperture::Rectangle
+      : aperture == "binocular" ? LensAperture::Binocular
+      : LensAperture::Circle;
+  }
+  desc.apertureAspect = std::max(getLensAttribute(lensPrim, lens_usd::kApertureAspect, 1.f), 0.01f);
+  desc.visionMode = parseLensVisionMode(getLensAttribute(lensPrim, lens_usd::kVisionMode, pxr::TfToken("none")));
+  desc.highlightHostiles = getLensAttribute(lensPrim, lens_usd::kHighlightHostiles, false);
+  desc.occludeOutside = getLensAttribute(lensPrim, lens_usd::kOccludeOutside, false);
+  desc.noGrain = getLensAttribute(lensPrim, lens_usd::kNoGrain, false);
+  desc.firstFocalPlane = getLensAttribute(lensPrim, lens_usd::kFirstFocalPlane, false);
+  desc.markingColor = getLensColor(lensPrim, lens_usd::kMarkingColor, Vector3(0.f, 0.f, 0.f));
+  desc.markingRadiance = std::max(getLensAttribute(lensPrim, lens_usd::kMarkingRadiance, 0.f), 0.f);
+  desc.markingOpacity = std::clamp(getLensAttribute(lensPrim, lens_usd::kMarkingOpacity, 1.f), 0.f, 1.f);
+  // The parallax distance is in the prim's units, like the lens' other lengths.
+  desc.parallaxDistance = std::max(getLensAttribute(lensPrim, lens_usd::kParallaxDistance, 0.f), 0.f);
+  desc.glareStrength = std::clamp(getLensAttribute(lensPrim, lens_usd::kGlareStrength, 0.f), 0.f, 1.f);
+  desc.dirtStrength = std::clamp(getLensAttribute(lensPrim, lens_usd::kDirtStrength, 0.f), 0.f, 1.f);
+  desc.referenceMagnification = std::max(getLensAttribute(lensPrim, lens_usd::kReferenceMagnification, 0.f), 0.f);
+  {
+    // A packaged texture has no resolved path, so it is resolved against the layer that sets it, as material textures are.
+    const pxr::TfToken textureToken(lens_usd::kReticleTexture);
+    const pxr::SdfAssetPath texturePath = getLensAttribute(lensPrim, lens_usd::kReticleTexture, pxr::SdfAssetPath());
+    if (!texturePath.GetResolvedPath().empty()) {
+      desc.reticleTexture = texturePath.GetResolvedPath();
+    } else if (!texturePath.GetAssetPath().empty()) {
+      desc.reticleTexture = resolveTexturePath(lensPrim, textureToken, texturePath.GetAssetPath());
+    }
+  }
+  desc.reticleAccentColor = getLensColor(lensPrim, lens_usd::kReticleAccentColor, Vector3(0.f, 0.f, 0.f));
+  desc.reticleAccentRadiance = getLensAttribute(lensPrim, lens_usd::kReticleAccentRadiance, 0.f);
+  desc.edgeGlowColor = getLensColor(lensPrim, lens_usd::kEdgeGlowColor, Vector3(0.f, 0.f, 0.f));
+  desc.edgeGlowStrength = getLensAttribute(lensPrim, lens_usd::kEdgeGlowStrength, 0.f);
+  desc.edgeShade = getLensAttribute(lensPrim, lens_usd::kEdgeShade, 0.f);
+  desc.edgeTint = getLensColor(lensPrim, lens_usd::kEdgeTint, Vector3(1.f, 1.f, 1.f));
+  desc.nightTint = getLensColor(lensPrim, lens_usd::kNightTint, Vector3(0.f, 0.f, 0.f));
+  desc.nightGain = std::max(getLensAttribute(lensPrim, lens_usd::kNightGain, 1.f), 0.f);
+  {
+    const std::string markings = getLensAttribute(lensPrim, lens_usd::kMarkings, pxr::TfToken("none")).GetString();
+    desc.reticleLabels = markings == "labels" || markings == "labelsRangefinder";
+    desc.rangefinder = markings == "rangefinder" || markings == "labelsRangefinder";
+  }
+  lens.firstPersonOnly = getLensAttribute(lensPrim, lens_usd::kFirstPersonOnly, false);
+
+  if (desc.eyepieceRadius <= 0.f) {
+    Logger::warn(str::format("The lens at ", lensPrim.GetPath().GetString(), " has no eyepiece radius and is ignored."));
+    return;
+  }
+
+  AssetReplacement replacement(lensPrim.GetPrimPath().GetString());
+  replacement.type = AssetReplacement::eLens;
+  replacement.replacementToObject = Matrix4(replacementToObjectAsArray);
+  replacement.lensData = std::move(lens);
+  args.meshes.push_back(std::move(replacement));
+}
+
 void UsdMod::Impl::processGraph(Args& args, const uint32_t meshIndex) {
   pxr::UsdPrim graphPrim = args.rootPrim.GetStage()->GetPrimAtPath(pxr::SdfPath(args.meshes[meshIndex].primPath));
   args.meshes[meshIndex].graphState = std::make_shared<RtGraphState>(GraphUsdParser::parseGraph(*args.target, graphPrim, args.pathHashToIndexMap));
@@ -1217,6 +1368,9 @@ void UsdMod::Impl::processPointInstancer(Args& args, const pxr::UsdPrim& prim) {
         if (!useFastPathForPointInstancerLights && args.meshes[meshInd].type == AssetReplacement::eLight) {
           numNewMeshes += instanceToObjectTransforms.size() - 1;
         }
+        if (args.meshes[meshInd].type == AssetReplacement::eLens) {
+          numNewMeshes += instanceToObjectTransforms.size() - 1;
+        }
       }
 
       // After processing prim we more meshes - create copies and apply the instance transforms to the copies
@@ -1253,7 +1407,7 @@ void UsdMod::Impl::processPointInstancer(Args& args, const pxr::UsdPrim& prim) {
           // Update the transforms for the first instance separately, since it already exists in the meshes vector.
           {
             const Matrix4 composedReplacementToObject = instanceToObjectTransforms[0] * replacementToInstance;
-            if (args.meshes[meshInd].type == AssetReplacement::eMesh) {
+            if (args.meshes[meshInd].type == AssetReplacement::eMesh || args.meshes[meshInd].type == AssetReplacement::eLens) {
               args.meshes[meshInd].replacementToObject = composedReplacementToObject;
             } else if (args.meshes[meshInd].lightData.has_value()){
               const pxr::GfMatrix4f pxrReplacementToObject = pxr::GfMatrix4f(reinterpret_cast<const float(&)[4][4]>(composedReplacementToObject));
@@ -1273,7 +1427,7 @@ void UsdMod::Impl::processPointInstancer(Args& args, const pxr::UsdPrim& prim) {
             args.meshes.back().pointInstanceIndex = instanceInd;
             // Append the meshToProtoRoot transform
             const Matrix4 composedReplacementToObject = instanceToObjectTransforms[instanceInd] * replacementToInstance;
-            if (args.meshes[index].type == AssetReplacement::eMesh) {
+            if (args.meshes[index].type == AssetReplacement::eMesh || args.meshes[index].type == AssetReplacement::eLens) {
               args.meshes[index].replacementToObject = composedReplacementToObject;
             } else if (args.meshes[index].lightData.has_value()){
               const pxr::GfMatrix4f pxrReplacementToObject = pxr::GfMatrix4f(reinterpret_cast<const float(&)[4][4]>(composedReplacementToObject));
@@ -1403,6 +1557,10 @@ void UsdMod::Impl::processReplacementRecursive(Args& args, const pxr::UsdPrim& p
     // For now, just create empty placeholders that point to the source prim.
     args.meshes.push_back(AssetReplacement(prim.GetPath().GetString()));
     args.meshes.back().type = AssetReplacement::eGraph;
+  }
+
+  if (!isRoot && prim.HasAPI(pxr::TfToken(lens_usd::kApiName))) {
+    processLens(args, prim);
   }
 
   auto children = prim.GetFilteredChildren(pxr::UsdPrimIsActive);

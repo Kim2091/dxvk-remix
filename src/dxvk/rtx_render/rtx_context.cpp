@@ -888,6 +888,9 @@ namespace dxvk {
         dust.simulateAndDraw(this, m_state, rtOutput);
         recordGpuStageTiming("DustParticles");
 
+        // The lens overlay works on the upscaled image, so its masks and reticle never enter any history.
+        getSceneManager().getLensManager().dispatchOverlay(this, rtOutput);
+
         // DLSS-NR stays outside the ordered post-processing stack. It must see linear HDR before any
         // stack member runs, it dispatches auto exposure itself, and "Post FX Enabled" must not gate it.
         const bool dlssNrEnabled = dispatchDlssNR(rtOutput);
@@ -1840,6 +1843,8 @@ namespace dxvk {
     auto const& renderTargetCamera { getSceneManager().getCameraManager().getCamera(CameraType::RenderToTexture) };
     constants.renderTargetCamera = renderTargetCamera.getShaderConstants(/*freecam =*/ false);
     constants.enableRaytracedRenderTarget = renderTargetCamera.isValid(m_device->getCurrentFrameId()) && RtxOptions::RaytracedRenderTarget::enable();
+
+    getSceneManager().getLensManager().writeShaderConstants(constants, camera, frameIdx);
     const CameraManager& cameraManager = getSceneManager().getCameraManager();
 
     const bool enablePortalVolumes = RtxGlobalVolumetrics::enableInPortals() &&

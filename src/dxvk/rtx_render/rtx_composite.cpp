@@ -493,6 +493,10 @@ namespace dxvk {
     compositeArgs.cloudMotionVectors = ctx->getCommonObjects()->metaNumos().writesCloudMotionVectors();
     compositeArgs.cloudMotionVectorCoverage = RtxNumos::cloudMotionVectorCoverage();
     compositeArgs.cloudMotionVectorMissDepth = sceneManager.getGlobals().clearColorDepth;
+    std::copy(std::begin(rtOutput.m_raytraceArgs.lenses), std::end(rtOutput.m_raytraceArgs.lenses), std::begin(compositeArgs.lenses));
+    compositeArgs.lensMask = rtOutput.m_raytraceArgs.lensMask;
+    compositeArgs.previousLensMask = rtOutput.m_raytraceArgs.previousLensMask;
+    compositeArgs.lensFeatureMask = rtOutput.m_raytraceArgs.lensFeatureMask;
     compositeArgs.enhanceAlbedo = ctx->useRayReconstruction() && rayReconstruction.enableDetailEnhancement();
     compositeArgs.writeRayReconstructionHitDistance = ctx->useRayReconstruction() ? 1u : 0u;
     compositeArgs.enableDlssNrVolumetricControlMask = rtOutput.m_raytraceArgs.enableDlssNrVolumetricControlMask;

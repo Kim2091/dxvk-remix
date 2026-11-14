@@ -172,6 +172,7 @@ namespace dxvk {
         RW_TEXTURE2D(GBUFFER_BINDING_PRIMARY_POSITION_ERROR_OUTPUT)
         RW_TEXTURE2D(GBUFFER_BINDING_SHARED_SHADOW_TERMINATOR_FIX_OUTPUT)
         RW_TEXTURE2D(GBUFFER_BINDING_PRIMARY_OBJECT_PICKING_OUTPUT)
+        RW_TEXTURE2D(GBUFFER_BINDING_LENS_FEATURES_OUTPUT)
 
         RW_TEXTURE2D(GBUFFER_BINDING_SECONDARY_ATTENUATION_OUTPUT)
         RW_TEXTURE2D(GBUFFER_BINDING_SECONDARY_WORLD_SHADING_NORMAL_OUTPUT)
@@ -1074,6 +1075,7 @@ namespace dxvk {
     ctx->bindResourceView(GBUFFER_BINDING_PRIMARY_DISOCCLUSION_THRESHOLD_MIX_OUTPUT, rtOutput.m_primaryDisocclusionThresholdMix.view, nullptr);
     ctx->bindResourceView(GBUFFER_BINDING_PRIMARY_DEPTH_OUTPUT, rtOutput.m_primaryDepth.view, nullptr);
     ctx->bindResourceView(GBUFFER_BINDING_PRIMARY_OBJECT_PICKING_OUTPUT, rtOutput.m_primaryObjectPicking.view, nullptr);
+    ctx->bindResourceView(GBUFFER_BINDING_LENS_FEATURES_OUTPUT, ctx->getSceneManager().getLensManager().prepareFeatures(ctx, rtOutput.m_compositeOutputExtent), nullptr);
 
     ctx->bindResourceView(GBUFFER_BINDING_SECONDARY_ATTENUATION_OUTPUT, rtOutput.m_secondaryAttenuation.view, nullptr);
     ctx->bindResourceView(GBUFFER_BINDING_SECONDARY_WORLD_SHADING_NORMAL_OUTPUT, rtOutput.m_secondaryWorldShadingNormal.view, nullptr);

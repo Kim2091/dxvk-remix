@@ -2,6 +2,7 @@
 // the screen overlay, UI state, texture creation, the bridge frame callbacks and VRAM requests.
 
 #include "rtx_fork_hooks.h"
+#include "rtx_lens.h"
 #include "rtx_remix_api_device.h"
 
 #include "rtx_context.h"                  // DxvkContext::getCommonObjects(), RtxContext
@@ -704,4 +705,14 @@ namespace fork_hooks {
   }
 
 } // namespace fork_hooks
+
+namespace {
+  // Lens reticles can name API-created textures by their "0x<hex>" image hash.
+  const bool s_lensTextureLookupSet = [] {
+    LensManager::s_textureHashLookup = [](DxvkContext& ctx, const std::string& path, TextureRef& outRef) {
+      return fork_hooks::textureHashPathLookup(ctx, path, outRef);
+    };
+    return true;
+  }();
+} // anonymous namespace
 } // namespace dxvk

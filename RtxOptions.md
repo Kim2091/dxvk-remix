@@ -768,6 +768,63 @@ This file is generated from the source by `scripts/gen_rtx_options_md.py`. Run `
 |rtx.legacyMaterial.specularLevel|float|1|||Scales the dielectric base reflectivity \(F0\) of non\-replaced legacy materials, from 0 to 1\. 1 keeps the standard 0\.04 reflectivity, and 0 removes reflection at normal incidence\. Grazing reflections are set separately by rtx\.legacyMaterial\.fresnelGrazing\. Fully metallic surfaces are unaffected\.|
 |rtx.legacyMaterial.thinFilmThicknessConstant|float|200|||The thickness \(in nanometers\) of the thin\-film layer assuming it is enabled on non\-replaced "legacy" materials\.<br>Should be any value larger than 0, typically within the wavelength of light, but must be less than or equal to OPAQUE\_SURFACE\_MATERIAL\_THIN\_FILM\_MAX\_THICKNESS \(\(1500\.0f\) nm\)\.|
 |rtx.legacyMaterial.useAlbedoTextureIfPresent|bool|True|||A flag to determine if an "albedo" texture \(a qualifying color texture\) from the original application should be used if present on non\-replaced "legacy" materials\.|
+|rtx.lens.chromaticFringe|float|0.5|0|1|The lateral chromatic aberration toward the field stop of telescopic lenses, from 0 \(none\) to 1, where red and blue split by two output pixels at the stop\.|
+|rtx.lens.debugCameraLens|bool|False|||Adds a lens fixed to the camera at the center of the screen, to test lens optics and motion vectors without any lens source\. Needs rtx\.lens\.enable\. Its settings are the rtx\.lens\.debugLens options\.|
+|rtx.lens.debugLens.aperture|int|0|||The window shape of the debug camera lens\.<br>Supported enum values are 0 = Circle, 1 = Rectangle, 2 = Binocular\.|
+|rtx.lens.debugLens.apertureAspect|float|1.5|0.1|10|The width over the height of the debug camera lens' window when it is a rectangle, or the offset of each circle's center from the axis in radii when it is binocular\.|
+|rtx.lens.debugLens.dirtStrength|float|0|0|1|The strength of the dirt on the debug camera lens' glass, from 0 to 1\.|
+|rtx.lens.debugLens.edgeGlowColor|float3|1, 0.6, 0.2|||The color of the debug camera lens' glow ring at the field stop\.|
+|rtx.lens.debugLens.edgeGlowStrength|float|0|0||The displayed strength of the debug camera lens' glow ring\. 0 draws no ring\.|
+|rtx.lens.debugLens.edgeShade|float|0|0|1|How much the debug camera lens' image darkens toward its field stop, from 0 to 1\.|
+|rtx.lens.debugLens.edgeTint|float3|1, 1, 1|||The color multiplied into the debug camera lens' image toward its field stop\.|
+|rtx.lens.debugLens.eyeOffsetCm|float3|0, 0, 0|||The offset of the eye from the debug camera lens' ideal eye point, in centimeters: x to the right, y up and z backward\. A sideways offset dims the whole image, a z offset dims it from one side\.|
+|rtx.lens.debugLens.eyeReliefCm|float|8|0||The eye relief of the debug camera lens, in centimeters \(see rtx\.sceneScale\): the ideal distance of the eye behind the eyepiece\.|
+|rtx.lens.debugLens.fieldStopDegrees|float|18|0.1|89|The apparent field stop half\-angle of the debug camera lens, in degrees\.|
+|rtx.lens.debugLens.firstFocalPlane|bool|False|||Puts the debug camera lens' reticle in the first focal plane, so it grows with the magnification relative to rtx\.lens\.debugLens\.referenceMagnification\.|
+|rtx.lens.debugLens.glareStrength|float|0|0|1|The strength of the debug camera lens' glare from bright light near its axis, from 0 to 1\.|
+|rtx.lens.debugLens.highlightHostiles|bool|False|||Outlines highlighted surfaces in the debug camera lens\.|
+|rtx.lens.debugLens.kind|int|0|||The kind of the debug camera lens\.<br>Supported enum values are 0 = Telescopic, 1 = Reflex\.|
+|rtx.lens.debugLens.magnification|float|4|0.01|100|The magnification of the debug camera lens\.|
+|rtx.lens.debugLens.markingColor|float3|0, 0, 0|||The color of the debug camera lens' labels and rangefinder readout\. Black draws them in the accent\.|
+|rtx.lens.debugLens.markingOpacity|float|1|0|1|How opaque the debug camera lens' markings are, from 0 to 1\.|
+|rtx.lens.debugLens.markingRadiance|float|0|0||The displayed radiance of the debug camera lens' markings\. 0 draws them lit or as ink, as the accent is\.|
+|rtx.lens.debugLens.noGrain|bool|False|||Turns off the grain of the debug camera lens' vision mode\.|
+|rtx.lens.debugLens.objectiveDistanceCm|float|30|0||The distance from the eyepiece to the objective of the debug camera lens, in centimeters\. Magnified rays start at the objective\.|
+|rtx.lens.debugLens.objectiveRadiusCm|float|2|0||The objective radius of the debug camera lens, in centimeters\. The exit pupil radius is this divided by the magnification\.|
+|rtx.lens.debugLens.occludeOutside|bool|False|||Paints everything outside the debug camera lens black, as behind a scope mask\.|
+|rtx.lens.debugLens.parallaxDistanceCm|float|0|0||The distance at which the debug camera lens' reticle has no parallax, in centimeters \(see rtx\.sceneScale\)\. 0 puts the reticle at infinity\.|
+|rtx.lens.debugLens.rangefinder|bool|False|||Draws a rangefinder readout below the debug camera lens' reticle center\.|
+|rtx.lens.debugLens.referenceMagnification|float|4|0.01|100|The magnification at which the debug camera lens' first focal plane reticle has its size\.|
+|rtx.lens.debugLens.reticle|int|2|||The reticle of the debug camera lens\.<br>Supported enum values are 0 = None, 1 = Crosshair, 2 = Duplex, 3 = Dot, 4 = Circle Dot, 5 = Mil\-Dot, 6 = German, 7 = Drop, 8 = Stadia, 9 = Frame, 10 = Grid, 11 = Dial, 12 = Texture\.|
+|rtx.lens.debugLens.reticleAccentColor|float3|1, 0.1, 0.05|||The color of the debug camera lens' mil\-dot dots and center dots\.|
+|rtx.lens.debugLens.reticleAccentRadiance|float|0|0||The displayed radiance of the debug camera lens' reticle accent\. 0 draws it as unlit ink\.|
+|rtx.lens.debugLens.reticleColor|float3|0, 0, 0|||The color of the debug camera lens' reticle\. Lit (radiance above 0) it is the emitted color; unlit it is ink that passes this share of the image, so black is opaque\.|
+|rtx.lens.debugLens.reticleLabels|bool|False|||Draws the debug camera lens' reticle labels: the grid's range labels and the frame's scale numbers\.|
+|rtx.lens.debugLens.reticleLineWidth|float|0.004|0|0.5|The half\-width of the debug camera lens' reticle lines, as a fraction of the field stop radius\.|
+|rtx.lens.debugLens.reticleRadiance|float|0|0||The emitted radiance of the debug camera lens' reticle\. 0 draws a black reticle\.|
+|rtx.lens.debugLens.reticleTexture|string||||The image file of the debug camera lens' texture reticle \(rtx\.lens\.debugLens\.reticle 12\)\. Its alpha is the ink, and it covers the square from \-1 to 1 of reticle space\.|
+|rtx.lens.debugLens.screenRadius|float|0.5|0|4|The radius of the debug camera lens, as a fraction of half the screen height\.|
+|rtx.lens.debugLens.tint|float3|0.92, 0.92, 0.92|||The transmission tint of the debug camera lens' glass\.|
+|rtx.lens.debugLens.visionMode|int|0|||The vision mode of the debug camera lens\.<br>Supported enum values are 0 = None, 1 = Night, 2 = Thermal\.|
+|rtx.lens.debugView|int|0|||Shows lens state in the output instead of the image\.<br>Supported enum values are 0 = Off, 1 = Mask \(each lens in its own color, scaled by its transmission, black elsewhere\), 2 = Direction \(the magnified ray direction inside lenses\)\.|
+|rtx.lens.edgeBlur|float|0.5|0|1|The blur in the outer 15% of the field of telescopic lenses \(field curvature\), from 0 \(none\) to 1, where it reaches three output pixels at the field stop\.|
+|rtx.lens.enable|bool|False|||Enables lenses: discs where camera rays are traced as magnified rays, as through a telescopic sight\.<br>Lenses come from mesh replacements in mod USD \(RemixLensAPI\), from the Remix API camera and from the debug camera lens\.|
+|rtx.lens.eyePupilMm|float|2.5|0.01||The radius of the viewer's eye pupil, in millimeters\. A larger pupil softens the exit pupil falloff when the eye is off the lens' axis\.|
+|rtx.lens.highlightColor|float3|1, 0.2, 0.1|||The color of highlight outlines in lens images, as a displayed color independent of exposure\.|
+|rtx.lens.highlightOnAllLenses|bool|False|||Outlines highlighted surfaces \(the HighlightHostile instance category\) in every lens, not only in lenses that ask for highlighting\.|
+|rtx.lens.highlightTint|float|0.15|0|1|How much highlighted surfaces in lens images are tinted with the highlight color, from 0 to 1\.|
+|rtx.lens.historyDiscardZoomStep|float|0.3|0||The relative magnification change in one frame above which a lens' pixels discard their denoiser history\. 0\.3 discards on a zoom step of more than 30%\. 0 never discards on zoom changes\.|
+|rtx.lens.magnificationScale|float|1|0.01|100|Multiplies the magnification of every lens except the debug camera lens\. A game integration can set it at runtime through the Remix API's SetConfigVariable to zoom a sight without changing the mod's USD\. It applies from the next frame\.|
+|rtx.lens.maxLenses|int|1|1|4|The maximum number of lenses traced in a frame, nearest to the camera first, from 1 to 4\.|
+|rtx.lens.nightVision.adaptationSpeed|float|3|0.01||How fast night vision adapts to the brightness in a lens, per second\.|
+|rtx.lens.nightVision.bloom|float|0.5|0|4|The strength of the bloom around bright points in night vision lens images\.|
+|rtx.lens.nightVision.grain|float|0.08|0|1|The strength of the grain in night vision lens images\. The grain grows with the square root of the signal, so it is relatively stronger in dark areas\.|
+|rtx.lens.nightVision.maxGainEv|float|8|0|20|The largest gain night vision applies to a lens image, in stops\.|
+|rtx.lens.nightVision.phosphorColor|float3|0.45, 1, 0.5|||The phosphor color of night vision lens images whose lens gives none\.|
+|rtx.lens.nightVision.targetLuminance|float|0.18|0.001|10|The displayed luminance night vision brings a lens image's average to\.|
+|rtx.lens.peripheralBlur|float|0|0|1|Blurs the image outside the lenses while a lens is active, from 0 \(off\) to 1, for a depth of field feel when looking through a sight\. The blur runs at half resolution and is skipped at 0\.|
+|rtx.lens.softEdgePixels|float|1|0||The width of the soft edge of a lens' field stop, in output pixels\.|
+|rtx.lens.vignetteStrength|float|0.5|0|1|How much a lens' image darkens toward its field stop, from 0 \(no darkening\) to 1\.|
 |rtx.lightConversionDistantLightFixedAngle|float|0.0349|0|3.14159|The angular size in radians of the distant light source for legacy lights converted to distant lights\. Set to ~2 degrees in radians by default\. Should only be within the range \[0, pi\]\.|
 |rtx.lightConversionDistantLightFixedIntensity|float|1|0||The fixed intensity \(in W/sr\) to use for legacy lights converted to distant lights \(currently directional lights will convert to distant lights\)\.|
 |rtx.lightConversionIntensityFactor|float|1|||Scales the converted light intensities\.|
@@ -1612,7 +1669,9 @@ This file is generated from the source by `scripts/gen_rtx_options_md.py`. Run `
 |rtx.gui.productName|string|Remix Plus|||The product name the menus show to the player: in the startup message, the welcome window, the developer menu title and the About tab\.<br>A game's rtx\.conf can set it to the name of its RTX release\.|
 |rtx.gui.reportFile|string||||Set by the game integration \(remix API SetConfigVariable\): the full path of the newest report file, such as a zip of a session's logs\. When set, the log section of the menus names the file and gets buttons that show it in Explorer and copy its path\.|
 |rtx.hairCardTextures|hash set||||Textures on draw calls that should be treated as alpha\-tested hair cards\.<br>Tagged materials preserve fine texture detail, render as cutouts instead of alpha blends, and disable backface culling\.|
+|rtx.heatSourceTextures|hash set||||Textures on draw calls that are hot in thermal lens images\.<br>Other surfaces are warm when emissive and otherwise at ambient temperature with a small sun term\.|
 |rtx.hideInstanceTextures|hash set||||Textures on draw calls that should be hidden from rendering, but not totally ignored\.<br>This is similar to rtx\.ignoreTextures but instead of completely ignoring such draw calls they are only hidden from rendering, allowing for the hidden objects to still appear in captures\.<br>As such, this is mostly only a development tool to hide objects during development until they are properly replaced, otherwise the objects should be ignored with rtx\.ignoreTextures instead for better performance\.|
+|rtx.highlightHostileTextures|hash set||||Textures on draw calls whose directly visible surfaces are outlined in lenses that highlight\.<br>See rtx\.lens\.highlightOnAllLenses and documentation/Lens\.md\.|
 |rtx.ignoreAlphaOnTextures|hash set||||Textures for which to ignore the alpha channel of the legacy colormap\. Textures will be rendered fully opaque as a result\.|
 |rtx.ignoreBakedLightingTextures|hash set||||Textures for which to ignore two types of baked lighting, Texture Factors and Vertex Color\.<br><br>Texture Factor disablement:<br>Using this feature on selected textures will eliminate the texture factors\.<br>For instance, if a game bakes lighting information into the Texture Factor for particular textures, applying this option will remove them\.<br>This becomes useful when unexpected results occur due to the Texture Factor\.<br>Consider an example where the original texture contains red tints baked into the Texture Factor\. If a user replaces the texture, it will blend with the red tints, resulting in an undesirable reddish outcome\.<br>In such cases, users can employ this option to eliminate the unwanted tints from their replacement textures\.<br>Similarly, users can tag textures if shadows are baked into the Texture Factor, causing the replacing texture to appear darker than anticipated\.<br><br>Vertex Color disablement:<br>Using this feature on selected textures will eliminate the vertex colors\.<br><br>Note, enabling this setting will automatically disable multiple\-stage texture factor blendings for the selected textures\.<br>Only use this option when necessary, as the Texture Factor and Vertex Color can be used for simulating various texture effects, tagging a texture with this option will unexpectedly eliminate these effects\.|
 |rtx.ignoreLights|hash set||||Lights that should be ignored\.<br>Any matching light will be skipped and not added to be ray traced\.|
