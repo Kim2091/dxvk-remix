@@ -118,3 +118,101 @@ jobs:
           _output\.trex\*.exe
           _output\.trex\*.pdb
           _output\.trex\usd\*
+
+  build-linux-clang:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      XWIN_VERSION: 0.10.0
+      BUILD_DIR: _Comp64Clang
+      WINEDEBUG: -all
+      WINEDLLOVERRIDES: mscoree,mshtml=
+
+    steps:
+    - name: Setup variables
+      uses: actions/github-script@v9
+      with:
+        script: core.exportVariable('GITHUB_SHA_SHORT', context.sha.substring(0, 7))
+
+    - name: Free disk space
+      run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+
+    - name: Checkout code
+      uses: actions/checkout@v6
+      with:
+        submodules: recursive
+
+    - name: Install packages
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential clang lld llvm wine wine64 curl python3-venv
+        # The xwin wrappers call the LLVM tools by their unversioned names in /usr/bin.
+        for tool in clang-cl lld-link llvm-lib llvm-rc llvm-strip llvm-mt; do
+          if [ ! -e "/usr/bin/${tool}" ] && [ -e "/usr/lib/llvm-18/bin/${tool}" ]; then
+            sudo ln -s "/usr/lib/llvm-18/bin/${tool}" "/usr/bin/${tool}"
+          fi
+        done
+        clang-cl --version
+
+    - name: Install Meson, Ninja and CMake
+      run: |
+        python3 -m venv "${RUNNER_TEMP}/venv"
+        "${RUNNER_TEMP}/venv/bin/pip" install meson==1.8.2 ninja==1.11.1 cmake==3.31.6
+        echo "${RUNNER_TEMP}/venv/bin" >> "${GITHUB_PATH}"
+
+    - name: Cache xwin
+      id: cache-xwin-bin
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/bin/xwin
+        key: xwin-bin-${{ runner.os }}-${{ env.XWIN_VERSION }}
+
+    - name: Install xwin
+      if: steps.cache-xwin-bin.outputs.cache-hit != 'true'
+      run: cargo install xwin --version "${XWIN_VERSION}" --locked
+
+    - name: Download the CRT and Windows SDK files
+      run: xwin --accept-license splat --output "${HOME}/.cache/xwin/dxvk-remix"
+
+    - name: Set up the Wine prefix
+      run: wineboot --init && wineserver --wait
+
+    - name: Configure
+      run: |
+        PATH="${PWD}/scripts-common/xwin:${PATH}" meson setup "${BUILD_DIR}" --cross-file build-win64-clang.txt --buildtype debugoptimized -Denable_tests=false
+
+    - name: Build
+      run: |
+        PATH="${PWD}/scripts-common/xwin:${PATH}" meson compile -C "${BUILD_DIR}" d3d9
+
+    - name: Upload build logs
+      if: ${{ always() }}
+      continue-on-error: true
+      uses: actions/upload-artifact@v7
+      with:
+        name: build-logs-linux-clang-${{github.run_number}}-${{env.GITHUB_SHA_SHORT}}-debugoptimized
+        path: |
+          ${{ env.BUILD_DIR }}/meson-logs/meson-log.txt
+          ${{ env.BUILD_DIR }}/update-deps.log
+          ${{ env.BUILD_DIR }}/nrd/cmake/CMakeCache.txt
+          ${{ env.BUILD_DIR }}/nrd/cmake/CMakeFiles/CMakeConfigureLog.yaml
+          ${{ env.BUILD_DIR }}/nrd/cmake/.ninja_log
+          update-deps.log
+        if-no-files-found: ignore
+        include-hidden-files: true
+        retention-days: 30
+
+    - name: Collect binaries and license notices
+      run: |
+        mkdir -p _output_linux
+        cp "${BUILD_DIR}/src/d3d9/d3d9.dll" "${BUILD_DIR}/nrd/bin/NRD.dll" _output_linux/
+        cp LICENSE LICENSE-MIT CREDITS.md ThirdPartyLicenses.txt _output_linux/
+
+    - name: Upload x64 binaries
+      uses: actions/upload-artifact@v7
+      with:
+        name: rtx-remix-linux-clang-${{github.run_number}}-${{env.GITHUB_SHA_SHORT}}-debugoptimized
+        path: _output_linux/*
+        if-no-files-found: error
+        retention-days: 30

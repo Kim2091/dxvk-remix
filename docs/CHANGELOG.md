@@ -67,9 +67,9 @@ Every graphics preset now selects the SHARC radiance cache on any GPU with its d
 ## 2026-11-14
 
 ### Linux cross-build with clang-cl
-The x64 runtime can be built on Linux with clang-cl, lld-link and the Microsoft CRT and Windows SDK files from xwin, and Wine runs the Windows-only build tools (slangc, glslangValidator, spirv-val, spirv-opt and nv_xxd). NRD.dll is cross-built with the same clang-cl wrappers, while its ShaderMake shader tool and DXC run natively. The output is the same Windows `d3d9.dll`, and the README has the setup steps. Thanks to CR (sambow23) for the pull request.
+The x64 runtime can be built on Linux with clang-cl, lld-link and the Microsoft CRT and Windows SDK files from xwin, and Wine runs the Windows-only build tools (slangc, glslangValidator, spirv-val, spirv-opt and nv_xxd). NRD.dll is cross-built with the same clang-cl wrappers, while its ShaderMake shader tool and DXC run natively. The output is the same Windows `d3d9.dll`, and the README has the setup steps. The `build-linux-clang` CI job builds the debugoptimized runtime and NRD.dll this way on Ubuntu 24.04. Thanks to CR (sambow23) for the pull request.
 - Options: none added. A Linux build uses the new `build-win64-clang.txt` cross file.
-- Commits: CR's "Add native Linux clang-cl build support" and the commit that adds this entry.
+- Commits: CR's "Add native Linux clang-cl build support", the commit that adds this entry and "CI: Linux clang-cl cross-build job".
 
 ## 2026-11-06
 
