@@ -1357,8 +1357,10 @@ namespace dxvk {
   bool OpacityMicromapManager::addNewOmmBuildRequest(RtInstance& instance, const OmmRequest& ommRequest) {
     
     // Prevent host getting overloaded
-    if (m_ommBuildRequestStatistics.size() >= OpacityMicromapOptions::BuildRequests::maxRequests())
+    if (m_ommBuildRequestStatistics.size() >= OpacityMicromapOptions::BuildRequests::maxRequests()) {
+      ++m_churn.requestsRefusedAtCap;
       return false;
+    }
 
     XXH64_hash_t ommSrcHash = ommRequest.ommSrcHash;
 
@@ -1387,6 +1389,7 @@ namespace dxvk {
 
           OMMBuildRequestStatistics& ommBuildRequestStatistics = m_ommBuildRequestStatistics[ommSrcHash];
           advanceRequestStatistics(ommBuildRequestStatistics, currentFrameIndex);
+          ommBuildRequestStatistics.lastSeenTick = m_statsTick;
           ommBuildRequestStatistics.numTimesRequested = 1 + std::min<uint16_t>(UINT16_MAX - 1, ommBuildRequestStatistics.numTimesRequested);
 
           if (currentFrameIndex != ommBuildRequestStatistics.lastRequestFrameId) {
@@ -1804,6 +1807,7 @@ namespace dxvk {
           // Check capacity — if stats map is full and this hash isn't tracked yet, defer.
           if (m_ommBuildRequestStatistics.size() >= OpacityMicromapOptions::BuildRequests::maxRequests() &&
               m_ommBuildRequestStatistics.find(cachedHash) == m_ommBuildRequestStatistics.end()) {
+            ++m_churn.requestsRefusedAtCap;
             ommInstanceData.ommRetryAfterFrame = currentFrameIndex + 1 + (numRegisterFailed % 32);
             ++numRegisterFailed;
             keepCandidateForRetry(inst);
@@ -1813,6 +1817,7 @@ namespace dxvk {
           // Accumulate stats cheaply.
           OMMBuildRequestStatistics& stats = m_ommBuildRequestStatistics[cachedHash];
           advanceRequestStatistics(stats, currentFrameIndex);
+          stats.lastSeenTick = m_statsTick;
           stats.numTimesRequested = 1 + std::min<uint16_t>(UINT16_MAX - 1, stats.numTimesRequested);
           if (currentFrameIndex != stats.lastRequestFrameId) {
             stats.lastRequestFrameId = currentFrameIndex;
@@ -2999,6 +3004,19 @@ namespace dxvk {
     }
   }
 
+  void OpacityMicromapManager::purgeStaleRequestStatistics() {
+    uint32_t purged = 0;
+    for (auto it = m_ommBuildRequestStatistics.begin(); it != m_ommBuildRequestStatistics.end();) {
+      if (m_statsTick - it->second.lastSeenTick > kRequestStatsMaxIdleFrames) {
+        it = m_ommBuildRequestStatistics.erase(it);
+        ++purged;
+      } else {
+        ++it;
+      }
+    }
+    m_churn.requestStatsPurged += purged;
+  }
+
   void OpacityMicromapManager::onFrameStart(Rc<DxvkContext> ctx) {
     ScopedCpuProfileZone();
     const uint32_t currentFrameIndex = m_device->getCurrentFrameId();
@@ -3077,6 +3095,9 @@ namespace dxvk {
     // accumulate enough "frames requested" to pass the filter without
     // requiring per-frame registration calls.
     ++m_statsTick;
+    if ((m_statsTick % kRequestStatsPurgeEveryFrames) == 0) {
+      purgeStaleRequestStatistics();
+    }
     const bool incremental = RtxOptions::ommIncrementalBookkeeping();
     if (incremental && !m_ommIncrementalActive) {
       // Instances created while the walk was in charge were never added to the candidate set.

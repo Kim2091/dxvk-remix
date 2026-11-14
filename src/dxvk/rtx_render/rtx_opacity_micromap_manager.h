@@ -634,7 +634,11 @@ namespace dxvk {
       uint32_t evictions = 0;             // LRU evictions
       uint32_t evictedYoungerThan900 = 0; // evictions forced by a budget decrease
       uint32_t mergedTouches = 0;         // keepMergedBlasMicromapsInUse refreshes
+      uint32_t requestStatsPurged = 0;    // purgeStaleRequestStatistics: entries no candidate asked for any more
+      uint32_t requestsRefusedAtCap = 0;  // requests refused because the statistics table was at maxRequests
     };
+    // Hashes waiting in the request filter (rtx.opacityMicromap.buildRequests.maxRequests caps it).
+    uint32_t getRequestStatisticsCount() const { return static_cast<uint32_t>(m_ommBuildRequestStatistics.size()); }
     ChurnStats takeChurnStats() {
       const ChurnStats s = m_churn;
       m_churn = {};
@@ -765,7 +769,16 @@ namespace dxvk {
       uint16_t numTimesRequested = 0;
       uint32_t lastRequestFrameId = kInvalidFrameIndex;
       uint32_t advanceTick = 0; // m_statsTick when numFramesRequested was last advanced
+      uint32_t lastSeenTick = 0; // m_statsTick when a candidate last asked for this hash (purgeStaleRequestStatistics)
     };
+    // Request statistics nobody asked for in kRequestStatsMaxIdleFrames traced frames are dropped, every
+    // kRequestStatsPurgeEveryFrames. An entry is otherwise erased only when its request passes the filter: a hash
+    // whose instances are destroyed first (a grass batch rebuilt, a mesh re-sent with new geometry) would stay for
+    // good, and once maxRequests entries have piled up no request is accepted any more: no micromap is baked for
+    // the rest of the session.
+    static constexpr uint32_t kRequestStatsPurgeEveryFrames = 256;
+    static constexpr uint32_t kRequestStatsMaxIdleFrames = 600;
+    void purgeStaleRequestStatistics();
     // Frames counted into numFramesRequested: the retain-mode auto-advance ("one more frame
     // requested" per onFrameStart). rtx.ommIncrementalBookkeeping applies it when an entry is read
     // instead of walking every entry each frame; the count is the same.

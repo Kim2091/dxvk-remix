@@ -98,6 +98,12 @@ On a frame with displacement the SHARC update ran inline with POM compiled in, s
 When acquiring a swap chain image returned suboptimal or out of date while the window had a zero-sized client area, for example during alt-tab or a minimize, the present recreated a swap chain that could not exist. With suboptimal it then read the semaphores of the destroyed swap chain, and the runtime crashed with `std::out_of_range` in `Presenter::getSync`. With out of date it retried in a busy loop until the window was restored. The present now skips the frame until the window is restored, still firing its frame latency signal. A New Vegas RTX player on an Intel Arc B580 hit the crash.
 - Options: none.
 
+### Fix: opacity micromaps are still baked late in a long session
+The request filter's statistics table lost an entry only when its request passed the filter. A hash whose instances were destroyed first (a grass batch rebuilt, a mesh sent again with new geometry) stayed for good, and with `rtx.opacityMicromap.buildRequests.maxRequests` entries in the table every new request was refused: no micromap was baked for the rest of the session. Entries that no candidate has asked for in 600 traced frames are now dropped, every 256 frames. `[OmmChurn]` reports the table's size, the entries dropped and the requests refused at the cap.
+- Options: none.
+- Measured: New Vegas, a vegetation exterior after 86 minutes of play with the table full: micromap coverage 0 %, 55 ms a frame. With the fix the table peaked at 651 of 5000 entries in a 76-minute session that dropped 5943 stale ones, and coverage averaged 98 %.
+- Commits: the commit that adds this entry.
+
 ## 2026-10-28
 
 ### Developer menu: settings search

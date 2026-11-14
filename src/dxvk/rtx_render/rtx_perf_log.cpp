@@ -1043,6 +1043,10 @@ namespace dxvk {
         " lostRerequests=", churn.lostRerequests, " evictions=", churn.evictions,
         " (younger than minUsageFrameAge ", churn.evictedYoungerThan900, ")",
         " mergedInUseRefreshes=", churn.mergedTouches,
+        // The request filter's table: hashes waiting in it now against its cap, entries dropped as stale, and
+        // requests refused because it was full (with the table at the cap nothing new is ever baked).
+        " requestStats=", omm->getRequestStatisticsCount(), "/", OpacityMicromapOptions::BuildRequests::maxRequests(),
+        " (purged ", churn.requestStatsPurged, ", refusedAtCap ", churn.requestsRefusedAtCap, ")",
         " | rebakeOnTextureChange=", OpacityMicromapOptions::rebakeOnTextureChange() ? 1 : 0,
         " rerequestLost=", OpacityMicromapOptions::rerequestLostMicromaps() ? 1 : 0,
         " keepMergedInUse=", OpacityMicromapOptions::Cache::keepMergedBlasMicromapsInUse() ? 1 : 0,
