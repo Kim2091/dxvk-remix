@@ -138,7 +138,8 @@ struct CompositeArgs {
   float cloudMotionVectorCoverage;
   // The depth a primary miss writes (RaytraceArgs::clearColorDepth). Cloud depth never lies beyond it.
   float cloudMotionVectorMissDepth;
-  uint cloudMotionVectorPad;
+  // Converts denoised radiance back to this frame's pre-exposure (rtx_pre_exposure.h).
+  float denoiserToFrame;
 
   // The lenses of this frame and the previous frame (RaytraceArgs::lenses), for the functions in lens.slangh.
   LensArgs lenses[kMaxLenses * 2];
