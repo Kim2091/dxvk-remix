@@ -9,7 +9,7 @@ This file is generated from the source by `scripts/gen_rtx_options_md.py`. Run `
 ## Simple Types
 | RTX Option | Type | Default Value | Min Value | Max Value | Description |
 | :-- | :-: | :-: | :-: | :-: | :-- |
-|rtx.accel.autoCellSize|bool|True|||When rtx\.mergedBucketCellSize is 0, derives the merged BLAS cell size from rtx\.sceneScale, as about 58\.5 metres in the game's world units\. Lets rtx\.accel\.staticClusters work in any game without a hand\-tuned cell size, for API hosts and D3D9 games alike\. An explicit rtx\.mergedBucketCellSize takes precedence\.|
+|rtx.accel.autoCellSize|bool|False|||When rtx\.mergedBucketCellSize is 0, derives the merged BLAS cell size from rtx\.sceneScale, as about 58\.5 metres in the game's world units\. Lets rtx\.accel\.staticClusters work in any game without a hand\-tuned cell size, for API hosts and D3D9 games alike\. An explicit rtx\.mergedBucketCellSize takes precedence\.|
 |rtx.accel.clusterFoldsPerFrame|int|2|||With rtx\.accel\.staticClusters: the most cluster keys per frame whose young buckets join their cluster\. Limits the rebuild cost per frame\.|
 |rtx.accel.clusterMergeOmm|bool|True|||With rtx\.accel\.staticClusters: instances with and without opacity micromaps in the same cell share one cluster, for fewer buckets\. When micromaps finish baking, only the buckets holding an instance with a new micromap are rebuilt, together with the rest of their cell's cluster\.|
 |rtx.accel.clusterYoungFrames|int|30|||With rtx\.accel\.staticClusters: instances created within this many frames stay in buckets of their own, so streaming does not rebuild their cell's cluster every frame\. 0 = off\.|

@@ -1638,7 +1638,7 @@ namespace dxvk {
                "change rebuilds only its own cell. Instances are placed by the centre of their bounding box. The traced "
                "result is the same. 0 = rtx.accel.autoCellSize picks the size, or no grid when that is off.");
     // A game-independent default for rtx.mergedBucketCellSize.
-    RTX_OPTION("rtx.accel", bool, autoCellSize, true,
+    RTX_OPTION("rtx.accel", bool, autoCellSize, false,
                "When rtx.mergedBucketCellSize is 0, derives the merged BLAS cell size from rtx.sceneScale, as about "
                "58.5 metres in the game's world units. Lets rtx.accel.staticClusters work in any game without a "
                "hand-tuned cell size, for API hosts and D3D9 games alike. An explicit rtx.mergedBucketCellSize takes "
