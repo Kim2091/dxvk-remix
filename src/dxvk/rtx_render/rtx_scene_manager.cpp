@@ -2351,8 +2351,20 @@ namespace dxvk {
     // from the triangle mesh (area-weighted) and written into the normal buffer.
     // Only dispatch on BVH build/update - for static geometry, positions don't change so
     // the normals computed on the first pass remain valid for subsequent frames.
-    if (drawCallState.getCategoryFlags().test(InstanceCategories::SmoothNormals) &&
-        (result == ObjectCacheState::KBuildBVH || result == ObjectCacheState::kUpdateBVH)) {
+    const bool geometryRebuilt = result == ObjectCacheState::KBuildBVH || result == ObjectCacheState::kUpdateBVH;
+    const bool smoothNormals = drawCallState.getCategoryFlags().test(InstanceCategories::SmoothNormals) && geometryRebuilt;
+
+    // A non-zero bone count does not imply the weight buffer is defined.
+    // processSkinning derives the count from D3DRS_VERTEXBLEND and the vertex
+    // declaration, while the buffer is populated only when the stream had a
+    // valid mapped slice. A fixed-function indexed-blend draw may legally
+    // leave the weight stream unbound while still reporting a bone count.
+    const bool skinning = drawCallState.getSkinningState().numBones > 0 &&
+                          drawCallState.getGeometryData().numBonesPerVertex > 0 &&
+                          drawCallState.getGeometryData().blendWeightBuffer.defined() && geometryRebuilt;
+
+    // Skinning rewrites every normal, so the smooth normals of skinned geometry are generated after it, from the pose.
+    if (smoothNormals && !skinning) {
       m_device->getCommon()->metaGeometryUtils().dispatchSmoothNormals(ctx, drawCallState.getGeometryData(), pBlas->modifiedGeometryData);
       pBlas->modifiedGeometryData.smoothNormalsApplied = true;
       // dispatchSmoothNormals() changes the vertex buffers, which need to be re-synced.
@@ -2361,10 +2373,14 @@ namespace dxvk {
       m_instanceManager.notifySceneChanged();
     }
 
-    if (drawCallState.getSkinningState().numBones > 0 &&
-        drawCallState.getGeometryData().numBonesPerVertex > 0 &&
-        (result == ObjectCacheState::KBuildBVH || result == ObjectCacheState::kUpdateBVH)) {
-      m_device->getCommon()->metaGeometryUtils().dispatchSkinning(drawCallState, pBlas->modifiedGeometryData);
+    if (skinning) {
+      RtxGeometryUtils& geometryUtils = m_device->getCommon()->metaGeometryUtils();
+      geometryUtils.dispatchSkinning(drawCallState, pBlas->modifiedGeometryData);
+      if (smoothNormals) {
+        geometryUtils.dispatchSkinnedSmoothNormals(drawCallState.getGeometryData(), pBlas->modifiedGeometryData);
+        pBlas->modifiedGeometryData.smoothNormalsApplied = true;
+        syncLinkedInstances(pBlas);
+      }
       pBlas->frameLastUpdated = pBlas->frameLastTouched;
       m_instanceManager.notifySceneChanged();
     }
