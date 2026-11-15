@@ -198,6 +198,10 @@ namespace dxvk {
     }
     Entry& entry = found->second;
     if (entry.hasDesc) {
+      // An identical transform changes nothing, so the instances stay on the preserve path.
+      if (sameBits(entry.desc.drawCall.getTransformData().objectToWorld, absolute)) {
+        return;
+      }
       entry.desc.drawCall.modifyTransformData().objectToWorld = absolute;
     }
     if (entry.lane == Lane::Legacy) {
@@ -223,6 +227,11 @@ namespace dxvk {
       }
       bool moved = false;
       const Matrix4 subTarget = submeshTransform(entry.desc, i, target);  // Per-part transform
+
+      // Rebasing can round two host transforms to the same bits.
+      if (sameBits(sub.instance->surface.objectToWorld, subTarget)) {
+        continue;
+      }
       if (!instances.relocateInstancerExternally(*sub.instance, subTarget, CameraType::Main, uiOffset, true, &moved)) {
         // Updated this frame already, or something only the full update derives: rebuild it at the frame.
         queueBuild(entry);
@@ -1419,6 +1428,9 @@ namespace dxvk {
             sub.instance->teleport(subTarget, previous);
           }
           changed = true;
+          continue;
+        }
+        if (sameBits(sub.instance->surface.objectToWorld, subTarget)) {
           continue;
         }
         bool moved = false;

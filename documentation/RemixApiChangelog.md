@@ -6,6 +6,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- 2026-10-30: `CreateMaterial` with a live hash no longer ignores the new data. An
+  identical description returns at once with no rebuilds, and different data
+  replaces the material and rebuilds its users. `DestroyMaterial` then
+  `CreateMaterial` still works. The API's signatures are unchanged.
 - 2026-10-28: `remixapi_GetMemoryPressure` reports the runtime's own pressure
   level, which now follows `usageBytes` (driver usage minus the free space inside
   the runtime's memory chunks) instead of the driver's usage. The struct is
