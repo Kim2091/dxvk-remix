@@ -111,6 +111,21 @@ The Halo meter now ignores first-person surfaces even without view model copies,
 New log figures for long-session VRAM growth: a `[MeshMem]` line next to `[AccelMem]` (the Remix API meshes and their buffers, the draw call cache's and the retained scene's BlasEntries, the allocator's used bytes per category), and allocator chunk figures per chunk class in `[VramBudget]` and in a new "Allocator Chunks" view under Rendering, VRAM Budget. The bridge now forwards `remixapi_GetVramStats`, so 32-bit hosts can read VRAM by category. Allocation behavior is unchanged.
 - Options: none.
 
+### Fixes and performance work from the Remix Plus trunk
+Sixteen fixes and performance changes from the trunk, ported one by one onto this runtime. The trunk's Oct 30 performance batch (`e67adb158`, `35a98479f`) is not part of it.
+- VRAM: replacement-texture mips nothing sampled for a while drop back, unused opacity micromaps are evicted at any pressure level, textures in draining memory chunks reload elsewhere, and very large 4-state micromaps get a lower subdivision level, so memory follows the scene instead of its high-water mark.
+- Remix API: a `CreateMaterial` repeat of the live description returns without rebuilding the material's users (the description digest covers terrain layers too), and different data now replaces the material. An identical transform keeps an instance on the preserve path. `CreateTexture` holds the API mutex only to queue its upload.
+- Acceleration structures: a dropped BLAS keeps its micromaps until in-flight frames finish, ray tracing waits for the TLAS build, a refit-limit rebuild goes into a fresh BLAS, and a stale previous surface index no longer maps a hit on the previous frame's TLAS to another instance. Self-checks behind `rtx.accelIncrementalSelfCheckFrames` log `[AccelGuard]` and `[SurfaceMappingCheck]`.
+- NRD without Ray Reconstruction: correct camera jitter sign, a hit distance for sky misses, hit distance reconstruction for direct light, a smoothed frame time for history length, history kept in its own pre-exposure across small exposure changes, and the path tracer preset NRD is tuned for.
+- Device-loss diagnostics on NVIDIA without Aftermath: VK_EXT_device_fault and pass markers, with each faulting address matched to the live or recently freed buffer that held it.
+- D3D9 and DXSO: correctness fixes and game config profiles from upstream DXVK (see `docs/dxvk-upstream-d3d9-triage.md`).
+- Bindless buffer descriptors are written only for the slots that changed, adapted from upstream dxvk-remix `89257d282`.
+- CPU: the legacy default opaque material is built once and reused until one of its options changes.
+- Smooth normals of geometry that Remix skins are generated after skinning, from the pose.
+- Options: added `rtx.vramBudget.idleMipFrames`, `rtx.vramBudget.idleMicromapFrames`, `rtx.vramBudget.relocateDrainingTextures` (default on), `rtx.opacityMicromap.cache.maxItemSizeMB` (128), `rtx.deviceFaultDiagnostics` (default off, restart required), `rtx.accel.usePreviousTlas` (default on), `rtx.deferVertexUploads` (default off) and `d3d9.allowDirectBufferMapping` (default on). Renamed `d3d9.apitraceMode` to `d3d9.cachedDynamicBuffers`. Flipped `rtx.accel.autoCellSize` and `rtx.di.enableDenoiserConfidence` (now on and off).
+- Presets: `idleMipFrames` is 7200 on Ultra, 3600 on High, 1800 on Medium and Low. `idleMicromapFrames` is 3600 on Ultra, 1800 on High, 900 on Medium and Low. The other options do not change the image, so the presets do not set them.
+- Commits: trunk `964dce845`, `9cbb7c8dd`, `d6d005566`, `6a5f30ce0`, `e4d101812`, `de6975804`, `f05a43718`, `c0d47542d`, `73670e719`, `d1f3acfa1`, `7de527f81`, `7b2257fff`, `774ad266d`, `6c508a390`, `d546c1ec9`, `7c03bfd4f`.
+
 ## 2026-10-28
 
 ### Developer menu: settings search
