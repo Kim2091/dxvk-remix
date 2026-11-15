@@ -38,6 +38,10 @@ The SHaRC work compared upstream's `303c81336` (SHaRC 1.8.3 integration), `90d74
 
 Ported by hand: the DLFG Lite half of `09808cc70` (its DLSS-NR half was ported earlier), the frame generation labels of `97355c1a1` (the DLSS-NR renames were not taken; the menu keeps its own names), and `c1a891bf8` (pipeline-handle race and command-list recycle order; the duplicate acquire wait was already fixed by `616df3dc2`). The rest of the range was not reviewed.
 
+## Between passes: incremental bindless buffer descriptors, 2026-11-02
+
+Take: `89257d282` (merge `9dd9b9398`, REMIX-6230), ported by hand in "Bindless buffer table: updates follow the changed slots". Kept from upstream: the slot list in `RetainedBufferTable`, `PendingSlotQueues`, `BindlessBufferMirror` and the unit tests. Different from upstream: registered buffers pin their backing, because a full-buffer write would otherwise rename a table buffer behind the mirror. `rtx.trackBindlessResourcesOnChange` stays, the failed-allocation recovery stays instead of a throw, and retired buffers need no snapshot resource. Measured gain: pending. The rest of the range was not reviewed.
+
 ## Starting point, 2026-10-15
 
 - `upstream/main` is at `029602f83` (2026-10-15).
