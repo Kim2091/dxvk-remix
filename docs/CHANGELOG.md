@@ -132,6 +132,11 @@ Sixteen fixes and performance changes from the trunk, ported one by one onto thi
 - Presets: `idleMipFrames` is 7200 on Ultra, 3600 on High, 1800 on Medium, Low and Very Low. `idleMicromapFrames` is 3600 on Ultra, 1800 on High, 900 on Medium, Low and Very Low. The other options do not change the image, so the presets do not set them.
 - Commits: trunk `964dce845`, `9cbb7c8dd`, `d6d005566`, `6a5f30ce0`, `e4d101812`, `de6975804`, `f05a43718`, `c0d47542d`, `73670e719`, `d1f3acfa1`, `7de527f81`, `7b2257fff`, `774ad266d`, `6c508a390`, `d546c1ec9`, `7c03bfd4f`.
 
+### Cheaper NUMOS clouds
+The cloud screen pass costs 12-30% less in the NUMOS viewer at 2560x1600 across clear, storm, overcast, layer 2, under-deck, in-deck, lens and flying scenes. The quarter march runs as three passes: a march-only pass, a rebuild without the march compiled in, and a fallback that marches only the silhouette pixels no fresh sample covers, with tiles that have none skipped. The rebuild resolves 2x2 pixels per lane from cells shared in groupshared memory, empty pixels skip the history reprojection, the detail noise reads coarser mips by footprint, and the lighting LOD threshold grows with distance past 20 km. Rays with no cloud span skip the per-ray setup.
+- Options: added `rtx.atmosphere.cloudQuarterMarchSchedule` (0 one pass, 1 split cross-tile, 2 split, 3 split cross-tile full precision; default 2), `rtx.atmosphere.cloudEmptyPixelSkip` (default on), `rtx.atmosphere.cloudLightingLodByDistance` (default on), `rtx.atmosphere.cloudMarchRayBudgetMillions` (default 0, off) and `rtx.atmosphere.cloudMarchEarlyExit` (default off). `rtx.atmosphere.cloudDetailLodMode` now defaults to 2.
+- NUMOS: `b120cd7` on numos-sky `feat/20261118-fnv-cloud-perf`.
+
 ## 2026-10-28
 
 ### Developer menu: settings search
