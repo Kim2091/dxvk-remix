@@ -49,6 +49,7 @@
 #include "rtx_render/rtx_shader_manager.h"
 #include "rtx_render/rtx_camera.h"
 #include "rtx_render/rtx_context.h"
+#include "rtx_render/rtx_geometry_utils.h"
 #include "rtx_render/rtx_pathtracer_integrate_direct.h"
 #include "rtx_render/rtx_pathtracer_gbuffer.h"
 #include "rtx_render/rtx_hash_collision_detection.h"
@@ -2083,6 +2084,7 @@ namespace dxvk {
       // NV-DXVK start: Optional UV animation cache optimization
       RemixGui::Checkbox("Optimize Animated Texture Coordinates", &SceneManager::optimizeAnimatedTexcoordsObject());
       // NV-DXVK end
+      RemixGui::Checkbox("Defer Deforming Geometry Uploads", &RtxGeometryUtils::deferVertexUploadsObject());
       RemixGui::Checkbox("Enable Instance Debugging", &RtxOptions::enableInstanceDebuggingToolsObject());
       RemixGui::Checkbox("Disable Draw Calls Post RTX Injection", &RtxOptions::skipDrawCallsPostRTXInjectionObject());
       RemixGui::Checkbox("GPU Screen Overlay (D3D11 Hosts)", &RtxOptions::enableGpuScreenOverlayObject());
