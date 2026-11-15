@@ -20,7 +20,9 @@
 * DEALINGS IN THE SOFTWARE.
 */
 
+#include <array>
 #include <cassert>
+#include <cstdio>
 #include <ctime>
 #include <tuple>
 #include <string>
@@ -101,6 +103,7 @@
 #include "rtx_render/rtx_numos_ui.h"
 #include "rtx_render/rtx_sky_ui.h"
 #include "../rtx_render/rtx_sharc.h"
+#include "../rtx_render/rtx_pt_performance.h"
 #include "../dxvk_instance.h"
 
 
@@ -255,6 +258,15 @@ namespace dxvk {
         {RenderPassIntegrateIndirectRaytraceMode::RayQuery, "RayQuery (CS)"},
         {RenderPassIntegrateIndirectRaytraceMode::RayQueryRayGen, "RayQuery (RGS)"},
         {RenderPassIntegrateIndirectRaytraceMode::TraceRay, "TraceRay (RGS)"}
+    } }
+  };
+
+  RemixGui::ComboWithKey<PtPerformanceFirstHit> ptPerformanceFirstHitCombo {
+    "First Hit",
+    RemixGui::ComboWithKey<PtPerformanceFirstHit>::ComboEntries { {
+        {PtPerformanceFirstHit::Trace, "Trace"},
+        {PtPerformanceFirstHit::Raster, "Raster"},
+        {PtPerformanceFirstHit::Auto, "Auto"}
     } }
   };
 
@@ -2166,9 +2178,9 @@ namespace dxvk {
         } else {
           resourceAliasingQueryText += "NRD, ";
         }
-        if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::NeuralRadianceCache) {
+        if (RtxOptions::resolvedIntegrateIndirectMode() == IntegrateIndirectMode::NeuralRadianceCache) {
           resourceAliasingQueryText += "NRC)";
-        } else if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::ReSTIRGI) {
+        } else if (RtxOptions::resolvedIntegrateIndirectMode() == IntegrateIndirectMode::ReSTIRGI) {
           resourceAliasingQueryText += "ReSTIR-GI)";
         } else {
           resourceAliasingQueryText += "ImportanceSampled)";
@@ -4090,12 +4102,117 @@ namespace dxvk {
       auto& rayReconstruction = common->metaRayReconstruction();
       ImGui::Indent();
 
+      RemixGui::Checkbox("Path Tracing: Performance", &PtPerformance::enableObject());
+      ImGui::Indent();
+      ImGui::BeginDisabled(!PtPerformance::active());
+      ImGui::TextSeparator("Sampling");
+      // Sparse rendering applies while DLSS Ray Reconstruction is on.
+      RemixGui::DragFloat("Sparse Sampling Rate##ptPerformance", &PtPerformance::samplingRateObject(), 0.005f, 1.0f / 16.0f, 1.0f, "%.3f");
+      RemixGui::DragFloat("Sparse Resolution Scaling Exponent##ptPerformance", &PtPerformance::samplingRateResolutionExponentObject(), 0.01f, 0.0f, 1.0f, "%.2f");
+
+      ImGui::TextSeparator("First Hit");
+      ptPerformanceFirstHitCombo.getKey(&PtPerformance::firstHitObject());
+      if (PtPerformance::active() && PtPerformance::firstHit() == PtPerformanceFirstHit::Auto) {
+        const RtxRasterFirstHit& rasterFirstHit = common->metaRasterFirstHit();
+        auto msText = [](float ms) {
+          std::array<char, 32> text = {};
+          if (ms < 0.0f) {
+            std::snprintf(text.data(), text.size(), "-");
+          } else {
+            std::snprintf(text.data(), text.size(), "%.2f ms", ms);
+          }
+          return text;
+        };
+        ImGui::Text("Auto: %s%s", PtPerformance::firstHitRaster() ? "Raster" : "Trace", rasterFirstHit.autoMeasuring() ? " (measuring)" : "");
+        ImGui::Text("Raster %s, Trace %s", msText(rasterFirstHit.autoRasterMs()).data(), msText(rasterFirstHit.autoTraceMs()).data());
+      }
+      ImGui::BeginDisabled(PtPerformance::firstHit() == PtPerformanceFirstHit::Trace);
+      RemixGui::Checkbox("Raster Alpha Test", &PtPerformance::rasterAlphaTestObject());
+      RemixGui::Checkbox("Raster Blended Surfaces as Cutouts", &PtPerformance::rasterBlendedAsCutoutObject());
+      RemixGui::Checkbox("Raster Occlusion Culling", &PtPerformance::rasterOcclusionCullingObject());
+      RemixGui::DragInt("Raster Log Interval (frames)", &PtPerformance::rasterLogIntervalFramesObject(), 1.0f, 0, 3600);
+      ImGui::EndDisabled();
+
+      ImGui::TextSeparator("Indirect");
+      RemixGui::DragInt("Indirect Bounces##ptPerformance", &PtPerformance::indirectBouncesObject(), 0.05f, 1, 2);
+      RemixGui::Checkbox("Extra Bounce on Cache Miss", &PtPerformance::cacheMissExtraBounceObject());
+      if (PtPerformance::active()) {
+        const char* missingFeature = RtxSharc::missingFeature(m_device);
+        if (RtxOptions::resolvedIntegrateIndirectMode() == IntegrateIndirectMode::Sharc) {
+          ImGui::TextUnformatted("Indirect light: SHARC radiance cache");
+        } else if (missingFeature != nullptr) {
+          ImGui::TextWrapped("Indirect light: preset mode, the device lacks %s", missingFeature);
+        } else {
+          ImGui::TextUnformatted("Indirect light: preset mode");
+        }
+      }
+      RemixGui::Checkbox("Indirect Rays Treat Alpha-Tested as Opaque", &PtPerformance::indirectAlphaAsOpaqueObject());
+      {
+        const bool nvidiaGpu = m_device->adapter()->deviceProperties().vendorID == static_cast<uint32_t>(DxvkGpuVendor::Nvidia);
+        ImGui::BeginDisabled(PtPerformance::indirectAlphaAsOpaque() || nvidiaGpu);
+        RemixGui::DragFloat("Indirect Alpha-Tested Opaque Beyond (m)", &PtPerformance::indirectAlphaOpaqueDistanceObject(), 0.1f, 0.0f, 100000.0f, "%.1f");
+        ImGui::EndDisabled();
+      }
+      RemixGui::Checkbox("Indirect Simple Shading", &PtPerformance::indirectSimpleShadingObject());
+      ImGui::BeginDisabled(!PtPerformance::indirectSimpleShading());
+      RemixGui::DragFloat("Indirect Mip Bias", &PtPerformance::secondaryMipBiasObject(), 0.1f, 0.0f, 6.0f, "%.1f");
+      ImGui::EndDisabled();
+      RemixGui::DragFloat("Indirect Ray Max Distance (m)", &PtPerformance::indirectRayMaxDistanceObject(), 1.0f, 0.0f, 100000.0f, "%.0f");
+
+      ImGui::TextSeparator("Direct");
+      RemixGui::DragFloat("Local Shadow Cull Ratio##ptPerformance", &PtPerformance::localShadowCullRatioObject(), 0.001f, 0.0f, 1.0f, "%.3f");
+      RemixGui::DragInt("Light BVH Candidates##ptPerformance", &PtPerformance::lightCandidatesObject(), 0.05f, 1, 32);
+      RemixGui::Checkbox("Reduced Direct Lighting", &PtPerformance::reducedDirectLightObject());
+
+      ImGui::TextSeparator("Volumetrics and Denoising");
+      RemixGui::Checkbox("Reduced Volumetrics", &PtPerformance::reducedVolumetricsObject());
+      RemixGui::Checkbox("Combined Denoiser", &PtPerformance::combinedDenoiserObject());
+      RemixGui::Checkbox("Reduced Denoiser", &PtPerformance::reducedDenoiserObject());
+
+      ImGui::TextSeparator("Cache");
+      RemixGui::Checkbox("Adaptive Cache Update Interval", &PtPerformance::cacheUpdateAdaptiveObject());
+      ImGui::BeginDisabled(!PtPerformance::cacheUpdateAdaptive());
+      RemixGui::DragFloat("Relax Above Resolvable Hit Ratio", &PtPerformance::cacheUpdateRelaxHitRatioObject(), 0.005f, 0.5f, 1.0f, "%.3f");
+      ImGui::EndDisabled();
+      ImGui::BeginDisabled(PtPerformance::cacheUpdateAdaptive());
+      RemixGui::DragInt("Cache Update Interval (frames)##ptPerformance", &PtPerformance::cacheUpdateIntervalObject(), 0.05f, 1, 4);
+      ImGui::EndDisabled();
+      if (PtPerformance::active()) {
+        const RtxSharc& sharc = common->metaSharc();
+        const float hitRatio = sharc.getPtPerformanceResolvableHitRatio();
+        if (hitRatio < 0.0f) {
+          ImGui::Text("Cache update interval %u, resolvable hit ratio -", sharc.getUpdateInterval());
+        } else {
+          ImGui::Text("Cache update interval %u, resolvable hit ratio %.3f", sharc.getUpdateInterval(), hitRatio);
+        }
+        RemixGui::SetTooltipToLastWidgetOnHover("The adaptive interval compares this ratio with the setting above: cache hits over the first "
+                                                "indirect hits, without the rejected, too close and footprint misses, which no update can fix.");
+        // Shares of the first indirect hits, from the recent read back frames.
+        const auto& rc = common->metaPathtracerIntegrateIndirect().getRecentPtPerformanceCounters();
+        const double queries = rc[PT_PERFORMANCE_COUNTER_CACHE_QUERIES];
+        if (queries > 0.0) {
+          ImGui::Text("Cache hit ratio over all first hits %.3f", rc[PT_PERFORMANCE_COUNTER_CACHE_HITS] / queries);
+          ImGui::Text("Misses: rejected %.3f, too close %.3f, footprint %.3f", rc[PT_PERFORMANCE_COUNTER_MISS_REJECTED] / queries,
+                      rc[PT_PERFORMANCE_COUNTER_MISS_TOO_CLOSE] / queries, rc[PT_PERFORMANCE_COUNTER_MISS_FOOTPRINT] / queries);
+          ImGui::Text("Misses: no entry %.3f, unfilled %.3f; sky %.3f", rc[PT_PERFORMANCE_COUNTER_MISS_NO_ENTRY] / queries,
+                      rc[PT_PERFORMANCE_COUNTER_MISS_UNFILLED] / queries,
+                      rc[PT_PERFORMANCE_COUNTER_SKY] / (queries + rc[PT_PERFORMANCE_COUNTER_SKY]));
+        }
+      }
+      ImGui::EndDisabled();
+      ImGui::Unindent();
+
       if (RtxOptions::showRaytracingOption()) {
         RemixGui::Checkbox("Raytracing Enabled", &RtxOptions::enableRaytracingObject());
 
         renderPassGBufferRaytraceModeCombo.getKey(&RtxOptions::renderPassGBufferRaytraceModeObject());
         renderPassIntegrateDirectRaytraceModeCombo.getKey(&RtxOptions::renderPassIntegrateDirectRaytraceModeObject());
         renderPassIntegrateIndirectRaytraceModeCombo.getKey(&RtxOptions::renderPassIntegrateIndirectRaytraceModeObject());
+        RemixGui::Checkbox("Indirect Ray Query Mode Runs the Compute Kernel on NVIDIA", &DxvkPathtracerIntegrateIndirect::rayQueryComputeKernelObject());
+        RemixGui::SetTooltipToLastWidgetOnHover(
+          "rtx.integrateIndirect.rayQueryComputeKernel. Off, Ray Query mode traces the ray query kernel as a ray generation shader\n"
+          "on NVIDIA GPUs, where the compute dispatch of this kernel faults the device, and the SHARC update and query run through\n"
+          "their ray tracing pipelines there. Other GPUs always run the compute kernels.");
 
         RemixGui::Separator();
       }
@@ -4372,7 +4489,13 @@ namespace dxvk {
         ImGui::Indent();
         integrateIndirectModeCombo.getKey(&RtxOptions::integrateIndirectModeObject());
 
-        if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::ReSTIRGI) {
+        // The cache needs device features some GPUs lack, so the control is disabled there, and performance mode
+        // selects the cache on its own, so the control is disabled while the mode is on.
+        ImGui::BeginDisabled(!RtxSharc::checkIsSupported(m_device) || PtPerformance::active());
+        RemixGui::Checkbox("Indirect Light From Radiance Cache", &RtxSharc::indirectFromCacheObject());
+        ImGui::EndDisabled();
+
+        if (RtxOptions::resolvedIntegrateIndirectMode() == IntegrateIndirectMode::ReSTIRGI) {
           if (RemixGui::CollapsingHeader("ReSTIR GI", collapsingHeaderClosedFlags)) {
             ImGui::Indent();
             ImGui::PushID("ReSTIR GI");
@@ -4381,7 +4504,7 @@ namespace dxvk {
             ImGui::PopID();
             ImGui::Unindent();
           }
-        } else if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::NeuralRadianceCache) {
+        } else if (RtxOptions::resolvedIntegrateIndirectMode() == IntegrateIndirectMode::NeuralRadianceCache) {
           if (RemixGui::CollapsingHeader("RTX Neural Radiance Cache", collapsingHeaderClosedFlags)) {
 
             ImGui::Indent();
@@ -4391,7 +4514,7 @@ namespace dxvk {
             ImGui::PopID();
             ImGui::Unindent();
           }
-        } else if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::Sharc) {
+        } else if (RtxOptions::resolvedIntegrateIndirectMode() == IntegrateIndirectMode::Sharc) {
           if (RemixGui::CollapsingHeader("SHARC", collapsingHeaderClosedFlags)) {
             ImGui::Indent();
             ImGui::PushID("SHARC");
@@ -4515,7 +4638,7 @@ namespace dxvk {
         common->metaComposite().showDenoiseImguiSettings();
         ImGui::Unindent();
       }
-      bool useDoubleDenoisers = RtxOptions::denoiseDirectAndIndirectLightingSeparately();
+      bool useDoubleDenoisers = RtxOptions::resolvedDenoiseDirectAndIndirectLightingSeparately();
       if (isRayReconstructionEnabled) {
         if (RemixGui::CollapsingHeader("DLSS-RR", collapsingHeaderClosedFlags)) {
           ImGui::Indent();

@@ -1499,7 +1499,7 @@ namespace dxvk {
     
     virtual void updateComputeShaderResources();
     virtual void updateRaytracingShaderResources();
-    void updateGraphicsShaderResources();
+    virtual void updateGraphicsShaderResources();
 
     template<VkPipelineBindPoint BindPoint>
     void updateShaderResources(

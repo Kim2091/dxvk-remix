@@ -62,6 +62,7 @@
 #include "rtx_render/rtx_dust_particles.h"
 #include "rtx_render/rtx_particle_system.h"
 #include "rtx_render/rtx_point_instancer_system.h"
+#include "rtx_render/rtx_raster_first_hit.h"
 #include "rtx_render/rtx_settings_sweep.h"
 // NV-DXVK start: SCCR cone maps
 #include "rtx_render/rtx_fork_pom_cone_map.h"
@@ -378,6 +379,10 @@ namespace dxvk {
       return m_pointInstancerSystem.get(m_device);
     }
 
+    RtxRasterFirstHit& metaRasterFirstHit() {
+      return m_rasterFirstHit.get(m_device);
+    }
+
     // NV-DXVK start: SCCR cone maps
     PomConeMapManager& metaPomConeMaps() {
       return m_pomConeMaps.get(m_device);
@@ -483,6 +488,7 @@ namespace dxvk {
     Lazy<RtxDustParticles>                  m_dustParticles;
     Lazy<RtxParticleSystemManager>          m_particleSystem;
     Lazy<RtxPointInstancerSystem>            m_pointInstancerSystem;
+    Lazy<RtxRasterFirstHit>                  m_rasterFirstHit;
     // NV-DXVK start: SCCR cone maps
     Lazy<PomConeMapManager>                  m_pomConeMaps;
     // NV-DXVK end

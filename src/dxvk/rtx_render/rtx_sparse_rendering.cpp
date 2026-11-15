@@ -30,9 +30,12 @@
 #include "rtx_options.h"
 #include "rtx_shader_manager.h"
 #include "rtx_pathtracer_integrate_direct.h"
+#include "rtx_pathtracer_integrate_indirect.h"
 #include "rtx_imgui.h"
+#include "rtx_pt_performance.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 
 #include "rtx/pass/sparse_rendering/active_pixel_mask_binding_indices.h"
@@ -50,6 +53,9 @@
 namespace dxvk {
 
   namespace {
+    // The render resolution of 4K with DLSS Auto, where the sampling rates are tuned.
+    constexpr float kReferencePixelCount = 2227.0f * 1238.0f;
+
     RemixGui::ComboWithKey<PerPixelRateNoiseSource> s_perPixelRateNoiseSourceCombo {
       "Per-Pixel Rate Noise Source",
       RemixGui::ComboWithKey<PerPixelRateNoiseSource>::ComboEntries { {
@@ -156,8 +162,12 @@ namespace dxvk {
     }
   }
 
+  bool SparseRendering::ptPerformanceOwnsSamplingRate() const {
+    return PtPerformance::active() && device()->getCommon()->metaRayReconstruction().useRayReconstruction();
+  }
+
   bool SparseRendering::isEnabled() const {
-    if (!Options::enableSparseRendering()) {
+    if (!Options::enableSparseRendering() && !m_ptPerformanceOwnsSamplingRate) {
       return false;
     }
 
@@ -170,9 +180,14 @@ namespace dxvk {
     }
 
     // ReSTIR GI would have to apply bsdfFactor2.x to inactive pixels as well, which the sparse path does not do.
-    if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::ReSTIRGI) {
+    if (RtxOptions::resolvedIntegrateIndirectMode() == IntegrateIndirectMode::ReSTIRGI) {
       ONCE(Logger::warn("[RTX Sparse Rendering] ReSTIR GI indirect illumination is not supported with sparse rendering; sparse rendering will not run. "
                         "It will resume automatically when another indirect illumination mode is selected."));
+      return false;
+    }
+
+    // Performance mode shades every pixel where its scaled rate reaches 1.
+    if (m_ptPerformanceOwnsSamplingRate && calculateSamplingRate(m_framePixelCount, true) >= 1.0f) {
       return false;
     }
 
@@ -184,9 +199,18 @@ namespace dxvk {
   }
 
   void SparseRendering::onFrameBegin(Rc<DxvkContext>& ctx, const FrameBeginContext& frameBeginCtx) {
+    // The owner of the rate and the pixel count are latched before isEnabled() runs in the base class,
+    // so the activity, the rate and every pass that reads them agree for the whole frame.
+    m_ptPerformanceOwnsSamplingRate = ptPerformanceOwnsSamplingRate();
+    m_framePixelCount = frameBeginCtx.downscaledExtent.width * frameBeginCtx.downscaledExtent.height;
+
     RtxPass::onFrameBegin(ctx, frameBeginCtx);
 
-    if (!isActive()) {
+    m_samplingRate = isActive() ? calculateSamplingRate(m_framePixelCount, m_ptPerformanceOwnsSamplingRate) : 1.0f;
+
+    // Performance mode writes no option, so the two settings below are resolved in code while it sets the rate
+    // (RtxContext and setSparseRenderingArgs).
+    if (!isActive() || m_ptPerformanceOwnsSamplingRate) {
       return;
     }
 
@@ -307,17 +331,36 @@ namespace dxvk {
   }
 
   bool SparseRendering::isEnabledByOptions() {
-    if (!Options::enableSparseRendering()) {
-      return false;
-    }
-    // See SparseRendering::isEnabled() for explanation on why these checks are necessary.
     if (!RtxOptions::isRayReconstructionEnabled()) {
       return false;
     }
-    if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::ReSTIRGI) {
+    if (!Options::enableSparseRendering() && !PtPerformance::active()) {
+      return false;
+    }
+    // See SparseRendering::isEnabled() for explanation on why these checks are necessary.
+    if (RtxOptions::resolvedIntegrateIndirectMode() == IntegrateIndirectMode::ReSTIRGI) {
       return false;
     }
     return true;
+  }
+
+  float SparseRendering::calculateSamplingRate(const uint32_t pixelCount, const bool ptPerformanceOwnsSamplingRate) {
+    const RtxOption<float>& samplingRateOption = Options::samplingRateObject();
+    const float minSamplingRate = samplingRateOption.getMinValue().value();
+    const float maxSamplingRate = samplingRateOption.getMaxValue().value();
+
+    if (ptPerformanceOwnsSamplingRate) {
+      const float pixelCountRatio = kReferencePixelCount / float(std::max(pixelCount, 1u));
+      const float ptPerformanceSamplingRate = PtPerformance::samplingRate() *
+        std::pow(pixelCountRatio, std::clamp(PtPerformance::samplingRateResolutionExponent(), 0.0f, 1.0f));
+      return std::isfinite(ptPerformanceSamplingRate) ? std::clamp(ptPerformanceSamplingRate, minSamplingRate, maxSamplingRate) : maxSamplingRate;
+    }
+
+    return std::clamp(Options::samplingRate(), minSamplingRate, maxSamplingRate);
+  }
+
+  float SparseRendering::getSamplingRate() const {
+    return m_samplingRate;
   }
 
   bool SparseRendering::resamplesNrcTrainingPaths(const bool nrcIsActive) const {
@@ -466,7 +509,8 @@ namespace dxvk {
 
     args.perPixelRateNoiseSource = Options::perPixelRateNoiseSource();
     args.enableSparsePrimaryRayMissComposition = Options::enableSparsePrimaryRayMissComposition();
-    args.enableSparseSecondaryLighting = Options::enableSparseSecondaryLighting();
+    // Secondary (PSR) surfaces stay dense while sparse rendering runs, see onFrameBegin.
+    args.enableSparseSecondaryLighting = Options::enableSparseSecondaryLighting() && !m_ptPerformanceOwnsSamplingRate;
     args.enableRtxdiReuseForInactivePixels = Options::enableRtxdiReuseForInactivePixels() || args.mode == SparseRenderingMode::Off;
     args.enableSparseVolumetricsPrimaryHit = Options::enableSparseVolumetricsPrimaryHit();
     args.enableSparseVolumetricsPrimaryMiss = Options::enableSparseVolumetricsPrimaryMiss();
@@ -476,7 +520,7 @@ namespace dxvk {
     NeuralRadianceCache& nrc = ctx.getCommonObjects()->metaNeuralRadianceCache();
     args.resampledNrcTrainingPaths = resamplesNrcTrainingPaths(nrc.isActive());
 
-    args.pixelSamplingRate = Options::samplingRate();
+    args.pixelSamplingRate = getSamplingRate();
 
     args.activePixelMaskExtent = { m_activePixelMaskExtent.width, m_activePixelMaskExtent.height };
 
@@ -509,8 +553,17 @@ namespace dxvk {
     constexpr ImGuiTreeNodeFlags collapsingHeaderFlags = collapsingHeaderClosedFlags | ImGuiTreeNodeFlags_DefaultOpen;
 
     RemixGui::Checkbox("Enable Sparse Rendering", &Options::enableSparseRenderingObject());
+    if (m_ptPerformanceOwnsSamplingRate) {
+      ImGui::TextWrapped("Path Tracing: Performance runs sparse rendering with its own rate (its Sparse Sampling Rate).");
+    }
 
     RemixGui::DragFloat("Sampling Rate", &Options::samplingRateObject(), 0.01f, 1.0f / 128.0f, 1.0f, "%.3f", sliderFlags);
+
+    if (isActive()) {
+      ImGui::Text("Effective Rate: %.3f", m_samplingRate);
+    } else {
+      ImGui::Text("Effective Rate: Off");
+    }
 
     RemixGui::Checkbox("Compact Active Pixels", &Options::compactActivePixelsObject());
     if (buildsActivePixelList() && m_activePixelCountPixels > 0u) {

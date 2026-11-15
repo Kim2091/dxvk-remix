@@ -40,7 +40,8 @@ namespace dxvk {
 
     struct Options {
       RTX_OPTION_ARGS("rtx.sparseRendering", bool, enableSparseRendering, false,
-        "Enables sparse rendering. When enabled, applies a constant per-pixel sampling rate across the screen. DLSS Ray Reconstruction is required.",
+        "Enables sparse rendering. When enabled, applies a constant per-pixel sampling rate across the screen. DLSS Ray Reconstruction is required. "
+        "Performance mode (rtx.ptPerformance.enable) runs sparse rendering with its own rate (rtx.ptPerformance.samplingRate) whatever this says.",
             args.environment = "RTX_SPARSE_RENDERING_ENABLE");
 
       RTX_OPTION_ENV("rtx.sparseRendering", PerPixelRateNoiseSource, perPixelRateNoiseSource, PerPixelRateNoiseSource::BlueNoise128x128x64x8, "RTX_SPARSE_RENDERING_PER_PIXEL_RATE_NOISE_SOURCE",
@@ -114,12 +115,16 @@ namespace dxvk {
     SparseRendering(dxvk::DxvkDevice* device);
 
     // Config-only mirror of isEnabled(): true iff the RTX options required for sparse rendering
-    // (SR option, DLSS-RR, NRC indirect mode) are configured to be enabled. Safe to call at
+    // (SR option or performance mode, DLSS-RR, NRC indirect mode) are configured to be enabled. Safe to call at
     // startup before NRC/RR have finished initialising. Use this for shader prewarming;
     // use isActive() for per-frame dispatch decisions.
     static bool isEnabledByOptions();
 
     bool resamplesNrcTrainingPaths(bool nrcIsActive) const;
+
+    // Returns the sampling rate that sparse rendering applies this frame, latched at the start of the frame.
+    // Returns 1 when sparse rendering does not run, including when performance mode's scaled rate reaches 1.
+    float getSamplingRate() const;
     static bool shouldDeferNrcTrainingSetup(const SparseRenderingArgs& args);
 
     void showImguiSettings();
@@ -143,6 +148,14 @@ namespace dxvk {
     void releaseDownscaledResource() override;
 
   private:
+    // Returns the sampling rate for a render resolution with this many pixels: rtx.ptPerformance.samplingRate scaled by its
+    // exponent while performance mode sets the rate, and rtx.sparseRendering.samplingRate as configured otherwise.
+    static float calculateSamplingRate(uint32_t pixelCount, bool ptPerformanceOwnsSamplingRate);
+
+    // True while performance mode is on with ray reconstruction, which runs sparse rendering at performance mode's rate
+    // whatever rtx.sparseRendering.enableSparseRendering says.
+    bool ptPerformanceOwnsSamplingRate() const;
+
     void dispatchActivePixelSamplingRate(RtxContext& ctx, const Resources::RaytracingOutput& rtOutput);
     void dispatchActivePixelMask(RtxContext& ctx, const Resources::RaytracingOutput& rtOutput);
     void dispatchCompactActivePixels(RtxContext& ctx, const Resources::RaytracingOutput& rtOutput);
@@ -151,6 +164,11 @@ namespace dxvk {
     void createActivePixelList(const VkExtent3D& downscaledExtent);
     void dispatchActivePixelListArgs(RtxContext& ctx);
     void readBackActivePixelCount(RtxContext& ctx);
+
+    // This frame's state, latched in onFrameBegin.
+    bool m_ptPerformanceOwnsSamplingRate = false;
+    uint32_t m_framePixelCount = 0u;
+    float m_samplingRate = 1.0f;
 
     VkExtent3D m_activePixelMaskExtent = { 0u, 0u, 0u };
 

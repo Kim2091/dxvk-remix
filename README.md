@@ -36,7 +36,7 @@ option is listed in [`RtxOptions.md`](RtxOptions.md).
 | **Screenshots** | Print Screen, or the Take Screenshot button in the Alt+X menu, saves the frame with the game's own interface and without the Remix menu, without a hitch. In HDR it saves an HDR PNG and a matching SDR PNG that shows correctly in ordinary viewers. |
 | **SCCR relief displacement** | A new default displacement mode that gives height-mapped surfaces deep, stable relief with correct depth and motion vectors. An optional shell-tracing mode keeps deep relief connected across triangle edges. |
 | **Light BVH light sampling** | The default light selection: it picks lights by their bounds, power and direction, which keeps scenes with many lights fast and clean. |
-| **SHaRC indirect lighting by default** | A world-space radiance cache (it stores bounced light in the world and reuses it) is the default indirect lighting on NVIDIA GPUs. It no longer goes dark for a moment after camera cuts or exposure changes. |
+| **SHaRC indirect lighting by default** | A world-space radiance cache (it stores bounced light in the world and reuses it) is the default indirect lighting on every GPU that supports it. It no longer goes dark for a moment after camera cuts or exposure changes. |
 | **Pre-exposure** | Keeps night scenes precise by scaling the image to the current exposure before it is stored, so dark scenes keep their detail. |
 | **Auto exposure** | A new metering model by TheGreatHmmmmm, weighted slightly below the middle of the screen so a bright sky counts for less. A single invalid pixel can no longer stick the exposure. |
 | **Underwater look** | Optional dimmed light, procedural caustics and depth murk for surfaces seen through water (off by default). |
@@ -164,16 +164,21 @@ The preset is in the Alt+X menu. **Auto** (the default) picks one for your GPU:
 
 | GPU | Auto picks |
 | :-- | :-- |
-| NVIDIA RTX 40 and 50 series | High |
-| NVIDIA RTX 30 series | Medium |
+| NVIDIA RTX 30, 40 and 50 series | Medium |
 | NVIDIA RTX 20 series, other GPUs | Low |
 
-GPUs with 8 GB of video memory or less get one step lower (Low at the bottom).
+RTX 30 series GPUs with 8 GB of video memory or less get Low.
+
+Medium, Low and Very Low run Path Tracing: Performance ([PtPerformance.md](documentation/PtPerformance.md)): path tracing
+with one cached indirect bounce, sparse shading with Ray Reconstruction, and a first hit that is rasterized or traced,
+whichever is cheaper. Ultra and High path-trace every
+pixel. Very Low runs Low's settings.
 
 | | Ultra | High | Medium | Low |
 | :-- | :-- | :-- | :-- | :-- |
+| **performance mode** | Off | Off | On | On |
 | **Light bounces** | 1 to 4 | 1 to 4 | 0 to 2 | 0 to 2 |
-| **Indirect lighting** (NVIDIA: SHaRC; other GPUs: ReSTIR GI) | Ultra cache update | High cache update, about half the cost of Ultra | Medium | Medium |
+| **Indirect lighting** (SHaRC; ReSTIR GI on GPUs without 64-bit buffer atomics) | Ultra cache update | High cache update, about half the cost of Ultra | Medium | Medium |
 | **Separate direct and indirect denoising** | On | On | Off | Off |
 | **Sparse rendering** (with Ray Reconstruction on) | Off: full image quality | 60% of pixels traced | 50% | about 36% |
 | **Volumetrics** | Ultra | Ultra | Medium | Low |

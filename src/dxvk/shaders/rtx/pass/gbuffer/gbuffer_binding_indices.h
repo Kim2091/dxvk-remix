@@ -120,9 +120,11 @@
 // and the PSR passes dispatch indirectly over them (gbuffer_rayquery_compact.comp.slang).
 #define GBUFFER_BINDING_COMPACT_PSR_LIST                                        152
 #define GBUFFER_BINDING_COMPACT_PSR_ARGS                                        153
+// The raster first hit's visibility buffer, read by the GBUFFER_VISIBILITY_INPUT kernels.
+#define GBUFFER_BINDING_RASTER_FIRST_HIT_INPUT                                  155
 
 // The per-pixel lens features (lens.h), written while RaytraceArgs.lensFeatureMask is nonzero.
-#define GBUFFER_BINDING_LENS_FEATURES_OUTPUT                                    154
+#define GBUFFER_BINDING_LENS_FEATURES_OUTPUT                                    156
 
 
 #define GBUFFER_MIN_BINDING                         GBUFFER_BINDING_LINEAR_WRAP_SAMPLER
