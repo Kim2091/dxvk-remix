@@ -79,6 +79,8 @@ namespace dxvk {
         uint64_t drainingBytes = 0;
         uint32_t blasRelocated = 0, blasRelocatedAtLog = 0;
         uint64_t blasRelocatedBytes = 0, blasRelocatedBytesAtLog = 0;
+        uint32_t idleMipDrops = 0, idleMipDropsAtLog = 0;
+        uint32_t texturesRelocated = 0, texturesRelocatedAtLog = 0;
       } s;
 
       constexpr uint32_t kSlackRefreshFrames = 15;
@@ -333,6 +335,14 @@ namespace dxvk {
       s.blasRelocatedBytes += bytes;
     }
 
+    void noteIdleMipDrops(uint32_t count) {
+      s.idleMipDrops += count;
+    }
+
+    void noteTextureRelocated() {
+      s.texturesRelocated++;
+    }
+
     HostInfo hostInfo() {
       HostInfo info {};
       info.level = s_level.load(std::memory_order_relaxed);
@@ -476,16 +486,20 @@ namespace dxvk {
         }
         s_drainingActive = s.draining && s.drainingBytes > 0;
 
-        if (s_drainingActive && omm && frame % kDrainOmmTrimFrames == 0) {
+        if (omm && frame % kDrainOmmTrimFrames == 0) {
+          uint32_t ommTrimAge = VramBudget::idleMicromapFrames();
           bool ommDraining = false;
           const VkPhysicalDeviceMemoryProperties& memProps = allocator.getMemoryProperties();
           for (uint32_t heapId = 0; heapId < memProps.memoryHeapCount; heapId++) {
-            if (memProps.memoryHeaps[heapId].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+            if (s_drainingActive && (memProps.memoryHeaps[heapId].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)) {
               ommDraining |= allocator.getChunkUsage(heapId).pools[uint32_t(DxvkMemoryAllocator::ChunkPool::Micromap)].drainingCount > 0;
             }
           }
           if (ommDraining) {
-            omm->requestTrim(kDrainOmmMinAgeFrames);
+            ommTrimAge = ommTrimAge == 0 ? kDrainOmmMinAgeFrames : std::min(ommTrimAge, kDrainOmmMinAgeFrames);
+          }
+          if (ommTrimAge != 0) {
+            omm->requestTrim(ommTrimAge);
           }
         }
       }
@@ -623,7 +637,8 @@ namespace dxvk {
         ", empty chunks ", mib(s.chunks - s.chunksAtLog), ", import mips skipped ~", mib(importSkipped - s.importAtLog),
         ", material texture refs re-pointed ", s.materialRefsRefreshed - s.materialRefsRefreshedAtLog,
         " | draining ", s_drainingActive.load() ? "on" : "off", ", ", mib(s.drainingBytes), " still in draining chunks, BLAS relocated ",
-        s.blasRelocated - s.blasRelocatedAtLog, " (", mib(s.blasRelocatedBytes - s.blasRelocatedBytesAtLog), ")",
+        s.blasRelocated - s.blasRelocatedAtLog, " (", mib(s.blasRelocatedBytes - s.blasRelocatedBytesAtLog), "), textures relocated ",
+        s.texturesRelocated - s.texturesRelocatedAtLog, ", textures that dropped idle mips ", s.idleMipDrops - s.idleMipDropsAtLog,
         " | vkAllocateMemory ", allocTiming.calls, " calls, ", uint32_t(allocTiming.totalMs * 10.0) / 10.0, " ms, longest ",
         uint32_t(allocTiming.maxMs * 100.0) / 100.0, " ms; chunks made ", allocTiming.chunksMade, ", freed ", allocTiming.chunksFreed,
         " | alloc totals: calls=", allocTotals.calls, " totalMs=", uint64_t(allocTotals.totalMs),
@@ -647,6 +662,8 @@ namespace dxvk {
       s.materialRefsRefreshedAtLog = s.materialRefsRefreshed;
       s.blasRelocatedAtLog = s.blasRelocated;
       s.blasRelocatedBytesAtLog = s.blasRelocatedBytes;
+      s.idleMipDropsAtLog = s.idleMipDrops;
+      s.texturesRelocatedAtLog = s.texturesRelocated;
     }
   }
 }
