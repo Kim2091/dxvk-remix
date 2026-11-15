@@ -2113,6 +2113,7 @@ namespace dxvk {
         "rtx.deviceFaultDiagnostics. Restart required: the Vulkan extensions are enabled at device creation (save rtx.conf first).\n"
         "After a device loss, remix-dxvk.log gets [DeviceFault] lines: the driver's fault description, each faulting GPU address\n"
         "with the buffer that holds or recently held it, and the pass the GPU was in. GPUs other than NVIDIA always have this.");
+      RemixGui::Checkbox("Temporal Passes Trace the Previous Frame's TLAS", &AccelManager::usePreviousTlasObject());
       RemixGui::Checkbox("Keep Compiled Pipelines Between Runs (restart required)", &DxvkPipelineCache::persistObject());
       RemixGui::SetTooltipToLastWidgetOnHover(
         "rtx.pipelineCache.persist. Restart required: the cache file is opened at device creation, so a change takes effect\n"

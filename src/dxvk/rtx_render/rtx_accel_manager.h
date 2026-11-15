@@ -29,6 +29,7 @@
 #include "../util/rc/util_rc_ptr.h"
 #include "rtx_types.h"
 #include "rtx_common_object.h"
+#include "rtx_option.h"
 #include "rtx_gpu_crash_recorder.h"
 #include "rtx_staging.h"
 #include "rtx_point_instancer_system.h"
@@ -155,6 +156,12 @@ class AccelManager : public CommonDeviceObject {
   };
 
 public:
+  RTX_OPTION("rtx.accel", bool, usePreviousTlas, true,
+             "Lets the temporal passes trace visibility rays against the previous frame's TLAS when ray reconstruction "
+             "is off or ReSTIR GI is on (RTXDI temporal bias correction and the denoiser gradients). Off, those rays "
+             "trace the current frame's TLAS from the previous frame's positions, as they do with ray reconstruction. "
+             "Turn it off to see whether a device loss follows the previous frame's TLAS.");
+
   AccelManager(AccelManager const&) = delete;
   AccelManager& operator=(AccelManager const&) = delete;
 
