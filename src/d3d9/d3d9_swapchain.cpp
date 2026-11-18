@@ -27,6 +27,7 @@
 
 #include "../dxvk/dxvk_device.h"
 #include "../dxvk/dxvk_objects.h"
+#include "../dxvk/rtx_render/rtx_allocation_trace.h"
 #include "../util/util_env.h"
 #include "../util/util_once.h"
 #include "../util/util_sentry.h"
@@ -1753,6 +1754,9 @@ namespace dxvk {
 
     for (uint32_t i = 0; i < m_backBuffers.size(); i++)
       m_backBuffers[i] = new D3D9Surface(m_parent, &desc, this, nullptr);
+
+    // Always recorded, so a trace turned on later knows which render targets are screen-sized.
+    AllocationTrace::onBackBuffers(desc.Width, desc.Height, str::format(desc.Format), uint32_t(m_backBuffers.size()));
 
     auto swapImage = m_backBuffers[0]->GetCommonTexture()->GetImage();
 

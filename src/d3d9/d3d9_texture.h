@@ -5,6 +5,8 @@
 #include "d3d9_volume.h"
 #include "d3d9_util.h"
 
+#include "../dxvk/rtx_render/rtx_allocation_trace.h"
+
 #include <vector>
 #include <list>
 #include <mutex>
@@ -46,6 +48,9 @@ namespace dxvk {
             this);
         }
       }
+
+      if (unlikely(AllocationTrace::active()) && m_texture.GetImage() != nullptr)
+        AllocationTrace::onD3D9OwnerRefs(*m_texture.GetImage(), &this->m_refCount, &this->m_refPrivate);
     }
 
     ~D3D9BaseTexture() {

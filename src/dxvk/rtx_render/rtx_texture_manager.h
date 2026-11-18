@@ -24,6 +24,8 @@
 
 #include <mutex>
 #include <queue>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "../../util/thread.h"
@@ -34,6 +36,7 @@
 
 namespace dxvk {
   class DxvkContext;
+  class DxvkImage;
   struct ManagedTexture;
   struct AsyncRunner;
   struct AsyncRunner_RTXIO;
@@ -176,6 +179,22 @@ namespace dxvk {
     }
     // NV-DXVK end
 
+    // Any thread. The application released the texture that owns image. Its game texture entries leave
+    // the cache in releaseAppTextures, once no instance's material uses them.
+    void noteAppTextureReleased(const Rc<DxvkImage>& image);
+
+    // CS thread, once per frame. Frees the game texture entries of the images noteAppTextureReleased
+    // queued at least kAppReleaseDelayFrames ago, and unbinds their views from ctx's resource slots.
+    // An entry that a live instance still uses stays until a later frame.
+    void releaseAppTextures(DxvkContext* ctx);
+
+    // CS thread. Adds the images queued by noteAppTextureReleased that releaseAppTextures has not let go yet.
+    void countPendingAppReleases(std::unordered_map<const DxvkImage*, uint32_t>& counts) const;
+
+    static constexpr uint32_t kAppReleaseDelayFrames = 4;
+    // Entries a live instance still used are checked again after this many frames.
+    static constexpr uint32_t kAppReleaseRetryFrames = 60;
+
     // Do not use. This is here temporarily for WAR for REMIX-1557
     void releaseTexture(TextureRef& textureRef) {
       m_textureCache.free(textureRef);
@@ -202,6 +221,17 @@ namespace dxvk {
     SparseUniqueCache<TextureRef, TextureHashFn, TextureEquality> m_textureCache;
     uint32_t m_textureCacheGeneration = 0;
     std::atomic<uint32_t> m_retainedCount { 0 }; // replacement textures (ManagedTexture) with m_refCount > 0
+    // Instance material references per cache slot, for textures of every kind (retainTexture / releaseTexture).
+    std::vector<uint32_t> m_slotRefs;
+
+    struct AppRelease {
+      Rc<DxvkImage> image;
+      uint32_t frame = 0;
+    };
+    dxvk::mutex m_appReleasedMutex;
+    std::vector<AppRelease> m_appReleasedQueue;    // Filled from any thread under m_appReleasedMutex.
+    std::vector<AppRelease> m_appReleasedPending;  // CS thread.
+    uint32_t m_lastAppReleaseScanFrame = 0;
 
     AsyncRunner*       m_asyncThread;
     AsyncRunner_RTXIO* m_asyncThread_rtxio;

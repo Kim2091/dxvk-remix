@@ -182,6 +182,7 @@ class SceneManager : public CommonDeviceObject, public ResourceCache {
   friend class TransientLane;
   friend class CoreMaterialBuilder;
   friend class OpacityMicromapManager; // Software micromap stores in m_bufferCache
+  friend class AllocationTrace; // Reads the draw-call cache's material textures
   RTX_OPTION("rtx.geometry", bool, optimizeAnimatedTexcoords, false,
     "Updates UV-only animation of compatible fixed-function geometry without a BLAS refit, which saves GPU time. Shader "
     "capture, skinning, smooth normals and active opacity micromaps keep the refit. Turn it off to always refit "

@@ -378,6 +378,20 @@ namespace dxvk {
     // the application releases its texture while other references keep the image alive.
     void markHeldAfterAppRelease();
 
+    // Marks the image as tracked by AllocationTrace, which the destructor then notifies.
+    void markAllocationTraced() {
+      m_allocationTraced = true;
+    }
+
+    // Marks the image as referenced by an entry of RtxTextureManager's texture cache. Any thread may read it.
+    void markInTextureCache() {
+      m_inTextureCache.store(true, std::memory_order_relaxed);
+    }
+
+    bool isInTextureCache() const {
+      return m_inTextureCache.load(std::memory_order_relaxed);
+    }
+
     // NV-DXVK start: Hashes to identify textures.
     void setHash(XXH64_hash_t hash) {
       m_hash = hash;
@@ -438,6 +452,8 @@ namespace dxvk {
 
     small_vector<VkFormat, 4> m_viewFormats;
     std::atomic<bool>     m_heldAfterAppRelease = { false };
+    bool                  m_allocationTraced = false;
+    std::atomic<bool>     m_inTextureCache = { false };
     
     bool canShareImage(const VkImageCreateInfo&  createInfo, const DxvkSharedHandleInfo& sharingInfo) const;
   };

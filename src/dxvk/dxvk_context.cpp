@@ -257,6 +257,42 @@ namespace dxvk {
   }
 
 
+  void DxvkContext::unbindImageViews(const std::unordered_set<const DxvkImage*>& images) {
+    if (images.empty()) {
+      return;
+    }
+    for (uint32_t slot = 0; slot < m_rc.size(); slot++) {
+      const Rc<DxvkImageView>& view = m_rc[slot].imageView;
+      if (view != nullptr && images.count(view->image().ptr()) != 0) {
+        bindResourceView(slot, nullptr, nullptr);
+      }
+    }
+  }
+
+
+  void DxvkContext::countBoundImages(std::unordered_map<const DxvkImage*, uint32_t>& counts) const {
+    for (const DxvkShaderResourceSlot& slot : m_rc) {
+      if (slot.imageView != nullptr) {
+        counts[slot.imageView->image().ptr()]++;
+      }
+    }
+    const DxvkRenderTargets& renderTargets = m_state.om.renderTargets;
+    if (renderTargets.depth.view != nullptr) {
+      counts[renderTargets.depth.view->image().ptr()]++;
+    }
+    for (const DxvkAttachment& color : renderTargets.color) {
+      if (color.view != nullptr) {
+        counts[color.view->image().ptr()]++;
+      }
+    }
+    for (const DxvkDeferredClear& clear : m_deferredClears) {
+      if (clear.imageView != nullptr) {
+        counts[clear.imageView->image().ptr()]++;
+      }
+    }
+  }
+
+
   void DxvkContext::bindResourceSampler(
     uint32_t              slot,
     const Rc<DxvkSampler>& sampler) {

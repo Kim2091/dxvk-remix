@@ -1,6 +1,7 @@
 #include "dxvk_image.h"
 
 #include "dxvk_device.h"
+#include "rtx_render/rtx_allocation_trace.h"
 
 namespace dxvk {
   
@@ -173,6 +174,9 @@ namespace dxvk {
     if (m_vkd->vkBindImageMemory(m_vkd->device(), m_image.image,
           m_image.memory.memory(), m_image.memory.offset()) != VK_SUCCESS)
       throw DxvkError("DxvkImage::DxvkImage: Failed to bind device memory");
+
+    if (unlikely(AllocationTrace::active()) && category == DxvkMemoryStats::Category::AppTexture)
+      AllocationTrace::onImageCreated(*this, name);
   }
   
   
@@ -204,6 +208,10 @@ namespace dxvk {
 
 
   DxvkImage::~DxvkImage() {
+    // First, so the trace never reads an image whose members are being destroyed.
+    if (unlikely(m_allocationTraced) && AllocationTrace::active())
+      AllocationTrace::onImageDestroyed(*this);
+
     if (m_heldAfterAppRelease.load()) {
       DxvkAppImageStats::get().heldAfterRelease -= 1;
       DxvkAppImageStats::get().heldAfterReleaseBytes -= int64_t(memSize());

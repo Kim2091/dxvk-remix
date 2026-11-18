@@ -532,6 +532,15 @@ namespace fork_hooks {
     s_apiTextures[hash] = ref;
   }
 
+  void countApiTextureImages(std::unordered_map<const DxvkImage*, uint32_t>& counts) {
+    std::lock_guard lock { s_apiTexturesMutex };
+    for (const auto& [hash, ref] : s_apiTextures) {
+      if (const DxvkImageView* view = ref.getImageView()) {
+        counts[view->image().ptr()]++;
+      }
+    }
+  }
+
   remixapi_ErrorCode destroyTexture(
       RemixApiDevice*     remixDevice,
       remixapi_TextureHandle handle) {

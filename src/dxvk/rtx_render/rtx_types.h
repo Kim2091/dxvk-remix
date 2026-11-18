@@ -1148,6 +1148,11 @@ struct BlasEntry {
     m_materials.clear();
   }
 
+  // The materials of other draws of this geometry in the frame it was last touched, keyed by material hash.
+  const std::unordered_map<XXH64_hash_t, LegacyMaterialData>& getCachedMaterials() const {
+    return m_materials;
+  }
+
   void linkInstance(RtInstance* instance) {
     m_linkedInstances.insert(instance);
   }

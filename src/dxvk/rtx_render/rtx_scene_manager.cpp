@@ -927,6 +927,7 @@ namespace dxvk {
     }
 
     vram_budget::processReleasedImports(ctx.ptr());
+    m_device->getCommon()->getTextureManager().releaseAppTextures(ctx.ptr());
     vram_budget::noteMaterialTexturesRefreshed(m_pReplacer->applyTextureRefreshes());
 
     logAccelMemoryBreakdown();

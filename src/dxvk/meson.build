@@ -180,6 +180,8 @@ dxvk_src = files([
   'rtx_render/rtx_accel_size_cache.h',
   'rtx_render/rtx_accumulation.cpp',
   'rtx_render/rtx_accumulation.h',
+  'rtx_render/rtx_allocation_trace.cpp',
+  'rtx_render/rtx_allocation_trace.h',
   'rtx_render/rtx_sparse_rendering.cpp',
   'rtx_render/rtx_sparse_rendering.h',
   'rtx_render/rtx_asset_data.h',

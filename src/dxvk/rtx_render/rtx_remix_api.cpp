@@ -68,6 +68,7 @@
 #include "../../util/xxHash/xxhash.h"
 
 #include "rtx_fork_hooks.h"
+#include "rtx_allocation_trace.h"
 #include "rtx_fork_fnv_material.h"
 #include "rtx_frontend_interface.h"
 #include "rtx_fork_api_recorder.h"
@@ -3265,6 +3266,21 @@ namespace dxvk {
       s_d3d11ImportStats.copiedOnWrite += 1;
       s_d3d11ImportStats.copiedOnWriteBytes += copyBytes;
     }
+  }
+
+  // CS thread. Adds the number of texture hashes host imports have registered on each image.
+  void remixHostImportCountImages(std::unordered_map<const DxvkImage*, uint32_t>& counts) {
+    for (const auto& [image, hashes] : s_importedImageHashes) {
+      counts[image] += uint32_t(hashes.size());
+    }
+  }
+
+  namespace {
+    // Gives the allocation trace the API's image holders.
+    const bool s_allocationTraceHolders = [] {
+      AllocationTrace::setHolderCounters(&remixHostImportCountImages, &fork_hooks::countApiTextureImages);
+      return true;
+    }();
   }
 
   // CS thread. A destroyed texture no longer needs copying when its image is written.

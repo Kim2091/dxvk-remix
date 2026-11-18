@@ -34,6 +34,7 @@ namespace dxvk {
   class BindlessResourceManager : public CommonDeviceObject {
   public:
     friend struct BindlessTable;
+    friend class AllocationTrace; // Counts the image views its tables hold
 
     enum Table {
       Textures = 0,

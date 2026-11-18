@@ -8,13 +8,80 @@
 #include "../util/util_shared_res.h"
 
 #include <algorithm>
+#include <cstring>
 #include <iostream>
 #include <sstream>
+#include <utility>
 #include "../dxvk/imgui/dxvk_imgui.h"
+#include "../dxvk/rtx_render/rtx_allocation_trace.h"
+#include "../dxvk/rtx_render/rtx_texture.h"
+#include "../dxvk/rtx_render/rtx_texture_manager.h"
 
 #include <charconv>
 
 namespace dxvk {
+  namespace {
+    // The texture's D3D9 description for rtx.debug.allocationTrace.
+    AllocationTrace::D3D9Info traceInfo(const D3D9_COMMON_TEXTURE_DESC& desc, D3DRESOURCETYPE type) {
+      AllocationTrace::D3D9Info info;
+      info.renderTarget = (desc.Usage & D3DUSAGE_RENDERTARGET) != 0;
+      info.depthStencil = (desc.Usage & D3DUSAGE_DEPTHSTENCIL) != 0;
+      info.backBuffer = desc.IsBackBuffer;
+      if (info.backBuffer) {
+        info.kind = "back buffer";
+      } else if (type == D3DRTYPE_CUBETEXTURE) {
+        info.kind = info.renderTarget ? "render target cube" : info.depthStencil ? "depth stencil cube" : "cube";
+      } else if (type == D3DRTYPE_VOLUMETEXTURE) {
+        info.kind = "volume";
+      } else if (type == D3DRTYPE_SURFACE) {
+        info.kind = info.renderTarget ? "render target" : info.depthStencil ? "depth stencil" : "surface";
+      } else {
+        info.kind = info.renderTarget ? "render target texture" : info.depthStencil ? "depth stencil texture" : "texture";
+      }
+
+      info.format = str::format(desc.Format);
+      constexpr const char* kFormatPrefix = "D3D9Format::";
+      if (info.format.rfind(kFormatPrefix, 0) == 0) {
+        info.format.erase(0, std::strlen(kFormatPrefix));
+      }
+
+      switch (desc.Pool) {
+      case D3DPOOL_DEFAULT: info.pool = "DEFAULT"; break;
+      case D3DPOOL_MANAGED: info.pool = "MANAGED"; break;
+      case D3DPOOL_SYSTEMMEM: info.pool = "SYSTEMMEM"; break;
+      case D3DPOOL_SCRATCH: info.pool = "SCRATCH"; break;
+      default: info.pool = str::format(uint32_t(desc.Pool)); break;
+      }
+
+      constexpr std::pair<DWORD, const char*> kUsageNames[] = {
+        { D3DUSAGE_RENDERTARGET, "RENDERTARGET" },
+        { D3DUSAGE_DEPTHSTENCIL, "DEPTHSTENCIL" },
+        { D3DUSAGE_DYNAMIC, "DYNAMIC" },
+        { D3DUSAGE_AUTOGENMIPMAP, "AUTOGENMIPMAP" },
+        { D3DUSAGE_WRITEONLY, "WRITEONLY" },
+      };
+      DWORD rest = desc.Usage;
+      for (const auto& [bit, name] : kUsageNames) {
+        if (rest & bit) {
+          info.usage += info.usage.empty() ? name : std::string("|") + name;
+          rest &= ~bit;
+        }
+      }
+      if (rest != 0) {
+        info.usage += str::format(info.usage.empty() ? "0x" : "|0x", std::hex, rest);
+      }
+      if (info.usage.empty()) {
+        info.usage = "0";
+      }
+
+      info.width = desc.Width;
+      info.height = desc.Height;
+      info.depth = desc.Depth;
+      info.mipLevels = desc.MipLevels;
+      return info;
+    }
+  }
+
   D3D9CommonTexture::D3D9CommonTexture(
           D3D9DeviceEx*             pDevice,
     const D3D9_COMMON_TEXTURE_DESC* pDesc,
@@ -86,6 +153,9 @@ namespace dxvk {
 
     if (m_desc.Usage & D3DUSAGE_AUTOGENMIPMAP)
       m_exposedMipLevels = 1;
+
+    if (unlikely(AllocationTrace::active()) && m_image != nullptr)
+      AllocationTrace::onD3D9Created(*m_image, traceInfo(m_desc, m_type));
   }
 
 
@@ -102,6 +172,13 @@ namespace dxvk {
         ImGUI::ReleaseTexture(m_image->getDescriptorHash());
       }
     }
+
+    // The texture cache keeps game textures until a scene clear, which rtx.scene.noImplicitClears can rule out.
+    if (m_image != nullptr && m_image->isInTextureCache())
+      m_device->GetDXVKDevice()->getCommon()->getTextureManager().noteAppTextureReleased(m_image);
+
+    if (unlikely(AllocationTrace::active()) && m_image != nullptr)
+      AllocationTrace::onD3D9Released(*m_image);
   }
 
 

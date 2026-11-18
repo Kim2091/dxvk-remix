@@ -53,6 +53,7 @@ namespace dxvk {
 
   class RetainedScene {
     friend class TransientLane;  // rtx.scene.directTransient builds from the same geometry table
+    friend class AllocationTrace; // Counts the textures its geometry and entries reference
   public:
     struct FrameStats {
       uint32_t direct = 0;      // direct entries

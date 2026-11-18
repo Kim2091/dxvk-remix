@@ -4,6 +4,8 @@
 
 #include "d3d9_device.h"
 
+#include "../dxvk/rtx_render/rtx_allocation_trace.h"
+
 namespace dxvk {
 
   D3D9Surface::D3D9Surface(
@@ -16,7 +18,11 @@ namespace dxvk {
         new D3D9CommonTexture( pDevice, pDesc, D3DRTYPE_SURFACE, pSharedHandle),
         0, 0,
         nullptr,
-        pContainer) { }
+        pContainer) {
+    // Back buffers swap their textures between surfaces, so their owner's counts would go stale.
+    if (unlikely(AllocationTrace::active()) && !pDesc->IsBackBuffer && m_texture->GetImage() != nullptr)
+      AllocationTrace::onD3D9OwnerRefs(*m_texture->GetImage(), &m_refCount, &m_refPrivate);
+  }
 
   D3D9Surface::D3D9Surface(
           D3D9DeviceEx*             pDevice,

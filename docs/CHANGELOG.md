@@ -137,6 +137,12 @@ The cloud screen pass costs 12-30% less in the NUMOS viewer at 2560x1600 across 
 - Options: added `rtx.atmosphere.cloudQuarterMarchSchedule` (0 one pass, 1 split cross-tile, 2 split, 3 split cross-tile full precision; default 2), `rtx.atmosphere.cloudEmptyPixelSkip` (default on), `rtx.atmosphere.cloudLightingLodByDistance` (default on), `rtx.atmosphere.cloudMarchRayBudgetMillions` (default 0, off) and `rtx.atmosphere.cloudMarchEarlyExit` (default off). `rtx.atmosphere.cloudDetailLodMode` now defaults to 2.
 - NUMOS: `b120cd7` on numos-sky `feat/20261118-fnv-cloud-perf`.
 
+### Allocation trace for app texture memory
+`rtx.debug.allocationTrace` logs `[AllocTrace]` lines to remix-dxvk.log: the creation, release and freeing of the application's render targets, depth stencils and textures of at least 8 MiB, with size, format, pool, usage and frame, a line whenever the back buffers or the set of screen-sized render targets change, and at intervals a summary of the live application images grouped by shape, next to the AppTexture memory figure. For each image still alive after the game released it, the summary lists what in Remix references it: the texture cache, the draw-call cache, host imports, API textures and in-flight GPU work. It is for finding where app texture memory goes when it grows over a session, such as across repeated menu openings, and changes no behavior.
+- Options: added `rtx.debug.allocationTrace` (default off) and `rtx.debug.allocationTraceSummarySeconds` (10), under Rendering, VRAM Budget, Allocation Trace. The presets do not set them: they are diagnostics.
+- Fix: the texture cache let go of a game texture only at a scene clear, so with `rtx.scene.noImplicitClears` every render target a ray traced draw had sampled stayed in VRAM for the whole session (about 16 MiB per pause-menu opening at 2560x1600). When the game releases a D3D9 texture, its cache entry is now freed a few frames later, once no instance's material uses it, and stale resource bindings of its views are dropped. The summary's held lines also count the draw-call cache's cached materials, the retained scene, context bindings, bindless tables and pending releases.
+- Commits: in this entry's commit.
+
 ## 2026-10-28
 
 ### Developer menu: settings search

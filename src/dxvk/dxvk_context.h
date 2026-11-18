@@ -27,6 +27,8 @@
 #include "dxvk_context_state.h"
 #include "dxvk_data.h"
 #include <optional>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace dxvk {
 
@@ -195,6 +197,13 @@ namespace dxvk {
             uint32_t              slot,
       const Rc<DxvkImageView>&    imageView,
       const Rc<DxvkBufferView>&   bufferView);
+
+    // Unbinds every resource slot that holds a view of one of the images.
+    // A resource slot keeps its view until a draw that uses the slot binds another one.
+    void unbindImageViews(const std::unordered_set<const DxvkImage*>& images);
+
+    // Adds, for each image, the views of it that the resource slots, render targets and deferred clears hold.
+    void countBoundImages(std::unordered_map<const DxvkImage*, uint32_t>& counts) const;
     
     /**
      * \brief Binds image sampler

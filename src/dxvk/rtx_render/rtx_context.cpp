@@ -98,6 +98,7 @@
 
 // Destructor requires the struct definitions
 #include "rtx_sky.h"
+#include "rtx_allocation_trace.h"
 
 namespace dxvk {
 
@@ -1088,6 +1089,8 @@ namespace dxvk {
 
     // This needs to happen at the end of frame, after ImGUI rendering
     GpuMemoryTracker::onFrameEnd();
+
+    AllocationTrace::onPresent(*this);
   }
 
   void RtxContext::updateMetrics(const float gpuIdleTimeMilliseconds) const {

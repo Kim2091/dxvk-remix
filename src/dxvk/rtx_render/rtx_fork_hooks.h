@@ -12,6 +12,9 @@
 // std::filesystem::path for textureHashPathLookup's input parameter.
 #include <filesystem>
 
+// std::unordered_map for countApiTextureImages.
+#include <unordered_map>
+
 // Provides the remixapi_* types used by the Remix API hooks.
 #include <remix/remix_c.h>
 
@@ -45,6 +48,7 @@ namespace dxvk {
 
   class DxvkContext;
   class DxvkDevice;
+  class DxvkImage;
   class GameCapturer;
   class GameOverlay;
   struct LightManager;
@@ -284,6 +288,10 @@ namespace dxvk {
     // imported texture (remixapi_ImportD3D9Texture) after RtxTextureManager::clear() the same way it finds an uploaded
     // one. destroyTexture removes it. Implementation in rtx_fork_api_entry.cpp.
     void registerApiTexture(uint64_t hash, const TextureRef& ref);
+
+    // CS thread. Adds, for each image, the number of entries in the hash -> texture map above that reference it.
+    // Implementation in rtx_fork_api_entry.cpp.
+    void countApiTextureImages(std::unordered_map<const DxvkImage*, uint32_t>& counts);
 
     // Fires the beginScene callback once per frame, on the first API submission of the frame.
     // Called from the instance, light and retained draw entry points before they take s_mutex.

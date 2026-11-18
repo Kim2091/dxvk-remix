@@ -99,6 +99,7 @@
 #include "rtx_render/rtx_fork_d3d9_identity.h"
 #include "rtx_render/rtx_host_settings.h"
 #include "rtx_render/rtx_vram_budget.h"
+#include "rtx_render/rtx_allocation_trace.h"
 #include "rtx_render/rtx_session_log.h"
 #include "rtx_render/rtx_numos_ui.h"
 #include "rtx_render/rtx_sky_ui.h"
@@ -4789,6 +4790,11 @@ namespace dxvk {
         RemixGui::DragInt("Host Release From Level", &VramBudget::hostSignalLevelObject(), 0.05f, 1, 3);
         ImGui::EndDisabled();
         RemixGui::Checkbox("Release Empty Chunks Even Without Pressure (measure slack)", &VramBudget::releaseEmptyChunksAlwaysObject());
+        ImGui::TreePop();
+      }
+      if (ImGui::TreeNode("Allocation Trace##vrambudget")) {
+        RemixGui::Checkbox("Log Application Texture Allocations", &AllocationTrace::allocationTraceObject());
+        RemixGui::DragInt("Summary Interval (s, 0 = only when turned off)", &AllocationTrace::allocationTraceSummarySecondsObject(), 1.f, 0, 3600);
         ImGui::TreePop();
       }
       ImGui::Unindent();

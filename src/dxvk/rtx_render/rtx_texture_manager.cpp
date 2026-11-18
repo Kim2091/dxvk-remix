@@ -26,6 +26,7 @@
 #include "../../util/rc/util_rc_ptr.h"
 #include "dxvk_context.h"
 #include "dxvk_scoped_annotation.h"
+#include <algorithm>
 #include <chrono>
 
 #include "rtx_asset_data_manager.h"
@@ -1037,6 +1038,9 @@ namespace dxvk {
     }
     const Rc<ManagedTexture>& tex = texRef.getManagedTexture();
     if (tex == nullptr) {
+      if (DxvkImageView* view = texRef.getImageView()) {
+        view->image()->markInTextureCache();
+      }
       return;
     }
 
@@ -1089,6 +1093,10 @@ namespace dxvk {
       }
       return;
     }
+    if (m_slotRefs.size() <= textureIndex) {
+      m_slotRefs.resize(m_textureCache.getTotalCount(), 0);
+    }
+    m_slotRefs[textureIndex]++;
     const Rc<ManagedTexture>& tex = m_textureCache.at(textureIndex).getManagedTexture();
     if (tex == nullptr) {
       return;
@@ -1110,6 +1118,9 @@ namespace dxvk {
     // cache before all instance destroy events fire; in that case the release is a no-op.
     if (textureIndex >= m_textureCache.getTotalCount()) {
       return;
+    }
+    if (textureIndex < m_slotRefs.size() && m_slotRefs[textureIndex] > 0) {
+      m_slotRefs[textureIndex]--;
     }
     const Rc<ManagedTexture>& tex = m_textureCache.at(textureIndex).getManagedTexture();
     if (tex == nullptr) {
@@ -1145,7 +1156,95 @@ namespace dxvk {
     memset(m_sf.m_related, 0xFF, SAMPLER_FEEDBACK_MAX_TEXTURE_COUNT * SAMPLER_FEEDBACK_RELATED_PER_TEX * sizeof(m_sf.m_related[0]));
 
     m_textureCache.clear();
+    m_slotRefs.clear();
     ++m_textureCacheGeneration;
+  }
+
+  void RtxTextureManager::noteAppTextureReleased(const Rc<DxvkImage>& image) {
+    std::lock_guard lock { m_appReleasedMutex };
+    m_appReleasedQueue.push_back({ image, m_device->getCurrentFrameId() });
+  }
+
+  void RtxTextureManager::releaseAppTextures(DxvkContext* ctx) {
+    ScopedCpuProfileZone();
+    {
+      std::lock_guard lock { m_appReleasedMutex };
+      for (AppRelease& release : m_appReleasedQueue) {
+        m_appReleasedPending.push_back(std::move(release));
+      }
+      m_appReleasedQueue.clear();
+    }
+    if (m_appReleasedPending.empty()) {
+      return;
+    }
+
+    // Waiting a few frames lets the frames that drew with the texture leave the instance tables first.
+    // In-flight GPU work does not need the wait: command lists hold their own references.
+    const uint32_t frame = m_device->getCurrentFrameId();
+    std::unordered_map<const DxvkImage*, bool> due;  // The value is true while a live instance uses an entry of the image.
+    bool newlyDue = false;
+    for (const AppRelease& release : m_appReleasedPending) {
+      if (frame - release.frame >= kAppReleaseDelayFrames) {
+        due.emplace(release.image.ptr(), false);
+        newlyDue |= release.frame + kAppReleaseDelayFrames > m_lastAppReleaseScanFrame;
+      }
+    }
+    // The scan reads the whole cache, so images whose entries were still in use wait for the retry interval.
+    if (due.empty() || (!newlyDue && frame - m_lastAppReleaseScanFrame < kAppReleaseRetryFrames)) {
+      return;
+    }
+    m_lastAppReleaseScanFrame = frame;
+
+    std::vector<TextureRef> toFree;
+    const std::vector<TextureRef>& table = m_textureCache.getObjectTable();
+    for (uint32_t index = 0; index < table.size(); index++) {
+      const TextureRef& ref = table[index];
+      if (!ref.isValid() || ref.getManagedTexture() != nullptr) {
+        continue;
+      }
+      const DxvkImageView* view = ref.getImageView();
+      if (view == nullptr) {
+        continue;
+      }
+      const auto found = due.find(view->image().ptr());
+      if (found == due.end()) {
+        continue;
+      }
+      // Only the D3D9 frontend keys its entries by the view handle. Host imports register the same view under the
+      // host's hash, and the host releases those with remixapi_DestroyTexture.
+      if (ref.getUniqueKey() != handleOrUniqueKey(kInvalidTextureKey, view->handle())) {
+        continue;
+      }
+      if (index < m_slotRefs.size() && m_slotRefs[index] > 0) {
+        found->second = true;
+        continue;
+      }
+      toFree.push_back(ref);
+    }
+    // Freed slots are reused by later textures. No instance material refers to them, since their counts are 0.
+    for (const TextureRef& ref : toFree) {
+      m_textureCache.free(ref);
+    }
+
+    std::unordered_set<const DxvkImage*> released;
+    for (const auto& [image, inUse] : due) {
+      if (!inUse) {
+        released.insert(image);
+      }
+    }
+    if (ctx != nullptr) {
+      ctx->unbindImageViews(released);
+    }
+    m_appReleasedPending.erase(
+      std::remove_if(m_appReleasedPending.begin(), m_appReleasedPending.end(),
+                     [&](const AppRelease& release) { return released.count(release.image.ptr()) != 0; }),
+      m_appReleasedPending.end());
+  }
+
+  void RtxTextureManager::countPendingAppReleases(std::unordered_map<const DxvkImage*, uint32_t>& counts) const {
+    for (const AppRelease& release : m_appReleasedPending) {
+      counts[release.image.ptr()]++;
+    }
   }
 
   void RtxTextureManager::requestHotReload(const Rc<ManagedTexture>& tex) {
